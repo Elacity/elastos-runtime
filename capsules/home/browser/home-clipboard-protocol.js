@@ -96,6 +96,13 @@ const HOME_CLIPBOARD_TARGET_PURPOSE_POLICY = Object.freeze({
       kind: "resource-uri",
     }),
   }),
+  "chat-room": Object.freeze({
+    "conversation.invite": Object.freeze({
+      operations: Object.freeze(["write"]),
+      maxUtf8Bytes: 16_384,
+      kind: "resource-uri",
+    }),
+  }),
 });
 
 export function homeClipboardExactKeys(value, expected) {

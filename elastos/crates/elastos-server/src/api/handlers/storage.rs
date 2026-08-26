@@ -83,6 +83,9 @@ impl From<ProviderError> for StorageApiError {
                 StorageApiError::Internal(format!("No provider: {}", m))
             }
             ProviderError::Provider(m) => StorageApiError::Internal(m),
+            ProviderError::Unavailable(m) => {
+                StorageApiError::Internal(format!("Peer unavailable: {}", m))
+            }
             ProviderError::Io(e) => StorageApiError::Internal(e.to_string()),
         }
     }

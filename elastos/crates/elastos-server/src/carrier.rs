@@ -28,12 +28,15 @@ use base64::Engine as _;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, SecretKey, Watcher};
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 // AutoDiscoveryGossip trait extends Gossip with DHT-based peer discovery.
 // RecordPublisher publishes topic records to DHT so peers can find each other.
 // DHT auto-discovery imports — used by native `elastos chat` path (main.rs).
 // Provider gossip_join uses deterministic subscribe_with_opts for now.
 #[allow(unused_imports)]
-use distributed_topic_tracker::{AutoDiscoveryGossip, RecordPublisher, TopicId};
+use distributed_topic_tracker::{
+    AutoDiscoveryGossip, Config as TopicTrackerConfig, RecordPublisher, TimeoutConfig, TopicId,
+};
 use futures_lite::StreamExt;
 use iroh_gossip::net::Gossip;
 use serde::{Deserialize, Serialize};
@@ -62,7 +65,6 @@ const CARRIER_ALPN: &[u8] = b"elastos/carrier/1";
 const BROWSER_CARRIER_STREAM_SCHEMA: &str = "elastos.browser.carrier-stream/v1";
 const BROWSER_CARRIER_STREAM_ACK_MAX_BYTES: usize = 16 * 1024;
 const CHAT_DISCOVERY_TOPIC_GENERAL: &str = "__elastos_internal/chat-presence-v1/#general";
-const CHAT_ROOM_SYNC_TOPIC: &str = "__elastos_internal/room-sync-v1/chat-room";
 const CONTENT_AVAILABILITY_ANNOUNCEMENT_SCHEMA: &str =
     "elastos.content.availability.announcement/v1";
 const CONTENT_AVAILABILITY_ANNOUNCEMENT_DOMAIN: &str =
@@ -95,8 +97,15 @@ const MAX_CARRIER_OBJECT_IMPORT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REMOTE_RECEIPT_REPLICA_SUMMARY_ROWS: usize = 5;
 const GOSSIP_SEND_TIMEOUT: Duration = Duration::from_millis(1_500);
 const GOSSIP_JOIN_PEERS_TIMEOUT: Duration = Duration::from_millis(1_500);
+const GOSSIP_JOIN_EXACT_MAX_PEERS: usize = 16;
 const GOSSIP_CARRIER_PUSH_MAX_TOPIC_LEN: usize = 256;
-const GOSSIP_CARRIER_PUSH_MAX_MESSAGE_BYTES: usize = 12 * 1024 * 1024;
+// Maximum complete JSON GossipMessage admitted to the iroh-gossip wire.
+const GOSSIP_WIRE_MESSAGE_MAX_BYTES: usize = 192 * 1024;
+const GOSSIP_TOPIC_BUFFER_MAX_BYTES: usize = 12 * 1024 * 1024;
+const GOSSIP_CURSOR_MAX_CONSUMER_ID_BYTES: usize = 128;
+const GOSSIP_PEEK_MAX_MESSAGES: usize = 256;
+// Maximum complete encoded provider response returned by one gossip_peek.
+const GOSSIP_PEEK_MAX_BATCH_BYTES: usize = GOSSIP_TOPIC_BUFFER_MAX_BYTES;
 
 /// Well-known secret for topic discovery. Any Carrier node with this secret
 /// can discover peers on the same topic via DHT.
@@ -159,9 +168,47 @@ fn requested_gossip_nonce(request: &serde_json::Value) -> u64 {
         .unwrap_or_else(random_gossip_nonce)
 }
 
+#[derive(Default)]
 struct TopicBuffer {
     messages: VecDeque<GossipMessage>,
     base_index: u64,
+    retained_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GossipCursorRange {
+    cursor: u64,
+    next_cursor: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OutstandingGossipPeek {
+    range: GossipCursorRange,
+    limit: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GossipConsumerCursor {
+    position: u64,
+    outstanding_peek: Option<OutstandingGossipPeek>,
+    last_acknowledged: Option<GossipCursorRange>,
+}
+
+impl GossipConsumerCursor {
+    fn at(position: u64) -> Self {
+        Self {
+            position,
+            outstanding_peek: None,
+            last_acknowledged: None,
+        }
+    }
+
+    fn normalize_to(&mut self, base_index: u64) {
+        if self.position < base_index {
+            self.position = base_index;
+            self.outstanding_peek = None;
+        }
+    }
 }
 
 const MAX_BUFFER: usize = 10_000;
@@ -175,6 +222,31 @@ fn same_gossip_delivery(left: &GossipMessage, right: &GossipMessage) -> bool {
         && left.signature == right.signature
 }
 
+fn serialize_gossip_wire_message(message: &GossipMessage) -> std::result::Result<Vec<u8>, usize> {
+    let encoded =
+        serde_json::to_vec(message).expect("GossipMessage JSON serialization cannot fail");
+    if encoded.len() > GOSSIP_WIRE_MESSAGE_MAX_BYTES {
+        return Err(encoded.len());
+    }
+    Ok(encoded)
+}
+
+fn gossip_message_encoded_len(message: &GossipMessage) -> usize {
+    serde_json::to_vec(message)
+        .expect("GossipMessage JSON serialization cannot fail")
+        .len()
+}
+
+fn pop_gossip_buffer_front(buffer: &mut TopicBuffer) -> Option<GossipMessage> {
+    let message = buffer.messages.pop_front()?;
+    buffer.retained_bytes = buffer
+        .retained_bytes
+        .checked_sub(gossip_message_encoded_len(&message))
+        .expect("gossip buffer byte accounting must remain exact");
+    buffer.base_index += 1;
+    Some(message)
+}
+
 fn push_gossip_buffer_message(buffer: &mut TopicBuffer, message: GossipMessage) -> bool {
     if buffer
         .messages
@@ -184,12 +256,27 @@ fn push_gossip_buffer_message(buffer: &mut TopicBuffer, message: GossipMessage) 
     {
         return false;
     }
-    if buffer.messages.len() >= MAX_BUFFER {
-        buffer.messages.pop_front();
-        buffer.base_index += 1;
+    let encoded_len = serialize_gossip_wire_message(&message)
+        .expect("only wire-bounded gossip messages may enter a topic buffer")
+        .len();
+    while buffer.messages.len() >= MAX_BUFFER
+        || buffer
+            .retained_bytes
+            .checked_add(encoded_len)
+            .is_none_or(|bytes| bytes > GOSSIP_TOPIC_BUFFER_MAX_BYTES)
+    {
+        pop_gossip_buffer_front(buffer)
+            .expect("one wire-bounded message must fit in the gossip buffer");
     }
+    buffer.retained_bytes += encoded_len;
     buffer.messages.push_back(message);
     true
+}
+
+fn spawn_carrier_gossip(endpoint: &Endpoint) -> Gossip {
+    Gossip::builder()
+        .max_message_size(GOSSIP_WIRE_MESSAGE_MAX_BYTES)
+        .spawn(endpoint.clone())
 }
 
 fn now_secs() -> u64 {
@@ -212,6 +299,65 @@ pub struct CarrierNode {
     pub memory_lookup: MemoryLookup,
 }
 
+impl CarrierNode {
+    pub(crate) async fn shutdown(self) {
+        let tasks = {
+            let mut state = self.gossip_state.lock().await;
+            let tasks = state
+                .receiver_tasks
+                .drain()
+                .map(|(_, task)| task)
+                .collect::<Vec<_>>();
+            state.senders.clear();
+            state.joined_topics.clear();
+            tasks
+        };
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Err(err) = self.gossip.shutdown().await {
+            tracing::warn!(error = %err, "carrier gossip shutdown failed during runtime shutdown");
+        }
+        self.endpoint.close().await;
+    }
+}
+
+pub struct CarrierRuntimeService {
+    node: Option<CarrierNode>,
+    #[cfg(test)]
+    stopped: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl CarrierRuntimeService {
+    pub fn new(node: CarrierNode) -> Self {
+        Self {
+            node: Some(node),
+            #[cfg(test)]
+            stopped: None,
+        }
+    }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        if let Some(node) = self.node.take() {
+            node.shutdown().await;
+        }
+        #[cfg(test)]
+        if let Some(stopped) = self.stopped.as_ref() {
+            stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn test_pending_service(stopped: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            node: None,
+            stopped: Some(stopped),
+        }
+    }
+}
+
 pub struct GossipState {
     endpoint: Endpoint,
     gossip: Gossip,
@@ -219,10 +365,12 @@ pub struct GossipState {
     signing_key: Option<ed25519_dalek::SigningKey>,
     joined_topics: std::collections::HashSet<String>,
     bootstrap_peers: Vec<iroh::EndpointId>,
+    #[cfg(test)]
+    last_direct_join_peers: Option<Vec<iroh::EndpointId>>,
     senders: HashMap<String, distributed_topic_tracker::GossipSender>,
     receiver_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
     buffers: Arc<Mutex<HashMap<String, TopicBuffer>>>,
-    cursors: Arc<Mutex<HashMap<(String, String), u64>>>,
+    cursors: Arc<Mutex<HashMap<(String, String), GossipConsumerCursor>>>,
     peers: Arc<Mutex<Vec<String>>>,
     topic_peers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     did: Option<String>,
@@ -243,6 +391,8 @@ impl GossipState {
             signing_key,
             joined_topics: std::collections::HashSet::new(),
             bootstrap_peers: Vec::new(),
+            #[cfg(test)]
+            last_direct_join_peers: None,
             senders: HashMap::new(),
             receiver_tasks: HashMap::new(),
             buffers: Arc::new(Mutex::new(HashMap::new())),
@@ -250,6 +400,14 @@ impl GossipState {
             peers: Arc::new(Mutex::new(Vec::new())),
             topic_peers: Arc::new(Mutex::new(HashMap::new())),
             did,
+        }
+    }
+}
+
+impl Drop for GossipState {
+    fn drop(&mut self) {
+        for task in self.receiver_tasks.values() {
+            task.abort();
         }
     }
 }
@@ -317,6 +475,68 @@ fn add_ticket_endpoints(
     added
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GossipJoinExactRequest {
+    op: String,
+    topic: String,
+    peers: Vec<String>,
+}
+
+fn parse_gossip_join_exact_request(
+    request: &serde_json::Value,
+) -> std::result::Result<(String, Vec<iroh::EndpointId>), serde_json::Value> {
+    let request: GossipJoinExactRequest =
+        serde_json::from_value(request.clone()).map_err(|err| {
+            serde_json::json!({
+                "status": "error",
+                "code": "invalid_request",
+                "message": err.to_string()
+            })
+        })?;
+    if request.op != "gossip_join_exact" || request.topic.is_empty() {
+        return Err(serde_json::json!({
+            "status": "error",
+            "code": "invalid_request",
+            "message": "gossip_join_exact requires its exact operation and a non-empty topic"
+        }));
+    }
+    if request.peers.len() > GOSSIP_JOIN_EXACT_MAX_PEERS {
+        return Err(serde_json::json!({
+            "status": "error",
+            "code": "too_many_peers",
+            "message": format!("peers must contain at most {GOSSIP_JOIN_EXACT_MAX_PEERS} entries")
+        }));
+    }
+
+    let mut parsed = Vec::with_capacity(request.peers.len());
+    for peer in request.peers {
+        let Ok(endpoint_id) = peer.parse::<iroh::EndpointId>() else {
+            return Err(serde_json::json!({
+                "status": "error",
+                "code": "invalid_peer",
+                "message": "every peer must be a canonical EndpointId string"
+            }));
+        };
+        if endpoint_id.to_string() != peer {
+            return Err(serde_json::json!({
+                "status": "error",
+                "code": "noncanonical_peer",
+                "message": "every peer must use the canonical EndpointId representation"
+            }));
+        }
+        if parsed.contains(&endpoint_id) {
+            return Err(serde_json::json!({
+                "status": "error",
+                "code": "duplicate_peer",
+                "message": "peers must not contain duplicates"
+            }));
+        }
+        parsed.push(endpoint_id);
+    }
+    Ok((request.topic, parsed))
+}
+
 async fn connect_ticket_endpoints(
     endpoint: &Endpoint,
     gossip: &Gossip,
@@ -355,6 +575,13 @@ pub fn did_to_public_key(did: &str) -> Option<iroh::PublicKey> {
     }
     let key_bytes: [u8; 32] = bytes[2..34].try_into().ok()?;
     iroh::PublicKey::from_bytes(&key_bytes).ok()
+}
+
+fn public_key_to_did(public_key: &iroh::PublicKey) -> String {
+    let mut bytes = Vec::with_capacity(34);
+    bytes.extend_from_slice(&[0xed, 0x01]);
+    bytes.extend_from_slice(public_key.as_bytes());
+    format!("did:key:z{}", bs58::encode(bytes).into_string())
 }
 
 pub fn decode_ticket_endpoints(ticket: &str) -> Vec<iroh::EndpointAddr> {
@@ -416,7 +643,7 @@ fn is_trusted_source_runtime(data_dir: &std::path::Path) -> bool {
         || publisher_artifacts_path(data_dir).exists()
 }
 
-fn register_topic_state(
+async fn register_topic_state(
     state: &mut GossipState,
     topic_name: &str,
     sender: distributed_topic_tracker::GossipSender,
@@ -429,7 +656,64 @@ fn register_topic_state(
         .insert(topic_name.to_string(), receiver_task)
     {
         existing.abort();
+        let _ = existing.await;
     }
+}
+
+async fn join_gossip_topic_direct(
+    state: &mut GossipState,
+    topic_name: &str,
+    bootstrap_peers: Vec<iroh::EndpointId>,
+) -> Result<()> {
+    #[cfg(test)]
+    {
+        state.last_direct_join_peers = Some(bootstrap_peers.clone());
+    }
+    let topic = topic_hash(topic_name);
+    if bootstrap_peers.is_empty() {
+        info!(
+            "carrier: gossip_join '{}' direct mode with 0 bootstrap peer(s)",
+            topic_name
+        );
+    } else {
+        info!(
+            "carrier: gossip_join '{}' with {} bootstrap peer(s)",
+            topic_name,
+            bootstrap_peers.len()
+        );
+    }
+    let joined = state
+        .gossip
+        .subscribe_with_opts(
+            topic,
+            iroh_gossip::api::JoinOptions::with_bootstrap(bootstrap_peers),
+        )
+        .await?;
+    let (iroh_sender, iroh_receiver) = joined.split();
+    let dtt_sender =
+        distributed_topic_tracker::GossipSender::new(iroh_sender, TimeoutConfig::default());
+    state
+        .buffers
+        .lock()
+        .await
+        .entry(topic_name.to_string())
+        .or_default();
+    let buffers = state.buffers.clone();
+    let peers = state.peers.clone();
+    let topic_peers = state.topic_peers.clone();
+    let topic_key = topic_name.to_string();
+    let receiver_task = tokio::spawn(async move {
+        recv_loop(
+            CarrierGossipReceiver::Direct(iroh_receiver),
+            buffers,
+            peers,
+            topic_peers,
+            topic_key,
+        )
+        .await;
+    });
+    register_topic_state(state, topic_name, dtt_sender, receiver_task).await;
+    Ok(())
 }
 
 async fn join_gossip_topic(
@@ -439,54 +723,7 @@ async fn join_gossip_topic(
 ) -> Result<()> {
     let bootstrap_peers = state.bootstrap_peers.clone();
     if force_direct {
-        let topic = topic_hash(topic_name);
-        if bootstrap_peers.is_empty() {
-            info!(
-                "carrier: gossip_join '{}' direct mode with 0 bootstrap peer(s)",
-                topic_name
-            );
-        } else {
-            info!(
-                "carrier: gossip_join '{}' with {} bootstrap peer(s)",
-                topic_name,
-                bootstrap_peers.len()
-            );
-        }
-        let joined = state
-            .gossip
-            .subscribe_with_opts(
-                topic,
-                iroh_gossip::api::JoinOptions::with_bootstrap(bootstrap_peers),
-            )
-            .await?;
-        let (iroh_sender, iroh_receiver) = joined.split();
-        let dtt_sender =
-            distributed_topic_tracker::GossipSender::new(iroh_sender, state.gossip.clone());
-        state
-            .buffers
-            .lock()
-            .await
-            .entry(topic_name.to_string())
-            .or_insert_with(|| TopicBuffer {
-                messages: VecDeque::new(),
-                base_index: 0,
-            });
-        let buffers = state.buffers.clone();
-        let peers = state.peers.clone();
-        let topic_peers = state.topic_peers.clone();
-        let topic_key = topic_name.to_string();
-        let receiver_task = tokio::spawn(async move {
-            recv_loop(
-                CarrierGossipReceiver::Direct(iroh_receiver),
-                buffers,
-                peers,
-                topic_peers,
-                topic_key,
-            )
-            .await;
-        });
-        register_topic_state(state, topic_name, dtt_sender, receiver_task);
-        return Ok(());
+        return join_gossip_topic_direct(state, topic_name, bootstrap_peers).await;
     }
 
     let sk_bytes = match &state.signing_key {
@@ -497,10 +734,10 @@ async fn join_gossip_topic(
     let topic_id = TopicId::new(topic_name.to_string());
     let record_publisher = RecordPublisher::new(
         topic_id,
-        dtt_sk.verifying_key(),
         dtt_sk,
         None,
         TOPIC_DISCOVERY_SECRET.to_vec(),
+        TopicTrackerConfig::default(),
     );
     info!(
         "carrier: gossip_join '{}' via DHT auto-discovery ({} connected bootstrap peer(s))",
@@ -517,10 +754,7 @@ async fn join_gossip_topic(
         .lock()
         .await
         .entry(topic_name.to_string())
-        .or_insert_with(|| TopicBuffer {
-            messages: VecDeque::new(),
-            base_index: 0,
-        });
+        .or_default();
     let buffers = state.buffers.clone();
     let peers = state.peers.clone();
     let topic_peers = state.topic_peers.clone();
@@ -535,7 +769,7 @@ async fn join_gossip_topic(
         )
         .await;
     });
-    register_topic_state(state, topic_name, sender, receiver_task);
+    register_topic_state(state, topic_name, sender, receiver_task).await;
     Ok(())
 }
 
@@ -590,15 +824,12 @@ pub async fn start_carrier_node_with_registry(
 ) -> Result<CarrierNode> {
     let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
 
-    // Build endpoint. Uses iroh default relays unless ELASTOS_RELAY_URL is set.
-    // Don't override address_lookup — the default includes pkarr for DHT discovery.
-    let mut builder = Endpoint::builder().secret_key(secret_key.clone());
+    // Build an endpoint with Iroh's N0 DNS and relay services unless a custom
+    // relay is configured. Topic discovery remains the tracker's DHT layer.
+    let mut builder = Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret_key.clone());
     if let Ok(relay_url) = std::env::var("ELASTOS_RELAY_URL") {
         if let Ok(url) = relay_url.parse::<url::Url>() {
-            let config = iroh::RelayConfig {
-                url: url.into(),
-                quic: Some(Default::default()),
-            };
+            let config = iroh::RelayConfig::new(url.into(), Some(Default::default()));
             builder =
                 builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from_iter([config])));
             info!("carrier: using custom relay {}", relay_url);
@@ -610,23 +841,26 @@ pub async fn start_carrier_node_with_registry(
     {
         Ok(builder) => match builder.bind().await {
             Ok(ep) => ep,
-            Err(_) => Endpoint::builder()
+            Err(_) => Endpoint::builder(iroh::endpoint::presets::N0)
                 .secret_key(secret_key)
                 .bind()
                 .await
                 .context("Failed to bind Carrier endpoint")?,
         },
-        Err(_) => Endpoint::builder()
+        Err(_) => Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
             .bind()
             .await
             .context("Failed to bind Carrier endpoint")?,
     };
 
-    // Add mDNS for LAN discovery (supplements the default pkarr/DNS).
+    // Add mDNS for LAN discovery alongside the N0 preset lookup services.
     if carrier_mdns_enabled() {
-        if let Ok(mdns) = iroh::address_lookup::MdnsAddressLookup::builder().build(endpoint.id()) {
-            endpoint.address_lookup().add(mdns);
+        if let Ok(mdns) = MdnsAddressLookup::builder().build(endpoint.id()) {
+            endpoint
+                .address_lookup()
+                .context("Carrier endpoint closed before mDNS setup")?
+                .add(mdns);
         }
     } else {
         info!("carrier: mDNS discovery disabled by ELASTOS_CARRIER_MDNS");
@@ -634,9 +868,12 @@ pub async fn start_carrier_node_with_registry(
 
     // Add MemoryLookup for explicit peer addresses (--connect tickets)
     let memory_lookup = MemoryLookup::new();
-    endpoint.address_lookup().add(memory_lookup.clone());
+    endpoint
+        .address_lookup()
+        .context("Carrier endpoint closed before address lookup setup")?
+        .add(memory_lookup.clone());
 
-    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let gossip = spawn_carrier_gossip(&endpoint);
 
     let gossip_state = Arc::new(Mutex::new(GossipState::new(
         endpoint.clone(),
@@ -697,18 +934,19 @@ pub async fn start_carrier_node_with_registry(
 
     if is_trusted_source_runtime(&data_dir) {
         let mut state = gossip_state.lock().await;
-        for topic in [CHAT_DISCOVERY_TOPIC_GENERAL, CHAT_ROOM_SYNC_TOPIC] {
-            match join_gossip_topic(&mut state, topic, true).await {
-                Ok(()) => {
-                    info!("carrier: trusted source discovery topic '{}' ready", topic);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "carrier: failed to join trusted source discovery topic '{}': {}",
-                        topic,
-                        err
-                    );
-                }
+        match join_gossip_topic(&mut state, CHAT_DISCOVERY_TOPIC_GENERAL, true).await {
+            Ok(()) => {
+                info!(
+                    "carrier: trusted source discovery topic '{}' ready",
+                    CHAT_DISCOVERY_TOPIC_GENERAL
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "carrier: failed to join trusted source discovery topic '{}': {}",
+                    CHAT_DISCOVERY_TOPIC_GENERAL,
+                    err
+                );
             }
         }
     }
@@ -773,6 +1011,7 @@ async fn handle_file_connection(
     provider_registry: Option<Weak<ProviderRegistry>>,
     gossip_state: Arc<Mutex<GossipState>>,
 ) -> Result<()> {
+    let source_endpoint_id = conn.remote_id();
     loop {
         let (mut send, recv) = match conn.accept_bi().await {
             Ok(streams) => streams,
@@ -782,9 +1021,15 @@ async fn handle_file_connection(
         let provider_registry = provider_registry.clone();
         let gossip_state = gossip_state.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_file_stream(&mut send, recv, &data_dir, provider_registry, gossip_state)
-                    .await
+            if let Err(e) = handle_file_stream(
+                &mut send,
+                recv,
+                &data_dir,
+                provider_registry,
+                gossip_state,
+                source_endpoint_id,
+            )
+            .await
             {
                 debug!("carrier file stream error: {:#}", e);
             }
@@ -799,6 +1044,7 @@ async fn handle_file_stream(
     data_dir: &std::path::Path,
     provider_registry: Option<Weak<ProviderRegistry>>,
     gossip_state: Arc<Mutex<GossipState>>,
+    source_endpoint_id: iroh::PublicKey,
 ) -> Result<()> {
     let mut reader = BufReader::new(recv);
     let mut line = String::new();
@@ -948,7 +1194,8 @@ async fn handle_file_stream(
                 .await?;
                 return Ok(());
             };
-            let response = carrier_provider_invoke_registry(&registry, &msg.data).await?;
+            let response =
+                carrier_provider_invoke_registry(&registry, &msg.data, &source_endpoint_id).await?;
             send_json(send, &response).await?;
         }
         "browser_exit_stream" => {
@@ -1036,17 +1283,23 @@ fn validate_carrier_gossip_topic(topic: &str) -> std::result::Result<(), String>
 
 fn carrier_gossip_message_from_value(
     value: &serde_json::Value,
-) -> std::result::Result<GossipMessage, String> {
+) -> std::result::Result<GossipMessage, (&'static str, String)> {
     let encoded =
-        serde_json::to_vec(value).map_err(|err| format!("message encoding failed: {err}"))?;
-    if encoded.len() > GOSSIP_CARRIER_PUSH_MAX_MESSAGE_BYTES {
-        return Err("message too large".to_string());
+        serde_json::to_vec(value).map_err(|err| ("message_encoding_failed", err.to_string()))?;
+    if encoded.len() > GOSSIP_WIRE_MESSAGE_MAX_BYTES {
+        return Err((
+            "message_too_large",
+            "complete gossip message exceeds wire limit".to_string(),
+        ));
     }
     let message: GossipMessage = serde_json::from_value(value.clone())
-        .map_err(|err| format!("invalid gossip message: {err}"))?;
-    if message.content.len() > GOSSIP_CARRIER_PUSH_MAX_MESSAGE_BYTES {
-        return Err("message content too large".to_string());
-    }
+        .map_err(|err| ("invalid_message", format!("invalid gossip message: {err}")))?;
+    serialize_gossip_wire_message(&message).map_err(|_| {
+        (
+            "message_too_large",
+            "complete gossip message exceeds wire limit".to_string(),
+        )
+    })?;
     Ok(message)
 }
 
@@ -1067,7 +1320,9 @@ async fn carrier_gossip_push(
     };
     let message = match carrier_gossip_message_from_value(message_value) {
         Ok(message) => message,
-        Err(error) => return serde_json::json!({ "ok": false, "error": error }),
+        Err((code, error)) => {
+            return serde_json::json!({ "ok": false, "code": code, "error": error })
+        }
     };
 
     let buffers = {
@@ -1076,12 +1331,7 @@ async fn carrier_gossip_push(
     };
     let inserted = {
         let mut buffers = buffers.lock().await;
-        let buffer = buffers
-            .entry(topic.to_string())
-            .or_insert_with(|| TopicBuffer {
-                messages: VecDeque::new(),
-                base_index: 0,
-            });
+        let buffer = buffers.entry(topic.to_string()).or_default();
         push_gossip_buffer_message(buffer, message)
     };
     serde_json::json!({
@@ -1335,6 +1585,7 @@ async fn bridge_browser_carrier_stream_to_relay(
 async fn carrier_provider_invoke_registry(
     registry: &ProviderRegistry,
     data: &serde_json::Value,
+    source_endpoint_id: &iroh::PublicKey,
 ) -> Result<serde_json::Value> {
     let source = data
         .get("source")
@@ -1355,7 +1606,7 @@ async fn carrier_provider_invoke_registry(
         .get("transfer")
         .and_then(|value| value.as_str())
         .unwrap_or("json");
-    let request = data
+    let mut request = data
         .get("request")
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("provider_invoke missing request"))?;
@@ -1377,6 +1628,17 @@ async fn carrier_provider_invoke_registry(
         }));
     }
 
+    let runtime = request
+        .get_mut("_runtime_invocation")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("validated provider invocation has Runtime metadata");
+    runtime.insert(
+        "carrier".to_string(),
+        serde_json::json!({
+            "source_endpoint_did": public_key_to_did(source_endpoint_id),
+        }),
+    );
+
     match registry.send_raw(target, &request).await {
         Ok(result) => Ok(serde_json::json!({
             "ok": true,
@@ -1393,7 +1655,15 @@ async fn carrier_provider_invoke_registry(
 fn carrier_provider_target_allowed(target: &str) -> bool {
     matches!(
         target,
-        "content" | "availability" | "rights" | "key" | "decrypt" | "drm"
+        "content"
+            | "availability"
+            | "rights"
+            | "key"
+            | "decrypt"
+            | "drm"
+            | "collaboration"
+            | "collaboration-direct"
+            | "collaboration-profile"
     )
 }
 
@@ -1447,18 +1717,9 @@ fn validate_carrier_provider_invocation(
     }
     let carrier = runtime
         .get("carrier")
-        .and_then(|value| value.as_object())
-        .ok_or_else(|| "provider_invoke requires carrier route metadata".to_string())?;
-    if carrier
-        .get("route")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default()
-        != "connect_ticket"
-    {
-        return Err("provider_invoke carrier route must be connect_ticket".to_string());
-    }
-    if carrier.contains_key("connect_ticket") {
-        return Err("provider_invoke carrier metadata must not expose connect_ticket".to_string());
+        .ok_or_else(|| "provider_invoke requires carrier metadata".to_string())?;
+    if !carrier.is_null() {
+        return Err("provider_invoke carrier metadata must be null".to_string());
     }
     if transfer == "stream" {
         validate_carrier_provider_stream_contract(runtime)?;
@@ -2645,6 +2906,11 @@ impl CarrierAvailabilityProvider {
                 .and_then(|value| value.as_str())
                 .map(str::to_string),
         };
+        let bytes = serialize_gossip_wire_message(&msg).map_err(|encoded_bytes| {
+            ProviderError::Provider(format!(
+                "Carrier availability gossip message too large: {encoded_bytes} bytes"
+            ))
+        })?;
 
         {
             let mut buffers = state.buffers.lock().await;
@@ -2655,7 +2921,6 @@ impl CarrierAvailabilityProvider {
 
         let delivery = match state.senders.get(&topic_name) {
             Some(sender) => {
-                let bytes = serde_json::to_vec(&msg).unwrap_or_default();
                 match tokio::time::timeout(GOSSIP_SEND_TIMEOUT, sender.broadcast(bytes)).await {
                     Err(_) => {
                         tracing::debug!("Carrier availability broadcast timed out");
@@ -2918,7 +3183,7 @@ async fn fetch_content_via_carrier_provider_invocation(
             transfer: ProviderTransfer::Stream,
             range: None,
             progress: None,
-            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute {
+            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::ConnectTicket {
                 connect_ticket: ticket.to_string(),
                 peer_did: None,
                 timeout_ms: Some(5_000),
@@ -2946,7 +3211,7 @@ async fn ensure_content_via_carrier_provider_invocation(
     source_request: &serde_json::Value,
 ) -> Result<CarrierReplicationProof> {
     validate_content_cid(cid).map_err(anyhow::Error::msg)?;
-    let route = ProviderCarrierRoute {
+    let route = ProviderCarrierRoute::ConnectTicket {
         connect_ticket: replica.connect_ticket.clone(),
         peer_did: Some(replica.node_did.clone()),
         timeout_ms: Some(5_000),
@@ -3833,7 +4098,7 @@ async fn import_ipld_dag_content_via_carrier_block_graph_provider(
     ensure_provider_ok(&export_response, "local block-graph export")?;
     let graph = exported_block_graph(&export_response, cid)?;
 
-    let route = ProviderCarrierRoute {
+    let route = ProviderCarrierRoute::ConnectTicket {
         connect_ticket: replica.connect_ticket.clone(),
         peer_did: Some(replica.node_did.clone()),
         timeout_ms: Some(5_000),
@@ -3870,7 +4135,7 @@ async fn import_ipld_dag_content_via_carrier_block_graph_provider(
         "availability_requirements": requirements.to_json(),
     });
     copy_optional_content_identity(source_request, &mut ensure_request);
-    let route = ProviderCarrierRoute {
+    let route = ProviderCarrierRoute::ConnectTicket {
         connect_ticket: replica.connect_ticket.clone(),
         peer_did: Some(replica.node_did.clone()),
         timeout_ms: Some(5_000),
@@ -4074,7 +4339,7 @@ async fn import_object_content_via_carrier_provider_invocation(
             transfer: ProviderTransfer::Json,
             range: None,
             progress: None,
-            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute {
+            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::ConnectTicket {
                 connect_ticket: replica.connect_ticket.clone(),
                 peer_did: Some(replica.node_did.clone()),
                 timeout_ms: Some(5_000),
@@ -4160,7 +4425,7 @@ async fn import_exact_content_via_carrier_provider_invocation(
             transfer: ProviderTransfer::Json,
             range: None,
             progress: None,
-            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute {
+            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::ConnectTicket {
                 connect_ticket: replica.connect_ticket.clone(),
                 peer_did: Some(replica.node_did.clone()),
                 timeout_ms: Some(5_000),
@@ -4911,6 +5176,188 @@ fn content_availability_fetch_tickets(messages: &[GossipMessage], cid: &str) -> 
         .collect()
 }
 
+fn gossip_cursor_error(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({"status":"error","code":code,"message":message})
+}
+
+fn parse_gossip_cursor_identity(
+    request: &serde_json::Value,
+) -> std::result::Result<(String, String), serde_json::Value> {
+    let topic = request
+        .get("topic")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| gossip_cursor_error("invalid_topic", "topic must be a string"))?;
+    if topic != topic.trim()
+        || topic.chars().any(char::is_control)
+        || validate_carrier_gossip_topic(topic).is_err()
+    {
+        return Err(gossip_cursor_error(
+            "invalid_topic",
+            "topic must be non-empty, canonical, and within the topic bound",
+        ));
+    }
+
+    let consumer_id = request
+        .get("consumer_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            gossip_cursor_error("invalid_consumer_id", "consumer_id must be a string")
+        })?;
+    if consumer_id.is_empty()
+        || consumer_id != consumer_id.trim()
+        || consumer_id.len() > GOSSIP_CURSOR_MAX_CONSUMER_ID_BYTES
+        || consumer_id.chars().any(char::is_control)
+    {
+        return Err(gossip_cursor_error(
+            "invalid_consumer_id",
+            "consumer_id must be non-empty, canonical, and within the consumer bound",
+        ));
+    }
+
+    Ok((topic.to_string(), consumer_id.to_string()))
+}
+
+fn parse_gossip_peek_limit(
+    request: &serde_json::Value,
+) -> std::result::Result<usize, serde_json::Value> {
+    let limit = request
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| gossip_cursor_error("invalid_limit", "limit must be an integer"))?;
+    if limit == 0 || limit > GOSSIP_PEEK_MAX_MESSAGES as u64 {
+        return Err(gossip_cursor_error(
+            "invalid_limit",
+            "limit must be within the bounded gossip peek range",
+        ));
+    }
+    Ok(limit as usize)
+}
+
+fn parse_gossip_ack_range(
+    request: &serde_json::Value,
+) -> std::result::Result<GossipCursorRange, serde_json::Value> {
+    let cursor = request
+        .get("cursor")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| gossip_cursor_error("invalid_cursor", "cursor must be an integer"))?;
+    let next_cursor = request
+        .get("next_cursor")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            gossip_cursor_error("invalid_next_cursor", "next_cursor must be an integer")
+        })?;
+    Ok(GossipCursorRange {
+        cursor,
+        next_cursor,
+    })
+}
+
+fn evict_gossip_cursors_for_new_consumer(
+    cursors: &mut HashMap<(String, String), GossipConsumerCursor>,
+    cursor_key: &(String, String),
+) {
+    if !cursors.contains_key(cursor_key) && cursors.len() >= MAX_CURSORS {
+        let to_remove = cursors
+            .keys()
+            .take(MAX_CURSORS / 10)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in to_remove {
+            cursors.remove(&key);
+        }
+    }
+}
+
+struct BoundedJsonByteCounter {
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl std::io::Write for BoundedJsonByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(next) = self.bytes.checked_add(bytes.len()) else {
+            return Err(std::io::Error::other("JSON byte count overflow"));
+        };
+        if next > self.max_bytes {
+            return Err(std::io::Error::other("JSON byte limit exceeded"));
+        }
+        self.bytes = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn gossip_peek_response(
+    cursor: u64,
+    next_cursor: u64,
+    messages: &[&GossipMessage],
+    limit: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status":"ok",
+        "data":{
+            "cursor": cursor,
+            "next_cursor": next_cursor,
+            "messages": messages,
+            "scanned": messages.len(),
+            "limit": limit
+        }
+    })
+}
+
+fn gossip_peek_response_envelope_max_bytes() -> usize {
+    let response = gossip_peek_response(u64::MAX, u64::MAX, &[], usize::MAX);
+    let mut counter = BoundedJsonByteCounter {
+        bytes: 0,
+        max_bytes: usize::MAX,
+    };
+    if serde_json::to_writer(&mut counter, &response).is_err() {
+        return GOSSIP_PEEK_MAX_BATCH_BYTES;
+    }
+    counter.bytes.saturating_sub(2) // Exclude the empty messages array itself.
+}
+
+fn bounded_gossip_peek_prefix<'a>(
+    messages: impl Iterator<Item = &'a GossipMessage>,
+    limit: usize,
+) -> std::result::Result<Vec<&'a GossipMessage>, ()> {
+    let mut selected = Vec::with_capacity(limit);
+    let Some(encoded_messages_limit) =
+        GOSSIP_PEEK_MAX_BATCH_BYTES.checked_sub(gossip_peek_response_envelope_max_bytes())
+    else {
+        return Err(());
+    };
+    let mut encoded_batch_bytes = 2_usize; // JSON array brackets.
+    for message in messages.take(limit) {
+        let separator_bytes = usize::from(!selected.is_empty());
+        let Some(message_limit) = encoded_messages_limit
+            .checked_sub(encoded_batch_bytes)
+            .and_then(|remaining| remaining.checked_sub(separator_bytes))
+        else {
+            if selected.is_empty() {
+                return Err(());
+            }
+            break;
+        };
+        let mut counter = BoundedJsonByteCounter {
+            bytes: 0,
+            max_bytes: message_limit,
+        };
+        if serde_json::to_writer(&mut counter, message).is_err() {
+            if selected.is_empty() {
+                return Err(());
+            }
+            break;
+        }
+        encoded_batch_bytes += separator_bytes + counter.bytes;
+        selected.push(message);
+    }
+    Ok(selected)
+}
+
 // ── Gossip Provider (implements Provider trait) ──────────────────
 
 /// In-process gossip provider for `elastos://peer/*`.
@@ -4993,6 +5440,30 @@ impl Provider for CarrierGossipProvider {
                 }
             }
 
+            "gossip_join_exact" => {
+                let (topic_name, exact_peers) = match parse_gossip_join_exact_request(request) {
+                    Ok(parsed) => parsed,
+                    Err(error) => return Ok(error),
+                };
+                if state.joined_topics.contains(&topic_name) {
+                    return Ok(
+                        serde_json::json!({"status":"error","code":"already_joined","message":"already joined"}),
+                    );
+                }
+                if state.joined_topics.len() >= MAX_TOPICS {
+                    return Ok(
+                        serde_json::json!({"status":"error","code":"too_many_topics","message":"topic limit reached"}),
+                    );
+                }
+
+                match join_gossip_topic_direct(&mut state, &topic_name, exact_peers).await {
+                    Ok(()) => Ok(serde_json::json!({"status":"ok","data":{"topic": topic_name}})),
+                    Err(err) => Ok(
+                        serde_json::json!({"status":"error","code":"join_failed","message": err.to_string()}),
+                    ),
+                }
+            }
+
             "gossip_leave" => {
                 let topic_name = request["topic"].as_str().unwrap_or_default();
                 if topic_name.is_empty() {
@@ -5011,6 +5482,7 @@ impl Provider for CarrierGossipProvider {
                 }
                 if let Some(task) = removed_task {
                     task.abort();
+                    let _ = task.await;
                 }
 
                 state
@@ -5061,6 +5533,16 @@ impl Provider for CarrierGossipProvider {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                 };
+                let bytes = match serialize_gossip_wire_message(&msg) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return Ok(serde_json::json!({
+                            "status":"error",
+                            "code":"message_too_large",
+                            "message":"complete gossip message exceeds wire limit"
+                        }))
+                    }
+                };
 
                 // Insert into local buffer so other local clients (native chat,
                 // WASM bridge, microVM bridge) on the same runtime see the message.
@@ -5078,7 +5560,6 @@ impl Provider for CarrierGossipProvider {
                     .get(topic_name)
                     .map(|peers| peers.len())
                     .unwrap_or_default();
-                let bytes = serde_json::to_vec(&msg).unwrap_or_default();
                 match tokio::time::timeout(GOSSIP_SEND_TIMEOUT, sender.broadcast(bytes)).await {
                     Ok(Ok(_)) if remote_peer_count > 0 => Ok(serde_json::json!({
                         "status":"ok",
@@ -5109,6 +5590,209 @@ impl Provider for CarrierGossipProvider {
                         }))
                     }
                 }
+            }
+
+            "gossip_peek" => {
+                let (topic_name, consumer_id) = match parse_gossip_cursor_identity(request) {
+                    Ok(identity) => identity,
+                    Err(error) => return Ok(error),
+                };
+                let limit = match parse_gossip_peek_limit(request) {
+                    Ok(limit) => limit,
+                    Err(error) => return Ok(error),
+                };
+                if !state.joined_topics.contains(&topic_name) {
+                    return Ok(gossip_cursor_error(
+                        "not_joined",
+                        "gossip topic is not joined",
+                    ));
+                }
+
+                let buffers = state.buffers.lock().await;
+                let Some(buffer) = buffers.get(&topic_name) else {
+                    return Ok(gossip_cursor_error(
+                        "missing_topic_buffer",
+                        "joined gossip topic has no buffer",
+                    ));
+                };
+                let Some(buffer_tail) = buffer.base_index.checked_add(buffer.messages.len() as u64)
+                else {
+                    return Ok(gossip_cursor_error(
+                        "invalid_topic_buffer",
+                        "gossip topic buffer cursor overflow",
+                    ));
+                };
+
+                let mut cursors = state.cursors.lock().await;
+                let cursor_key = (topic_name, consumer_id);
+                evict_gossip_cursors_for_new_consumer(&mut cursors, &cursor_key);
+                let cursor = cursors
+                    .entry(cursor_key)
+                    .or_insert_with(|| GossipConsumerCursor::at(buffer.base_index));
+                cursor.normalize_to(buffer.base_index);
+                if cursor.position > buffer_tail {
+                    return Ok(gossip_cursor_error(
+                        "invalid_cursor_state",
+                        "consumer cursor is beyond the gossip buffer tail",
+                    ));
+                }
+
+                let start = (cursor.position - buffer.base_index) as usize;
+                let outstanding = cursor.outstanding_peek;
+                let batch_limit = match outstanding {
+                    Some(peek) if peek.limit != limit => {
+                        return Ok(gossip_cursor_error(
+                            "peek_limit_conflict",
+                            "retry limit must match the outstanding gossip peek limit",
+                        ))
+                    }
+                    Some(peek)
+                        if peek.range.cursor == cursor.position
+                            && peek.range.next_cursor >= peek.range.cursor
+                            && peek.range.next_cursor <= buffer_tail =>
+                    {
+                        (peek.range.next_cursor - peek.range.cursor) as usize
+                    }
+                    Some(_) => {
+                        return Ok(gossip_cursor_error(
+                            "invalid_cursor_state",
+                            "outstanding gossip peek range is inconsistent with the buffer",
+                        ))
+                    }
+                    None => limit,
+                };
+                let messages = match bounded_gossip_peek_prefix(
+                    buffer.messages.iter().skip(start),
+                    batch_limit,
+                ) {
+                    Ok(messages) => messages,
+                    Err(()) => {
+                        return Ok(gossip_cursor_error(
+                            "peek_frame_too_large",
+                            "first retained gossip frame exceeds the encoded batch byte limit",
+                        ))
+                    }
+                };
+                let scanned = messages.len();
+                if outstanding.is_some() && scanned != batch_limit {
+                    return Ok(gossip_cursor_error(
+                        "invalid_cursor_state",
+                        "outstanding gossip peek range is no longer fully retained",
+                    ));
+                }
+                let next_cursor = cursor.position + scanned as u64;
+                cursor.outstanding_peek = Some(OutstandingGossipPeek {
+                    range: GossipCursorRange {
+                        cursor: cursor.position,
+                        next_cursor,
+                    },
+                    limit,
+                });
+
+                Ok(gossip_peek_response(
+                    cursor.position,
+                    next_cursor,
+                    &messages,
+                    limit,
+                ))
+            }
+
+            "gossip_ack" => {
+                let (topic_name, consumer_id) = match parse_gossip_cursor_identity(request) {
+                    Ok(identity) => identity,
+                    Err(error) => return Ok(error),
+                };
+                let acknowledged = match parse_gossip_ack_range(request) {
+                    Ok(range) => range,
+                    Err(error) => return Ok(error),
+                };
+                if !state.joined_topics.contains(&topic_name) {
+                    return Ok(gossip_cursor_error(
+                        "not_joined",
+                        "gossip topic is not joined",
+                    ));
+                }
+
+                let buffers = state.buffers.lock().await;
+                let Some(buffer) = buffers.get(&topic_name) else {
+                    return Ok(gossip_cursor_error(
+                        "missing_topic_buffer",
+                        "joined gossip topic has no buffer",
+                    ));
+                };
+                let Some(buffer_tail) = buffer.base_index.checked_add(buffer.messages.len() as u64)
+                else {
+                    return Ok(gossip_cursor_error(
+                        "invalid_topic_buffer",
+                        "gossip topic buffer cursor overflow",
+                    ));
+                };
+                if acknowledged.next_cursor < acknowledged.cursor {
+                    return Ok(gossip_cursor_error(
+                        "backward_ack",
+                        "next_cursor must not precede cursor",
+                    ));
+                }
+                if acknowledged.next_cursor > buffer_tail {
+                    return Ok(gossip_cursor_error(
+                        "ack_beyond_tail",
+                        "next_cursor exceeds the current gossip buffer tail",
+                    ));
+                }
+
+                let mut cursors = state.cursors.lock().await;
+                let cursor_key = (topic_name, consumer_id);
+                let Some(cursor) = cursors.get_mut(&cursor_key) else {
+                    return Ok(gossip_cursor_error(
+                        "unknown_cursor",
+                        "gossip acknowledgement requires an existing consumer cursor",
+                    ));
+                };
+                let acknowledges_current_peek =
+                    cursor.outstanding_peek.map(|peek| peek.range) == Some(acknowledged);
+                if !acknowledges_current_peek && cursor.last_acknowledged == Some(acknowledged) {
+                    return Ok(serde_json::json!({
+                        "status":"ok",
+                        "data":{
+                            "cursor": acknowledged.cursor,
+                            "next_cursor": acknowledged.next_cursor,
+                            "advanced": false
+                        }
+                    }));
+                }
+                cursor.normalize_to(buffer.base_index);
+                if cursor.position > buffer_tail {
+                    return Ok(gossip_cursor_error(
+                        "invalid_cursor_state",
+                        "consumer cursor is beyond the gossip buffer tail",
+                    ));
+                }
+                if acknowledged.cursor != cursor.position {
+                    return Ok(gossip_cursor_error(
+                        "cursor_conflict",
+                        "acknowledgement cursor does not match the current consumer cursor",
+                    ));
+                }
+                if cursor.outstanding_peek.map(|peek| peek.range) != Some(acknowledged) {
+                    return Ok(gossip_cursor_error(
+                        "unobserved_ack_range",
+                        "acknowledgement must match the exact outstanding gossip peek range",
+                    ));
+                }
+
+                let advanced = acknowledged.next_cursor > acknowledged.cursor;
+                cursor.position = acknowledged.next_cursor;
+                cursor.outstanding_peek = None;
+                cursor.last_acknowledged = Some(acknowledged);
+
+                Ok(serde_json::json!({
+                    "status":"ok",
+                    "data":{
+                        "cursor": acknowledged.cursor,
+                        "next_cursor": acknowledged.next_cursor,
+                        "advanced": advanced
+                    }
+                }))
             }
 
             "gossip_recv" => {
@@ -5150,10 +5834,12 @@ impl Provider for CarrierGossipProvider {
                     }
                 }
                 let cursor_key = (topic_name.to_string(), consumer_id);
-                let cursor = cursors.entry(cursor_key).or_insert(buf.base_index);
+                let cursor = cursors
+                    .entry(cursor_key)
+                    .or_insert_with(|| GossipConsumerCursor::at(buf.base_index));
 
-                let start = if *cursor >= buf.base_index {
-                    (*cursor - buf.base_index) as usize
+                let start = if cursor.position >= buf.base_index {
+                    (cursor.position - buf.base_index) as usize
                 } else {
                     0
                 };
@@ -5170,7 +5856,9 @@ impl Provider for CarrierGossipProvider {
                 };
 
                 let next_cursor = buf.base_index + start as u64 + count as u64;
-                *cursor = next_cursor;
+                cursor.position = next_cursor;
+                cursor.outstanding_peek = None;
+                cursor.last_acknowledged = None;
 
                 Ok(serde_json::json!({
                     "status":"ok",
@@ -5349,11 +6037,18 @@ async fn handle_gossip_event(
 ) {
     match event {
         iroh_gossip::api::Event::Received(msg) => {
-            if let Ok(gossip_msg) = serde_json::from_slice::<GossipMessage>(&msg.content) {
-                let mut bufs = buffers.lock().await;
-                if let Some(buf) = bufs.get_mut(topic) {
-                    push_gossip_buffer_message(buf, gossip_msg);
-                }
+            if msg.content.len() > GOSSIP_WIRE_MESSAGE_MAX_BYTES {
+                return;
+            }
+            let Ok(gossip_msg) = serde_json::from_slice::<GossipMessage>(&msg.content) else {
+                return;
+            };
+            if serialize_gossip_wire_message(&gossip_msg).is_err() {
+                return;
+            }
+            let mut bufs = buffers.lock().await;
+            if let Some(buf) = bufs.get_mut(topic) {
+                push_gossip_buffer_message(buf, gossip_msg);
             }
         }
         iroh_gossip::api::Event::NeighborUp(peer) => {
@@ -5388,12 +6083,24 @@ enum CarrierGossipReceiver {
 }
 
 impl CarrierGossipReceiver {
-    async fn next(
-        &mut self,
-    ) -> Option<std::result::Result<iroh_gossip::api::Event, iroh_gossip::api::ApiError>> {
+    async fn next(&mut self) -> anyhow::Result<Option<iroh_gossip::api::Event>> {
         match self {
-            Self::Direct(receiver) => receiver.next().await,
-            Self::Discovered(receiver) => receiver.next().await,
+            Self::Direct(receiver) => match receiver.next().await {
+                Some(Ok(event)) => Ok(Some(event)),
+                Some(Err(err)) => Err(err.into()),
+                None => Ok(None),
+            },
+            Self::Discovered(receiver) => match receiver.next().await {
+                Ok(event) => Ok(Some(event)),
+                Err(err) => {
+                    if receiver.is_joined().await.unwrap_or(false) {
+                        Err(err.into())
+                    } else {
+                        tracing::warn!("carrier discovered gossip receiver ended: {err}");
+                        Ok(None)
+                    }
+                }
+            },
         }
     }
 }
@@ -5407,14 +6114,14 @@ async fn recv_loop(
 ) {
     loop {
         match receiver.next().await {
-            Some(Ok(event)) => {
+            Ok(Some(event)) => {
                 handle_gossip_event(event, &buffers, &peers, &topic_peers, &topic).await;
             }
-            Some(Err(e)) => {
+            Err(e) => {
                 tracing::warn!("carrier recv_loop error on '{}': {}", topic, e);
                 // Continue — transient errors should not kill the receiver
             }
-            None => {
+            Ok(None) => {
                 tracing::info!("carrier recv_loop ended for '{}' (stream closed)", topic);
                 break;
             }
@@ -5424,7 +6131,20 @@ async fn recv_loop(
 
 // ── Client and provider-plane invocation ─────────────────────────
 
-pub struct CarrierProviderInvoker;
+/// Runtime-owned Carrier peer invoker.
+///
+/// Peer-DID and connect-ticket routes use the long-lived Carrier endpoint, so
+/// every invocation keeps one Runtime endpoint identity and its discovery
+/// context. A Peer-DID naming that same endpoint loops through Carrier's
+/// authenticated provider admission without opening a network connection.
+/// The registry is weak so the registry-owned invoker cannot form an ownership
+/// cycle. An invoker without the required endpoint or registry fails before a
+/// provider effect.
+#[derive(Default)]
+pub struct CarrierProviderInvoker {
+    peer_endpoint: Option<Endpoint>,
+    provider_registry: Weak<ProviderRegistry>,
+}
 
 #[derive(Debug, Clone)]
 pub struct BrowserCarrierStreamRequest {
@@ -5439,15 +6159,75 @@ pub struct BrowserCarrierStreamRequest {
     pub timeout_ms: Option<u64>,
 }
 
-impl CarrierProviderInvoker {
-    pub fn new() -> Self {
-        Self
-    }
+pub struct BrowserCarrierStream {
+    pub send: iroh::endpoint::SendStream,
+    pub recv: iroh::endpoint::RecvStream,
+    _client: CarrierClient,
 }
 
-impl Default for CarrierProviderInvoker {
-    fn default() -> Self {
-        Self::new()
+impl CarrierProviderInvoker {
+    pub fn new() -> Self {
+        Self {
+            peer_endpoint: None,
+            provider_registry: Weak::new(),
+        }
+    }
+
+    /// Binds the invoker to the long-lived Carrier endpoint that owns peer
+    /// discovery. This form can resolve foreign peer-DID routes but deliberately
+    /// has no same-endpoint dispatcher.
+    pub fn with_carrier_endpoint(endpoint: Endpoint) -> Self {
+        Self {
+            peer_endpoint: Some(endpoint),
+            provider_registry: Weak::new(),
+        }
+    }
+
+    /// Binds the Carrier endpoint and its non-owning local provider dispatcher.
+    /// Production uses this form so a same-endpoint route enters the exact same
+    /// Carrier provider admission path as a remotely received invocation.
+    pub fn with_carrier_endpoint_and_registry(
+        endpoint: Endpoint,
+        provider_registry: Weak<ProviderRegistry>,
+    ) -> Self {
+        Self {
+            peer_endpoint: Some(endpoint),
+            provider_registry,
+        }
+    }
+
+    async fn invoke_loopback_provider(
+        &self,
+        peer_endpoint: &Endpoint,
+        invocation: &ProviderInvocation,
+        request: serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, ProviderError> {
+        let registry = self.provider_registry.upgrade().ok_or_else(|| {
+            ProviderError::Unavailable(
+                "Carrier loopback provider registry is unavailable".to_string(),
+            )
+        })?;
+        let message: CarrierMessage = serde_json::from_value(carrier_provider_invoke_message(
+            invocation, request,
+        ))
+        .map_err(|err| {
+            ProviderError::Provider(format!(
+                "Carrier loopback invocation encoding failed: {err}"
+            ))
+        })?;
+        let response =
+            carrier_provider_invoke_registry(&registry, &message.data, &peer_endpoint.id())
+                .await
+                .map_err(|err| {
+                    ProviderError::Provider(format!(
+                        "Carrier loopback provider invocation failed: {err}"
+                    ))
+                })?;
+        carrier_provider_invoke_result(response).map_err(|err| {
+            ProviderError::Provider(format!(
+                "Carrier loopback provider invocation failed: {err}"
+            ))
+        })
     }
 }
 
@@ -5460,43 +6240,123 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
         request: serde_json::Value,
     ) -> std::result::Result<serde_json::Value, ProviderError> {
         let timeout_secs = carrier_route_timeout_secs(route);
-        let mut endpoints = decode_ticket_endpoints(&route.connect_ticket);
-        if let Some(peer_did) = route.peer_did.as_deref() {
-            endpoints.retain(|endpoint| carrier_endpoint_matches_peer(endpoint, peer_did));
-            if endpoints.is_empty() {
-                return Err(ProviderError::Provider(
-                    "Carrier provider invocation peer_did does not match connect_ticket"
-                        .to_string(),
-                ));
+        match route {
+            ProviderCarrierRoute::ConnectTicket {
+                connect_ticket,
+                peer_did,
+                ..
+            } => {
+                let peer_endpoint = self.peer_endpoint.as_ref().ok_or_else(|| {
+                    ProviderError::Unavailable(
+                        "Carrier peer routing is not available on this Runtime".to_string(),
+                    )
+                })?;
+                let mut endpoints = decode_ticket_endpoints(connect_ticket);
+                if let Some(peer_did) = peer_did.as_deref() {
+                    endpoints.retain(|endpoint| carrier_endpoint_matches_peer(endpoint, peer_did));
+                    if endpoints.is_empty() {
+                        return Err(ProviderError::Provider(
+                            "Carrier provider invocation peer_did does not match connect_ticket"
+                                .to_string(),
+                        ));
+                    }
+                }
+                if endpoints.is_empty() {
+                    return Err(ProviderError::Provider(
+                        "Carrier provider invocation connect_ticket has no endpoints".to_string(),
+                    ));
+                }
+                if endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.id == peer_endpoint.id())
+                {
+                    return self
+                        .invoke_loopback_provider(peer_endpoint, invocation, request)
+                        .await;
+                }
+
+                let mut errors = Vec::new();
+                for (index, endpoint) in endpoints.into_iter().enumerate() {
+                    match CarrierClient::connect_known_endpoint(
+                        peer_endpoint,
+                        endpoint,
+                        timeout_secs,
+                    )
+                    .await
+                    {
+                        Ok(client) => {
+                            match client.invoke_provider(invocation, request.clone()).await {
+                                Ok(response) => return Ok(response),
+                                Err(err) => {
+                                    errors.push(format!("ticket[{index}] invoke failed: {err}"))
+                                }
+                            }
+                        }
+                        Err(err) => errors.push(format!("ticket[{index}] connect failed: {err}")),
+                    }
+                }
+
+                Err(ProviderError::Provider(format!(
+                    "Carrier provider invocation failed: {}",
+                    errors.join(" | ")
+                )))
+            }
+            ProviderCarrierRoute::PeerDid { peer_did, .. } => {
+                let public_key = did_to_public_key(peer_did).ok_or_else(|| {
+                    ProviderError::Provider(
+                        "Carrier provider invocation peer_did is invalid".to_string(),
+                    )
+                })?;
+                // Runtime owns peer resolution. Without the long-lived Carrier
+                // endpoint there is no verified route, so report the peer as
+                // unavailable before any provider effect.
+                let peer_endpoint = self.peer_endpoint.as_ref().ok_or_else(|| {
+                    ProviderError::Unavailable(
+                        "Carrier peer routing is not available on this Runtime".to_string(),
+                    )
+                })?;
+                if public_key == peer_endpoint.id() {
+                    return self
+                        .invoke_loopback_provider(peer_endpoint, invocation, request)
+                        .await;
+                }
+                let client =
+                    CarrierClient::connect_resolved_peer(peer_endpoint, public_key, timeout_secs)
+                        .await
+                        .map_err(|err| {
+                            // Keep the cause. A message that will not send is
+                            // hard enough to diagnose without the Runtime
+                            // throwing away the reason on its way out.
+                            tracing::debug!(
+                                peer = %peer_did,
+                                error = %err,
+                                "Carrier peer connect failed"
+                            );
+                            ProviderError::Unavailable(
+                                "no verified Carrier route to the requested peer".to_string(),
+                            )
+                        })?;
+                client
+                    .invoke_provider(invocation, request)
+                    .await
+                    .map_err(|err| {
+                        tracing::debug!(
+                            peer = %peer_did,
+                            error = %err,
+                            "Carrier peer invocation failed"
+                        );
+                        ProviderError::Provider(
+                            "Carrier provider invocation peer_did route failed".to_string(),
+                        )
+                    })
             }
         }
-        if endpoints.is_empty() {
-            return Err(ProviderError::Provider(
-                "Carrier provider invocation connect_ticket has no endpoints".to_string(),
-            ));
-        }
-
-        let mut errors = Vec::new();
-        for (index, endpoint) in endpoints.into_iter().enumerate() {
-            match CarrierClient::connect_endpoint_addr(endpoint, timeout_secs).await {
-                Ok(client) => match client.invoke_provider(invocation, request.clone()).await {
-                    Ok(response) => return Ok(response),
-                    Err(err) => errors.push(format!("ticket[{index}] invoke failed: {err}")),
-                },
-                Err(err) => errors.push(format!("ticket[{index}] connect failed: {err}")),
-            }
-        }
-
-        Err(ProviderError::Provider(format!(
-            "Carrier provider invocation failed: {}",
-            errors.join(" | ")
-        )))
     }
 }
 
 pub async fn open_browser_carrier_stream(
     request: &BrowserCarrierStreamRequest,
-) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
+) -> Result<BrowserCarrierStream> {
     let timeout_ms = request.timeout_ms.unwrap_or(5_000).clamp(1, 60_000);
     let timeout_secs = timeout_ms.div_ceil(1_000);
     let mut endpoints = decode_ticket_endpoints(&request.connect_ticket);
@@ -5514,7 +6374,13 @@ pub async fn open_browser_carrier_stream(
     for (index, endpoint) in endpoints.into_iter().enumerate() {
         match CarrierClient::connect_endpoint_addr(endpoint, timeout_secs).await {
             Ok(client) => match client.open_browser_exit_stream(request).await {
-                Ok(streams) => return Ok(streams),
+                Ok((send, recv)) => {
+                    return Ok(BrowserCarrierStream {
+                        send,
+                        recv,
+                        _client: client,
+                    })
+                }
                 Err(err) => errors.push(format!("ticket[{index}] stream open failed: {err}")),
             },
             Err(err) => errors.push(format!("ticket[{index}] connect failed: {err}")),
@@ -5525,7 +6391,7 @@ pub async fn open_browser_carrier_stream(
 }
 
 fn carrier_route_timeout_secs(route: &ProviderCarrierRoute) -> u64 {
-    let timeout_ms = route.timeout_ms.unwrap_or(5_000).clamp(1, 60_000);
+    let timeout_ms = route.timeout_ms().unwrap_or(5_000).clamp(1, 60_000);
     timeout_ms.div_ceil(1_000)
 }
 
@@ -5541,7 +6407,80 @@ pub struct CarrierClient {
     _endpoint: Endpoint,
 }
 
+fn carrier_provider_invoke_message(
+    invocation: &ProviderInvocation,
+    request: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "op": "provider_invoke",
+        "source": invocation.source.as_str(),
+        "target": invocation.target.as_str(),
+        "operation": invocation.op.as_str(),
+        "transfer": invocation.transfer.as_str(),
+        "range": invocation.range.map(|range| serde_json::json!({
+            "start": range.start,
+            "end": range.end,
+        })),
+        "progress": invocation.progress.as_ref().map(|progress| serde_json::json!({
+            "request_id": progress.request_id.as_str(),
+            "expected_bytes": progress.expected_bytes,
+        })),
+        "request": request,
+    })
+}
+
+fn carrier_provider_invoke_result(response: serde_json::Value) -> Result<serde_json::Value> {
+    if response.get("ok").and_then(|value| value.as_bool()) == Some(true) {
+        return Ok(response
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null));
+    }
+    let message = response
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Carrier provider invocation failed");
+    anyhow::bail!(message.to_string())
+}
+
 impl CarrierClient {
+    /// Connects to a peer through an existing long-lived endpoint.
+    ///
+    /// The caller's endpoint owns discovery, its address book, and its relay
+    /// context, so resolution reuses warm state instead of starting from a
+    /// discovery-isolated endpoint. The accepted connection must present the
+    /// requested endpoint identity; a substituted peer is rejected before any
+    /// provider request is written.
+    pub(crate) async fn connect_resolved_peer(
+        endpoint: &Endpoint,
+        peer: iroh::PublicKey,
+        timeout_secs: u64,
+    ) -> Result<Self> {
+        Self::connect_known_endpoint(endpoint, iroh::EndpointAddr::from(peer), timeout_secs).await
+    }
+
+    pub(crate) async fn connect_known_endpoint(
+        endpoint: &Endpoint,
+        addr: iroh::EndpointAddr,
+        timeout_secs: u64,
+    ) -> Result<Self> {
+        let peer = addr.id;
+        let conn = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            endpoint.connect(addr, CARRIER_ALPN),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("connect timed out"))?
+        .context("connect failed")?;
+        if conn.remote_id() != peer {
+            anyhow::bail!("resolved Carrier endpoint identity does not match the requested peer");
+        }
+        Ok(Self {
+            conn,
+            _endpoint: endpoint.clone(),
+        })
+    }
+
     pub(crate) async fn connect_endpoint_addr(
         addr: iroh::EndpointAddr,
         timeout_secs: u64,
@@ -5549,7 +6488,7 @@ impl CarrierClient {
         let mut rng_bytes = [0u8; 32];
         getrandom::getrandom(&mut rng_bytes).map_err(|e| anyhow::anyhow!("rng: {}", e))?;
         let secret_key = SecretKey::from_bytes(&rng_bytes);
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
             .bind()
             .await
@@ -5673,22 +6612,7 @@ impl CarrierClient {
         request: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let (mut send, recv) = self.conn.open_bi().await?;
-        let msg = serde_json::json!({
-            "op": "provider_invoke",
-            "source": invocation.source.as_str(),
-            "target": invocation.target.as_str(),
-            "operation": invocation.op.as_str(),
-            "transfer": invocation.transfer.as_str(),
-            "range": invocation.range.map(|range| serde_json::json!({
-                "start": range.start,
-                "end": range.end,
-            })),
-            "progress": invocation.progress.as_ref().map(|progress| serde_json::json!({
-                "request_id": progress.request_id.as_str(),
-                "expected_bytes": progress.expected_bytes,
-            })),
-            "request": request,
-        });
+        let msg = carrier_provider_invoke_message(invocation, request);
         let mut bytes = serde_json::to_vec(&msg)?;
         bytes.push(b'\n');
         send.write_all(&bytes).await?;
@@ -5698,17 +6622,7 @@ impl CarrierClient {
         let mut line = String::new();
         reader.read_line(&mut line).await?;
         let response: serde_json::Value = serde_json::from_str(line.trim())?;
-        if response.get("ok").and_then(|value| value.as_bool()) == Some(true) {
-            return Ok(response
-                .get("result")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null));
-        }
-        let message = response
-            .get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or("Carrier provider invocation failed");
-        anyhow::bail!("{message}");
+        carrier_provider_invoke_result(response)
     }
 
     pub async fn open_browser_exit_stream(
@@ -5911,21 +6825,241 @@ mod tests {
     use super::*;
     use std::sync::{Mutex as StdMutex, OnceLock};
 
+    fn authenticated_test_source_endpoint() -> iroh::PublicKey {
+        iroh::SecretKey::from_bytes(&[42u8; 32]).public()
+    }
+
+    fn test_topic_buffer(
+        messages: impl IntoIterator<Item = GossipMessage>,
+        base_index: u64,
+    ) -> TopicBuffer {
+        let messages: VecDeque<_> = messages.into_iter().collect();
+        assert!(messages.len() <= MAX_BUFFER);
+        let retained_bytes = messages
+            .iter()
+            .map(|message| {
+                let encoded_len = gossip_message_encoded_len(message);
+                assert!(encoded_len <= GOSSIP_WIRE_MESSAGE_MAX_BYTES);
+                encoded_len
+            })
+            .sum();
+        assert!(retained_bytes <= GOSSIP_TOPIC_BUFFER_MAX_BYTES);
+        TopicBuffer {
+            messages,
+            base_index,
+            retained_bytes,
+        }
+    }
+
+    fn corrupt_test_topic_buffer(
+        messages: impl IntoIterator<Item = GossipMessage>,
+        base_index: u64,
+    ) -> TopicBuffer {
+        let messages: VecDeque<_> = messages.into_iter().collect();
+        let retained_bytes = messages.iter().map(gossip_message_encoded_len).sum();
+        TopicBuffer {
+            messages,
+            base_index,
+            retained_bytes,
+        }
+    }
+
+    fn gossip_test_message_with_encoded_len(index: u64, encoded_len: usize) -> GossipMessage {
+        let mut message = cursor_test_message(index);
+        message.content.clear();
+        let empty_len = gossip_message_encoded_len(&message);
+        assert!(encoded_len >= empty_len);
+        message.content = "x".repeat(encoded_len - empty_len);
+        assert_eq!(gossip_message_encoded_len(&message), encoded_len);
+        message
+    }
+
     fn env_lock() -> &'static StdMutex<()> {
         static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| StdMutex::new(()))
     }
 
     async fn shutdown_test_carrier_node(node: CarrierNode) {
-        {
+        let tasks = {
             let mut state = node.gossip_state.lock().await;
-            for (_, task) in state.receiver_tasks.drain() {
-                task.abort();
-            }
+            let tasks = state
+                .receiver_tasks
+                .drain()
+                .map(|(_, task)| task)
+                .collect::<Vec<_>>();
             state.senders.clear();
             state.joined_topics.clear();
+            tasks
+        };
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
         }
+        tokio::time::timeout(Duration::from_secs(5), node.gossip.shutdown())
+            .await
+            .expect("test gossip shutdown timed out")
+            .expect("test gossip shutdown failed");
         node.endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_carrier_gossip_leave_rejoin_and_shutdown_finish_receiver_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, did) = elastos_identity::derive_did(&[73u8; 32]);
+        let node = start_carrier_node(&sk, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let provider = CarrierGossipProvider::new(node.gossip_state.clone());
+        let topic = "__test/tracker-handle-teardown";
+
+        let first_join = provider
+            .send_raw(&serde_json::json!({
+                "op": "gossip_join",
+                "topic": topic,
+                "mode": "direct",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(first_join["status"], "ok");
+        let first_task = node
+            .gossip_state
+            .lock()
+            .await
+            .receiver_tasks
+            .get(topic)
+            .expect("joined topic has a receiver task")
+            .abort_handle();
+
+        let leave = provider
+            .send_raw(&serde_json::json!({"op": "gossip_leave", "topic": topic}))
+            .await
+            .unwrap();
+        assert_eq!(leave["status"], "ok");
+        assert!(first_task.is_finished());
+        {
+            let state = node.gossip_state.lock().await;
+            assert!(!state.joined_topics.contains(topic));
+            assert!(!state.senders.contains_key(topic));
+            assert!(!state.receiver_tasks.contains_key(topic));
+        }
+
+        let second_join = provider
+            .send_raw(&serde_json::json!({
+                "op": "gossip_join",
+                "topic": topic,
+                "mode": "direct",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(second_join["status"], "ok");
+        let second_task = node
+            .gossip_state
+            .lock()
+            .await
+            .receiver_tasks
+            .get(topic)
+            .expect("rejoined topic has a receiver task")
+            .abort_handle();
+
+        shutdown_test_carrier_node(node).await;
+        assert!(second_task.is_finished());
+    }
+
+    #[tokio::test]
+    async fn test_carrier_tracker_leave_rejoin_and_shutdown_finish_receiver_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, did) = elastos_identity::derive_did(&[74u8; 32]);
+        let node = start_carrier_node(&sk, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let provider = CarrierGossipProvider::new(node.gossip_state.clone());
+        let topic = "__test/tracker-auto-discovery-handle-teardown";
+
+        let first_join = provider
+            .send_raw(&serde_json::json!({"op": "gossip_join", "topic": topic}))
+            .await
+            .unwrap();
+        assert_eq!(first_join["status"], "ok");
+        let first_task = node
+            .gossip_state
+            .lock()
+            .await
+            .receiver_tasks
+            .get(topic)
+            .expect("tracked topic has a receiver task")
+            .abort_handle();
+
+        let leave = provider
+            .send_raw(&serde_json::json!({"op": "gossip_leave", "topic": topic}))
+            .await
+            .unwrap();
+        assert_eq!(leave["status"], "ok");
+        assert!(first_task.is_finished());
+
+        let second_join = provider
+            .send_raw(&serde_json::json!({"op": "gossip_join", "topic": topic}))
+            .await
+            .unwrap();
+        assert_eq!(second_join["status"], "ok");
+        let second_task = node
+            .gossip_state
+            .lock()
+            .await
+            .receiver_tasks
+            .get(topic)
+            .expect("rejoined tracked topic has a receiver task")
+            .abort_handle();
+
+        shutdown_test_carrier_node(node).await;
+        assert!(second_task.is_finished());
+    }
+
+    #[tokio::test]
+    async fn test_gossip_state_drop_aborts_receiver_tasks() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .bind()
+            .await
+            .unwrap();
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let memory_lookup = MemoryLookup::new();
+        let mut state =
+            GossipState::new(endpoint.clone(), gossip.clone(), memory_lookup, None, None);
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("receiver task did not start");
+        let task_abort = task.abort_handle();
+        state.receiver_tasks.insert("drop-test".into(), task);
+
+        drop(state);
+
+        tokio::time::timeout(Duration::from_secs(5), dropped_rx)
+            .await
+            .expect("receiver task was not dropped")
+            .expect("receiver task drop signal was lost");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !task_abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted receiver task did not finish");
+        gossip.shutdown().await.unwrap();
+        endpoint.close().await;
     }
 
     struct MockCarrierIpfsProvider;
@@ -6025,6 +7159,10 @@ mod tests {
 
     struct MockCarrierContentProvider;
 
+    struct RecordingCarrierContentProvider {
+        requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+    }
+
     #[async_trait::async_trait]
     impl Provider for MockCarrierContentProvider {
         async fn handle(
@@ -6080,6 +7218,43 @@ mod tests {
                     }
                 }));
             }
+            Ok(serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "op": request.get("op").cloned().unwrap_or(serde_json::Value::Null),
+                    "runtime_invocation": request
+                        .get("_runtime_invocation")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                }
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RecordingCarrierContentProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "recording content provider only supports raw operations".into(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+
+        fn name(&self) -> &'static str {
+            "recording-carrier-content-provider"
+        }
+
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            self.requests.lock().unwrap().push(request.clone());
             Ok(serde_json::json!({
                 "status": "ok",
                 "data": {
@@ -6234,8 +7409,14 @@ mod tests {
             invocation: &ProviderInvocation,
             request: serde_json::Value,
         ) -> std::result::Result<serde_json::Value, ProviderError> {
+            let ticket = match route {
+                ProviderCarrierRoute::ConnectTicket { connect_ticket, .. } => {
+                    connect_ticket.as_str()
+                }
+                ProviderCarrierRoute::PeerDid { .. } => "",
+            };
             self.requests.lock().await.push(serde_json::json!({
-                "ticket": route.connect_ticket.as_str(),
+                "ticket": ticket,
                 "source": invocation.source.as_str(),
                 "target": invocation.target.as_str(),
                 "op": invocation.op.as_str(),
@@ -6551,7 +7732,7 @@ mod tests {
 
     #[test]
     fn test_topic_hash_matches_distributed_topic_tracker_topic_id() {
-        let topic_name = "__elastos_internal/room-sync-v1/chat-room";
+        let topic_name = "__elastos_internal/carrier-test-v1/topic";
         let mut expected = [0u8; 32];
         expected.copy_from_slice(&Sha512::digest(topic_name.as_bytes())[..32]);
 
@@ -7147,11 +8328,7 @@ mod tests {
                     "op": "fetch",
                     "capability": "provider:carrier-availability->content:fetch",
                     "transport": "carrier-provider-plane",
-                    "carrier": {
-                        "route": "connect_ticket",
-                        "peer_did": "did:key:zRemote",
-                        "timeout_ms": 5000
-                    },
+                    "carrier": null,
                     "transfer": "bytes",
                     "range": null,
                     "progress": null
@@ -7159,7 +8336,8 @@ mod tests {
             }
         });
 
-        let response = carrier_provider_invoke_registry(&registry, &request)
+        let source_endpoint = authenticated_test_source_endpoint();
+        let response = carrier_provider_invoke_registry(&registry, &request, &source_endpoint)
             .await
             .unwrap();
 
@@ -7170,7 +8348,537 @@ mod tests {
             response["result"]["data"]["runtime_invocation"]["transport"],
             "carrier-provider-plane"
         );
+        assert_eq!(
+            response["result"]["data"]["runtime_invocation"]["carrier"]["source_endpoint_did"],
+            public_key_to_did(&source_endpoint)
+        );
         assert!(!response.to_string().contains("\"connect_ticket\":"));
+    }
+
+    struct PeerDidRouteFixture {
+        local_registry: Arc<ProviderRegistry>,
+        remote_requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+        remote_did: String,
+        remote_addr: iroh::EndpointAddr,
+        local_node: CarrierNode,
+        remote_node: CarrierNode,
+        _remote_registry: Arc<ProviderRegistry>,
+        _local_dir: tempfile::TempDir,
+        _remote_dir: tempfile::TempDir,
+    }
+
+    /// Deterministic peer-DID resolver setup.
+    ///
+    /// Runtime keeps one long-lived Carrier endpoint and owns peer resolution.
+    /// Seeding the remote node's verified address into that endpoint's address
+    /// book makes resolution in-process, so a routed invocation does not depend
+    /// on public discovery timing. Nothing here is visible to apps: the route
+    /// stays a peer DID and the address never leaves Runtime.
+    async fn peer_did_route_fixture(local_seed: u8, remote_seed: u8) -> PeerDidRouteFixture {
+        let local_dir = tempfile::tempdir().unwrap();
+        let local_registry = Arc::new(ProviderRegistry::new());
+        let (local_sk, local_did) = elastos_identity::derive_did(&[local_seed; 32]);
+        let local_node = start_carrier_node_with_registry(
+            &local_sk,
+            &local_did,
+            local_dir.path().to_path_buf(),
+            Some(Arc::downgrade(&local_registry)),
+        )
+        .await
+        .unwrap();
+        local_registry
+            .set_carrier_invoker(Arc::new(
+                CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                    local_node.endpoint.clone(),
+                    Arc::downgrade(&local_registry),
+                ),
+            ))
+            .await;
+
+        let remote_requests = Arc::new(StdMutex::new(Vec::new()));
+        let remote_registry = Arc::new(ProviderRegistry::new());
+        remote_registry
+            .register_sub_provider(
+                "content",
+                Arc::new(RecordingCarrierContentProvider {
+                    requests: remote_requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        let remote_dir = tempfile::tempdir().unwrap();
+        let (remote_sk, remote_did) = elastos_identity::derive_did(&[remote_seed; 32]);
+        let remote_node = start_carrier_node_with_registry(
+            &remote_sk,
+            &remote_did,
+            remote_dir.path().to_path_buf(),
+            Some(Arc::downgrade(&remote_registry)),
+        )
+        .await
+        .unwrap();
+
+        let mut remote_watch = remote_node.endpoint.watch_addr();
+        let remote_addr = remote_watch.get();
+        local_node
+            .memory_lookup
+            .add_endpoint_info(remote_addr.clone());
+
+        PeerDidRouteFixture {
+            local_registry,
+            remote_requests,
+            remote_did,
+            remote_addr,
+            local_node,
+            remote_node,
+            _remote_registry: remote_registry,
+            _local_dir: local_dir,
+            _remote_dir: remote_dir,
+        }
+    }
+
+    fn peer_did_invocation(peer_did: &str) -> ProviderInvocation {
+        ProviderInvocation {
+            source: "content-provider".to_string(),
+            target: "content".to_string(),
+            op: "fetch".to_string(),
+            request: serde_json::json!({ "op": "fetch" }),
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                peer_did: peer_did.to_string(),
+                timeout_ms: Some(5_000),
+            }),
+        }
+    }
+
+    fn connect_ticket_invocation(
+        remote_addr: iroh::EndpointAddr,
+        remote_did: &str,
+    ) -> ProviderInvocation {
+        ProviderInvocation {
+            source: "content-provider".to_string(),
+            target: "content".to_string(),
+            op: "fetch".to_string(),
+            request: serde_json::json!({ "op": "fetch" }),
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::ConnectTicket {
+                connect_ticket: encode_ticket_for(remote_addr),
+                peer_did: Some(remote_did.to_string()),
+                timeout_ms: Some(5_000),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_peer_did_route_reaches_resolved_provider_without_exposing_topology() {
+        let fixture = peer_did_route_fixture(60, 61).await;
+
+        let response = fixture
+            .local_registry
+            .invoke_provider(peer_did_invocation(&fixture.remote_did))
+            .await
+            .unwrap();
+
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["data"]["op"], "fetch");
+        assert_eq!(
+            response["data"]["runtime_invocation"]["transport"],
+            "carrier-provider-plane"
+        );
+        assert_eq!(
+            response["data"]["runtime_invocation"]["carrier"],
+            serde_json::Value::Null
+        );
+
+        let rendered = response.to_string();
+        assert!(!rendered.contains("connect_ticket"));
+        assert!(!rendered.contains("did:key:"));
+        assert!(!rendered.contains("127.0.0.1") && !rendered.contains("localhost"));
+
+        let requests = fixture.remote_requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["_runtime_invocation"]["carrier"]["source_endpoint_did"],
+            public_key_to_did(&fixture.local_node.endpoint.id())
+        );
+        assert_eq!(
+            requests[0]["_runtime_invocation"]["source"],
+            "content-provider"
+        );
+        assert_eq!(requests[0]["_runtime_invocation"]["target"], "content");
+        drop(requests);
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn test_peer_did_self_route_uses_carrier_admission_without_network_connect() {
+        let fixture = peer_did_route_fixture(90, 91).await;
+        let local_did = public_key_to_did(&fixture.local_node.endpoint.id());
+
+        let local_requests = Arc::new(StdMutex::new(Vec::new()));
+        fixture
+            .local_registry
+            .register_sub_provider(
+                "content",
+                Arc::new(RecordingCarrierContentProvider {
+                    requests: local_requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Close both Carrier nodes before invoking. A socket/dial path can no
+        // longer succeed, while the in-process Carrier admission path remains
+        // available through the registry and endpoint identity held by the
+        // invoker.
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+
+        let response = fixture
+            .local_registry
+            .invoke_provider(peer_did_invocation(&local_did))
+            .await
+            .expect("same-endpoint PeerDid must loop through Carrier admission");
+
+        assert_eq!(response["status"], "ok");
+        assert_eq!(
+            response["data"]["runtime_invocation"]["transport"],
+            "carrier-provider-plane"
+        );
+        assert!(
+            fixture.remote_requests.lock().unwrap().is_empty(),
+            "self PeerDid must not dial the remote Carrier peer"
+        );
+        let requests = local_requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["_runtime_invocation"]["transport"],
+            "carrier-provider-plane"
+        );
+        assert_eq!(
+            requests[0]["_runtime_invocation"]["carrier"]["source_endpoint_did"],
+            local_did
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_ticket_self_route_uses_carrier_admission_without_network_connect() {
+        let fixture = peer_did_route_fixture(93, 94).await;
+        let local_did = public_key_to_did(&fixture.local_node.endpoint.id());
+        let mut local_watch = fixture.local_node.endpoint.watch_addr();
+        let local_addr = local_watch.get();
+        let local_requests = Arc::new(StdMutex::new(Vec::new()));
+        fixture
+            .local_registry
+            .register_sub_provider(
+                "content",
+                Arc::new(RecordingCarrierContentProvider {
+                    requests: local_requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+
+        let response = fixture
+            .local_registry
+            .invoke_provider(connect_ticket_invocation(local_addr, &local_did))
+            .await
+            .expect("same-endpoint ticket must loop through Carrier admission");
+
+        assert_eq!(response["status"], "ok");
+        assert!(fixture.remote_requests.lock().unwrap().is_empty());
+        let requests = local_requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["_runtime_invocation"]["transport"],
+            "carrier-provider-plane"
+        );
+        assert_eq!(
+            requests[0]["_runtime_invocation"]["carrier"]["source_endpoint_did"],
+            local_did
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_ticket_self_route_rejects_mismatched_peer_before_provider_effect() {
+        let fixture = peer_did_route_fixture(95, 96).await;
+        let mut local_watch = fixture.local_node.endpoint.watch_addr();
+        let local_addr = local_watch.get();
+        let local_requests = Arc::new(StdMutex::new(Vec::new()));
+        fixture
+            .local_registry
+            .register_sub_provider(
+                "content",
+                Arc::new(RecordingCarrierContentProvider {
+                    requests: local_requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let error = fixture
+            .local_registry
+            .invoke_provider(connect_ticket_invocation(local_addr, &fixture.remote_did))
+            .await
+            .expect_err("mismatched peer_did and ticket must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("peer_did does not match connect_ticket"));
+        assert!(local_requests.lock().unwrap().is_empty());
+        assert!(fixture.remote_requests.lock().unwrap().is_empty());
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn test_peer_did_self_route_requires_a_live_loopback_registry_before_provider_effect() {
+        let local_dir = tempfile::tempdir().unwrap();
+        let (local_sk, local_did) = elastos_identity::derive_did(&[92; 32]);
+        let node = start_carrier_node(&local_sk, &local_did, local_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+
+        let absent_registry = Arc::new(ProviderRegistry::new());
+        absent_registry
+            .register_sub_provider(
+                "content",
+                Arc::new(RecordingCarrierContentProvider {
+                    requests: requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        absent_registry
+            .set_carrier_invoker(Arc::new(CarrierProviderInvoker::with_carrier_endpoint(
+                node.endpoint.clone(),
+            )))
+            .await;
+        let error = absent_registry
+            .invoke_provider(peer_did_invocation(&local_did))
+            .await
+            .expect_err("self route without a loopback registry must fail closed");
+        assert!(error.to_string().contains("registry is unavailable"));
+        assert!(requests.lock().unwrap().is_empty());
+
+        let closed_target = Arc::new(ProviderRegistry::new());
+        let closed_weak = Arc::downgrade(&closed_target);
+        drop(closed_target);
+        let closed_registry = Arc::new(ProviderRegistry::new());
+        closed_registry
+            .register_sub_provider(
+                "content",
+                Arc::new(RecordingCarrierContentProvider {
+                    requests: requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        closed_registry
+            .set_carrier_invoker(Arc::new(
+                CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                    node.endpoint.clone(),
+                    closed_weak,
+                ),
+            ))
+            .await;
+        let error = closed_registry
+            .invoke_provider(peer_did_invocation(&local_did))
+            .await
+            .expect_err("self route with a closed loopback registry must fail closed");
+        assert!(error.to_string().contains("registry is unavailable"));
+        assert!(requests.lock().unwrap().is_empty());
+
+        shutdown_test_carrier_node(node).await;
+    }
+
+    #[tokio::test]
+    async fn test_connect_ticket_route_reuses_runtime_endpoint_identity() {
+        let fixture = peer_did_route_fixture(72, 73).await;
+
+        for expected in 1..=2usize {
+            let response = fixture
+                .local_registry
+                .invoke_provider(connect_ticket_invocation(
+                    fixture.remote_addr.clone(),
+                    &fixture.remote_did,
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(response["status"], "ok");
+            assert_eq!(fixture.remote_requests.lock().unwrap().len(), expected);
+            assert_eq!(
+                fixture.remote_requests.lock().unwrap()[expected - 1]["_runtime_invocation"]
+                    ["carrier"]["source_endpoint_did"],
+                public_key_to_did(&fixture.local_node.endpoint.id())
+            );
+            assert!(!fixture.local_node.endpoint.is_closed());
+        }
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn test_connect_ticket_route_without_runtime_endpoint_fails_before_provider_effect() {
+        let fixture = peer_did_route_fixture(74, 75).await;
+        fixture
+            .local_registry
+            .set_carrier_invoker(Arc::new(CarrierProviderInvoker::new()))
+            .await;
+
+        let err = fixture
+            .local_registry
+            .invoke_provider(connect_ticket_invocation(
+                fixture.remote_addr.clone(),
+                &fixture.remote_did,
+            ))
+            .await
+            .expect_err("ticket route without the Runtime endpoint must fail closed");
+
+        assert!(
+            matches!(err, ProviderError::Unavailable(_)),
+            "expected typed peer-unavailable, got {err:?}"
+        );
+        assert!(fixture.remote_requests.lock().unwrap().is_empty());
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn test_peer_did_route_without_runtime_endpoint_is_unavailable_before_provider_effect() {
+        let fixture = peer_did_route_fixture(62, 63).await;
+        // Rebind the registry to an invoker that owns no Carrier endpoint, so
+        // Runtime has no verified route to any peer.
+        fixture
+            .local_registry
+            .set_carrier_invoker(Arc::new(CarrierProviderInvoker::new()))
+            .await;
+
+        let err = fixture
+            .local_registry
+            .invoke_provider(peer_did_invocation(&fixture.remote_did))
+            .await
+            .expect_err("no verified route must fail closed");
+
+        assert!(
+            matches!(err, ProviderError::Unavailable(_)),
+            "expected typed peer-unavailable, got {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(!rendered.contains("did:key:"));
+        assert!(!rendered.contains("connect_ticket"));
+        assert!(!rendered.contains("127.0.0.1") && !rendered.contains("localhost"));
+        assert!(fixture.remote_requests.lock().unwrap().is_empty());
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn test_peer_did_route_rejects_substituted_identity_before_provider_effect() {
+        let fixture = peer_did_route_fixture(64, 65).await;
+
+        // A DID Runtime cannot resolve at all.
+        let (_, unknown_did) = elastos_identity::derive_did(&[66u8; 32]);
+        let err = fixture
+            .local_registry
+            .invoke_provider(peer_did_invocation(&unknown_did))
+            .await
+            .expect_err("unresolvable peer must fail closed");
+        assert!(
+            matches!(err, ProviderError::Unavailable(_)),
+            "expected typed peer-unavailable, got {err:?}"
+        );
+
+        // A DID whose address book entry points at another peer's transport
+        // address. The resolved endpoint identity must still have to match the
+        // requested DID.
+        let (_, substituted_did) = elastos_identity::derive_did(&[67u8; 32]);
+        let substituted_key = did_to_public_key(&substituted_did).unwrap();
+        let mut substituted_addr = iroh::EndpointAddr::from(substituted_key);
+        substituted_addr
+            .addrs
+            .extend(fixture.remote_addr.addrs.iter().cloned());
+        fixture
+            .local_node
+            .memory_lookup
+            .add_endpoint_info(substituted_addr);
+
+        let err = fixture
+            .local_registry
+            .invoke_provider(peer_did_invocation(&substituted_did))
+            .await
+            .expect_err("substituted peer identity must fail closed");
+        assert!(
+            matches!(err, ProviderError::Unavailable(_)),
+            "expected typed peer-unavailable, got {err:?}"
+        );
+
+        assert!(
+            fixture.remote_requests.lock().unwrap().is_empty(),
+            "a rejected route must not reach the remote provider"
+        );
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn test_peer_did_route_executes_each_invocation_exactly_once() {
+        let fixture = peer_did_route_fixture(68, 69).await;
+
+        for expected in 1..=3usize {
+            fixture
+                .local_registry
+                .invoke_provider(peer_did_invocation(&fixture.remote_did))
+                .await
+                .unwrap();
+            assert_eq!(fixture.remote_requests.lock().unwrap().len(), expected);
+        }
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn test_peer_did_route_serves_concurrent_invocations_exactly_once_each() {
+        let fixture = peer_did_route_fixture(70, 71).await;
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let registry = fixture.local_registry.clone();
+            let peer_did = fixture.remote_did.clone();
+            handles.push(tokio::spawn(async move {
+                registry
+                    .invoke_provider(peer_did_invocation(&peer_did))
+                    .await
+            }));
+        }
+
+        let mut ok = 0;
+        for handle in handles {
+            let response = handle.await.unwrap().unwrap();
+            assert_eq!(response["status"], "ok");
+            ok += 1;
+        }
+        assert_eq!(ok, 8);
+        assert_eq!(fixture.remote_requests.lock().unwrap().len(), 8);
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
     }
 
     #[tokio::test]
@@ -7265,11 +8973,11 @@ mod tests {
             timeout_ms: Some(5_000),
         };
 
-        let (mut send, mut recv) = open_browser_carrier_stream(&request).await.unwrap();
-        send.write_all(b"ping").await.unwrap();
-        send.finish().unwrap();
+        let mut stream = open_browser_carrier_stream(&request).await.unwrap();
+        stream.send.write_all(b"ping").await.unwrap();
+        stream.send.finish().unwrap();
         let mut response = [0_u8; 4];
-        recv.read_exact(&mut response).await.unwrap();
+        stream.recv.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"pong");
 
         relay_task.await.unwrap();
@@ -7297,11 +9005,7 @@ mod tests {
                     "op": "fetch",
                     "capability": "provider:carrier-availability->content:fetch",
                     "transport": "carrier-provider-plane",
-                    "carrier": {
-                        "route": "connect_ticket",
-                        "peer_did": "did:key:zRemote",
-                        "timeout_ms": 5000
-                    },
+                    "carrier": null,
                     "transfer": "stream",
                     "stream": {
                         "schema": "elastos.provider.stream/v1",
@@ -7314,9 +9018,13 @@ mod tests {
             }
         });
 
-        let response = carrier_provider_invoke_registry(&registry, &request)
-            .await
-            .unwrap();
+        let response = carrier_provider_invoke_registry(
+            &registry,
+            &request,
+            &authenticated_test_source_endpoint(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(response["ok"], true);
         assert_eq!(
@@ -7327,7 +9035,60 @@ mod tests {
             response["result"]["data"]["runtime_invocation"]["stream"]["encoding"],
             "base64-chunks"
         );
+        assert_eq!(
+            response["result"]["data"]["runtime_invocation"]["carrier"]["source_endpoint_did"],
+            public_key_to_did(&authenticated_test_source_endpoint())
+        );
         assert!(!response.to_string().contains("\"connect_ticket\":"));
+    }
+
+    #[tokio::test]
+    async fn test_carrier_provider_invoke_rejects_non_null_carrier_metadata() {
+        let registry = ProviderRegistry::new();
+        registry
+            .register_sub_provider("content", Arc::new(MockCarrierContentProvider))
+            .await
+            .unwrap();
+        let request = serde_json::json!({
+            "source": "carrier-availability",
+            "target": "content",
+            "operation": "fetch",
+            "transfer": "bytes",
+            "request": {
+                "op": "fetch",
+                "_runtime_invocation": {
+                    "schema": "elastos.provider.invocation/v1",
+                    "source": "carrier-availability",
+                    "target": "content",
+                    "op": "fetch",
+                    "capability": "provider:carrier-availability->content:fetch",
+                    "transport": "carrier-provider-plane",
+                    "carrier": {
+                        "route": "peer_did",
+                        "peer_did": "did:key:zInjected",
+                        "timeout_ms": 5000
+                    },
+                    "transfer": "bytes",
+                    "range": null,
+                    "progress": null
+                }
+            }
+        });
+
+        let response = carrier_provider_invoke_registry(
+            &registry,
+            &request,
+            &authenticated_test_source_endpoint(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["code"], "invalid_provider_invocation");
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("carrier metadata must be null"));
     }
 
     #[tokio::test]
@@ -7351,17 +9112,19 @@ mod tests {
                     "op": "fetch",
                     "capability": "provider:carrier-availability->content:fetch",
                     "transport": "carrier-provider-plane",
-                    "carrier": {
-                        "route": "connect_ticket"
-                    },
+                    "carrier": null,
                     "transfer": "stream"
                 }
             }
         });
 
-        let response = carrier_provider_invoke_registry(&registry, &request)
-            .await
-            .unwrap();
+        let response = carrier_provider_invoke_registry(
+            &registry,
+            &request,
+            &authenticated_test_source_endpoint(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(response["ok"], false);
         assert_eq!(response["code"], "invalid_provider_invocation");
@@ -7392,17 +9155,19 @@ mod tests {
                     "op": "cat",
                     "capability": "provider:content-provider->ipfs:cat",
                     "transport": "carrier-provider-plane",
-                    "carrier": {
-                        "route": "connect_ticket"
-                    },
+                    "carrier": null,
                     "transfer": "bytes"
                 }
             }
         });
 
-        let response = carrier_provider_invoke_registry(&registry, &request)
-            .await
-            .unwrap();
+        let response = carrier_provider_invoke_registry(
+            &registry,
+            &request,
+            &authenticated_test_source_endpoint(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(response["ok"], false);
         assert_eq!(response["code"], "unauthorized_provider_target");
@@ -8469,14 +10234,17 @@ mod tests {
             1_700_000_000,
         );
         let (local_sk, local_did) = elastos_identity::derive_did(&[21u8; 32]);
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
             .bind()
             .await
             .unwrap();
         let memory_lookup = MemoryLookup::new();
-        endpoint.address_lookup().add(memory_lookup.clone());
-        let gossip = Gossip::builder().spawn(endpoint.clone());
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
+        let gossip = spawn_carrier_gossip(&endpoint);
         let state = Arc::new(Mutex::new(GossipState::new(
             endpoint.clone(),
             gossip,
@@ -8487,13 +10255,11 @@ mod tests {
         {
             let mut guard = state.lock().await;
             guard.joined_topics.insert(topic_name.clone());
-            guard.buffers.lock().await.insert(
-                topic_name,
-                TopicBuffer {
-                    messages: VecDeque::from([remote_message]),
-                    base_index: 0,
-                },
-            );
+            guard
+                .buffers
+                .lock()
+                .await
+                .insert(topic_name, test_topic_buffer([remote_message], 0));
         }
 
         let registry = Arc::new(ProviderRegistry::new());
@@ -8677,14 +10443,17 @@ mod tests {
             1_700_000_000,
         );
         let (local_sk, local_did) = elastos_identity::derive_did(&[24u8; 32]);
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
             .bind()
             .await
             .unwrap();
         let memory_lookup = MemoryLookup::new();
-        endpoint.address_lookup().add(memory_lookup.clone());
-        let gossip = Gossip::builder().spawn(endpoint.clone());
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
+        let gossip = spawn_carrier_gossip(&endpoint);
         let state = Arc::new(Mutex::new(GossipState::new(
             endpoint.clone(),
             gossip,
@@ -8695,13 +10464,11 @@ mod tests {
         {
             let mut guard = state.lock().await;
             guard.joined_topics.insert(topic_name.clone());
-            guard.buffers.lock().await.insert(
-                topic_name,
-                TopicBuffer {
-                    messages: VecDeque::from([remote_message]),
-                    base_index: 0,
-                },
-            );
+            guard
+                .buffers
+                .lock()
+                .await
+                .insert(topic_name, test_topic_buffer([remote_message], 0));
         }
 
         let registry = Arc::new(ProviderRegistry::new());
@@ -8854,6 +10621,153 @@ mod tests {
         assert_eq!(bootstrap_peers, vec![expected_peer]);
     }
 
+    #[tokio::test]
+    async fn test_gossip_join_exact_rejects_ambiguous_peer_sets_without_state_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing_key, did) = elastos_identity::derive_did(&[13u8; 32]);
+        let node = start_carrier_node(&signing_key, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let provider = CarrierGossipProvider::new(node.gossip_state.clone());
+        let configured_peer = iroh::SecretKey::from_bytes(&[14u8; 32]).public();
+        node.gossip_state
+            .lock()
+            .await
+            .bootstrap_peers
+            .push(configured_peer);
+
+        let canonical_peer = iroh::SecretKey::from_bytes(&[15u8; 32])
+            .public()
+            .to_string();
+        let noncanonical_peer = canonical_peer.to_ascii_uppercase();
+        assert_ne!(noncanonical_peer, canonical_peer);
+        let overflow_peers = (0..=GOSSIP_JOIN_EXACT_MAX_PEERS)
+            .map(|index| {
+                iroh::SecretKey::from_bytes(&[32 + index as u8; 32])
+                    .public()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        let requests = [
+            serde_json::json!({
+                "op": "gossip_join_exact",
+                "topic": "__test/exact-rejected-missing"
+            }),
+            serde_json::json!({
+                "op": "gossip_join_exact",
+                "topic": "__test/exact-rejected-not-array",
+                "peers": "not-an-array"
+            }),
+            serde_json::json!({
+                "op": "gossip_join_exact",
+                "topic": "__test/exact-rejected-non-string",
+                "peers": [7]
+            }),
+            serde_json::json!({
+                "op": "gossip_join_exact",
+                "topic": "__test/exact-rejected-invalid",
+                "peers": ["not-an-endpoint-id"]
+            }),
+            serde_json::json!({
+                "op": "gossip_join_exact",
+                "topic": "__test/exact-rejected-noncanonical",
+                "peers": [noncanonical_peer]
+            }),
+            serde_json::json!({
+                "op": "gossip_join_exact",
+                "topic": "__test/exact-rejected-duplicate",
+                "peers": [canonical_peer.clone(), canonical_peer]
+            }),
+            serde_json::json!({
+                "op": "gossip_join_exact",
+                "topic": "__test/exact-rejected-overflow",
+                "peers": overflow_peers
+            }),
+            serde_json::json!({
+                "op": "gossip_join_exact",
+                "topic": "__test/exact-rejected-unknown-field",
+                "peers": [],
+                "mode": "direct"
+            }),
+        ];
+
+        for request in requests {
+            let response = provider.send_raw(&request).await.unwrap();
+            assert_eq!(response["status"], "error", "request: {request}");
+        }
+
+        let state = node.gossip_state.lock().await;
+        assert_eq!(state.bootstrap_peers, vec![configured_peer]);
+        assert!(state.joined_topics.is_empty());
+        assert!(state.last_direct_join_peers.is_none());
+        drop(state);
+        shutdown_test_carrier_node(node).await;
+    }
+
+    #[tokio::test]
+    async fn test_gossip_join_exact_uses_only_explicit_peers_while_direct_join_uses_global_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing_key, did) = elastos_identity::derive_did(&[16u8; 32]);
+        let node = start_carrier_node(&signing_key, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let provider = CarrierGossipProvider::new(node.gossip_state.clone());
+        let configured_peer = iroh::SecretKey::from_bytes(&[17u8; 32]).public();
+        let exact_peer = iroh::SecretKey::from_bytes(&[18u8; 32]).public();
+        node.gossip_state
+            .lock()
+            .await
+            .bootstrap_peers
+            .push(configured_peer);
+
+        let exact_response = provider
+            .send_raw(&serde_json::json!({
+                "op": "gossip_join_exact",
+                "topic": "__test/exact-local-only",
+                "peers": []
+            }))
+            .await
+            .unwrap();
+        assert_eq!(exact_response["status"], "ok");
+        {
+            let state = node.gossip_state.lock().await;
+            assert_eq!(state.bootstrap_peers, vec![configured_peer]);
+            assert_eq!(state.last_direct_join_peers, Some(Vec::new()));
+        }
+
+        let populated_exact_response = provider
+            .send_raw(&serde_json::json!({
+                "op": "gossip_join_exact",
+                "topic": "__test/exact-populated",
+                "peers": [exact_peer.to_string()]
+            }))
+            .await
+            .unwrap();
+        assert_eq!(populated_exact_response["status"], "ok");
+        {
+            let state = node.gossip_state.lock().await;
+            assert_eq!(state.bootstrap_peers, vec![configured_peer]);
+            assert_eq!(state.last_direct_join_peers, Some(vec![exact_peer]));
+        }
+
+        let direct_response = provider
+            .send_raw(&serde_json::json!({
+                "op": "gossip_join",
+                "topic": "__test/existing-direct",
+                "mode": "direct"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(direct_response["status"], "ok");
+        {
+            let state = node.gossip_state.lock().await;
+            assert_eq!(state.bootstrap_peers, vec![configured_peer]);
+            assert_eq!(state.last_direct_join_peers, Some(vec![configured_peer]));
+        }
+
+        shutdown_test_carrier_node(node).await;
+    }
+
     #[test]
     fn test_cached_release_metadata_does_not_mark_trusted_source_runtime() {
         let dir = tempfile::tempdir().unwrap();
@@ -8896,7 +10810,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_trusted_source_runtime_joins_room_sync_topic() {
+    async fn test_trusted_source_runtime_joins_discovery_topic() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(elastos_common::localhost::publisher_root_path(dir.path()))
             .unwrap();
@@ -8910,7 +10824,6 @@ mod tests {
         let state = node.gossip_state.lock().await;
 
         assert!(state.joined_topics.contains(CHAT_DISCOVERY_TOPIC_GENERAL));
-        assert!(state.joined_topics.contains(CHAT_ROOM_SYNC_TOPIC));
         drop(state);
         node.endpoint.close().await;
     }
@@ -9012,6 +10925,49 @@ mod tests {
         assert_eq!(received.content, "hello from node2");
         assert_eq!(received.sender_id, did2);
 
+        let opaque_envelope =
+            vec![0x5a; elastos_common::collaboration_protocol::MAX_COLLABORATION_ENVELOPE_BYTES];
+        let near_max = GossipMessage {
+            sender_id: did2.clone(),
+            sender_nick: "collaboration-transport".to_string(),
+            content: base64::engine::general_purpose::STANDARD.encode(opaque_envelope),
+            ts: 1_700_000_001,
+            nonce: 100,
+            signature: None,
+            sender_session_id: None,
+        };
+        let near_max_bytes = serialize_gossip_wire_message(&near_max).unwrap();
+        assert!(
+            near_max_bytes.len() > iroh_gossip::proto::DEFAULT_MAX_MESSAGE_SIZE,
+            "near-maximum collaboration transport frame must exceed iroh's old 4 KiB default"
+        );
+        assert!(near_max_bytes.len() <= GOSSIP_WIRE_MESSAGE_MAX_BYTES);
+        assert_eq!(
+            node1.gossip.max_message_size(),
+            GOSSIP_WIRE_MESSAGE_MAX_BYTES
+        );
+        assert_eq!(
+            node2.gossip.max_message_size(),
+            GOSSIP_WIRE_MESSAGE_MAX_BYTES
+        );
+        sender2
+            .broadcast(near_max_bytes.clone().into())
+            .await
+            .unwrap();
+
+        let near_max_event = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(Ok(event)) = receiver1.next().await {
+                if let iroh_gossip::api::Event::Received(received) = event {
+                    return Some(received);
+                }
+            }
+            None
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(near_max_event.content.as_ref(), near_max_bytes.as_slice());
+
         // Cleanup
         shutdown_test_carrier_node(node1).await;
         shutdown_test_carrier_node(node2).await;
@@ -9101,6 +11057,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_gossip_wire_bound_rejects_send_push_and_ingress_before_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing_key, did) = elastos_identity::derive_did(&[34u8; 32]);
+        let node = start_carrier_node(&signing_key, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let provider = CarrierGossipProvider::new(node.gossip_state.clone());
+        let topic = "__test/gossip-wire-bound";
+        assert_eq!(
+            provider
+                .send_raw(&serde_json::json!({
+                    "op":"gossip_join", "topic":topic, "mode":"direct"
+                }))
+                .await
+                .unwrap()["status"],
+            "ok"
+        );
+
+        let oversized = gossip_test_message_with_encoded_len(1, GOSSIP_WIRE_MESSAGE_MAX_BYTES + 1);
+        let oversized_bytes = serde_json::to_vec(&oversized).unwrap();
+        assert_eq!(oversized_bytes.len(), GOSSIP_WIRE_MESSAGE_MAX_BYTES + 1);
+        let rejected_send = provider
+            .send_raw(&serde_json::json!({
+                "op":"gossip_send",
+                "topic":topic,
+                "message":oversized.content.clone(),
+                "sender":oversized.sender_nick.clone(),
+                "sender_id":oversized.sender_id.clone(),
+                "ts":oversized.ts,
+                "nonce":oversized.nonce,
+                "signature":oversized.signature.clone(),
+                "sender_session_id":oversized.sender_session_id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(rejected_send["status"], "error");
+        assert_eq!(rejected_send["code"], "message_too_large");
+
+        let rejected_push = carrier_gossip_push(
+            node.gossip_state.clone(),
+            &serde_json::json!({"topic":topic, "message":oversized}),
+        )
+        .await;
+        assert_eq!(rejected_push["ok"], false);
+        assert_eq!(rejected_push["code"], "message_too_large");
+
+        let (buffers, peers, topic_peers) = {
+            let state = node.gossip_state.lock().await;
+            (
+                state.buffers.clone(),
+                state.peers.clone(),
+                state.topic_peers.clone(),
+            )
+        };
+        handle_gossip_event(
+            iroh_gossip::api::Event::Received(iroh_gossip::api::Message {
+                content: oversized_bytes.into(),
+                scope: iroh_gossip::proto::DeliveryScope::Neighbors,
+                delivered_from: node.endpoint.id(),
+            }),
+            &buffers,
+            &peers,
+            &topic_peers,
+            topic,
+        )
+        .await;
+        {
+            let buffers = buffers.lock().await;
+            let buffer = buffers.get(topic).unwrap();
+            assert!(buffer.messages.is_empty());
+            assert_eq!(buffer.retained_bytes, 0);
+            assert_eq!(buffer.base_index, 0);
+        }
+
+        let pushed = gossip_test_message_with_encoded_len(2, GOSSIP_WIRE_MESSAGE_MAX_BYTES);
+        let pushed_response = carrier_gossip_push(
+            node.gossip_state.clone(),
+            &serde_json::json!({"topic":topic, "message":pushed}),
+        )
+        .await;
+        assert_eq!(pushed_response["ok"], true);
+        assert_eq!(pushed_response["inserted"], true);
+
+        let received = gossip_test_message_with_encoded_len(3, GOSSIP_WIRE_MESSAGE_MAX_BYTES);
+        let received_bytes = serialize_gossip_wire_message(&received).unwrap();
+        handle_gossip_event(
+            iroh_gossip::api::Event::Received(iroh_gossip::api::Message {
+                content: received_bytes.into(),
+                scope: iroh_gossip::proto::DeliveryScope::Neighbors,
+                delivered_from: node.endpoint.id(),
+            }),
+            &buffers,
+            &peers,
+            &topic_peers,
+            topic,
+        )
+        .await;
+        let buffers = buffers.lock().await;
+        let buffer = buffers.get(topic).unwrap();
+        assert_eq!(buffer.messages.len(), 2);
+        assert_eq!(buffer.retained_bytes, 2 * GOSSIP_WIRE_MESSAGE_MAX_BYTES);
+        drop(buffers);
+        shutdown_test_carrier_node(node).await;
+    }
+
+    #[tokio::test]
+    async fn test_gossip_buffer_byte_eviction_preserves_cursor_and_ack_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing_key, did) = elastos_identity::derive_did(&[35u8; 32]);
+        let node = start_carrier_node(&signing_key, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let provider = CarrierGossipProvider::new(node.gossip_state.clone());
+        let topic = "__test/gossip-byte-eviction";
+        let small_message_bytes = GOSSIP_WIRE_MESSAGE_MAX_BYTES / 3;
+        let mut messages = (0..3)
+            .map(|index| gossip_test_message_with_encoded_len(index, small_message_bytes))
+            .collect::<Vec<_>>();
+        messages.extend((3..66).map(|index| {
+            gossip_test_message_with_encoded_len(index, GOSSIP_WIRE_MESSAGE_MAX_BYTES)
+        }));
+        let buffer = test_topic_buffer(messages, 0);
+        assert_eq!(buffer.retained_bytes, GOSSIP_TOPIC_BUFFER_MAX_BYTES);
+        {
+            let mut state = node.gossip_state.lock().await;
+            state.joined_topics.insert(topic.to_string());
+            state.buffers.lock().await.insert(topic.to_string(), buffer);
+        }
+
+        let peek = provider
+            .send_raw(&serde_json::json!({
+                "op":"gossip_peek", "topic":topic,
+                "consumer_id":"byte-eviction", "limit":1
+            }))
+            .await
+            .unwrap();
+        assert_eq!(peek["data"]["cursor"], 0);
+        assert_eq!(peek["data"]["next_cursor"], 1);
+        let ack_request = serde_json::json!({
+            "op":"gossip_ack", "topic":topic,
+            "consumer_id":"byte-eviction", "cursor":0, "next_cursor":1
+        });
+        assert_eq!(
+            provider.send_raw(&ack_request).await.unwrap()["data"]["advanced"],
+            true
+        );
+
+        {
+            let state = node.gossip_state.lock().await;
+            let mut buffers = state.buffers.lock().await;
+            let buffer = buffers.get_mut(topic).unwrap();
+            let duplicate = buffer.messages.back().unwrap().clone();
+            assert!(!push_gossip_buffer_message(buffer, duplicate));
+            assert_eq!(buffer.base_index, 0);
+            assert_eq!(buffer.retained_bytes, GOSSIP_TOPIC_BUFFER_MAX_BYTES);
+
+            let next = gossip_test_message_with_encoded_len(66, GOSSIP_WIRE_MESSAGE_MAX_BYTES);
+            assert!(push_gossip_buffer_message(buffer, next));
+            assert_eq!(buffer.base_index, 3);
+            assert_eq!(buffer.messages.len(), 64);
+            assert_eq!(buffer.retained_bytes, GOSSIP_TOPIC_BUFFER_MAX_BYTES);
+        }
+
+        let replay = provider.send_raw(&ack_request).await.unwrap();
+        assert_eq!(replay["status"], "ok");
+        assert_eq!(replay["data"]["advanced"], false);
+        let normalized = provider
+            .send_raw(&serde_json::json!({
+                "op":"gossip_peek", "topic":topic,
+                "consumer_id":"byte-eviction", "limit":1
+            }))
+            .await
+            .unwrap();
+        assert_eq!(normalized["data"]["cursor"], 3);
+        assert_eq!(normalized["data"]["next_cursor"], 4);
+        assert_eq!(normalized["data"]["messages"][0]["nonce"], 4);
+        shutdown_test_carrier_node(node).await;
+    }
+
+    #[tokio::test]
     async fn test_carrier_gossip_push_pull_over_carrier_client() {
         let dir = tempfile::tempdir().unwrap();
         let (sk, did) = elastos_identity::derive_did(&[33u8; 32]);
@@ -9170,6 +11306,558 @@ mod tests {
         shutdown_test_carrier_node(node).await;
     }
 
+    fn cursor_test_message(index: u64) -> GossipMessage {
+        GossipMessage {
+            sender_id: format!("transport-sender-{index}"),
+            sender_nick: format!("transport-nick-{index}"),
+            content: format!("opaque-frame-{index}"),
+            ts: 1_700_000_000 + index,
+            nonce: index + 1,
+            signature: Some(format!("untrusted-signature-{index}")),
+            sender_session_id: Some(format!("untrusted-session-{index}")),
+        }
+    }
+
+    async fn install_cursor_test_topic(
+        node: &CarrierNode,
+        topic: &str,
+        base_index: u64,
+        message_indexes: impl IntoIterator<Item = u64>,
+    ) {
+        let mut state = node.gossip_state.lock().await;
+        state.joined_topics.insert(topic.to_string());
+        state.buffers.lock().await.insert(
+            topic.to_string(),
+            test_topic_buffer(
+                message_indexes.into_iter().map(cursor_test_message),
+                base_index,
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gossip_peek_is_repeatable_and_ack_advances_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing_key, did) = elastos_identity::derive_did(&[61u8; 32]);
+        let node = start_carrier_node(&signing_key, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let provider = CarrierGossipProvider::new(node.gossip_state.clone());
+        let topic = "__test/gossip-peek-repeatable";
+        install_cursor_test_topic(&node, topic, 0, 0..3).await;
+
+        let peek_request = serde_json::json!({
+            "op": "gossip_peek",
+            "topic": topic,
+            "consumer_id": "durable-consumer",
+            "limit": 1,
+        });
+        let first = provider.send_raw(&peek_request).await.unwrap();
+        {
+            let state = node.gossip_state.lock().await;
+            let message = cursor_test_message(3);
+            push_gossip_buffer_message(state.buffers.lock().await.get_mut(topic).unwrap(), message);
+        }
+        let repeated = provider.send_raw(&peek_request).await.unwrap();
+        assert_eq!(
+            first, repeated,
+            "peek must retain its exact range when frames are appended"
+        );
+        assert_eq!(first["status"], "ok");
+        assert_eq!(first["data"]["cursor"], 0);
+        assert_eq!(first["data"]["next_cursor"], 1);
+        assert_eq!(first["data"]["scanned"], 1);
+        assert_eq!(
+            first["data"]["messages"][0]["sender_id"],
+            "transport-sender-0"
+        );
+        assert_eq!(
+            first["data"]["messages"][0]["sender_session_id"], "untrusted-session-0",
+            "peek must not filter or reinterpret outer transport metadata"
+        );
+        {
+            let state = node.gossip_state.lock().await;
+            let cursors = state.cursors.lock().await;
+            assert_eq!(
+                cursors
+                    .get(&(topic.to_string(), "durable-consumer".to_string()))
+                    .unwrap()
+                    .position,
+                0
+            );
+        }
+
+        for unobserved_ack in [(0, 3), (0, 4)] {
+            let rejected = provider
+                .send_raw(&serde_json::json!({
+                    "op":"gossip_ack", "topic":topic, "consumer_id":"durable-consumer",
+                    "cursor":unobserved_ack.0, "next_cursor":unobserved_ack.1
+                }))
+                .await
+                .unwrap();
+            assert_eq!(rejected["status"], "error");
+            assert_eq!(rejected["code"], "unobserved_ack_range");
+        }
+
+        let ack_request = serde_json::json!({
+            "op": "gossip_ack",
+            "topic": topic,
+            "consumer_id": "durable-consumer",
+            "cursor": 0,
+            "next_cursor": 1,
+        });
+        let ack = provider.send_raw(&ack_request).await.unwrap();
+        assert_eq!(ack["status"], "ok");
+        assert_eq!(ack["data"]["advanced"], true);
+        let replay = provider.send_raw(&ack_request).await.unwrap();
+        assert_eq!(replay["status"], "ok");
+        assert_eq!(replay["data"]["advanced"], false);
+
+        {
+            let state = node.gossip_state.lock().await;
+            let mut buffers = state.buffers.lock().await;
+            let buffer = buffers.get_mut(topic).unwrap();
+            pop_gossip_buffer_front(buffer);
+            pop_gossip_buffer_front(buffer);
+        }
+        let replay_after_eviction = provider.send_raw(&ack_request).await.unwrap();
+        assert_eq!(replay_after_eviction["status"], "ok");
+        assert_eq!(replay_after_eviction["data"]["advanced"], false);
+        let conflicting_replay = provider
+            .send_raw(&serde_json::json!({
+                "op":"gossip_ack", "topic":topic, "consumer_id":"durable-consumer",
+                "cursor":0, "next_cursor":2
+            }))
+            .await
+            .unwrap();
+        assert_eq!(conflicting_replay["status"], "error");
+
+        let next = provider.send_raw(&peek_request).await.unwrap();
+        assert_eq!(next["data"]["cursor"], 2);
+        assert_eq!(next["data"]["next_cursor"], 3);
+        assert_eq!(next["data"]["messages"][0]["content"], "opaque-frame-2");
+
+        for invalid_ack in [
+            serde_json::json!({
+                "op":"gossip_ack", "topic":topic, "consumer_id":"durable-consumer",
+                "cursor":1, "next_cursor":3
+            }),
+            serde_json::json!({
+                "op":"gossip_ack", "topic":topic, "consumer_id":"durable-consumer",
+                "cursor":2, "next_cursor":1
+            }),
+            serde_json::json!({
+                "op":"gossip_ack", "topic":topic, "consumer_id":"durable-consumer",
+                "cursor":2, "next_cursor":5
+            }),
+        ] {
+            assert_eq!(
+                provider.send_raw(&invalid_ack).await.unwrap()["status"],
+                "error",
+                "invalid acknowledgement must fail: {invalid_ack}"
+            );
+        }
+
+        let final_ack = provider
+            .send_raw(&serde_json::json!({
+                "op":"gossip_ack", "topic":topic, "consumer_id":"durable-consumer",
+                "cursor":2, "next_cursor":3
+            }))
+            .await
+            .unwrap();
+        assert_eq!(final_ack["data"]["advanced"], true);
+        assert_eq!(
+            provider.send_raw(&ack_request).await.unwrap()["status"],
+            "error",
+            "a later acknowledgement must retire the older replay boundary"
+        );
+        shutdown_test_carrier_node(node).await;
+    }
+
+    #[tokio::test]
+    async fn test_gossip_peek_enforces_aggregate_encoded_batch_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing_key, did) = elastos_identity::derive_did(&[64u8; 32]);
+        let node = start_carrier_node(&signing_key, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let provider = CarrierGossipProvider::new(node.gossip_state.clone());
+        let bounded_topic = "__test/gossip-peek-byte-bound";
+        let oversized_topic = "__test/gossip-peek-oversized-first";
+        let mut valid_messages = Vec::new();
+        let mut retained_bytes = 0;
+        while retained_bytes < GOSSIP_TOPIC_BUFFER_MAX_BYTES {
+            let encoded_len =
+                (GOSSIP_TOPIC_BUFFER_MAX_BYTES - retained_bytes).min(GOSSIP_WIRE_MESSAGE_MAX_BYTES);
+            let message =
+                gossip_test_message_with_encoded_len(valid_messages.len() as u64, encoded_len);
+            retained_bytes += encoded_len;
+            valid_messages.push(message);
+        }
+        assert_eq!(retained_bytes, GOSSIP_TOPIC_BUFFER_MAX_BYTES);
+        assert!(valid_messages.len() <= GOSSIP_PEEK_MAX_MESSAGES);
+        let oversized = gossip_test_message_with_encoded_len(
+            valid_messages.len() as u64,
+            GOSSIP_PEEK_MAX_BATCH_BYTES,
+        );
+        {
+            let mut state = node.gossip_state.lock().await;
+            state.joined_topics.insert(bounded_topic.to_string());
+            state.joined_topics.insert(oversized_topic.to_string());
+            let mut buffers = state.buffers.lock().await;
+            buffers.insert(
+                bounded_topic.to_string(),
+                test_topic_buffer(valid_messages, 0),
+            );
+            buffers.insert(
+                oversized_topic.to_string(),
+                corrupt_test_topic_buffer([oversized], 0),
+            );
+        }
+
+        let bounded = provider
+            .send_raw(&serde_json::json!({
+                "op":"gossip_peek", "topic":bounded_topic,
+                "consumer_id":"byte-bounded", "limit":GOSSIP_PEEK_MAX_MESSAGES
+            }))
+            .await
+            .unwrap();
+        assert_eq!(bounded["status"], "ok");
+        assert_eq!(bounded["data"]["cursor"], 0);
+        let next_cursor = bounded["data"]["next_cursor"].as_u64().unwrap();
+        assert!(next_cursor > 0);
+        assert_eq!(
+            bounded["data"]["messages"].as_array().unwrap().len() as u64,
+            next_cursor
+        );
+        let encoded_response_len = serde_json::to_vec(&bounded).unwrap().len();
+        assert!(
+            encoded_response_len <= GOSSIP_PEEK_MAX_BATCH_BYTES,
+            "the complete encoded provider response must fit the batch boundary"
+        );
+        assert!(encoded_response_len > GOSSIP_PEEK_MAX_BATCH_BYTES - 256 * 1024);
+        let changed_limit = provider
+            .send_raw(&serde_json::json!({
+                "op":"gossip_peek", "topic":bounded_topic,
+                "consumer_id":"byte-bounded", "limit":1
+            }))
+            .await
+            .unwrap();
+        assert_eq!(changed_limit["status"], "error");
+        assert_eq!(changed_limit["code"], "peek_limit_conflict");
+        let skipped_prefix = provider
+            .send_raw(&serde_json::json!({
+                "op":"gossip_ack", "topic":bounded_topic,
+                "consumer_id":"byte-bounded", "cursor":0,
+                "next_cursor":next_cursor + 1
+            }))
+            .await
+            .unwrap();
+        assert_eq!(skipped_prefix["status"], "error");
+        assert_eq!(skipped_prefix["code"], "unobserved_ack_range");
+        assert_eq!(
+            provider
+                .send_raw(&serde_json::json!({
+                    "op":"gossip_ack", "topic":bounded_topic,
+                    "consumer_id":"byte-bounded", "cursor":0,
+                    "next_cursor":next_cursor
+                }))
+                .await
+                .unwrap()["status"],
+            "ok"
+        );
+
+        let oversized_first = provider
+            .send_raw(&serde_json::json!({
+                "op":"gossip_peek", "topic":oversized_topic,
+                "consumer_id":"oversized-first", "limit":1
+            }))
+            .await
+            .unwrap();
+        assert_eq!(oversized_first["status"], "error");
+        assert_eq!(oversized_first["code"], "peek_frame_too_large");
+        let state = node.gossip_state.lock().await;
+        let cursors = state.cursors.lock().await;
+        let cursor = cursors
+            .get(&(oversized_topic.to_string(), "oversized-first".to_string()))
+            .unwrap();
+        assert_eq!(cursor.position, 0);
+        assert_eq!(cursor.outstanding_peek, None);
+        drop(cursors);
+        drop(state);
+        shutdown_test_carrier_node(node).await;
+    }
+
+    #[tokio::test]
+    async fn test_gossip_empty_peek_requires_exact_empty_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing_key, did) = elastos_identity::derive_did(&[65u8; 32]);
+        let node = start_carrier_node(&signing_key, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let provider = CarrierGossipProvider::new(node.gossip_state.clone());
+        let topic = "__test/gossip-empty-peek";
+        install_cursor_test_topic(&node, topic, 0, std::iter::empty()).await;
+
+        let peek_request = serde_json::json!({
+            "op":"gossip_peek", "topic":topic, "consumer_id":"empty", "limit":1
+        });
+        let empty = provider.send_raw(&peek_request).await.unwrap();
+        assert_eq!(empty["status"], "ok");
+        assert_eq!(empty["data"]["cursor"], 0);
+        assert_eq!(empty["data"]["next_cursor"], 0);
+        assert_eq!(empty["data"]["messages"].as_array().unwrap().len(), 0);
+        let empty_ack = serde_json::json!({
+            "op":"gossip_ack", "topic":topic, "consumer_id":"empty",
+            "cursor":0, "next_cursor":0
+        });
+        let accepted = provider.send_raw(&empty_ack).await.unwrap();
+        assert_eq!(accepted["status"], "ok");
+        assert_eq!(accepted["data"]["advanced"], false);
+        assert_eq!(provider.send_raw(&peek_request).await.unwrap(), empty);
+        assert_eq!(
+            provider.send_raw(&empty_ack).await.unwrap(),
+            accepted,
+            "a second current empty range must be consumed, not mistaken for replay"
+        );
+
+        {
+            let state = node.gossip_state.lock().await;
+            state
+                .buffers
+                .lock()
+                .await
+                .get_mut(topic)
+                .unwrap()
+                .messages
+                .push_back(cursor_test_message(0));
+        }
+        let appended = provider.send_raw(&peek_request).await.unwrap();
+        assert_eq!(appended["data"]["cursor"], 0);
+        assert_eq!(appended["data"]["next_cursor"], 1);
+        assert_eq!(appended["data"]["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(provider.send_raw(&empty_ack).await.unwrap(), accepted);
+        assert_eq!(
+            provider
+                .send_raw(&serde_json::json!({
+                    "op":"gossip_ack", "topic":topic, "consumer_id":"empty",
+                    "cursor":0, "next_cursor":1
+                }))
+                .await
+                .unwrap()["data"]["advanced"],
+            true
+        );
+        shutdown_test_carrier_node(node).await;
+    }
+
+    #[tokio::test]
+    async fn test_gossip_peek_normalizes_evicted_prefix_without_crossing_consumers_or_topics() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing_key, did) = elastos_identity::derive_did(&[62u8; 32]);
+        let node = start_carrier_node(&signing_key, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let provider = CarrierGossipProvider::new(node.gossip_state.clone());
+        let topic_a = "__test/gossip-peek-isolation-a";
+        let topic_b = "__test/gossip-peek-isolation-b";
+        install_cursor_test_topic(&node, topic_a, 0, 0..3).await;
+        install_cursor_test_topic(&node, topic_b, 10, 10..12).await;
+
+        let peek_a = serde_json::json!({
+            "op":"gossip_peek", "topic":topic_a, "consumer_id":"consumer-a", "limit":1
+        });
+        assert_eq!(
+            provider.send_raw(&peek_a).await.unwrap()["data"]["cursor"],
+            0
+        );
+        {
+            let state = node.gossip_state.lock().await;
+            let mut buffers = state.buffers.lock().await;
+            let buffer = buffers.get_mut(topic_a).unwrap();
+            pop_gossip_buffer_front(buffer);
+        }
+        let after_eviction = provider.send_raw(&peek_a).await.unwrap();
+        assert_eq!(after_eviction["data"]["cursor"], 1);
+        assert_eq!(after_eviction["data"]["next_cursor"], 2);
+        assert_eq!(
+            after_eviction["data"]["messages"][0]["content"],
+            "opaque-frame-1"
+        );
+
+        let other_consumer = provider
+            .send_raw(&serde_json::json!({
+                "op":"gossip_peek", "topic":topic_a, "consumer_id":"consumer-b", "limit":1
+            }))
+            .await
+            .unwrap();
+        assert_eq!(other_consumer["data"]["cursor"], 1);
+        let other_topic = provider
+            .send_raw(&serde_json::json!({
+                "op":"gossip_peek", "topic":topic_b, "consumer_id":"consumer-a", "limit":1
+            }))
+            .await
+            .unwrap();
+        assert_eq!(other_topic["data"]["cursor"], 10);
+        assert_eq!(
+            other_topic["data"]["messages"][0]["content"],
+            "opaque-frame-10"
+        );
+
+        let foreign_topic_ack = provider
+            .send_raw(&serde_json::json!({
+                "op":"gossip_ack", "topic":"__test/not-joined", "consumer_id":"consumer-a",
+                "cursor":0, "next_cursor":0
+            }))
+            .await
+            .unwrap();
+        assert_eq!(foreign_topic_ack["status"], "error");
+
+        let state = node.gossip_state.lock().await;
+        let cursors = state.cursors.lock().await;
+        assert_eq!(cursors.len(), 3);
+        assert_eq!(
+            cursors
+                .get(&(topic_a.to_string(), "consumer-a".to_string()))
+                .unwrap()
+                .position,
+            1
+        );
+        assert_eq!(
+            cursors
+                .get(&(topic_a.to_string(), "consumer-b".to_string()))
+                .unwrap()
+                .position,
+            1
+        );
+        assert_eq!(
+            cursors
+                .get(&(topic_b.to_string(), "consumer-a".to_string()))
+                .unwrap()
+                .position,
+            10
+        );
+        drop(cursors);
+        drop(state);
+        shutdown_test_carrier_node(node).await;
+    }
+
+    #[tokio::test]
+    async fn test_gossip_peek_ack_inputs_and_cursor_capacity_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing_key, did) = elastos_identity::derive_did(&[63u8; 32]);
+        let node = start_carrier_node(&signing_key, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let provider = CarrierGossipProvider::new(node.gossip_state.clone());
+        let topic = "__test/gossip-peek-bounds";
+        install_cursor_test_topic(&node, topic, 0, 0..1).await;
+        node.gossip_state
+            .lock()
+            .await
+            .joined_topics
+            .insert("__test/joined-without-buffer".to_string());
+
+        let oversized_topic = "x".repeat(GOSSIP_CARRIER_PUSH_MAX_TOPIC_LEN + 1);
+        let oversized_consumer = "x".repeat(GOSSIP_CURSOR_MAX_CONSUMER_ID_BYTES + 1);
+        let invalid_peeks = [
+            serde_json::json!({"op":"gossip_peek","consumer_id":"consumer","limit":1}),
+            serde_json::json!({"op":"gossip_peek","topic":7,"consumer_id":"consumer","limit":1}),
+            serde_json::json!({"op":"gossip_peek","topic":"bad\ntopic","consumer_id":"consumer","limit":1}),
+            serde_json::json!({"op":"gossip_peek","topic":oversized_topic,"consumer_id":"consumer","limit":1}),
+            serde_json::json!({"op":"gossip_peek","topic":topic,"limit":1}),
+            serde_json::json!({"op":"gossip_peek","topic":topic,"consumer_id":"","limit":1}),
+            serde_json::json!({"op":"gossip_peek","topic":topic,"consumer_id":oversized_consumer,"limit":1}),
+            serde_json::json!({"op":"gossip_peek","topic":topic,"consumer_id":"consumer"}),
+            serde_json::json!({"op":"gossip_peek","topic":topic,"consumer_id":"consumer","limit":0}),
+            serde_json::json!({"op":"gossip_peek","topic":topic,"consumer_id":"consumer","limit":GOSSIP_PEEK_MAX_MESSAGES + 1}),
+            serde_json::json!({"op":"gossip_peek","topic":topic,"consumer_id":"consumer","limit":"1"}),
+            serde_json::json!({"op":"gossip_peek","topic":"__test/not-joined","consumer_id":"consumer","limit":1}),
+            serde_json::json!({"op":"gossip_peek","topic":"__test/joined-without-buffer","consumer_id":"consumer","limit":1}),
+        ];
+        for request in invalid_peeks {
+            assert_eq!(
+                provider.send_raw(&request).await.unwrap()["status"],
+                "error",
+                "invalid peek must fail: {request}"
+            );
+        }
+
+        provider
+            .send_raw(&serde_json::json!({
+                "op":"gossip_peek", "topic":topic, "consumer_id":"ack-input", "limit":1
+            }))
+            .await
+            .unwrap();
+        for request in [
+            serde_json::json!({
+                "op":"gossip_ack", "topic":topic, "consumer_id":"ack-input", "next_cursor":1
+            }),
+            serde_json::json!({
+                "op":"gossip_ack", "topic":topic, "consumer_id":"ack-input", "cursor":0
+            }),
+            serde_json::json!({
+                "op":"gossip_ack", "topic":topic, "consumer_id":"ack-input",
+                "cursor":"0", "next_cursor":1
+            }),
+            serde_json::json!({
+                "op":"gossip_ack", "topic":topic, "consumer_id":"never-peeked",
+                "cursor":0, "next_cursor":1
+            }),
+        ] {
+            assert_eq!(
+                provider.send_raw(&request).await.unwrap()["status"],
+                "error",
+                "invalid ack must fail: {request}"
+            );
+        }
+
+        let existing_consumers = {
+            let state = node.gossip_state.lock().await;
+            let mut cursors = state.cursors.lock().await;
+            cursors.clear();
+            let consumers = (0..MAX_CURSORS)
+                .map(|index| format!("bounded-{index}"))
+                .collect::<Vec<_>>();
+            for consumer in &consumers {
+                cursors.insert(
+                    (topic.to_string(), consumer.clone()),
+                    GossipConsumerCursor::at(0),
+                );
+            }
+            consumers
+        };
+        let bounded_peek = provider
+            .send_raw(&serde_json::json!({
+                "op":"gossip_peek", "topic":topic, "consumer_id":"new-consumer", "limit":1
+            }))
+            .await
+            .unwrap();
+        assert_eq!(bounded_peek["status"], "ok");
+        let evicted_consumer = {
+            let state = node.gossip_state.lock().await;
+            assert!(state.bootstrap_peers.is_empty());
+            assert_eq!(state.joined_topics.len(), 2);
+            let cursors = state.cursors.lock().await;
+            assert!(cursors.len() <= MAX_CURSORS);
+            assert!(cursors.contains_key(&(topic.to_string(), "new-consumer".to_string())));
+            existing_consumers
+                .into_iter()
+                .find(|consumer| !cursors.contains_key(&(topic.to_string(), consumer.clone())))
+                .expect("cursor pressure must evict at least one old consumer")
+        };
+        let evicted_ack = provider
+            .send_raw(&serde_json::json!({
+                "op":"gossip_ack", "topic":topic, "consumer_id":evicted_consumer,
+                "cursor":0, "next_cursor":1
+            }))
+            .await
+            .unwrap();
+        assert_eq!(evicted_ack["status"], "error");
+        assert_eq!(evicted_ack["code"], "unknown_cursor");
+
+        shutdown_test_carrier_node(node).await;
+    }
+
     /// Prove that two consumers sharing the same gossip buffer see each
     /// other's messages. This is the core invariant for same-runtime
     /// native↔WASM chat interop: both capsules use the shared buffer
@@ -9178,27 +11866,21 @@ mod tests {
     async fn test_shared_buffer_cross_consumer_delivery() {
         let buffers: Arc<Mutex<HashMap<String, TopicBuffer>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let cursors: Arc<Mutex<HashMap<(String, String), u64>>> =
+        let cursors: Arc<Mutex<HashMap<(String, String), GossipConsumerCursor>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let topic = "#general".to_string();
 
         // Create buffer
         {
             let mut bufs = buffers.lock().await;
-            bufs.insert(
-                topic.clone(),
-                TopicBuffer {
-                    messages: VecDeque::new(),
-                    base_index: 0,
-                },
-            );
+            bufs.insert(topic.clone(), TopicBuffer::default());
         }
 
         // Consumer A (native chat) writes a message
         {
             let mut bufs = buffers.lock().await;
             let buf = bufs.get_mut(&topic).unwrap();
-            buf.messages.push_back(GossipMessage {
+            let message = GossipMessage {
                 sender_id: "did:key:zAlice".to_string(),
                 sender_nick: "alice".to_string(),
                 content: "hello from native".to_string(),
@@ -9206,7 +11888,8 @@ mod tests {
                 nonce: 1,
                 signature: Some("sig_alice".to_string()),
                 sender_session_id: None,
-            });
+            };
+            push_gossip_buffer_message(buf, message);
         }
 
         // Consumer B (WASM chat) reads with different consumer_id
@@ -9216,14 +11899,14 @@ mod tests {
             let mut curs = cursors.lock().await;
             let cursor = curs
                 .entry((topic.clone(), "chat-wasm".to_string()))
-                .or_insert(buf.base_index);
-            let start = (*cursor - buf.base_index) as usize;
+                .or_insert_with(|| GossipConsumerCursor::at(buf.base_index));
+            let start = (cursor.position - buf.base_index) as usize;
             let messages: Vec<&GossipMessage> = buf.messages.iter().skip(start).take(50).collect();
 
             assert_eq!(messages.len(), 1, "WASM consumer must see native's message");
             assert_eq!(messages[0].content, "hello from native");
             assert_eq!(messages[0].sender_nick, "alice");
-            *cursor = buf.base_index + start as u64 + messages.len() as u64;
+            cursor.position = buf.base_index + start as u64 + messages.len() as u64;
         }
 
         // Consumer A (native chat) reads — should also see its own message
@@ -9233,8 +11916,8 @@ mod tests {
             let mut curs = cursors.lock().await;
             let cursor = curs
                 .entry((topic.clone(), "chat-native".to_string()))
-                .or_insert(buf.base_index);
-            let start = (*cursor - buf.base_index) as usize;
+                .or_insert_with(|| GossipConsumerCursor::at(buf.base_index));
+            let start = (cursor.position - buf.base_index) as usize;
             let messages: Vec<&GossipMessage> = buf.messages.iter().skip(start).take(50).collect();
 
             assert_eq!(
@@ -9242,14 +11925,14 @@ mod tests {
                 1,
                 "native consumer must see its own message"
             );
-            *cursor = buf.base_index + start as u64 + messages.len() as u64;
+            cursor.position = buf.base_index + start as u64 + messages.len() as u64;
         }
 
         // Consumer B writes a reply
         {
             let mut bufs = buffers.lock().await;
             let buf = bufs.get_mut(&topic).unwrap();
-            buf.messages.push_back(GossipMessage {
+            let message = GossipMessage {
                 sender_id: "did:key:zBob".to_string(),
                 sender_nick: "bob".to_string(),
                 content: "hello from wasm".to_string(),
@@ -9257,7 +11940,8 @@ mod tests {
                 nonce: 2,
                 signature: Some("sig_bob".to_string()),
                 sender_session_id: None,
-            });
+            };
+            push_gossip_buffer_message(buf, message);
         }
 
         // Consumer A reads again — should see only the new message (cursor advanced)
@@ -9267,8 +11951,8 @@ mod tests {
             let mut curs = cursors.lock().await;
             let cursor = curs
                 .entry((topic.clone(), "chat-native".to_string()))
-                .or_insert(buf.base_index);
-            let start = (*cursor - buf.base_index) as usize;
+                .or_insert_with(|| GossipConsumerCursor::at(buf.base_index));
+            let start = (cursor.position - buf.base_index) as usize;
             let messages: Vec<&GossipMessage> = buf.messages.iter().skip(start).take(50).collect();
 
             assert_eq!(
@@ -9283,10 +11967,7 @@ mod tests {
 
     #[test]
     fn test_gossip_buffer_deduplicates_replayed_delivery() {
-        let mut buffer = TopicBuffer {
-            messages: VecDeque::new(),
-            base_index: 0,
-        };
+        let mut buffer = TopicBuffer::default();
         let message = GossipMessage {
             sender_id: "did:key:zAlice".to_string(),
             sender_nick: "alice".to_string(),

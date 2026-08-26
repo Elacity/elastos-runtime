@@ -8,12 +8,22 @@ export let launcherGrid = document.querySelector("#launcher-grid");
 export let launcherEmptyState = document.querySelector("#launcher-empty-state");
 export let launcherSearch = document.querySelector("#launcher-search");
 export let launcherToggleButton = document.querySelector("#launcher-toggle");
-export let closeLauncherButton = document.querySelector("#close-launcher");
+export let launcherViewToggle = document.querySelector("#launcher-view-toggle");
+export let toolbarActiveTitleNode = document.querySelector("#toolbar-active-title");
 export let toolbarHomeButton = document.querySelector("#toolbar-home");
+export let toolbarIdentityAvatar = document.querySelector("#toolbar-identity-avatar");
+export let toolbarIdentityMonogram = document.querySelector("#toolbar-identity-monogram");
+export let toolbarIdentityAvatarImage = document.querySelector("#toolbar-identity-avatar-image");
 export let toolbarInboxButton = document.querySelector("#toolbar-inbox");
 export let toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
-export let toolbarFullscreenButton = document.querySelector("#toolbar-fullscreen");
-export let toolbarSignOutButton = document.querySelector("#toolbar-sign-out");
+export let toolbarSpotlightButton = document.querySelector("#toolbar-spotlight");
+export let toolbarFullscreenButton = document.querySelector("#control-centre-fullscreen");
+export let toolbarSignOutButton = document.querySelector("#identity-menu-sign-out");
+export let toolbarSystem = document.querySelector("#toolbar-system");
+export let toolbarIdentityMenu = document.querySelector("#toolbar-identity-menu");
+export let toolbarIdentityMenuName = document.querySelector("#toolbar-identity-menu-name");
+export let identityMenuSystemButton = document.querySelector("#identity-menu-system");
+export let identityMenuShowDesktopButton = document.querySelector("#identity-menu-show-desktop");
 export let homeNotificationToast = document.querySelector("#home-notification-toast");
 export let homeNotificationTitle = document.querySelector("#home-notification-title");
 export let homeNotificationBody = document.querySelector("#home-notification-body");
@@ -50,9 +60,9 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260725a", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260813a", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260725a", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260813a", import.meta.url).href;
 let homeGuiTemplateHtmlPromise = null;
 let homeGuiLaunchToken = "";
 
@@ -70,6 +80,9 @@ export const shellState = {
   zIndexCounter: 100,
   browserWindowSerial: 0,
   activeWindowId: null,
+  activeStageId: "desktop",
+  extraDesktops: [],
+  spaceOrder: [],
   clockTimer: null,
   summaryRefreshDebounceTimer: null,
   summaryRefreshInFlight: false,
@@ -102,6 +115,7 @@ export const shellState = {
   contextMenuTarget: { kind: "desktop" },
   contextMenuIgnoreOutsideUntil: 0,
   selectedDesktopTargetId: null,
+  marqueeSelection: new Set(),
   recentTargetIds: [],
   selectedLauncherTargetId: null,
   launcherIgnoreOutsideUntil: 0,
@@ -137,12 +151,22 @@ function bindHomeGuiDomRefs() {
   launcherEmptyState = document.querySelector("#launcher-empty-state");
   launcherSearch = document.querySelector("#launcher-search");
   launcherToggleButton = document.querySelector("#launcher-toggle");
-  closeLauncherButton = document.querySelector("#close-launcher");
+  launcherViewToggle = document.querySelector("#launcher-view-toggle");
+  toolbarActiveTitleNode = document.querySelector("#toolbar-active-title");
   toolbarHomeButton = document.querySelector("#toolbar-home");
+  toolbarIdentityAvatar = document.querySelector("#toolbar-identity-avatar");
+  toolbarIdentityMonogram = document.querySelector("#toolbar-identity-monogram");
+  toolbarIdentityAvatarImage = document.querySelector("#toolbar-identity-avatar-image");
   toolbarInboxButton = document.querySelector("#toolbar-inbox");
   toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
-  toolbarFullscreenButton = document.querySelector("#toolbar-fullscreen");
-  toolbarSignOutButton = document.querySelector("#toolbar-sign-out");
+  toolbarSpotlightButton = document.querySelector("#toolbar-spotlight");
+  toolbarFullscreenButton = document.querySelector("#control-centre-fullscreen");
+  toolbarSignOutButton = document.querySelector("#identity-menu-sign-out");
+  toolbarSystem = document.querySelector("#toolbar-system");
+  toolbarIdentityMenu = document.querySelector("#toolbar-identity-menu");
+  toolbarIdentityMenuName = document.querySelector("#toolbar-identity-menu-name");
+  identityMenuSystemButton = document.querySelector("#identity-menu-system");
+  identityMenuShowDesktopButton = document.querySelector("#identity-menu-show-desktop");
   homeNotificationToast = document.querySelector("#home-notification-toast");
   homeNotificationTitle = document.querySelector("#home-notification-title");
   homeNotificationBody = document.querySelector("#home-notification-body");
@@ -260,6 +284,13 @@ export async function fetchJson(url, init) {
   return response.json();
 }
 
+export async function mutateDesktopObject(op, payload = {}) {
+  return fetchJson("/api/apps/home/desktop/objects", {
+    method: "POST",
+    body: JSON.stringify({ op, ...payload }),
+  });
+}
+
 export function allVisibleTargets(summary) {
   if (!summary || !Array.isArray(summary.targets)) {
     return [];
@@ -365,6 +396,73 @@ export function targetTitle(summary, targetId) {
 export function canonicalTargetTitle(targetId, title) {
   const normalizedTitle = normalizeText(title);
   return normalizedTitle || targetId;
+}
+
+/* Window chrome modes are presentation-only. Fail closed to standard.
+   unified-sidebar: split-view apps — lights over the leading column.
+   unified-toolbar: Browser-style — lights over the tool row; menubar owns the
+   focused app name. */
+export const WINDOW_CHROME_STANDARD = "standard";
+export const WINDOW_CHROME_UNIFIED_SIDEBAR = "unified-sidebar";
+export const WINDOW_CHROME_UNIFIED_TOOLBAR = "unified-toolbar";
+
+const WINDOW_CHROME_BY_TARGET = {
+  marketplace: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  system: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  library: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  services: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  people: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  documents: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  inbox: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  chat: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  "chat-room": WINDOW_CHROME_UNIFIED_SIDEBAR,
+  browser: WINDOW_CHROME_UNIFIED_TOOLBAR,
+};
+
+const WINDOW_CHROME_CONTINUOUS_TARGETS = new Set([
+  "wallet",
+  "archive-manager",
+  "gba-emulator",
+  "wallet-metamask",
+  "wallet-unisat",
+  "wallet-walletconnect",
+]);
+
+export function parseWindowChromeMode(value) {
+  if (value === WINDOW_CHROME_UNIFIED_SIDEBAR) {
+    return WINDOW_CHROME_UNIFIED_SIDEBAR;
+  }
+  if (value === WINDOW_CHROME_UNIFIED_TOOLBAR) {
+    return WINDOW_CHROME_UNIFIED_TOOLBAR;
+  }
+  return WINDOW_CHROME_STANDARD;
+}
+
+function windowChromeModeForTarget(targetId) {
+  return parseWindowChromeMode(
+    WINDOW_CHROME_BY_TARGET[normalizeText(targetId).toLowerCase()] || WINDOW_CHROME_STANDARD,
+  );
+}
+
+export function applyWindowChrome(windowNode, targetId) {
+  if (!windowNode) {
+    return WINDOW_CHROME_STANDARD;
+  }
+  windowNode.classList.remove(
+    "window-chrome-unified-sidebar",
+    "window-chrome-unified-toolbar",
+    "window-chrome-continuous",
+  );
+  const mode = windowChromeModeForTarget(targetId);
+  if (mode === WINDOW_CHROME_UNIFIED_SIDEBAR) {
+    windowNode.classList.add("window-chrome-unified-sidebar");
+  } else if (mode === WINDOW_CHROME_UNIFIED_TOOLBAR) {
+    windowNode.classList.add("window-chrome-unified-toolbar");
+  } else if (WINDOW_CHROME_CONTINUOUS_TARGETS.has(normalizeText(targetId).toLowerCase())) {
+    windowNode.classList.add("window-chrome-continuous");
+  }
+  windowNode.dataset.windowChromeMode = mode;
+  return mode;
 }
 
 export function desktopLabelForTarget(summary, targetId) {
@@ -665,6 +763,20 @@ export function clampDesktopPosition(position) {
   };
 }
 
+export function snapDesktopPosition(entryId, position) {
+  const clamped = clampDesktopPosition(position);
+  const snapped = clampDesktopPosition({
+    x: DESKTOP_ICON_MARGIN +
+      Math.round((clamped.x - DESKTOP_ICON_MARGIN) / DESKTOP_ICON_GAP_X) * DESKTOP_ICON_GAP_X,
+    y: DESKTOP_ICON_MARGIN +
+      Math.round((clamped.y - DESKTOP_ICON_MARGIN) / DESKTOP_ICON_GAP_Y) * DESKTOP_ICON_GAP_Y,
+  });
+  if (desktopPositionOverlapsAny(snapped, occupiedDesktopPositionsExcept(entryId))) {
+    return clamped;
+  }
+  return snapped;
+}
+
 export function desktopPositionForTarget(targetId, defaultIndex) {
   const stored = shellState.shellLayoutState.desktop[targetId];
   if (stored) {
@@ -807,10 +919,95 @@ export function clampDesktopLayoutToViewport() {
   return changed;
 }
 
+export function trapTabWithin(container, event) {
+  if (event.key !== "Tab" || !container) {
+    return false;
+  }
+  const focusables = Array.from(
+    container.querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter(
+    (element) => !element.hidden && !element.disabled && element.offsetParent !== null,
+  );
+  if (focusables.length === 0) {
+    event.preventDefault();
+    return true;
+  }
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const active = document.activeElement;
+  if (event.shiftKey && (active === first || !container.contains(active))) {
+    event.preventDefault();
+    last.focus();
+    return true;
+  }
+  if (!event.shiftKey && (active === last || !container.contains(active))) {
+    event.preventDefault();
+    first.focus();
+    return true;
+  }
+  return false;
+}
+
 export function mountGlyph(container, targetId, forcedTone) {
   const tone = forcedTone || glyphTone(targetId);
   container.dataset.tone = tone;
+  const capsuleIcon = capsuleIconMarkup(targetId);
+  if (capsuleIcon) {
+    // "raster" tells the stylesheet to drop the synthetic tile it draws behind
+    // the built-in glyphs, so the capsule's own artwork stands alone.
+    container.dataset.tone = "raster";
+    container.innerHTML = capsuleIcon;
+    return;
+  }
   container.innerHTML = glyphSvg(targetId);
+}
+
+export function formatBadgeCount(count, cap = 99) {
+  const n = Math.max(0, Number(count) || 0);
+  if (n === 0) {
+    return "";
+  }
+  return n > cap ? `${cap}+` : String(n);
+}
+
+let focusModeMemory = "";
+
+export function focusModeEnabled() {
+  return focusModeMemory === "on";
+}
+
+export function setFocusModeEnabled(on) {
+  focusModeMemory = on ? "on" : "off";
+}
+
+// Capsule asset routes the Runtime resolved from each capsule's declared icon
+// directory. The shell keeps no icon table of its own: an app that ships an
+// icon owns it, and one that ships none gets the built-in glyph below.
+const CAPSULE_ICON_ROUTE = /^\/apps\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+\.png$/;
+
+function capsuleIconVariants(targetId) {
+  const target = targetById(shellState.currentSummary, targetId);
+  const variants = Array.isArray(target?.icon) ? target.icon : [];
+  return variants.filter((variant) => (
+    Number.isFinite(variant?.size) &&
+    typeof variant?.route === "string" &&
+    CAPSULE_ICON_ROUTE.test(variant.route)
+  ));
+}
+
+function capsuleIconMarkup(targetId) {
+  const variants = capsuleIconVariants(targetId);
+  if (variants.length === 0) {
+    return "";
+  }
+  const bySize = new Map(variants.map((variant) => [variant.size, variant.route]));
+  const preferred = bySize.get(128) || variants[variants.length - 1].route;
+  const srcset = variants
+    .map((variant) => `${variant.route} ${variant.size}w`)
+    .join(", ");
+  return `<img class="app-icon-img" src="${preferred}" srcset="${srcset}" sizes="(max-width: 640px) 48px, 64px" alt="" draggable="false" />`;
 }
 
 export function glyphTone(targetId) {
@@ -1041,4 +1238,26 @@ export function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll("\"", "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+const sharedUiPreferences = {};
+
+export function rememberSharedUiPreferences(preferences) {
+  if (preferences && typeof preferences === "object") {
+    Object.assign(sharedUiPreferences, preferences);
+  }
+}
+
+export function pushUiPreferencesToFrameWindow(frameWindow) {
+  if (!frameWindow || Object.keys(sharedUiPreferences).length === 0) {
+    return;
+  }
+  try {
+    frameWindow.postMessage(
+      { type: "elastos:ui-preference", preferences: { ...sharedUiPreferences } },
+      "*",
+    );
+  } catch (_error) {
+    // Frame mid-teardown.
+  }
 }

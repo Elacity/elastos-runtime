@@ -69,13 +69,22 @@ pub(in crate::api::gateway) async fn browser_app_wallet_bridge(
             }
         };
     let context = authority.home_launch_context();
+    let request_origin = match browser_request_origin(&headers) {
+        Ok(origin) => origin,
+        Err(_) => {
+            return browser_wallet_cors_response(
+                &headers,
+                (StatusCode::BAD_REQUEST, "invalid gateway origin").into_response(),
+            );
+        }
+    };
     let response = Json(
         browser_wallet_bridge_payload(
             &state,
             &context,
             &authority,
             home_launch_token_header(&headers).as_deref(),
-            browser_request_origin(&headers).as_deref(),
+            Some(request_origin.as_str()),
         )
         .await,
     )

@@ -42,6 +42,10 @@ lint:
     cd elastos && cargo clippy --workspace --all-targets -- -D warnings
     cd elastos && cargo fmt --all -- --check
 
+# Stamp the shared UI token sheet into each consuming capsule
+vendor-ui:
+    ./scripts/vendor-ui-tokens.sh
+
 # Auto-format code
 fmt:
     cd elastos && cargo fmt --all
@@ -52,20 +56,41 @@ verify:
     just alignment-check
     node scripts/check-elastos-bus-wit.mjs
     node scripts/check-capsule-templates.mjs
+    ./scripts/vendor-ui-tokens.sh --check
     node scripts/home-entropy-check.mjs
+    node scripts/carrier-dependency-generation-check.mjs
+    just product-ui-source
     node scripts/home-clipboard-source-gate.mjs
     node scripts/browser-entropy-check.mjs
     node --test scripts/browser-window-close-handshake.test.mjs
+    node --test scripts/home-two-runtime-acceptance.test.mjs
     python3 scripts/source-home-capsule-inventory-smoke.py
     ./scripts/command-smoke.sh
+    ./scripts/browser-local-exit-orphan-cleanup-smoke.sh
     just candidate-command-audit
     cd elastos && cargo fmt --all -- --check
     cd elastos && cargo clippy --workspace --all-targets -- -D warnings
     cd elastos && cargo test --workspace
+    # browser-local-exit carries its own workspace, so --workspace above misses it
+    cd elastos/tools/browser-local-exit && cargo fmt -- --check
+    cd elastos/tools/browser-local-exit && cargo clippy --all-targets -- -D warnings
+    cd elastos/tools/browser-local-exit && cargo test
+
+product-ui-source:
+    node scripts/home-shell-regression-smoke.mjs
+    node scripts/people-discovery-smoke.mjs
+
+product-ui-browser:
+    node scripts/people-product-layout-smoke.mjs
+    node scripts/chat-room-configured-layout-smoke.mjs
+
+product-ui-virtual-auth:
+    HOME_VIRTUAL_AUTH_APP_MATRIX=1 node scripts/home-passkey-virtual-auth-smoke.mjs
 
 # Release-trust gate: requires canonical publisher signer, not the dev signer
 verify-release:
     just verify
+    just product-ui-browser
     just local-carrier-setup-smoke
     just home-frontdoor-smoke
 
@@ -110,7 +135,11 @@ candidate-command-audit:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build -p elastos-server --release --manifest-path elastos/Cargo.toml
-    ELASTOS_AUDIT_BIN="$PWD/elastos/target/release/elastos" ./scripts/installed-command-audit.sh
+    audit_target_root="${CARGO_TARGET_DIR:-$PWD/elastos/target}"
+    if [[ "$audit_target_root" != /* ]]; then
+        audit_target_root="$PWD/$audit_target_root"
+    fi
+    ELASTOS_AUDIT_BIN="$audit_target_root/release/elastos" ./scripts/installed-command-audit.sh
 
 # Clean build artifacts
 clean:
@@ -145,10 +174,6 @@ publish-quick version key:
 # Local publish: skip build + rootfs + no public URL (fastest)
 publish-local version key:
     ./scripts/publish-release.sh --version {{version}} --key {{key}} --skip-build --skip-rootfs --no-public-url
-
-# Run P2P chat demo
-chat *args:
-    ./scripts/chat.sh {{args}}
 
 # Run GBA emulator demo
 gba *args:

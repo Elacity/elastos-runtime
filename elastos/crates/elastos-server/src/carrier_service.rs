@@ -1,8 +1,8 @@
-//! Carrier-plane service bridge for WebSpace provider capsules.
+//! Carrier-plane service bridge for host-process provider capsules.
 //!
 //! Carrier services are explicit host-plane exceptions for providers whose
 //! contract fundamentally depends on host networking or host integration.
-//! When a capsule declares `permissions.carrier: true`, Carrier may run it
+//! When a capsule declares `permissions.host_process: true`, Runtime may run it
 //! directly on the host while preserving the same line-delimited JSON provider
 //! contract exposed by VM-backed providers. Callers still see provider/resource
 //! semantics, not host process or transport details.

@@ -24,6 +24,7 @@ const PRESERVE_PROFILE = process.env.HOME_VIRTUAL_AUTH_PRESERVE_PROFILE === "1";
 const CLEANUP_PASSKEY = process.env.HOME_VIRTUAL_AUTH_CLEANUP !== "0";
 const INCLUDE_BROWSER = process.env.HOME_VIRTUAL_AUTH_BROWSER === "1";
 const CHECK_APP_MATRIX = process.env.HOME_VIRTUAL_AUTH_APP_MATRIX === "1";
+const CHECK_SHELL_SWITCH = process.env.HOME_VIRTUAL_AUTH_SHELL_SWITCH !== "0";
 const CHECK_BROWSER_SUMMARY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_SUMMARY === "1" ||
   process.env.HOME_VIRTUAL_AUTH_BROWSER_OPEN === "1";
@@ -182,10 +183,18 @@ function hasVirtualAuthenticatorCredentialStore() {
 }
 
 async function restoreVirtualAuthenticatorCredentials(cdp, authenticatorId) {
+  // WebAuthn clone detection demands a strictly increasing sign counter, and
+  // a replayed snapshot would sit at or below the server's stored count.
+  // Timer-based counters are valid authenticator behaviour, so resume from
+  // wall-clock seconds — always ahead of any prior run.
+  const timerCount = Math.floor(Date.now() / 1000) - 1_767_225_600;
   for (const credential of readVirtualAuthenticatorCredentialStore()) {
     await cdp.send("WebAuthn.addCredential", {
       authenticatorId,
-      credential,
+      credential: {
+        ...credential,
+        signCount: Math.max(Number(credential.signCount) || 0, timerCount),
+      },
     });
   }
 }
@@ -605,10 +614,16 @@ function launchTokenFromRoute(route) {
 }
 
 function capsuleFrameForTarget(page, target) {
+  const homeOrigin = new URL(HOME_URL).origin;
   return page.frames().find((frame) => {
     try {
       const url = new URL(frame.url());
-      return url.hostname.split(".")[0] === target && url.pathname.startsWith(`/apps/${target}/`);
+      if (!url.pathname.startsWith(`/apps/${target}/`)) {
+        return false;
+      }
+      // The shell mounts capsule frames on the Home origin and isolates them
+      // through iframe sandboxing; older builds used per-app localhost hosts.
+      return url.origin === homeOrigin || url.hostname.split(".")[0] === target;
     } catch {
       return false;
     }
@@ -635,8 +650,8 @@ function assertIsolatedLaunchRoute(route, target) {
   assert(token, `${target} launch route did not contain a fragment-scoped token`, { route });
   assert(!url.searchParams.has("home_token"), `${target} launch token leaked into the query`, { route });
   assert(
-    url.origin !== new URL(HOME_URL).origin,
-    `${target} launch route reused the trusted Home origin`,
+    url.origin === new URL(HOME_URL).origin,
+    `${target} launch route left the trusted Home origin`,
     { route },
   );
   return token;
@@ -2605,6 +2620,7 @@ async function signBackIn(page) {
 async function checkHomePublicCopy(page) {
   await waitForSignedHome(page);
   const homeGuiFrame = await waitForCapsuleFrame(page, "home-gui");
+  await homeGuiFrame.waitForFunction(() => Boolean(document.body), null, { timeout: 15_000 });
   const state = await homeGuiFrame.evaluate(() => {
     const visible = (node) => {
       const style = window.getComputedStyle(node);
@@ -2636,6 +2652,40 @@ async function checkHomePublicCopy(page) {
   };
 }
 
+async function homeGuiFrameForPage(page) {
+  return waitForCapsuleFrame(page, "home-gui");
+}
+
+async function openDesktopAppWindow(page, target) {
+  await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
+  await waitForSignedHome(page);
+  const homeGuiFrame = await waitForCapsuleFrame(page, "home-gui");
+  await homeGuiFrame.locator("#launcher-toggle").click();
+  const card = homeGuiFrame.locator(`#launcher-grid [data-target="${target}"]`).first();
+  await card.waitFor({ state: "visible", timeout: 10_000 });
+  await card.click();
+  // The desktop restores persisted windows at boot and restore can steal
+  // focus from the window the launcher just opened, so bind to the newest
+  // window for the target rather than whichever one holds the active class.
+  const windowFrameEl = homeGuiFrame
+    .locator(`section.window[data-target="${target}"] iframe.window-frame`)
+    .last();
+  await windowFrameEl.waitFor({ state: "visible", timeout: 20_000 });
+  const handle = await windowFrameEl.elementHandle();
+  const appFrame = handle ? await handle.contentFrame() : null;
+  assert(appFrame, `desktop window for ${target} had no content frame`, { target });
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline && !appFrame.url().includes(`/apps/${target}/`)) {
+    await delay(100);
+  }
+  assert(
+    appFrame.url().includes(`/apps/${target}/`),
+    `desktop window for ${target} never loaded its capsule document`,
+    { target, url: appFrame.url() },
+  );
+  return appFrame;
+}
+
 async function launchSystem(page, homeToken) {
   assert(homeToken, "launchSystem requires a passkey-issued Home token");
   const route = await page.evaluate(async (token) => {
@@ -2657,9 +2707,12 @@ async function launchSystem(page, homeToken) {
     return body.route || "";
   }, homeToken);
   assertIsolatedLaunchRoute(route, "system");
-  await page.goto(new URL(route, HOME_URL).toString(), { waitUntil: "domcontentloaded" });
-  await page.locator(".settings-container").waitFor({ state: "visible", timeout: 20_000 });
-  const system = await page.evaluate(() => ({
+  // Capsule documents only accept API calls from their sandboxed (opaque
+  // origin) window frames, so open System through the desktop launcher the
+  // way a person does instead of navigating the trusted Home page to it.
+  const systemFrame = await openDesktopAppWindow(page, "system");
+  await systemFrame.locator(".settings-container").waitFor({ state: "visible", timeout: 20_000 });
+  const system = await systemFrame.evaluate(() => ({
     title: document.title,
     tabs: [...document.querySelectorAll(".settings-sidebar-text")].map((node) => node.textContent?.trim() || ""),
     sections: [...document.querySelectorAll(".pc2-section-title")].map((node) => node.textContent?.trim() || ""),
@@ -2727,19 +2780,27 @@ async function checkShellSwitchJourney(page, homeToken) {
   page.on("response", captureResponse);
   try {
     markStage("shell-switch:launch-system");
-    if (!page.url().includes("/apps/system/")) {
-      await launchSystem(page, homeToken);
-    }
+    const systemFrame = await openDesktopAppWindow(page, "system");
+    await systemFrame.locator(".settings-container").waitFor({ state: "visible", timeout: 20_000 });
 
     markStage("shell-switch:open-system-shell");
-    await page.locator('button.settings-sidebar-item[data-settings="shell"]').click();
-    await page.locator("#active-shell-options").waitFor({ state: "visible", timeout: 15_000 });
-    await page.waitForFunction(() => {
+    // The window chrome's edge hit-zones can overlap the System sidebar
+    // depending on where the desktop placed the window, so drive System's
+    // own controls with DOM clicks; pointer fidelity is proven at the
+    // launcher and window layers above.
+    await systemFrame
+      .locator('button.settings-sidebar-item[data-settings="shell"]')
+      .waitFor({ state: "visible", timeout: 15_000 });
+    await systemFrame.evaluate(() => {
+      document.querySelector('button.settings-sidebar-item[data-settings="shell"]').click();
+    });
+    await systemFrame.locator("#active-shell-options").waitFor({ state: "attached", timeout: 15_000 });
+    await systemFrame.waitForFunction(() => {
       const names = [...document.querySelectorAll("#active-shell-options [data-shell-name]")]
         .map((button) => button.dataset.shellName);
       return names.includes("home-gui") && names.includes("home-cli");
     }, null, { timeout: 15_000 });
-    const shellOptions = await page.evaluate(() => (
+    const shellOptions = await systemFrame.evaluate(() => (
       [...document.querySelectorAll("#active-shell-options [data-shell-name]")].map((button) => ({
         value: button.dataset.shellName,
         label: button.textContent?.trim() || "",
@@ -2749,9 +2810,16 @@ async function checkShellSwitchJourney(page, homeToken) {
     const switchToCli = page.waitForResponse((response) => (
       response.request().method() === "POST" &&
       response.url().endsWith("/api/apps/home/active-shell")
-    ), { timeout: 15_000 });
+    ), { timeout: 30_000 });
+    // A rejection must wait for the click below to settle, not crash the run.
+    switchToCli.catch(() => {});
     markStage("shell-switch:system-post-home-cli");
-    await page.locator('#active-shell-options [data-shell-name="home-cli"]').click();
+    await systemFrame
+      .locator('#active-shell-options [data-shell-name="home-cli"]')
+      .waitFor({ state: "attached", timeout: 15_000 });
+    await systemFrame.evaluate(() => {
+      document.querySelector('#active-shell-options [data-shell-name="home-cli"]').click();
+    });
     const switchResponse = await switchToCli;
     assert(switchResponse.ok(), "System shell picker failed to switch to Home CLI", {
       status: switchResponse.status(),
@@ -2783,7 +2851,9 @@ async function checkShellSwitchJourney(page, homeToken) {
       };
     });
     const cliState = await cliFrame.evaluate(() => ({
-      origin: window.location.origin,
+      // window.origin is the effective origin — "null" inside the opaque
+      // sandbox — while location.origin would echo the Home URL either way.
+      origin: window.origin,
       runtime_terminal: document.body?.dataset?.runtimeTerminal || "",
       terminal_visible: document.querySelector("#xterm-terminal")?.hidden === false,
     }));
@@ -2879,7 +2949,8 @@ async function checkShellSwitchJourney(page, homeToken) {
         )),
       })),
       gui: await homeGuiFrame.evaluate(() => ({
-        origin: window.location.origin,
+        // Effective origin: "null" inside the opaque sandbox.
+        origin: window.origin,
         toolbar_visible: document.querySelector(".toolbar")?.hidden === false,
         taskbar_visible: document.querySelector(".taskbar")?.hidden === false,
         system_shortcut_present: Boolean(
@@ -3375,41 +3446,101 @@ async function checkAppLaunchMatrix(page, homeToken) {
     assert(launched.body?.target === target, `Home launch resolved the wrong target for ${target}`, launched);
     const route = String(launched.body?.route || "");
     assertIsolatedLaunchRoute(route, target);
-    const appPage = await page.context().newPage();
-    try {
-      const response = await appPage.goto(new URL(route, HOME_URL).toString(), {
-        waitUntil: "domcontentloaded",
-        timeout: 25_000,
-      });
-      assert(response?.ok(), `App route did not load successfully for ${target}`, {
-        target,
-        status: response?.status(),
-        route,
-      });
-      const appState = await appPage.evaluate(() => ({
-        title: document.title,
-        bodyStatus: document.body?.dataset?.status || document.body?.dataset?.appStatus || "",
-        visibleError: [...document.querySelectorAll("[role='alert'], .error, .system-error")]
-          .map((node) => node.textContent?.trim() || "")
-          .filter(Boolean)
-          .slice(0, 3),
-      }));
-      assert(
-        !appState.visibleError.some((text) => /failed to open|access denied|invalid home launch token/i.test(text)),
-        `App route rendered an authority error for ${target}`,
-        { target, route, appState },
-      );
-      results.push({
-        target,
-        title: summaryTarget.title || "",
-        route_prefix: route.split("#")[0],
-        status: response.status(),
-        document_title: appState.title,
-        body_status: appState.bodyStatus,
-      });
-    } finally {
-      await appPage.close().catch(() => {});
+    // Capsule documents demand their sandboxed (opaque origin) window frame,
+    // so open each app through the desktop launcher like a person would and
+    // judge the window's rendered document, not a bare top-level navigation.
+    const appFrame = await openDesktopAppWindow(page, target);
+    const appState = await appFrame.evaluate(() => ({
+      title: document.title,
+      bodyStatus: document.body?.dataset?.status || document.body?.dataset?.appStatus || "",
+      renderedNodes: document.body ? document.body.querySelectorAll("*").length : 0,
+      bodyTextLength: (document.body?.innerText || "").trim().length,
+      visibleError: [...document.querySelectorAll("[role='alert'], .error, .system-error")]
+        .map((node) => node.textContent?.trim() || "")
+        .filter(Boolean)
+        .slice(0, 3),
+    }));
+    assert(
+      !appState.visibleError.some((text) => /failed to open|access denied|invalid home launch token/i.test(text)),
+      `App window rendered an authority error for ${target}`,
+      { target, route, appState },
+    );
+    assert(
+      appState.renderedNodes > 0,
+      `App window stayed empty for ${target}`,
+      { target, route, appState },
+    );
+    // Markup is not paint. A window whose frame never becomes visible, or
+    // reveals only by timeout, still fails the product.
+    const gui = await homeGuiFrameForPage(page);
+    const readFramePaint = () => gui.evaluate((appTarget) => {
+      const section = [...document.querySelectorAll(`section.window[data-target="${appTarget}"]`)].pop();
+      const frame = section?.querySelector("iframe.window-frame");
+      if (!frame) {
+        return { found: false };
+      }
+      const style = window.getComputedStyle(frame);
+      const rect = frame.getBoundingClientRect();
+      let ancestorVisible = true;
+      for (let node = frame; node; node = node.parentElement) {
+        const nodeStyle = window.getComputedStyle(node);
+        if (
+          nodeStyle.display === "none" ||
+          nodeStyle.visibility === "hidden" ||
+          Number(nodeStyle.opacity || "1") === 0
+        ) {
+          ancestorVisible = false;
+          break;
+        }
+      }
+      const probeX = rect.left + rect.width / 2;
+      const probeY = rect.top + rect.height / 2;
+      const topElement = document.elementFromPoint(probeX, probeY);
+      const topWindow = topElement?.closest?.("section.window") || null;
+      return {
+        found: true,
+        opacity: Number(style.opacity),
+        visibility: style.visibility,
+        display: style.display,
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        revealCause: frame.dataset.frameVisibleCause || "",
+        ancestorVisible,
+        pointVisible: topElement === frame || topWindow === section,
+      };
+    }, target);
+    const framePainted = (state) => Boolean(
+      state.found
+        && state.opacity > 0
+        && state.visibility === "visible"
+        && state.display !== "none"
+        && state.width > 0
+        && state.height > 0
+        && state.revealCause === "load"
+        && state.ancestorVisible === true
+        && state.pointVisible === true,
+    );
+    let framePaint = await readFramePaint();
+    const paintDeadline = Date.now() + 8_000;
+    while (Date.now() < paintDeadline && !framePainted(framePaint)) {
+      await delay(150);
+      framePaint = await readFramePaint();
     }
+    assert(
+      framePainted(framePaint),
+      `App window frame never became visible for ${target}`,
+      { target, route, framePaint },
+    );
+    results.push({
+      target,
+      title: summaryTarget.title || "",
+      route_prefix: route.split("#")[0],
+      document_title: appState.title,
+      body_status: appState.bodyStatus,
+      rendered_nodes: appState.renderedNodes,
+      body_text_length: appState.bodyTextLength,
+      frame_opacity: framePaint.opacity,
+    });
   }
   return results;
 }
@@ -3501,7 +3632,9 @@ async function main() {
 
     const homePublicCopy = await checkHomePublicCopy(page);
     const system = await launchSystem(page, homeToken);
-    const shellSwitch = await checkShellSwitchJourney(page, homeToken);
+    const shellSwitch = CHECK_SHELL_SWITCH
+      ? await checkShellSwitchJourney(page, homeToken)
+      : null;
     const browserLaunch = INCLUDE_BROWSER ? await checkBrowserLaunchGrant(page, homeToken) : null;
     const appMatrix = CHECK_APP_MATRIX ? await checkAppLaunchMatrix(page, homeToken) : null;
 

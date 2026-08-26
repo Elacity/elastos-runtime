@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260725a";
+import { existsSync, readFileSync } from "node:fs";
+
+const moduleVersion = "home-20260813a";
 const savedStatePatches = [];
 const requests = [];
 const windowEventListeners = new Map();
@@ -40,6 +42,10 @@ class FakeElement {
     this.dataset = {};
     this.style = {};
     this.hidden = false;
+    this.inert = false;
+    this.disabled = false;
+    this.textContent = "";
+    this.innerHTML = "";
     this.classList = new FakeClassList();
     this.content = withTemplateContent
       ? {
@@ -69,7 +75,9 @@ class FakeElement {
 
   querySelector(selector) {
     if (!this.queries.has(selector)) {
-      this.queries.set(selector, new FakeElement(`${this.selector} ${selector}`));
+      const child = new FakeElement(`${this.selector} ${selector}`);
+      child.parentElement = this;
+      this.queries.set(selector, child);
     }
     return this.queries.get(selector);
   }
@@ -103,7 +111,20 @@ class FakeElement {
     return null;
   }
 
-  focus() {}
+  contains(node) {
+    let current = node;
+    while (current) {
+      if (current === this) {
+        return true;
+      }
+      current = current.parentElement || null;
+    }
+    return false;
+  }
+
+  focus() {
+    document.activeElement = this;
+  }
 
   getBoundingClientRect() {
     if (this.selector === "#desktop") {
@@ -194,6 +215,35 @@ function positionsOverlap(left, right) {
   return Math.abs(left.x - right.x) < 92 && Math.abs(left.y - right.y) < 98;
 }
 
+async function withCapturedFrameRevealTimers(run) {
+  const nativeSetTimeout = window.setTimeout;
+  const nativeClearTimeout = window.clearTimeout;
+  let nextTimerId = 1;
+  const timers = new Map();
+  window.setTimeout = (callback, _delay) => {
+    const timerId = nextTimerId++;
+    timers.set(timerId, callback);
+    return timerId;
+  };
+  window.clearTimeout = (timerId) => {
+    timers.delete(Number(timerId));
+  };
+  try {
+    return await run({
+      timerIds: () => [...timers.keys()],
+      fire(timerId) {
+        const callback = timers.get(timerId);
+        assert(callback, "missing captured frame reveal timer", { timerId, timerIds: [...timers.keys()] });
+        timers.delete(timerId);
+        callback();
+      },
+    });
+  } finally {
+    window.setTimeout = nativeSetTimeout;
+    window.clearTimeout = nativeClearTimeout;
+  }
+}
+
 const shellCore = await import(`../capsules/home-gui/browser/shell-core.js?v=${moduleVersion}`);
 const shellWindows = await import(`../capsules/home-gui/browser/shell-windows.js?v=${moduleVersion}`);
 const shellSurface = await import(`../capsules/home-gui/browser/shell-surface.js?v=${moduleVersion}`);
@@ -204,6 +254,7 @@ const summary = {
     { target: "wallet", title: "Wallet", route: "/apps/wallet/" },
     { target: "inbox", title: "Inbox", route: "/apps/inbox/" },
     { target: "people", title: "People", route: "/apps/people/", attach_kind: "iframe", role: "app" },
+    { target: "chat-room", title: "Chat", route: "/apps/chat-room/", attach_kind: "iframe", role: "app" },
     { target: "browser", title: "Browser", route: "/apps/browser/" },
     { target: "system", title: "System", route: "/apps/system/" },
   ],
@@ -229,6 +280,112 @@ document.body.dataset.homeShell = "desktop";
 const layout = shellCore.shellState.shellLayoutState.desktop;
 assert(layout.wallet, "wallet desktop position missing", layout);
 assert(layout.people, "people desktop position missing", layout);
+
+const peopleStyle = readFileSync(
+  new URL("../capsules/people/browser/style.css", import.meta.url),
+  "utf8",
+);
+const chatStyle = readFileSync(
+  new URL("../capsules/chat-room/browser/style.css", import.meta.url),
+  "utf8",
+);
+const inboxSource = readFileSync(
+  new URL("../capsules/inbox/browser/index.html", import.meta.url),
+  "utf8",
+);
+const collaborationChromeSources = [peopleStyle, chatStyle, inboxSource].join("\n");
+const browserStyle = readFileSync(
+  new URL("../capsules/browser/browser/style.css", import.meta.url),
+  "utf8",
+);
+const homeGuiScript = readFileSync(
+  new URL("../capsules/home-gui/browser/home-gui.js", import.meta.url),
+  "utf8",
+);
+const homeGuiStyle = readFileSync(
+  new URL("../capsules/home-gui/browser/style.css", import.meta.url),
+  "utf8",
+);
+const homeGuiTemplate = readFileSync(
+  new URL("../capsules/home-gui/browser/home-gui-template.html", import.meta.url),
+  "utf8",
+);
+const launcherDarkDockIcon = new URL(
+  "../capsules/home-gui/browser/icons/apps-launcher/dark-dock/icon-64.png",
+  import.meta.url,
+);
+const launcherLightDockIcon = new URL(
+  "../capsules/home-gui/browser/icons/apps-launcher/light-dock/icon-64.png",
+  import.meta.url,
+);
+const canonicalWindowHeadMarkup =
+  /<div class="window-head">\s*<div class="window-traffic-lights">\s*<button class="window-action-btn" data-action="close"[\s\S]*?<button class="window-action-btn" data-action="minimize"[\s\S]*?<button class="window-action-btn" data-action="maximize"[\s\S]*?<\/div>\s*<div class="window-head-draggable">[\s\S]*?<\/div>\s*<div class="window-head-balance" aria-hidden="true"><\/div>\s*<\/div>/;
+const canonicalLauncherMarkup =
+  /<aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>\s*<div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">\s*<div class="launcher-header">[\s\S]*?<p class="launcher-browse-label">Apps<\/p>[\s\S]*?<button\s+id="launcher-view-toggle"[\s\S]*?<\/button>\s*<\/div>\s*<div class="launcher-scroll hide-scrollbar">[\s\S]*?<h1 class="launcher-heading visually-hidden">Apps<\/h1>[\s\S]*?<div id="launcher-grid" class="launcher-sections"><\/div>[\s\S]*?<\/div>\s*<\/div>\s*<\/aside>/;
+
+assert(
+  peopleStyle.includes("padding: var(--window-chrome-safe-top, 52px) 12px 16px;"),
+  "People unified-sidebar must reserve the Home safe-top inset in its sidebar column",
+);
+assert(
+  !chatStyle.includes("window-chrome-safe-top"),
+  "Chat still reserves host titlebar space inside the capsule",
+);
+assert(
+  !inboxSource.includes("window-chrome-safe-top"),
+  "Inbox still reserves host titlebar space inside the capsule",
+);
+assert(
+  !/window-action-btn|window-traffic-lights|data-action="(?:minimize|maximize|close)"/.test(
+    collaborationChromeSources,
+  ),
+  "People, Chat, or Inbox reintroduced capsule-owned outer window chrome",
+);
+assert(
+  browserStyle.includes("padding: 8px 10px 8px var(--window-chrome-safe-leading, 96px);"),
+  "Browser no longer applies the Home-owned toolbar content inset",
+);
+assert(
+  !homeGuiScript.includes("(label || toolbarFullscreenButton).textContent"),
+  "Home toolbar fullscreen control still writes visible label text into the menubar",
+);
+assert(
+  canonicalWindowHeadMarkup.test(homeGuiTemplate),
+  "Home window template must keep one traffic-light group in close/minimize/maximize order before the draggable title and balance shim",
+);
+assert(
+  canonicalLauncherMarkup.test(homeGuiTemplate) &&
+    !homeGuiTemplate.includes('id="close-launcher"') &&
+    !homeGuiTemplate.includes('placeholder="Search Home"'),
+  "Home launcher template must keep one complete canonical launcher generation",
+);
+assert(
+  existsSync(launcherDarkDockIcon) && existsSync(launcherLightDockIcon),
+  "Home launcher dock raster assets must exist for both themes",
+);
+assert(
+  homeGuiStyle.includes("@media (max-width: 1100px)") &&
+    homeGuiStyle.includes(".toolbar-active-title") &&
+    homeGuiStyle.includes("display: none;"),
+  "Home toolbar still lacks the narrow-width title fallback",
+);
+assert(
+  homeGuiTemplate.includes('id="toolbar-system"') &&
+    homeGuiTemplate.includes('id="toolbar-active-title"') &&
+    homeGuiTemplate.includes('id="toolbar-menubar"') &&
+    homeGuiTemplate.includes('id="toolbar-control-centre"') &&
+    homeGuiTemplate.includes('id="control-centre-fullscreen"') &&
+    homeGuiTemplate.includes('id="identity-menu-sign-out"') &&
+    !homeGuiTemplate.includes('id="toolbar-fullscreen"') &&
+    !homeGuiTemplate.includes('id="toolbar-sign-out"'),
+  "Home template still mixes the obsolete naked top bar with the canonical system bar structure",
+);
+assert(
+  homeGuiStyle.includes("--toolbar-h: 36px;") &&
+    homeGuiStyle.includes(".toolbar-status-cluster") === false,
+  "Home toolbar geometry contract drifted from the bounded 36px system bar",
+);
+
 assert(!positionsOverlap(layout.wallet, layout.people), "People and Wallet desktop positions still overlap", layout);
 assert(!positionsOverlap(layout.inbox, layout.people), "People and Inbox desktop positions still overlap", layout);
 assert(
@@ -300,6 +457,7 @@ shellWindows.configureWindowHooks({
   renderDesktop: () => {},
   renderTaskbar: () => {},
   updateTaskbarState: () => {},
+  syncMenubar: () => {},
   launchTarget: async (target, query) => {
     restoredBrowserLaunches.push({ target, query: { ...query } });
     if (restoredBrowserLaunches.length === 2) {
@@ -308,17 +466,116 @@ shellWindows.configureWindowHooks({
     const launchToken = restoredBrowserLaunches.length === 1
       ? "browser-window-close-token"
       : `browser-window-renewed-token-${restoredBrowserLaunches.length}`;
+    const routeBase = target === "browser" ? "/apps/browser/" : `/apps/${target}/`;
+    const title = ({
+      people: "People",
+      "chat-room": "Chat",
+      inbox: "Inbox",
+      wallet: "Wallet",
+      browser: "Browser",
+    })[target] || target;
     return {
       target,
-      title: "Browser",
+      title,
       route:
-        `/apps/browser/?browser_instance=${encodeURIComponent(query.browser_instance)}` +
+        `${routeBase}?browser_instance=${encodeURIComponent(query.browser_instance || "")}` +
         `#home_token=${launchToken}`,
       attach_kind: "iframe",
       launch_status: "launched",
     };
   },
 });
+for (const launch of [
+  { target: "people", title: "People", route: "/apps/people/", attach_kind: "iframe", launch_status: "launched" },
+  { target: "chat", title: "Chat", route: "/apps/chat/", attach_kind: "iframe", launch_status: "launched" },
+  { target: "chat-room", title: "Chat", route: "/apps/chat-room/", attach_kind: "iframe", launch_status: "launched" },
+  { target: "inbox", title: "Inbox", route: "/apps/inbox/", attach_kind: "iframe", launch_status: "launched" },
+  { target: "wallet", title: "Wallet", route: "/apps/wallet/", attach_kind: "iframe", launch_status: "launched" },
+  { target: "browser", title: "Browser", route: "/apps/browser/", attach_kind: "iframe", launch_status: "launched" },
+]) {
+  await shellWindows.attachAuthorizedTarget(launch);
+}
+
+const expectedWindowChrome = {
+  people: {
+    mode: "unified-sidebar",
+    className: "window-chrome-unified-sidebar",
+  },
+  chat: {
+    mode: "unified-sidebar",
+    className: "window-chrome-unified-sidebar",
+  },
+  "chat-room": {
+    mode: "unified-sidebar",
+    className: "window-chrome-unified-sidebar",
+  },
+  inbox: {
+    mode: "unified-sidebar",
+    className: "window-chrome-unified-sidebar",
+  },
+  wallet: {
+    mode: "standard",
+    className: "window-chrome-continuous",
+  },
+  browser: {
+    mode: "unified-toolbar",
+    className: "window-chrome-unified-toolbar",
+  },
+};
+
+for (const entry of shellCore.shellState.windows.values()) {
+  const expected = expectedWindowChrome[entry.targetId];
+  assert(
+    entry.node.dataset.windowChromeMode === expected.mode,
+    "first-party window did not receive the intended Home chrome mode",
+    { target: entry.targetId, mode: entry.node.dataset.windowChromeMode, expected },
+  );
+  if (expected.className) {
+    assert(
+      entry.node.classList.contains(expected.className),
+      "first-party window did not receive the expected Home chrome class",
+      { target: entry.targetId, classes: [...entry.node.classList.values] },
+    );
+  }
+}
+
+const browserEntry = [...shellCore.shellState.windows.values()].find((entry) => entry.targetId === "browser");
+const browserClose = browserEntry.node.querySelector("[data-action='close']");
+browserClose.focus();
+shellWindows.minimizeWindow(browserEntry.id);
+assert(
+  browserEntry.node.classList.contains("hidden") &&
+    browserEntry.node.inert === true &&
+    browserEntry.node.getAttribute("aria-hidden") === "true" &&
+    !browserEntry.node.contains(document.activeElement),
+  "hiding a focused window left focus inside aria-hidden or non-inert chrome",
+  {
+    activeElement: document.activeElement?.selector || null,
+    hidden: browserEntry.node.classList.contains("hidden"),
+    inert: browserEntry.node.inert,
+    ariaHidden: browserEntry.node.getAttribute("aria-hidden"),
+  },
+);
+const focusedVisibleWindow = [...shellCore.shellState.windows.values()].find(
+  (entry) =>
+    !entry.node.classList.contains("hidden") &&
+    entry.node.contains(document.activeElement),
+);
+assert(
+  focusedVisibleWindow ||
+    document.activeElement?.selector === "#toolbar-home" ||
+    document.activeElement?.selector === "#launcher-toggle" ||
+    document.activeElement?.selector === "body",
+  "hiding the active window did not move focus to a visible Home-owned window or stable shell control",
+  {
+    activeElement: document.activeElement?.selector || null,
+    focusedVisibleTarget: focusedVisibleWindow?.targetId || null,
+  },
+);
+
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+restoredBrowserLaunches.length = 0;
 shellCore.shellState.currentSummary = summary;
 shellCore.shellState.browserContextId = "browser:0123456789abcdef0123456789abcdef";
 shellCore.shellState.homeBrowserState.session = {
@@ -559,6 +816,77 @@ assert(
 );
 shellCore.shellState.activeWindowId = null;
 shellCore.shellState.homeBrowserState.session = null;
+
+await withCapturedFrameRevealTimers(async ({ timerIds }) => {
+  const loadRevealEntry = await shellWindows.attachAuthorizedTarget({
+    target: "people",
+    title: "People",
+    route: "/apps/people/#home_token=deterministic-people-load-reveal",
+    attach_kind: "iframe",
+    launch_status: "launched",
+  });
+  const loadRevealFrame = loadRevealEntry.node.querySelector(".window-frame");
+  assert(typeof loadRevealFrame.onload === "function", "launched window did not assign a frame onload handler");
+  const loadRevealTimerId = Number(loadRevealFrame.dataset.frameRevealTimer || "");
+  assert(
+    Number.isFinite(loadRevealTimerId) &&
+      timerIds().includes(loadRevealTimerId) &&
+      loadRevealFrame.dataset.frameVisible !== "true" &&
+      loadRevealFrame.dataset.frameVisibleCause === undefined,
+    "frame reveal was not deferred behind the existing onload/timer path",
+    {
+      frameVisible: loadRevealFrame.dataset.frameVisible,
+      frameVisibleCause: loadRevealFrame.dataset.frameVisibleCause,
+      frameRevealTimerId: loadRevealTimerId,
+      timerIds: timerIds(),
+    },
+  );
+  loadRevealFrame.onload();
+  assert(
+    loadRevealFrame.dataset.frameVisible === "true" &&
+      loadRevealFrame.dataset.frameVisibleCause === "load" &&
+      !timerIds().includes(loadRevealTimerId),
+    "frame onload did not reveal the window with a load cause",
+    {
+      frameVisible: loadRevealFrame.dataset.frameVisible,
+      frameVisibleCause: loadRevealFrame.dataset.frameVisibleCause,
+      frameRevealTimerId: loadRevealTimerId,
+      timerIds: timerIds(),
+    },
+  );
+  shellWindows.closeWindow(loadRevealEntry.id);
+});
+
+await withCapturedFrameRevealTimers(async ({ timerIds, fire }) => {
+  const timeoutRevealEntry = await shellWindows.attachAuthorizedTarget({
+    target: "inbox",
+    title: "Inbox",
+    route: "/apps/inbox/#home_token=deterministic-inbox-timeout-reveal",
+    attach_kind: "iframe",
+    launch_status: "launched",
+  });
+  const timeoutRevealFrame = timeoutRevealEntry.node.querySelector(".window-frame");
+  const timeoutTimerId = Number(timeoutRevealFrame.dataset.frameRevealTimer || "");
+  assert(
+    Number.isFinite(timeoutTimerId) && timerIds().includes(timeoutTimerId),
+    "timeout reveal path did not arm a frame reveal timer",
+    { frameRevealTimerId: timeoutTimerId, timerIds: timerIds() },
+  );
+  fire(timeoutTimerId);
+  assert(
+    timeoutRevealFrame.dataset.frameVisible === "true" &&
+      timeoutRevealFrame.dataset.frameVisibleCause === "timeout",
+    "frame timeout reveal did not record a timeout cause",
+    {
+      frameVisible: timeoutRevealFrame.dataset.frameVisible,
+      frameVisibleCause: timeoutRevealFrame.dataset.frameVisibleCause,
+      timerIds: timerIds(),
+    },
+  );
+  shellWindows.closeWindow(timeoutRevealEntry.id);
+});
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
 
 function windowModel(entry) {
   const frame = entry.node.querySelector(".window-frame");

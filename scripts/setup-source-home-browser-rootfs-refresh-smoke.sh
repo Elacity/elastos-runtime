@@ -75,11 +75,92 @@ awk '
   { print }
 ' "$repo_root/scripts/setup-source-home.sh" >"$functions_file"
 source "$functions_file"
+
+resolve_root="$tmp_dir/resolve-root"
+rust_target="aarch64-unknown-linux-musl"
+mkdir -p \
+  "$resolve_root/elastos/tools/browser-vm-runtime-relay" \
+  "$resolve_root/elastos/tools/browser-vm-guest-control-bridge" \
+  "$resolve_root/elastos/target/$rust_target/release" \
+  "$resolve_root/relative-target/$rust_target/release" \
+  "$resolve_root/elastos/tools/browser-vm-runtime-relay/target/$rust_target/release" \
+  "$resolve_root/elastos/tools/browser-vm-guest-control-bridge/target/$rust_target/release"
+printf '[package]\nname = "browser-vm-runtime-relay"\nversion = "0.0.0"\n' \
+  >"$resolve_root/elastos/tools/browser-vm-runtime-relay/Cargo.toml"
+printf '[package]\nname = "browser-vm-guest-control-bridge"\nversion = "0.0.0"\n' \
+  >"$resolve_root/elastos/tools/browser-vm-guest-control-bridge/Cargo.toml"
+cp "$current_relay" "$resolve_root/elastos/target/$rust_target/release/browser-vm-runtime-relay"
+cp "$current_bridge" "$resolve_root/elastos/target/$rust_target/release/browser-vm-guest-control-bridge"
+cp "$old_relay" \
+  "$resolve_root/elastos/tools/browser-vm-runtime-relay/target/$rust_target/release/browser-vm-runtime-relay"
+cp "$old_bridge" \
+  "$resolve_root/elastos/tools/browser-vm-guest-control-bridge/target/$rust_target/release/browser-vm-guest-control-bridge"
+cp "$current_relay" "$resolve_root/relative-target/$rust_target/release/browser-vm-runtime-relay"
+cp "$current_bridge" "$resolve_root/relative-target/$rust_target/release/browser-vm-guest-control-bridge"
+
+ROOT="$resolve_root"
+unset ELASTOS_BROWSER_VM_RUNTIME_RELAY_BIN
+unset ELASTOS_BROWSER_VM_GUEST_CONTROL_BRIDGE_BIN
+unset CARGO_TARGET_DIR
+default_runtime_relay="$(resolve_browser_vm_guest_helper_source \
+  "browser-vm-runtime-relay" \
+  "ELASTOS_BROWSER_VM_RUNTIME_RELAY_BIN" \
+  "browser-vm-runtime-relay" \
+  "browser-vm-runtime-relay" \
+  "linux-arm64")"
+default_guest_bridge="$(resolve_browser_vm_guest_helper_source \
+  "browser-vm-guest-control-bridge" \
+  "ELASTOS_BROWSER_VM_GUEST_CONTROL_BRIDGE_BIN" \
+  "browser-vm-guest-control-bridge" \
+  "browser-vm-guest-control-bridge" \
+  "linux-arm64")"
+[[ "$default_runtime_relay" == "$resolve_root/elastos/target/$rust_target/release/browser-vm-runtime-relay" ]]
+[[ "$default_guest_bridge" == "$resolve_root/elastos/target/$rust_target/release/browser-vm-guest-control-bridge" ]]
+
+abs_target="$tmp_dir/absolute-target"
+mkdir -p "$abs_target/$rust_target/release"
+cp "$current_relay" "$abs_target/$rust_target/release/browser-vm-runtime-relay"
+cp "$current_bridge" "$abs_target/$rust_target/release/browser-vm-guest-control-bridge"
+export CARGO_TARGET_DIR="$abs_target"
+abs_runtime_relay="$(resolve_browser_vm_guest_helper_source \
+  "browser-vm-runtime-relay" \
+  "ELASTOS_BROWSER_VM_RUNTIME_RELAY_BIN" \
+  "browser-vm-runtime-relay" \
+  "browser-vm-runtime-relay" \
+  "linux-arm64")"
+abs_guest_bridge="$(resolve_browser_vm_guest_helper_source \
+  "browser-vm-guest-control-bridge" \
+  "ELASTOS_BROWSER_VM_GUEST_CONTROL_BRIDGE_BIN" \
+  "browser-vm-guest-control-bridge" \
+  "browser-vm-guest-control-bridge" \
+  "linux-arm64")"
+[[ "$abs_runtime_relay" == "$abs_target/$rust_target/release/browser-vm-runtime-relay" ]]
+[[ "$abs_guest_bridge" == "$abs_target/$rust_target/release/browser-vm-guest-control-bridge" ]]
+
+export CARGO_TARGET_DIR="relative-target"
+relative_runtime_relay="$(resolve_browser_vm_guest_helper_source \
+  "browser-vm-runtime-relay" \
+  "ELASTOS_BROWSER_VM_RUNTIME_RELAY_BIN" \
+  "browser-vm-runtime-relay" \
+  "browser-vm-runtime-relay" \
+  "linux-arm64")"
+relative_guest_bridge="$(resolve_browser_vm_guest_helper_source \
+  "browser-vm-guest-control-bridge" \
+  "ELASTOS_BROWSER_VM_GUEST_CONTROL_BRIDGE_BIN" \
+  "browser-vm-guest-control-bridge" \
+  "browser-vm-guest-control-bridge" \
+  "linux-arm64")"
+[[ "$relative_runtime_relay" == "$resolve_root/relative-target/$rust_target/release/browser-vm-runtime-relay" ]]
+[[ "$relative_guest_bridge" == "$resolve_root/relative-target/$rust_target/release/browser-vm-guest-control-bridge" ]]
+[[ "$relative_runtime_relay" != "$resolve_root/elastos/tools/browser-vm-runtime-relay/target/$rust_target/release/browser-vm-runtime-relay" ]]
+[[ "$relative_guest_bridge" != "$resolve_root/elastos/tools/browser-vm-guest-control-bridge/target/$rust_target/release/browser-vm-guest-control-bridge" ]]
+
 ROOT="$repo_root"
 DATA_DIR="$tmp_dir/data"
 BROWSER_VM_ROOTFS_BACKUP=""
 export ELASTOS_BROWSER_VM_RUNTIME_RELAY_BIN="$current_relay"
 export ELASTOS_BROWSER_VM_GUEST_CONTROL_BRIDGE_BIN="$current_bridge"
+unset CARGO_TARGET_DIR
 
 refresh_browser_vm_native_helpers "$rootfs" "$debugfs" "linux-arm64"
 

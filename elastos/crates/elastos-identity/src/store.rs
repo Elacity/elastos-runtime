@@ -159,13 +159,20 @@ pub fn derive_did(secret: &[u8; 32]) -> (ed25519_dalek::SigningKey, String) {
     (signing_key, did)
 }
 
+/// Canonical shared device-key path at `{data_dir}/identity/device.key`.
+pub fn device_key_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("identity").join("device.key")
+}
+
 /// Load or create the shared device key at `{data_dir}/identity/device.key`.
 ///
 /// Returns 32 random bytes wrapped in `Zeroizing`. The key file is created
 /// with 0600 permissions on Unix.
 pub fn load_or_create_device_key(data_dir: &Path) -> anyhow::Result<Zeroizing<[u8; 32]>> {
-    let key_dir = data_dir.join("identity");
-    let key_path = key_dir.join("device.key");
+    let key_path = device_key_path(data_dir);
+    let key_dir = key_path
+        .parent()
+        .expect("device key path always has an identity directory");
 
     if key_path.exists() {
         let bytes = std::fs::read(&key_path)?;
@@ -179,7 +186,7 @@ pub fn load_or_create_device_key(data_dir: &Path) -> anyhow::Result<Zeroizing<[u
         key.copy_from_slice(&bytes);
         Ok(Zeroizing::new(key))
     } else {
-        std::fs::create_dir_all(&key_dir)?;
+        std::fs::create_dir_all(key_dir)?;
         let mut key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut key);
         std::fs::write(&key_path, key)?;

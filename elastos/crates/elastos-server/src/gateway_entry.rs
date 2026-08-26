@@ -9,6 +9,9 @@ pub async fn run_gateway(
         Ok(elastos_server::gateway_cmd::GatewayControlPlane {
             provider_registry: infra.provider_registry,
             host_helpers: infra.host_helpers,
+            carrier_service: infra.carrier_service,
+            collaboration_context: infra.collaboration_context,
+            collaboration_service: infra.collaboration_service,
         })
     })
     .await

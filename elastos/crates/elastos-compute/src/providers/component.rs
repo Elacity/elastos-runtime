@@ -274,7 +274,7 @@ fn bus_error(code: &str, message: impl Into<String>) -> elastos::bus::types::Bus
         "not_found" => elastos::bus::types::BusError::NotFound(message),
         "timeout" => elastos::bus::types::BusError::Timeout(message),
         "unavailable" => elastos::bus::types::BusError::Unavailable(message),
-        "invalid" | "invalid_action" | "invalid_carrier_invoke" => {
+        "invalid" | "invalid_action" | "invalid_resource_invoke" => {
             elastos::bus::types::BusError::Invalid(message)
         }
         _ => elastos::bus::types::BusError::Internal(message),
@@ -394,7 +394,7 @@ impl elastos::bus::providers::Host for ComponentState {
             grant: request.grant,
         }))?;
         let (result, audit) = match response {
-            RuntimeResponse::CarrierResult { result, audit } => (result, audit),
+            RuntimeResponse::ResourceResult { result, audit } => (result, audit),
             response => return Err(response_error(&response)),
         };
         let status = result
@@ -442,7 +442,7 @@ mod tests {
                 Ok(serde_json::json!({
                     "id": 1,
                     "response": {
-                        "type": "carrier_result",
+                        "type": "resource_result",
                         "result": { "status": "ok", "data": { "ok": true } },
                         "audit": "runtime-audit-1"
                     }

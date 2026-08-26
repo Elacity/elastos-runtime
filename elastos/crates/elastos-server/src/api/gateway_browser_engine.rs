@@ -373,6 +373,7 @@ fn scrub_exit_authority_fields(value: &mut serde_json::Value) {
                 "relay_ipc",
                 "raw_socket",
                 "connect_ticket",
+                "peer_did",
             ] {
                 object.remove(key);
             }
@@ -407,4 +408,41 @@ fn invalid_provider_summary(provider: &str, reason: &str) -> serde_json::Value {
         "wallet_injection": false,
         "reason": reason,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::browser_visible_remote_carrier_exits;
+    use serde_json::json;
+
+    #[test]
+    fn browser_visible_remote_carrier_exits_redacts_transport_identity_and_authority() {
+        let visible = browser_visible_remote_carrier_exits(&json!({
+            "remote_carrier_exits": [{
+                "id": "shared-exit",
+                "grant_id": "grant:test",
+                "peer_did": "did:key:z6Mktest",
+                "connect_ticket": "ticket:secret",
+                "allowed_principals": ["person:local:test"],
+                "carrier": {
+                    "peer_did": "did:key:z6Mknested",
+                    "connect_ticket": "ticket:nested"
+                }
+            }]
+        }));
+        let exits = visible
+            .as_array()
+            .expect("remote exits should stay an array");
+        assert_eq!(exits.len(), 1);
+        let exit = exits[0].as_object().expect("exit should stay an object");
+        assert!(!exit.contains_key("peer_did"));
+        assert!(!exit.contains_key("connect_ticket"));
+        assert!(!exit.contains_key("allowed_principals"));
+        assert!(exit
+            .get("carrier")
+            .and_then(|value| value.as_object())
+            .is_some_and(|carrier| {
+                !carrier.contains_key("peer_did") && !carrier.contains_key("connect_ticket")
+            }));
+    }
 }

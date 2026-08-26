@@ -2495,6 +2495,7 @@ fn browser_vm_manifest(memory_mib: u32, vcpu_count: u8) -> CapsuleManifest {
             persistent_storage_mb: None,
         }),
         providers: None,
+        icon: None,
         viewer: None,
         signature: None,
     }

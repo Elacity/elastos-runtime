@@ -29,6 +29,10 @@ pub(crate) struct ServerInfrastructure {
     pub(crate) provider_cid: String,
     pub(crate) shell_cid: Option<String>,
     pub(crate) host_helpers: Vec<api::server::HostHelperProcess>,
+    pub(crate) carrier_service: Option<elastos_server::carrier::CarrierRuntimeService>,
+    pub(crate) collaboration_context: api::gateway::GatewayCollaborationContext,
+    pub(crate) collaboration_service:
+        Option<elastos_server::collaboration_startup::CollaborationRuntimeService>,
 }
 
 const CONTENT_REPAIR_SCHEDULER_ENV: &str = "ELASTOS_CONTENT_REPAIR_SCHEDULER";
@@ -204,6 +208,10 @@ async fn setup_server_infrastructure_impl(
 ) -> anyhow::Result<ServerInfrastructure> {
     let data_dir = default_data_dir();
     let _ = ownership::repair_path_recursive(&data_dir);
+    let collaboration_configuration =
+        elastos_server::collaboration_startup::load_and_accept_collaboration_startup_configuration(
+            &data_dir,
+        )?;
 
     let audit_log = Arc::new(primitives::audit::AuditLog::new());
     let session_registry = Arc::new(session::SessionRegistry::new(audit_log.clone()));
@@ -237,6 +245,7 @@ async fn setup_server_infrastructure_impl(
     let provider_registry = Arc::new(provider::ProviderRegistry::new());
     let mut managed_host_processes = Vec::new();
     let mut external_availability_registered = false;
+    let mut carrier_service = None;
     let content_provider = Arc::new(ContentProvider::new(
         data_dir.clone(),
         Arc::downgrade(&provider_registry),
@@ -944,6 +953,7 @@ async fn setup_server_infrastructure_impl(
     // Carrier is fundamental infrastructure: gossip, content, identity.
     // Identity is DID (derived from device_key), not raw device_key.
     let (carrier_signing_key, carrier_did) = elastos_identity::derive_did(&device_key);
+    let mut collaboration_carrier_provider: Option<Arc<dyn provider::Provider>> = None;
     {
         match elastos_server::carrier::start_carrier_node_with_registry(
             &carrier_signing_key,
@@ -956,13 +966,17 @@ async fn setup_server_infrastructure_impl(
             Ok(carrier_node) => {
                 provider_registry
                     .set_carrier_invoker(Arc::new(
-                        elastos_server::carrier::CarrierProviderInvoker::new(),
+                        elastos_server::carrier::CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                            carrier_node.endpoint.clone(),
+                            Arc::downgrade(&provider_registry),
+                        ),
                     ))
                     .await;
                 let gossip_provider: Arc<dyn provider::Provider> =
                     Arc::new(elastos_server::carrier::CarrierGossipProvider::new(
                         carrier_node.gossip_state.clone(),
                     ));
+                collaboration_carrier_provider = Some(gossip_provider.clone());
                 if let Err(e) = provider_registry
                     .register_sub_provider("peer", gossip_provider)
                     .await
@@ -985,13 +999,9 @@ async fn setup_server_infrastructure_impl(
                         tracing::warn!("Failed to register Carrier availability provider: {}", e);
                     }
                 }
-                // Hold the carrier node alive. Dropping it kills the endpoint.
-                tokio::spawn(async move {
-                    let _node = carrier_node;
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                    }
-                });
+                carrier_service = Some(elastos_server::carrier::CarrierRuntimeService::new(
+                    carrier_node,
+                ));
                 tracing::info!("Carrier node online (P2P + gossip)");
             }
             Err(e) => {
@@ -999,6 +1009,20 @@ async fn setup_server_infrastructure_impl(
             }
         }
     }
+
+    let collaboration_service =
+        elastos_server::collaboration_startup::start_collaboration_runtime_service(
+            &data_dir,
+            carrier_signing_key,
+            collaboration_configuration,
+            collaboration_carrier_provider,
+            provider_registry.clone(),
+        )
+        .await?;
+    let collaboration_context = collaboration_service
+        .as_ref()
+        .map(|service| service.gateway_context())
+        .unwrap_or_default();
 
     maybe_spawn_content_repair_scheduler(provider_registry.clone());
 
@@ -1059,6 +1083,9 @@ async fn setup_server_infrastructure_impl(
         provider_cid,
         shell_cid,
         host_helpers: managed_host_processes,
+        carrier_service,
+        collaboration_context,
+        collaboration_service,
     })
 }
 
@@ -1071,12 +1098,19 @@ fn spawn_browser_local_exit(path: &Path, config: &serde_json::Value) -> anyhow::
     {
         remove_existing_browser_local_exit_socket(&relay_path)?;
     }
+    // `stdin` is the helper's parent-liveness channel, not a data channel: we
+    // hold the write end open for as long as this process lives, so the helper
+    // reads EOF and reaps itself however we exit. `HostHelperProcess::drop` only
+    // covers graceful shutdown — SIGKILL, an abort on panic, and the installed
+    // binary supersession watch's `process::exit` all skip it, and each of those
+    // used to strand a helper holding the relay socket.
     let mut child = Command::new(path)
         .env(
             "ELASTOS_BROWSER_LOCAL_EXIT_CONFIG",
             serde_json::to_string(config)?,
         )
-        .stdin(Stdio::null())
+        .env("ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF", "1")
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1186,13 +1220,53 @@ fn remove_existing_browser_local_exit_socket(path: &Path) -> anyhow::Result<()> 
         );
     }
 
-    std::fs::remove_file(path).map_err(|err| {
-        anyhow::anyhow!(
+    // Unlinking a socket a live helper is still listening on does not stop that
+    // helper — it keeps serving an unreachable, unlinked socket forever. Doing it
+    // blindly on every launch is how helpers piled up one per launch, all bound to
+    // the same path. Give an incumbent a moment to reap itself (the parent-EOF
+    // watch makes that prompt) before deciding the path is genuinely abandoned.
+    #[cfg(unix)]
+    {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while browser_local_exit_socket_has_listener(path) {
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "browser-local-exit relay socket {} is still served by a live helper; \
+                     stop the ElastOS host that owns it before starting another",
+                    path.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        // The incumbent reaped itself and removed its own socket.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(anyhow::anyhow!(
             "failed to remove existing browser-local-exit relay socket {}: {}",
             path.display(),
             err
-        )
-    })
+        )),
+    }
+}
+
+/// Whether anything is still accepting on `path`, distinguishing a live helper
+/// from a socket file left behind by one that is already gone.
+#[cfg(unix)]
+fn browser_local_exit_socket_has_listener(path: &Path) -> bool {
+    use std::os::unix::net::UnixStream;
+
+    match UnixStream::connect(path) {
+        Ok(stream) => {
+            // Connected without sending a relay-open handshake; drop it immediately.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            true
+        }
+        // ECONNREFUSED means the socket file outlived its listener.
+        Err(_) => false,
+    }
 }
 
 fn availability_provider_config_from_env() -> Option<serde_json::Value> {
@@ -2005,6 +2079,48 @@ mod tests {
         assert!(relay_path.exists());
     }
 
+    /// Bindable socket paths must stay under `SUN_LEN`, which `tempfile::tempdir`
+    /// paths can overrun on macOS.
+    #[cfg(unix)]
+    fn bindable_relay_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ele-srv-{}-{tag}.sock", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_local_exit_replace_existing_socket_removes_a_socket_with_no_listener() {
+        let relay_path = bindable_relay_path("stale");
+        let _ = std::fs::remove_file(&relay_path);
+        let listener = std::os::unix::net::UnixListener::bind(&relay_path).unwrap();
+        // Rust does not unlink the path on drop, so this leaves the exact shape a
+        // hard-killed helper leaves behind: a socket file with nothing serving it.
+        drop(listener);
+        assert!(relay_path.exists());
+
+        remove_existing_browser_local_exit_socket(&relay_path).unwrap();
+        assert!(!relay_path.exists(), "stale relay socket must be reclaimed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_local_exit_replace_existing_socket_refuses_a_live_listener() {
+        let relay_path = bindable_relay_path("live");
+        let _ = std::fs::remove_file(&relay_path);
+        let listener = std::os::unix::net::UnixListener::bind(&relay_path).unwrap();
+
+        // Silently unlinking here is what stranded helpers one per launch: the
+        // incumbent keeps serving an unlinked socket that nothing can reach again.
+        let err = remove_existing_browser_local_exit_socket(&relay_path).unwrap_err();
+        assert!(
+            err.to_string().contains("still served by a live helper"),
+            "unexpected error: {err}"
+        );
+        assert!(relay_path.exists(), "a live helper's socket must survive");
+
+        drop(listener);
+        let _ = std::fs::remove_file(&relay_path);
+    }
+
     #[test]
     fn browser_local_exit_socket_ready_requires_socket() {
         let dir = tempfile::tempdir().unwrap();
@@ -2020,5 +2136,39 @@ mod tests {
         {
             assert!(browser_local_exit_socket_ready(&relay_path).unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn carrier_runtime_service_shutdown_releases_endpoint_for_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let device_key = elastos_identity::load_or_create_device_key(dir.path()).unwrap();
+        let (signing_key, did) = elastos_identity::derive_did(&device_key);
+
+        let node = elastos_server::carrier::start_carrier_node_with_registry(
+            &signing_key,
+            &did,
+            dir.path().to_path_buf(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !node.endpoint.bound_sockets().is_empty(),
+            "carrier endpoint should be bound before readiness is published"
+        );
+
+        let mut service = elastos_server::carrier::CarrierRuntimeService::new(node);
+        service.shutdown().await.unwrap();
+
+        let restarted = elastos_server::carrier::start_carrier_node_with_registry(
+            &signing_key,
+            &did,
+            dir.path().to_path_buf(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut restarted_service = elastos_server::carrier::CarrierRuntimeService::new(restarted);
+        restarted_service.shutdown().await.unwrap();
     }
 }

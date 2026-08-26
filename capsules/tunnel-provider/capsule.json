@@ -72,6 +72,6 @@
     "gpu": false
   },
   "permissions": {
-    "carrier": true
+    "host_process": true
   }
 }

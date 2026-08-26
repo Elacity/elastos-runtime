@@ -435,7 +435,10 @@ pub(super) async fn browser_app_open(
         };
     let context = authority.home_launch_context();
     let home_token = home_launch_token_header(&headers);
-    let request_origin = browser_request_origin(&headers);
+    let request_origin = match browser_request_origin(&headers) {
+        Ok(origin) => Some(origin),
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid gateway origin").into_response(),
+    };
     if input.async_open {
         let owner_launch_id = authority.verified_context().launch_id();
         let browser_instance = match browser_instance_id(input.browser_instance.clone()) {

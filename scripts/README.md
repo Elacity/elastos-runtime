@@ -10,7 +10,7 @@ automatically a stable end-user command.
 - `install.sh` runs the signed installer.
 - `setup-source-home.sh` builds and provisions a source Home.
 - `home-demo-local.sh` and `chat-demo-local.sh` start disposable local demos.
-- `agent.sh`, `chat.sh`, and `share-demo.sh` run focused demos.
+- `share-demo.sh` runs the focused sharing demo.
 - `setup-crosvm.sh` installs VM prerequisites.
 - `publish-release.sh` is the low-level release publisher.
 - `vendor-walletconnect-adapter.sh` refreshes the pinned WalletConnect asset.

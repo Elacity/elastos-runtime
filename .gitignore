@@ -141,3 +141,4 @@ scripts/dev-sync-jetson.sh
 scripts/full-check-inventory.sh
 scripts/control_graph_cron.py
 scripts/status.sh
+scripts/dev/dkms-docker/shared

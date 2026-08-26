@@ -20,7 +20,10 @@ for the canonical definition.
 
 ## Runtime
 
-The minimal trusted base (`elastos` binary). Enforces isolation, signatures, and capabilities. Everything outside the runtime is a capsule.
+The minimal trusted base (`elastos` binary). It enforces isolation, signatures,
+capabilities, routing, lifecycle, and audit. Capsules and providers run outside
+the trusted core. Native host and engine adapters may also sit outside it, but
+they do not become capsules merely because they are separate processes.
 
 ## Principal
 
@@ -28,12 +31,23 @@ The runtime authority subject. A principal may represent a human account,
 agent, device, capsule, or provider. Sessions and capability tokens are issued
 to principals. Wallet addresses, passkeys, and DIDs are proof bindings or linked
 identities for a principal, not replacements for the principal itself.
+A person using Home, that person's local principal, their signed Profile, and a
+delivery Device DID remain separate identities and authority subjects.
 
 ## Passkey
 
 The default human proof for Home. A passkey proves control of a local account to
 the runtime and unlocks short-lived sessions. It is not a wallet, not a DID, and
 normally does not expose raw key material for encryption.
+
+## Profile DID
+
+The stable person/contact identity used by signed People, discovery, accepted
+contacts, and direct-conversation identity. A Profile DID belongs to a
+principal-owned signed Profile document and remains stable across device
+replacement or revocation. It is not the passkey and not the local principal
+identifier. It represents the person in collaboration, but the signed Profile
+document is not the human actor or the delivery device.
 
 ## WebAuthn PRF
 
@@ -46,9 +60,10 @@ session data.
 ## Device DID (`did:key`)
 
 The self-certifying device/node identity derived from local key material. The
-runtime currently uses `did:key` for Carrier/node signing and local provider
-identity. It is useful without a blockchain, but it does not prove a global
-name claim.
+runtime currently uses `did:key` for Carrier/node signing, routing, delivery
+attribution, and local provider identity. It is useful without a blockchain,
+but it is device/transport identity, not person/contact identity, and it does
+not prove a global name claim.
 
 ## Account DID (`did:elastos` / EID)
 
@@ -97,9 +112,38 @@ shell may be graphical, CLI, or TUI, but its manifest role is not an authority
 grant. Runtime policy decides which shell identities may become active and
 authorizes every launch, approval, provider, and shell-switch effect.
 
+## ESP
+
+ElastOS Shell Protocol. ESP is the shell-facing contract for Runtime facts and
+typed intents. Home and alternate shells use it without gaining authority.
+Some branch history calls the Runtime and capability baseline first integrated
+on the ESP line the "ESP substrate." That is lineage shorthand, not a second
+protocol, expansion, authority layer, or capsule ABI.
+
 ## Provider
 
 A capsule that implements a protocol contract for other capsules to consume. Examples: `localhost-provider` (file-backed localhost roots), `did-provider` (identity), `ai-provider` (LLM routing), `chain-provider` (typed chain reads/proofs), `wallet-provider` (wallet proof, account-link, and approval authority), `drm-provider` (protected-content open boundary), `rights-provider` (protected-content rights questions), `key-provider` (protected-content key release), `decrypt-provider` (protected-content decrypt/render sessions), `availability-provider` (configured replication adapter), and `ipfs-provider` (low-level IPFS via Kubo). P2P networking is provided by built-in Carrier, not a separate provider capsule. Application capsules use providers through `elastos://` or rooted `localhost://` resources rather than implementing protocols directly.
+
+## Observation
+
+A provider report about a named subject at a stated time. An observation used
+for authority or safety must carry enough source, freshness, integrity, and
+replay evidence for the consuming policy. Receiving a webhook or transport
+message does not establish that the reported state is true.
+
+## Actuation
+
+An effect intended to change digital, economic, rights, or physical state.
+Runtime authorizes and routes it through a typed provider operation. A physical
+controller retains the final local safety decision. Ownership evidence is not
+an actuation capability.
+
+## Effect settlement
+
+Runtime's durable knowledge of whether an external effect occurred. Transport
+acceptance, provider acceptance, execution, and observed outcome are separate
+claims. If Runtime cannot prove the outcome after dispatch, settlement remains
+unknown and retry follows the operation's reconciliation contract.
 
 ## Content Availability Provider
 
@@ -123,7 +167,15 @@ Distributed key-management system for protected content. The ElastOS direction i
 PQ-hybrid threshold release for new content: AES-256 CEKs, `t-of-n` shares,
 hybrid X25519 + ML-KEM share wrapping, and provider-owned key/decrypt sessions.
 FROST may help sign classical v0 receipts or cohort decisions, but it is not the
-long-term dKMS security root.
+long-term dKMS security root. Runtime selects the local adapter or Carrier route
+for a dKMS operation. The caller does not select a dKMS peer, host, backend, or
+transport.
+
+## CEK
+
+Content encryption key. A CEK may exist only inside reviewed key-release and
+decrypt custody. Runtime, Carrier, ordinary Apps, and ordinary receipts may
+carry sealed key material or bounded results, but never the live CEK.
 
 ## Carrier
 
@@ -143,6 +195,13 @@ The native namespace exposed by the runtime. It is broader than Carrier alone:
 - all are routed and capability-checked by the runtime
 
 So `elastos://` is the contract surface; Carrier is one major substrate behind it.
+
+## Exit
+
+The typed egress contract for reaching public network destinations under
+Runtime policy. Carrier is endpoint-authenticated transport between ElastOS
+nodes. Runtime may reach a remote Exit over Carrier, but Exit and Carrier remain
+separate capabilities and responsibilities.
 
 ## HTTP
 
@@ -170,7 +229,9 @@ The current transport implementation for Carrier's network plane. A Rust library
 
 ## Boson / Carrier Native
 
-The Elastos Foundation's native Carrier protocol. A future transport target for interoperability — when Boson matures, it becomes another transport under the Carrier abstraction alongside iroh.
+The Elastos Foundation's native Carrier protocol. Boson is a future transport
+target for interoperability. If it matures, it can sit under the Carrier
+abstraction alongside iroh.
 
 ## TAP Device
 

@@ -6,19 +6,20 @@ import {
   relaunchHomeGuiWindowForToken,
   renewHomeGuiBrowserWindowAuthority,
   restoreHomeGuiSession,
+  setHomeGuiMenuManifest,
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
-} from "./home-gui.js?v=home-20260731b";
+} from "./home-gui.js?v=home-20260813a";
 import {
   acceptHomeBrowserContextId,
   hasHomeBrowserContextId,
   setHomeGuiLaunchToken,
-} from "./shell-core.js?v=home-20260725a";
+} from "./shell-core.js?v=home-20260813a";
 import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
-} from "./home-gui-authority.js?v=home-20260731b";
+} from "./home-gui-authority.js?v=home-20260813a";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
@@ -146,6 +147,15 @@ function handleGuiCommand(message) {
   if (command === "attach-authorized-target") {
     return attachAuthorizedHomeGuiTarget(
       consumeAuthorizedAttachmentDescriptor(message),
+    );
+  }
+  if (command === "set-menu-manifest") {
+    if (!hasExactKeys(message, ["type", "command", "homeToken", "menus"])) {
+      return false;
+    }
+    return setHomeGuiMenuManifest(
+      typeof message.homeToken === "string" ? message.homeToken.trim() : "",
+      message.menus,
     );
   }
   if (command === "show-desktop") {

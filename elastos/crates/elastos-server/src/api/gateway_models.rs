@@ -27,10 +27,57 @@ struct HomeRouteInfo {
 
 #[derive(Serialize)]
 struct HomeIdentitySummary {
+    /// The local Runtime device identity. Serialized to exactly one browser
+    /// surface: System, the runtime-inspection page. Every other capsule read
+    /// model strips it via `without_device_identity` — invariant 1 keeps
+    /// device identity out of app-facing projections, and no other surface
+    /// consumes it.
     device_did: Option<String>,
-    handle: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    profile_card: Option<HomeProfileCardSummary>,
+    profile_readiness: Option<ProfileReadinessSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile_setup_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<HomeProfileSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProfileReadinessSummary {
+    schema: &'static str,
+    status: &'static str,
+}
+
+impl ProfileReadinessSummary {
+    const SCHEMA: &'static str = "elastos.profile.readiness/v1";
+
+    fn ready() -> Self {
+        Self {
+            schema: Self::SCHEMA,
+            status: "ready",
+        }
+    }
+
+    fn setup_required() -> Self {
+        Self {
+            schema: Self::SCHEMA,
+            status: "setup_required",
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            schema: Self::SCHEMA,
+            status: "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HomeProfileSummary {
+    schema: String,
+    display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handle: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,7 +99,6 @@ struct HomePeopleSummary {
     service_offer_count: usize,
     #[serde(default)]
     service_offers: Vec<HomeServiceOfferSummary>,
-    discovery: HomePeopleDiscoverySummary,
 }
 
 impl Default for HomePeopleSummary {
@@ -63,99 +109,23 @@ impl Default for HomePeopleSummary {
             contacts: Vec::new(),
             service_offer_count: 0,
             service_offers: Vec::new(),
-            discovery: HomePeopleDiscoverySummary::default(),
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct HomePeopleDiscoverySummary {
-    schema: String,
-    enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    expires_at: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    remaining_seconds: Option<u64>,
-    visibility: String,
-    status: String,
-    status_message: String,
-    topic: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    local_peer_id: Option<String>,
-    discovered_count: usize,
-    #[serde(default)]
-    discovered_peers: Vec<HomePeopleDiscoveryPeerSummary>,
-    request_count: usize,
-    #[serde(default)]
-    requests: Vec<HomePeopleDiscoveryRequestSummary>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    changed: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    refresh_fingerprint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    next_refresh_after_ms: Option<u64>,
-}
-
-impl Default for HomePeopleDiscoverySummary {
-    fn default() -> Self {
-        Self {
-            schema: "elastos.people.discovery/v1".to_string(),
-            enabled: false,
-            expires_at: None,
-            remaining_seconds: None,
-            visibility: "off".to_string(),
-            status: "off".to_string(),
-            status_message: "Discovery is off.".to_string(),
-            topic: "__elastos_internal/people-discovery-v1".to_string(),
-            local_peer_id: None,
-            discovered_count: 0,
-            discovered_peers: Vec::new(),
-            request_count: 0,
-            requests: Vec::new(),
-            changed: None,
-            refresh_fingerprint: None,
-            next_refresh_after_ms: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct HomePeopleDiscoveryPeerSummary {
-    peer_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    did: Option<String>,
-    display_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    handle: Option<String>,
-    last_seen_at: u64,
-    status: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct HomePeopleDiscoveryRequestSummary {
-    request_id: String,
-    peer_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    did: Option<String>,
-    display_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    handle: Option<String>,
-    created_at: u64,
-    status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    invite_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct HomePeopleContactSummary {
     contact_id: String,
     #[serde(skip)]
+    remote_profile_did: Option<String>,
+    #[serde(skip)]
     added_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation_id: Option<String>,
     display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handle: Option<String>,
     relationship: String,
-    route: String,
     can_message: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     device_label: Option<String>,
@@ -163,6 +133,13 @@ struct HomePeopleContactSummary {
     profile_card: Option<HomeProfileCardSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_seen_at: Option<u64>,
+    /// Presence-derived: `Some(true)` when the contact's signed Profile has an
+    /// unexpired presence heartbeat right now, `Some(false)` when presence is
+    /// configured and it does not, `None` when there is no presence basis to
+    /// answer from. Heartbeat metadata — deliberately excluded from the People
+    /// realtime signature, like `last_seen_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reachable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -323,8 +300,8 @@ struct HomeDesktopObjectsSummary {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SystemHandleUpdateRequest {
-    handle: String,
+struct PeopleProfileUpdateRequest {
+    display_name: String,
 }
 
 #[derive(Deserialize)]
@@ -806,6 +783,16 @@ struct HomeState {
     notifications: HomeNotificationsSummary,
 }
 
+/// One rendered size of a capsule's own app icon.
+///
+/// The route is a plain capsule asset route, so the shell fetches the icon
+/// from the capsule that owns it instead of from a central shell icon table.
+#[derive(Clone, Serialize)]
+pub(in crate::api::gateway) struct CapsuleIconVariant {
+    pub(in crate::api::gateway) size: u32,
+    pub(in crate::api::gateway) route: String,
+}
+
 #[derive(Clone, Serialize)]
 struct HomeTargetSummary {
     target: String,
@@ -819,6 +806,10 @@ struct HomeTargetSummary {
     viewer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     viewer_title: Option<String>,
+    /// Empty when the capsule declares no icon; the shell then draws its own
+    /// generic glyph rather than guessing at an asset route.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    icon: Vec<CapsuleIconVariant>,
 }
 
 #[derive(Deserialize)]
@@ -882,6 +873,7 @@ struct ChatRoomSessionStartResponse {
     status: String,
     display_name: String,
     expires_at: u64,
+    poll: GatewayRoomPollView,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -894,15 +886,11 @@ struct GatewayRoomSummary {
     #[serde(default)]
     latest_request_device: Option<String>,
     #[serde(default)]
-    active_participants: Vec<crate::room_service::ParticipantView>,
-    #[serde(default)]
     pending_requests: Vec<crate::room_service::PendingRequestView>,
     #[serde(default)]
     active_sessions: Vec<GatewayActiveSessionSummary>,
     #[serde(default)]
-    room_control: crate::room_service::RoomControlSummary,
-    #[serde(default)]
-    local_runtime_did: Option<String>,
+    room_control: GatewayRoomControlSummary,
     #[serde(default)]
     local_runtime_role: Option<crate::room_service::RoomRole>,
     #[serde(default)]
@@ -927,7 +915,86 @@ struct GatewayActiveSessionSummary {
     #[serde(default)]
     capabilities: Vec<String>,
     #[serde(default)]
-    member_did: Option<String>,
+    member_bound: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GatewayRoomControlSummary {
+    #[serde(default)]
+    access_policy: crate::room_service::RoomAccessPolicyView,
+    #[serde(default)]
+    members: Vec<GatewayRoomMemberSummary>,
+    #[serde(default)]
+    pending_invites: Vec<GatewayRoomInviteSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GatewayRoomMemberSummary {
+    role: String,
+    added_at: u64,
+    #[serde(default)]
+    profile_card: Option<GatewayRoomProfileCardSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GatewayRoomProfileCardSummary {
+    display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GatewayRoomInviteSummary {
+    invite_id: String,
+    role: String,
+    created_at: u64,
+    expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GatewayRoomPollView {
+    room_slug: String,
+    display_name: String,
+    latest_seq: u64,
+    #[serde(default)]
+    participants: Vec<GatewayParticipantView>,
+    #[serde(default)]
+    objects: Vec<GatewayConversationObjectView>,
+    #[serde(default)]
+    transport: crate::room_service::RoomTransportView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GatewayConversationObjectView {
+    seq: u64,
+    sender: String,
+    #[serde(default)]
+    sender_profile_verified: Option<bool>,
+    #[serde(default)]
+    from_current_session: bool,
+    kind: crate::room_service::ConversationObjectKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    emoji: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link: Option<crate::room_service::LinkPreviewView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attachment: Option<crate::room_service::AttachmentView>,
+    created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GatewayParticipantView {
+    display_name: String,
+    #[serde(default)]
+    profile_verified: Option<bool>,
+    device_label: String,
+    last_seen_at: u64,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    local_session_count: usize,
+    #[serde(default)]
+    is_current_session: bool,
 }
 
 impl From<crate::room_service::RoomSummary> for GatewayRoomSummary {
@@ -938,15 +1005,13 @@ impl From<crate::room_service::RoomSummary> for GatewayRoomSummary {
             active_session_count: summary.active_session_count,
             latest_request_name: summary.latest_request_name,
             latest_request_device: summary.latest_request_device,
-            active_participants: summary.active_participants,
             pending_requests: summary.pending_requests,
             active_sessions: summary
                 .active_sessions
                 .into_iter()
                 .map(GatewayActiveSessionSummary::from)
                 .collect(),
-            room_control: summary.room_control,
-            local_runtime_did: summary.local_runtime_did,
+            room_control: GatewayRoomControlSummary::from(summary.room_control),
             local_runtime_role: summary.local_runtime_role,
             canonical_hosted_guest_url: summary.canonical_hosted_guest_url,
             ephemeral_hosted_guest_url: summary.ephemeral_hosted_guest_url,
@@ -967,7 +1032,115 @@ impl From<crate::room_service::ActiveSessionView> for GatewayActiveSessionSummar
             expires_at: session.expires_at,
             last_seen_at: session.last_seen_at,
             capabilities: session.capabilities,
-            member_did: session.member_did,
+            member_bound: session.member_did.is_some(),
         }
     }
+}
+
+impl From<crate::room_service::RoomControlSummary> for GatewayRoomControlSummary {
+    fn from(summary: crate::room_service::RoomControlSummary) -> Self {
+        Self {
+            access_policy: summary.access_policy,
+            members: summary
+                .members
+                .into_iter()
+                .map(GatewayRoomMemberSummary::from)
+                .collect(),
+            pending_invites: summary
+                .pending_invites
+                .into_iter()
+                .map(GatewayRoomInviteSummary::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<crate::room_service::RoomMemberView> for GatewayRoomMemberSummary {
+    fn from(view: crate::room_service::RoomMemberView) -> Self {
+        Self {
+            role: gateway_room_role_label(view.role),
+            added_at: view.added_at,
+            profile_card: view.profile_card.map(GatewayRoomProfileCardSummary::from),
+        }
+    }
+}
+
+impl From<crate::room_service::RoomProfileCardView> for GatewayRoomProfileCardSummary {
+    fn from(view: crate::room_service::RoomProfileCardView) -> Self {
+        Self {
+            display_name: view.display_name,
+        }
+    }
+}
+
+impl From<crate::room_service::RoomInviteView> for GatewayRoomInviteSummary {
+    fn from(view: crate::room_service::RoomInviteView) -> Self {
+        Self {
+            invite_id: view.invite_id,
+            role: gateway_room_role_label(view.role),
+            created_at: view.created_at,
+            expires_at: view.expires_at,
+        }
+    }
+}
+
+impl From<crate::room_service::RoomPollView> for GatewayRoomPollView {
+    fn from(view: crate::room_service::RoomPollView) -> Self {
+        Self {
+            room_slug: view.room_slug,
+            display_name: view.display_name,
+            latest_seq: view.latest_seq,
+            participants: view
+                .participants
+                .into_iter()
+                .map(GatewayParticipantView::from)
+                .collect(),
+            objects: view
+                .objects
+                .into_iter()
+                .map(GatewayConversationObjectView::from)
+                .collect(),
+            transport: view.transport,
+        }
+    }
+}
+
+impl From<crate::room_service::ConversationObjectView> for GatewayConversationObjectView {
+    fn from(view: crate::room_service::ConversationObjectView) -> Self {
+        Self {
+            seq: view.seq,
+            sender: view.sender,
+            sender_profile_verified: view.sender_profile_verified,
+            from_current_session: view.from_current_session,
+            kind: view.kind,
+            body: view.body,
+            emoji: view.emoji,
+            link: view.link,
+            attachment: view.attachment,
+            created_at: view.created_at,
+        }
+    }
+}
+
+impl From<crate::room_service::ParticipantView> for GatewayParticipantView {
+    fn from(view: crate::room_service::ParticipantView) -> Self {
+        Self {
+            display_name: view.display_name,
+            profile_verified: view.profile_verified,
+            device_label: view.device_label,
+            last_seen_at: view.last_seen_at,
+            role: view.role.map(gateway_room_role_label),
+            local_session_count: view.local_session_count,
+            is_current_session: view.is_current_session,
+        }
+    }
+}
+
+fn gateway_room_role_label(role: crate::room_service::RoomRole) -> String {
+    match role {
+        crate::room_service::RoomRole::Owner => "owner",
+        crate::room_service::RoomRole::Admin => "admin",
+        crate::room_service::RoomRole::Member => "member",
+    }
+    .to_string()
 }

@@ -11,15 +11,24 @@ pub(super) async fn inbox_summary(
         };
     let context = authority.home_launch_context();
 
-    let data_dir = state.data_dir.clone();
-    let sync_context = context.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        home_services_sync_access_requests(&data_dir, &sync_context)
-    })
-    .await;
-
     let home_state = home_state(&state.data_dir);
     let mut notifications = home_state.notifications;
+    let contact_authority =
+        match super::gateway_home_system::load_configured_contact_authority_for_context(
+            &state.data_dir,
+            &context,
+            state.collaboration_discovery_service.as_ref(),
+        ) {
+            Ok(authority) => authority,
+            Err(err) => return inbox_error_response(err),
+        };
+    if let Err(err) = super::gateway_home_system::apply_contact_request_notification_projection(
+        &state.data_dir,
+        contact_authority.as_ref().map(|authority| &authority.store),
+        &mut notifications,
+    ) {
+        return inbox_error_response(err);
+    }
     append_home_service_access_notifications(&state.data_dir, &context, &mut notifications);
     let wallet_approvals = system_wallet_approvals_summary(&state, &authority, false).await;
     append_wallet_approval_notifications(&mut notifications, wallet_approvals.approval_requests);
@@ -246,6 +255,24 @@ async fn dispatch_inbox_action(
             },
         );
     }
+    if let Some(request_hash) = action_id.strip_prefix("contact-accept-request:") {
+        return decide_contact_request(
+            state,
+            context,
+            request_hash,
+            crate::collaboration_discovery::CollaborationContactDecision::Accepted,
+        )
+        .await;
+    }
+    if let Some(request_hash) = action_id.strip_prefix("contact-decline-request:") {
+        return decide_contact_request(
+            state,
+            context,
+            request_hash,
+            crate::collaboration_discovery::CollaborationContactDecision::Declined,
+        )
+        .await;
+    }
     if let Some(request_id) = action_id.strip_prefix("room-approve-request:") {
         let message = match crate::room_service::approve_request(data_dir, request_id)? {
             Some(outcome) => format!(
@@ -394,6 +421,52 @@ async fn dispatch_inbox_action(
         return Ok("Rejected Wallet market-price source.".to_string());
     }
     anyhow::bail!("unknown inbox action");
+}
+
+async fn decide_contact_request(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    request_hash: &str,
+    decision: crate::collaboration_discovery::CollaborationContactDecision,
+) -> anyhow::Result<String> {
+    let request_hash = request_hash.trim();
+    if request_hash.is_empty() {
+        anyhow::bail!("contact request is missing");
+    }
+    let service = state
+        .collaboration_discovery_service
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("contact decisions are not available on this Home"))?;
+    let authority = super::gateway_home_system::load_configured_contact_authority_for_context(
+        &state.data_dir,
+        context,
+        Some(service),
+    )?
+    .ok_or_else(|| anyhow::anyhow!("save your Profile before deciding contact requests"))?;
+    super::gateway_home_system::register_configured_contact_sync_for_context(
+        service,
+        context,
+        &authority,
+        now_ts(),
+    )?;
+    service
+        .submit_contact_decision(
+            authority.store.as_ref(),
+            &authority.profile,
+            request_hash,
+            decision,
+            now_ts(),
+        )
+        .await?;
+    service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now_ts())?;
+    Ok(match decision {
+        crate::collaboration_discovery::CollaborationContactDecision::Accepted => {
+            "Contact added.".to_string()
+        }
+        crate::collaboration_discovery::CollaborationContactDecision::Declined => {
+            "Request declined.".to_string()
+        }
+    })
 }
 
 pub(super) async fn approve_runtime_capability_request(

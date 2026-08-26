@@ -19,15 +19,6 @@
         "aarch64-linux"
       ]
     },
-    "chat": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "x86_64-linux",
-        "aarch64-linux"
-      ]
-    },
     "did-provider": {
       "cid": "",
       "sha256": "",
@@ -212,15 +203,6 @@
       ]
     },
     "tunnel-provider": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "x86_64-linux",
-        "aarch64-linux"
-      ]
-    },
-    "agent": {
       "cid": "",
       "sha256": "",
       "size": 0,
@@ -869,28 +851,6 @@
         }
       }
     },
-    "chat": {
-      "install_path": "capsules/chat",
-      "description": "Packaged microVM chat bundle for the full-screen Carrier chat path",
-      "platforms": {
-        "linux-amd64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "chat-linux-amd64.tar.gz",
-          "extract_path": "chat",
-          "install_path": "capsules/chat"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "chat-linux-arm64.tar.gz",
-          "extract_path": "chat",
-          "install_path": "capsules/chat"
-        }
-      }
-    },
     "ipfs-provider": {
       "install_path": "bin/ipfs-provider",
       "description": "Host IPFS bridge binary required for direct share/open and attest commands",
@@ -1218,7 +1178,7 @@
       ]
     },
     "home": {
-      "description": "Managed Home plus native Carrier chat",
+      "description": "Managed Home",
       "components": [
         "shell",
         "localhost-provider",
@@ -1254,7 +1214,7 @@
       ]
     },
     "demo": {
-      "description": "Home demo path with native chat, room, full-screen chat, site, sharing, GBA, and browser capsule surfaces",
+      "description": "Home demo path with Runtime-backed Chat, site, sharing, GBA, and Browser surfaces",
       "components": [
         "shell",
         "localhost-provider",
@@ -1282,7 +1242,6 @@
         "object-provider",
         "content-block-graph-provider",
         "browser",
-        "chat",
         "gba-emulator",
         "gba-ucity",
         "chat-room",
@@ -1296,17 +1255,6 @@
         "marketplace",
         "archive-manager",
         "inbox"
-      ]
-    },
-    "chat": {
-      "description": "Packaged full-screen microVM chat on a KVM-capable host",
-      "components": [
-        "shell",
-        "localhost-provider",
-        "did-provider",
-        "chat",
-        "crosvm",
-        "vmlinux"
       ]
     },
     "operator": {
@@ -1446,7 +1394,6 @@
         "wallet-walletconnect",
         "wallet",
         "browser",
-        "chat",
         "gba-emulator",
         "gba-ucity",
         "chat-room",

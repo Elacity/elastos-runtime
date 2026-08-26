@@ -57,7 +57,7 @@ command matrix.
 
 Prerequisites:
 
-- Rust 1.89 or newer
+- Rust 1.91 or newer
 - Git
 - `just`, installed with `cargo install just`
 - Linux with KVM only when working on crosvm or microVM paths

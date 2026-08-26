@@ -7,39 +7,273 @@
   hidden
 ></div>
 
-<header class="toolbar" aria-label="Home toolbar" data-home-gui-hidden-by-host="hidden" inert hidden>
-  <button id="toolbar-home" class="toolbar-btn toolbar-brand" type="button" aria-label="Go Home" title="ElastOS">
-    <img src="/apps/home-gui/elastos-logo.svg" alt="ElastOS" draggable="false" />
-  </button>
+<header class="toolbar" aria-label="System bar" data-home-gui-hidden-by-host="hidden" inert hidden>
+  <div id="toolbar-system" class="toolbar-system">
+    <button
+      id="toolbar-home"
+      class="toolbar-btn toolbar-brand"
+      type="button"
+      aria-label="ElastOS menu"
+      title="ElastOS"
+      aria-haspopup="menu"
+      aria-expanded="false"
+      aria-controls="toolbar-identity-menu"
+    >
+      <img src="/apps/home-gui/elastos-logo.svg" alt="" draggable="false" />
+    </button>
+    <div
+      id="toolbar-identity-menu"
+      class="toolbar-identity-menu toolbar-system-menu"
+      role="menu"
+      aria-label="ElastOS"
+      hidden
+    >
+      <div class="toolbar-identity-header" role="presentation">
+        <span id="toolbar-identity-avatar" class="toolbar-identity-menu-avatar" aria-hidden="true">
+          <span id="toolbar-identity-monogram" class="toolbar-identity-menu-monogram"></span>
+          <img id="toolbar-identity-avatar-image" class="toolbar-identity-menu-avatar-image" alt="" hidden />
+        </span>
+        <span class="toolbar-identity-header-copy">
+          Signed in as <strong id="toolbar-identity-menu-name"></strong>
+        </span>
+      </div>
+      <button id="identity-menu-about" class="toolbar-identity-item" type="button" role="menuitem">
+        <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 7.25V11M8 5.25h.01"/></svg>
+        About ElastOS
+      </button>
+      <button id="identity-menu-system" class="toolbar-identity-item" type="button" role="menuitem">
+        <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2"/><path d="M8 2.5v1.2M8 12.3V13.5M2.5 8h1.2M12.3 8h1.2M4.1 4.1l.85.85M11.05 11.05l.85.85M4.1 11.9l.85-.85M11.05 4.95l.85-.85"/></svg>
+        System Settings…
+      </button>
+      <button id="identity-menu-marketplace" class="toolbar-identity-item" type="button" role="menuitem">
+        <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="10" height="10" rx="2.2"/><path d="M6.2 9.2V6.8l2.3 1.35L10.8 6.8v2.4"/></svg>
+        Apps
+      </button>
+      <div class="toolbar-identity-divider" role="separator"></div>
+      <button id="identity-menu-show-desktop" class="toolbar-identity-item" type="button" role="menuitem">
+        <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="11" height="7.5" rx="1.2"/><path d="M5.5 13.5h5M8 11v2.5"/></svg>
+        Show Desktop
+      </button>
+      <button id="identity-menu-shortcuts" class="toolbar-identity-item" type="button" role="menuitem">
+        <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="11" height="8" rx="1.2"/><path d="M5 10h2.2M8.8 10H11M5.5 7h5"/></svg>
+        Shortcuts
+        <span class="toolbar-identity-shortcut" aria-hidden="true">⌘/</span>
+      </button>
+      <div class="toolbar-identity-divider" role="separator"></div>
+      <button id="identity-menu-lock" class="toolbar-identity-item" type="button" role="menuitem">
+        <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="7" width="9" height="6.5" rx="1.2"/><path d="M5.5 7V5.2a2.5 2.5 0 0 1 5 0V7"/></svg>
+        Lock Screen
+      </button>
+      <button id="identity-menu-sign-out" class="toolbar-identity-item" type="button" role="menuitem">
+        <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 3.5H4.2A1.7 1.7 0 0 0 2.5 5.2v5.6A1.7 1.7 0 0 0 4.2 12.5h2.3M7 8h6.5M11.2 5.5 13.5 8l-2.3 2.5"/></svg>
+        Sign Out…
+      </button>
+    </div>
+  </div>
+  <span id="toolbar-active-title" class="toolbar-active-title">Home</span>
+  <nav id="toolbar-menubar" class="toolbar-menubar" aria-label="App menus"></nav>
   <div class="toolbar-spacer"></div>
+  <button
+    id="toolbar-wallet"
+    class="toolbar-btn wallet-btn"
+    type="button"
+    aria-label="Wallet"
+    title="Wallet"
+    aria-expanded="false"
+    aria-controls="wallet-rail"
+    hidden
+  ></button>
   <button
     id="toolbar-inbox"
     class="toolbar-btn inbox-btn"
     type="button"
-    aria-label="Open inbox"
+    aria-label="Inbox — pending actions"
     title="Inbox"
+    aria-haspopup="dialog"
+    aria-expanded="false"
+    aria-controls="inbox-rail"
   >
     <span id="toolbar-inbox-count" class="toolbar-inbox-count" hidden></span>
   </button>
   <button
-    id="toolbar-fullscreen"
-    class="toolbar-btn fullscreen-btn"
+    id="toolbar-spotlight"
+    class="toolbar-btn spotlight-btn"
     type="button"
-    aria-label="Enter fullscreen"
-    title="Fullscreen"
-    aria-pressed="false"
+    aria-label="Search"
+    title="Search (Cmd+Space)"
+  ></button>
+  <button
+    id="toolbar-mission-control"
+    class="toolbar-btn toolbar-mission-btn"
+    type="button"
+    aria-label="Overview"
+    title="Overview (F3)"
   >
-    <img src="/apps/home-gui/fullscreen.svg" alt="" draggable="false" />
+    <span class="mission-control-glyph" aria-hidden="true"></span>
   </button>
   <button
-    id="toolbar-sign-out"
-    class="toolbar-btn sign-out-btn"
+    id="toolbar-control-centre"
+    class="toolbar-btn control-centre-btn"
     type="button"
-    aria-label="Sign out"
-    title="Sign out"
-  ></button>
-  <div id="clock" class="toolbar-clock">--:--</div>
+    aria-label="Status"
+    title="Status"
+    aria-haspopup="dialog"
+    aria-expanded="false"
+    aria-controls="control-centre"
+  >
+    <span class="control-centre-glyph" aria-hidden="true"></span>
+  </button>
+  <button
+    id="clock"
+    class="toolbar-clock"
+    type="button"
+    aria-haspopup="true"
+    aria-expanded="false"
+    aria-controls="notification-center"
+    aria-label="Clock. Open notification history"
+    title="Notification history"
+  >--:--</button>
 </header>
+
+<aside
+  id="notification-center"
+  class="notification-center"
+  role="group"
+  aria-label="Notification history"
+  tabindex="-1"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="nc-cal" aria-label="Date">
+    <div class="nc-cal-primary">
+      <div id="nc-cal-date" class="nc-cal-date">—</div>
+      <div id="nc-cal-time" class="nc-cal-time">—</div>
+    </div>
+    <div
+      id="nc-cal-month"
+      class="nc-cal-month"
+      role="grid"
+      aria-label="This month"
+    ></div>
+  </div>
+  <div class="notification-center-head">
+    <h2 class="notification-center-title">History</h2>
+    <button id="notification-center-clear" class="notification-center-clear" type="button" hidden>
+      Clear history
+    </button>
+  </div>
+  <div id="notification-center-list" class="notification-center-list hide-scrollbar"></div>
+  <p id="notification-center-empty" class="notification-center-empty" hidden>
+    No recent notifications on this device
+  </p>
+</aside>
+
+<aside
+  id="control-centre"
+  class="control-centre"
+  role="group"
+  aria-label="Status"
+  tabindex="-1"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="control-centre-section" role="radiogroup" aria-label="Appearance">
+    <div class="control-centre-label">Appearance</div>
+    <div id="control-centre-theme" class="control-centre-segment">
+      <span class="control-centre-segment-thumb" aria-hidden="true"></span>
+      <button type="button" class="control-centre-segment-option" data-theme-option="auto" role="radio" aria-checked="false">
+        Auto
+      </button>
+      <button type="button" class="control-centre-segment-option" data-theme-option="light" role="radio" aria-checked="false">
+        Light
+      </button>
+      <button type="button" class="control-centre-segment-option" data-theme-option="dark" role="radio" aria-checked="false">
+        Dark
+      </button>
+    </div>
+  </div>
+  <div class="control-centre-section" aria-label="Accent">
+    <div class="control-centre-label">Accent</div>
+    <div id="control-centre-accent" class="control-centre-accents" role="radiogroup" aria-label="Accent color"></div>
+    <div id="control-centre-accent-custom" class="control-centre-accent-custom" hidden>
+      <div id="control-centre-accent-picker" class="el-accent-picker"></div>
+      <label class="control-centre-accent-custom-hex">
+        <span>Hex</span>
+        <input id="control-centre-accent-hex" type="text" maxlength="7" spellcheck="false" autocomplete="off" placeholder="#4f7fff" aria-label="Custom accent hex" />
+      </label>
+    </div>
+  </div>
+  <div class="control-centre-divider" role="separator"></div>
+  <div class="control-centre-section" aria-label="Attention">
+    <div class="control-centre-label">Attention</div>
+    <button id="control-centre-focus" class="control-centre-row" type="button" role="switch" aria-checked="false">
+      <span class="control-centre-row-label">Focus</span>
+      <span class="control-centre-switch" aria-hidden="true"></span>
+    </button>
+    <button id="control-centre-approvals" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">Approvals</span>
+      <span id="control-centre-approvals-detail" class="control-centre-row-detail">None</span>
+    </button>
+  </div>
+  <div class="control-centre-divider" role="separator"></div>
+  <div class="control-centre-section" aria-label="Nearby">
+    <div class="control-centre-label">Nearby</div>
+    <button id="control-centre-discovery" class="control-centre-row" type="button" role="switch" aria-checked="false">
+      <span class="control-centre-row-label">Find People</span>
+      <span class="control-centre-switch" aria-hidden="true"></span>
+    </button>
+    <p id="control-centre-discovery-detail" class="control-centre-hint" hidden></p>
+    <div id="control-centre-carrier" class="control-centre-row control-centre-row-static" aria-live="polite">
+      <span class="control-centre-row-label">Carrier</span>
+      <span id="control-centre-carrier-detail" class="control-centre-row-detail">—</span>
+    </div>
+  </div>
+  <div class="control-centre-divider" role="separator"></div>
+  <div class="control-centre-section" aria-label="Display">
+    <div class="control-centre-label">Display</div>
+    <button id="control-centre-sounds" class="control-centre-row" type="button" role="switch" aria-checked="false">
+      <span class="control-centre-row-label">UI Sounds</span>
+      <span class="control-centre-switch" aria-hidden="true"></span>
+    </button>
+    <button id="control-centre-dock" class="control-centre-row" type="button" role="switch" aria-checked="false">
+      <span class="control-centre-row-label">Auto-hide Dock</span>
+      <span class="control-centre-switch" aria-hidden="true"></span>
+    </button>
+    <button id="control-centre-desktop-icons" class="control-centre-row" type="button" role="switch" aria-checked="true">
+      <span class="control-centre-row-label">Desktop Icons</span>
+      <span class="control-centre-switch" aria-hidden="true"></span>
+    </button>
+    <button id="control-centre-fullscreen" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">Enter Fullscreen</span>
+    </button>
+    <button id="control-centre-show-windows" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">Overview</span>
+      <span class="control-centre-row-detail">›</span>
+    </button>
+  </div>
+  <div class="control-centre-divider" role="separator"></div>
+  <div class="control-centre-section" aria-label="Session">
+    <div class="control-centre-label">Session</div>
+    <div id="control-centre-whoami" class="control-centre-row control-centre-row-static">
+      <span class="control-centre-row-label">Signed in as</span>
+      <span id="control-centre-whoami-detail" class="control-centre-row-detail">—</span>
+    </div>
+    <button id="control-centre-wallet" class="control-centre-row control-centre-wallet" type="button" hidden>
+      <span class="control-centre-row-label">Wallet</span>
+      <span class="control-centre-row-detail">Open</span>
+    </button>
+    <button id="control-centre-this-device" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">This Device</span>
+      <span class="control-centre-row-detail">About</span>
+    </button>
+    <button id="control-centre-system" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">System</span>
+      <span class="control-centre-row-detail">Open</span>
+    </button>
+  </div>
+</aside>
 
 <main class="desktop-workspace" data-home-gui-hidden-by-host="hidden" inert hidden>
   <div id="window-snap-preview" class="window-snap-preview" aria-hidden="true" hidden></div>
@@ -73,24 +307,35 @@
   </div>
 </footer>
 
-<aside id="launcher" class="launcher" aria-hidden="true" data-open="false" inert hidden>
-  <div class="launcher-popover hide-scrollbar" role="dialog" aria-modal="true" aria-label="Home launcher">
-    <button id="close-launcher" class="launcher-close" type="button" aria-label="Close launcher">
-      <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
-    </button>
-    <div class="launcher-search-wrap">
-      <input
-        id="launcher-search"
-        class="launcher-search-field"
-        type="search"
-        autocomplete="off"
-        placeholder="Search Home"
-        spellcheck="false"
-      />
+<aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>
+  <div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">
+    <div class="launcher-header">
+      <div class="launcher-search-wrap" hidden>
+        <input
+          id="launcher-search"
+          class="launcher-search-field"
+          type="search"
+          autocomplete="off"
+          placeholder="Search"
+          spellcheck="false"
+          tabindex="-1"
+          aria-hidden="true"
+        />
+      </div>
+      <p class="launcher-browse-label">Apps</p>
+      <button
+        id="launcher-view-toggle"
+        class="launcher-header-btn"
+        type="button"
+        aria-label="Switch to list view"
+        aria-pressed="false"
+      ></button>
     </div>
-    <h1 class="launcher-heading">Open</h1>
-    <div id="launcher-grid" class="launcher-sections"></div>
-    <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
+    <div class="launcher-scroll hide-scrollbar">
+      <h1 class="launcher-heading visually-hidden">Apps</h1>
+      <div id="launcher-grid" class="launcher-sections"></div>
+      <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
+    </div>
   </div>
 </aside>
 
@@ -123,19 +368,22 @@
 <template id="window-template">
   <section class="window" role="dialog" aria-modal="false" aria-hidden="true">
     <div class="window-head">
+      <div class="window-traffic-lights">
+        <button class="window-action-btn" data-action="close" type="button" aria-label="Close">
+          <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+        </button>
+        <button class="window-action-btn" data-action="minimize" type="button" aria-label="Minimize">
+          <img src="/apps/home-gui/minimize.svg" alt="" draggable="false" />
+        </button>
+        <button class="window-action-btn" data-action="maximize" type="button" aria-label="Enter Fullscreen" title="Enter Fullscreen">
+          <img src="/apps/home-gui/scale.svg" alt="" draggable="false" />
+        </button>
+      </div>
       <div class="window-head-draggable">
         <span class="window-head-icon"></span>
         <span class="window-head-title"></span>
       </div>
-      <button class="window-action-btn" data-action="minimize" type="button" aria-label="Minimize">
-        <img src="/apps/home-gui/minimize.svg" alt="" draggable="false" />
-      </button>
-      <button class="window-action-btn" data-action="maximize" type="button" aria-label="Maximize">
-        <img src="/apps/home-gui/scale.svg" alt="" draggable="false" />
-      </button>
-      <button class="window-action-btn" data-action="close" type="button" aria-label="Close">
-        <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
-      </button>
+      <div class="window-head-balance" aria-hidden="true"></div>
     </div>
     <div class="window-body"></div>
     <div class="window-resize-handle window-resize-handle-n" data-resize="n" aria-hidden="true"></div>

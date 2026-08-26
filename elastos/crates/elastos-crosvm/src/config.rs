@@ -438,6 +438,7 @@ mod tests {
             }),
             providers: None,
             authority: None,
+            icon: None,
             viewer: None,
             signature: None,
         };
@@ -499,6 +500,7 @@ mod tests {
             }),
             providers: None,
             authority: None,
+            icon: None,
             viewer: None,
             signature: None,
         };
