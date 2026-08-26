@@ -159,6 +159,8 @@ globalThis.HTMLElement = FakeElement;
 globalThis.document = {
   activeElement: null,
   body: elementForSelector("body"),
+  addEventListener() {},
+  removeEventListener() {},
   querySelector: elementForSelector,
   createElement: (tag) => new FakeElement(tag),
 };
@@ -245,8 +247,32 @@ async function withCapturedFrameRevealTimers(run) {
 }
 
 const shellCore = await import(`../capsules/home-gui/browser/shell-core.js?v=${moduleVersion}`);
+const shellChrome = await import(`../capsules/home-gui/browser/shell-chrome.js?v=${moduleVersion}`);
+const shellControlCentre = await import(`../capsules/home-gui/browser/shell-control-centre.js?v=${moduleVersion}`);
 const shellWindows = await import(`../capsules/home-gui/browser/shell-windows.js?v=${moduleVersion}`);
 const shellSurface = await import(`../capsules/home-gui/browser/shell-surface.js?v=${moduleVersion}`);
+const shellWalletRail = await import(`../capsules/home-gui/browser/shell-wallet-rail.js?v=${moduleVersion}`);
+const shellConnectorSheet = await import(`../capsules/home-gui/browser/shell-connector-sheet.js?v=${moduleVersion}`);
+
+function sourceBlock(source, needle, label) {
+  const start = source.indexOf(needle);
+  assert(start >= 0, `${label} missing`, { needle });
+  const open = start + needle.lastIndexOf("{");
+  assert(open >= 0, `${label} missing body`, { needle });
+  let depth = 0;
+  for (let index = open; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(start, index + 1);
+      }
+    }
+  }
+  throw new Error(`${label} block did not terminate`);
+}
 
 const trashGlyph = new FakeElement(".taskbar-item-icon");
 shellCore.mountGlyph(trashGlyph, "trash");
@@ -290,10 +316,87 @@ const summary = {
 
 shellCore.initializeShellLayout(summary);
 document.body.dataset.homeShell = "desktop";
+shellCore.shellState.currentSummary = summary;
 
 const layout = shellCore.shellState.shellLayoutState.desktop;
 assert(layout.wallet, "wallet desktop position missing", layout);
 assert(layout.people, "people desktop position missing", layout);
+
+const firstRunSummary = {
+  authority: { signed_in: true },
+  targets: [
+    { target: "wallet", title: "Wallet", route: "/apps/wallet/" },
+    { target: "chat-room", title: "Chat", route: "/apps/chat-room/" },
+    { target: "browser", title: "Browser", route: "/apps/browser/" },
+    { target: "system", title: "System", route: "/apps/system/" },
+    { target: "documents", title: "Documents", route: "/apps/documents/" },
+    { target: "object-target", title: "Shared object", route: "/apps/object-target/", target_kind: "object" },
+  ],
+  browser_state: {
+    principal_id: "principal:first-run",
+  },
+};
+
+shellCore.initializeShellLayout(firstRunSummary);
+assert(
+  JSON.stringify(shellCore.shellState.shellLayoutState.taskbar) === JSON.stringify([
+    "browser",
+    "wallet",
+    "documents",
+    "chat-room",
+    "system",
+  ]),
+  "fresh layout did not seed only the available core dock targets in canonical order",
+  shellCore.shellState.shellLayoutState.taskbar,
+);
+assert(
+  JSON.stringify(shellCore.shellState.shellLayoutState.desktopHidden) === JSON.stringify([
+    "wallet",
+    "chat-room",
+    "browser",
+    "system",
+    "documents",
+  ]),
+  "fresh layout did not hide all non-object visible targets and keep object targets visible",
+  shellCore.shellState.shellLayoutState.desktopHidden,
+);
+assert(
+  shellCore.isTargetOnDesktop("object-target") === true,
+  "fresh layout hid an object target from the desktop",
+  shellCore.shellState.shellLayoutState.desktopHidden,
+);
+assert(
+  shellCore.isTargetOnDesktop("wallet") === false,
+  "fresh layout left an app target on the desktop",
+  shellCore.shellState.shellLayoutState.desktopHidden,
+);
+
+const storedEmptyTaskbarSummary = {
+  authority: { signed_in: true },
+  targets: firstRunSummary.targets,
+  browser_state: {
+    principal_id: "principal:stored-empty-taskbar",
+    layout: {
+      desktop: {},
+      taskbar: [],
+      desktopHidden: ["wallet", "browser"],
+      desktopIconsVisible: true,
+    },
+  },
+};
+
+shellCore.initializeShellLayout(storedEmptyTaskbarSummary);
+assert(
+  Array.isArray(shellCore.shellState.shellLayoutState.taskbar) &&
+    shellCore.shellState.shellLayoutState.taskbar.length === 0,
+  "stored empty taskbar was rewritten by the first-run dock policy",
+  shellCore.shellState.shellLayoutState.taskbar,
+);
+assert(
+  JSON.stringify(shellCore.shellState.shellLayoutState.desktopHidden) === JSON.stringify(["wallet", "browser"]),
+  "stored desktopHidden changed without required normalization",
+  shellCore.shellState.shellLayoutState.desktopHidden,
+);
 
 const peopleStyle = readFileSync(
   new URL("../capsules/people/browser/style.css", import.meta.url),
@@ -316,6 +419,40 @@ const homeGuiScript = readFileSync(
   new URL("../capsules/home-gui/browser/home-gui.js", import.meta.url),
   "utf8",
 );
+const shellChromeScript = readFileSync(
+  new URL("../capsules/home-gui/browser/shell-chrome.js", import.meta.url),
+  "utf8",
+);
+const shellControlCentreScript = readFileSync(
+  new URL("../capsules/home-gui/browser/shell-control-centre.js", import.meta.url),
+  "utf8",
+);
+const homeGuiShellScript = readFileSync(
+  new URL("../capsules/home-gui/browser/home-gui-shell.js", import.meta.url),
+  "utf8",
+);
+const homeShellHostScript = readFileSync(
+  new URL("../capsules/home/browser/home-shell-host.js", import.meta.url),
+  "utf8",
+);
+const controlCentreScript = readFileSync(
+  new URL("../capsules/home-gui/browser/shell-control-centre.js", import.meta.url),
+  "utf8",
+);
+const openHomeGuiTargetBlock = sourceBlock(
+  homeGuiScript,
+  "export function openHomeGuiTarget(target, options = {}) {",
+  "Home GUI connector open path",
+);
+const attachAuthorizedHomeGuiTargetBlock = sourceBlock(
+  homeGuiScript,
+  "export function attachAuthorizedHomeGuiTarget(launched) {",
+  "Home GUI authorized connector attach path",
+);
+const homeSetupSheetScript = readFileSync(
+  new URL("../capsules/home-gui/browser/shell-setup-sheet.js", import.meta.url),
+  "utf8",
+);
 const homeGuiStyle = readFileSync(
   new URL("../capsules/home-gui/browser/style.css", import.meta.url),
   "utf8",
@@ -334,8 +471,215 @@ const launcherLightDockIcon = new URL(
 );
 const canonicalWindowHeadMarkup =
   /<div class="window-head">\s*<div class="window-traffic-lights">\s*<button class="window-action-btn" data-action="close"[\s\S]*?<button class="window-action-btn" data-action="minimize"[\s\S]*?<button class="window-action-btn" data-action="maximize"[\s\S]*?<\/div>\s*<div class="window-head-draggable">[\s\S]*?<\/div>\s*<div class="window-head-balance" aria-hidden="true"><\/div>\s*<\/div>/;
-const canonicalLauncherMarkup =
-  /<aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>\s*<div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">\s*<div class="launcher-header">[\s\S]*?<p class="launcher-browse-label">Apps<\/p>[\s\S]*?<button\s+id="launcher-view-toggle"[\s\S]*?<\/button>\s*<\/div>\s*<div class="launcher-scroll hide-scrollbar">[\s\S]*?<h1 class="launcher-heading visually-hidden">Apps<\/h1>[\s\S]*?<div id="launcher-grid" class="launcher-sections"><\/div>[\s\S]*?<\/div>\s*<\/div>\s*<\/aside>/;
+const taskbarOpenIndex = homeGuiTemplate.indexOf('<footer class="taskbar"');
+const launcherOpenIndex = homeGuiTemplate.indexOf('<aside id="launcher"');
+const launcherCloseIndex = homeGuiTemplate.indexOf("</aside>", launcherOpenIndex);
+const taskbarPrimaryIndex = homeGuiTemplate.indexOf('<div class="taskbar-primary">', launcherCloseIndex);
+const taskbarCloseIndex = homeGuiTemplate.indexOf("</footer>", taskbarPrimaryIndex);
+const launcherMarkup = launcherOpenIndex >= 0 && launcherCloseIndex > launcherOpenIndex
+  ? homeGuiTemplate.slice(launcherOpenIndex, launcherCloseIndex)
+  : "";
+
+assert(
+  openHomeGuiTargetBlock.includes("void showConnectorSheet(target, {") &&
+    openHomeGuiTargetBlock.includes('query: { ...query, presentation: "sheet" },') &&
+    openHomeGuiTargetBlock.includes('console.error("connector sheet open failed", error);') &&
+    !openHomeGuiTargetBlock.includes("openTarget(target, options);\n      },"),
+  "Home GUI connector sheet open path still falls back to a generic connector launch",
+  openHomeGuiTargetBlock,
+);
+assert(
+  /if \(walletRailOpen\(\) && isConnectorSheetTarget\(launched\?\.target\)\) \{\s*return attachAuthorizedConnectorSheet\(launched\);\s*\}\s*return attachAuthorizedTarget\(launched\);/.test(
+    attachAuthorizedHomeGuiTargetBlock,
+  ),
+  "Home GUI authorized connector attach path no longer keeps wallet ceremony on the sheet",
+  attachAuthorizedHomeGuiTargetBlock,
+);
+
+assert(
+  (homeGuiTemplate.match(/id="launcher"/g) || []).length === 1 &&
+    taskbarOpenIndex >= 0 &&
+    launcherOpenIndex > taskbarOpenIndex &&
+    launcherCloseIndex > launcherOpenIndex &&
+    taskbarPrimaryIndex > launcherCloseIndex &&
+    taskbarCloseIndex > taskbarPrimaryIndex &&
+    launcherMarkup.includes('class="launcher-popover" role="dialog" aria-label="Home launcher"') &&
+    !launcherMarkup.includes('aria-modal="true"') &&
+    !launcherMarkup.includes('id="close-launcher"') &&
+    !launcherMarkup.includes('placeholder="Search Home"'),
+  "Home must keep exactly one non-modal launcher surface nested inside the Shelf",
+  {
+    taskbarOpenIndex,
+    launcherOpenIndex,
+    launcherCloseIndex,
+    taskbarPrimaryIndex,
+    taskbarCloseIndex,
+  },
+);
+assert(
+  homeGuiTemplate.includes('id="control-centre-quick-open"') &&
+    homeGuiTemplate.includes('id="control-centre-spotlight"') &&
+    homeGuiTemplate.includes('id="control-centre-inbox-detail"') &&
+    homeGuiTemplate.includes('id="control-centre-quick-wallet"'),
+  "Home GUI template is missing the mobile quick-open controls",
+);
+assert(
+  shellChromeScript.includes("export function summaryDisplayName(summary)") &&
+    shellChromeScript.includes("summary?.identity?.profile?.display_name") &&
+    shellChromeScript.includes("summary?.identity?.profile?.handle") &&
+    !shellChromeScript.includes("profile_setup_display_name"),
+  "Home GUI display-name helper must prefer signed Profile names without setup fallbacks",
+);
+assert(
+  shellControlCentreScript.includes('import { summaryDisplayName } from "./shell-chrome.js') &&
+    shellControlCentreScript.includes("whoamiDetail.textContent = summaryDisplayName(summary);") &&
+    shellControlCentreScript.includes('quickSpotlightRow?.addEventListener("click"') &&
+    shellControlCentreScript.includes("showSpotlight();") &&
+    shellControlCentreScript.includes('quickInboxRow?.addEventListener("click"') &&
+    shellControlCentreScript.includes("showInboxRail();") &&
+    shellControlCentreScript.includes('quickWalletRow?.addEventListener("click"') &&
+    shellControlCentreScript.includes("showWalletRail();"),
+  "Home Control Centre quick-open rows must use the existing Spotlight, Inbox, and Wallet openers",
+);
+assert(
+  homeGuiStyle.includes(".control-centre-quick-open {\n  display: none;\n}") &&
+    homeGuiStyle.includes(".control-centre-row-label {\n  flex: 0 0 auto;\n  white-space: nowrap;\n}") &&
+    homeGuiStyle.includes(".control-centre-row-detail {\n  min-width: 0;\n  color: var(--muted);\n") &&
+    homeGuiStyle.includes("@media (max-width: 640px)") &&
+    homeGuiStyle.includes(".control-centre-quick-open {\n    display: block;\n  }"),
+  "Home mobile Control Centre is missing the donor quick-open layout and truncation rules",
+);
+
+{
+  const previousSummary = shellCore.shellState.currentSummary;
+  const launcherSurface = elementForSelector("#launcher");
+  const taskbar = elementForSelector(".taskbar");
+  shellCore.shellState.currentSummary = summary;
+  elementForSelector("#launcher-search").value = "";
+  shellSurface.showLauncher();
+  assert(
+    launcherSurface.hidden === false &&
+      launcherSurface.dataset.open === "true" &&
+      taskbar.classList.contains("is-launcher-face"),
+    "showLauncher did not open the Shelf face with one launcher presentation state",
+    {
+      launcherHidden: launcherSurface.hidden,
+      launcherOpen: launcherSurface.dataset.open,
+      taskbarClasses: [...taskbar.classList.values],
+    },
+  );
+  shellSurface.setDockAutoHide(true);
+  assert(
+    document.body.classList.contains("dock-autohide") &&
+      taskbar.classList.contains("is-launcher-face"),
+    "open launcher did not preserve the Shelf face while dock auto-hide is enabled",
+    {
+      bodyClasses: [...document.body.classList.values],
+      taskbarClasses: [...taskbar.classList.values],
+    },
+  );
+  shellSurface.hideLauncher();
+  shellSurface.setDockAutoHide(false);
+  shellCore.shellState.currentSummary = previousSummary;
+  assert(
+    launcherSurface.dataset.open === "false" &&
+      taskbar.classList.contains("is-launcher-face") === false,
+    "hideLauncher did not clear the Shelf face presentation state",
+    {
+      launcherOpen: launcherSurface.dataset.open,
+      taskbarClasses: [...taskbar.classList.values],
+    },
+  );
+}
+
+{
+  const identitySummary = {
+    authority: { signed_in: true },
+    identity: {
+      profile: {
+        display_name: "Verified Profile Name",
+        handle: "verified-profile-handle",
+      },
+      handle: "outer-handle-must-not-render",
+      profile_setup_display_name: "Setup Suggestion",
+      principal_id: "principal:should-not-render",
+    },
+    notifications: {
+      attention_count: 3,
+      entries: [
+        { kind: "wallet_approval_request", action_ref: { action_id: "wallet-approve-request:1" } },
+        { kind: "generic", action_ref: { action_id: "generic:1" } },
+      ],
+    },
+    targets: [
+      { target: "wallet", title: "Wallet", route: "/apps/wallet/" },
+      { target: "inbox", title: "Inbox", route: "/apps/inbox/" },
+    ],
+  };
+  const signedHandleFallbackSummary = {
+    authority: { signed_in: true },
+    identity: {
+      profile: {
+        display_name: "   ",
+        handle: "profile-handle-fallback",
+      },
+      handle: "outer-fallback-must-not-render",
+      profile_setup_display_name: "Setup-only name",
+      principal_id: "principal:fallback",
+    },
+    notifications: { entries: [] },
+    targets: [],
+  };
+  shellControlCentre.bindControlCentre();
+  shellCore.shellState.currentSummary = identitySummary;
+  assert(
+    shellChrome.summaryDisplayName(identitySummary) === "Verified Profile Name" &&
+      shellChrome.summaryDisplayName(signedHandleFallbackSummary) === "profile-handle-fallback",
+    "Home shared display-name helper did not prefer signed Profile display_name then profile.handle",
+    {
+      identity: shellChrome.summaryDisplayName(identitySummary),
+      fallback: shellChrome.summaryDisplayName(signedHandleFallbackSummary),
+    },
+  );
+  shellControlCentre.syncControlCentre(identitySummary);
+  assert(
+    elementForSelector("#control-centre-whoami-detail").textContent === "Verified Profile Name" &&
+      elementForSelector("#control-centre-inbox").hidden === false &&
+      elementForSelector("#control-centre-inbox").disabled === false &&
+      elementForSelector("#control-centre-inbox-detail").textContent === "3 pending" &&
+      elementForSelector("#control-centre-quick-wallet").hidden === false &&
+      elementForSelector("#control-centre-quick-wallet-detail").textContent === "1 pending",
+    "Home Control Centre did not project the shared signed identity and bounded quick-open counts",
+    {
+      whoami: elementForSelector("#control-centre-whoami-detail").textContent,
+      inboxHidden: elementForSelector("#control-centre-inbox").hidden,
+      inboxDisabled: elementForSelector("#control-centre-inbox").disabled,
+      inboxDetail: elementForSelector("#control-centre-inbox-detail").textContent,
+      walletHidden: elementForSelector("#control-centre-quick-wallet").hidden,
+      walletDetail: elementForSelector("#control-centre-quick-wallet-detail").textContent,
+    },
+  );
+  shellCore.shellState.currentSummary = signedHandleFallbackSummary;
+  shellControlCentre.syncControlCentre(signedHandleFallbackSummary);
+  assert(
+    elementForSelector("#control-centre-inbox").hidden === true &&
+      elementForSelector("#control-centre-inbox").disabled === true &&
+      elementForSelector("#control-centre-inbox-detail").textContent === "Unavailable" &&
+      elementForSelector("#control-centre-quick-wallet").hidden === true &&
+      elementForSelector("#control-centre-whoami-detail").textContent === "profile-handle-fallback" &&
+      elementForSelector("#control-centre-whoami-detail").textContent !== "Setup-only name" &&
+      elementForSelector("#control-centre-whoami-detail").textContent !== "principal:fallback",
+    "Home Control Centre did not hide unavailable quick-open rows or keep setup/principal values out of the signed identity label",
+    {
+      whoami: elementForSelector("#control-centre-whoami-detail").textContent,
+      inboxHidden: elementForSelector("#control-centre-inbox").hidden,
+      inboxDisabled: elementForSelector("#control-centre-inbox").disabled,
+      inboxDetail: elementForSelector("#control-centre-inbox-detail").textContent,
+      walletHidden: elementForSelector("#control-centre-quick-wallet").hidden,
+    },
+  );
+  shellCore.shellState.currentSummary = summary;
+}
 
 assert(
   peopleStyle.includes("padding: var(--window-chrome-safe-top, 52px) 12px 16px;"),
@@ -364,14 +708,118 @@ assert(
   "Home toolbar fullscreen control still writes visible label text into the menubar",
 );
 assert(
+  /requestHome\("home:ui-preference", \{\s*action: "write",\s*key,\s*value,\s*\}\)/m.test(
+    homeGuiShellScript,
+  ) &&
+    !homeGuiScript.includes('window.addEventListener("elastos:ui-preference-changed"') &&
+    homeGuiScript.includes(
+      "applyHomeGuiUiPreferences(homeGuiUiPreferencesFromSummary(summary));",
+    ),
+  "Home GUI must send cosmetic writes through the verified host and apply only Runtime-returned canonical state from summary",
+);
+assert(
+  homeShellHostScript.includes('data.type === "home:ui-preference"') &&
+    homeShellHostScript.includes('context.targetId !== HOME_GUI_SHELL_ID') &&
+    homeShellHostScript.includes('fetchJson("/api/apps/home/appearance/preferences"') &&
+    homeShellHostScript.includes("accent_custom") &&
+    !homeShellHostScript.includes("elastos.home.appearance-cache.v1"),
+  "Home host must keep one Runtime-backed appearance record, reject non-Home-GUI writers, and avoid a second browser cache store",
+);
+assert(
+  controlCentreScript.includes('window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed"') &&
+    !controlCentreScript.includes("window.elastosTheme.set(option.dataset.themeOption)") &&
+    !controlCentreScript.includes("setFocusModeEnabled(next)") &&
+    !controlCentreScript.includes("setUiSoundsEnabled(next)") &&
+    !controlCentreScript.includes("setDockAutoHide(next)"),
+  "Control Centre must issue preference requests without treating local mutations as canonical state",
+);
+assert(
+  homeGuiScript.includes("const active = Boolean(fullscreenElement());") &&
+    homeGuiScript.includes("document.addEventListener(\"fullscreenchange\", syncFullscreenButton);") &&
+    homeGuiScript.includes("document.addEventListener(\"webkitfullscreenchange\", syncFullscreenButton);") &&
+    homeGuiScript.includes("await exit.call(document);") &&
+    homeGuiScript.includes("await request.call(root);"),
+  "Home Control Centre fullscreen action no longer follows the real browser Fullscreen API state",
+);
+assert(
+  !homeGuiScript.includes("toggleActiveFullscreenStage") &&
+    !homeGuiScript.includes("Window fullscreen stage (dedicated Space)"),
+  "Home Control Centre fullscreen action still routes through the app-window fullscreen Space path",
+);
+assert(
+  homeGuiScript.includes("bindSetupSheet();") &&
+    homeGuiScript.includes("syncSetupSheet(previous, summary);") &&
+    homeGuiScript.includes("holdHomeSetupAct,") &&
+    homeGuiScript.includes('"#setup-sheet"'),
+  "Home shell must wire the setup sheet through the existing shell summary and window-hook boundaries",
+);
+assert(
+  homeGuiTemplate.includes('id="setup-sheet"') &&
+    homeGuiTemplate.includes("Save a Recovery Kit, then create your Profile.") &&
+    homeGuiTemplate.includes('id="setup-sheet-recovery"') &&
+    homeGuiTemplate.includes('id="setup-sheet-profile"') &&
+    homeGuiTemplate.indexOf('id="setup-sheet-step-recovery"') <
+      homeGuiTemplate.indexOf('id="setup-sheet-step-profile"'),
+  "Home setup sheet must keep the Recovery-first order and the bounded setup actions",
+);
+assert(
+  homeSetupSheetScript.includes('const PROFILE_READINESS_SCHEMA = "elastos.profile.readiness/v1";') &&
+    homeSetupSheetScript.includes('const RECOVERY_READINESS_SCHEMA = "elastos.recovery.readiness/v1";') &&
+    homeSetupSheetScript.includes('openTarget("system", { query: { settings: "security" } });') &&
+    homeSetupSheetScript.includes('openTarget("people");') &&
+    homeSetupSheetScript.includes('const SETUP_HOLD_TARGETS = new Set(["chat-room"]);') &&
+    homeSetupSheetScript.includes('return status !== "ready" && status !== "signed_out";') &&
+    !homeSetupSheetScript.includes("principal_id") &&
+    !homeSetupSheetScript.includes("credential_id") &&
+    !homeSetupSheetScript.includes("localStorage") &&
+    !homeSetupSheetScript.includes("indexedDB") &&
+    !homeSetupSheetScript.includes("sessionStorage") &&
+    !homeSetupSheetScript.includes("createInitialProfile") &&
+    !homeSetupSheetScript.includes("skip") &&
+    !homeSetupSheetScript.includes("fallback"),
+  "Home setup must use typed Runtime readiness only, hold Chat only, and open System or People without local fallback state",
+);
+assert(
+  homeSetupSheetScript.includes('recoveryButton.textContent = unavailable') &&
+    homeSetupSheetScript.includes('? "Open System"') &&
+    homeSetupSheetScript.includes('profileButton.disabled = unavailable || profileReady || !recoveryReady || !targetById(summary, "people");') &&
+    homeSetupSheetScript.includes('const next = unavailable || homeRecoveryStatus(shellState.currentSummary) !== "ready"') &&
+    homeSetupSheetScript.includes('? recoveryButton') &&
+    homeSetupSheetScript.includes(': profileButton;'),
+  "Unavailable setup state must route only to System and must not enable Profile",
+);
+assert(
+  homeSetupSheetScript.includes('rememberChromeNotification({') &&
+    homeSetupSheetScript.includes('kind: "home_setup"') &&
+    homeSetupSheetScript.includes('sheet.setAttribute("aria-hidden", "false");') &&
+    homeSetupSheetScript.includes('sheet.setAttribute("aria-hidden", "true");') &&
+    homeSetupSheetScript.includes('sheet.setAttribute("aria-modal", "false");') &&
+    homeSetupSheetScript.includes('sheet.setAttribute("aria-modal", "true");') &&
+    homeSetupSheetScript.includes('if (event.key === "Escape")') &&
+    homeSetupSheetScript.includes('window.addEventListener("pointermove", onSetupCardPointerMove);') &&
+    homeSetupSheetScript.includes('window.addEventListener("pointerup", onSetupCardPointerUp);'),
+  "Home setup must keep the session reminder, accessibility state, Escape close, and yielded drag behavior wired through Home chrome",
+);
+assert(
+  homeGuiStyle.includes(".setup-sheet {") &&
+    homeGuiStyle.includes("width: min(92vw, 420px);") &&
+    homeGuiStyle.includes("width: min(92vw, 360px);") &&
+    homeGuiStyle.includes("@media (prefers-reduced-motion: reduce)") &&
+    homeGuiStyle.includes(".setup-sheet-step .el-button") &&
+    homeGuiStyle.includes(".setup-sheet-step-body"),
+  "Home setup layout must stay bounded on narrow widths and keep reduced-motion behavior",
+);
+assert(
   canonicalWindowHeadMarkup.test(homeGuiTemplate),
   "Home window template must keep one traffic-light group in close/minimize/maximize order before the draggable title and balance shim",
 );
 assert(
-  canonicalLauncherMarkup.test(homeGuiTemplate) &&
-    !homeGuiTemplate.includes('id="close-launcher"') &&
-    !homeGuiTemplate.includes('placeholder="Search Home"'),
-  "Home launcher template must keep one complete canonical launcher generation",
+  (homeGuiTemplate.match(/id="launcher"/g) || []).length === 1 &&
+    launcherMarkup.includes('class="launcher-popover" role="dialog" aria-label="Home launcher"') &&
+    !launcherMarkup.includes('aria-modal="true"') &&
+    !launcherMarkup.includes('id="close-launcher"') &&
+    !launcherMarkup.includes('placeholder="Search Home"'),
+  "Home launcher template must keep one Shelf face without modal overlay claims",
 );
 assert(
   existsSync(launcherDarkDockIcon) && existsSync(launcherLightDockIcon),
@@ -1041,6 +1489,110 @@ shellWindows.closeWindow(backgroundConnector.id);
 shellWindows.closeWindow(continuityWallet.id);
 shellCore.shellState.windows.clear();
 shellCore.shellState.activeWindowId = null;
+
+shellWalletRail.bindWalletRail();
+shellConnectorSheet.bindConnectorSheet();
+const walletRailNode = document.querySelector("#wallet-rail");
+walletRailNode.hidden = true;
+walletRailNode.inert = true;
+const boundWalletRailFrame = shellWalletRail.walletRailFrame();
+boundWalletRailFrame.hidden = true;
+boundWalletRailFrame.dataset.route =
+  "/apps/wallet/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=wallet-rail-token";
+shellWalletRail.syncWalletRailAvailability(summary);
+const connectorSheetNode = document.querySelector("#connector-sheet");
+connectorSheetNode.hidden = true;
+connectorSheetNode.inert = true;
+const windowsBeforeAuthorizedConnectorSheet = shellCore.shellState.windows.size;
+const requestsBeforeAuthorizedConnectorSheet = requests.length;
+const closedRailConnectorSheet = await shellConnectorSheet.attachAuthorizedConnectorSheet({
+  target: "wallet-metamask",
+  title: "MetaMask",
+  route:
+    "/apps/wallet-metamask/?home_origin=http%3A%2F%2Flocalhost%3A61180" +
+    "#home_token=authorized-metamask-token",
+  attach_kind: "iframe",
+  launch_status: "launched",
+});
+assert(
+  closedRailConnectorSheet === false &&
+    connectorSheetNode.hidden === true &&
+    shellCore.shellState.windows.size === windowsBeforeAuthorizedConnectorSheet &&
+    requests.length === requestsBeforeAuthorizedConnectorSheet,
+  "direct authorized connector sheet attachment with a closed Wallet rail did not fail closed",
+  {
+    closedRailConnectorSheet,
+    hidden: connectorSheetNode.hidden,
+    windows: [...shellCore.shellState.windows.keys()],
+    newRequests: requests.slice(requestsBeforeAuthorizedConnectorSheet),
+  },
+);
+shellWalletRail.showWalletRail();
+const attachedConnectorSheet = await shellConnectorSheet.attachAuthorizedConnectorSheet({
+  target: "wallet-metamask",
+  title: "MetaMask",
+  route:
+    "/apps/wallet-metamask/?home_origin=http%3A%2F%2Flocalhost%3A61180" +
+    "#home_token=authorized-metamask-token",
+  attach_kind: "iframe",
+  launch_status: "launched",
+});
+assert(
+  attachedConnectorSheet === true &&
+    shellConnectorSheet.connectorSheetOpen() &&
+    shellConnectorSheet.connectorSheetTarget() === "wallet-metamask" &&
+    connectorSheetNode.hidden === false,
+  "authorized connector descriptor did not open the wallet connector sheet",
+  {
+    attachedConnectorSheet,
+    activeTarget: shellConnectorSheet.connectorSheetTarget(),
+    hidden: connectorSheetNode.hidden,
+  },
+);
+const connectorSheetFrame = shellConnectorSheet.connectorSheetFrame();
+assert(
+  connectorSheetFrame.dataset.route ===
+    "/apps/wallet-metamask/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=authorized-metamask-token" &&
+    connectorSheetFrame.getAttribute("src") ===
+      "/apps/wallet-metamask/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=authorized-metamask-token",
+  "authorized connector sheet did not mount the exact descriptor route byte-for-byte",
+  {
+    route: connectorSheetFrame.dataset.route,
+    src: connectorSheetFrame.getAttribute("src"),
+  },
+);
+assert(
+  shellCore.shellState.windows.size === windowsBeforeAuthorizedConnectorSheet &&
+    requests.length === requestsBeforeAuthorizedConnectorSheet,
+  "authorized connector descriptor created a generic connector surface or a second launch",
+  {
+    windows: [...shellCore.shellState.windows.keys()],
+    newRequests: requests.slice(requestsBeforeAuthorizedConnectorSheet),
+  },
+);
+shellConnectorSheet.hideConnectorSheet();
+const failedAuthorizedConnectorSheet = await shellConnectorSheet.attachAuthorizedConnectorSheet({
+  target: "wallet-metamask",
+  title: "MetaMask",
+  route: "",
+  attach_kind: "iframe",
+  launch_status: "launched",
+});
+assert(
+  failedAuthorizedConnectorSheet === false &&
+    connectorSheetNode.hidden === true &&
+    !connectorSheetFrame.dataset.route &&
+    shellCore.shellState.windows.size === windowsBeforeAuthorizedConnectorSheet &&
+    requests.length === requestsBeforeAuthorizedConnectorSheet,
+  "failed authorized connector sheet attachment did not fail closed",
+  {
+    failedAuthorizedConnectorSheet,
+    hidden: connectorSheetNode.hidden,
+    route: connectorSheetFrame.dataset.route || null,
+    windows: [...shellCore.shellState.windows.keys()],
+    newRequests: requests.slice(requestsBeforeAuthorizedConnectorSheet),
+  },
+);
 
 function sessionWindow(id, targetId, {
   x,

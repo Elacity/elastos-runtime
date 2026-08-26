@@ -362,6 +362,8 @@ pub(super) fn load_gateway_identity_summary_for_context(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
 ) -> anyhow::Result<HomeIdentitySummary> {
+    let recovery_readiness =
+        super::gateway_home_system::recovery_readiness_for_context(data_dir, context);
     let (profile_readiness, profile) =
         super::gateway_home_system::home_profile_readiness_projection_for_context(
             data_dir, context,
@@ -369,6 +371,7 @@ pub(super) fn load_gateway_identity_summary_for_context(
     Ok(HomeIdentitySummary {
         device_did: load_gateway_device_did(data_dir)?,
         profile_readiness: Some(profile_readiness.clone()),
+        recovery_readiness: Some(recovery_readiness),
         profile_setup_display_name: if profile_readiness.status == "setup_required" {
             principal_display_name_for_context(data_dir, context)
         } else {

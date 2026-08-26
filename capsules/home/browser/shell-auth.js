@@ -5,9 +5,15 @@ import {
 } from "./shell-core.js?v=home-20260802a";
 
 const unlockPanel = document.querySelector("#home-unlock");
+const unlockFace = document.querySelector(".home-unlock-face");
 const unlockCard = document.querySelector(".home-unlock-card");
+const unlockDate = document.querySelector("#home-unlock-date");
+const unlockTime = document.querySelector("#home-unlock-time");
 const unlockTitle = document.querySelector("#home-unlock-title");
 const unlockCopy = document.querySelector("#home-unlock-copy");
+const unlockPerson = document.querySelector("#home-unlock-person");
+const unlockPersonName = document.querySelector("#home-unlock-person-name");
+const unlockMonogram = document.querySelector("#home-unlock-monogram");
 const unlockPrimary = document.querySelector("#home-unlock-primary");
 const unlockSecondary = document.querySelector("#home-unlock-secondary");
 const unlockStatus = document.querySelector("#home-unlock-status");
@@ -18,7 +24,9 @@ let unlockPresentation = "modal";
 let unlockCallback = null;
 let busy = false;
 let sessionRefreshInFlight = null;
-let autoSignInAttempted = false;
+let unlockClockTimer = 0;
+let unlockLeaveTimer = 0;
+let unlockPersonLabel = "";
 
 export function isHomeAuthError(error) {
   const status = Number(error && error.status);
@@ -28,15 +36,16 @@ export function isHomeAuthError(error) {
 export async function showHomeUnlock(onUnlocked, options = {}) {
   unlockCallback = typeof onUnlocked === "function" ? onUnlocked : null;
   unlockPresentation = options && options.presentation === "prompt" ? "prompt" : "modal";
-  const forceNeutralSurface = options && options.surface === "neutral";
+  unlockPersonLabel = readUnlockPersonLabel(options && options.personName);
   if (!unlockPanel) {
     throw new Error("Home unlock surface is missing");
   }
+  cancelUnlockLeave();
   document.body.dataset.homeStatus = unlockPresentation === "prompt" ? "ready" : "locked";
   unlockPanel.dataset.mode = unlockPresentation;
-  unlockPanel.dataset.surface = !forceNeutralSurface && document.body.dataset.homeShell === "desktop"
-    ? "desktop"
-    : "neutral";
+  unlockPanel.dataset.surface = "neutral";
+  delete unlockPanel.dataset.flow;
+  unlockPanel.style.removeProperty("--home-unlock-ground");
   renderUnlockChecking();
   unlockPanel.hidden = false;
   unlockPanel.setAttribute("aria-hidden", "false");
@@ -58,9 +67,6 @@ export async function showHomeUnlock(onUnlocked, options = {}) {
       : "create";
     renderUnlockMode({ registered, guestRegistrationEnabled });
     setUnlockStatus(unlockStatusCopy(registered, guestRegistrationEnabled), "muted");
-    if (registered) {
-      startAutomaticPasskeySignIn({ guestRegistrationEnabled });
-    }
   } catch (error) {
     unlockMode = "signin";
     renderUnlockMode({ registered: true, guestRegistrationEnabled: false });
@@ -72,22 +78,40 @@ export function hideHomeUnlock() {
   if (!unlockPanel) {
     return;
   }
-  unlockPanel.hidden = true;
-  unlockPanel.setAttribute("aria-hidden", "true");
-  delete unlockPanel.dataset.mode;
-  delete unlockPanel.dataset.surface;
-  setUnlockNameVisible(false);
-  setUnlockStatus("", "muted");
+  const finish = () => {
+    unlockPanel.hidden = true;
+    unlockPanel.setAttribute("aria-hidden", "true");
+    unlockPanel.classList.remove("home-unlock-leaving");
+    delete unlockPanel.dataset.mode;
+    delete unlockPanel.dataset.surface;
+    delete unlockPanel.dataset.flow;
+    unlockPanel.style.removeProperty("--home-unlock-ground");
+    setUnlockNameVisible(false);
+    setUnlockStatus("", "muted");
+    stopUnlockClock();
+  };
+  if (unlockPanel.hidden || prefersReducedMotion()) {
+    finish();
+    return;
+  }
+  cancelUnlockLeave();
+  unlockPanel.classList.add("home-unlock-leaving");
+  unlockLeaveTimer = window.setTimeout(() => {
+    unlockLeaveTimer = 0;
+    finish();
+  }, 320);
 }
 
 export function bindHomeUnlock() {
-  unlockPrimary?.addEventListener("click", () => {
+  const startUnlock = () => {
     if (unlockMode === "create" || unlockMode === "create_guest") {
       runPasskeyCreate().catch(reportUnlockError);
       return;
     }
     runPasskeySignIn().catch(reportUnlockError);
-  });
+  };
+  unlockPrimary?.addEventListener("click", startUnlock);
+  unlockPerson?.addEventListener("click", startUnlock);
   unlockSecondary?.addEventListener("click", () => {
     if (unlockMode === "signin_guest_enabled") {
       unlockMode = "create_guest";
@@ -96,9 +120,7 @@ export function bindHomeUnlock() {
     }
     if (unlockMode === "create_guest") {
       unlockMode = "signin_guest_enabled";
-      autoSignInAttempted = false;
       renderUnlockMode({ registered: true, guestRegistrationEnabled: true });
-      startAutomaticPasskeySignIn({ guestRegistrationEnabled: true });
       return;
     }
     runPasskeySignIn().catch(reportUnlockError);
@@ -198,7 +220,6 @@ export async function requestPasskeyStepUp(appToken, operation, request) {
 }
 
 function renderUnlockChecking() {
-  autoSignInAttempted = false;
   if (unlockTitle) {
     unlockTitle.textContent = "Sign in";
   }
@@ -213,6 +234,17 @@ function renderUnlockChecking() {
     unlockSecondary.hidden = true;
   }
   setUnlockNameVisible(false);
+  if (unlockFace) {
+    unlockFace.hidden = unlockPanel?.dataset.surface !== "lock-face";
+  }
+  if (unlockCard) {
+    unlockCard.hidden = unlockPanel?.dataset.surface === "lock-face";
+  }
+  if (unlockPanel?.dataset.surface === "lock-face") {
+    startUnlockClock();
+  } else {
+    stopUnlockClock();
+  }
   setUnlockStatus("One moment.", "muted");
 }
 
@@ -220,6 +252,7 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
   const creatingGuest = unlockMode === "create_guest";
   const creatingAdmin = unlockMode === "create";
   const canCreate = creatingAdmin || creatingGuest;
+  const showFace = registered && !creatingGuest && unlockMode !== "unsupported";
   if (unlockTitle) {
     unlockTitle.textContent = creatingGuest ? "Create guest account" : (registered ? "Sign in" : "Set up Home");
   }
@@ -242,6 +275,42 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
     unlockSecondary.hidden = !registered || !guestRegistrationEnabled;
     unlockSecondary.textContent = creatingGuest ? "Back to sign in" : "Create guest account";
   }
+  if (unlockPanel) {
+    unlockPanel.dataset.surface = showFace ? "lock-face" : "neutral";
+    if (showFace) {
+      unlockPanel.dataset.flow = "picker";
+      unlockPanel.style.setProperty("--home-unlock-ground", 'url("/apps/home-gui/wallpaper.webp")');
+    } else {
+      delete unlockPanel.dataset.flow;
+      unlockPanel.style.removeProperty("--home-unlock-ground");
+    }
+  }
+  if (unlockFace) {
+    unlockFace.hidden = !showFace;
+  }
+  if (unlockCard) {
+    unlockCard.hidden = showFace;
+  }
+  if (unlockPersonName) {
+    unlockPersonName.textContent = unlockPersonLabel;
+    unlockPersonName.hidden = !unlockPersonLabel;
+  }
+  if (unlockMonogram) {
+    unlockMonogram.textContent = "e";
+  }
+  if (unlockPerson) {
+    unlockPerson.disabled = unlockMode === "unsupported";
+    const personLabel = unlockPersonLabel
+      ? `Use passkey for ${unlockPersonLabel}`
+      : "Use passkey";
+    unlockPerson.setAttribute("aria-label", personLabel);
+    unlockPerson.title = personLabel;
+  }
+  if (showFace) {
+    startUnlockClock();
+  } else {
+    stopUnlockClock();
+  }
   setUnlockNameVisible(canCreate);
 }
 
@@ -253,23 +322,6 @@ function unlockStatusCopy(registered, guestRegistrationEnabled) {
     return "";
   }
   return "";
-}
-
-async function startAutomaticPasskeySignIn({ guestRegistrationEnabled }) {
-  if (autoSignInAttempted || busy || unlockMode === "unsupported") {
-    return;
-  }
-  autoSignInAttempted = true;
-  try {
-    await runPasskeySignIn({ automatic: true });
-  } catch (error) {
-    if (unlockMode === "signin_guest_enabled" && guestRegistrationEnabled) {
-      renderUnlockMode({ registered: true, guestRegistrationEnabled: true });
-      setUnlockStatus("No passkey selected.", "muted");
-      return;
-    }
-    reportUnlockError(error);
-  }
 }
 
 async function runPasskeyCreate() {
@@ -307,13 +359,13 @@ async function runPasskeyCreate() {
   }
 }
 
-async function runPasskeySignIn(options = {}) {
+async function runPasskeySignIn() {
   if (busy || !window.PublicKeyCredential) {
     return;
   }
   busy = true;
   setButtonsDisabled(true);
-  setUnlockStatus(options.automatic ? "Choose your passkey." : "Waiting for passkey", "muted");
+  setUnlockStatus("Choose your passkey.", "muted");
   try {
     const begin = await fetchJson("/api/auth/passkey/authenticate/begin", { method: "POST" });
     const credential = await navigator.credentials.get(toRequestOptions(begin.options));
@@ -370,6 +422,9 @@ function reportUnlockError(error) {
 }
 
 function setButtonsDisabled(disabled) {
+  if (unlockPerson) {
+    unlockPerson.disabled = disabled || unlockMode === "unsupported";
+  }
   if (unlockPrimary) {
     unlockPrimary.disabled = disabled || unlockMode === "unsupported";
   }
@@ -411,6 +466,66 @@ function setUnlockStatus(message, tone) {
   unlockStatus.textContent = message;
   unlockStatus.hidden = !message;
   unlockStatus.dataset.tone = tone || "muted";
+}
+
+function readUnlockPersonLabel(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, 64);
+}
+
+function cancelUnlockLeave() {
+  if (unlockLeaveTimer) {
+    window.clearTimeout(unlockLeaveTimer);
+    unlockLeaveTimer = 0;
+  }
+  unlockPanel?.classList.remove("home-unlock-leaving");
+}
+
+function prefersReducedMotion() {
+  return window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches === true;
+}
+
+function startUnlockClock() {
+  updateUnlockClock();
+  if (unlockClockTimer) {
+    return;
+  }
+  unlockClockTimer = window.setInterval(updateUnlockClock, 30_000);
+}
+
+function stopUnlockClock() {
+  if (!unlockClockTimer) {
+    return;
+  }
+  window.clearInterval(unlockClockTimer);
+  unlockClockTimer = 0;
+}
+
+function updateUnlockClock() {
+  const now = new Date();
+  if (unlockDate) {
+    unlockDate.textContent = formatUnlockDate(now);
+  }
+  if (unlockTime) {
+    unlockTime.textContent = formatUnlockTime(now);
+  }
+}
+
+function formatUnlockDate(value) {
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+  }).format(value);
+}
+
+function formatUnlockTime(value) {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(value);
 }
 
 function toCreationOptions(options) {

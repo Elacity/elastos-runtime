@@ -4,6 +4,7 @@ import {
   toolbarIdentityAvatar,
   toolbarIdentityAvatarImage,
   toolbarIdentityMonogram,
+  toolbarSignOutButton,
   toolbarSystem,
   toolbarIdentityMenu,
   toolbarIdentityMenuName,
@@ -21,8 +22,12 @@ import {
 
 let avatarResolveSeq = 0;
 
-function summaryDisplayName(summary) {
-  const handle = summary?.identity?.handle;
+export function summaryDisplayName(summary) {
+  const profileName = summary?.identity?.profile?.display_name;
+  if (typeof profileName === "string" && profileName.trim()) {
+    return profileName.trim();
+  }
+  const handle = summary?.identity?.profile?.handle;
   if (typeof handle === "string" && handle.trim()) {
     return handle.trim();
   }
@@ -82,13 +87,16 @@ export function syncIdentity(summary) {
   if (!toolbarIdentityMenuName) {
     return;
   }
-  const signedIn = Boolean(summary?.authority?.signed_in);
+  const signedIn = summary?.authority?.signed_in === true;
   if (!signedIn) {
     clearIdentitySurface();
     return;
   }
   const name = summaryDisplayName(summary);
   toolbarIdentityMenuName.textContent = name;
+  if (toolbarSignOutButton) {
+    toolbarSignOutButton.hidden = false;
+  }
   const seed =
     typeof summary?.identity?.principal_id === "string"
       ? summary.identity.principal_id
@@ -102,6 +110,9 @@ export function clearIdentitySurface() {
   }
   closeIdentityMenu({ restoreFocus: false });
   toolbarIdentityMenuName.textContent = "";
+  if (toolbarSignOutButton) {
+    toolbarSignOutButton.hidden = true;
+  }
   avatarResolveSeq += 1;
   clearAvatarPhoto();
   if (toolbarIdentityMonogram) {

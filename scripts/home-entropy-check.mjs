@@ -875,21 +875,45 @@ const systemJs = read("capsules/system/browser/system.js");
 const systemEspProjections = read("capsules/system/browser/esp-projections.mjs");
 const walletApiSource = read("capsules/wallet/browser/wallet-api.js");
 for (const [token, value] of new Map([
-  ["--color-settings-bg", "#ffffff"],
-  ["--color-settings-sidebar", "#f9f9f9"],
-  ["--color-settings-card", "#ffffff"],
-  ["--color-bg-tertiary", "#f3f4f6"],
-  ["--color-text-primary", "#1f2937"],
-  ["--color-text-secondary", "#4b5563"],
-  ["--color-text-muted", "#6b7280"],
-  ["--color-border", "#e5e7eb"],
-  ["--color-border-light", "#d1d5db"],
-  ["--color-input-bg", "#ffffff"],
-  ["--color-input-border", "#d1d5db"],
-  ["--color-input-text", "#1f2937"],
+  ["--color-settings-bg", "var(--el-bg)"],
+  ["--color-settings-card", "var(--el-surface-raised)"],
+  ["--color-bg-tertiary", "var(--el-inset)"],
+  ["--color-text-primary", "var(--el-text)"],
+  ["--color-text-secondary", "var(--el-muted)"],
+  ["--color-text-muted", "var(--el-soft)"],
+  ["--color-border", "var(--el-hairline)"],
+  ["--color-border-light", "var(--el-hairline-strong)"],
+  ["--color-input-bg", "var(--el-inset)"],
+  ["--color-input-border", "var(--el-hairline)"],
+  ["--color-input-text", "var(--el-text)"],
+  ["--color-success", "var(--el-ok)"],
+  ["--color-error", "var(--el-danger)"],
 ])) {
   assertToken(systemSettingsStyle, "capsules/system/browser/style.css", token, value);
 }
+assert(
+  system.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    system.includes('<script src="./elastos-theme.js"></script>') &&
+    system.includes('<script src="./elastos-accent-picker.js"></script>'),
+  "System must load the shared token sheet, theme runtime, and accent picker",
+);
+assert(
+  systemJs.includes('"/api/apps/system/summary"') &&
+    systemJs.includes('"/api/apps/system/appearance/preferences"') &&
+    systemJs.includes("createHomeClipboardClient") &&
+    systemJs.includes('targetId: "system"') &&
+    systemJs.includes('purpose: "identity.did"') &&
+    !systemJs.includes('"home:ui-preference"') &&
+    !systemJs.includes("localStorage") &&
+    !systemJs.includes("sessionStorage") &&
+    !systemJs.includes("navigator.clipboard") &&
+    !systemJs.includes("execCommand") &&
+    !systemJs.includes("account-picture") &&
+    !systemJs.includes("avatar") &&
+    !system.includes("account-picture") &&
+    !system.includes("avatar"),
+  "System appearance and DID copy must stay Runtime-owned and avoid browser storage, Home write fallbacks, or avatar surfaces",
+);
 
 const libraryStyle = read("capsules/library/browser/library.css");
 for (const [token, value] of new Map([
@@ -1726,15 +1750,56 @@ assert(
   "Home window template must keep one traffic-light group in close/minimize/maximize order before the draggable title and balance shim",
 );
 assert(
-  /<aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>\s*<div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">\s*<div class="launcher-header">[\s\S]*?<p class="launcher-browse-label">Apps<\/p>[\s\S]*?<button\s+id="launcher-view-toggle"[\s\S]*?<\/button>\s*<\/div>\s*<div class="launcher-scroll hide-scrollbar">[\s\S]*?<h1 class="launcher-heading visually-hidden">Apps<\/h1>[\s\S]*?<div id="launcher-grid" class="launcher-sections"><\/div>[\s\S]*?<\/div>\s*<\/div>\s*<\/aside>/.test(
-    homeGuiTemplateHtml,
-  ) &&
-    !homeGuiTemplateHtml.includes('id="close-launcher"') &&
-    !homeGuiTemplateHtml.includes('placeholder="Search Home"') &&
+  (homeGuiTemplateHtml.match(/id="launcher"/g) || []).length === 1 &&
+    (() => {
+      const taskbarOpenIndex = homeGuiTemplateHtml.indexOf('<footer class="taskbar"');
+      const launcherOpenIndex = homeGuiTemplateHtml.indexOf('<aside id="launcher"');
+      const launcherCloseIndex = homeGuiTemplateHtml.indexOf("</aside>", launcherOpenIndex);
+      const taskbarPrimaryIndex = homeGuiTemplateHtml.indexOf('<div class="taskbar-primary">', launcherCloseIndex);
+      const taskbarCloseIndex = homeGuiTemplateHtml.indexOf("</footer>", taskbarPrimaryIndex);
+      const launcherMarkup =
+        launcherOpenIndex >= 0 && launcherCloseIndex > launcherOpenIndex
+          ? homeGuiTemplateHtml.slice(launcherOpenIndex, launcherCloseIndex)
+          : "";
+      return taskbarOpenIndex >= 0 &&
+        launcherOpenIndex > taskbarOpenIndex &&
+        launcherCloseIndex > launcherOpenIndex &&
+        taskbarPrimaryIndex > launcherCloseIndex &&
+        taskbarCloseIndex > taskbarPrimaryIndex &&
+        launcherMarkup.includes('class="launcher-popover" role="dialog" aria-label="Home launcher"') &&
+        !launcherMarkup.includes('aria-modal="true"') &&
+        !launcherMarkup.includes('id="close-launcher"') &&
+        !launcherMarkup.includes('placeholder="Search Home"');
+    })() &&
     fileExists("capsules/home-gui/browser/icons/apps-launcher/dark-dock/icon-64.png") &&
     fileExists("capsules/home-gui/browser/icons/apps-launcher/light-dock/icon-64.png") &&
     fileExists("capsules/home-gui/browser/icons/apps-launcher/icon-64.png"),
-  "Home launcher must keep one complete launcher generation with its raster icon set",
+  "Home launcher must keep exactly one Shelf-nested non-modal launcher surface with its raster icon set",
+);
+assert(
+  shellSurface.includes('taskbar?.classList.toggle("is-launcher-face", isVisible);') &&
+    shellSurface.includes('launcherToggleButton.setAttribute("aria-expanded", isVisible ? "true" : "false");') &&
+    shellSurface.includes('trapTabWithin(launcher.querySelector(".launcher-popover"), event);') &&
+    !shellSurface.includes("pendingRunningDockIds") &&
+    !shellSurface.includes("dockFlyRevealTargetId") &&
+    !shellSurface.includes("shelfMorphApi") &&
+    !shellSurface.includes("flyLauncherCardToDock") &&
+    !shellSurface.includes("is-receiving-fly"),
+  "Home launcher must use one simple Shelf-face state and keep the existing keyboard trap without donor morph choreography",
+);
+assert(
+  homeGuiStyle.includes("body.dock-autohide .taskbar.is-launcher-face,") &&
+    homeGuiStyle.includes(".taskbar.is-launcher-face .launcher {") &&
+    homeGuiStyle.includes(".taskbar .launcher[hidden] {") &&
+    homeGuiStyle.includes(".launcher {\n  position: static;") &&
+    !homeGuiStyle.includes(".launcher {\n  position: fixed;") &&
+    homeGuiStyle.includes("@media (prefers-reduced-motion: reduce) {\n  .launcher,") &&
+    homeGuiStyle.includes(".taskbar.is-launcher-face {\n    width: calc(100vw - 20px);") &&
+    homeGuiStyle.includes(".launcher-popover {\n    height: min(48vh, 380px);") &&
+    homeGuiStyle.includes(".taskbar.is-launcher-face .launcher {\n    max-height: min(48vh, 380px);") &&
+    !homeGuiStyle.includes("launcher-fly-icon") &&
+    !homeGuiStyle.includes("data-launcher-morphing"),
+  "Home launcher styles must keep one material Shelf face, narrow bounds, reduced motion, and matched narrow launcher heights",
 );
 assert(
   /people:\s*WINDOW_CHROME_UNIFIED_SIDEBAR/.test(homeGuiCore) &&
@@ -2492,13 +2557,15 @@ assert(
   servicesCapsule.includes('"name": "services"') &&
     servicesCapsule.includes('"role": "app"') &&
     servicesIndex.includes("Services · ElastOS") &&
+    servicesIndex.includes('./elastos-theme.js') &&
+    servicesIndex.includes('./elastos-ui.css') &&
     servicesIndex.includes("This device") &&
     servicesIndex.includes("From People") &&
     servicesIndex.includes("Shared from this device") &&
     servicesIndex.includes("Available from People") &&
     servicesIndex.includes("mine-services") &&
     servicesIndex.includes("other-services") &&
-    servicesIndex.includes("services-20260626a") &&
+    servicesIndex.includes("services-20260819a") &&
     servicesIndex.includes("services-20260711i") &&
     servicesScript.includes("/api/apps/services/summary") &&
     servicesScript.includes("/api/apps/services/offers") &&
@@ -2531,6 +2598,11 @@ assert(
     servicesStyle.includes(".services-toolbar") &&
     servicesStyle.includes(".service-confirm") &&
     servicesStyle.includes(".pc2-btn-danger") &&
+    (servicesStyle.match(/letter-spacing:\s*[^;]+;/g) || []).length === 4 &&
+    (servicesStyle.match(/letter-spacing:\s*[^;]+;/g) || []).every(
+      (declaration) => declaration === "letter-spacing: 0;",
+    ) &&
+    !servicesStyle.includes("Narrow stopgap") &&
     !servicesIndex.includes("settings-sidebar-title") &&
     !servicesStyle.includes(".settings-sidebar-title") &&
     !servicesStyle.includes(".service-filter-banner") &&
@@ -5075,7 +5147,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-20260712a";
+const systemAssetVersion = "system-20260819f";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 const auditChainBoundary = {
@@ -7392,6 +7464,13 @@ assert(
   "Home passkey login must use concise data/apps/desktop copy without redundant kicker text",
 );
 assert(
+  shellIndex.includes('class="home-unlock-face"') &&
+    shellIndex.includes('id="home-unlock-person"') &&
+    shellIndex.includes('id="home-unlock-person-name"') &&
+    shellIndex.indexOf('id="home-unlock-person"') < shellIndex.indexOf('id="home-unlock-person-name"'),
+  "Home lock face must keep the profile name outside the passkey hit target",
+);
+assert(
   shellIndex.includes('id="home-unlock-name"') &&
     shellAuth.includes("display_name: displayName"),
   "Home passkey creation must collect and persist a passkey/user display name",
@@ -7406,22 +7485,26 @@ assert(
   "Home must present guest enrollment as self-registration",
 );
 assert(
-  shellAuth.includes("startAutomaticPasskeySignIn") &&
-    shellAuth.includes("Choose your passkey."),
-  "Home sign-in must automatically ask for a passkey instead of requiring a duplicate continue click",
+  shellAuth.includes("unlockPerson?.addEventListener(\"click\", startUnlock);") &&
+    shellAuth.includes("setUnlockStatus(\"Choose your passkey.\", \"muted\");") &&
+    shellAuth.includes('unlockPanel.dataset.surface = showFace ? "lock-face" : "neutral";') &&
+    shellAuth.includes("unlockPersonName.textContent = unlockPersonLabel;") &&
+    shellAuth.includes("Use passkey for ${unlockPersonLabel}") &&
+    shellAuth.includes("unlockPanel?.dataset.surface === \"lock-face\""),
+  "Home lock sign-in must keep the explicit-click lock-face flow",
 );
-const renderUnlockCheckingBody = shellAuth.match(
-  /function renderUnlockChecking\(\) \{[\s\S]*?\n\}/,
-)?.[0] || "";
 assert(
-  shellAuth.includes("if (registered) {\n      startAutomaticPasskeySignIn") &&
-    renderUnlockCheckingBody.includes("autoSignInAttempted = false") &&
+  !shellAuth.includes("startAutomaticPasskeySignIn") &&
+    !shellAuth.includes("autoSignInAttempted") &&
     !shellAuth.includes("AbortController") &&
-    !shellAuth.includes('name === "AbortError"') &&
-    !shellAuth.includes("guestRegistrationAvailable") &&
-    !shellAuth.includes('registered && unlockPresentation === "modal"') &&
-    shellAuth.includes('unlockMode === "signin_guest_enabled" && guestRegistrationEnabled'),
-  "Home unsigned desktop unlock must stay aligned with the main passkey prompt behavior",
+    !shellAuth.includes('name === "AbortError"'),
+  "Home lock sign-in must not auto-start or add hidden cancellation state",
+);
+assert(
+  !shellAuth.includes("status.accounts") &&
+    !shellAuth.includes("profile_setup_display_name") &&
+    !shellAuth.includes("guestRegistrationAvailable"),
+  "Home lock sign-in must not depend on unsigned account-directory or profile setup fields",
 );
 assert(
   shellAuth.includes('unlockMode === "create_guest"') &&
@@ -7439,6 +7522,19 @@ assert(
   shellAuth.includes("isPasskeyNotSelected") &&
     shellAuth.includes('setUnlockStatus("No passkey selected.", "muted")'),
   "Home sign-in must suppress raw WebAuthn cancellation errors and keep onboarding actionable",
+);
+assert(
+  shellJs.includes("identity?.profile?.display_name") &&
+    shellJs.includes("options?.preserveSignedProfileLabel ? currentSignedProfileDisplayName() : \"\"") &&
+    shellJs.includes("preserveSignedProfileLabel: true") &&
+    !shellJs.includes("/api/auth/passkey/accounts") &&
+    !shellJs.includes("profile_setup_display_name"),
+  "Home host must reveal the signed-session profile label only for the authorized explicit lock action",
+);
+assert(
+  homeGuiJs.includes("homeGuiHostActions.requestHomeUnlock?.();") &&
+    !homeGuiJs.includes('CustomEvent("elastos:request-lock")'),
+  "Home GUI lock action must use the host unlock seam instead of a detached DOM event",
 );
 assert(
   shellAuth.includes(
@@ -10546,9 +10642,14 @@ assert(
   "Browser capsule must use the high-level Browser open route without faking EIP-1193 wallet injection, external host browsing, iframe host browsing, or diagnostic frame fallbacks into arbitrary web pages",
 );
 assert(
-  browserStyle.includes(".browser-stage") &&
+  browser.includes('<script src="./elastos-theme.js"></script>') &&
+    browser.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    browserStyle.includes(".browser-stage") &&
     browserStyle.includes("@media (max-width: 640px)") &&
-    browserStyle.includes("--accent: #d46f24") &&
+    browserStyle.includes("--accent: var(--el-accent)") &&
+    browserStyle.includes("overflow: hidden") &&
+    browserStyle.includes("height: 100%") &&
+    browserStyle.includes("min-height: 0") &&
     !browserStyle.includes(".browser-hero") &&
     !browserStyle.includes(".browser-card"),
   "Browser capsule must have a compact responsive ElastOS-aligned host-adapter UI without proof/debug cards",
@@ -11369,9 +11470,15 @@ assert(
   systemStyle.includes(".pc2-section-title") &&
     systemStyle.includes("font-size: 11px;") &&
     systemStyle.includes("text-transform: uppercase;") &&
-    systemStyle.includes("background: #f9f9f9;") &&
-    systemStyle.includes("border: 1px solid #d0d0d0;"),
-  "System Settings must keep PC2 compact section/card styling",
+    systemStyle.includes(".settings-content h1") &&
+    (systemStyle.match(/letter-spacing:\s*[^;]+;/g) || []).length === 5 &&
+    (systemStyle.match(/letter-spacing:\s*[^;]+;/g) || []).every(
+      (declaration) => declaration === "letter-spacing: 0;",
+    ) &&
+    systemStyle.includes(".pc2-card-row") &&
+    systemStyle.includes("background: var(--color-settings-card);") &&
+    systemStyle.includes("border: 1px solid var(--color-border);"),
+  "System Settings must keep PC2 compact section/card styling with exact zero letter spacing throughout System",
 );
 assert(
   !system.includes('data-settings="storage"') &&

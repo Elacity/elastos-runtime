@@ -64,7 +64,7 @@
         <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="7" width="9" height="6.5" rx="1.2"/><path d="M5.5 7V5.2a2.5 2.5 0 0 1 5 0V7"/></svg>
         Lock Screen
       </button>
-      <button id="identity-menu-sign-out" class="toolbar-identity-item" type="button" role="menuitem">
+      <button id="identity-menu-sign-out" class="toolbar-identity-item" type="button" role="menuitem" hidden>
         <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 3.5H4.2A1.7 1.7 0 0 0 2.5 5.2v5.6A1.7 1.7 0 0 0 4.2 12.5h2.3M7 8h6.5M11.2 5.5 13.5 8l-2.3 2.5"/></svg>
         Sign Out…
       </button>
@@ -179,6 +179,26 @@
   inert
   hidden
 >
+  <div
+    id="control-centre-quick-open"
+    class="control-centre-section control-centre-quick-open"
+    aria-label="Quick open"
+  >
+    <div class="control-centre-label">Quick open</div>
+    <button id="control-centre-spotlight" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">Spotlight</span>
+      <span class="control-centre-row-detail">›</span>
+    </button>
+    <button id="control-centre-inbox" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">Inbox</span>
+      <span id="control-centre-inbox-detail" class="control-centre-row-detail">Open</span>
+    </button>
+    <button id="control-centre-quick-wallet" class="control-centre-row" type="button" hidden>
+      <span class="control-centre-row-label">Wallet</span>
+      <span id="control-centre-quick-wallet-detail" class="control-centre-row-detail">Open</span>
+    </button>
+  </div>
+  <div class="control-centre-divider control-centre-quick-open" role="separator"></div>
   <div class="control-centre-section" role="radiogroup" aria-label="Appearance">
     <div class="control-centre-label">Appearance</div>
     <div id="control-centre-theme" class="control-centre-segment">
@@ -275,6 +295,55 @@
   </div>
 </aside>
 
+<section
+  id="setup-sheet"
+  class="setup-sheet"
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="setup-sheet-title"
+  tabindex="-1"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="setup-sheet-card">
+    <button
+      id="setup-sheet-close"
+      class="wallet-rail-head-btn wallet-rail-icon-btn wallet-rail-close"
+      type="button"
+      aria-label="Close setup"
+    >
+      <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+    </button>
+    <h2 id="setup-sheet-title" class="setup-sheet-title">Welcome to Home</h2>
+    <p id="setup-sheet-lead" class="setup-sheet-lead">
+      Save a Recovery Kit, then create your Profile.
+    </p>
+    <ol class="setup-sheet-steps">
+      <li id="setup-sheet-step-recovery" class="setup-sheet-step">
+        <span class="setup-sheet-step-index" aria-hidden="true">1</span>
+        <div class="setup-sheet-step-copy">
+          <h3 class="setup-sheet-step-title">Recovery Kit</h3>
+          <p id="setup-sheet-recovery-body" class="setup-sheet-step-body">Required first. Download a kit in System → Security so this Home can create your Profile.</p>
+        </div>
+        <button id="setup-sheet-recovery" class="el-button el-button-primary" type="button">
+          Save kit
+        </button>
+      </li>
+      <li id="setup-sheet-step-profile" class="setup-sheet-step">
+        <span class="setup-sheet-step-index" aria-hidden="true">2</span>
+        <div class="setup-sheet-step-copy">
+          <h3 class="setup-sheet-step-title">Create your Profile</h3>
+          <p id="setup-sheet-profile-body" class="setup-sheet-step-body">The name people see. Chat stays closed until this exists.</p>
+        </div>
+        <button id="setup-sheet-profile" class="el-button" type="button">
+          Create Profile
+        </button>
+      </li>
+    </ol>
+  </div>
+</section>
+
 <main class="desktop-workspace" data-home-gui-hidden-by-host="hidden" inert hidden>
   <div id="window-snap-preview" class="window-snap-preview" aria-hidden="true" hidden></div>
   <section id="desktop" class="desktop" aria-live="polite">
@@ -291,6 +360,37 @@
 
 <footer class="taskbar" aria-label="Home taskbar" data-home-gui-hidden-by-host="hidden" inert hidden>
   <div class="taskbar-inner">
+    <aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>
+      <div class="launcher-popover" role="dialog" aria-label="Home launcher">
+        <div class="launcher-header">
+          <div class="launcher-search-wrap" hidden>
+            <input
+              id="launcher-search"
+              class="launcher-search-field"
+              type="search"
+              autocomplete="off"
+              placeholder="Search"
+              spellcheck="false"
+              tabindex="-1"
+              aria-hidden="true"
+            />
+          </div>
+          <p class="launcher-browse-label">Apps</p>
+          <button
+            id="launcher-view-toggle"
+            class="launcher-header-btn"
+            type="button"
+            aria-label="Switch to list view"
+            aria-pressed="false"
+          ></button>
+        </div>
+        <div class="launcher-scroll hide-scrollbar">
+          <h1 class="launcher-heading visually-hidden">Apps</h1>
+          <div id="launcher-grid" class="launcher-sections"></div>
+          <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
+        </div>
+      </div>
+    </aside>
     <div class="taskbar-primary">
       <button
         id="launcher-toggle"
@@ -306,38 +406,6 @@
     </div>
   </div>
 </footer>
-
-<aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>
-  <div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">
-    <div class="launcher-header">
-      <div class="launcher-search-wrap" hidden>
-        <input
-          id="launcher-search"
-          class="launcher-search-field"
-          type="search"
-          autocomplete="off"
-          placeholder="Search"
-          spellcheck="false"
-          tabindex="-1"
-          aria-hidden="true"
-        />
-      </div>
-      <p class="launcher-browse-label">Apps</p>
-      <button
-        id="launcher-view-toggle"
-        class="launcher-header-btn"
-        type="button"
-        aria-label="Switch to list view"
-        aria-pressed="false"
-      ></button>
-    </div>
-    <div class="launcher-scroll hide-scrollbar">
-      <h1 class="launcher-heading visually-hidden">Apps</h1>
-      <div id="launcher-grid" class="launcher-sections"></div>
-      <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
-    </div>
-  </div>
-</aside>
 
 <div id="desktop-context-menu" class="context-menu" role="menu" aria-label="Home actions" inert hidden></div>
 

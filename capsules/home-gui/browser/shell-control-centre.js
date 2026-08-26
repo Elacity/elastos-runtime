@@ -12,18 +12,19 @@ import {
   focusModeEnabled,
   formatBadgeCount,
   setDesktopIconsVisible,
-  setFocusModeEnabled,
   shellState,
+  targetById,
 } from "./shell-core.js?v=home-20260813a";
-import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260813a";
+import { uiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260813a";
 import {
   dockAutoHideEnabled,
-  setDockAutoHide,
 } from "./shell-surface.js?v=home-20260813a";
 import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260813a";
 import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260813a";
+import { showSpotlight } from "./shell-spotlight.js?v=home-20260813a";
 import { openTarget } from "./shell-windows.js?v=home-20260813a";
 import { openExpose } from "./shell-expose.js?v=home-20260813a";
+import { summaryDisplayName } from "./shell-chrome.js?v=home-20260813a";
 
 /* Control Centre: the quick layer for controls that already have canonical
    stores — theme, sounds, focus, accent, dock, desktop icons — plus Nearby
@@ -53,6 +54,11 @@ let whoamiDetail = null;
 let walletRow = null;
 let thisDeviceRow = null;
 let systemRow = null;
+let quickSpotlightRow = null;
+let quickInboxRow = null;
+let quickInboxDetail = null;
+let quickWalletRow = null;
+let quickWalletDetail = null;
 let outsideDismissBound = false;
 let registered = false;
 let discoveryTick = 0;
@@ -82,6 +88,11 @@ export function bindControlCentre() {
   walletRow = document.querySelector("#control-centre-wallet");
   thisDeviceRow = document.querySelector("#control-centre-this-device");
   systemRow = document.querySelector("#control-centre-system");
+  quickSpotlightRow = document.querySelector("#control-centre-spotlight");
+  quickInboxRow = document.querySelector("#control-centre-inbox");
+  quickInboxDetail = document.querySelector("#control-centre-inbox-detail");
+  quickWalletRow = document.querySelector("#control-centre-quick-wallet");
+  quickWalletDetail = document.querySelector("#control-centre-quick-wallet-detail");
   if (!panel || !button) {
     return;
   }
@@ -103,11 +114,9 @@ export function bindControlCentre() {
 
   themeSegment?.addEventListener("click", (event) => {
     const option = event.target.closest("[data-theme-option]");
-    if (!option || !window.elastosTheme) {
+    if (!option) {
       return;
     }
-    window.elastosTheme.set(option.dataset.themeOption);
-    syncThemeSegment();
     window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
       detail: { key: "theme", value: option.dataset.themeOption },
     }));
@@ -115,21 +124,16 @@ export function bindControlCentre() {
 
   accentRow?.addEventListener("click", (event) => {
     const option = event.target.closest("[data-accent-option]");
-    if (!option || !window.elastosTheme?.setAccent) {
+    if (!option) {
       return;
     }
     const next = option.dataset.accentOption;
     if (next === "custom") {
-      const hex = window.elastosTheme.accentCustom?.() || "#4f7fff";
-      window.elastosTheme.setAccentCustom?.(hex);
-      window.elastosTheme.setAccent("custom");
-      publishAccentCustom(hex);
       publishAccent("custom");
       syncAccentRow({ showCustomEditor: true });
       accentCustomPicker?.open?.();
       return;
     }
-    window.elastosTheme.setAccent(next);
     publishAccent(next);
     syncAccentRow({ showCustomEditor: false });
   });
@@ -154,8 +158,6 @@ export function bindControlCentre() {
 
   focusSwitch?.addEventListener("click", () => {
     const next = !focusModeEnabled();
-    setFocusModeEnabled(next);
-    syncFocusSwitch();
     window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
       detail: { key: "focusMode", value: next ? "on" : "off" },
     }));
@@ -182,20 +184,13 @@ export function bindControlCentre() {
 
   soundsSwitch?.addEventListener("click", () => {
     const next = !uiSoundsEnabled();
-    setUiSoundsEnabled(next);
-    syncSoundsSwitch();
     window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
       detail: { key: "sounds", value: next ? "on" : "off" },
     }));
-    if (next) {
-      playUiSound("notification");
-    }
   });
 
   dockSwitch?.addEventListener("click", () => {
     const next = !dockAutoHideEnabled();
-    setDockAutoHide(next);
-    syncDockSwitch();
     window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
       detail: { key: "dockAutoHide", value: next ? "on" : "off" },
     }));
@@ -211,6 +206,24 @@ export function bindControlCentre() {
   showWindowsRow?.addEventListener("click", () => {
     hideControlCentre({ restoreFocus: false });
     openExpose();
+  });
+
+  quickSpotlightRow?.addEventListener("click", () => {
+    hideControlCentre({ restoreFocus: false });
+    showSpotlight();
+  });
+
+  quickInboxRow?.addEventListener("click", () => {
+    hideControlCentre({ restoreFocus: false });
+    showInboxRail();
+  });
+
+  quickWalletRow?.addEventListener("click", () => {
+    if (!walletRailAvailable()) {
+      return;
+    }
+    hideControlCentre({ restoreFocus: false });
+    showWalletRail();
   });
 
   walletRow?.addEventListener("click", () => {
@@ -300,6 +313,7 @@ export function syncControlCentre(summary) {
   syncDesktopIconsSwitch();
   syncWhoami(summary);
   syncWalletRow();
+  syncQuickOpen(summary);
 }
 
 function publishAccent(value) {
@@ -315,7 +329,7 @@ function publishAccentCustom(value) {
 }
 
 function commitAccentCustom(raw, { fromWheel }) {
-  if (!window.elastosTheme?.setAccentCustom) {
+  if (!window.elastosTheme?.normalizeHex) {
     return;
   }
   const hex = window.elastosTheme.normalizeHex?.(raw) || "";
@@ -325,11 +339,6 @@ function commitAccentCustom(raw, { fromWheel }) {
     }
     return;
   }
-  window.elastosTheme.setAccentCustom(hex);
-  if (window.elastosTheme.accent?.() !== "custom") {
-    window.elastosTheme.setAccent("custom");
-    publishAccent("custom");
-  }
   if (accentCustomHex && !fromWheel) {
     accentCustomHex.value = hex;
   } else if (accentCustomHex && document.activeElement !== accentCustomHex) {
@@ -338,7 +347,6 @@ function commitAccentCustom(raw, { fromWheel }) {
   if (!fromWheel) {
     accentCustomPicker?.setHex?.(hex);
   }
-  paintCustomSwatch(hex);
   window.clearTimeout(accentCustomWriteTimer);
   accentCustomWriteTimer = window.setTimeout(() => {
     publishAccentCustom(hex);
@@ -542,12 +550,7 @@ function syncWhoami(summary) {
   if (!whoamiDetail) {
     return;
   }
-  const name =
-    summary?.identity?.profile_card?.display_name ||
-    summary?.identity?.handle ||
-    summary?.authority?.principal_id ||
-    "Signed in";
-  whoamiDetail.textContent = String(name);
+  whoamiDetail.textContent = summaryDisplayName(summary);
 }
 
 function syncWalletRow() {
@@ -557,6 +560,39 @@ function syncWalletRow() {
   // Toolbar Wallet is the primary door — keep CC Wallet hidden when the rail
   // is available (Jobs: quiet money).
   walletRow.hidden = true;
+}
+
+function syncQuickOpen(summary) {
+  const inboxTarget = targetById(summary, "inbox");
+  if (quickInboxRow) {
+    quickInboxRow.hidden = !inboxTarget;
+    quickInboxRow.disabled = !inboxTarget;
+  }
+  if (quickInboxDetail) {
+    if (!inboxTarget) {
+      quickInboxDetail.textContent = "Unavailable";
+    } else {
+      const notifications = summary?.notifications || {};
+      const entries = Array.isArray(notifications.entries) ? notifications.entries : [];
+      const semanticCount =
+        Number(notifications.attention_count || 0) || Number(notifications.unread_count || 0);
+      const badgeCount = Math.max(0, semanticCount || entries.length);
+      quickInboxDetail.textContent =
+        badgeCount > 0 ? `${formatBadgeCount(badgeCount)} pending` : "Open";
+    }
+  }
+
+  const walletTarget = targetById(summary, "wallet");
+  if (quickWalletRow) {
+    quickWalletRow.hidden = !walletTarget;
+  }
+  if (quickWalletDetail) {
+    const count = pendingApprovalEntries(summary).filter(
+      (entry) => entry?.kind === "wallet_approval_request",
+    ).length;
+    quickWalletDetail.textContent =
+      count > 0 ? `${formatBadgeCount(count)} pending` : "Open";
+  }
 }
 
 function bindOutsideDismiss() {

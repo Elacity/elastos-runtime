@@ -445,12 +445,14 @@ assert(
 );
 
 assert(
-  browserStyle.includes(".browser-stage") &&
+  browser.includes('<script src="./elastos-theme.js"></script>') &&
+    browser.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    browserStyle.includes(".browser-stage") &&
     browserStyle.includes("@media (max-width: 640px)") &&
-    browserStyle.includes("--accent: #d46f24") &&
-    browserStyle.includes("overflow: hidden") &&
+    browserStyle.includes("--accent: var(--el-accent)") &&
     browserStyle.includes("height: 100%") &&
     browserStyle.includes("min-height: 0") &&
+    browserStyle.includes("overflow: hidden") &&
     !browserStyle.includes(".browser-hero") &&
     !browserStyle.includes(".browser-card"),
   "Browser UI must stay compact and responsive without old proof/debug card chrome",

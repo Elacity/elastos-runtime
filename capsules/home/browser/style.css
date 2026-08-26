@@ -101,16 +101,13 @@ img {
   display: grid;
   place-items: center;
   padding: max(18px, env(safe-area-inset-top, 0)) 18px max(18px, env(safe-area-inset-bottom, 0));
-  background: #050608;
+  background-color: #050608;
+  background-image: var(--home-unlock-ground, none);
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: cover;
   backdrop-filter: none;
   animation: home-unlock-fade 180ms ease-out both;
-}
-
-.home-unlock[data-surface="desktop"] {
-  background:
-    radial-gradient(circle at 50% 28%, rgba(246, 146, 26, 0.18), transparent 30%),
-    rgba(0, 0, 0, 0.74);
-  backdrop-filter: blur(6px);
 }
 
 .home-unlock[hidden] {
@@ -124,17 +121,127 @@ img {
   padding: max(18px, env(safe-area-inset-top, 0)) 18px max(18px, env(safe-area-inset-bottom, 0));
 }
 
-.home-unlock[data-surface="desktop"][data-mode="prompt"] {
-  background:
-    radial-gradient(circle at 50% 28%, rgba(246, 146, 26, 0.14), transparent 30%),
-    rgba(0, 0, 0, 0.58);
-  backdrop-filter: blur(4px);
-}
-
 .home-unlock[data-surface="neutral"],
 .home-unlock[data-surface="neutral"][data-mode="prompt"] {
-  background: #050608;
+  background-color: #050608;
+  background-image: none;
   backdrop-filter: none;
+}
+
+.home-unlock-face {
+  display: grid;
+  justify-items: center;
+  align-content: space-between;
+  width: min(420px, 100%);
+  min-height: min(640px, calc(100vh - 48px));
+  min-height: min(640px, calc(100dvh - 48px));
+  padding: 28px 0 36px;
+  text-align: center;
+}
+
+.home-unlock-face[hidden] {
+  display: none;
+}
+
+.home-unlock-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 18px;
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.home-unlock-brand-mark {
+  width: 32px;
+  height: 32px;
+}
+
+.home-unlock-clock {
+  display: grid;
+  gap: 10px;
+  align-content: center;
+}
+
+.home-unlock-date,
+.home-unlock-time {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.95);
+}
+
+.home-unlock-date {
+  font-size: 24px;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+.home-unlock-time {
+  font-size: 80px;
+  line-height: 0.95;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.home-unlock-account {
+  display: grid;
+  justify-items: center;
+  gap: 14px;
+}
+
+.home-unlock-person {
+  display: inline-grid;
+  place-items: center;
+  width: 132px;
+  height: 132px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  background: rgba(7, 10, 14, 0.44);
+  box-shadow: 0 18px 36px rgba(0, 0, 0, 0.28);
+  cursor: pointer;
+}
+
+.home-unlock-person:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.home-unlock-person:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: 4px;
+}
+
+.home-unlock-avatar {
+  display: inline-grid;
+  place-items: center;
+  width: 96px;
+  height: 96px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.home-unlock-avatar-monogram {
+  font-size: 42px;
+  line-height: 1;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: lowercase;
+}
+
+.home-unlock-account-name {
+  margin: 0;
+  min-height: 24px;
+  padding: 0 18px;
+  color: rgba(255, 255, 255, 0.94);
+  font-size: 20px;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+.home-unlock-account-name[hidden] {
+  visibility: hidden;
 }
 
 .home-unlock-card {
@@ -153,6 +260,10 @@ img {
   padding: 26px 28px 28px;
 }
 
+.home-unlock[data-surface="lock-face"] .home-unlock-card {
+  display: none;
+}
+
 .home-unlock-logo {
   width: 118px;
   height: auto;
@@ -166,9 +277,9 @@ img {
 
 .home-unlock h1 {
   margin: 0;
-  font-size: clamp(26px, 6vw, 34px);
+  font-size: 34px;
   line-height: 1.04;
-  letter-spacing: -0.045em;
+  letter-spacing: 0;
 }
 
 .home-unlock[data-mode="prompt"] h1 {
@@ -223,7 +334,7 @@ img {
   color: #161616;
   font-size: 13px;
   font-weight: 800;
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
   cursor: pointer;
 }
 
@@ -326,6 +437,34 @@ img {
 }
 
 @media (max-width: 720px) {
+  .home-unlock-face {
+    min-height: min(560px, calc(100vh - 36px));
+    min-height: min(560px, calc(100dvh - 36px));
+    padding: 24px 0 30px;
+  }
+
+  .home-unlock-date {
+    font-size: 20px;
+  }
+
+  .home-unlock-time {
+    font-size: 64px;
+  }
+
+  .home-unlock-person {
+    width: 120px;
+    height: 120px;
+  }
+
+  .home-unlock-avatar {
+    width: 88px;
+    height: 88px;
+  }
+
+  .home-unlock-account-name {
+    font-size: 18px;
+  }
+
   .home-unlock-card,
   .home-unlock[data-mode="prompt"] .home-unlock-card {
     width: min(360px, 100%);
@@ -341,6 +480,49 @@ img {
   }
 }
 
+@media (max-width: 520px) {
+  .home-unlock {
+    padding: max(16px, env(safe-area-inset-top, 0)) 16px max(16px, env(safe-area-inset-bottom, 0));
+  }
+
+  .home-unlock-face {
+    width: 100%;
+    min-height: min(520px, calc(100vh - 32px));
+    min-height: min(520px, calc(100dvh - 32px));
+    padding: 20px 0 26px;
+  }
+
+  .home-unlock-brand {
+    font-size: 13px;
+  }
+
+  .home-unlock-date {
+    font-size: 18px;
+  }
+
+  .home-unlock-time {
+    font-size: 52px;
+  }
+
+  .home-unlock-person {
+    width: 108px;
+    height: 108px;
+  }
+
+  .home-unlock-avatar {
+    width: 80px;
+    height: 80px;
+  }
+
+  .home-unlock-avatar-monogram {
+    font-size: 36px;
+  }
+
+  .home-unlock-account-name {
+    font-size: 17px;
+  }
+}
+
 @keyframes home-unlock-fade {
   0% { opacity: 0; }
   100% { opacity: 1; }
@@ -349,6 +531,33 @@ img {
 @keyframes home-unlock-pop {
   0% { opacity: 0; transform: scale(0.96); }
   100% { opacity: 1; transform: scale(1); }
+}
+
+.home-unlock[data-flow="picker"] .home-unlock-face {
+  animation: home-unlock-chrome-in 220ms ease-out both;
+}
+
+.home-unlock.home-unlock-leaving {
+  animation: home-unlock-overlay-out 320ms ease both;
+}
+
+@keyframes home-unlock-chrome-in {
+  0% { opacity: 0; transform: translateY(10px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes home-unlock-overlay-out {
+  0% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .home-unlock,
+  .home-unlock-card,
+  .home-unlock[data-flow="picker"] .home-unlock-face,
+  .home-unlock.home-unlock-leaving {
+    animation: none;
+  }
 }
 
 .active-shell-root {

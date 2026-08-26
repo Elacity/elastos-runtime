@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Context as _;
 use elastos_common::CapsuleRole;
@@ -67,6 +68,34 @@ pub(super) fn profile_required_error(message: &'static str) -> anyhow::Error {
 
 pub(super) fn profile_required_message(err: &anyhow::Error) -> Option<&'static str> {
     err.downcast_ref::<ProfileRequiredError>()
+        .map(|error| error.message())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HomeAppearancePreferenceRequestError(&'static str);
+
+impl HomeAppearancePreferenceRequestError {
+    fn message(self) -> &'static str {
+        self.0
+    }
+}
+
+impl std::fmt::Display for HomeAppearancePreferenceRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for HomeAppearancePreferenceRequestError {}
+
+pub(super) fn home_appearance_preference_request_error(message: &'static str) -> anyhow::Error {
+    HomeAppearancePreferenceRequestError(message).into()
+}
+
+pub(super) fn home_appearance_preference_request_message(
+    err: &anyhow::Error,
+) -> Option<&'static str> {
+    err.downcast_ref::<HomeAppearancePreferenceRequestError>()
         .map(|error| error.message())
 }
 
@@ -1874,7 +1903,7 @@ pub(super) async fn people_profile_update(
             Ok(recovery) => recovery,
             Err(err) => return home_error_response(err),
         };
-        if !recovery.root_encrypted || !recovery.recovery_configured {
+        if !crate::api::auth_gateway::principal_root_recovery_is_ready(&recovery) {
             return (
                 StatusCode::CONFLICT,
                 Json(PeopleProfileProtectionRequiredResponse {
@@ -3697,6 +3726,7 @@ fn standard_home_identity_summary() -> HomeIdentitySummary {
     HomeIdentitySummary {
         device_did: None,
         profile_readiness: None,
+        recovery_readiness: None,
         profile_setup_display_name: None,
         profile: None,
     }
@@ -3705,6 +3735,26 @@ fn standard_home_identity_summary() -> HomeIdentitySummary {
 pub(in crate::api) struct ProfileReadinessProjection {
     pub readiness: ProfileReadinessSummary,
     profile: Option<crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument>,
+}
+
+pub(super) fn recovery_readiness_for_context(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> RecoveryReadinessSummary {
+    match crate::api::auth_gateway::principal_root_recovery_status_for_verified_principal(
+        data_dir,
+        &home_browser_principal_id(context),
+        &home_browser_localhost_root(context),
+    ) {
+        Ok(recovery) => {
+            if crate::api::auth_gateway::principal_root_recovery_is_ready(&recovery) {
+                RecoveryReadinessSummary::ready()
+            } else {
+                RecoveryReadinessSummary::setup_required()
+            }
+        }
+        Err(_) => RecoveryReadinessSummary::unavailable(),
+    }
 }
 
 pub(in crate::api) fn profile_readiness_for_principal(
@@ -5123,22 +5173,205 @@ struct HomeBackgroundImageEntry {
     version: String,
 }
 
+const HOME_APPEARANCE_SCHEMA: &str = "elastos.home.appearance/v1";
+const HOME_APPEARANCE_PREFERENCES_SCHEMA: &str = "elastos.home.appearance.preferences/v1";
+const HOME_APPEARANCE_PREFERENCES_FILE: &str = "preferences.json";
+const HOME_APPEARANCE_PREFERENCES_MAX_BYTES: usize = 4 * 1024;
+const HOME_APPEARANCE_MAX_REVISION: u64 = 9_007_199_254_740_991;
+static HOME_APPEARANCE_PREFERENCES_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+const HOME_APPEARANCE_DEFAULT_THEME: &str = "dark";
+const HOME_APPEARANCE_DEFAULT_ACCENT: &str = "blue";
+const HOME_APPEARANCE_DEFAULT_ACCENT_CUSTOM: &str = "#4f7fff";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HomeAppearancePreferences {
+    schema: String,
+    revision: u64,
+    theme: String,
+    accent: String,
+    accent_custom: String,
+    dock_auto_hide: bool,
+    sounds: bool,
+    focus_mode: bool,
+}
+
+impl Default for HomeAppearancePreferences {
+    fn default() -> Self {
+        Self {
+            schema: HOME_APPEARANCE_PREFERENCES_SCHEMA.to_string(),
+            revision: 0,
+            theme: HOME_APPEARANCE_DEFAULT_THEME.to_string(),
+            accent: HOME_APPEARANCE_DEFAULT_ACCENT.to_string(),
+            accent_custom: HOME_APPEARANCE_DEFAULT_ACCENT_CUSTOM.to_string(),
+            dock_auto_hide: false,
+            sounds: false,
+            focus_mode: false,
+        }
+    }
+}
+
+fn normalize_home_appearance_accent_custom(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() != 7 || bytes[0] != b'#' {
+        return None;
+    }
+    if !bytes[1..].iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+fn validate_home_appearance_preferences(
+    preferences: &HomeAppearancePreferences,
+) -> anyhow::Result<()> {
+    if preferences.schema != HOME_APPEARANCE_PREFERENCES_SCHEMA {
+        anyhow::bail!("invalid appearance preference schema");
+    }
+    if preferences.revision > HOME_APPEARANCE_MAX_REVISION {
+        anyhow::bail!("invalid appearance preference revision");
+    }
+    if !is_valid_home_appearance_theme(preferences.theme.as_str()) {
+        anyhow::bail!("invalid appearance preference theme");
+    }
+    if !is_valid_home_appearance_accent(preferences.accent.as_str()) {
+        anyhow::bail!("invalid appearance preference accent");
+    }
+    let normalized_accent_custom =
+        normalize_home_appearance_accent_custom(&preferences.accent_custom)
+            .ok_or_else(|| anyhow::anyhow!("invalid appearance preference accent_custom"))?;
+    if normalized_accent_custom != preferences.accent_custom {
+        anyhow::bail!("invalid appearance preference accent_custom");
+    }
+    Ok(())
+}
+
+fn is_valid_home_appearance_theme(value: &str) -> bool {
+    matches!(value, "auto" | "light" | "dark")
+}
+
+fn is_valid_home_appearance_accent(value: &str) -> bool {
+    matches!(
+        value,
+        "blue" | "purple" | "pink" | "red" | "orange" | "yellow" | "green" | "graphite" | "custom"
+    )
+}
+
+fn validate_home_appearance_preferences_update(
+    update: &HomeAppearancePreferencesUpdate,
+) -> anyhow::Result<()> {
+    let field_count = [
+        update.theme.is_some(),
+        update.accent.is_some(),
+        update.accent_custom.is_some(),
+        update.dock_auto_hide.is_some(),
+        update.sounds.is_some(),
+        update.focus_mode.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if field_count != 1 {
+        return Err(home_appearance_preference_request_error(
+            "appearance preference update must set exactly one field",
+        ));
+    }
+    if let Some(theme) = &update.theme {
+        if !is_valid_home_appearance_theme(theme.trim()) {
+            return Err(home_appearance_preference_request_error(
+                "invalid appearance preference request theme",
+            ));
+        }
+    }
+    if let Some(accent) = &update.accent {
+        if !is_valid_home_appearance_accent(accent.trim()) {
+            return Err(home_appearance_preference_request_error(
+                "invalid appearance preference request accent",
+            ));
+        }
+    }
+    if let Some(accent_custom) = &update.accent_custom {
+        if normalize_home_appearance_accent_custom(accent_custom).is_none() {
+            return Err(home_appearance_preference_request_error(
+                "invalid appearance preference request accent_custom",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn home_appearance_preferences(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<HomeAppearancePreferences> {
+    let path = home_appearance_path(data_dir, context, HOME_APPEARANCE_PREFERENCES_FILE)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                anyhow::bail!("invalid appearance preferences path");
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HomeAppearancePreferences::default());
+        }
+        Err(err) => return Err(err.into()),
+    }
+    let bytes = crate::auth::read_principal_root_object(
+        data_dir,
+        &home_browser_principal_id(context),
+        &home_browser_localhost_root(context),
+        &home_appearance_object_uri(context, HOME_APPEARANCE_PREFERENCES_FILE),
+        &path,
+    )?;
+    if bytes.len() > HOME_APPEARANCE_PREFERENCES_MAX_BYTES {
+        anyhow::bail!("appearance preferences are too large");
+    }
+    let preferences = serde_json::from_slice::<HomeAppearancePreferences>(&bytes)?;
+    validate_home_appearance_preferences(&preferences)?;
+    Ok(preferences)
+}
+
+fn home_appearance_summary_from_preferences(
+    preferences: HomeAppearancePreferences,
+    image_url: Option<String>,
+    overlay_enabled: bool,
+    overlay_opacity: f64,
+) -> HomeAppearanceSummary {
+    HomeAppearanceSummary {
+        schema: HOME_APPEARANCE_SCHEMA.to_string(),
+        revision: preferences.revision,
+        theme: preferences.theme,
+        accent: preferences.accent,
+        accent_custom: preferences.accent_custom,
+        dock_auto_hide: preferences.dock_auto_hide,
+        sounds: preferences.sounds,
+        focus_mode: preferences.focus_mode,
+        background_image_url: image_url,
+        background_overlay_enabled: overlay_enabled,
+        background_overlay_opacity: overlay_opacity,
+    }
+}
+
 fn home_appearance_summary(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
 ) -> anyhow::Result<HomeAppearanceSummary> {
+    let preferences = home_appearance_preferences(data_dir, context)?;
     let (overlay_enabled, overlay_opacity) = home_background_overlay_settings(data_dir, context)?;
     let cache_scope = home_appearance_cache_scope(context);
-    Ok(HomeAppearanceSummary {
-        background_image_url: home_background_image_entry(data_dir, context)?.map(|entry| {
-            format!(
-                "/api/apps/home/appearance/background-image?scope={cache_scope}&v={}",
-                entry.version
-            )
-        }),
-        background_overlay_enabled: overlay_enabled,
-        background_overlay_opacity: overlay_opacity,
-    })
+    let image_url = home_background_image_entry(data_dir, context)?.map(|entry| {
+        format!(
+            "/api/apps/home/appearance/background-image?scope={cache_scope}&v={}",
+            entry.version
+        )
+    });
+    Ok(home_appearance_summary_from_preferences(
+        preferences,
+        image_url,
+        overlay_enabled,
+        overlay_opacity,
+    ))
 }
 
 fn home_appearance_cache_scope(context: &HomeLaunchTokenContext) -> String {
@@ -5147,11 +5380,83 @@ fn home_appearance_cache_scope(context: &HomeLaunchTokenContext) -> String {
 }
 
 fn standard_home_appearance_summary() -> HomeAppearanceSummary {
-    HomeAppearanceSummary {
-        background_image_url: None,
-        background_overlay_enabled: HOME_BACKGROUND_OVERLAY_DEFAULT,
-        background_overlay_opacity: HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT,
-    }
+    home_appearance_summary_from_preferences(
+        HomeAppearancePreferences::default(),
+        None,
+        HOME_BACKGROUND_OVERLAY_DEFAULT,
+        HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT,
+    )
+}
+
+fn home_save_appearance_preferences(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    update: HomeAppearancePreferencesUpdate,
+) -> anyhow::Result<HomeAppearanceSummary> {
+    validate_home_appearance_preferences_update(&update)?;
+    let preferences = {
+        let _guard = HOME_APPEARANCE_PREFERENCES_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| anyhow::anyhow!("appearance preferences mutex poisoned"))?;
+        let mut preferences = home_appearance_preferences(data_dir, context)?;
+        preferences.revision = preferences
+            .revision
+            .checked_add(1)
+            .filter(|revision| *revision <= HOME_APPEARANCE_MAX_REVISION)
+            .ok_or_else(|| anyhow::anyhow!("appearance preference revision overflow"))?;
+        if let Some(theme) = update.theme {
+            preferences.theme = theme.trim().to_string();
+        }
+        if let Some(accent) = update.accent {
+            preferences.accent = accent.trim().to_string();
+        }
+        if let Some(accent_custom) = update.accent_custom {
+            preferences.accent_custom = normalize_home_appearance_accent_custom(&accent_custom)
+                .ok_or_else(|| anyhow::anyhow!("invalid appearance preference accent_custom"))?;
+        }
+        if let Some(dock_auto_hide) = update.dock_auto_hide {
+            preferences.dock_auto_hide = dock_auto_hide;
+        }
+        if let Some(sounds) = update.sounds {
+            preferences.sounds = sounds;
+        }
+        if let Some(focus_mode) = update.focus_mode {
+            preferences.focus_mode = focus_mode;
+        }
+        validate_home_appearance_preferences(&preferences)?;
+        let bytes = serde_json::to_vec_pretty(&preferences)?;
+        if bytes.len() > HOME_APPEARANCE_PREFERENCES_MAX_BYTES {
+            anyhow::bail!("appearance preferences are too large");
+        }
+        let path = home_appearance_path(data_dir, context, HOME_APPEARANCE_PREFERENCES_FILE)?;
+        if let Some(parent) = path.parent() {
+            crate::auth::create_owner_only_dir_all(data_dir, parent)?;
+        }
+        crate::auth::write_principal_root_object(
+            data_dir,
+            &home_browser_principal_id(context),
+            &home_browser_localhost_root(context),
+            &home_appearance_object_uri(context, HOME_APPEARANCE_PREFERENCES_FILE),
+            &path,
+            &bytes,
+        )?;
+        preferences
+    };
+    let (overlay_enabled, overlay_opacity) = home_background_overlay_settings(data_dir, context)?;
+    let cache_scope = home_appearance_cache_scope(context);
+    let image_url = home_background_image_entry(data_dir, context)?.map(|entry| {
+        format!(
+            "/api/apps/home/appearance/background-image?scope={cache_scope}&v={}",
+            entry.version
+        )
+    });
+    Ok(home_appearance_summary_from_preferences(
+        preferences,
+        image_url,
+        overlay_enabled,
+        overlay_opacity,
+    ))
 }
 
 fn home_appearance_root_uri(context: &HomeLaunchTokenContext) -> String {
@@ -5371,6 +5676,37 @@ fn refresh_runtime_owned_contexts_after_profile_change(
     };
     if let Err(err) = service.register_runtime_owned_contexts(data_dir) {
         tracing::debug!(error = %err, "refreshing collaboration contexts after a Profile change failed");
+    }
+}
+
+pub(super) async fn system_appearance_preferences_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<HomeAppearancePreferencesUpdate>,
+) -> Response {
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return system_error_response(err),
+        };
+    match home_save_appearance_preferences(&state.data_dir, &context, req) {
+        Ok(summary) => Json(summary).into_response(),
+        Err(err) => system_error_response(err),
+    }
+}
+
+pub(super) async fn home_appearance_preferences_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<HomeAppearancePreferencesUpdate>,
+) -> Response {
+    let context = match require_home_active_shell_token_context(&state.data_dir, &headers) {
+        Ok(context) => context,
+        Err(err) => return home_error_response(err),
+    };
+    match home_save_appearance_preferences(&state.data_dir, &context, req) {
+        Ok(summary) => Json(summary).into_response(),
+        Err(err) => home_error_response(err),
     }
 }
 

@@ -6,7 +6,7 @@
  * never touches the server-side entries that drive the inbox badge.
  *
  * History only: entry clicks route to the actionable surface by kind
- * (wallet → Wallet rail; everything else → Inbox rail).
+ * (wallet → Wallet rail; setup → setup sheet; everything else → Inbox rail).
  */
 
 import { clockNode } from "./shell-core.js?v=home-20260813a";
@@ -23,7 +23,9 @@ import { showWalletRail } from "./shell-wallet-rail.js?v=home-20260813a";
 
 const MAX_ENTRIES = 50;
 const WEEKDAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+const HOME_SETUP_KIND = "home_setup";
 let notificationHistory = [];
+let homeSetupNotificationHandler = null;
 
 /* Bound by bindNotificationCenter() once the lazy GUI template is in the DOM. */
 let panel = null;
@@ -43,6 +45,48 @@ function loadHistory() {
 
 function saveHistory(entries) {
   notificationHistory = entries.slice(0, MAX_ENTRIES);
+}
+
+export function setHomeSetupNotificationHandler(handler) {
+  homeSetupNotificationHandler = typeof handler === "function" ? handler : null;
+}
+
+export function rememberChromeNotification(entry) {
+  const id = typeof entry?.id === "string" ? entry.id.trim() : "";
+  if (!id) {
+    return;
+  }
+  const history = loadHistory();
+  if (history.some((item) => item.id === id)) {
+    return;
+  }
+  history.unshift({
+    id,
+    kind: typeof entry.kind === "string" ? entry.kind : "",
+    title: typeof entry.title === "string" && entry.title.trim() ? entry.title.trim() : "Notification",
+    body: typeof entry.body === "string" ? entry.body : "",
+    seenAt: Date.now(),
+  });
+  saveHistory(history);
+  if (panel && !panel.hidden) {
+    renderNotificationCenter();
+  }
+}
+
+export function forgetChromeNotification(id) {
+  const target = typeof id === "string" ? id.trim() : "";
+  if (!target) {
+    return;
+  }
+  const history = loadHistory();
+  const next = history.filter((item) => item.id !== target);
+  if (next.length === history.length) {
+    return;
+  }
+  saveHistory(next);
+  if (panel && !panel.hidden) {
+    renderNotificationCenter();
+  }
 }
 
 /* Called on every summary poll: remember entries we have not seen before,
@@ -227,7 +271,9 @@ function renderNotificationCenter() {
     }
     card.addEventListener("click", () => {
       hideNotificationCenter({ restoreFocus: false });
-      if (item.kind === "wallet_approval_request") {
+      if (item.kind === HOME_SETUP_KIND) {
+        homeSetupNotificationHandler?.();
+      } else if (item.kind === "wallet_approval_request") {
         showWalletRail();
       } else {
         showInboxRail();
