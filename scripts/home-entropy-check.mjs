@@ -7314,6 +7314,13 @@ assert(
   "Home passkey login must use concise data/apps/desktop copy without redundant kicker text",
 );
 assert(
+  shellIndex.includes('class="home-unlock-face"') &&
+    shellIndex.includes('id="home-unlock-person"') &&
+    shellIndex.includes('id="home-unlock-person-name"') &&
+    shellIndex.indexOf('id="home-unlock-person"') < shellIndex.indexOf('id="home-unlock-person-name"'),
+  "Home lock face must keep the profile name outside the passkey hit target",
+);
+assert(
   shellIndex.includes('id="home-unlock-name"') &&
     shellAuth.includes("display_name: displayName"),
   "Home passkey creation must collect and persist a passkey/user display name",
@@ -7328,22 +7335,26 @@ assert(
   "Home must present guest enrollment as self-registration",
 );
 assert(
-  shellAuth.includes("startAutomaticPasskeySignIn") &&
-    shellAuth.includes("Choose your passkey."),
-  "Home sign-in must automatically ask for a passkey instead of requiring a duplicate continue click",
+  shellAuth.includes("unlockPerson?.addEventListener(\"click\", startUnlock);") &&
+    shellAuth.includes("setUnlockStatus(\"Choose your passkey.\", \"muted\");") &&
+    shellAuth.includes('unlockPanel.dataset.surface = showFace ? "lock-face" : "neutral";') &&
+    shellAuth.includes("unlockPersonName.textContent = unlockPersonLabel;") &&
+    shellAuth.includes("Use passkey for ${unlockPersonLabel}") &&
+    shellAuth.includes("unlockPanel?.dataset.surface === \"lock-face\""),
+  "Home lock sign-in must keep the explicit-click lock-face flow",
 );
-const renderUnlockCheckingBody = shellAuth.match(
-  /function renderUnlockChecking\(\) \{[\s\S]*?\n\}/,
-)?.[0] || "";
 assert(
-  shellAuth.includes("if (registered) {\n      startAutomaticPasskeySignIn") &&
-    renderUnlockCheckingBody.includes("autoSignInAttempted = false") &&
+  !shellAuth.includes("startAutomaticPasskeySignIn") &&
+    !shellAuth.includes("autoSignInAttempted") &&
     !shellAuth.includes("AbortController") &&
-    !shellAuth.includes('name === "AbortError"') &&
-    !shellAuth.includes("guestRegistrationAvailable") &&
-    !shellAuth.includes('registered && unlockPresentation === "modal"') &&
-    shellAuth.includes('unlockMode === "signin_guest_enabled" && guestRegistrationEnabled'),
-  "Home unsigned desktop unlock must stay aligned with the main passkey prompt behavior",
+    !shellAuth.includes('name === "AbortError"'),
+  "Home lock sign-in must not auto-start or add hidden cancellation state",
+);
+assert(
+  !shellAuth.includes("status.accounts") &&
+    !shellAuth.includes("profile_setup_display_name") &&
+    !shellAuth.includes("guestRegistrationAvailable"),
+  "Home lock sign-in must not depend on unsigned account-directory or profile setup fields",
 );
 assert(
   shellAuth.includes('unlockMode === "create_guest"') &&
@@ -7361,6 +7372,19 @@ assert(
   shellAuth.includes("isPasskeyNotSelected") &&
     shellAuth.includes('setUnlockStatus("No passkey selected.", "muted")'),
   "Home sign-in must suppress raw WebAuthn cancellation errors and keep onboarding actionable",
+);
+assert(
+  shellJs.includes("identity?.profile?.display_name") &&
+    shellJs.includes("options?.preserveSignedProfileLabel ? currentSignedProfileDisplayName() : \"\"") &&
+    shellJs.includes("preserveSignedProfileLabel: true") &&
+    !shellJs.includes("/api/auth/passkey/accounts") &&
+    !shellJs.includes("profile_setup_display_name"),
+  "Home host must reveal the signed-session profile label only for the authorized explicit lock action",
+);
+assert(
+  homeGuiJs.includes("homeGuiHostActions.requestHomeUnlock?.();") &&
+    !homeGuiJs.includes('CustomEvent("elastos:request-lock")'),
+  "Home GUI lock action must use the host unlock seam instead of a detached DOM event",
 );
 assert(
   shellAuth.includes(

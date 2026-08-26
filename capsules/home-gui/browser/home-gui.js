@@ -1165,7 +1165,7 @@ export function bindHomeGuiInteractions(options = {}) {
   });
 
   document.querySelector("#identity-menu-lock")?.addEventListener("click", () => {
-    window.dispatchEvent(new CustomEvent("elastos:request-lock"));
+    homeGuiHostActions.requestHomeUnlock?.();
   });
 
   bindAboutOverlay();
