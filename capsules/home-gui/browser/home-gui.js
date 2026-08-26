@@ -133,6 +133,7 @@ import {
   inboxRailSessionMounted,
 } from "./shell-inbox-rail.js?v=home-20260813a";
 import {
+  attachAuthorizedConnectorSheet,
   bindConnectorSheet,
   connectorSheetFrame,
   connectorSheetTarget,
@@ -369,19 +370,16 @@ export function closeHomeGuiWindowsForTarget(targetId) {
 
 export function openHomeGuiTarget(target, options = {}) {
   const query = options.query && typeof options.query === "object" ? options.query : {};
-  // Wallet connectors open as an in-rail ceremony sheet — not a second
-  // desktop product window — when the wallet asks for sheet presentation
-  // or the wallet rail is already open.
   if (
     isConnectorSheetTarget(target) &&
     (query.presentation === "sheet" || walletRailOpen())
   ) {
-    showConnectorSheet(target, { ...options, query: { ...query, presentation: "sheet" } }).catch(
-      (error) => {
-        console.error("connector sheet open failed", error);
-        openTarget(target, options);
-      },
-    );
+    void showConnectorSheet(target, {
+      ...options,
+      query: { ...query, presentation: "sheet" },
+    }).catch((error) => {
+      console.error("connector sheet open failed", error);
+    });
     return;
   }
   openTarget(target, options);
@@ -711,6 +709,9 @@ export function relaunchHomeGuiWindowForToken(homeToken) {
 }
 
 export function attachAuthorizedHomeGuiTarget(launched) {
+  if (walletRailOpen() && isConnectorSheetTarget(launched?.target)) {
+    return attachAuthorizedConnectorSheet(launched);
+  }
   return attachAuthorizedTarget(launched);
 }
 

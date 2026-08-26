@@ -92,6 +92,46 @@ export async function showConnectorSheet(targetId, options = {}) {
   return true;
 }
 
+/* Host already launched this connector. Mount that exact route in the rail
+   sheet and do not launch again. */
+export async function attachAuthorizedConnectorSheet(launched) {
+  const targetId = launched?.target;
+  const route = typeof launched?.route === "string" ? launched.route : "";
+  if (
+    !sheet ||
+    !frame ||
+    !isConnectorSheetTarget(targetId) ||
+    !route ||
+    !walletRailOpen()
+  ) {
+    return false;
+  }
+  activeTarget = targetId;
+  if (titleNode) {
+    titleNode.textContent = SHEET_TITLES[targetId] || "Connect wallet";
+  }
+  sheet.hidden = false;
+  sheet.inert = false;
+  sheet.setAttribute("aria-hidden", "false");
+  sheet.focus({ preventScroll: true });
+  frame.hidden = false;
+  frame.classList.remove("is-ready");
+  frame.setAttribute("sandbox", iframeSandboxForLaunch(launched));
+  frame.setAttribute("allow", iframeAllowForLaunch(launched));
+  frame.title = escapeHtml(launched.title || SHEET_TITLES[targetId] || "Connector");
+  frame.addEventListener(
+    "load",
+    () => {
+      frame.classList.add("is-ready");
+      pushUiPreferencesToFrameWindow(frame.contentWindow);
+    },
+    { once: true },
+  );
+  frame.src = route;
+  frame.dataset.route = route;
+  return true;
+}
+
 export function hideConnectorSheet() {
   if (!sheet || sheet.hidden) {
     return;
