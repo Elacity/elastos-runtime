@@ -281,6 +281,82 @@ const layout = shellCore.shellState.shellLayoutState.desktop;
 assert(layout.wallet, "wallet desktop position missing", layout);
 assert(layout.people, "people desktop position missing", layout);
 
+const firstRunSummary = {
+  authority: { signed_in: true },
+  targets: [
+    { target: "wallet", title: "Wallet", route: "/apps/wallet/" },
+    { target: "chat-room", title: "Chat", route: "/apps/chat-room/" },
+    { target: "browser", title: "Browser", route: "/apps/browser/" },
+    { target: "system", title: "System", route: "/apps/system/" },
+    { target: "documents", title: "Documents", route: "/apps/documents/" },
+    { target: "object-target", title: "Shared object", route: "/apps/object-target/", target_kind: "object" },
+  ],
+  browser_state: {
+    principal_id: "principal:first-run",
+  },
+};
+
+shellCore.initializeShellLayout(firstRunSummary);
+assert(
+  JSON.stringify(shellCore.shellState.shellLayoutState.taskbar) === JSON.stringify([
+    "browser",
+    "wallet",
+    "documents",
+    "chat-room",
+    "system",
+  ]),
+  "fresh layout did not seed only the available core dock targets in canonical order",
+  shellCore.shellState.shellLayoutState.taskbar,
+);
+assert(
+  JSON.stringify(shellCore.shellState.shellLayoutState.desktopHidden) === JSON.stringify([
+    "wallet",
+    "chat-room",
+    "browser",
+    "system",
+    "documents",
+  ]),
+  "fresh layout did not hide all non-object visible targets and keep object targets visible",
+  shellCore.shellState.shellLayoutState.desktopHidden,
+);
+assert(
+  shellCore.isTargetOnDesktop("object-target") === true,
+  "fresh layout hid an object target from the desktop",
+  shellCore.shellState.shellLayoutState.desktopHidden,
+);
+assert(
+  shellCore.isTargetOnDesktop("wallet") === false,
+  "fresh layout left an app target on the desktop",
+  shellCore.shellState.shellLayoutState.desktopHidden,
+);
+
+const storedEmptyTaskbarSummary = {
+  authority: { signed_in: true },
+  targets: firstRunSummary.targets,
+  browser_state: {
+    principal_id: "principal:stored-empty-taskbar",
+    layout: {
+      desktop: {},
+      taskbar: [],
+      desktopHidden: ["wallet", "browser"],
+      desktopIconsVisible: true,
+    },
+  },
+};
+
+shellCore.initializeShellLayout(storedEmptyTaskbarSummary);
+assert(
+  Array.isArray(shellCore.shellState.shellLayoutState.taskbar) &&
+    shellCore.shellState.shellLayoutState.taskbar.length === 0,
+  "stored empty taskbar was rewritten by the first-run dock policy",
+  shellCore.shellState.shellLayoutState.taskbar,
+);
+assert(
+  JSON.stringify(shellCore.shellState.shellLayoutState.desktopHidden) === JSON.stringify(["wallet", "browser"]),
+  "stored desktopHidden changed without required normalization",
+  shellCore.shellState.shellLayoutState.desktopHidden,
+);
+
 const peopleStyle = readFileSync(
   new URL("../capsules/people/browser/style.css", import.meta.url),
   "utf8",
