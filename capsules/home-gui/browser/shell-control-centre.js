@@ -12,14 +12,12 @@ import {
   focusModeEnabled,
   formatBadgeCount,
   setDesktopIconsVisible,
-  setFocusModeEnabled,
   shellState,
   targetById,
 } from "./shell-core.js?v=home-20260813a";
-import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260813a";
+import { uiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260813a";
 import {
   dockAutoHideEnabled,
-  setDockAutoHide,
 } from "./shell-surface.js?v=home-20260813a";
 import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260813a";
 import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260813a";
@@ -116,11 +114,9 @@ export function bindControlCentre() {
 
   themeSegment?.addEventListener("click", (event) => {
     const option = event.target.closest("[data-theme-option]");
-    if (!option || !window.elastosTheme) {
+    if (!option) {
       return;
     }
-    window.elastosTheme.set(option.dataset.themeOption);
-    syncThemeSegment();
     window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
       detail: { key: "theme", value: option.dataset.themeOption },
     }));
@@ -128,21 +124,16 @@ export function bindControlCentre() {
 
   accentRow?.addEventListener("click", (event) => {
     const option = event.target.closest("[data-accent-option]");
-    if (!option || !window.elastosTheme?.setAccent) {
+    if (!option) {
       return;
     }
     const next = option.dataset.accentOption;
     if (next === "custom") {
-      const hex = window.elastosTheme.accentCustom?.() || "#4f7fff";
-      window.elastosTheme.setAccentCustom?.(hex);
-      window.elastosTheme.setAccent("custom");
-      publishAccentCustom(hex);
       publishAccent("custom");
       syncAccentRow({ showCustomEditor: true });
       accentCustomPicker?.open?.();
       return;
     }
-    window.elastosTheme.setAccent(next);
     publishAccent(next);
     syncAccentRow({ showCustomEditor: false });
   });
@@ -167,8 +158,6 @@ export function bindControlCentre() {
 
   focusSwitch?.addEventListener("click", () => {
     const next = !focusModeEnabled();
-    setFocusModeEnabled(next);
-    syncFocusSwitch();
     window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
       detail: { key: "focusMode", value: next ? "on" : "off" },
     }));
@@ -195,20 +184,13 @@ export function bindControlCentre() {
 
   soundsSwitch?.addEventListener("click", () => {
     const next = !uiSoundsEnabled();
-    setUiSoundsEnabled(next);
-    syncSoundsSwitch();
     window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
       detail: { key: "sounds", value: next ? "on" : "off" },
     }));
-    if (next) {
-      playUiSound("notification");
-    }
   });
 
   dockSwitch?.addEventListener("click", () => {
     const next = !dockAutoHideEnabled();
-    setDockAutoHide(next);
-    syncDockSwitch();
     window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
       detail: { key: "dockAutoHide", value: next ? "on" : "off" },
     }));
@@ -347,7 +329,7 @@ function publishAccentCustom(value) {
 }
 
 function commitAccentCustom(raw, { fromWheel }) {
-  if (!window.elastosTheme?.setAccentCustom) {
+  if (!window.elastosTheme?.normalizeHex) {
     return;
   }
   const hex = window.elastosTheme.normalizeHex?.(raw) || "";
@@ -357,11 +339,6 @@ function commitAccentCustom(raw, { fromWheel }) {
     }
     return;
   }
-  window.elastosTheme.setAccentCustom(hex);
-  if (window.elastosTheme.accent?.() !== "custom") {
-    window.elastosTheme.setAccent("custom");
-    publishAccent("custom");
-  }
   if (accentCustomHex && !fromWheel) {
     accentCustomHex.value = hex;
   } else if (accentCustomHex && document.activeElement !== accentCustomHex) {
@@ -370,7 +347,6 @@ function commitAccentCustom(raw, { fromWheel }) {
   if (!fromWheel) {
     accentCustomPicker?.setHex?.(hex);
   }
-  paintCustomSwatch(hex);
   window.clearTimeout(accentCustomWriteTimer);
   accentCustomWriteTimer = window.setTimeout(() => {
     publishAccentCustom(hex);

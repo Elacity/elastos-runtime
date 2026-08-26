@@ -162,14 +162,6 @@ bindControlCentre();
 bindWalletRail();
 bindInboxRail();
 bindConnectorSheet();
-window.addEventListener("elastos:ui-preference-changed", (event) => {
-  const detail = event?.detail;
-  const key = typeof detail?.key === "string" ? detail.key.trim() : "";
-  if (!key) {
-    return;
-  }
-  applyHomeGuiUiPreferences({ [key]: detail.value });
-});
 
 const HOME_GUI_HOST_SELECTORS = Object.freeze([
   ".desktop-backdrop",
@@ -746,6 +738,7 @@ export function homeGuiLauncherIsOpen() {
 export function syncHomeGuiProjection(previous, summary, options = {}) {
   shellState.currentSummary = summary;
   shellState.requestSummaryRefresh = homeGuiHostActions.requestSummaryRefresh;
+  applyHomeGuiUiPreferences(homeGuiUiPreferencesFromSummary(summary));
   if (options.initialize === true || options.principalChanged === true) {
     initializeShellLayout(summary);
     initializeRecentTargets(summary);
@@ -781,6 +774,59 @@ export function syncHomeGuiChrome(previous, summary) {
   recordNotifications(summary);
   syncSetupSheet(previous, summary);
   syncControlCentre(summary);
+}
+
+function homeGuiUiPreferencesFromSummary(summary) {
+  if (summary?.authority?.signed_in !== true) {
+    return {
+      revision: 0,
+      theme: "dark",
+      accent: "blue",
+      accentCustom: "#4f7fff",
+      dockAutoHide: "off",
+      sounds: "off",
+      focusMode: "off",
+    };
+  }
+  const appearance = summary?.appearance;
+  const revision = appearance?.revision;
+  const accentCustom =
+    typeof appearance?.accent_custom === "string" &&
+    /^#[0-9a-f]{6}$/i.test(appearance.accent_custom.trim())
+      ? appearance.accent_custom.trim().toLowerCase()
+      : "";
+  if (
+    appearance?.schema !== "elastos.home.appearance/v1" ||
+    !Number.isSafeInteger(revision) ||
+    revision < 0 ||
+    !["dark", "light", "auto"].includes(appearance?.theme) ||
+    ![
+      "blue",
+      "purple",
+      "pink",
+      "red",
+      "orange",
+      "yellow",
+      "green",
+      "graphite",
+      "custom",
+    ].includes(appearance?.accent) ||
+    !accentCustom ||
+    typeof appearance?.dock_auto_hide !== "boolean" ||
+    typeof appearance?.sounds !== "boolean" ||
+    typeof appearance?.focus_mode !== "boolean"
+  ) {
+    throw new Error("Home GUI rejected the appearance summary");
+  }
+  return {
+    revision,
+    theme: appearance.theme,
+    accent: appearance.accent,
+    accentCustom,
+    dockAutoHide: appearance.dock_auto_hide === true ? "on" : "off",
+    sounds: appearance.sounds === true ? "on" : "off",
+    focusMode: appearance.focus_mode === true ? "on" : "off",
+  };
 }
 
 /* Menus are self-declared UI, not authority: the host verifies the sender's

@@ -413,6 +413,18 @@ const shellControlCentreScript = readFileSync(
   new URL("../capsules/home-gui/browser/shell-control-centre.js", import.meta.url),
   "utf8",
 );
+const homeGuiShellScript = readFileSync(
+  new URL("../capsules/home-gui/browser/home-gui-shell.js", import.meta.url),
+  "utf8",
+);
+const homeShellHostScript = readFileSync(
+  new URL("../capsules/home/browser/home-shell-host.js", import.meta.url),
+  "utf8",
+);
+const controlCentreScript = readFileSync(
+  new URL("../capsules/home-gui/browser/shell-control-centre.js", import.meta.url),
+  "utf8",
+);
 const openHomeGuiTargetBlock = sourceBlock(
   homeGuiScript,
   "export function openHomeGuiTarget(target, options = {}) {",
@@ -680,6 +692,32 @@ assert(
 assert(
   !homeGuiScript.includes("(label || toolbarFullscreenButton).textContent"),
   "Home toolbar fullscreen control still writes visible label text into the menubar",
+);
+assert(
+  /requestHome\("home:ui-preference", \{\s*action: "write",\s*key,\s*value,\s*\}\)/m.test(
+    homeGuiShellScript,
+  ) &&
+    !homeGuiScript.includes('window.addEventListener("elastos:ui-preference-changed"') &&
+    homeGuiScript.includes(
+      "applyHomeGuiUiPreferences(homeGuiUiPreferencesFromSummary(summary));",
+    ),
+  "Home GUI must send cosmetic writes through the verified host and apply only Runtime-returned canonical state from summary",
+);
+assert(
+  homeShellHostScript.includes('data.type === "home:ui-preference"') &&
+    homeShellHostScript.includes('context.targetId !== HOME_GUI_SHELL_ID') &&
+    homeShellHostScript.includes('fetchJson("/api/apps/home/appearance/preferences"') &&
+    homeShellHostScript.includes("accent_custom") &&
+    !homeShellHostScript.includes("elastos.home.appearance-cache.v1"),
+  "Home host must keep one Runtime-backed appearance record, reject non-Home-GUI writers, and avoid a second browser cache store",
+);
+assert(
+  controlCentreScript.includes('window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed"') &&
+    !controlCentreScript.includes("window.elastosTheme.set(option.dataset.themeOption)") &&
+    !controlCentreScript.includes("setFocusModeEnabled(next)") &&
+    !controlCentreScript.includes("setUiSoundsEnabled(next)") &&
+    !controlCentreScript.includes("setDockAutoHide(next)"),
+  "Control Centre must issue preference requests without treating local mutations as canonical state",
 );
 assert(
   homeGuiScript.includes("const active = Boolean(fullscreenElement());") &&
