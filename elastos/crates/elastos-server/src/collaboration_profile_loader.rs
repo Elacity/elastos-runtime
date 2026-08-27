@@ -651,7 +651,7 @@ mod tests {
     }
 
     fn did(key: &SigningKey) -> String {
-        crate::crypto::encode_signing_key_did(&key)
+        crate::crypto::encode_signing_key_did(key)
     }
 
     fn grant_bytes(network_id: &str) -> Vec<u8> {

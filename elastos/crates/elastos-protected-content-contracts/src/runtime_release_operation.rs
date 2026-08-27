@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, Verifier as _};
+use ed25519_dalek::Signature;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -344,7 +344,7 @@ impl SignedRuntimeReleaseOperationV1 {
         )
         .map_err(|_| RuntimeReleaseOperationError::InvalidRuntimeSignature)?;
         runtime_key
-            .verify(&self.statement.canonical_bytes()?, &signature)
+            .verify_strict(&self.statement.canonical_bytes()?, &signature)
             .map_err(|_| RuntimeReleaseOperationError::InvalidRuntimeSignature)?;
         let verified = verify_release_operation_statement(&self.statement, now)?;
         Ok(AuthenticatedRuntimeReleaseOperationV1 {
