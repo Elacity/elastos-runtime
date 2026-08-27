@@ -571,7 +571,7 @@ pub fn did_to_public_key(did: &str) -> Option<iroh::PublicKey> {
     iroh::PublicKey::from_bytes(verifying_key.as_bytes()).ok()
 }
 
-fn public_key_to_did(public_key: &iroh::PublicKey) -> anyhow::Result<String> {
+pub(crate) fn public_key_to_did(public_key: &iroh::PublicKey) -> anyhow::Result<String> {
     let verifying_key = validate_canonical_ed25519_verifying_key_bytes(*public_key.as_bytes())
         .context("iroh public keys must be canonical Ed25519 verifying keys")?;
     encode_did_key(&verifying_key)
