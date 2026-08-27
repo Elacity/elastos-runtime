@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-08-19 UTC
+Last updated: 2026-08-27 UTC
 
 This file records public-safe current truth for released 0.6.0 and active
 unpublished work. Historical
@@ -17,15 +17,24 @@ the public repository.
   `origin/review/collaboration-candidate`. Each review branch depends on its
   parent; installed and live claims remain separate target evidence, not branch
   truth.
+- Bottom-up review of the stacked chain is in progress. The
+  `review/collaboration-foundation` and `review/collaboration-product-integration`
+  tips carry the chat/agent retirement packaging and source-gate alignment
+  needed to pass CI at each checkpoint, and both tips are CI-green on the
+  shared upstream (2026-08-27). `review/collaboration-candidate` additionally
+  carries the browser-local-exit orphan-reaping hotfix merge (`46e51a77`,
+  2026-08-27); that hotfix and the system-map docs merge are not yet contained
+  in the extraction stack.
 - `codex/post-0.6-consolidation` remains an unpublished local integration line
   for additional collaboration and UI work. It has no upstream and is not
   installed or published product truth.
-- `origin/feat/protected-content-contracts` is the published source-only
-  protected-content contract branch stacked on
-  `origin/review/collaboration-candidate`. It adds the canonical
-  `elastos-protected-content-contracts` crate, the related documentation, and
-  the shared strict DID/Carrier codec correction required by that contract
-  surface. It does not integrate Runtime orchestration, provider replacement,
+- `feat/protected-content-contracts` is a published source-only contract
+  branch, stacked for review on
+  `origin/review/collaboration-product-integration`. It adds the
+  canonical `elastos-protected-content-contracts` crate, the related
+  documentation, and the shared strict DID/Carrier codec correction required by
+  that contract surface. It does not integrate Runtime orchestration, provider
+  replacement, custody, threshold reconstruction, recipient encryption proof,
   decryption, playback, installation, or deployment.
 - `origin/feat/protected-content-custody` is the published source-only child
   review line

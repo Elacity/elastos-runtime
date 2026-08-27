@@ -201,7 +201,7 @@ fn initial_config_bytes(
     conversation_id: &str,
     bootstrap_peer: CollaborationBootstrapPeer,
 ) -> anyhow::Result<Vec<u8>> {
-    let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
+    let signer_did = crate::crypto::encode_signing_key_did(signing_key);
     let grant_bytes = canonical_default_conversation_grant_bytes(&DefaultConversationGrant {
         schema: DEFAULT_CONVERSATION_GRANT_SCHEMA_V1.to_string(),
         network_id: network_id.to_string(),
