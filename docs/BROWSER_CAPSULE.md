@@ -319,6 +319,21 @@ and it must be constrainable by scheme and port:
 }
 ```
 
+The helper's lifetime is bound to the Runtime that launched it. The Runtime
+spawns it with a piped stdin it holds open and sets
+`ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF=1`; the helper watches that pipe and
+reaps itself the moment it reaches EOF. `HostHelperProcess::drop` covers only
+graceful shutdown, and SIGKILL, an abort on panic, and the installed-binary
+supersession watch's `std::process::exit` all skip it — without the pipe each of
+those stranded a helper at PPID=1 holding the relay socket, one per launch.
+Teardown is scoped by inode identity to the socket the helper actually bound, so
+a stranded helper can never unlink a successor's relay socket at the same path.
+For the same reason the Runtime refuses to replace a relay socket that a live
+helper is still serving, instead of silently taking the path from it. Launches
+that run the helper directly leave `ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF` unset
+and keep their existing lifetime. `scripts/browser-local-exit-orphan-cleanup-smoke.sh`
+is the regression proof.
+
 `address_family` is an Exit routing policy, not a browser fallback. Supported
 values are `system`, `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, and
 `ipv6_only`; the default is `prefer_ipv4` because some public sites apply

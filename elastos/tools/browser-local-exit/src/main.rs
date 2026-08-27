@@ -23,6 +23,10 @@ use std::time::Duration;
 use url::Url;
 
 const CONFIG_ENV: &str = "ELASTOS_BROWSER_LOCAL_EXIT_CONFIG";
+/// Opt-in marker set by the Runtime when it launches this helper with a piped
+/// stdin it holds open. Standalone launches leave it unset and keep stdin at
+/// /dev/null, where an immediate EOF must never be read as a dead launcher.
+const PARENT_EOF_ENV: &str = "ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF";
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
 const MAX_PROXY_RESPONSE_BYTES: usize = 64 * 1024;
 
@@ -117,7 +121,12 @@ fn run_server(config: LocalExitConfig, stdout: &mut dyn Write) -> Result<(), Str
     let path = Path::new(&config.relay_ipc_path);
     prepare_socket_path(path, config.replace_existing_socket)?;
     let listener = UnixListener::bind(path).map_err(|err| err.to_string())?;
-    let _socket_guard = SocketFileGuard::new(path);
+    let owned_socket = OwnedSocket::identify(path)?;
+    let _socket_guard = SocketFileGuard::new(owned_socket.clone());
+
+    if parent_eof_watch_requested() {
+        spawn_parent_eof_watch(owned_socket);
+    }
 
     writeln!(
         stdout,
@@ -737,22 +746,89 @@ fn default_allowed_ports() -> Vec<u16> {
     vec![80, 443]
 }
 
-struct SocketFileGuard {
+/// The relay socket this process actually bound, pinned by inode identity.
+///
+/// `replace_existing_socket` lets a newer helper unlink our path and bind its
+/// own socket there. Teardown therefore has to prove the file still on disk is
+/// the one we created — an unconditional `remove_file` would silently cut the
+/// successor's relay out from under it.
+#[derive(Clone)]
+struct OwnedSocket {
     path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl OwnedSocket {
+    fn identify(path: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(path).map_err(|err| err.to_string())?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+
+    fn still_ours(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(&self.path)
+            .map(|metadata| metadata.dev() == self.dev && metadata.ino() == self.ino)
+            .unwrap_or(false)
+    }
+
+    fn remove_if_ours(&self) {
+        if self.still_ours() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+struct SocketFileGuard {
+    socket: OwnedSocket,
 }
 
 impl SocketFileGuard {
-    fn new(path: &Path) -> Self {
-        Self {
-            path: path.to_path_buf(),
-        }
+    fn new(socket: OwnedSocket) -> Self {
+        Self { socket }
     }
 }
 
 impl Drop for SocketFileGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        self.socket.remove_if_ours();
     }
+}
+
+fn parent_eof_watch_requested() -> bool {
+    std::env::var(PARENT_EOF_ENV).map(|value| value == "1") == Ok(true)
+}
+
+/// Tie this helper's lifetime to the Runtime that launched it.
+///
+/// The Runtime stops us from `HostHelperProcess::drop`, which never runs when it
+/// is SIGKILLed, aborts on panic, or leaves through `std::process::exit` — the
+/// installed-binary supersession watch takes that last path on every rebuild.
+/// Holding the read end of a pipe the Runtime owns turns all of those into one
+/// signal: the write end closes with the Runtime, we read EOF, and we tear down.
+fn spawn_parent_eof_watch(socket: OwnedSocket) {
+    thread::spawn(move || {
+        let mut stdin = io::stdin();
+        let mut scratch = [0_u8; 64];
+        loop {
+            match stdin.read(&mut scratch) {
+                // The Runtime never writes on this pipe; only EOF is meaningful.
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        eprintln!("browser-local-exit launcher exited; stopping relay");
+        // Drop guards do not run under `process::exit`, so release the socket here.
+        socket.remove_if_ours();
+        std::process::exit(0);
+    });
 }
 
 #[cfg(test)]
@@ -831,6 +907,67 @@ mod tests {
             Some("test local exit")
         );
         assert_eq!(log.get("direct_network"), Some(&json!(false)));
+    }
+
+    /// `temp_socket_path` nests a long unique directory, which overruns `SUN_LEN`
+    /// on macOS. Tests that actually bind need a short path instead.
+    fn bindable_socket_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ele-{}-{}-{tag}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .subsec_nanos()
+        ))
+    }
+
+    #[test]
+    fn socket_teardown_releases_the_socket_this_process_bound() {
+        let path = bindable_socket_path("own");
+        let listener = UnixListener::bind(&path).expect("bind relay socket");
+        let owned = OwnedSocket::identify(&path).expect("identify relay socket");
+
+        assert!(owned.still_ours());
+        owned.remove_if_ours();
+        assert!(!path.exists(), "helper must release its own relay socket");
+        drop(listener);
+    }
+
+    #[test]
+    fn socket_teardown_never_unlinks_a_successor_socket_at_the_same_path() {
+        let path = bindable_socket_path("successor");
+        let first = UnixListener::bind(&path).expect("bind first relay socket");
+        let owned = OwnedSocket::identify(&path).expect("identify first relay socket");
+
+        // A successor helper replaces the path, exactly as `replace_existing_socket` does.
+        fs::remove_file(&path).expect("unlink first relay socket");
+        let successor = UnixListener::bind(&path).expect("bind successor relay socket");
+
+        assert!(
+            !owned.still_ours(),
+            "inode identity must distinguish the successor socket"
+        );
+        owned.remove_if_ours();
+        assert!(
+            path.exists(),
+            "a stranded helper must not unlink the successor's relay socket"
+        );
+
+        drop(first);
+        drop(successor);
+    }
+
+    #[test]
+    fn parent_eof_watch_is_opt_in() {
+        // Standalone launches leave stdin at /dev/null, where an immediate EOF
+        // must not be mistaken for a dead launcher.
+        std::env::remove_var(PARENT_EOF_ENV);
+        assert!(!parent_eof_watch_requested());
+
+        std::env::set_var(PARENT_EOF_ENV, "1");
+        assert!(parent_eof_watch_requested());
+        std::env::remove_var(PARENT_EOF_ENV);
     }
 
     #[test]
