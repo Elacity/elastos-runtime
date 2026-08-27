@@ -1452,6 +1452,25 @@ impl CollaborationDiscoveryService {
     ) -> anyhow::Result<serde_json::Value> {
         let mut errors = Vec::new();
         for peer in self.bootstrap_peers.iter() {
+            // `node_id` is a canonical raw Carrier endpoint id by contract
+            // (validate_collaboration_bootstrap_peer); the provider route pins
+            // peers by DID, so convert strictly and fail closed per peer.
+            let peer_did = match peer
+                .node_id
+                .parse::<iroh::EndpointId>()
+                .ok()
+                .filter(|endpoint_id| endpoint_id.to_string() == peer.node_id)
+                .map(|endpoint_id| crate::carrier::public_key_to_did(&endpoint_id))
+            {
+                Some(Ok(peer_did)) => peer_did,
+                _ => {
+                    errors.push(format!(
+                        "bootstrap peer node_id '{}' is not a canonical Carrier endpoint id",
+                        peer.node_id
+                    ));
+                    continue;
+                }
+            };
             match self
                 .registry
                 .invoke_provider(ProviderInvocation {
@@ -1469,7 +1488,7 @@ impl CollaborationDiscoveryService {
                     transport: ProviderInvocationTransport::Carrier(
                         ProviderCarrierRoute::ConnectTicket {
                             connect_ticket: peer.connect_ticket.clone(),
-                            peer_did: Some(peer.node_id.clone()),
+                            peer_did: Some(peer_did),
                             timeout_ms: Some(DISCOVERY_PROVIDER_TIMEOUT_MS),
                         },
                     ),
@@ -6474,7 +6493,10 @@ pub(crate) mod tests {
             )
             .await
             .unwrap_err();
-        assert!(format!("{error:#}").contains("peer_did does not match connect_ticket"));
+        assert!(
+            format!("{error:#}").contains("is not a canonical Carrier endpoint id"),
+            "non-canonical substituted node_id must fail closed before any route is built"
+        );
     }
 
     #[tokio::test]
