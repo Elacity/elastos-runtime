@@ -8,14 +8,29 @@ const homeClipboardClientUrl = new URL(
   "../capsules/home/browser/home-clipboard-client.js",
   import.meta.url,
 ).href;
+const katexModuleUrl = new URL(
+  "../capsules/assistant/browser/vendor/katex/katex.mjs",
+  import.meta.url,
+).href;
 const originalSource = readFileSync(
   new URL("../capsules/assistant/browser/assistant.js", import.meta.url),
   "utf8",
 );
-const source = originalSource.replace(
-  '"/apps/home/home-clipboard-client.js?v=home-20260726a"',
-  JSON.stringify(homeClipboardClientUrl),
+const originalIndexSource = readFileSync(
+  new URL("../capsules/assistant/browser/index.html", import.meta.url),
+  "utf8",
 );
+const source = `${originalSource
+  .replace(
+    '"/apps/home/home-clipboard-client.js?v=home-20260726a"',
+    JSON.stringify(homeClipboardClientUrl),
+  )
+  .replace(
+    '"./vendor/katex/katex.mjs"',
+    JSON.stringify(katexModuleUrl),
+  )}
+export { renderMarkdown, renderMessageBody };
+`;
 const assistantModule = await import(
   `data:text/javascript,${encodeURIComponent(source)}`,
 );
@@ -319,6 +334,170 @@ async function buildApp(options = {}) {
       return timers.size;
     },
   };
+}
+
+{
+  const rendered = assistantModule.renderMessageBody(
+    {
+      role: "assistant",
+      content: [
+        "# Heading",
+        "",
+        "Paragraph with **bold**, *italic*, `code`, and [Docs](https://example.com/docs).",
+        "",
+        "- one",
+        "- two",
+        "",
+        "> quoted",
+        "",
+        "| Name | Value |",
+        "| --- | --- |",
+        "| alpha | 1 |",
+        "",
+        "Inline math $x^2$.",
+        "",
+        "$$",
+        "\\frac{1}{2}",
+        "$$",
+        "",
+        "```js",
+        "const value = 1;",
+        "```",
+      ].join("\n"),
+    },
+    {},
+  );
+  assert.match(rendered, /assistant-md-h assistant-md-h1/);
+  assert.match(rendered, /assistant-md-list/);
+  assert.match(rendered, /assistant-md-quote/);
+  assert.match(rendered, /assistant-md-table/);
+  assert.match(rendered, /assistant-md-code/);
+  assert.match(rendered, /assistant-md-inline/);
+  assert.match(rendered, /class="katex"/);
+  assert.equal(/<a\b|href=|target=/.test(rendered), false);
+  assert.match(rendered, /assistant-md-link/);
+  assert.match(rendered, /assistant-md-link-url/);
+}
+
+{
+  const rendered = assistantModule.renderMessageBody(
+    {
+      role: "assistant",
+      content: "| Name | Value |\n| --- | --- |\n| alpha | 1 |",
+    },
+    {},
+  );
+  assert.match(rendered, /assistant-md-table/);
+  assert.match(rendered, /<th>Name<\/th>/);
+  assert.match(rendered, /<td>1<\/td>/);
+}
+
+{
+  const rendered = assistantModule.renderMessageBody(
+    {
+      role: "assistant",
+      content: "Pipe text stays plain: alpha | beta | gamma",
+    },
+    {},
+  );
+  assert.match(rendered, /assistant-md-p/);
+  assert.equal(rendered.includes("assistant-md-table"), false);
+  assert.match(rendered, /alpha \| beta \| gamma/);
+}
+
+{
+  const rendered = assistantModule.renderMessageBody(
+    {
+      role: "assistant",
+      content: 'Unsafe <img src=x onerror=1> and <script>alert(1)</script> stay inert.',
+    },
+    {},
+  );
+  assert.equal(rendered.includes("<img"), false);
+  assert.equal(rendered.includes("<script"), false);
+  assert.match(rendered, /&lt;img src=x onerror=1&gt;/);
+  assert.match(rendered, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+}
+
+{
+  const rendered = assistantModule.renderMessageBody(
+    {
+      role: "assistant",
+      content:
+        "Literal `*bold* $x^2$ [AT&T](https://example.com?a=1&b=2)` and math $a*b$.",
+    },
+    {},
+  );
+  assert.match(
+    rendered,
+    /<code class="assistant-md-inline">\*bold\* \$x\^2\$ \[AT&amp;T\]\(https:\/\/example\.com\?a=1&amp;b=2\)<\/code>/,
+  );
+  assert.match(rendered, /annotation encoding="application\/x-tex">a\*b<\/annotation>/);
+  assert.match(rendered, /assistant-md-math/);
+  assert.equal(rendered.includes("AT&amp;amp;T"), false);
+  assert.equal(rendered.includes("a=1&amp;amp;b=2"), false);
+}
+
+{
+  const rendered = assistantModule.renderMessageBody(
+    {
+      role: "assistant",
+      content: "Entity stays literal in math $&amp;lt;$.",
+    },
+    {},
+  );
+  assert.match(rendered, /assistant-md-math-raw/);
+  assert.match(rendered, /&amp;amp;amp;lt;/);
+  assert.equal(rendered.includes("&amp;amp;lt;"), false);
+  assert.equal(rendered.includes('class="katex"'), false);
+}
+
+{
+  const rendered = assistantModule.renderMessageBody(
+    {
+      role: "assistant",
+      content: "Malformed math $\\badcommand{}$ still shows as text.",
+    },
+    {},
+  );
+  assert.match(rendered, /assistant-md-math-raw/);
+  assert.match(rendered, /\\badcommand\{\}/);
+}
+
+{
+  const rendered = assistantModule.renderMessageBody(
+    {
+      role: "assistant",
+      content: "$$\n\\frac{1}{2}",
+    },
+    {},
+  );
+  assert.match(rendered, /\$\$/);
+  assert.equal(rendered.includes("assistant-md-math-block"), false);
+}
+
+{
+  const rendered = assistantModule.renderMessageBody(
+    {
+      role: "assistant",
+      content: "\\[\n\\frac{1}{2}",
+    },
+    { streaming: true },
+  );
+  assert.match(rendered, /\\\[/);
+  assert.equal(rendered.includes("assistant-md-math-block"), false);
+}
+
+{
+  const rendered = assistantModule.renderMessageBody(
+    {
+      role: "user",
+      content: "# Keep this plain\n<script>alert(1)</script>\n`code`",
+    },
+    {},
+  );
+  assert.equal(/assistant-md-h|assistant-md-code|class="katex"/.test(rendered), false);
+  assert.match(rendered, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
 }
 
 {
@@ -1608,17 +1787,17 @@ async function buildApp(options = {}) {
 assert(!/\blocalStorage\b|\bsessionStorage\b|\bindexedDB\b/.test(originalSource));
 assert(!/navigator\.clipboard|execCommand/.test(originalSource));
 assert(originalSource.includes('"/apps/home/home-clipboard-client.js?v=home-20260726a"'));
+assert(originalSource.includes('"./vendor/katex/katex.mjs"'));
+assert(originalIndexSource.includes('./vendor/katex/katex.min.css'));
 assert(originalSource.includes("copyNode.hidden = view.copyHidden;"));
 assert(originalSource.includes("chatNode.disabled = view.modeSwitchDisabled;"));
 assert(originalSource.includes("buildNode.disabled = view.modeSwitchDisabled;"));
 assert(originalSource.includes("studioNode.disabled = view.modeSwitchDisabled;"));
 assert(!/MODEL_OBJECT_OUTPUT_SCHEMA|elastos:\/\/object\//.test(originalSource));
 assert(!/home:clipboard-request|home:clipboard-ready|home:clipboard-result|home:clipboard-cancel/.test(originalSource));
+assert(!/target="_blank"|window\.open\(/.test(originalSource));
 assert(
   !/(["'](?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)["']\s*:|\b(?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)\s*:)/i.test(originalSource),
 );
 assert(!/typed text runs only|Build mode uses the same typed text runs/i.test(originalSource));
-assert(!/run:sha256:|offer:text-|workspace revision/i.test(readFileSync(
-  new URL("../capsules/assistant/browser/index.html", import.meta.url),
-  "utf8",
-)));
+assert(!/run:sha256:|offer:text-|workspace revision/i.test(originalIndexSource));
