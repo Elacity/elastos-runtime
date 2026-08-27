@@ -1452,6 +1452,25 @@ impl CollaborationDiscoveryService {
     ) -> anyhow::Result<serde_json::Value> {
         let mut errors = Vec::new();
         for peer in self.bootstrap_peers.iter() {
+            // `node_id` is a canonical raw Carrier endpoint id by contract
+            // (validate_collaboration_bootstrap_peer); the provider route pins
+            // peers by DID, so convert strictly and fail closed per peer.
+            let peer_did = match peer
+                .node_id
+                .parse::<iroh::EndpointId>()
+                .ok()
+                .filter(|endpoint_id| endpoint_id.to_string() == peer.node_id)
+                .map(|endpoint_id| crate::carrier::public_key_to_did(&endpoint_id))
+            {
+                Some(Ok(peer_did)) => peer_did,
+                _ => {
+                    errors.push(format!(
+                        "bootstrap peer node_id '{}' is not a canonical Carrier endpoint id",
+                        peer.node_id
+                    ));
+                    continue;
+                }
+            };
             match self
                 .registry
                 .invoke_provider(ProviderInvocation {
@@ -1469,7 +1488,7 @@ impl CollaborationDiscoveryService {
                     transport: ProviderInvocationTransport::Carrier(
                         ProviderCarrierRoute::ConnectTicket {
                             connect_ticket: peer.connect_ticket.clone(),
-                            peer_did: Some(peer.node_id.clone()),
+                            peer_did: Some(peer_did),
                             timeout_ms: Some(DISCOVERY_PROVIDER_TIMEOUT_MS),
                         },
                     ),
@@ -3175,7 +3194,7 @@ pub(crate) mod tests {
         trusted_signing_key: &SigningKey,
         bootstrap_peers: Vec<CollaborationBootstrapPeer>,
     ) -> VerifiedCollaborationNetworkProfile {
-        let signer_did = crate::crypto::encode_signing_key_did(&trusted_signing_key);
+        let signer_did = crate::crypto::encode_signing_key_did(trusted_signing_key);
         let profile = CollaborationNetworkProfile {
             schema: COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
             network_id: network_id.to_string(),
@@ -3204,7 +3223,7 @@ pub(crate) mod tests {
                 .unwrap(),
             ),
             network_id,
-            &[crate::crypto::encode_signing_key_did(&trusted_signing_key)],
+            &[crate::crypto::encode_signing_key_did(trusted_signing_key)],
             None,
         )
         .unwrap()
@@ -3238,7 +3257,7 @@ pub(crate) mod tests {
     ) {
         std::fs::create_dir_all(root).unwrap();
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let did = crate::crypto::encode_signing_key_did(&device_signing_key);
+        let did = crate::crypto::encode_signing_key_did(device_signing_key);
         let principal_id = format!("person:local:{}", &did[8..16]);
         let protection = crate::auth::store_test_principal_root_protection(root, &principal_id);
         let local_profile =
@@ -3276,7 +3295,7 @@ pub(crate) mod tests {
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let profile = signed_profile(NETWORK, trusted_signing_key, bootstrap_peers);
         let registry = Arc::new(ProviderRegistry::new());
-        let did = crate::crypto::encode_signing_key_did(&device_signing_key);
+        let did = crate::crypto::encode_signing_key_did(device_signing_key);
         let node = start_carrier_node_with_registry(
             device_signing_key,
             &did,
@@ -3917,7 +3936,7 @@ pub(crate) mod tests {
         let remote_profile = service_profile(&remote_service, "Remote Person", Some("remote"));
         let network = remote_service.network_profile();
         let registry = Arc::new(ProviderRegistry::new());
-        let local_did = crate::crypto::encode_signing_key_did(&local_key);
+        let local_did = crate::crypto::encode_signing_key_did(local_key);
         let local_node = start_carrier_node_with_registry(
             local_key,
             &local_did,
@@ -4087,7 +4106,7 @@ pub(crate) mod tests {
             revision,
             previous_profile_sha256,
             updated_at,
-            vec![crate::crypto::encode_signing_key_did(&device_signing_key)],
+            vec![crate::crypto::encode_signing_key_did(device_signing_key)],
         )
         .unwrap()
     }
@@ -6474,7 +6493,10 @@ pub(crate) mod tests {
             )
             .await
             .unwrap_err();
-        assert!(format!("{error:#}").contains("peer_did does not match connect_ticket"));
+        assert!(
+            format!("{error:#}").contains("is not a canonical Carrier endpoint id"),
+            "non-canonical substituted node_id must fail closed before any route is built"
+        );
     }
 
     #[tokio::test]
