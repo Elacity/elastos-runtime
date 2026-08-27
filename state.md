@@ -36,15 +36,39 @@ the public repository.
   that contract surface. It does not integrate Runtime orchestration, provider
   replacement, custody, threshold reconstruction, recipient encryption proof,
   decryption, playback, installation, or deployment.
-- Released 0.6 and the parent collaboration source retain the older
+- `origin/feat/protected-content-custody` is the published source-only child
+  review line
+  stacked on `origin/feat/protected-content-contracts`. It adds the
+  `elastos-protected-content-custody` crate plus custody-envelope
+  provisioning, recipient-sealed node release, and recipient-side threshold
+  reconstruction for new content. It also includes the typed EVM rights-policy
+  and evidence contracts, Profile-signed recipient-key authorization, signed
+  custody epochs, the Runtime-to-release-node operation envelope, and one
+  owner-only node-local durable dual-key replay store. That store privately
+  gates release, persists the exact encrypted node contribution, and replays
+  only that result after restart. Its current reviewed behavior rejects
+  invalid X25519 contract key bytes before HPKE use, requires exactly the
+  bound released threshold, and checks a manifest-bound CEK commitment after
+  reconstruction to detect a wrong reconstructed key. It does not integrate
+  Runtime/provider/Carrier orchestration, Runtime-owned durable replay
+  storage, full operational custody state, recipient key-possession proof, node
+  admission or issuer lifecycle services, decrypt/render product flows,
+  installation, or deployment. A durable local claim without a stored result
+  fails closed and currently requires a fresh Runtime release operation; there
+  is no operation-resume journal for that state.
+- Released 0.6 and the published collaboration review stack retain the older
   provisional `elastos_common::protected_content` DTOs plus fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
   capsules. That surface does not consume or prove the new v1 contract.
   Installed-target truth requires separate target evidence.
-- An independent branch-local source/contract review of
-  `feat/protected-content-contracts` completed with no code findings after the
-  strict DID codec and Carrier codec consolidation. This is not an external
-  cryptographic audit or production security approval.
+- An independent branch-local source/contract review of the published
+  `origin/feat/protected-content-contracts` branch completed with no code
+  findings after the strict DID codec and Carrier codec consolidation. This is
+  not an external cryptographic audit or production security approval.
+- An independent AI/model review found the invalid-X25519 acceptance,
+  released-threshold mismatch, and missing reconstructed-key commitment check
+  now corrected on the custody review line. That review is useful source
+  review evidence, not a professional external cryptographic audit.
 - The collaboration review stack adds Runtime-backed People/Chat collaboration
   and selected shell UI work. The source boundary is complete for review:
   Profile authority, Runtime lifecycle, Carrier routing, People/Chat
@@ -150,8 +174,9 @@ the public repository.
   `local-identity-profile-smoke.sh`, depending on target role.
 - Public Linux runtime portability proof path:
   `audit-linux-runtime-portability.sh`.
-- Protected-content provider journey proof path:
-  `protected-content-provider-contract-smoke.sh`.
+- Provisional protected-content provider retirement guard:
+  `protected-content-provider-contract-smoke.sh`. It does not verify the
+  canonical v1 custody or Runtime path.
 
 ## Browser Truth
 

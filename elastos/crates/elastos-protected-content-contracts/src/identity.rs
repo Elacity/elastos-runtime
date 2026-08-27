@@ -3,6 +3,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::canonical::{validate_ascii_identifier, CanonicalBody, ContractError, Decoder, Encoder};
+use crate::CustodyEpochIdentityV1;
 
 pub const MAX_ENCRYPTED_CONTENT_BYTES: u64 = 1 << 50;
 pub const MAX_KEY_ENVELOPE_BYTES: u32 = 1 << 20;
@@ -325,6 +326,7 @@ pub struct KeyEnvelopeIdentityV1 {
     envelope_bytes: u32,
     node_set_id: Digest32,
     threshold: ThresholdV1,
+    custody_epoch: CustodyEpochIdentityV1,
 }
 
 impl KeyEnvelopeIdentityV1 {
@@ -334,6 +336,7 @@ impl KeyEnvelopeIdentityV1 {
         envelope_bytes: u32,
         node_set_id: Digest32,
         threshold: ThresholdV1,
+        custody_epoch: CustodyEpochIdentityV1,
     ) -> Result<Self, ContractError> {
         let value = Self {
             encrypted_content,
@@ -341,6 +344,7 @@ impl KeyEnvelopeIdentityV1 {
             envelope_bytes,
             node_set_id,
             threshold,
+            custody_epoch,
         };
         value.validate()?;
         Ok(value)
@@ -365,6 +369,10 @@ impl KeyEnvelopeIdentityV1 {
     pub const fn threshold(&self) -> ThresholdV1 {
         self.threshold
     }
+
+    pub const fn custody_epoch(&self) -> CustodyEpochIdentityV1 {
+        self.custody_epoch
+    }
 }
 
 impl CanonicalBody for KeyEnvelopeIdentityV1 {
@@ -373,6 +381,7 @@ impl CanonicalBody for KeyEnvelopeIdentityV1 {
     fn validate(&self) -> Result<(), ContractError> {
         self.encrypted_content.validate()?;
         self.threshold.validate()?;
+        self.custody_epoch.validate()?;
         if self.envelope_bytes == 0 || self.envelope_bytes > MAX_KEY_ENVELOPE_BYTES {
             return Err(ContractError::InvalidField("envelope_bytes"));
         }
@@ -385,6 +394,7 @@ impl CanonicalBody for KeyEnvelopeIdentityV1 {
         encoder.u32(self.envelope_bytes);
         encoder.fixed(self.node_set_id.as_bytes());
         self.threshold.encode(encoder);
+        encoder.nested(&self.custody_epoch)?;
         Ok(())
     }
 
@@ -395,6 +405,7 @@ impl CanonicalBody for KeyEnvelopeIdentityV1 {
             decoder.u32()?,
             Digest32::new(decoder.fixed()?),
             ThresholdV1::decode(decoder)?,
+            decoder.nested("custody_epoch")?,
         )
     }
 }

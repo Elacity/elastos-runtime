@@ -135,23 +135,35 @@ The contract and its limits live in
 
 ### 3. Build Runtime-mediated protected content
 
-Protected content uses the same effect path as ordinary content:
+The target protected-content design uses the same effect path as ordinary
+content:
 
-`viewer -> Runtime capability -> protected-content coordinator -> providers`
+`viewer -> Runtime -> rights provider -> custody providers -> decrypt provider`
 
-The coordinator resolves the content object, checks availability, verifies
-rights, requests key release, creates a decrypt or render session, and records
-the result. Each dependency has a typed contract and fails closed. Viewers
-receive scoped output or a scoped session, not content keys, chain RPC, wallet
-authority, storage APIs, or provider credentials.
+Runtime will resolve the content object, check availability, verify rights,
+request recipient-encrypted custody contributions, create a scoped decrypt or
+render session, and record the result. Each dependency will have a typed
+contract and fail closed. Viewers will receive scoped output or a scoped
+session, not content keys, custody shares, chain RPC, Wallet authority, storage
+APIs, provider routes, network locations, or credentials.
 
 The dependency order for this work is strict:
 
-1. review the canonical v1 contract as source only;
-2. review custody, recipient-encryption, replay, and policy design;
-3. replace the provisional DTO/provider surface atomically and wire
-   Runtime/Wallet/provider integration to the reviewed contract; and
-4. prove the installed end-to-end open/decrypt/render path.
+A. review the canonical v1 source-only contract and operational contract
+   surface, including the exact EVM `has_access_by_content_id`
+   policy/evidence contract, recipient-key authorization, immutable custody
+   epochs, and the authenticated replay-pending Runtime-to-release-node
+   envelope;
+B. build source-only custody-node operations and durable node state on top of
+   that contract. The published custody branch covers the node-local durable
+   dual-key claim, claim-gated release, exact encrypted-result persistence, and
+   exact retry replay. Remaining work is issuer lifecycle, node admission,
+   rotation, recovery, operational review, and recovery from a durable claim
+   that has no durable result;
+C. replace the provisional DTO/provider surface atomically and wire
+   Runtime/Wallet/provider integration to the reviewed contract, with one
+   source allow flow and one source deny flow; and
+D. prove the installed end-to-end open/decrypt/render path.
 
 Carrier remains transport only throughout that sequence. It carries
 Runtime-selected traffic, but it does not define rights authority, custody

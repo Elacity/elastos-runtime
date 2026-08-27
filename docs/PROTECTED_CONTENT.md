@@ -4,103 +4,92 @@ Protected content is Runtime-mediated. App, viewer, and content capsules ask to
 open an object; they do not receive raw wallet, chain, IPFS, Elacity, or key
 authority.
 
-The source tree currently has two protected-content layers:
+The source tree currently has one canonical source-only review stack and one
+provisional retirement surface:
 
-- The canonical v1 review candidate is the source-only
-  `elastos-protected-content-contracts` crate, documented in
-  [Protected-content v1 contracts](PROTECTED_CONTENT_CONTRACTS_V1.md). It is
-  not yet wired into Runtime orchestration, provider integration, custody,
-  threshold reconstruction, recipient encryption proof, decryption, playback,
-  installation, or deployment.
-- The current installed/provider surface is the older provisional
+- The canonical v1 source-only review stack is the
+  `elastos-protected-content-contracts` crate plus the companion
+  `elastos-protected-content-custody` crate, documented in
+  [Protected-content v1 contracts](PROTECTED_CONTENT_CONTRACTS_V1.md). That
+  stack now defines canonical authority bindings, typed rights-policy and
+  evidence contracts, Profile-signed recipient-key authorization, signed
+  immutable custody epochs, a typed Runtime-to-release-node operation
+  envelope, a local durable dual-key replay-claim store for custody nodes,
+  a claim-gated node release path, and source-only custody helpers for
+  custody-envelope provisioning, recipient-sealed node release, and
+  recipient-side threshold reconstruction for new content. It is not yet wired
+  into Runtime orchestration, provider integration, Runtime-owned replay
+  storage, recipient key-possession proof, decryption, playback, installation,
+  or deployment.
+- The older installed/provider surface is the provisional
   `elastos_common::protected_content` DTO set plus the fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
-  capsules. That provisional surface does not consume or prove the new v1
-  contract. Future integration must replace it atomically, with no parallel
-  decoder, fallback, or migration path.
+  capsules. It is not current architecture and does not consume or prove the
+  v1 contract. The Runtime integration stage must remove it atomically. It must
+  not remain as a parallel decoder or compatibility path.
 
-The current provider chain is:
+## Canonical architecture
 
-`capsule -> runtime capability -> elastos://drm/open -> drm-provider -> rights/key/decrypt providers`
+The intended protected-content path is:
 
-## Current provider slice
+`capsule -> Runtime coordinator -> rights-provider -> custody providers -> decrypt-provider`
 
-The repo currently has the provisional fail-closed provider boundary, not
-production DRM:
+- Capsules own user workflow and request an action. They do not select
+  providers, custody nodes, routes, or network locations.
+- Runtime derives authority from the authenticated Profile, exact Wallet
+  approval, session, object, and action. It selects providers, owns durable
+  orchestration, and audits the result.
+- `rights-provider` evaluates the exact approved policy through typed Chain
+  evidence. It does not release content keys.
+- Each selected custody provider independently verifies the exact Runtime
+  operation and rights evidence, then returns only a recipient-encrypted
+  contribution and an authenticated receipt.
+- `decrypt-provider` is the only boundary that may reconstruct and briefly hold
+  a live CEK. It returns only scoped output or an opaque session handle and
+  zeroizes the CEK when the session ends.
+- Carrier transports endpoint traffic selected by Runtime. Carrier is not
+  Profile, rights, custody, or key authority.
 
-- shared provisional protected-content schemas in `elastos-common`
-- `drm-provider` registered as `elastos://drm/*`
-- `rights-provider` registered as `elastos://rights/*`
-- `key-provider` registered as `elastos://key/*`
-- `decrypt-provider` registered as `elastos://decrypt/*`
-- `status` advertises the blocked raw-authority list and canonical open
-  sequence, including Runtime-owned receipt and audit steps
-- `open` validates sealed-object requests and fails closed with the same
-  machine-readable required sequence until rights, key, and decrypt providers
-  exist
-- `open` rejects key envelopes without approved algorithm metadata
-- `rights-provider` validates typed access/subscription questions and fails
-  closed until a dDRM/chain policy backend is configured
-- `chain-provider` exposes typed `has_access_by_content_id` reads that validate
-  inputs and only call configured contract selectors
-- `key-provider` validates key-release requests and algorithm-agile key
-  envelopes, then fails closed until a dKMS backend is configured
-- `decrypt-provider` validates scoped decrypt/render session requests and fails
-  closed until decrypt/render backends are configured
-- `content-provider` rejects incomplete `sealed` object publishes before IPFS:
-  `sealed.json`, payload, rights policy, availability receipt, provenance, and
-  approved key-envelope algorithms are required
-
-This is intentional. The first safe steps are to make the authority boundary
-unambiguous in the canonical v1 contract and keep the current provider chain
-fail closed until the reviewed integration slice exists.
-
-PC2's dDRM contracts and WASM decrypt/render/media crates are useful
-implementation references. They should enter Runtime only as provider-internal
-backends behind `rights-provider`, `key-provider`, and `decrypt-provider`; they
-must not give app or viewer capsules raw CEK, wallet, chain, IPFS, or Elacity
+Runtime may relay recipient-encrypted contributions or sealed material that it
+cannot open. Runtime and capsules must never receive raw CEKs or custody shares.
+Capsules must also never receive provider routes, endpoint DIDs, IP addresses,
+ports, credentials, Wallet RPC, Chain RPC, Kubo/IPFS APIs, or Elacity SDK
 authority.
 
-## dDRM Decrypt Rail Options And Recommendation
+This architecture is not yet installed or wired into Runtime. The current
+branch is source-only contracts and custody behavior.
 
-The v0.4.0 provider chain intentionally proves the fail-closed sockets:
+## Provisional retirement surface
 
-`drm-provider -> rights-provider -> key-provider -> decrypt-provider`
+Released 0.6 still contains the provisional `elastos_common::protected_content`
+DTOs and the fail-closed `drm-provider`, `rights-provider`, `key-provider`, and
+`decrypt-provider` capsules. They remain only as a disabled retirement surface
+until the canonical Runtime path replaces them. They are not a second product
+architecture and are not evidence that the canonical v1 path works.
 
-The remaining architecture decision is how the live CEK reaches the decrypt
-boundary once real decryption is wired. The recommended default is a
-sealed-material rail:
+The provisional provider smoke verifies only that this old surface rejects raw
+authority and remains unavailable without configured backends. It must not be
+used to claim custody, Runtime orchestration, decryption, or playback readiness.
 
-- Runtime orchestrates the normal provider chain through `drm`, `rights`, and
-  `key`.
-- `decrypt-provider` creates a per-session one-time public key for the decrypt
-  sandbox.
-- `key-provider` or the dKMS release backend seals the CEK to that one-time
-  decrypt-session public key, using the approved PQ-hybrid envelope profile.
-- The decrypt step receives sealed material in the decrypt-session request,
-  unwraps it inside the sandbox, decrypts/renders, zeroizes the live CEK, and
-  returns only scoped output.
-- `decrypt-provider` does not pull keys by making outbound capability calls.
-  The component that briefly sees the live CEK must have the smallest possible
-  authority surface.
+PC2's dDRM contracts and WASM decrypt/render/media crates remain implementation
+references. A later integration may use reviewed parts inside canonical
+providers, but those parts must not create a second authority path.
 
-This keeps the rights/key/decrypt separation while avoiding an outbound
-authority grant to the highest-risk boundary. It also explains the current
-schema gap: `ReleaseReceiptV1` proves authorization, but it intentionally carries
-no key material; the next contract addition should add a sealed decrypt material
-envelope to the key/decrypt handoff instead of sending a raw CEK or letting
-decrypt fetch one.
+## Future sealed decrypt handoff
 
-Other options were considered and rejected as the normal Runtime path:
+The intended handoff keeps live key material out of Runtime. Runtime binds an
+authorized decrypt session to the exact object, action, recipient, rights
+evidence, custody epoch, expiry, and provider identity. Custody nodes return
+recipient-encrypted contributions. Runtime relays those opaque contributions to
+the authorized decrypt boundary. The decrypt boundary reconstructs and uses the
+CEK only inside that scoped session, then zeroizes it. It does not make outbound
+calls to obtain broader authority.
 
-| Option | Shape | Assessment |
-|--------|-------|------------|
-| Decrypt pulls keys | `decrypt-provider` calls `key-provider` or a key backend after authorization | Flexible, but grants outbound authority to the boundary that briefly holds live CEK. Keep only for controlled diagnostics or explicit capability-gated adapters. |
-| One combined key/decrypt provider | Key release and decrypt/render run in one provider | Simpler CEK path, but collapses authority separation and increases blast radius. Useful for tests, not the target trust boundary. |
-| Runtime relays raw CEK | Runtime receives CEK and passes it to decrypt | Not acceptable. Runtime would become a key-material holder instead of an orchestrator. |
-| Runtime relays sealed material | Runtime passes a sealed envelope without being able to open it | Acceptable if the envelope is transcript-bound and Runtime never sees raw CEK. This is the practical form of the recommended rail. |
-| dKMS direct-to-decrypt sealing | dKMS seals directly to the one-time decrypt-session key | Best target when available. `key-provider` brokers policy and receipts without seeing raw CEK. |
-| Lit/Chipotle backend | Vendor-backed key release returns a CEK envelope, as PC2 does today | Useful compatibility backend only. The Runtime contract must remain backend-neutral and must also support an ElastOS-native dKMS path. |
+The new Profile-signed recipient-key authorization in the v1 contract is an
+authorization object only. It binds one exact recipient public key and one
+exact Runtime operation issuer for one binding/action/session/time window. It
+does not prove X25519 secret-key possession. Actual holder-only possession
+remains a later Runtime-owned invariant.
 
 Before live decrypt is enabled, the sealed material envelope must bind the full
 transcript: principal, session, object, action, viewer interface, output kind,
@@ -111,70 +100,81 @@ current `ddrm-decrypt` WASM pattern proves the containment invariant, but its
 P-256 and Lit/Chipotle details are implementation references rather than
 Runtime product truth.
 
-## Protected Object Shape
+## Current source-only custody helper
 
-New protected objects should publish as sealed SmartWeb objects:
+The `elastos-protected-content-custody` crate is a source-only helper for new
+protected content:
 
-```json
-{
-  "schema": "elastos.sealed.object/v1",
-  "payload_cid": "bafy...",
-  "rights_policy_cid": "bafy...",
-  "availability_receipt_cid": "bafy...",
-  "key_envelope": {
-    "scheme": "elastos-pq-hybrid-threshold-v0",
-    "kid": "...",
-    "wrapped_cek": "...",
-    "policy_hash": "sha256:...",
-    "algorithms": {
-      "cipher": "aes-256-gcm",
-      "signature": ["ed25519", "ml-dsa-65"],
-      "kem": ["x25519", "ml-kem-768"],
-      "share_scheme": "shamir-t-of-n"
-    }
-  },
-  "viewer": {
-    "required_interface": "elastos.viewer/document@1"
-  }
-}
-```
+- It provisions canonical custody envelopes from the reviewed v1 contract.
+- It binds each custody manifest to a domain-separated CEK commitment, then
+  checks that commitment after threshold reconstruction before returning an
+  opaque content-key wrapper.
+- It uses one pinned recipient-sealing suite for stored and released shares:
+  RFC 9180 base mode X25519 + HKDF-SHA256 + AES-256-GCM.
+- It rejects noncanonical and low-order X25519 contract key bytes as a stricter
+  local canonical-identity rule before HPKE use. This is stronger than the RFC
+  7748 primitive requirement; it is not claimed as an RFC mandate.
+- It uses GF256 Shamir splitting through `vsss-rs` for new content only.
+- Released terminal settlement and recipient reconstruction require exactly the
+  bound threshold count. Required-plus-one contributions are rejected.
+- It returns only opaque, redacted secret wrappers; it does not expose a
+  capsule-visible raw-key API.
+- It is source-only. There are no running custody nodes, Runtime/provider
+  routes, Runtime-owned replay orchestration, recipient key-possession proof,
+  decrypt/render product flow, installation, or deployment in this branch. The
+  custody crate includes one node-local durable dual-key replay-claim store. It
+  privately gates release on the exact claim, persists the exact encrypted node
+  contribution, and replays only that result after restart. A durable claim
+  without a stored result fails closed. The store adds a domain-separated
+  integrity digest to detect same-length corruption or torn local state, but it
+  does not defend against a malicious same-UID rewrite that can recompute the
+  digest.
 
-`payload_cid` can be publicly reachable because protected payload bytes must be
-encrypted before replication. Access is enforced by rights checks and key release,
-not by hiding CIDs.
+This helper does not make a PQ claim. PQ-hybrid custody, dKMS node lifecycle,
+and product wiring remain future work. The current HPKE dependency is `hpke`
+0.13, whose upstream documentation says it has not been formally audited. This
+branch therefore makes no external cryptographic audit claim. The manifest
+commitment only detects that threshold reconstruction produced the wrong key; it
+does not identify the malicious node and it is not verifiable secret sharing.
 
-## Crypto Agility And dKMS Direction
+## Current source-only operational contracts
 
-FROST is a threshold Schnorr protocol, so it is classical ECC security, not a
-post-quantum root. ElastOS may use FROST for short/medium-term receipt or cohort
-signing, but new dKMS content must not depend on FROST as the long-term key
-security foundation.
+The reviewed v1 contract stack now also defines the source-only operational
+contract layer that later Runtime and custody-node integrations must consume:
 
-New protected content should use algorithm-agile sealed objects:
+- `RightsPolicyBodyV1`, `RightsEvaluationEvidenceRequestV1`, and
+  `RightsEvaluationEvidenceV1` provide one narrow typed EVM policy/evidence
+  shape grounded in the current `chain-provider`
+  `has_access_by_content_id` method only: exact Wallet-derived subject,
+  `chain_id`, contract bytes, selector, ABI identity, `content_id`, one exact
+  contract right string, the product action that policy maps to that right,
+  one bounded confirmation rule, and exact observed block/result evidence.
+  They do not carry RPC URLs, provider labels, or routes.
+- `SignedRecipientKeyAuthorizationV1` lets the authenticated Profile authorize
+  one exact recipient public key and one exact Runtime application-operation
+  issuer for one protected-content binding, action, session, and time window.
+- `SignedCustodyEpochV1` signs one immutable custody epoch over the exact node
+  signing keys, node custody keys, deterministic coordinates, threshold,
+  approved suites, and issuer key. Existing envelopes cannot silently inherit a
+  new epoch.
+- `SignedRuntimeReleaseOperationV1` is the typed application-authenticated
+  Runtime-to-release-node envelope above Carrier transport evidence. It binds
+  the exact Wallet request, exact release request, exact recipient bytes and
+  authorization, exact policy and evidence request, exact custody epoch, exact
+  Runtime issuer, one audit id, and one bounded window. Verification returns an
+  authenticated replay-pending value only. It exposes exact request hashes and
+  replay claim keys for the node-local atomic durable claim step, but it does
+  not expose actionable verified requests before that claim succeeds. A crash
+  or storage failure after the node-local claim succeeds but before
+  contribution settlement is fail closed and currently requires a fresh
+  Runtime release operation; there is no durable operation-resume journal yet.
 
-- Encrypt payload bytes with AES-256-GCM or ChaCha20-Poly1305.
-- Split the AES-256 CEK into `t-of-n` shares.
-- Wrap each share to an approved dKMS node with hybrid X25519 + ML-KEM-768.
-- Sign release receipts with classical + PQ signatures where practical, starting
-  with Ed25519 plus ML-DSA; use SLH-DSA for conservative hash-based signatures
-  where size and speed are acceptable.
-- Reconstruct the CEK only inside the key/decrypt provider boundary, then return
-  scoped render/decrypt output to the viewer instead of raw CEKs.
-- When the decrypt engine is wired, prefer dKMS-direct sealing to the decrypt
-  session key. If an intermediate key-provider re-seal is used during migration,
-  it must remain provider-internal, signed, auditable, and short-lived.
+This operational layer is still source-only. There is no provider registry
+cutover, Runtime-owned replay store, recipient key-possession proof, node
+lifecycle service, installed product flow, or production confidentiality claim
+in this branch.
 
-Current EVM/BTC/ELA wallet proofs and dDRM chain state are still classical. They
-are useful authorization inputs today, but they should not be the only permanent
-identity or access root for long-lived encrypted assets.
-
-References: [NIST PQC standards announcement](https://www.nist.gov/news-events/news/2024/08/nist-releases-first-3-finalized-post-quantum-encryption-standards),
-[FIPS 203 ML-KEM](https://csrc.nist.gov/pubs/fips/203/final),
-[FIPS 204 ML-DSA](https://csrc.nist.gov/pubs/fips/204/final),
-[FIPS 205 SLH-DSA](https://csrc.nist.gov/pubs/fips/205/final),
-and [RFC 9591 FROST](https://www.rfc-editor.org/rfc/rfc9591).
-
-## Provider Boundary
+## Capsule boundary
 
 Normal capsules must not see:
 
@@ -183,34 +183,36 @@ Normal capsules must not see:
 - arbitrary chain RPC
 - Kubo/IPFS APIs
 - Elacity SDK or pinning credentials
+- custody shares or node contributions
+- provider routes, endpoint DIDs, IP addresses, or ports
 
-The provider plane should expose typed questions instead:
-
-- `elastos://drm/open`
-- `elastos://rights/access/has_access_by_content_id`
-- `elastos://rights/subscription/is_subscription_active`
-- `elastos://rights/content/can_stream`
-- `elastos://rights/content/can_download`
-- `elastos://chain/<network>/rights/has_access_by_content_id`
-- `elastos://key/release`
-- `elastos://decrypt/session/open`
-- `elastos://decrypt/render`
+In the intended architecture, capsules request an object action through Runtime
+and receive a typed terminal result or scoped output handle. Runtime will select
+and coordinate the typed rights, custody, and decrypt operations.
 
 ## Remaining sequence
 
-1. Finish independent review of the source-only canonical v1 contract and the
-   related custody, encryption, replay, recipient-key, and policy decisions.
-2. Replace the provisional `elastos_common::protected_content` DTO/provider
+A. Finish the source-only review gate: professional external cryptographic and
+   contract review, plus any additional grounded HPKE wrapper known-answer
+   coverage that a reviewed upstream vector path can support.
+B. Continue the source-only custody-node operations and durable node-state
+   layer around the reviewed contracts. The published custody branch adds the
+   durable dual-key claim boundary, claim-gated node release, and exact encrypted
+   result replay. Remaining work is node admission, rotation, revocation,
+   recovery, issuer-key lifecycle, operational audit retention, and recovery
+   from a claim that completed before its result became durable.
+C. Replace the provisional `elastos_common::protected_content` DTO/provider
    surface atomically with Runtime-owned orchestration over the reviewed v1
-   contract: content status/fetch, typed rights checks, rights-bound key
-   release, release-receipt-bound decrypt/render sessions, sealed decrypt
-   material, and signed terminal receipts.
-3. Wire `rights-provider`, `key-provider`, and `decrypt-provider` to reviewed
-   policy, custody, and decrypt/render backends behind that one contract.
-4. Wire real protected-content producers to the existing sealed-object publish
-   contract after payload encryption, rights policy, availability receipt,
-   provenance, key-envelope, and viewer-interface generation exist.
-5. Add a permissioned ElastOS PQ-hybrid dKMS v0 for new content only.
+   contract: Wallet integration, recipient key generation and possession proof,
+   typed rights checks, rights-bound key release, release-receipt-bound
+   decrypt/render sessions, sealed decrypt material, and one source allow/deny
+   proof with no fallback path.
+D. Prove the installed end-to-end path: real protected-content producers,
+   installed provider/runtime flow, decrypt/render handoff, and final product
+   evidence.
+
+Only after A-D should ElastOS decide whether a permissioned PQ-hybrid dKMS
+layer should replace the pinned source-only helper for new content.
 
 Visible protected-content UI may ship only as a disabled/read-only readiness
 rail until fail-closed provider tests and capability-resource checks cover the
@@ -219,14 +221,14 @@ receipts and a disabled `Encrypted recipients` option, but it must not claim
 production encrypted-recipient sharing, dDRM completion, or generic decrypt/
 render readiness.
 
-## Executable Proof
+## Provisional retirement guard
 
-Run `scripts/protected-content-provider-contract-smoke.sh` after changing
-protected-content provider capsules. It exercises the real provider binaries
-over their JSON line protocol and verifies the current provisional provider
-journey, not the canonical v1 contract crate:
+Run `scripts/protected-content-provider-contract-smoke.sh` only when changing
+the provisional provider capsules. It exercises those old binaries over their
+JSON line protocol. It is a fail-closed retirement guard, not verification of
+the canonical Runtime, rights, custody, or decrypt architecture:
 
 - status exposes blocked raw authority
 - valid requests fail closed until backends are configured
 - invalid raw-authority requests are rejected
-- `drm-provider.open` reports the declared provider/runtime sequence
+- the provisional `drm-provider.open` reports its old declared sequence

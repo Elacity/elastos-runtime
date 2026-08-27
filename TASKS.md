@@ -415,7 +415,7 @@ and review items pass.
   Reopen a slice only for a newly proven release-candidate defect with a named
   owner and verification command.
 - [ ] Treat Remote Carrier Exit as part of the Carrier slice: two-runtime evidence must cite the exact source/exit runtime DIDs and endpoint evidence; the installed artifact readiness report and route-readiness report must be hash-bound; evidence for route readiness, installed artifact readiness, discovery, policy, accounting, stream transport, Browser proof, and cleanup must cite reviewed route nouns; the local Browser machine-proof artifact must cite the reviewed route target or target host; local artifacts must stay redacted, and remote paths need an explicit digest and review trail. Compose Inspector, typed Runtime authority, installed artifact readiness, route-readiness, operator evidence, Browser handoff, manual UX, performance/zoom, and clean-worktree proof before any full-goal claim.
-- [ ] Keep the verification gate green after each slice: run Rust workspace commands from `elastos/` such as `cargo fmt --all -- --check`, the narrow Rust tests for touched crates, `cargo check` for changed capsules, `git diff --check`, `scripts/check-wci-alignment.sh`, `scripts/protected-content-provider-contract-smoke.sh` where protected-content providers are touched, `node scripts/home-entropy-check.mjs` where Home UI is touched, `scripts/auth-wallet-focus-smoke.sh` after auth/wallet/chain changes, `scripts/installed-provider-verify.sh <provider>` after installed provider binary changes, and a live `/apps/home/` proof before handing browser-visible changes back for testing.
+- [ ] Keep the verification gate green after each slice: run Rust workspace commands from `elastos/` such as `cargo fmt --all -- --check`, the narrow Rust tests for touched crates, `cargo check` for changed capsules, `git diff --check`, `scripts/check-wci-alignment.sh`, `scripts/protected-content-provider-contract-smoke.sh` only as the provisional provider retirement guard where those old capsules are touched, `node scripts/home-entropy-check.mjs` where Home UI is touched, `scripts/auth-wallet-focus-smoke.sh` after auth/wallet/chain changes, `scripts/installed-provider-verify.sh <provider>` after installed provider binary changes, and a live `/apps/home/` proof before handing browser-visible changes back for testing.
 - [ ] Do not add visible UI, protocol surface, provider behavior, or blockchain hooks unless the runtime capability path, fail-closed behavior, and docs contract are already explicit.
 - [ ] Keep first-party capsule projection validation covered by
   `first_party_capsules_have_complete_projection_contract`; extend the same
@@ -655,7 +655,7 @@ and review items pass.
   2. Runtime: signed bundle identity, whole-package verification, interface/version contracts, install receipts, update policy
   3. Carrier: package/update distribution and peer discovery for trusted sources
   4. Blockchain: publisher identity, provenance receipts, and optional license/payment hooks without making token mechanics the core model
-- [ ] Keep Marketplace remote install/update/uninstall gated until the signed install contract exists. Marketplace may browse installed and verified Runtime apps, show details, and open installed Home launch targets, but remote actions need signed app manifests, publisher identity, install/update/removal receipts, provider policy, payment receipts where required, dDRM rights/key/decrypt policy, and Home/capsule change events before one-click install is exposed. Loose repo/dev folders can remain Home/dev targets, but they must not be presented as remotely installable Marketplace apps.
+- [ ] Keep Marketplace remote install/update/uninstall gated until the signed install contract exists. Marketplace may browse installed and verified Runtime apps, show details, and open installed Home launch targets, but remote actions need signed app manifests, publisher identity, install/update/removal receipts, provider policy, payment receipts where required, protected-content rights/custody/decrypt policy, and Home/capsule change events before one-click install is exposed. Loose repo/dev folders can remain Home/dev targets, but they must not be presented as remotely installable Marketplace apps.
 - [ ] Do not prioritize rich DRM economics, DeFi/BtcFi, Android box specifics, or literal Capsule-NFT mechanics before the package identity, principal, space, and provider contracts are real.
 
 ### Runtime primitives missing for the PC2 world-computer model
@@ -708,87 +708,154 @@ and review items pass.
 - [ ] Extract the shared capsule token block into a versioned support asset once capsule packaging can import shared CSS without coupling style to runtime authority.
 
 ### Trusted content and access rights
+
+The source-only protected-content stack now has two published review branches
+in order: canonical contracts, then custody and node operations. Remaining work
+must stay in this order. Carrier remains transport only throughout every stage
+below.
+
+The published custody branch defines the source-only EVM
+`has_access_by_content_id` policy/evidence contract, including the exact
+contract right string mapped from one product action, Profile-signed
+recipient-key authorization, signed immutable custody epoch, and authenticated
+replay-pending Runtime release-operation envelope. It also adds the node-local
+durable dual-key replay store and the private claim-gated transition from
+authenticated replay-pending evidence to an exact persisted encrypted
+contribution. Exact retries replay only that result after restart. Remaining
+tasks start after those boundaries; they do not reopen them as ambient provider
+configuration. Runtime owns its own orchestration replay. Each custody node
+owns only its local claim and result. A crash after the claim becomes durable
+but before the result becomes durable remains fail closed and requires a fresh
+Runtime release operation; there is no operation-resume journal for that state.
+
+#### A. Source-only review gate
+
 - [ ] Obtain external cryptographic, custody, and contract review of
-  `docs/PROTECTED_CONTENT_CONTRACTS_V1.md` and the source-only
-  `elastos-protected-content-contracts` crate before any provider or product
+  `docs/PROTECTED_CONTENT_CONTRACTS_V1.md`, the source-only
+  `elastos-protected-content-contracts` crate, and the source-only
+  `elastos-protected-content-custody` crate before any provider or product
   integration. The branch-local source review already closed with no code
   findings after the shared strict DID codec and Carrier codec consolidation;
   that was not an external cryptographic audit or production security
-  approval. Review the canonical codec, domain tags, field bounds, EIP-191
-  recovery (`0/1` only), canonical Profile `did:key`, policy identity,
-  owner-Wallet recovery, Runtime-selected and Wallet-signed recipient binding,
-  atomic replay keys, node decisions, terminal issuer signatures, nested
+  approval. An independent AI/model review later found and prompted the local
+  custody remediation for invalid X25519 contract bytes, exact released
+  threshold settlement, and post-reconstruction CEK commitment checking; that
+  review is also not a professional external audit. Review the canonical
+  codec, domain tags, field bounds, EIP-191 recovery (`0/1` only), canonical
+  Profile `did:key`, policy identity and body, recipient-key authorization,
+  owner-Wallet recovery, Runtime operation issuer binding, atomic replay keys,
+  signed custody epochs, node decisions, terminal issuer signatures, nested
   authority windows including contribution-to-terminal settlement, shared
   canonical Ed25519 validation (including noncanonical-encoding rejection),
-  unique contribution commitments at threshold settlement, and golden vectors.
+  the stricter local canonical X25519 contract-key rule, custody-envelope AAD
+  domains, pinned HPKE share sealing, GF256 Shamir share handling,
+  exact-threshold release settlement, threshold reconstruction zeroization,
+  manifest-bound reconstructed-key commitment checking, unique contribution
+  commitments at threshold settlement, and golden vectors.
+- [ ] Add professionally reviewed wrapper-level known-answer coverage for the
+  pinned HPKE share framing if a grounded upstream vector path becomes
+  available. The current source keeps tamper and binding tests, but the pinned
+  upstream `hpke` 0.13 vector set does not cover our exact fixed 32-byte share
+  wrapper framing.
+
+#### B. Source-only custody node operations and durable node state
+
+- [ ] Complete the remaining custody operational design around the reviewed
+  epoch and release-operation contracts: node admission and rotation, review or
+  replacement of the pinned threshold and recipient-encryption suites,
+  revocation, audit retention, issuer-key lifecycle, and recovery operations.
+  The source-only `elastos-protected-content-custody` crate now implements new
+  content share provisioning, recipient-sealed node release, and recipient-side
+  threshold reconstruction, but it does not yet prove full operational custody
+  safety, complete node-state durability, or product integration. Its
+  manifest-bound CEK commitment
+  detects a wrong reconstructed key; it does not identify the malicious node or
+  add verifiable secret sharing.
+- [ ] Extend the reviewed node-local replay-claim and claim-gated release
+  transition into full operational node state: retained claim pruning policy,
+  multi-process operational audit retention, node admission and issuer-key
+  lifecycle, recovery tooling, and storage review for production hosts. The
+  published custody branch already proves one owner-only durable dual-key
+  claim store, atomic no-partial-claim updates, restart survival, private
+  claim-before-release authority, exact encrypted-result persistence, and exact
+  retry replay. It does not yet add an operation-resume journal for a claim
+  that became durable before its result, so that state still requires a fresh
+  Runtime release operation.
+
+#### C. Atomic Runtime/provider cutover plus source allow/deny proof
+
 - [ ] Add a typed protected-content Wallet operation that verifies an
   externally completed signature, canonicalizes a `27/28` recovery byte to
   `0/1` after signer verification and before `WalletSignedRightsRequestV1`
   construction, and covers managed, MetaMask, and WalletConnect paths with
   exact tests. The v1 contract itself continues to accept only canonical
   `0/1`.
-- [ ] Decide and review the custody architecture, node admission and rotation,
-  threshold algorithm, recipient encryption suite, contribution protection,
-  durable per-node replay claims, revocation, audit retention, issuer-key
-  lifecycle, and recovery operations. The v1 contract binds recipient-labeled
-  bytes but does not implement or prove encryption, custody, or threshold
-  reconstruction.
-- [ ] Define how Runtime derives the recipient public key from the authenticated
-  Profile and session, proves key possession, and selects an approved encryption
-  suite. The caller must not provide endpoint, device, route, or Carrier
-  identity as recipient authority.
-- [ ] Define the typed, application-authenticated Runtime-to-release-node
-  operation. It must carry the exact canonical Wallet request and release
-  request plus the exact recipient public key, bind the invoking Runtime and
-  provider operation, and require every node to verify both requests, match the
-  public key to `RecipientKeyIdentityV1`, and claim replay before acting.
-  Carrier endpoint authentication is transport evidence, not application
-  authorship; never serialize or trust a caller-asserted `Verified*` marker.
-- [ ] Implement durable atomic replay claim stores for Runtime and every release
-  node. Claims must use the contract's exact authority-scope hash plus nonce,
-  survive restarts until expiry, and prove insert-if-absent behavior under
-  concurrency and storage failure. Runtime must generate a fresh opaque
-  32-byte session binding, fresh rights and release nonces, and bounded time
-  windows; capsules must not select replay or session authority.
-- [ ] Define the immutable rights-policy body format and provider evaluation
-  evidence addressed by `RightsPolicyIdentityV1`. Pin approved chain ids,
-  contract addresses, selectors, and ABI fixtures inside provider policy; keep
-  chain URLs and transport selection outside capsule/provider contracts.
-- [ ] Wire Runtime-owned protected-content orchestration only after that review:
-  content status/fetch, Wallet-approved rights request, independent node rights
-  checks, key release, scoped decrypt/render session, terminal receipt, audit,
-  cancellation, and cleanup. Runtime must select providers and Carrier endpoints;
-  capsules must not select routes or receive contributions or raw keys. Bind
-  the fresh opaque contract value to the verified session in Runtime state;
-  never place a session ID, session cookie, launch token, capability token, or
-  bearer credential in the contract.
-- [ ] Replace the provisional `elastos_common::protected_content` DTOs and their
-  current provider consumers atomically with the reviewed v1 crate during the
-  integration slice. Delete the superseded shapes; do not keep parallel
+- [ ] Implement how Runtime derives the recipient public key from the
+  authenticated Profile and session, proves holder-only key possession, and
+  selects an approved encryption suite. The current Profile signature
+  authorizes one exact recipient public key and one Runtime operation issuer;
+  it does not prove X25519 secret-key possession. The caller must not provide
+  endpoint, device, route, or Carrier identity as recipient authority.
+- [ ] Implement the Runtime-owned replay claim store and orchestration around
+  the reviewed contract values. Runtime must generate a fresh opaque 32-byte
+  session binding, fresh rights and release nonces, and bounded time windows;
+  capsules must not select replay or session authority.
+- [ ] Pin approved chain ids, contract addresses, selectors, and ABI fixtures
+  inside provider policy and evaluation evidence for `RightsPolicyBodyV1`.
+  The source-only contract already requires those typed inputs; this stage
+  chooses the approved production values and wires them into provider policy.
+  Keep chain URLs and transport selection outside capsule/provider contracts.
+- [ ] Wire Runtime-owned protected-content orchestration only through the
+  reviewed v1 contracts: content status/fetch, Wallet-approved rights request,
+  recipient-key authorization, application-authenticated release operation,
+  independent node rights checks, key release, scoped decrypt/render session,
+  terminal receipt, audit, cancellation, and cleanup. Runtime must select
+  providers and Carrier endpoints; capsules must not select routes or receive
+  contributions or raw keys. Bind the fresh opaque contract value to the
+  verified session in Runtime state; never place a session ID, session cookie,
+  launch token, capability token, or bearer credential in the contract.
+- [ ] Replace the provisional `elastos_common::protected_content` DTOs and
+  their current provider consumers atomically with the reviewed v1 crate during
+  the integration slice. Delete the superseded shapes; do not keep parallel
   authorities, compatibility adapters, or fallback decoding.
-- [ ] Add reviewed production dDRM rights-method configuration for the approved ESC/Elacity contracts only after contract addresses, selectors, and ABI fixtures are pinned in tests.
-- [ ] Wire `rights-provider` to approved dDRM/chain policy backends through typed
-  `chain-provider` reads, with every release node verifying the Wallet's exact
-  right independently. Do not put license logic in app UI or gateway-only checks.
-- [ ] Wire `key-provider` to the reviewed threshold-custody backend only after
+- [ ] Add reviewed production dDRM rights-method configuration for the approved
+  ESC/Elacity contracts only after contract addresses, selectors, and ABI
+  fixtures are pinned in tests.
+- [ ] Wire `rights-provider` to approved dDRM/chain policy backends through
+  typed `chain-provider` reads, with every release node verifying the Wallet's
+  exact right independently. Do not put license logic in app UI or
+  gateway-only checks.
+- [ ] Wire Runtime-selected custody providers to the reviewed threshold-custody
+  backend only after
   node contribution authentication, same-node rights evidence,
-  recipient-sealing encryption, unique-node threshold settlement, durable
-  replay rejection, expiry, revocation, and failure cleanup are proven. Verify
-  the installed capsule-visible response is the authenticated terminal receipt,
-  not provider-private contribution bytes or key-backend authority.
-- [ ] Wire `decrypt-provider` to a real decrypt/render backend that returns scoped rendered output or decrypt sessions to the viewer instead of broad raw key access.
+  recipient-sealing encryption, exact-threshold settlement, durable replay
+  rejection, expiry, revocation, and failure cleanup are proven. Verify the
+  capsule-visible response is the authenticated terminal receipt, not
+  provider-private contribution bytes or key-backend authority.
+- [ ] Wire `decrypt-provider` to a real decrypt/render backend that returns
+  scoped rendered output or decrypt sessions to the viewer instead of broad raw
+  key access.
 - [ ] Evaluate decrypt/render/media helper crates as provider-internal
   implementation candidates only after the fail-closed protected-content
-  sequence is wired and installed-path tests prove capsules receive neither
-  key material nor IPFS, chain, Wallet, or route authority. Source contract
+  sequence is wired and source-path tests prove capsules receive neither key
+  material nor IPFS, chain, Wallet, or route authority. Source contract
   field-name tests are not confidentiality proof.
-- [ ] Wire real protected-content producers to the existing `sealed` content object contract after payload encryption, rights policy, availability receipt, provenance, key-envelope, and viewer-interface generation exist.
-- [ ] Add permissioned ElastOS PQ-hybrid dKMS custody for new protected content
-  only after the v1 contracts and custody design pass independent review. Do not
-  use FROST as the long-term dKMS root; FROST is only a classical helper for
-  receipts or cohort decisions.
-- [ ] Keep Carrier responsible for encrypted blob transport and remote update delivery, not for replacing capability and policy enforcement.
-- [ ] Prove one honest protected-content flow end to end: resolve object by stable identity, verify trust material, authorize access, decrypt for the rightful user, open in the correct viewer/app, and fail closed for everyone else.
+- [ ] Prove one source allow flow and one source deny flow through the reviewed
+  Runtime/provider contract path with no fallback or parallel DTO surface.
+
+#### D. Isolated installed proof
+
+- [ ] Wire real protected-content producers to the existing `sealed` content
+  object contract after payload encryption, rights policy, availability
+  receipt, provenance, key-envelope, and viewer-interface generation exist.
+- [ ] Prove one honest protected-content flow end to end on an installed
+  target: resolve object by stable identity, verify trust material, authorize
+  access, decrypt for the rightful user, open in the correct viewer/app, and
+  fail closed for everyone else.
+- [ ] Only after stages A-D, decide whether to add permissioned ElastOS
+  PQ-hybrid dKMS custody for new protected content. Do not use FROST as the
+  long-term dKMS root; FROST is only a classical helper for receipts or cohort
+  decisions.
 
 ### Operator and audit hardening
 - [ ] Keep the existing SHA-256 audit chain canonical for 0.6 unless an explicit
