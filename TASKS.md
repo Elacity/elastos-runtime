@@ -18,7 +18,7 @@ section if a higher section is incoherent, unverified, or too large to review.
 ### 0.7 UIUX candidate closeout
 
 This is the only active closeout for the unpublished
-`feat/0.7-uiux-candidate` line over released `main` at `d358dedb`. Keep
+`feat/0.7-uiux-candidate` line over `origin/upstream/0.7-dev`. Keep
 protected-content and broader product-documentation work on their separate
 reviewed branches unless a user explicitly asks to integrate them.
 
@@ -118,14 +118,6 @@ cause worth naming: the shell was assembled and asserted against, but never
 actually used by a person on a clean Home, and several of these are code
 whose own comments describe behaviour that was never implemented.
 
-- [ ] Give Chat its unified-sidebar layout. The window chrome for a
-  sidebar-owning Chat exists as `window-chrome-unified-sidebar` and is now
-  opt-in by that class alone; Chat rode along by data-target while its
-  sidebar was unbuilt, which left the traffic lights floating over bare
-  content, so it uses standard window chrome until the restyle builds the
-  real sidebar with the conversation list. The lone "Shared room" tab no
-  longer renders as a full-width button: a selector appears only once a
-  direct conversation gives it something to switch between.
 - [ ] Make `elastos setup` provision the macOS Browser. Browser runs fine on
   macOS — through Apple's Virtualization.framework, not the Linux
   supervisor/proxy/bridge components — but nothing in the install path puts

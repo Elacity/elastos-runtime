@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-08-26 UTC
+Last updated: 2026-08-27 UTC
 
 This file records public-safe current truth for released 0.6.0, published review
 lines, and active unpublished work. Historical
@@ -13,16 +13,17 @@ the public repository.
 - `main` at `d358dedb` is the released 0.6.0 line.
 - `feat/0.7-uiux-candidate` is the current unpublished 0.7 UIUX source
   candidate over `origin/upstream/0.7-dev`. Its reviewed UI implementation tip
-  is `03cb271d` (tree `123776843b769b37288668001fd07cc5fb4c499f`).
+  is `fb1fed21` (tree `faf8936680fa53393a8b12327ae08abfaecdaff0`).
 - The candidate integrates the reviewed collaboration, Home/platform/app UIUX,
   Wallet/connectors, GBA viewer/content, typed model-provider, standalone
   Assistant, and legacy AI-path retirement work into one source line. The named
   focused source gates are green; installation, localhost artifact proof,
   public-seed proof, and human acceptance remain separate gates.
-- The broad `just verify` gate is not yet green on this host: it stops in the
-  existing `carrier-dependency-generation-check` when Cargo tries to resolve
-  crates from the network and DNS fails for `static.crates.io`. That is an
-  environment blocker, not a proved defect in this candidate diff.
+- The focused `carrier-dependency-generation-check` gate is green on this host
+  in the current candidate state, including the standalone object-provider
+  graph. The broader `just verify` gate passed on Thursday, August 27, 2026 on
+  this source line; install, localhost artifact, public-seed, and human
+  acceptance proof remain separate gates.
 - Assistant uses only the typed Runtime model-provider boundary. It truthfully
   reports no available models when the operator-owned model-provider config is
   absent, and it does not expose backend selectors, credentials, or topology.
@@ -259,8 +260,12 @@ the public repository.
 - Assistant is a standalone first-party capsule. Chat, Build, and Studio use
   only typed Runtime model resources and the protected Assistant workspace;
   transcript copy goes only through the trusted Home Clipboard path.
-- Assistant source proof is source-only today. No install, localhost, or human
-  acceptance claim is recorded yet for this candidate's Assistant workflows.
+- Assistant model messages render a self-contained safe markdown subset with
+  escaped HTML, inert links, headings/lists/blockquotes/tables, fenced and
+  inline code, and inline/display math through vendored KaTeX 0.18.3. Focused
+  source proof lives in `scripts/assistant-shell-smoke.mjs`; no install,
+  localhost, or human acceptance claim is recorded yet for Assistant
+  workflows.
 
 ## System Truth
 
