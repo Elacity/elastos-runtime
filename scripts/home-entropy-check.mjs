@@ -184,6 +184,9 @@ function listMarkdownFiles(dir = repoRootPath) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".superpowers" ||
+      entry.name === "superpowers" ||
+      entry.name === ".claude" ||
       entry.name === "target" ||
       entry.name === "node_modules"
     ) {
@@ -205,6 +208,9 @@ function listTextFiles(dir) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".superpowers" ||
+      entry.name === "superpowers" ||
+      entry.name === ".claude" ||
       entry.name === "target" ||
       entry.name === "node_modules"
     ) {
@@ -414,6 +420,9 @@ function listFilesRecursive(dir) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".superpowers" ||
+      entry.name === "superpowers" ||
+      entry.name === ".claude" ||
       entry.name === "target" ||
       entry.name === "node_modules"
     ) {
