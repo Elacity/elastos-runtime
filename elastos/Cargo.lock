@@ -64,6 +64,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -78,6 +79,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1662,9 +1664,12 @@ dependencies = [
 name = "elastos-protected-content-custody"
 version = "0.6.0"
 dependencies = [
+ "aes",
+ "aes-gcm",
  "ed25519-dalek 2.2.0",
  "elastos-auth",
  "elastos-protected-content-contracts",
+ "ghash",
  "hpke",
  "k256",
  "nix",
@@ -1677,6 +1682,19 @@ dependencies = [
  "thiserror 1.0.69",
  "vsss-rs",
  "zeroize",
+]
+
+[[package]]
+name = "elastos-protected-content-provider-contracts"
+version = "0.6.0"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "elastos-auth",
+ "elastos-protected-content-contracts",
+ "k256",
+ "serde",
+ "serde_json",
+ "sha3",
 ]
 
 [[package]]
@@ -2307,6 +2325,7 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+ "zeroize",
 ]
 
 [[package]]

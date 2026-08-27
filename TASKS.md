@@ -709,10 +709,12 @@ and review items pass.
 
 ### Trusted content and access rights
 
-The source-only protected-content stack now has two published review branches
-in order: canonical contracts, then custody and node operations. Remaining work
-must stay in this order. Carrier remains transport only throughout every stage
-below.
+The published source-only protected-content stack currently ends at
+`origin/feat/protected-content-key-reconstruction` at `a8d0a9a6`: canonical
+contracts, custody and node operations, then decrypt-boundary reconstruction.
+The local `feat/protected-content-custody-pool` branch is source-only and
+unpublished. Remaining work must stay in this order. Carrier remains transport
+only throughout every stage below.
 
 The published custody branch defines the source-only EVM
 `has_access_by_content_id` policy/evidence contract, including the exact
@@ -764,13 +766,28 @@ Runtime release operation; there is no operation-resume journal for that state.
   epoch and release-operation contracts: node admission and rotation, review or
   replacement of the pinned threshold and recipient-encryption suites,
   revocation, audit retention, issuer-key lifecycle, and recovery operations.
-  The source-only `elastos-protected-content-custody` crate now implements new
-  content share provisioning, recipient-sealed node release, and recipient-side
-  threshold reconstruction, but it does not yet prove full operational custody
-  safety, complete node-state durability, or product integration. Its
-  manifest-bound CEK commitment
-  detects a wrong reconstructed key; it does not identify the malicious node or
-  add verifiable secret sharing.
+  The published source-only stack through
+  `origin/feat/protected-content-key-reconstruction` now implements new
+  content share provisioning, recipient-sealed node release, and
+  decrypt-boundary threshold reconstruction, but it does not yet prove full
+  operational custody safety, complete node-state durability, or product
+  integration. Its manifest-bound CEK commitment detects a wrong
+  reconstructed key; it does not identify the malicious node or add verifiable
+  secret sharing.
+- [ ] Keep the new custody pool, each object's selected committee, and any
+  later Runtime route resolution as three separate truths.
+- [ ] Bind each protected object or manifest to the exact custody-pool
+  identity, exact immutable `SignedCustodyEpochV1` identity, and exact
+  `CustodyCommitteeAuthorizationIdentityV1` so Runtime open can require those
+  object-bound identities rather than any newer pool or authorization.
+- [ ] Define the explicit re-share and new-epoch transition that replaces an
+  object's committee only by minting a new signed custody epoch plus a new
+  bound committee authorization, without rewriting older object authority.
+- [ ] Keep `CustodyEnvelopeV1` private to the trusted mint/custody provisioning
+  handoff. It must not become public asset metadata or capsule-visible state.
+  Future durable custody storage persists exactly one node-sealed share at each
+  selected custody node. Public metadata contains no shares: only bounded
+  identities, threshold/epoch/pool facts, CEK commitment, and signatures.
 - [ ] Extend the reviewed node-local replay-claim and claim-gated release
   transition into full operational node state: retained claim pruning policy,
   multi-process operational audit retention, node admission and issuer-key
@@ -781,7 +798,6 @@ Runtime release operation; there is no operation-resume journal for that state.
   retry replay. It does not yet add an operation-resume journal for a claim
   that became durable before its result, so that state still requires a fresh
   Runtime release operation.
-
 #### C. Atomic Runtime/provider cutover plus source allow/deny proof
 
 - [ ] Add a typed protected-content Wallet operation that verifies an
@@ -814,6 +830,15 @@ Runtime release operation; there is no operation-resume journal for that state.
   contributions or raw keys. Bind the fresh opaque contract value to the
   verified session in Runtime state; never place a session ID, session cookie,
   launch token, capability token, or bearer credential in the contract.
+- [ ] Keep the later Runtime open/buy integration aligned with the reviewed
+  authority model: viewer launches must use Home projection authority; Runtime
+  must derive Wallet v2 authority from verified launch authority; Chain may
+  prepare nonce/gas, but approval and broadcast must use the existing durable
+  Runtime transaction coordinator. Do not add Creator-local transaction
+  workflow, broad chain-scan fallback, debug logging flood, CBC envelope, or
+  sidecar/WireGuard/topology path. The public, unmerged PR #15 commits `ffea5998`
+  and `e148218b` are source evidence only, not current code or accepted
+  behavior.
 - [ ] Replace the provisional `elastos_common::protected_content` DTOs and
   their current provider consumers atomically with the reviewed v1 crate during
   the integration slice. Delete the superseded shapes; do not keep parallel
@@ -832,9 +857,26 @@ Runtime release operation; there is no operation-resume journal for that state.
   rejection, expiry, revocation, and failure cleanup are proven. Verify the
   capsule-visible response is the authenticated terminal receipt, not
   provider-private contribution bytes or key-backend authority.
+- [ ] Atomically cut Runtime/Library over from the provisional `key-provider`
+  route to Runtime-selected custody providers keyed by `node_public_key`,
+  keeping pool eligibility policy, per-object committee authority, and current
+  reachability separate. Runtime must own provider lifecycle/registration,
+  choose a currently available typed provider route for each exact committee
+  node, produce one real allow/deny/replay audit over provider selection, and
+  leave no fallback rail or dual authority. Carrier remains transport only; do
+  not add service IDs, endpoint identities, or topology to the signed pool or
+  custody epoch.
 - [ ] Wire `decrypt-provider` to a real decrypt/render backend that returns
   scoped rendered output or decrypt sessions to the viewer instead of broad raw
   key access.
+- [ ] Define and wire the private decrypt-provider output/read boundary over
+  the canonical authenticated chunk payload. The local unpublished
+  `feat/protected-content-decrypt-output` child branch currently proves only
+  custody-local staged decrypt output from the exact authenticated release
+  inputs, full ciphertext identity verification before plaintext write, and
+  chunk authentication inside the custody boundary. It does not yet add
+  provider wire, Runtime orchestration, viewer streaming, or product
+  integration.
 - [ ] Evaluate decrypt/render/media helper crates as provider-internal
   implementation candidates only after the fail-closed protected-content
   sequence is wired and source-path tests prove capsules receive neither key
@@ -852,6 +894,19 @@ Runtime release operation; there is no operation-resume journal for that state.
   target: resolve object by stable identity, verify trust material, authorize
   access, decrypt for the rightful user, open in the correct viewer/app, and
   fail closed for everyone else.
+- [ ] Keep PR #15 / `feat/dkms-esp-port` limited to source evidence for later
+  UX and node-operation extraction only. Keep as research its threshold crypto,
+  node-local custody, recipient-sealed contributions, CEK commitment, lifecycle
+  scenarios, and fail-closed negative tests. Reimplement at the canonical
+  boundary: per-node durable shard storage, DKG/rotation/re-share/revocation,
+  pool/governance policy, provider roles, and Runtime-open scenarios. Reject
+  from the product path: public aggregated `shares[]` metadata, capsule-owned
+  authority, raw CEK operations, `rail_shim`/reference fallbacks, old
+  `drm-provider` orchestration, direct TCP/IP/port topology in capsules or
+  contracts, static authorization fallbacks, and the standalone harness as a
+  product route. Treat PR #15's generated `escrow.json` as historical dev
+  evidence only: it aggregates wrapped shares and its writer omits
+  `cek_commitment_b64` while the reload path requires it.
 - [ ] Only after stages A-D, decide whether to add permissioned ElastOS
   PQ-hybrid dKMS custody for new protected content. Do not use FROST as the
   long-term dKMS root; FROST is only a classical helper for receipts or cohort

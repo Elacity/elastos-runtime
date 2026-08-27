@@ -1,0 +1,17 @@
+[package]
+name = "elastos-protected-content-provider-contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Private Runtime-to-provider protected-content transport contracts"
+
+[dependencies]
+elastos-protected-content-contracts = { path = "../elastos-protected-content-contracts" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+elastos-auth = { path = "../elastos-auth" }
+ed25519-dalek = "2.1"
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"

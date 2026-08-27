@@ -40,27 +40,104 @@ the public repository.
   review line
   stacked on `origin/feat/protected-content-contracts`. It adds the
   `elastos-protected-content-custody` crate plus custody-envelope
-  provisioning, recipient-sealed node release, and recipient-side threshold
-  reconstruction for new content. It also includes the typed EVM rights-policy
-  and evidence contracts, Profile-signed recipient-key authorization, signed
-  custody epochs, the Runtime-to-release-node operation envelope, and one
-  owner-only node-local durable dual-key replay store. That store privately
-  gates release, persists the exact encrypted node contribution, and replays
-  only that result after restart. Its current reviewed behavior rejects
-  invalid X25519 contract key bytes before HPKE use, requires exactly the
-  bound released threshold, and checks a manifest-bound CEK commitment after
-  reconstruction to detect a wrong reconstructed key. It does not integrate
-  Runtime/provider/Carrier orchestration, Runtime-owned durable replay
-  storage, full operational custody state, recipient key-possession proof, node
-  admission or issuer lifecycle services, decrypt/render product flows,
+  provisioning and recipient-sealed node release. It also includes the typed
+  EVM rights-policy and evidence contracts, Profile-signed recipient-key
+  authorization, signed custody epochs, the Runtime-to-release-node operation
+  envelope, and one owner-only node-local durable dual-key replay store. That
+  store privately gates release, persists the exact encrypted node
+  contribution, and replays only that result after restart.
+- `origin/feat/protected-content-key-reconstruction` is the published
+  source-only child review line stacked on
+  `origin/feat/protected-content-custody`. It adds authenticated release
+  reconstruction inside the decrypt boundary for new content. Its current
+  reviewed behavior rejects invalid X25519 contract key bytes before HPKE use,
+  requires exactly the bound released threshold, and checks a manifest-bound
+  CEK commitment after reconstruction to detect a wrong reconstructed key. The
+  current published protected-content stack therefore ends at `a8d0a9a6` on
+  `origin/feat/protected-content-key-reconstruction`. It does not integrate
+  Runtime/provider/Carrier
+  orchestration, Runtime-owned durable replay storage, full operational
+  custody state, recipient key-possession proof, product decrypt/render flows,
   installation, or deployment. A durable local claim without a stored result
   fails closed and currently requires a fresh Runtime release operation; there
   is no operation-resume journal for that state.
+- The local unpublished `feat/protected-content-payload-sealing` child branch
+  keeps staged payload sealing inside
+  `elastos-protected-content-custody`. That is an additive custody-extension
+  exception, not a new product path: keeping CEK generation, CEK commitment,
+  custody-envelope provisioning, and zeroization in one crypto boundary is
+  safer than exposing or duplicating CEK APIs across crates. The staging writer
+  returns canonical metadata only after ciphertext staging and custody
+  provisioning both succeed; callers must discard staged output after every
+  error. This branch is source-only and unpublished.
+- The local unpublished `feat/protected-content-decrypt-output` child branch
+  depends on that sealing branch and keeps decrypt-output inside the same
+  custody boundary. It accepts the exact encrypted-content identity plus the
+  existing authenticated release inputs, reconstructs the CEK only inside the
+  custody crate, verifies the full framed ciphertext identity before any
+  plaintext write, authenticates every chunk before staging plaintext, and
+  returns only bounded plaintext metadata after full success. On any error it
+  returns no success metadata and callers must discard staged plaintext output.
+  This branch is source-only and unpublished. It does not add provider wire,
+  Runtime integration, viewer output protocol, installation, or deployment.
+- The local unpublished `feat/protected-content-custody-pool` child branch
+  depends on that unpublished custody-local stack and adds a source-only
+  custody-pool module inside the canonical
+  `elastos-protected-content-contracts` crate. Validation requires the exact
+  signed pool, exact signed custody epoch, exact signed committee
+  authorization, a caller-supplied trusted policy-authority key, and a
+  caller-supplied expected `CustodyCommitteeAuthorizationIdentityV1`. It
+  enforces fixed 2-of-3 diversity across distinct operators and failure
+  domains and rejects topology-bearing fields. Object-bound pool/epoch/
+  authorization identity commitment, Runtime/provider routing, installation,
+  and deployment are not implemented. This branch is source-only and
+  unpublished.
+- The local unpublished `feat/protected-content-custody-provider` child branch
+  depends on that custody-pool work and remains source-only and unregistered.
+  It proves exact object/pool/epoch/committee binding, one selected node and one
+  sealed-share provisioning record, expected Runtime issuer and local-node
+  validation, owner-only durable node-share storage, exact duplicate/conflict/
+  restart behavior, signed-rights-gated release, exact encrypted contribution
+  replay, bounded provider frames, and clean shutdown. It exposes no CEK, raw
+  share, topology, Carrier authority, route, host, IP address, port, or
+  credential. The old provisional `key-provider` remains the only active
+  registered product key/custody path until a later atomic Runtime cutover.
+- `CustodyEnvelopeV1` is current source-only provisioning authority, not public
+  asset metadata. Future durable custody storage must keep exactly one
+  node-sealed share at each selected custody node. Public metadata contains no
+  shares; it contains bounded identities, threshold/epoch/pool facts, CEK
+  commitment, and signatures only.
+- Raw CEK and private-key JSON vectors in historical protected-content work are
+  deterministic test fixtures only. Product operations, responses, logs, public
+  metadata, and durable product state must not contain raw CEKs.
+- PR #15 / `feat/dkms-esp-port` remains public, unmerged source evidence only:
+  keep its threshold crypto, node-local custody, recipient-sealed
+  contributions, CEK commitment, lifecycle scenarios, and fail-closed negative
+  tests as research; reimplement per-node durable shard storage,
+  DKG/rotation/re-share/revocation, pool/governance policy, provider roles, and
+  Runtime-open scenarios at the canonical boundary; reject its public
+  aggregated `shares[]` metadata, capsule-owned authority, raw CEK operations,
+  `rail_shim`/reference fallbacks, old `drm-provider` orchestration, direct
+  topology in capsules or contracts, static authorization fallbacks, and
+  standalone harness as a product route. Its generated `escrow.json` is
+  historical dev evidence only because it aggregates wrapped shares and its
+  writer omits `cek_commitment_b64` while the reload path requires it.
+- Current protected-content source proof covers canonical contracts, node
+  release, exact-threshold reconstruction inside the decrypt boundary,
+  tamper/expiry/wrong-binding rejection, commitment checking, and CEK
+  zeroization. PR #15 adds provider/dev-harness encryption and decryption
+  evidence. No accepted test yet proves
+  `mint -> Runtime authority/provider selection/audit -> per-node custody
+  release -> private reconstruction/decryption -> plaintext/playback` through
+  the real Runtime product path.
 - Released 0.6 and the published collaboration review stack retain the older
   provisional `elastos_common::protected_content` DTOs plus fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
-  capsules. That surface does not consume or prove the new v1 contract.
-  Installed-target truth requires separate target evidence.
+  capsules. That old DRM/provider surface remains installed and source-visible
+  only until an atomic Runtime cutover replaces it. It does not consume or
+  prove the new v1 contract, and the new protected-content product path is not
+  yet connected or usable. Installed-target truth requires separate target
+  evidence.
 - An independent branch-local source/contract review of the published
   `origin/feat/protected-content-contracts` branch completed with no code
   findings after the strict DID codec and Carrier codec consolidation. This is

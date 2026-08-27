@@ -10,16 +10,16 @@ use rand09::SeedableRng as _;
 use sha2::{Digest as _, Sha256};
 
 use elastos_protected_content_contracts::{
-    AuthenticatedRuntimeReleaseOperationV1, CanonicalContract, CustodyEnvelopeV1, Digest32,
-    NodePublicKey, NodeSetV1, ReplayClaimEntryV1, ReplayClaimError, ReplayClaimKeyV1,
-    ReplayNonce16, RightsDecisionV1, RuntimeReleaseAuditIdV1, SignedNodeContributionV1,
-    SignedNodeRightsDecisionV1, VerifiedNodeContributionV1, VerifiedNodeRightsDecisionV1,
-    CUSTODY_HPKE_SUITE_ID_V1, MAX_RECIPIENT_SEALED_CONTRIBUTION_BYTES,
+    AuthenticatedRuntimeReleaseOperationV1, CanonicalContract, Digest32, NodePublicKey, NodeSetV1,
+    ReplayClaimEntryV1, ReplayClaimError, ReplayClaimKeyV1, ReplayNonce16, RightsDecisionV1,
+    RuntimeReleaseAuditIdV1, SignedNodeContributionV1, SignedNodeRightsDecisionV1,
+    VerifiedNodeContributionV1, VerifiedNodeRightsDecisionV1, CUSTODY_HPKE_SUITE_ID_V1,
+    MAX_RECIPIENT_SEALED_CONTRIBUTION_BYTES,
 };
 
 use crate::{
-    release::produce_node_contribution_with_rng, secrets::NodeCustodySecretKeyV1, CustodyError,
-    RecipientPublicKeyV1,
+    node_share::NodeLocalStoredShareV1, release::produce_node_contribution_with_rng,
+    secrets::NodeCustodySecretKeyV1, CustodyError, RecipientPublicKeyV1,
 };
 
 const STATE_MAGIC: &[u8; 8] = b"epc-rcl1";
@@ -54,6 +54,18 @@ impl ClaimedNodeReleaseOperationV1 {
 
     pub const fn selected_node_public_key(&self) -> NodePublicKey {
         self.selected_node_public_key
+    }
+
+    pub(crate) fn validate_node_share(
+        &self,
+        node_share: &NodeLocalStoredShareV1,
+        now: u64,
+    ) -> Result<(), CustodyError> {
+        node_share.validate_release_claim_context(
+            &self.authenticated_operation,
+            self.selected_node_public_key,
+            now,
+        )
     }
 
     pub fn binding(&self) -> &elastos_protected_content_contracts::ProtectedContentBindingV1 {
@@ -205,14 +217,14 @@ impl DurableReplayClaimStoreV1 {
     pub(crate) fn claim_node_release_operation(
         &mut self,
         operation: AuthenticatedRuntimeReleaseOperationV1,
-        envelope: &CustodyEnvelopeV1,
+        node_share: &NodeLocalStoredShareV1,
         selected_node_public_key: NodePublicKey,
         now: u64,
     ) -> Result<ClaimedNodeReleaseOperationV1, CustodyError> {
         if selected_node_public_key != self.node_public_key {
             return Err(CustodyError::BindingMismatch("store_node_public_key"));
         }
-        operation.validate_node_release_claim_context(envelope, selected_node_public_key, now)?;
+        node_share.validate_release_claim_context(&operation, selected_node_public_key, now)?;
         let rights_claim = ReplayClaimEntryV1::new(
             operation.rights_request_replay_claim_key(),
             operation
@@ -245,7 +257,7 @@ impl DurableReplayClaimStoreV1 {
         &mut self,
         operation: AuthenticatedRuntimeReleaseOperationV1,
         signed_rights_decision: &SignedNodeRightsDecisionV1,
-        envelope: &CustodyEnvelopeV1,
+        node_share: &NodeLocalStoredShareV1,
         node_signing_key: &SigningKey,
         node_custody_secret: &NodeCustodySecretKeyV1,
         recipient_public_key: &RecipientPublicKeyV1,
@@ -258,7 +270,7 @@ impl DurableReplayClaimStoreV1 {
         self.claim_or_replay_node_contribution_with_rng(
             operation,
             signed_rights_decision,
-            envelope,
+            node_share,
             node_signing_key,
             node_custody_secret,
             recipient_public_key,
@@ -274,7 +286,7 @@ impl DurableReplayClaimStoreV1 {
         &mut self,
         operation: AuthenticatedRuntimeReleaseOperationV1,
         signed_rights_decision: &SignedNodeRightsDecisionV1,
-        envelope: &CustodyEnvelopeV1,
+        node_share: &NodeLocalStoredShareV1,
         node_signing_key: &SigningKey,
         node_custody_secret: &NodeCustodySecretKeyV1,
         recipient_public_key: &RecipientPublicKeyV1,
@@ -288,7 +300,7 @@ impl DurableReplayClaimStoreV1 {
         if selected_node_public_key != self.node_public_key {
             return Err(CustodyError::BindingMismatch("store_node_public_key"));
         }
-        operation.validate_node_release_claim_context(envelope, selected_node_public_key, now)?;
+        node_share.validate_release_claim_context(&operation, selected_node_public_key, now)?;
         if operation.recipient().encryption_suite_id() != CUSTODY_HPKE_SUITE_ID_V1 {
             return Err(CustodyError::BindingMismatch(
                 "recipient_encryption_suite_id",
@@ -297,7 +309,7 @@ impl DurableReplayClaimStoreV1 {
         if recipient_public_key.identity()? != *operation.recipient() {
             return Err(CustodyError::BindingMismatch("recipient_key_identity"));
         }
-        let node_set = envelope.manifest().node_set()?;
+        let node_set = node_share.node_set()?;
         let decision =
             operation.verify_node_rights_decision(signed_rights_decision, &node_set, now)?;
         if decision.decision() != RightsDecisionV1::Allowed {
@@ -307,10 +319,7 @@ impl DurableReplayClaimStoreV1 {
         }
         operation
             .validate_node_contribution_active_window(issued_at, expires_at, &decision, now)?;
-        let node_entry = envelope
-            .manifest()
-            .node(selected_node_public_key)
-            .ok_or(CustodyError::BindingMismatch("custody_node"))?;
+        let node_entry = node_share.node()?;
         node_custody_secret.matches_node_entry(
             selected_node_public_key,
             node_entry.custody_public_key(),
@@ -390,7 +399,7 @@ impl DurableReplayClaimStoreV1 {
         let contribution = produce_node_contribution_with_rng(
             &claimed,
             signed_rights_decision,
-            envelope,
+            node_share,
             node_signing_key,
             node_custody_secret,
             recipient_public_key,
@@ -1084,6 +1093,7 @@ mod tests {
         recipient_public_key, signed_node_decision,
         verified_release_request_for_envelope_and_recipient_seed, NOW,
     };
+    use elastos_protected_content_contracts::CustodyEnvelopeV1;
 
     #[derive(Debug)]
     struct PanicRng;
@@ -1136,6 +1146,10 @@ mod tests {
 
     fn durable_store(seed: u8, temp: &tempfile::TempDir) -> DurableReplayClaimStoreV1 {
         DurableReplayClaimStoreV1::new(store_node(seed), store_dir(temp))
+    }
+
+    fn node_share_for(envelope: &CustodyEnvelopeV1, node_seed: u8) -> NodeLocalStoredShareV1 {
+        NodeLocalStoredShareV1::extract_from_envelope(envelope, node_public_key(node_seed)).unwrap()
     }
 
     fn derived_max_signed_node_contribution_bytes() -> usize {
@@ -1306,7 +1320,7 @@ mod tests {
             .claim_or_replay_node_contribution_with_rng(
                 first_operation,
                 &decision,
-                &envelope,
+                &node_share_for(&envelope, 1),
                 &node_signing_key(1),
                 &node_custody_secret(1),
                 &recipient_public_key(0x30),
@@ -1325,7 +1339,7 @@ mod tests {
                     &envelope, 0x30,
                 ),
                 &decision,
-                &envelope,
+                &node_share_for(&envelope, 1),
                 &node_signing_key(1),
                 &node_custody_secret(1),
                 &recipient_public_key(0x30),
@@ -1347,7 +1361,12 @@ mod tests {
             &envelope, 0x30,
         );
         store
-            .claim_node_release_operation(operation, &envelope, node_public_key(1), NOW + 3)
+            .claim_node_release_operation(
+                operation,
+                &node_share_for(&envelope, 1),
+                node_public_key(1),
+                NOW + 3,
+            )
             .unwrap();
 
         let decision = allowed_decision_for(&envelope, 0x30);
@@ -1357,7 +1376,7 @@ mod tests {
                     &envelope, 0x30,
                 ),
                 &decision,
-                &envelope,
+                &node_share_for(&envelope, 1),
                 &node_signing_key(1),
                 &node_custody_secret(1),
                 &recipient_public_key(0x30),
@@ -1386,7 +1405,7 @@ mod tests {
                     &envelope, 0x30,
                 ),
                 &decision,
-                &envelope,
+                &node_share_for(&envelope, 1),
                 &node_signing_key(1),
                 &node_custody_secret(1),
                 &recipient_public_key(0x30),
@@ -1405,7 +1424,7 @@ mod tests {
                     &envelope, 0x31,
                 ),
                 &mismatched_decision,
-                &envelope,
+                &node_share_for(&envelope, 1),
                 &node_signing_key(1),
                 &node_custody_secret(1),
                 &recipient_public_key(0x31),
@@ -1426,7 +1445,7 @@ mod tests {
                     &envelope, 0x30,
                 ),
                 &decision,
-                &envelope,
+                &node_share_for(&envelope, 1),
                 &node_signing_key(1),
                 &node_custody_secret(1),
                 &recipient_public_key(0x30),
@@ -1452,7 +1471,7 @@ mod tests {
                     &envelope, 0x30,
                 ),
                 &decision,
-                &envelope,
+                &node_share_for(&envelope, 1),
                 &node_signing_key(1),
                 &node_custody_secret(1),
                 &recipient_public_key(0x30),
@@ -1476,7 +1495,7 @@ mod tests {
                     &envelope, 0x30,
                 ),
                 &decision,
-                &envelope,
+                &node_share_for(&envelope, 1),
                 &node_signing_key(1),
                 &node_custody_secret(1),
                 &recipient_public_key(0x30),
@@ -1795,7 +1814,7 @@ mod tests {
         assert!(matches!(
             wrong_store.claim_node_release_operation(
                 operation,
-                &envelope,
+                &node_share_for(&envelope, 1),
                 node_public_key(1),
                 NOW + 3
             ),
@@ -1808,7 +1827,12 @@ mod tests {
             &envelope, 0x30,
         );
         correct_store
-            .claim_node_release_operation(operation, &envelope, node_public_key(1), NOW + 3)
+            .claim_node_release_operation(
+                operation,
+                &node_share_for(&envelope, 1),
+                node_public_key(1),
+                NOW + 3,
+            )
             .unwrap();
 
         let mut reopened_wrong_store = durable_store(2, &temp);
@@ -1818,7 +1842,7 @@ mod tests {
         assert!(matches!(
             reopened_wrong_store.claim_node_release_operation(
                 operation,
-                &envelope,
+                &node_share_for(&envelope, 2),
                 node_public_key(2),
                 NOW + 3
             ),

@@ -1,7 +1,6 @@
 use elastos_protected_content_contracts::{
-    CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyEpochIdentityV1, CustodyNodeIdentityV1,
-    EncryptedContentIdentityV1, NodeCustodyPublicKeyV1, NodePublicKey, ShareCoordinateV1,
-    ThresholdV1,
+    CustodyEnvelopeManifestV1, CustodyEnvelopeV1, EncryptedContentIdentityV1, ThresholdV1,
+    ValidatedCustodyCommitteeV1,
 };
 use hpke::rand_core::{CryptoRng as HpkeCryptoRng, RngCore as HpkeRngCore};
 use rand09::{rngs::StdRng as HpkeStdRng, SeedableRng as _};
@@ -18,9 +17,7 @@ use crate::{
 pub fn provision_custody_envelope(
     encrypted_content: EncryptedContentIdentityV1,
     content_key: &ContentEncryptionKeyV1,
-    custody_epoch: CustodyEpochIdentityV1,
-    threshold: ThresholdV1,
-    node_keys: Vec<(NodePublicKey, NodeCustodyPublicKeyV1)>,
+    committee: &ValidatedCustodyCommitteeV1,
 ) -> Result<CustodyEnvelopeV1, CustodyError> {
     let mut hpke_rng =
         HpkeStdRng::try_from_os_rng().map_err(|_| CustodyError::RandomnessUnavailable)?;
@@ -29,9 +26,7 @@ pub fn provision_custody_envelope(
     provision_custody_envelope_with_rng(
         encrypted_content,
         content_key,
-        custody_epoch,
-        threshold,
-        node_keys,
+        committee,
         &mut hpke_rng,
         &mut shamir_rng,
     )
@@ -40,9 +35,7 @@ pub fn provision_custody_envelope(
 pub(crate) fn provision_custody_envelope_with_rng<RHpke, RShamir>(
     encrypted_content: EncryptedContentIdentityV1,
     content_key: &ContentEncryptionKeyV1,
-    custody_epoch: CustodyEpochIdentityV1,
-    threshold: ThresholdV1,
-    node_keys: Vec<(NodePublicKey, NodeCustodyPublicKeyV1)>,
+    committee: &ValidatedCustodyCommitteeV1,
     hpke_rng: &mut RHpke,
     shamir_rng: &mut RShamir,
 ) -> Result<CustodyEnvelopeV1, CustodyError>
@@ -50,26 +43,15 @@ where
     RHpke: HpkeCryptoRng + HpkeRngCore,
     RShamir: CryptoRng10,
 {
+    let verified_epoch = committee.committee();
     let manifest = CustodyEnvelopeManifestV1::new(
         encrypted_content,
-        custody_epoch,
-        threshold,
+        committee.pool_identity(),
+        verified_epoch.epoch_identity(),
+        committee.authorization_identity(),
+        verified_epoch.threshold(),
         content_key.commitment(),
-        node_keys
-            .into_iter()
-            .enumerate()
-            .map(|(index, (node_public_key, custody_public_key))| {
-                CustodyNodeIdentityV1::new(
-                    node_public_key,
-                    custody_public_key,
-                    ShareCoordinateV1::new(
-                        u8::try_from(index + 1)
-                            .map_err(|_| CustodyError::MalformedShare("share_coordinate"))?,
-                    )?,
-                )
-                .map_err(CustodyError::from)
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+        verified_epoch.nodes().to_vec(),
     )?;
     let manifest_hash = manifest.manifest_hash()?;
     let share_values = split_content_key(content_key, manifest.threshold(), shamir_rng)?;
@@ -137,8 +119,10 @@ mod tests {
     use rand09::{rngs::StdRng as HpkeStdRng, SeedableRng as _};
     use rand10::{rngs::StdRng as ShamirStdRng, SeedableRng as _};
 
+    use elastos_protected_content_contracts::NodeCustodyPublicKeyV1;
+
     use super::*;
-    use crate::test_support::{content_key, custody_epoch_identity, custody_nodes, digest};
+    use crate::test_support::{content_key, digest, validated_custody_committee};
 
     #[test]
     fn provision_is_deterministic_under_test_rng_and_binds_identity() {
@@ -149,9 +133,7 @@ mod tests {
         let envelope_a = provision_custody_envelope_with_rng(
             EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
             &content_key(),
-            custody_epoch_identity(),
-            ThresholdV1::new(2, 3).unwrap(),
-            custody_nodes(),
+            &validated_custody_committee(),
             &mut hpke_rng_a,
             &mut shamir_rng_a,
         )
@@ -159,9 +141,7 @@ mod tests {
         let envelope_b = provision_custody_envelope_with_rng(
             EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
             &content_key(),
-            custody_epoch_identity(),
-            ThresholdV1::new(2, 3).unwrap(),
-            custody_nodes(),
+            &validated_custody_committee(),
             &mut hpke_rng_b,
             &mut shamir_rng_b,
         )
@@ -173,28 +153,31 @@ mod tests {
     }
 
     #[test]
-    fn provision_rejects_duplicate_custody_keys() {
-        let nodes = {
-            let mut nodes = custody_nodes();
-            nodes[1].1 = nodes[0].1;
-            nodes
-        };
-        let err = provision_custody_envelope(
+    fn provision_derives_authority_from_validated_committee_only() {
+        let committee = validated_custody_committee();
+        let envelope = provision_custody_envelope(
             EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
             &content_key(),
-            custody_epoch_identity(),
-            ThresholdV1::new(2, 3).unwrap(),
-            nodes,
+            &committee,
         )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            CustodyError::Contract(
-                elastos_protected_content_contracts::ContractError::InvalidField(
-                    "node_custody_public_key"
-                )
-            )
-        ));
+        .unwrap();
+        assert_eq!(
+            envelope.manifest().custody_pool(),
+            committee.pool_identity()
+        );
+        assert_eq!(
+            envelope.manifest().custody_epoch(),
+            committee.committee().epoch_identity()
+        );
+        assert_eq!(
+            envelope.manifest().custody_committee_authorization(),
+            committee.authorization_identity()
+        );
+        assert_eq!(
+            envelope.manifest().threshold(),
+            committee.committee().threshold()
+        );
+        assert_eq!(envelope.manifest().nodes(), committee.committee().nodes());
     }
 
     #[test]

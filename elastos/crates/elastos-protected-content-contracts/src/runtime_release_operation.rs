@@ -321,10 +321,16 @@ impl SignedRuntimeReleaseOperationV1 {
 
     pub fn verify(
         &self,
+        expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
         now: u64,
     ) -> Result<AuthenticatedRuntimeReleaseOperationV1, RuntimeReleaseOperationError> {
         self.canonical_bytes()?;
         map_active(self.statement.issued_at, self.statement.expires_at, now)?;
+        if self.statement.runtime_operation_issuer != expected_runtime_issuer {
+            return Err(RuntimeReleaseOperationError::BindingMismatch(
+                "runtime_operation_issuer",
+            ));
+        }
         let signature = Signature::from_bytes(
             &self
                 .runtime_signature
@@ -708,7 +714,9 @@ mod tests {
     fn envelope_for_epoch(custody_epoch: CustodyEpochIdentityV1) -> CustodyEnvelopeV1 {
         let manifest = crate::CustodyEnvelopeManifestV1::new(
             crate::EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
+            crate::CustodyPoolIdentityV1::new(digest(0x35), 512).unwrap(),
             custody_epoch,
+            crate::CustodyCommitteeAuthorizationIdentityV1::new(digest(0x36), 512).unwrap(),
             ThresholdV1::new(2, 3).unwrap(),
             digest(0x19),
             vec![
@@ -861,10 +869,12 @@ mod tests {
     #[test]
     fn runtime_release_operation_binds_exact_authority_hashes_and_replay_keys() {
         let operation = signed_operation();
-        let authenticated = operation.verify(NOW + 3).unwrap();
+        let authenticated = operation
+            .verify(operation.statement().runtime_operation_issuer(), NOW + 3)
+            .unwrap();
         assert_eq!(
             encode(authenticated.operation_hash().as_bytes()),
-            "f37a1060048335ddaf05fc2c1b767b9983bc6a16af936113b1742af679089058"
+            "71ee173d7a811fff30ac32bd1e6920378462119477bad9c233dd6e40c73e0e84"
         );
         assert_eq!(
             authenticated.rights_request_hash(),
@@ -897,7 +907,9 @@ mod tests {
     #[test]
     fn runtime_release_operation_exposes_exact_replay_keys_but_stays_non_actionable() {
         let operation = signed_operation();
-        let authenticated = operation.verify(NOW + 3).unwrap();
+        let authenticated = operation
+            .verify(operation.statement().runtime_operation_issuer(), NOW + 3)
+            .unwrap();
         assert_eq!(
             authenticated.release_request_hash(),
             operation
@@ -911,7 +923,10 @@ mod tests {
     #[test]
     fn runtime_release_operation_claim_context_rejects_wrong_epoch_and_unknown_node() {
         let wrong_epoch = signed_operation()
-            .verify(NOW + 3)
+            .verify(
+                signed_operation().statement().runtime_operation_issuer(),
+                NOW + 3,
+            )
             .unwrap()
             .validate_node_release_claim_context(
                 &envelope_for_epoch(CustodyEpochIdentityV1::new(digest(0xee), 512).unwrap()),
@@ -926,7 +941,10 @@ mod tests {
         ));
 
         let unknown_node = signed_operation()
-            .verify(NOW + 3)
+            .verify(
+                signed_operation().statement().runtime_operation_issuer(),
+                NOW + 3,
+            )
             .unwrap()
             .validate_node_release_claim_context(
                 &envelope_for_epoch(signed_epoch().epoch_identity().unwrap()),
@@ -976,7 +994,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            wrong.verify(NOW + 3),
+            wrong.verify(wrong.statement().runtime_operation_issuer(), NOW + 3),
             Err(RuntimeReleaseOperationError::Rights(
                 RightsError::InvalidWalletSignature
             ))
@@ -1169,9 +1187,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            wrong.verify(NOW + 3),
+            wrong.verify(wrong.statement().runtime_operation_issuer(), NOW + 3),
             Err(RuntimeReleaseOperationError::CustodyEpoch(
                 CustodyEpochError::InvalidIssuerSignature
+            ))
+        );
+    }
+
+    #[test]
+    fn runtime_release_operation_rejects_wrong_expected_runtime_issuer() {
+        let operation = signed_operation();
+        let wrong_runtime_issuer = RuntimeOperationIssuerKeyV1::new(
+            SigningKey::from_bytes(&[0x77; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            operation.verify(wrong_runtime_issuer, NOW + 3),
+            Err(RuntimeReleaseOperationError::BindingMismatch(
+                "runtime_operation_issuer"
             ))
         );
     }
