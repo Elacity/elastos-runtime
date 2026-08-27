@@ -4,6 +4,11 @@
 //! Apps never receive raw RPC URLs or arbitrary JSON-RPC passthrough.
 
 use elastos_guest::prelude::*;
+use elastos_protected_content_contracts::{
+    CanonicalContract, EvmRightsMethodAbiV1, RightsEvaluationEvidenceV1, RightsPolicyBodyV1,
+    RightsSubjectSourceV1, RuntimeOperationIssuerKeyV1, SignedRuntimeReleaseOperationV1,
+    MAX_RIGHTS_EVIDENCE_LIFETIME_SECS,
+};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -33,6 +38,7 @@ const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
 };
 const NODE_LIFECYCLE_CONTROL_REASON: &str =
     "node lifecycle control requires an operator-approved supervisor";
+const MAX_PROTECTED_CONTENT_RUNTIME_OPERATION_BYTES: usize = 16384;
 
 struct ChainProvider {
     networks: Vec<ChainNetwork>,
@@ -41,6 +47,8 @@ struct ChainProvider {
     node_lifecycle_state: NodeLifecycleStateFile,
     node_lifecycle_state_error: Option<String>,
     node_supervisor: NodeSupervisorConfig,
+    protected_content_runtime_issuer: Option<RuntimeOperationIssuerKeyV1>,
+    now_unix_seconds: fn() -> u64,
 }
 
 impl ChainProvider {
@@ -66,6 +74,8 @@ impl ChainProvider {
             node_lifecycle_state,
             node_lifecycle_state_error,
             node_supervisor: NodeSupervisorConfig::default(),
+            protected_content_runtime_issuer: None,
+            now_unix_seconds: now_ts,
         }
     }
 
@@ -122,13 +132,9 @@ impl ChainProvider {
             Request::Logs { network, filter } => self.logs(&network, filter),
             Request::Transaction { network, hash } => self.transaction(&network, &hash),
             Request::Receipt { network, hash } => self.receipt(&network, &hash),
-            Request::HasAccessByContentId {
-                network,
-                contract,
-                content_id,
-                subject,
-                right,
-            } => self.has_access_by_content_id(&network, &contract, &content_id, &subject, &right),
+            Request::ProtectedContentRightsEvidence {
+                signed_runtime_release_operation,
+            } => self.protected_content_rights_evidence(&signed_runtime_release_operation),
             Request::Proof {
                 network,
                 proof_kind,
@@ -158,7 +164,7 @@ impl ChainProvider {
 
     fn init(&mut self, config: Value) -> Response {
         let extra = config.get("extra").unwrap_or(&config);
-        if let Some(networks) = config
+        let next_networks = if let Some(networks) = config
             .get("extra")
             .and_then(|extra| extra.get("networks"))
             .or_else(|| config.get("networks"))
@@ -168,22 +174,44 @@ impl ChainProvider {
                     if let Err(err) = validate_networks(&networks) {
                         return Response::error("invalid_config", &err);
                     }
-                    self.networks = networks;
+                    Some(networks)
                 }
                 Err(err) => return Response::error("invalid_config", &err.to_string()),
             }
-        }
-        if let Some(supervisor) = extra.get("node_supervisor") {
+        } else {
+            None
+        };
+        let next_supervisor = if let Some(supervisor) = extra.get("node_supervisor") {
             match serde_json::from_value::<NodeSupervisorConfig>(supervisor.clone()) {
                 Ok(supervisor) => {
                     if let Err(err) = validate_node_supervisor_config(&supervisor) {
                         return Response::error("invalid_config", &err);
                     }
-                    self.node_supervisor = supervisor;
+                    Some(supervisor)
                 }
                 Err(err) => return Response::error("invalid_config", &err.to_string()),
             }
+        } else {
+            None
+        };
+        let next_runtime_issuer = if let Some(runtime_issuer) = config
+            .get("extra")
+            .and_then(|extra| extra.get("protected_content_runtime_issuer"))
+        {
+            match parse_runtime_issuer(runtime_issuer) {
+                Ok(runtime_issuer) => Some(runtime_issuer),
+                Err(err) => return Response::error("invalid_config", &err),
+            }
+        } else {
+            None
+        };
+        if let Some(networks) = next_networks {
+            self.networks = networks;
         }
+        if let Some(supervisor) = next_supervisor {
+            self.node_supervisor = supervisor;
+        }
+        self.protected_content_runtime_issuer = next_runtime_issuer;
         Response::ok(json!({
             "provider": "chain",
             "protocol_version": "1.0",
@@ -705,65 +733,240 @@ impl ChainProvider {
         }
     }
 
-    fn has_access_by_content_id(
+    fn protected_content_rights_evidence(
         &self,
-        network_id: &str,
-        contract: &str,
-        content_id: &str,
-        subject: &str,
-        right: &str,
+        signed_runtime_release_operation: &str,
     ) -> Response {
-        let network = match self.evm_network(network_id) {
+        let operation = match decode_contract_hex::<SignedRuntimeReleaseOperationV1>(
+            signed_runtime_release_operation,
+            MAX_PROTECTED_CONTENT_RUNTIME_OPERATION_BYTES,
+            "signed_runtime_release_operation",
+        ) {
+            Ok(operation) => operation,
+            Err(err) => return Response::error("invalid_runtime_operation", &err),
+        };
+        let expected_runtime_issuer = match self.protected_content_runtime_issuer {
+            Some(issuer) => issuer,
+            None => {
+                return Response::error(
+                    "runtime_issuer_not_configured",
+                    "protected-content Runtime issuer is not configured",
+                )
+            }
+        };
+        let now = (self.now_unix_seconds)();
+        let authenticated = match operation.verify(expected_runtime_issuer, now) {
+            Ok(authenticated) => authenticated,
+            Err(_) => {
+                return Response::error(
+                    "invalid_runtime_operation",
+                    "signed Runtime operation is invalid",
+                )
+            }
+        };
+        let policy = operation.statement().policy_body();
+        let request = operation.statement().evidence_request();
+        if let Err(err) = request.validate_against_policy(policy) {
+            return Response::error("invalid_runtime_operation", &err.to_string());
+        }
+        if policy.subject_source() != RightsSubjectSourceV1::WalletAddress {
+            return Response::error(
+                "unsupported_rights_subject_source",
+                "rights subject source is not supported",
+            );
+        }
+        let network = match self.evm_network_for_protected_content_policy(policy) {
             Ok(network) => network,
             Err(response) => return response,
         };
-        if let Err(err) = validate_evm_address(contract) {
-            return Response::error("invalid_contract", &err);
+        let chain_id = policy.chain_id();
+        let method = match policy.method_abi() {
+            EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString => {
+                let contract = format!("0x{}", encode_hex(policy.contract_address().as_bytes()));
+                match rights_method(network, "has_access_by_content_id", &contract) {
+                    Ok(method)
+                        if method.selector
+                            == format!(
+                                "0x{}",
+                                encode_hex(policy.function_selector().as_bytes())
+                            ) =>
+                    {
+                        method
+                    }
+                    Ok(_) => {
+                        return Response::error(
+                            "rights_selector_mismatch",
+                            "configured rights method selector does not match policy",
+                        )
+                    }
+                    Err(response) => return response,
+                }
+            }
+        };
+        match self.evm_rpc(network, "eth_chainId", json!([])) {
+            Ok(value) => match value.as_str().and_then(|value| parse_hex_u64(value).ok()) {
+                Some(live_chain_id) if live_chain_id == chain_id => {}
+                Some(_) => {
+                    return Response::error(
+                        "chain_id_mismatch",
+                        "live chain id does not match policy chain id",
+                    )
+                }
+                None => {
+                    return Response::error(
+                        "upstream_invalid_chain_id",
+                        "live chain id must be a hex quantity",
+                    )
+                }
+            },
+            Err(response) => return response,
         }
-        if let Err(err) = validate_content_id(content_id) {
-            return Response::error("invalid_content_id", &err);
-        }
-        if let Err(err) = validate_evm_address(subject) {
-            return Response::error("invalid_subject", &err);
-        }
-        if let Err(err) = validate_right(right) {
-            return Response::error("invalid_right", &err);
-        }
-        let method = match rights_method(network, "has_access_by_content_id", contract) {
-            Ok(method) => method,
+
+        let head = match self.evm_rpc(network, "eth_blockNumber", json!([])) {
+            Ok(value) => match value.as_str().and_then(|value| parse_hex_u64(value).ok()) {
+                Some(head) => head,
+                None => {
+                    return Response::error(
+                        "upstream_invalid_head",
+                        "chain head must be a hex quantity",
+                    )
+                }
+            },
             Err(response) => return response,
         };
+        let min_confirmations = u64::from(policy.observation_finality().min_confirmations());
+        let observed = match head.checked_sub(min_confirmations) {
+            Some(observed) => observed,
+            None => {
+                return Response::error(
+                    "insufficient_finality",
+                    "chain head is below required confirmation depth",
+                )
+            }
+        };
+        let observed_tag = format!("0x{observed:x}");
+        let observed_hash = match self.evm_rpc(
+            network,
+            "eth_getBlockByNumber",
+            json!([observed_tag.as_str(), false]),
+        ) {
+            Ok(value) => match evm_observed_block(&value, observed) {
+                Ok(hash) => hash,
+                Err(err) => return Response::error("upstream_invalid_block", &err),
+            },
+            Err(response) => return response,
+        };
+
+        let subject = format!("0x{}", encode_hex(request.binding().wallet().as_bytes()));
         let data = match method.abi {
             RightsMethodAbi::HasAccessByContentIdStringAddressString => {
                 match encode_has_access_by_content_id_call(
                     &method.selector,
-                    content_id,
-                    subject,
-                    right,
+                    policy.content_id(),
+                    &subject,
+                    policy.evm_right_argument(),
                 ) {
                     Ok(data) => data,
                     Err(err) => return Response::error("invalid_rights_method", &err),
                 }
             }
         };
-        match self.evm_rpc(
+        let has_access = match self.evm_rpc(
             network,
             "eth_call",
-            json!([{ "to": method.contract.as_str(), "data": data }, "latest"]),
+            json!([
+                { "to": method.contract.as_str(), "data": data },
+                {
+                    "blockHash": format!("0x{}", encode_hex(observed_hash.as_bytes())),
+                    "requireCanonical": true
+                }
+            ]),
         ) {
             Ok(result) => match decode_evm_bool(&result) {
-                Ok(has_access) => Response::ok(json!({
-                    "network": network.id,
-                    "contract": method.contract.as_str(),
-                    "content_id": content_id,
-                    "subject": subject,
-                    "right": right,
-                    "has_access": has_access,
-                })),
-                Err(err) => Response::error("upstream_invalid_bool", &err),
+                Ok(has_access) => has_access,
+                Err(err) => return Response::error("upstream_invalid_bool", &err),
             },
-            Err(response) => response,
+            Err(response) => return response,
+        };
+        let acquired_at = now;
+        let expires_at = match acquired_at
+            .checked_add(MAX_RIGHTS_EVIDENCE_LIFETIME_SECS)
+            .map(|expires_at| expires_at.min(operation.statement().expires_at()))
+        {
+            Some(expires_at) if expires_at > acquired_at => expires_at,
+            _ => {
+                return Response::error(
+                    "invalid_evidence_window",
+                    "rights evidence window is outside Runtime operation",
+                )
+            }
+        };
+        let evidence = match RightsEvaluationEvidenceV1::new(
+            authenticated.operation_hash(),
+            authenticated.release_request_hash(),
+            request.binding().clone(),
+            request.policy_identity().clone(),
+            request.binding().wallet(),
+            chain_id,
+            observed,
+            observed_hash,
+            head,
+            has_access,
+            acquired_at,
+            expires_at,
+        )
+        .and_then(|evidence| {
+            evidence.validate_against_request(request, policy)?;
+            Ok(evidence)
+        }) {
+            Ok(evidence) => evidence,
+            Err(err) => return Response::error("invalid_evidence", &err.to_string()),
+        };
+        let evidence_bytes = match evidence.canonical_bytes() {
+            Ok(bytes) => bytes,
+            Err(err) => return Response::error("invalid_evidence", &err.to_string()),
+        };
+        let evidence_hash = match evidence.canonical_hash() {
+            Ok(hash) => hash,
+            Err(err) => return Response::error("invalid_evidence", &err.to_string()),
+        };
+        Response::ok(json!({
+            "schema": "elastos.chain.protected-content-rights-evidence/v1",
+            "chain_id": chain_id,
+            "observed_block_number": observed,
+            "head_block_number": head,
+            "observed_block_hash": format!("0x{}", encode_hex(observed_hash.as_bytes())),
+            "rights_evaluation_evidence": format!("0x{}", encode_hex(&evidence_bytes)),
+            "rights_evaluation_evidence_hash": format!("0x{}", encode_hex(evidence_hash.as_bytes())),
+        }))
+    }
+
+    fn evm_network_for_protected_content_policy(
+        &self,
+        policy: &RightsPolicyBodyV1,
+    ) -> Result<&ChainNetwork, Response> {
+        let contract = format!("0x{}", encode_hex(policy.contract_address().as_bytes()));
+        let mut matches = self.networks.iter().filter(|network| {
+            network.kind == ChainKind::EvmJsonRpc
+                && network.chain_id == Some(policy.chain_id())
+                && network.rights_methods.iter().any(|method| {
+                    method.id == "has_access_by_content_id"
+                        && method.contract.eq_ignore_ascii_case(&contract)
+                })
+        });
+        let Some(network) = matches.next() else {
+            return Err(Response::error(
+                "rights_query_not_configured",
+                "no configured protected-content rights evidence source matches policy",
+            ));
+        };
+        if matches.next().is_some() {
+            return Err(Response::error(
+                "ambiguous_rights_evidence_source",
+                "multiple protected-content rights evidence sources match policy",
+            ));
         }
+        Ok(network)
     }
 
     fn proof(&self, network_id: &str, proof_kind: ChainProofKind, subject: &str) -> Response {

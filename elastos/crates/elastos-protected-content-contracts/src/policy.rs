@@ -1,13 +1,15 @@
 use serde::Serialize;
 
 use crate::canonical::{validate_ascii_identifier, CanonicalBody, ContractError, Decoder, Encoder};
+use crate::rights::{validate_active, validate_time_window};
 use crate::{
-    CanonicalContract, Digest32, ProtectedContentBindingV1, RightsActionV1, RightsPolicyIdentityV1,
-    WalletAddress,
+    AuthenticatedRuntimeReleaseOperationV1, CanonicalContract, Digest32, ProtectedContentBindingV1,
+    RightsActionV1, RightsPolicyIdentityV1, WalletAddress,
 };
 
 const MAX_POLICY_IDENTIFIER_BYTES: usize = 256;
 const MAX_EVM_RIGHT_ARGUMENT_BYTES: usize = "download".len();
+pub const MAX_RIGHTS_EVIDENCE_LIFETIME_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -306,6 +308,8 @@ impl CanonicalBody for RightsEvaluationEvidenceRequestV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RightsEvaluationEvidenceV1 {
+    runtime_operation_hash: Digest32,
+    release_request_hash: Digest32,
     binding: ProtectedContentBindingV1,
     policy_identity: RightsPolicyIdentityV1,
     subject_wallet: WalletAddress,
@@ -314,11 +318,15 @@ pub struct RightsEvaluationEvidenceV1 {
     observed_block_hash: Digest32,
     head_block_number: u64,
     has_access: bool,
+    acquired_at: u64,
+    expires_at: u64,
 }
 
 impl RightsEvaluationEvidenceV1 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        runtime_operation_hash: Digest32,
+        release_request_hash: Digest32,
         binding: ProtectedContentBindingV1,
         policy_identity: RightsPolicyIdentityV1,
         subject_wallet: WalletAddress,
@@ -327,8 +335,12 @@ impl RightsEvaluationEvidenceV1 {
         observed_block_hash: Digest32,
         head_block_number: u64,
         has_access: bool,
+        acquired_at: u64,
+        expires_at: u64,
     ) -> Result<Self, ContractError> {
         let value = Self {
+            runtime_operation_hash,
+            release_request_hash,
             binding,
             policy_identity,
             subject_wallet,
@@ -337,9 +349,19 @@ impl RightsEvaluationEvidenceV1 {
             observed_block_hash,
             head_block_number,
             has_access,
+            acquired_at,
+            expires_at,
         };
         value.validate()?;
         Ok(value)
+    }
+
+    pub const fn runtime_operation_hash(&self) -> Digest32 {
+        self.runtime_operation_hash
+    }
+
+    pub const fn release_request_hash(&self) -> Digest32 {
+        self.release_request_hash
     }
 
     pub fn binding(&self) -> &ProtectedContentBindingV1 {
@@ -374,6 +396,14 @@ impl RightsEvaluationEvidenceV1 {
         self.has_access
     }
 
+    pub const fn acquired_at(&self) -> u64 {
+        self.acquired_at
+    }
+
+    pub const fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+
     pub fn validate_against_request(
         &self,
         request: &RightsEvaluationEvidenceRequestV1,
@@ -402,6 +432,32 @@ impl RightsEvaluationEvidenceV1 {
         }
         Ok(())
     }
+
+    pub fn validate_against_runtime_release_at(
+        &self,
+        operation: &AuthenticatedRuntimeReleaseOperationV1,
+        now: u64,
+    ) -> Result<(), ContractError> {
+        self.validate_against_request(
+            operation.statement().evidence_request(),
+            operation.statement().policy_body(),
+        )?;
+        if self.runtime_operation_hash != operation.operation_hash() {
+            return Err(ContractError::InvalidField(
+                "evidence.runtime_operation_hash",
+            ));
+        }
+        if self.release_request_hash != operation.release_request_hash() {
+            return Err(ContractError::InvalidField("evidence.release_request_hash"));
+        }
+        if self.acquired_at < operation.statement().issued_at()
+            || self.expires_at > operation.statement().expires_at()
+        {
+            return Err(ContractError::InvalidField("evidence.window"));
+        }
+        validate_active(self.acquired_at, self.expires_at, now)
+            .map_err(|_| ContractError::InvalidField("evidence.window"))
+    }
 }
 
 impl CanonicalBody for RightsEvaluationEvidenceV1 {
@@ -410,6 +466,12 @@ impl CanonicalBody for RightsEvaluationEvidenceV1 {
     fn validate(&self) -> Result<(), ContractError> {
         self.binding.canonical_bytes()?;
         self.policy_identity.canonical_bytes()?;
+        validate_time_window(
+            self.acquired_at,
+            self.expires_at,
+            MAX_RIGHTS_EVIDENCE_LIFETIME_SECS,
+            "rights_evaluation_evidence_lifetime",
+        )?;
         if self.binding.rights_policy() != &self.policy_identity {
             return Err(ContractError::InvalidField("evidence.binding"));
         }
@@ -429,6 +491,8 @@ impl CanonicalBody for RightsEvaluationEvidenceV1 {
     }
 
     fn encode_fields(&self, encoder: &mut Encoder) -> Result<(), ContractError> {
+        encoder.fixed(self.runtime_operation_hash.as_bytes());
+        encoder.fixed(self.release_request_hash.as_bytes());
         encoder.nested(&self.binding)?;
         encoder.nested(&self.policy_identity)?;
         encoder.fixed(self.subject_wallet.as_bytes());
@@ -437,11 +501,15 @@ impl CanonicalBody for RightsEvaluationEvidenceV1 {
         encoder.fixed(self.observed_block_hash.as_bytes());
         encoder.u64(self.head_block_number);
         encoder.u8(u8::from(self.has_access));
+        encoder.u64(self.acquired_at);
+        encoder.u64(self.expires_at);
         Ok(())
     }
 
     fn decode_fields(decoder: &mut Decoder<'_>) -> Result<Self, ContractError> {
         Self::new(
+            Digest32::new(decoder.fixed()?),
+            Digest32::new(decoder.fixed()?),
             decoder.nested("binding")?,
             decoder.nested("policy_identity")?,
             WalletAddress::new(decoder.fixed()?),
@@ -450,6 +518,8 @@ impl CanonicalBody for RightsEvaluationEvidenceV1 {
             Digest32::new(decoder.fixed()?),
             decoder.u64()?,
             decode_bool(decoder, "has_access")?,
+            decoder.u64()?,
+            decoder.u64()?,
         )
     }
 }
@@ -579,6 +649,8 @@ mod tests {
         request.validate_against_policy(&policy).unwrap();
 
         let evidence = RightsEvaluationEvidenceV1::new(
+            digest(0x90),
+            digest(0x91),
             binding.clone(),
             policy.policy_identity().unwrap(),
             binding.wallet(),
@@ -587,6 +659,8 @@ mod tests {
             digest(0x55),
             112,
             true,
+            1_000,
+            1_030,
         )
         .unwrap();
         evidence
@@ -614,6 +688,8 @@ mod tests {
         )
         .unwrap();
         let wrong_wallet = RightsEvaluationEvidenceV1::new(
+            digest(0x90),
+            digest(0x91),
             binding.clone(),
             policy.policy_identity().unwrap(),
             wallet(8),
@@ -622,6 +698,8 @@ mod tests {
             digest(0x55),
             112,
             true,
+            1_000,
+            1_030,
         )
         .unwrap_err();
         assert_eq!(
@@ -630,6 +708,8 @@ mod tests {
         );
 
         let wrong_chain = RightsEvaluationEvidenceV1::new(
+            digest(0x90),
+            digest(0x91),
             binding.clone(),
             policy.policy_identity().unwrap(),
             binding.wallet(),
@@ -638,6 +718,8 @@ mod tests {
             digest(0x55),
             112,
             true,
+            1_000,
+            1_030,
         )
         .unwrap();
         assert_eq!(
@@ -646,6 +728,8 @@ mod tests {
         );
 
         let low_finality = RightsEvaluationEvidenceV1::new(
+            digest(0x90),
+            digest(0x91),
             binding,
             policy.policy_identity().unwrap(),
             wallet(7),
@@ -654,6 +738,8 @@ mod tests {
             digest(0x55),
             111,
             true,
+            1_000,
+            1_030,
         )
         .unwrap();
         assert_eq!(

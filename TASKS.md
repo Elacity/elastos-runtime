@@ -709,208 +709,125 @@ and review items pass.
 
 ### Trusted content and access rights
 
-The published source-only protected-content stack currently ends at
-`origin/feat/protected-content-key-reconstruction` at `a8d0a9a6`: canonical
-contracts, custody and node operations, then decrypt-boundary reconstruction.
-The local `feat/protected-content-custody-pool` branch is source-only and
-unpublished. Remaining work must stay in this order. Carrier remains transport
-only throughout every stage below.
+Protected-content work stays source-only until the complete mint -> buy -> open
+-> play path is proven through Runtime. Carrier remains transport only, Home
+launch tokens remain HTTP-edge credentials, and capsules never receive CEKs,
+raw shares, provider routes, host/IP/port data, credentials, or transferable
+playback URLs.
 
-The published custody branch defines the source-only EVM
-`has_access_by_content_id` policy/evidence contract, including the exact
-contract right string mapped from one product action, Profile-signed
-recipient-key authorization, signed immutable custody epoch, and authenticated
-replay-pending Runtime release-operation envelope. It also adds the node-local
-durable dual-key replay store and the private claim-gated transition from
-authenticated replay-pending evidence to an exact persisted encrypted
-contribution. Exact retries replay only that result after restart. Remaining
-tasks start after those boundaries; they do not reopen them as ambient provider
-configuration. Runtime owns its own orchestration replay. Each custody node
-owns only its local claim and result. A crash after the claim becomes durable
-but before the result becomes durable remains fail closed and requires a fresh
-Runtime release operation; there is no operation-resume journal for that state.
+Source prerequisites already present in this branch ancestry:
 
-#### A. Source-only review gate
+- Published review stack through
+  `origin/feat/protected-content-key-reconstruction` at `a8d0a9a6`: canonical
+  protected-content contracts, custody-envelope provisioning, recipient-sealed
+  node release, exact-threshold reconstruction inside the decrypt boundary,
+  commitment checking, replay-pending release authority, and fail-closed
+  tamper/expiry/wrong-binding tests.
+- Published source-only custody-provider review line at
+  `origin/feat/protected-content-custody-provider` / `f7cd6c3d`: object-bound
+  pool/epoch/committee-authorization identity, authenticated chunk payload and
+  staged decrypt-output helpers, one selected node/one sealed share per record,
+  expected Runtime issuer pinning, owner-only durable node-share storage, exact
+  duplicate/conflict/restart behavior, signed-rights-gated release, bounded
+  provider frames, strict shutdown, and no CEK/share/topology exposure. It is
+  unregistered and not installed product behavior.
+- Local source-only Wallet-rights branch at `2c69d0c2`: a dedicated Wallet
+  operation signs the exact canonical `RightsRequestV1` bytes for the selected
+  active EVM account through the existing verified Wallet invocation context;
+  generic approval cannot substitute for it.
+- Local source-only Runtime coordinator branch at `b00bfeeb`: private
+  durable Runtime release state plus typed internal coordination over existing
+  Wallet, rights, and custody provider contracts. It persists before provider
+  effects, records effect-started state, replays only exact terminal results,
+  leaves ambiguous post-dispatch outcomes nonterminal, and does not expose or
+  accept provider topology.
+- Local source-only chain-rights evidence branch at `7c747253` and rights
+  evaluator branch at `a32ae85a` (the latest code commit before this docs-only
+  planning commit): typed chain-rights evidence plus a typed rights evaluator
+  using EIP-1898-style exact block hash/number binding, live chain-id
+  verification, selector/method binding, bounded freshness, Runtime-operation
+  hash binding, redacted upstream failures, and no caller-supplied rights
+  evidence. Current planning truth lives on the `feat/protected-content-rights`
+  branch, not on a self-referential code hash.
 
-- [ ] Obtain external cryptographic, custody, and contract review of
-  `docs/PROTECTED_CONTENT_CONTRACTS_V1.md`, the source-only
-  `elastos-protected-content-contracts` crate, and the source-only
-  `elastos-protected-content-custody` crate before any provider or product
-  integration. The branch-local source review already closed with no code
-  findings after the shared strict DID codec and Carrier codec consolidation;
-  that was not an external cryptographic audit or production security
-  approval. An independent AI/model review later found and prompted the local
-  custody remediation for invalid X25519 contract bytes, exact released
-  threshold settlement, and post-reconstruction CEK commitment checking; that
-  review is also not a professional external audit. Review the canonical
-  codec, domain tags, field bounds, EIP-191 recovery (`0/1` only), canonical
-  Profile `did:key`, policy identity and body, recipient-key authorization,
-  owner-Wallet recovery, Runtime operation issuer binding, atomic replay keys,
-  signed custody epochs, node decisions, terminal issuer signatures, nested
-  authority windows including contribution-to-terminal settlement, shared
-  canonical Ed25519 validation (including noncanonical-encoding rejection),
-  the stricter local canonical X25519 contract-key rule, custody-envelope AAD
-  domains, pinned HPKE share sealing, GF256 Shamir share handling,
-  exact-threshold release settlement, threshold reconstruction zeroization,
-  manifest-bound reconstructed-key commitment checking, unique contribution
-  commitments at threshold settlement, and golden vectors.
-- [ ] Add professionally reviewed wrapper-level known-answer coverage for the
-  pinned HPKE share framing if a grounded upstream vector path becomes
-  available. The current source keeps tamper and binding tests, but the pinned
-  upstream `hpke` 0.13 vector set does not cover our exact fixed 32-byte share
-  wrapper framing.
+Remaining work, in strict dependency order. Review/publish hygiene still applies
+before any local source-only child branch is used as a parent, but it is not a
+product implementation stage:
 
-#### B. Source-only custody node operations and durable node state
+- [ ] Implement the inactive Runtime provider lifecycle, registration, routing,
+  and durable reconciliation seam before or in the same slice as any typed
+  rights-provider process adapter. Runtime must own provider selection,
+  readiness, registration, durable journal, audit, retry, and terminal
+  settlement. It must reconcile identity-bound durable claims or operations that
+  survive a crash after provider effects but before a terminal result, require a
+  terminal receipt before retirement, and never use time, path absence, provider
+  absence, fallback, or dual authority as settlement truth. Carrier may
+  transport selected endpoint calls; capsules must not choose providers, nodes,
+  routes, endpoints, hosts, IP addresses, ports, or credentials.
+- [ ] Add the typed provider-process adapter for the rights evaluator through
+  that Runtime-owned/provider-registry seam only. It must not use direct RPC,
+  static evidence, caller-supplied evidence, fallback, or topology in
+  requests/results.
+- [ ] Implement recipient possession and decrypt-session authority: Runtime
+  derives a recipient public key from the authenticated Profile/session and
+  proves holder-only possession before the decrypt boundary reconstructs or
+  uses the CEK. The existing Profile signature authorizes one public key; it is
+  not possession proof.
+- [ ] Implement the Runtime-owned producer/mint journal/state machine for one
+  media flow only: stage ciphertext and object bytes; bind exact encrypted
+  object, key envelope, custody pool, custody epoch, committee authorization,
+  node set, threshold, CEK commitment, rights policy, viewer interface, and
+  availability requirements; record exact per-stage receipts; provision one
+  sealed share to each selected custody node; recover cleanly after restart;
+  commit availability; then list. On partial custody provisioning, Runtime must
+  record a durable terminal mint abort, never list or expose the object, and
+  retain any accepted orphan shares as unreachable by every valid release
+  operation. Later garbage collection of those orphans requires a separately
+  reviewed signed custody retirement operation with terminal receipts; that
+  operation does not exist now. Before installed acceptance, choose one explicit
+  policy: implement that exact retirement operation, or prove bounded orphan
+  retention is the accepted first-release policy. Listing must never commit
+  before ciphertext/object availability and required custody provisioning are
+  durable. The first proof must use three distinct custody-provider instances
+  for 2-of-3: three distinct node identities, three distinct owner-only state
+  roots, distinct operators/failure domains, exact duplicate/conflict/restart
+  proof, and no one-node shortcut.
+- [ ] Connect buy/open to real Wallet and Chain evidence. Wallet signs the exact
+  approved action; Chain supplies final typed rights evidence; approval and
+  broadcast use the existing durable Runtime transaction coordinator. Runtime
+  then coordinates private reconstruction/decryption and scoped viewer output.
+  Playback output must be short-lived and bound to exact principal, launch or
+  Runtime session, viewer, object identity, action, and expiry. Runtime resolves
+  object identity; docs and APIs must not specify a bearer `play_url`. Home
+  launch tokens must not become Wallet or protected-content authority.
+- [ ] Prove the full inactive Runtime product path before removing the
+  provisional path: mint -> buy -> open -> play for two principals; three
+  custody nodes; allow, deny, tamper, wrong object,
+  wrong/missing/duplicate/malicious contribution, replay, restart/crash,
+  cleanup, durable reconciliation, terminal receipts, and no
+  CEK/share/topology leakage.
+- [ ] Atomically replace the provisional `elastos_common::protected_content`,
+  `drm-provider`, `key-provider`, and provisional decrypt authority only after
+  the complete inactive replacement path is proven. Delete the superseded
+  authority surface in that cutover slice; do not keep compatibility decoders,
+  fallbacks, dual writes, dual authority, or a second journal.
+- [ ] Update the minimum UI only after the authority path is green, then prove
+  installed two-principal acceptance: Create for one media asset, Store
+  listing/detail/buy, Library open, Wallet/Home approval, and one
+  Runtime-selected viewer. Documents, Store consolidation, broad UI redesign,
+  extra formats, migration, compatibility, Iroh upgrades, deployment, and
+  release remain later work unless the first flow proves they are required.
 
-- [ ] Complete the remaining custody operational design around the reviewed
-  epoch and release-operation contracts: node admission and rotation, review or
-  replacement of the pinned threshold and recipient-encryption suites,
-  revocation, audit retention, issuer-key lifecycle, and recovery operations.
-  The published source-only stack through
-  `origin/feat/protected-content-key-reconstruction` now implements new
-  content share provisioning, recipient-sealed node release, and
-  decrypt-boundary threshold reconstruction, but it does not yet prove full
-  operational custody safety, complete node-state durability, or product
-  integration. Its manifest-bound CEK commitment detects a wrong
-  reconstructed key; it does not identify the malicious node or add verifiable
-  secret sharing.
-- [ ] Keep the new custody pool, each object's selected committee, and any
-  later Runtime route resolution as three separate truths.
-- [ ] Bind each protected object or manifest to the exact custody-pool
-  identity, exact immutable `SignedCustodyEpochV1` identity, and exact
-  `CustodyCommitteeAuthorizationIdentityV1` so Runtime open can require those
-  object-bound identities rather than any newer pool or authorization.
-- [ ] Define the explicit re-share and new-epoch transition that replaces an
-  object's committee only by minting a new signed custody epoch plus a new
-  bound committee authorization, without rewriting older object authority.
-- [ ] Keep `CustodyEnvelopeV1` private to the trusted mint/custody provisioning
-  handoff. It must not become public asset metadata or capsule-visible state.
-  Future durable custody storage persists exactly one node-sealed share at each
-  selected custody node. Public metadata contains no shares: only bounded
-  identities, threshold/epoch/pool facts, CEK commitment, and signatures.
-- [ ] Extend the reviewed node-local replay-claim and claim-gated release
-  transition into full operational node state: retained claim pruning policy,
-  multi-process operational audit retention, node admission and issuer-key
-  lifecycle, recovery tooling, and storage review for production hosts. The
-  published custody branch already proves one owner-only durable dual-key
-  claim store, atomic no-partial-claim updates, restart survival, private
-  claim-before-release authority, exact encrypted-result persistence, and exact
-  retry replay. It does not yet add an operation-resume journal for a claim
-  that became durable before its result, so that state still requires a fresh
-  Runtime release operation.
-#### C. Atomic Runtime/provider cutover plus source allow/deny proof
-
-- [ ] Add a typed protected-content Wallet operation that verifies an
-  externally completed signature, canonicalizes a `27/28` recovery byte to
-  `0/1` after signer verification and before `WalletSignedRightsRequestV1`
-  construction, and covers managed, MetaMask, and WalletConnect paths with
-  exact tests. The v1 contract itself continues to accept only canonical
-  `0/1`.
-- [ ] Implement how Runtime derives the recipient public key from the
-  authenticated Profile and session, proves holder-only key possession, and
-  selects an approved encryption suite. The current Profile signature
-  authorizes one exact recipient public key and one Runtime operation issuer;
-  it does not prove X25519 secret-key possession. The caller must not provide
-  endpoint, device, route, or Carrier identity as recipient authority.
-- [ ] Implement the Runtime-owned replay claim store and orchestration around
-  the reviewed contract values. Runtime must generate a fresh opaque 32-byte
-  session binding, fresh rights and release nonces, and bounded time windows;
-  capsules must not select replay or session authority.
-- [ ] Pin approved chain ids, contract addresses, selectors, and ABI fixtures
-  inside provider policy and evaluation evidence for `RightsPolicyBodyV1`.
-  The source-only contract already requires those typed inputs; this stage
-  chooses the approved production values and wires them into provider policy.
-  Keep chain URLs and transport selection outside capsule/provider contracts.
-- [ ] Wire Runtime-owned protected-content orchestration only through the
-  reviewed v1 contracts: content status/fetch, Wallet-approved rights request,
-  recipient-key authorization, application-authenticated release operation,
-  independent node rights checks, key release, scoped decrypt/render session,
-  terminal receipt, audit, cancellation, and cleanup. Runtime must select
-  providers and Carrier endpoints; capsules must not select routes or receive
-  contributions or raw keys. Bind the fresh opaque contract value to the
-  verified session in Runtime state; never place a session ID, session cookie,
-  launch token, capability token, or bearer credential in the contract.
-- [ ] Keep the later Runtime open/buy integration aligned with the reviewed
-  authority model: viewer launches must use Home projection authority; Runtime
-  must derive Wallet v2 authority from verified launch authority; Chain may
-  prepare nonce/gas, but approval and broadcast must use the existing durable
-  Runtime transaction coordinator. Do not add Creator-local transaction
-  workflow, broad chain-scan fallback, debug logging flood, CBC envelope, or
-  sidecar/WireGuard/topology path. The public, unmerged PR #15 commits `ffea5998`
-  and `e148218b` are source evidence only, not current code or accepted
-  behavior.
-- [ ] Replace the provisional `elastos_common::protected_content` DTOs and
-  their current provider consumers atomically with the reviewed v1 crate during
-  the integration slice. Delete the superseded shapes; do not keep parallel
-  authorities, compatibility adapters, or fallback decoding.
-- [ ] Add reviewed production dDRM rights-method configuration for the approved
-  ESC/Elacity contracts only after contract addresses, selectors, and ABI
-  fixtures are pinned in tests.
-- [ ] Wire `rights-provider` to approved dDRM/chain policy backends through
-  typed `chain-provider` reads, with every release node verifying the Wallet's
-  exact right independently. Do not put license logic in app UI or
-  gateway-only checks.
-- [ ] Wire Runtime-selected custody providers to the reviewed threshold-custody
-  backend only after
-  node contribution authentication, same-node rights evidence,
-  recipient-sealing encryption, exact-threshold settlement, durable replay
-  rejection, expiry, revocation, and failure cleanup are proven. Verify the
-  capsule-visible response is the authenticated terminal receipt, not
-  provider-private contribution bytes or key-backend authority.
-- [ ] Atomically cut Runtime/Library over from the provisional `key-provider`
-  route to Runtime-selected custody providers keyed by `node_public_key`,
-  keeping pool eligibility policy, per-object committee authority, and current
-  reachability separate. Runtime must own provider lifecycle/registration,
-  choose a currently available typed provider route for each exact committee
-  node, produce one real allow/deny/replay audit over provider selection, and
-  leave no fallback rail or dual authority. Carrier remains transport only; do
-  not add service IDs, endpoint identities, or topology to the signed pool or
-  custody epoch.
-- [ ] Wire `decrypt-provider` to a real decrypt/render backend that returns
-  scoped rendered output or decrypt sessions to the viewer instead of broad raw
-  key access.
-- [ ] Define and wire the private decrypt-provider output/read boundary over
-  the canonical authenticated chunk payload. The local unpublished
-  `feat/protected-content-decrypt-output` child branch currently proves only
-  custody-local staged decrypt output from the exact authenticated release
-  inputs, full ciphertext identity verification before plaintext write, and
-  chunk authentication inside the custody boundary. It does not yet add
-  provider wire, Runtime orchestration, viewer streaming, or product
-  integration.
-- [ ] Evaluate decrypt/render/media helper crates as provider-internal
-  implementation candidates only after the fail-closed protected-content
-  sequence is wired and source-path tests prove capsules receive neither key
-  material nor IPFS, chain, Wallet, or route authority. Source contract
-  field-name tests are not confidentiality proof.
-- [ ] Prove one source allow flow and one source deny flow through the reviewed
-  Runtime/provider contract path with no fallback or parallel DTO surface.
-
-#### D. Isolated installed proof
-
-- [ ] Wire real protected-content producers to the existing `sealed` content
-  object contract after payload encryption, rights policy, availability
-  receipt, provenance, key-envelope, and viewer-interface generation exist.
-- [ ] Prove one honest protected-content flow end to end on an installed
-  target: resolve object by stable identity, verify trust material, authorize
-  access, decrypt for the rightful user, open in the correct viewer/app, and
-  fail closed for everyone else.
-- [ ] Keep PR #15 / `feat/dkms-esp-port` limited to source evidence for later
-  UX and node-operation extraction only. Keep as research its threshold crypto,
-  node-local custody, recipient-sealed contributions, CEK commitment, lifecycle
-  scenarios, and fail-closed negative tests. Reimplement at the canonical
-  boundary: per-node durable shard storage, DKG/rotation/re-share/revocation,
-  pool/governance policy, provider roles, and Runtime-open scenarios. Reject
-  from the product path: public aggregated `shares[]` metadata, capsule-owned
-  authority, raw CEK operations, `rail_shim`/reference fallbacks, old
-  `drm-provider` orchestration, direct TCP/IP/port topology in capsules or
-  contracts, static authorization fallbacks, and the standalone harness as a
-  product route. Treat PR #15's generated `escrow.json` as historical dev
-  evidence only: it aggregates wrapped shares and its writer omits
-  `cek_commitment_b64` while the reload path requires it.
-- [ ] Only after stages A-D, decide whether to add permissioned ElastOS
-  PQ-hybrid dKMS custody for new protected content. Do not use FROST as the
-  long-term dKMS root; FROST is only a classical helper for receipts or cohort
-  decisions.
+PR #15 / `feat/dkms-esp-port` remains source evidence only: keep its mint/open
+playback behavior, threshold crypto shape, node-local custody direction,
+recipient-sealed contributions, CEK commitment, lifecycle scenarios, and
+fail-closed negative tests. Reimplement durable shard storage, DKG/rotation/
+re-share/revocation, pool/governance policy, provider roles, Runtime-open
+scenarios, and UX at the canonical boundaries above. Reject public aggregate
+`shares[]` metadata, capsule-owned authority, raw CEK operations,
+`rail_shim`/reference fallbacks, old DRM orchestration, direct TCP/IP/port
+topology in capsules or contracts, static authorization fallbacks, and the
+standalone harness as a product route.
 
 ### Operator and audit hardening
 - [ ] Keep the existing SHA-256 audit chain canonical for 0.6 unless an explicit

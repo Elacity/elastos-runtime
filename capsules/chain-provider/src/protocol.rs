@@ -144,12 +144,8 @@ pub(super) enum Request {
         network: String,
         hash: String,
     },
-    HasAccessByContentId {
-        network: String,
-        contract: String,
-        content_id: String,
-        subject: String,
-        right: String,
+    ProtectedContentRightsEvidence {
+        signed_runtime_release_operation: String,
     },
     Proof {
         network: String,

@@ -1,0 +1,18 @@
+[package]
+name = "elastos-protected-content-rights"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Source-only protected-content rights evaluation boundary"
+
+[dependencies]
+ed25519-dalek = "2.1"
+elastos-protected-content-contracts = { path = "../elastos-protected-content-contracts" }
+elastos-protected-content-provider-contracts = { path = "../elastos-protected-content-provider-contracts" }
+thiserror = "1.0"
+
+[dev-dependencies]
+elastos-auth = { path = "../elastos-auth" }
+k256 = { version = "0.13", features = ["ecdsa"] }
+serde_json = "1.0"
+sha3 = "0.10"
