@@ -3194,7 +3194,7 @@ pub(crate) mod tests {
         trusted_signing_key: &SigningKey,
         bootstrap_peers: Vec<CollaborationBootstrapPeer>,
     ) -> VerifiedCollaborationNetworkProfile {
-        let signer_did = crate::crypto::encode_signing_key_did(&trusted_signing_key);
+        let signer_did = crate::crypto::encode_signing_key_did(trusted_signing_key);
         let profile = CollaborationNetworkProfile {
             schema: COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
             network_id: network_id.to_string(),
@@ -3223,7 +3223,7 @@ pub(crate) mod tests {
                 .unwrap(),
             ),
             network_id,
-            &[crate::crypto::encode_signing_key_did(&trusted_signing_key)],
+            &[crate::crypto::encode_signing_key_did(trusted_signing_key)],
             None,
         )
         .unwrap()
@@ -3257,7 +3257,7 @@ pub(crate) mod tests {
     ) {
         std::fs::create_dir_all(root).unwrap();
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let did = crate::crypto::encode_signing_key_did(&device_signing_key);
+        let did = crate::crypto::encode_signing_key_did(device_signing_key);
         let principal_id = format!("person:local:{}", &did[8..16]);
         let protection = crate::auth::store_test_principal_root_protection(root, &principal_id);
         let local_profile =
@@ -3295,7 +3295,7 @@ pub(crate) mod tests {
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let profile = signed_profile(NETWORK, trusted_signing_key, bootstrap_peers);
         let registry = Arc::new(ProviderRegistry::new());
-        let did = crate::crypto::encode_signing_key_did(&device_signing_key);
+        let did = crate::crypto::encode_signing_key_did(device_signing_key);
         let node = start_carrier_node_with_registry(
             device_signing_key,
             &did,
@@ -3936,7 +3936,7 @@ pub(crate) mod tests {
         let remote_profile = service_profile(&remote_service, "Remote Person", Some("remote"));
         let network = remote_service.network_profile();
         let registry = Arc::new(ProviderRegistry::new());
-        let local_did = crate::crypto::encode_signing_key_did(&local_key);
+        let local_did = crate::crypto::encode_signing_key_did(local_key);
         let local_node = start_carrier_node_with_registry(
             local_key,
             &local_did,
@@ -4106,7 +4106,7 @@ pub(crate) mod tests {
             revision,
             previous_profile_sha256,
             updated_at,
-            vec![crate::crypto::encode_signing_key_did(&device_signing_key)],
+            vec![crate::crypto::encode_signing_key_did(device_signing_key)],
         )
         .unwrap()
     }

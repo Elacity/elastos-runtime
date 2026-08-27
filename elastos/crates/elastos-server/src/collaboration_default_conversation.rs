@@ -269,7 +269,7 @@ mod tests {
         previous: Option<&VerifiedCollaborationNetworkProfile>,
         grant_cid: Option<String>,
     ) -> VerifiedCollaborationNetworkProfile {
-        let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
+        let signer_did = crate::crypto::encode_signing_key_did(signing_key);
         let payload = CollaborationNetworkProfile {
             schema: COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
             network_id: network_id.to_string(),
@@ -358,7 +358,7 @@ mod tests {
             1,
             None,
             NOW,
-            vec![crate::crypto::encode_signing_key_did(&endpoint)],
+            vec![crate::crypto::encode_signing_key_did(endpoint)],
         )
         .unwrap()
     }

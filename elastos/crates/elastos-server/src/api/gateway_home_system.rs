@@ -1343,7 +1343,7 @@ mod discovery_summary_tests {
                 1,
                 None,
                 created_at,
-                vec![crate::crypto::encode_signing_key_did(&signing_key)],
+                vec![crate::crypto::encode_signing_key_did(signing_key)],
             )
             .unwrap();
         signed_discovery_message(
@@ -1413,7 +1413,7 @@ mod discovery_summary_tests {
             request_message_id: request.payload.message_id,
             request_message_nonce: request.payload.nonce,
             recipient_profile_did: recipient_profile_did.to_string(),
-            recipient_endpoint_did: crate::crypto::encode_signing_key_did(&recipient_key),
+            recipient_endpoint_did: crate::crypto::encode_signing_key_did(recipient_key),
             decision,
             decided_at,
         };

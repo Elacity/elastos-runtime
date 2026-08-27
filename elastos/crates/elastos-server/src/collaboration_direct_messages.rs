@@ -1745,7 +1745,7 @@ fn receipt_for(
         sender_profile_did: message.envelope().payload.sender_profile_did.clone(),
         message_id: message.envelope().payload.message_id.clone(),
         message_nonce: message.envelope().payload.nonce.clone(),
-        recipient_endpoint_did: crate::crypto::encode_signing_key_did(&signing_key),
+        recipient_endpoint_did: crate::crypto::encode_signing_key_did(signing_key),
         accepted_at: now,
     };
     let (signature, signer_did) = domain_separated_sign(
@@ -1779,7 +1779,7 @@ pub(crate) fn prepare_direct_message(
     validate_id(intent.request_id, "direct message request_id")?;
     crate::crypto::decode_did_key(intent.recipient_profile_did)
         .context("invalid direct message recipient Profile DID")?;
-    let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
+    let signer_did = crate::crypto::encode_signing_key_did(signing_key);
     if !sender_profile.authorizes_signer(&signer_did, "chat", DIRECT_MESSAGE_PAYLOAD_TYPE) {
         anyhow::bail!("direct message signer is not authorized by the sender Profile");
     }
