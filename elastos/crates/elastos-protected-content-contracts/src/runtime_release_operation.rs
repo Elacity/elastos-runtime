@@ -10,8 +10,9 @@ use crate::{
     RecipientKeyAuthorizationContextV1, RecipientPublicKeyBytesV1, ReplayClaimKeyV1,
     RightsEvaluationEvidenceRequestV1, RightsPolicyBodyV1, RuntimeOperationIssuerKeyV1,
     SignedCustodyEpochV1, SignedNodeContributionV1, SignedNodeRightsDecisionV1,
-    SignedRecipientKeyAuthorizationV1, VerifiedKeyReleaseRequestV1, VerifiedNodeContributionV1,
-    VerifiedNodeRightsDecisionV1, WalletSignedRightsRequestV1,
+    SignedRecipientKeyAuthorizationV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
+    VerifiedKeyReleaseRequestV1, VerifiedNodeContributionV1, VerifiedNodeRightsDecisionV1,
+    WalletSignedRightsRequestV1,
 };
 
 pub const MAX_RUNTIME_RELEASE_OPERATION_LIFETIME_SECS: u64 = 60;
@@ -512,6 +513,18 @@ impl AuthenticatedRuntimeReleaseOperationV1 {
         let verified = verify_release_operation_statement(&self.statement, now)
             .map_err(map_runtime_release_key_release_error)?;
         contribution.verify(&verified.release, node_set, now)
+    }
+
+    pub fn verify_terminal_receipt(
+        &self,
+        terminal_receipt: &SignedTerminalReceiptV1,
+        contributions: &[VerifiedNodeContributionV1],
+        expected_issuer: TerminalReceiptIssuerKey,
+        now: u64,
+    ) -> Result<(), KeyReleaseError> {
+        let verified = verify_release_operation_statement(&self.statement, now)
+            .map_err(map_runtime_release_key_release_error)?;
+        terminal_receipt.verify(&verified.release, contributions, expected_issuer, now)
     }
 }
 
