@@ -108,7 +108,7 @@ fn reset_mock_chain_broadcast_count(signed_transaction: &str) {
         .unwrap()
         .remove(signed_transaction);
     if signed_transaction.starts_with("0x")
-        && signed_transaction.len() % 2 == 0
+        && signed_transaction.len().is_multiple_of(2)
         && signed_transaction[2..]
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
@@ -2064,7 +2064,7 @@ impl MockBrowserOwnershipCounts {
 }
 
 struct MockRemoteCarrierExitProvider {
-    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    close_calls: BrowserCloseCallRecorder,
     close_failures_remaining: Arc<TokioMutex<usize>>,
     close_hangs_remaining: std::sync::atomic::AtomicUsize,
     close_started: Option<Arc<tokio::sync::Notify>>,
@@ -2085,10 +2085,7 @@ impl MockRemoteCarrierExitProvider {
         }
     }
 
-    fn with_close_failures(
-        close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
-        close_failures: usize,
-    ) -> Self {
+    fn with_close_failures(close_calls: BrowserCloseCallRecorder, close_failures: usize) -> Self {
         Self::with_close_behavior(
             MockExitClosePlan {
                 close_calls,
@@ -2228,7 +2225,9 @@ impl Provider for MockRemoteCarrierExitProvider {
             .and_then(|value| value.as_str())
             .unwrap_or("did:elastos:test");
         if request.get("op").and_then(|value| value.as_str()) == Some("close_stream") {
-            self.close_calls.lock().await.push(request.clone());
+            // Append the exact call, then publish the new count, so a waiter
+            // that sees the count can read this call.
+            self.close_calls.record(request.clone()).await;
             if let Some(close_started) = &self.close_started {
                 close_started.notify_one();
             }
@@ -2508,8 +2507,8 @@ struct MockReconciliatingBrowserEngineProvider {
     failure: MockDispatchedBrowserLaunchFailure,
     effect: TokioMutex<Option<serde_json::Value>>,
     launch_calls: std::sync::atomic::AtomicUsize,
-    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
-    reconciliation_calls: Arc<std::sync::atomic::AtomicUsize>,
+    close_calls: BrowserCloseCallRecorder,
+    reconciliation_calls: BrowserReconciliationCallRecorder,
 }
 
 #[derive(Clone, Copy)]
@@ -3251,7 +3250,9 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
             Some("status") if request.get("lifecycle_generation").is_some() => {
                 let reconciliation_call = self
                     .reconciliation_calls
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    .record(request.clone())
+                    .await
+                    - 1;
                 if matches!(
                     self.failure,
                     MockDispatchedBrowserLaunchFailure::DidNotActResourcesInUse
@@ -3494,11 +3495,9 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
             }
             Some("close_page") => {
                 assert_browser_close_request_contract(request);
-                let close_call = {
-                    let mut close_calls = self.close_calls.lock().await;
-                    close_calls.push(request.clone());
-                    close_calls.len()
-                };
+                // Append the exact call, then publish the new count, so a
+                // waiter that sees the count can read this call.
+                let close_call = self.close_calls.record(request.clone()).await;
                 if matches!(
                     self.failure,
                     MockDispatchedBrowserLaunchFailure::LateSuccessCleanupRetry

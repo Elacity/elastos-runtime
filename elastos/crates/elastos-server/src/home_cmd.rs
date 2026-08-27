@@ -364,8 +364,6 @@ struct PeopleStatus {
     service_offer_count: usize,
     #[serde(default)]
     service_offers: Vec<serde_json::Value>,
-    #[serde(default)]
-    discovery: PeopleDiscoveryStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -395,78 +393,6 @@ struct PeopleProfileCardStatus {
     display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handle: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct PeopleDiscoveryStatus {
-    #[serde(default)]
-    schema: String,
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    expires_at: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    remaining_seconds: Option<u64>,
-    #[serde(default)]
-    visibility: String,
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    status_message: String,
-    #[serde(default)]
-    topic: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    local_peer_id: Option<String>,
-    #[serde(default)]
-    discovered_count: usize,
-    #[serde(default)]
-    discovered_peers: Vec<PeopleDiscoveryPeerStatus>,
-    #[serde(default)]
-    request_count: usize,
-    #[serde(default)]
-    requests: Vec<PeopleDiscoveryRequestStatus>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    changed: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    refresh_fingerprint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    next_refresh_after_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct PeopleDiscoveryPeerStatus {
-    #[serde(default)]
-    peer_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    did: Option<String>,
-    #[serde(default)]
-    display_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    handle: Option<String>,
-    #[serde(default)]
-    last_seen_at: u64,
-    #[serde(default)]
-    status: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct PeopleDiscoveryRequestStatus {
-    #[serde(default)]
-    request_id: String,
-    #[serde(default)]
-    peer_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    did: Option<String>,
-    #[serde(default)]
-    display_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    handle: Option<String>,
-    #[serde(default)]
-    created_at: u64,
-    #[serde(default)]
-    status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    invite_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1769,51 +1695,6 @@ async fn dispatch_action(
             None => Ok("That Chat web guest session is already gone.".to_string()),
         };
     }
-    if let Some(invite_id) = action_id.strip_prefix("room-accept-invite:") {
-        let actor_did = snapshot.room.local_runtime_did.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "local ElastOS identity is not available for ElastOS user invite acceptance"
-            )
-        })?;
-        let member = elastos_server::room_service::accept_room_invite(
-            &default_data_dir(),
-            elastos_server::room_service::RoomInviteAcceptInput {
-                actor_did,
-                invite_id: invite_id.to_string(),
-            },
-        )?;
-        return Ok(format!("Joined Chat as {}.", member.member_did));
-    }
-    if let Some(invite_id) = action_id.strip_prefix("room-revoke-invite:") {
-        let actor_did = require_room_admin_actor(snapshot)?;
-        return match elastos_server::room_service::revoke_room_invite(
-            &default_data_dir(),
-            &actor_did,
-            invite_id,
-        )? {
-            Some(invite) => Ok(format!(
-                "Canceled ElastOS user invite for {}.",
-                invite.invited_did
-            )),
-            None => Ok("That ElastOS user invite is already gone.".to_string()),
-        };
-    }
-    if let Some(member_did) = action_id.strip_prefix("room-remove-member:") {
-        let actor_did = require_room_admin_actor(snapshot)?;
-        return match elastos_server::room_service::remove_room_member(
-            &default_data_dir(),
-            elastos_server::room_service::RoomMemberRemoveInput {
-                actor_did,
-                member_did: member_did.to_string(),
-            },
-        )? {
-            Some(member) => Ok(format!(
-                "Removed trusted participant {} from Chat.",
-                member.member_did
-            )),
-            None => Ok("That trusted participant is already gone.".to_string()),
-        };
-    }
     if let Some(source) = action_id.strip_prefix("site-stage:") {
         let source = source.trim();
         if source.is_empty() {
@@ -1927,50 +1808,6 @@ async fn dispatch_people_action(
 }
 
 fn people_api_action(action_id: &str) -> Option<anyhow::Result<PeopleApiAction>> {
-    if action_id == "people-discovery-enable" {
-        return Some(Ok(PeopleApiAction {
-            path: "/api/apps/people/discovery".to_string(),
-            body: serde_json::json!({ "enabled": true }),
-            success_message: "People discovery is on.",
-        }));
-    }
-    if action_id == "people-discovery-disable" {
-        return Some(Ok(PeopleApiAction {
-            path: "/api/apps/people/discovery".to_string(),
-            body: serde_json::json!({ "enabled": false }),
-            success_message: "People discovery is off.",
-        }));
-    }
-    if action_id == "people-discovery-refresh" {
-        return Some(Ok(PeopleApiAction {
-            path: "/api/apps/people/discovery/refresh".to_string(),
-            body: serde_json::json!({}),
-            success_message: "People discovery refreshed.",
-        }));
-    }
-    if let Some(peer_id) = action_id.strip_prefix("people-request-peer:") {
-        if peer_id.trim().is_empty() {
-            return Some(Err(anyhow::anyhow!("People peer id is missing")));
-        }
-        return Some(Ok(PeopleApiAction {
-            path: "/api/apps/people/discovery/requests".to_string(),
-            body: serde_json::json!({ "peer_id": peer_id }),
-            success_message: "People request sent.",
-        }));
-    }
-    if let Some(request_id) = action_id.strip_prefix("people-accept-request:") {
-        if request_id.trim().is_empty() {
-            return Some(Err(anyhow::anyhow!("People request id is missing")));
-        }
-        return Some(Ok(PeopleApiAction {
-            path: format!(
-                "/api/apps/people/discovery/requests/{}/accept",
-                percent_encode_path_segment(request_id)
-            ),
-            body: serde_json::json!({}),
-            success_message: "People request accepted.",
-        }));
-    }
     if let Some(contact_id) = action_id.strip_prefix("people-remove-contact:") {
         if contact_id.trim().is_empty() {
             return Some(Err(anyhow::anyhow!("People contact id is missing")));
@@ -2038,19 +1875,6 @@ fn people_contact_display_name(contact: &PeopleContactStatus, fallback: &str) ->
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(fallback)
         .to_string()
-}
-
-fn percent_encode_path_segment(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(*byte as char)
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
 }
 
 async fn dispatch_capsule_action(
@@ -3566,31 +3390,6 @@ fn action_readiness(action_id: &str, snapshot: &HomeSnapshot) -> ActionReadiness
                 )
             }
         }
-        _ if action_id.starts_with("room-revoke-invite:") => {
-            if room_admin_role(snapshot) {
-                ActionReadiness::Ready
-            } else {
-                ActionReadiness::Blocked(
-                    "only conversation managers may cancel ElastOS user invites".to_string(),
-                )
-            }
-        }
-        _ if action_id.starts_with("room-remove-member:") => {
-            if room_admin_role(snapshot) {
-                ActionReadiness::Ready
-            } else {
-                ActionReadiness::Blocked(
-                    "only conversation managers may remove trusted participants".to_string(),
-                )
-            }
-        }
-        _ if action_id.starts_with("room-accept-invite:") => {
-            if snapshot.room.local_runtime_did.is_some() {
-                ActionReadiness::Ready
-            } else {
-                ActionReadiness::Blocked("local ElastOS identity is not available yet".to_string())
-            }
-        }
         _ => ActionReadiness::Blocked("unknown action".to_string()),
     }
 }
@@ -3649,50 +3448,6 @@ fn gather_room_actions(snapshot: &HomeSnapshot) -> Vec<ActionInfo> {
             reason: None,
         });
     }
-    if let Some(local_runtime_did) = snapshot.room.local_runtime_did.as_deref() {
-        for invite in &snapshot.room.pending_invites {
-            if invite.invited_did == local_runtime_did {
-                actions.push(ActionInfo {
-                    id: format!("room-accept-invite:{}", invite.invite_id),
-                    label: "Join trusted conversation".to_string(),
-                    description: "Accept this ElastOS user invite on the local Home.".to_string(),
-                    command: "home: accept this ElastOS user invite on the local Home".to_string(),
-                    ready: true,
-                    reason: None,
-                });
-            }
-        }
-    }
-    if room_admin_role(snapshot) {
-        for invite in &snapshot.room.pending_invites {
-            actions.push(ActionInfo {
-                id: format!("room-revoke-invite:{}", invite.invite_id),
-                label: format!("Revoke invite for {}", invite.invited_did),
-                description: "Cancel this pending ElastOS user invite.".to_string(),
-                command: "home: cancel this specific ElastOS user invite".to_string(),
-                ready: true,
-                reason: None,
-            });
-        }
-        for member in &snapshot.room.members {
-            if member.role == "owner" {
-                continue;
-            }
-            if snapshot.room.local_runtime_did.as_deref() == Some(member.member_did.as_str()) {
-                continue;
-            }
-            if can_manage_member(snapshot, member) {
-                actions.push(ActionInfo {
-                    id: format!("room-remove-member:{}", member.member_did),
-                    label: format!("Remove {}", member.member_did),
-                    description: "Remove this trusted participant from Chat.".to_string(),
-                    command: "home: remove this trusted participant from Chat".to_string(),
-                    ready: true,
-                    reason: None,
-                });
-            }
-        }
-    }
     for request in &snapshot.room.pending_requests {
         actions.push(ActionInfo {
             id: format!("room-approve-request:{}", request.request_id),
@@ -3735,14 +3490,6 @@ fn room_admin_role(snapshot: &HomeSnapshot) -> bool {
         snapshot.room.local_runtime_role.as_deref(),
         Some("owner" | "admin")
     )
-}
-
-fn can_manage_member(snapshot: &HomeSnapshot, member: &RoomMemberStatus) -> bool {
-    match snapshot.room.local_runtime_role.as_deref() {
-        Some("owner") => member.role != "owner",
-        Some("admin") => member.role == "member",
-        _ => false,
-    }
 }
 
 fn require_room_admin_actor(snapshot: &HomeSnapshot) -> anyhow::Result<String> {
@@ -4223,15 +3970,7 @@ mod tests {
                     "can_message": true
                 }],
                 "service_offer_count": 2,
-                "service_offers": [{"offer_id": "offer-a"}, {"offer_id": "offer-b"}],
-                "discovery": {
-                    "schema": "elastos.people.discovery/v1",
-                    "enabled": true,
-                    "visibility": "trusted",
-                    "status": "ready",
-                    "status_message": "ready",
-                    "topic": "__elastos_internal/people-discovery-v1"
-                }
+                "service_offers": [{"offer_id": "offer-a"}, {"offer_id": "offer-b"}]
             },
             "services": {
                 "schema": "elastos.runtime.services/v1",
@@ -4367,38 +4106,11 @@ mod tests {
 
     #[test]
     fn people_actions_map_to_runtime_people_routes() {
-        let cases = [
-            (
-                "people-discovery-enable",
-                "/api/apps/people/discovery",
-                serde_json::json!({ "enabled": true }),
-            ),
-            (
-                "people-discovery-disable",
-                "/api/apps/people/discovery",
-                serde_json::json!({ "enabled": false }),
-            ),
-            (
-                "people-discovery-refresh",
-                "/api/apps/people/discovery/refresh",
-                serde_json::json!({}),
-            ),
-            (
-                "people-request-peer:peer-1",
-                "/api/apps/people/discovery/requests",
-                serde_json::json!({ "peer_id": "peer-1" }),
-            ),
-            (
-                "people-accept-request:req 1",
-                "/api/apps/people/discovery/requests/req%201/accept",
-                serde_json::json!({}),
-            ),
-            (
-                "people-remove-contact:contact-1",
-                "/api/apps/people/contacts/remove",
-                serde_json::json!({ "contact_id": "contact-1" }),
-            ),
-        ];
+        let cases = [(
+            "people-remove-contact:contact-1",
+            "/api/apps/people/contacts/remove",
+            serde_json::json!({ "contact_id": "contact-1" }),
+        )];
 
         for (action_id, path, body) in cases {
             let action = people_api_action(action_id)
@@ -4408,8 +4120,8 @@ mod tests {
             assert_eq!(action.body, body);
         }
         assert!(people_api_action("people-message:contact-1").is_none());
-        assert!(people_api_action("people-request-peer:")
-            .expect("request action should parse")
+        assert!(people_api_action("people-remove-contact:")
+            .expect("remove action should parse")
             .is_err());
     }
 
@@ -4895,6 +4607,53 @@ mod tests {
         assert!(labels.contains(&"Close public join requests".to_string()));
         assert!(labels.contains(&"Open ElastOS user invites".to_string()));
         assert!(labels.contains(&"Restrict web guest approvals".to_string()));
+    }
+
+    #[test]
+    fn room_actions_do_not_expose_unauthenticated_membership_commands() {
+        let mut snapshot = sample_snapshot_with_components(&[]);
+        snapshot.room.local_runtime_role = Some("owner".to_string());
+        snapshot.room.members = vec![
+            RoomMemberStatus {
+                member_did: "did:key:z6owner".to_string(),
+                role: "owner".to_string(),
+            },
+            RoomMemberStatus {
+                member_did: "did:key:z6member".to_string(),
+                role: "member".to_string(),
+            },
+        ];
+        snapshot.room.pending_invites = vec![RoomInviteStatus {
+            invite_id: "invite-1".to_string(),
+            invited_did: "did:key:z6pending".to_string(),
+            role: "member".to_string(),
+        }];
+        snapshot.room.pending_invite_count = snapshot.room.pending_invites.len();
+
+        let action_ids: Vec<String> = gather_room_actions(&snapshot)
+            .into_iter()
+            .map(|action| action.id)
+            .collect();
+        assert!(!action_ids
+            .iter()
+            .any(|action_id| action_id.starts_with("room-accept-invite:")));
+        assert!(!action_ids
+            .iter()
+            .any(|action_id| action_id.starts_with("room-revoke-invite:")));
+        assert!(!action_ids
+            .iter()
+            .any(|action_id| action_id.starts_with("room-remove-member:")));
+
+        for action_id in [
+            "room-accept-invite:invite-1",
+            "room-revoke-invite:invite-1",
+            "room-remove-member:did:key:z6member",
+        ] {
+            assert!(matches!(
+                action_readiness(action_id, &snapshot),
+                ActionReadiness::Blocked(reason) if reason == "unknown action"
+            ));
+        }
     }
 
     #[test]

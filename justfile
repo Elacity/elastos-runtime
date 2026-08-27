@@ -53,6 +53,7 @@ verify:
     node scripts/check-elastos-bus-wit.mjs
     node scripts/check-capsule-templates.mjs
     node scripts/home-entropy-check.mjs
+    node scripts/carrier-dependency-generation-check.mjs
     node scripts/home-clipboard-source-gate.mjs
     node scripts/browser-entropy-check.mjs
     node --test scripts/browser-window-close-handshake.test.mjs

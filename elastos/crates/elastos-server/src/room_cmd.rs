@@ -1,34 +1,14 @@
-use clap::ValueEnum;
 use serde::Serialize;
-use std::io::Read as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use elastos_server::browser_app_hosts::load_browser_app_hosted_endpoint;
 use elastos_server::notifications::sync_room_notifications;
 use elastos_server::room_service::{
-    accept_room_invite, approve_next_request, approve_request, deny_next_request, deny_request,
-    export_room_acceptance_envelope, export_room_invite_envelope, import_room_acceptance_envelope,
-    import_room_invite_envelope, invite_room_member, load_summary, local_runtime_access,
-    reset_room, room_root_uri, room_slug, seed_room_owner, ApprovalOutcome, DenyOutcome,
-    PendingRequestView, RoomInviteAcceptInput, RoomInviteInput, RoomOwnerSeedInput,
-    RoomResetOutput, RoomRole, RoomSummary,
+    approve_next_request, approve_request, deny_next_request, deny_request, load_summary,
+    local_runtime_access, reset_room, room_root_uri, room_slug, ApprovalOutcome, DenyOutcome,
+    PendingRequestView, RoomResetOutput, RoomRole, RoomSummary,
 };
 use elastos_server::sources::default_data_dir;
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum RoomInviteRoleArg {
-    Member,
-    Admin,
-}
-
-impl From<RoomInviteRoleArg> for RoomRole {
-    fn from(value: RoomInviteRoleArg) -> Self {
-        match value {
-            RoomInviteRoleArg::Member => RoomRole::Member,
-            RoomInviteRoleArg::Admin => RoomRole::Admin,
-        }
-    }
-}
 
 #[derive(Debug, Serialize)]
 struct RoomShowOutput {
@@ -48,25 +28,6 @@ pub async fn run_room(cmd: crate::RoomCommand) -> anyhow::Result<()> {
     match cmd {
         crate::RoomCommand::Show { json } => run_show(&data_dir, json).await,
         crate::RoomCommand::Pending { json } => run_pending(&data_dir, json).await,
-        crate::RoomCommand::Seed { title, json } => run_seed(&data_dir, title, json).await,
-        crate::RoomCommand::Invite { did, role, json } => {
-            run_invite(&data_dir, did, role, json).await
-        }
-        crate::RoomCommand::InviteExport { did, role, json } => {
-            run_invite_export(&data_dir, did, role, json).await
-        }
-        crate::RoomCommand::InviteImport { path, json } => {
-            run_invite_import(&data_dir, path, json).await
-        }
-        crate::RoomCommand::Accept { invite_id, json } => {
-            run_accept(&data_dir, invite_id, json).await
-        }
-        crate::RoomCommand::AcceptExport { invite_id, json } => {
-            run_accept_export(&data_dir, invite_id, json).await
-        }
-        crate::RoomCommand::AcceptImport { path, json } => {
-            run_accept_import(&data_dir, path, json).await
-        }
         crate::RoomCommand::Approve { request_id, json } => {
             run_approve(&data_dir, request_id, json).await
         }
@@ -182,9 +143,9 @@ async fn run_show(data_dir: &Path, json: bool) -> anyhow::Result<()> {
         }
     }
     if summary.room_control.owner_did.is_none() {
-        println!("Hint:       elastos room seed --title \"Room\"");
+        println!("Hint:       Use authenticated People or Chat to create room membership.");
     } else {
-        println!("Hint:       elastos room invite <did:key:...> --role member");
+        println!("Hint:       Use authenticated People or Chat to manage room membership.");
         println!("Next:       elastos room pending");
         println!("Open:       elastos room open --addr 0.0.0.0:8090");
     }
@@ -221,176 +182,6 @@ async fn run_pending(data_dir: &Path, json: bool) -> anyhow::Result<()> {
     }
     println!("Approve: elastos room approve <request-id>");
     println!("Deny:    elastos room deny <request-id> --reason \"Denied from CLI\"");
-    Ok(())
-}
-
-async fn run_seed(data_dir: &Path, title: String, json: bool) -> anyhow::Result<()> {
-    let owner_did = require_local_did(data_dir).await?;
-    let control = seed_room_owner(data_dir, RoomOwnerSeedInput { owner_did, title })?;
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&control)?);
-        return Ok(());
-    }
-
-    println!("Seeded room owner.");
-    println!(
-        "Owner DID:  {}",
-        control.owner_did.as_deref().unwrap_or("(missing)")
-    );
-    println!("Title:      {}", control.title);
-    Ok(())
-}
-
-async fn run_invite(
-    data_dir: &Path,
-    invited_did: String,
-    role: RoomInviteRoleArg,
-    json: bool,
-) -> anyhow::Result<()> {
-    let actor_did = require_local_did(data_dir).await?;
-    let invite = invite_room_member(
-        data_dir,
-        RoomInviteInput {
-            actor_did,
-            invited_did,
-            role: role.into(),
-        },
-    )?;
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&invite)?);
-        return Ok(());
-    }
-
-    println!(
-        "Created sovereign {} invite for {}.",
-        role_label(&invite.role),
-        invite.invited_did
-    );
-    println!("Invite ID:  {}", invite.invite_id);
-    println!("Expires:    {}", invite.expires_at);
-    println!(
-        "Note:       This records room membership intent on this runtime. Use `elastos room invite-export ...` to create a signed envelope for another runtime."
-    );
-    Ok(())
-}
-
-async fn run_invite_export(
-    data_dir: &Path,
-    invited_did: String,
-    role: RoomInviteRoleArg,
-    json: bool,
-) -> anyhow::Result<()> {
-    let actor_did = require_local_did(data_dir).await?;
-    let envelope = export_room_invite_envelope(
-        data_dir,
-        RoomInviteInput {
-            actor_did,
-            invited_did,
-            role: role.into(),
-        },
-    )?;
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&envelope)?);
-        return Ok(());
-    }
-
-    println!(
-        "Created signed sovereign {} invite envelope for {}.",
-        role_label(&envelope.payload.role),
-        envelope.payload.invited_did
-    );
-    println!("Invite ID:  {}", envelope.payload.invite_id);
-    println!("Expires:    {}", envelope.payload.expires_at);
-    println!("Signer:     {}", envelope.signer_did);
-    println!();
-    println!("{}", serde_json::to_string_pretty(&envelope)?);
-    Ok(())
-}
-
-async fn run_invite_import(
-    data_dir: &Path,
-    path: Option<PathBuf>,
-    json: bool,
-) -> anyhow::Result<()> {
-    let envelope_bytes = read_room_invite_bytes(path)?;
-    let invite = import_room_invite_envelope(data_dir, &envelope_bytes)?;
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&invite)?);
-        return Ok(());
-    }
-
-    println!("Imported sovereign room invite.");
-    println!("Invite ID:  {}", invite.invite_id);
-    println!("Invited DID: {}", invite.invited_did);
-    println!("Role:       {}", role_label(&invite.role));
-    println!("Next:       elastos room accept {}", invite.invite_id);
-    Ok(())
-}
-
-async fn run_accept(data_dir: &Path, invite_id: String, json: bool) -> anyhow::Result<()> {
-    let actor_did = require_local_did(data_dir).await?;
-    let next_invite_id = invite_id.clone();
-    let member = accept_room_invite(
-        data_dir,
-        RoomInviteAcceptInput {
-            actor_did,
-            invite_id,
-        },
-    )?;
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&member)?);
-        return Ok(());
-    }
-
-    println!("Joined room as {}.", role_label(&member.role));
-    println!("Member DID: {}", member.member_did);
-    println!(
-        "Next:       elastos room accept-export {}",
-        next_invite_id.trim()
-    );
-    Ok(())
-}
-
-async fn run_accept_export(data_dir: &Path, invite_id: String, json: bool) -> anyhow::Result<()> {
-    let envelope = export_room_acceptance_envelope(data_dir, &invite_id)?;
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&envelope)?);
-        return Ok(());
-    }
-
-    println!(
-        "Created signed room acceptance envelope for invite {}.",
-        envelope.payload.invite_id
-    );
-    println!("Member DID: {}", envelope.payload.member_did);
-    println!("Signer:     {}", envelope.signer_did);
-    println!();
-    println!("{}", serde_json::to_string_pretty(&envelope)?);
-    Ok(())
-}
-
-async fn run_accept_import(
-    data_dir: &Path,
-    path: Option<PathBuf>,
-    json: bool,
-) -> anyhow::Result<()> {
-    let envelope_bytes = read_room_invite_bytes(path)?;
-    let member = import_room_acceptance_envelope(data_dir, &envelope_bytes)?;
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&member)?);
-        return Ok(());
-    }
-
-    println!("Imported room acceptance.");
-    println!("Member DID: {}", member.member_did);
-    println!("Role:       {}", role_label(&member.role));
     Ok(())
 }
 
@@ -528,15 +319,6 @@ async fn run_reset(data_dir: &Path, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn require_local_did(data_dir: &Path) -> anyhow::Result<String> {
-    load_room_runtime_did(data_dir).await.map_err(|e| {
-        anyhow::anyhow!(
-            "local room DID is not available yet; initialize identity first or reopen Home: {}",
-            e
-        )
-    })
-}
-
 async fn load_room_summary_with_local_context(data_dir: &Path) -> anyhow::Result<RoomSummary> {
     let mut summary = load_summary(data_dir)?;
     let runtime_did = load_room_runtime_did(data_dir).await.ok();
@@ -592,22 +374,6 @@ fn print_local_room_open(opened: &elastos_server::operator_control::OperatorRoom
     }
     for extra in opened.room_urls.iter().skip(1) {
         println!("Also:       {}", extra);
-    }
-}
-
-fn read_room_invite_bytes(path: Option<PathBuf>) -> anyhow::Result<Vec<u8>> {
-    match path {
-        None => {
-            let mut bytes = Vec::new();
-            std::io::stdin().read_to_end(&mut bytes)?;
-            Ok(bytes)
-        }
-        Some(path) if path.as_os_str() == "-" => {
-            let mut bytes = Vec::new();
-            std::io::stdin().read_to_end(&mut bytes)?;
-            Ok(bytes)
-        }
-        Some(path) => std::fs::read(path).map_err(Into::into),
     }
 }
 

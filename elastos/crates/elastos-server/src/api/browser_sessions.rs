@@ -23,6 +23,9 @@ pub async fn browser_session_request(
     headers: HeaderMap,
     Json(body): Json<BrowserSessionRequestBody>,
 ) -> Response {
+    if state.collaboration_chat_product_port.is_some() {
+        return configured_collaboration_browser_session_unsupported_response();
+    }
     let data_dir = state.data_dir.clone();
     match tokio::task::spawn_blocking(move || {
         let host_member_did = elastos_identity::load_or_create_did(&data_dir)
@@ -64,6 +67,9 @@ pub async fn browser_session_request_status(
     headers: HeaderMap,
     Path(request_id): Path<String>,
 ) -> Response {
+    if state.collaboration_chat_product_port.is_some() {
+        return configured_collaboration_browser_session_unsupported_response();
+    }
     if super::gateway::cookie_value_from_headers(&headers, BROWSER_SESSION_REQUEST_COOKIE)
         .as_deref()
         != Some(request_id.as_str())
@@ -85,6 +91,14 @@ pub async fn browser_session_request_status(
         Ok(Err(err)) => browser_session_error_response(err),
         Err(err) => browser_session_join_error_response(err),
     }
+}
+
+fn configured_collaboration_browser_session_unsupported_response() -> Response {
+    (
+        StatusCode::CONFLICT,
+        "Configured collaboration Chat is available only through its signed Home projection.",
+    )
+        .into_response()
 }
 
 fn set_browser_request_cookie_header(

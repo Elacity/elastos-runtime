@@ -155,7 +155,7 @@ async fn run_component_capsule(
         move |line, capsule_id, principal_id| {
             let response = hostcall_handle
                 .block_on(
-                    elastos_server::carrier_bridge::handle_remote_request_with_audit_dir(
+                    elastos_server::resource_bridge::handle_remote_request_with_audit_dir(
                         line,
                         &api_url,
                         &client_token,

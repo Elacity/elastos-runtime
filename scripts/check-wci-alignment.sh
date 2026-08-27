@@ -392,8 +392,8 @@ check_forbidden_in_path 'wallet_provider_data' elastos/crates/elastos-server/src
 check_required 'wallet_resource_rejects_all_principal_sensitive_operations' elastos/crates/elastos-server/src/provider_resource.rs 'generic Wallet resources must reject principal-sensitive operations'
 check_required 'generic_http_wallet_operations_fail_before_provider_invocation' elastos/crates/elastos-server/src/api/handlers/provider.rs 'generic HTTP Wallet operations must fail before provider invocation'
 check_required 'generic_wallet_capability_requests_fail_before_pending' elastos/crates/elastos-server/src/api/handlers/capability.rs 'generic Wallet capabilities must fail before pending approval'
-check_required 'component_bridge_wallet_contract_fails_before_provider_invocation' elastos/crates/elastos-server/src/carrier_bridge.rs 'component Wallet Bus attempts must fail before provider invocation'
-check_required 'attached_bridge_wallet_contract_fails_before_http_dispatch' elastos/crates/elastos-server/src/carrier_bridge.rs 'attached component Wallet Bus attempts must fail before HTTP dispatch'
+check_required 'component_bridge_wallet_contract_fails_before_provider_invocation' elastos/crates/elastos-server/src/resource_bridge.rs 'component Wallet Bus attempts must fail before provider invocation'
+check_required 'attached_bridge_wallet_contract_fails_before_http_dispatch' elastos/crates/elastos-server/src/resource_bridge.rs 'attached component Wallet Bus attempts must fail before HTTP dispatch'
 check_required 'inspect_planning_exposes_only_wallet_status_without_provider_invocation' elastos/crates/elastos-server/src/api/gateway_tests/inspect.rs 'Inspect planning must expose only Wallet status without invoking the provider'
 check_required 'recover_evm_address' capsules/wallet-provider/src/main.rs 'wallet-provider must verify external EVM approval signatures before completion receipts'
 check_required '/api/apps/system/wallet/approvals' elastos/crates/elastos-server/src/api/gateway.rs 'System must expose wallet approval review through the runtime surface'
@@ -643,16 +643,13 @@ check_required 'System, People, Services, Browser, Wallet' docs/GETTING_STARTED.
 check_required 'Documents, Library, Marketplace, Archive, and Inbox' docs/GETTING_STARTED.md 'getting started must list Marketplace and Archive in the default Home visible surfaces'
 check_forbidden_in_path 'http://' elastos/crates/elastos-runtime/src/provider/registry.rs 'provider-registry tests/docs must not preserve http:// parity assumptions'
 check_forbidden_in_path 'localhost:// = ' README.md 'public docs must not flatten localhost:// into a single-root slogan'
-check_forbidden_in_path 'did-provider' capsules/chat/capsule.json 'chat capsule should use the host did bridge instead of bundling a stale did-provider dependency'
 check_forbidden_in_path 'component\.as_os_str\(\) == "target"' elastos/crates/elastos-server/src/binaries.rs 'provider resolution must not auto-enable repo asset lookup just because the binary runs from target/'
 check_forbidden_in_path 'component\.as_os_str\(\) == "target"' elastos/crates/elastos-server/src/ipfs.rs 'viewer resolution must not auto-enable repo asset lookup just because the binary runs from target/'
 check_forbidden_in_path 'Legacy TCP fallback' elastos/crates/elastos-server/src/vm_provider.rs 'vm provider bridge must not describe generic TCP fallback as a normal contract'
 check_forbidden_in_path 'guest_from_fallback' elastos/crates/elastos-server/src/init.rs 'init should name guest dependency source explicitly instead of treating registry dependency as an unnamed fallback'
 check_forbidden_in_path 'ListCapsules|LaunchCapsule|StopCapsule|GrantCapability|RevokeCapability|SendMessage|ReceiveMessages|FetchContent|StorageRead|StorageWrite' elastos/crates/elastos-guest/src/runtime.rs 'guest SDK must expose capsule-kernel calls, not raw runtime control/storage/message APIs'
-check_forbidden_in_path 'ProviderCall|ProviderResult|provider_call|provider_result' elastos/crates/elastos-guest/src/runtime.rs 'guest SDK must expose carrier_invoke, not provider_call'
-check_forbidden_in_path 'provider_call|Provider call' capsules/chat/src 'chat capsule must use carrier_invoke instead of provider_call'
-check_forbidden_in_path 'provider_call|Provider call' capsules/agent/src 'agent capsule must use carrier_invoke instead of provider_call'
-check_forbidden_in_path 'provider_call|Provider call' capsules/home-cli/src 'home-cli capsule must use carrier_invoke instead of provider_call'
+check_forbidden_in_path 'ProviderCall|ProviderResult|provider_call|provider_result' elastos/crates/elastos-guest/src/runtime.rs 'guest SDK must expose resource_invoke, not provider_call'
+check_forbidden_in_path 'provider_call|Provider call' capsules/home-cli/src 'home-cli capsule must use resource_invoke instead of provider_call'
 check_forbidden_in_path 'guest SDK|SDK request|SDK response|mirror the guest' elastos/crates/elastos-runtime/src/handler 'elastos-runtime handler must be named as internal shell/control, not public guest SDK'
 check_forbidden_in_path 'get_ipfs_bridge|prepare_capsule_from_cid|send_raw\("ipfs"' elastos/crates/elastos-server/src/run_cmd.rs 'run --cid must materialize through elastos://content, not raw IPFS'
 check_forbidden_in_path 'get_ipfs_bridge|prepare_capsule_from_cid|send_raw\("ipfs"' elastos/crates/elastos-server/src/serve_cmd.rs 'serve --cid must materialize through elastos://content, not raw IPFS'
@@ -663,6 +660,14 @@ import json, re, sys
 from pathlib import Path
 
 components = json.loads(Path("components.json").read_text())
+
+for obsolete in ("chat", "agent"):
+    if obsolete in components.get("capsules", {}) or obsolete in components.get("external", {}):
+        print(f"[alignment] obsolete transport-facing {obsolete} capsule must not be packaged")
+        sys.exit(1)
+    if any(obsolete in profile.get("components", []) for profile in components.get("profiles", {}).values()):
+        print(f"[alignment] obsolete transport-facing {obsolete} capsule must not appear in a profile")
+        sys.exit(1)
 
 allowed_roles = {"shell", "app", "viewer", "provider", "content"}
 ordinary_roles = {"app", "viewer", "content"}
@@ -753,8 +758,8 @@ for path in manifest_paths:
         problems = []
         if permissions.get("guest_network"):
             problems.append("guest_network")
-        if permissions.get("carrier"):
-            problems.append("carrier host execution")
+        if permissions.get("host_process"):
+            problems.append("host-process execution")
         if provides:
             problems.append("provides namespace")
         if manifest.get("providers"):
@@ -806,8 +811,8 @@ for path in manifest_paths:
     elif manifest.get("authority") is not None:
         print(f"[alignment] non-provider capsule {manifest.get('name', path)} declares provider authority metadata")
         sys.exit(1)
-    if permissions.get("carrier") and (role != "provider" or not provides):
-        print(f"[alignment] {path} uses carrier host execution without provider role and provides namespace")
+    if permissions.get("host_process") and (role != "provider" or not provides):
+        print(f"[alignment] {path} uses host-process execution without provider role and provides namespace")
         sys.exit(1)
     if permissions.get("guest_network") and (role != "provider" or not provides):
         print(f"[alignment] {path} uses guest_network without provider role and provides namespace")
@@ -1017,7 +1022,7 @@ if publish_rust_home != home_profile_capsules or publish_rust_required != home_p
     print("[alignment] missing from Rust home:", ", ".join(sorted(home_profile_capsules - publish_rust_home)) or "(none)")
     print("[alignment] extra in Rust home:", ", ".join(sorted(publish_rust_home - home_profile_capsules)) or "(none)")
     sys.exit(1)
-for demo_capsule in ["chat", "gba-emulator", "gba-ucity", "chat-room", "ipfs-provider", "tunnel-provider"]:
+for demo_capsule in ["gba-emulator", "gba-ucity", "chat-room", "ipfs-provider", "tunnel-provider"]:
     if demo_capsule not in publish_rust_demo:
         print(f"[alignment] Rust demo publish profile missing {demo_capsule}")
         sys.exit(1)
@@ -1034,28 +1039,6 @@ for provider in sorted(wallet_browser_providers):
     if provider not in publish_rust_required:
         print(f"[alignment] Rust required supported publish capsule set missing {provider}")
         sys.exit(1)
-chat = components["profiles"].get("chat")
-if not chat:
-    print("[alignment] chat profile is missing")
-    sys.exit(1)
-chat_components = set(chat["components"])
-required_chat = {
-    "shell",
-    "localhost-provider",
-    "did-provider",
-    "chat",
-    "crosvm",
-    "vmlinux",
-}
-missing_chat = sorted(required_chat.difference(chat_components))
-if missing_chat:
-    print("[alignment] chat profile missing required microVM chat components:", ", ".join(missing_chat))
-    sys.exit(1)
-forbidden_chat = {"kubo", "ipfs-provider", "site-provider", "tunnel-provider", "cloudflared"}
-bad_chat = sorted(forbidden_chat.intersection(chat_components))
-if bad_chat:
-    print("[alignment] chat profile includes non-chat transport/public components:", ", ".join(bad_chat))
-    sys.exit(1)
 blockchain = components["profiles"].get("blockchain")
 if not blockchain:
     print("[alignment] blockchain profile is missing")

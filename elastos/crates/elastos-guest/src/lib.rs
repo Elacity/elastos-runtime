@@ -18,7 +18,7 @@
 //!     {
 //!         let mut client = RuntimeClient::new();
 //!         let token = client.request_capability("elastos://did/*", "execute").unwrap();
-//!         let did = client.carrier_invoke("elastos://did/*", "get_did", &serde_json::json!({}), &token).unwrap();
+//!         let did = client.resource_invoke("elastos://did/*", "get_did", &serde_json::json!({}), &token).unwrap();
 //!         println!("DID: {did}");
 //!     }
 //! }

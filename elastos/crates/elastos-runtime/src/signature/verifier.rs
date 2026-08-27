@@ -193,6 +193,7 @@ mod tests {
             permissions: Permissions::default(),
             microvm: None,
             providers: None,
+            icon: None,
             viewer: None,
             signature: None,
         }

@@ -184,6 +184,9 @@ function listMarkdownFiles(dir = repoRootPath) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".superpowers" ||
+      entry.name === "superpowers" ||
+      entry.name === ".claude" ||
       entry.name === "target" ||
       entry.name === "node_modules"
     ) {
@@ -205,6 +208,9 @@ function listTextFiles(dir) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".superpowers" ||
+      entry.name === "superpowers" ||
+      entry.name === ".claude" ||
       entry.name === "target" ||
       entry.name === "node_modules"
     ) {
@@ -242,7 +248,7 @@ function assertProviderOperationEnumsRejectUnknownFields() {
 function assertGatewayRequestStructsRejectUnknownFields() {
   const names = [
     "HomeBrowserStateUpdate",
-    "SystemHandleUpdateRequest",
+    "PeopleProfileUpdateRequest",
     "SystemBackgroundOverlayRequest",
     "SystemGuestRegistrationRequest",
     "WalletApprovalRejectRequest",
@@ -346,9 +352,6 @@ function assertMarkdownLocalLinksResolve() {
 
 function assertUsersSelfReferencesAreApproved() {
   const allowed = new Set([
-    "capsules/chat/capsule.json",
-    "capsules/chat/src/carrier.rs",
-    "capsules/chat/src/session.rs",
     "capsules/browser-engine-adapter/src/main.rs",
     "capsules/browser-engine-adapter/src/tests.rs",
     "capsules/browser-engine-adapter/src/validation.rs",
@@ -365,7 +368,7 @@ function assertUsersSelfReferencesAreApproved() {
     "elastos/crates/elastos-server/src/api/gateway_tests/support_runtime.rs",
     "elastos/crates/elastos-server/src/api/handlers/storage.rs",
     "elastos/crates/elastos-server/src/api/viewer_gateway.rs",
-    "elastos/crates/elastos-server/src/carrier_bridge.rs",
+    "elastos/crates/elastos-server/src/resource_bridge.rs",
     "elastos/crates/elastos-server/src/notifications.rs",
     "elastos/crates/elastos-server/src/runtime_control.rs",
   ]);
@@ -416,6 +419,9 @@ function listFilesRecursive(dir) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".superpowers" ||
+      entry.name === "superpowers" ||
+      entry.name === ".claude" ||
       entry.name === "target" ||
       entry.name === "node_modules"
     ) {
@@ -960,10 +966,8 @@ const peopleCapsuleManifest = JSON.parse(read("capsules/people/capsule.json"));
 const systemCapsuleManifest = JSON.parse(read("capsules/system/capsule.json"));
 const appSurfaceCapsuleManifests = Object.fromEntries(
   [
-    "agent",
     "archive-manager",
     "browser",
-    "chat",
     "chat-room",
     "documents",
     "gba-emulator",
@@ -1125,7 +1129,6 @@ const homeCliTerminal = read("capsules/home-cli/src/terminal.rs");
 const homeCliText = read("capsules/home-cli/src/text.rs");
 const homeCliTests = read("capsules/home-cli/src/tests.rs");
 const homeCli = [homeCliMain, homeCliTerminal, homeCliText, homeCliTests].join("\n");
-const chatCarrier = read("capsules/chat/src/carrier.rs");
 const carrierService = read("elastos/crates/elastos-server/src/carrier_service.rs");
 const localhostProvider = read("elastos/capsules/localhost-provider/src/main.rs");
 const operatorControl = read(
@@ -1172,6 +1175,7 @@ const gatewayHomeTerminal = read(
   "elastos/crates/elastos-server/src/api/gateway_home_terminal.rs",
 );
 const gatewayInboxApi = read("elastos/crates/elastos-server/src/api/gateway_inbox.rs");
+const contactStore = read("elastos/crates/elastos-server/src/collaboration_contact_store.rs");
 const gatewayBrowserApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway_browser.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_engine.rs",
@@ -1280,7 +1284,7 @@ const notifications = read(
   "elastos/crates/elastos-server/src/notifications.rs",
 );
 const carrierBridge = read(
-  "elastos/crates/elastos-server/src/carrier_bridge.rs",
+  "elastos/crates/elastos-server/src/resource_bridge.rs",
 );
 const carrierRuntime = read("elastos/crates/elastos-server/src/carrier.rs");
 const runtimeCore = read("elastos/crates/elastos-server/src/runtime.rs");
@@ -2324,7 +2328,9 @@ assert(
     ) &&
     gatewayHomeSystemTests.includes('approved_offer["status"], "active"') &&
     gatewayHomeSystemTests.includes("fake-ticket-services-right") &&
-    gatewayHomeSystemTests.includes("offer[\"grant_required\"] == true") &&
+    gatewayHomeSystemTests.includes(
+      'assert_eq!(approved_offer["grant_required"], false)',
+    ) &&
     gatewayApi.includes("local:provider:browser-engine") &&
     gatewayApi.includes("local:provider:browser-exit") &&
     gatewayApi.includes("home_configured_remote_exit_offers") &&
@@ -2414,116 +2420,34 @@ assert(
 );
 assert(
   gatewayApi.includes('const PEOPLE_CAPSULE_ID: &str = "people"') &&
-    gatewayApi.includes('"/api/apps/people/summary"') &&
-    gatewayApi.includes('"/api/apps/people/discovery"') &&
-    gatewayApi.includes('"/api/apps/people/profile-card"') &&
-    gatewayApi.includes('"/api/apps/people/discovery/refresh"') &&
-    gatewayApi.includes('"/api/apps/people/discovery/requests"') &&
-    gatewayApi.includes('"/api/apps/people/discovery/requests/:request_id/accept"') &&
-    gatewayApi.includes('"/api/apps/people/discovery/requests/:request_id/join"') &&
-    gatewayApi.includes("HOME_PEOPLE_DISCOVERY_SCHEMA") &&
-    gatewayApi.includes("HOME_PEOPLE_CONTACTS_SCHEMA") &&
-    gatewayApi.includes("HOME_PEOPLE_DISCOVERY_TOPIC") &&
-    gatewayApi.includes("people_discovery_update") &&
-    gatewayApi.includes("people_profile_card_update") &&
-    gatewayApi.includes("update_profile_card_for_context") &&
-    gatewayApi.includes("people_discovery_refresh") &&
-    gatewayApi.includes("home_people_discovery_sync") &&
-    gatewayApi.includes("HOME_PEOPLE_DISCOVERY_PRESENCE_INTERVAL_SECS") &&
-    gatewayApi.includes("HOME_PEOPLE_DISCOVERY_BOOTSTRAP_INTERVAL_SECS") &&
-    gatewayApi.includes("home_people_discovery_annotate_refresh") &&
-    gatewayApi.includes("home_people_discovery_state_signature") &&
-    gatewayApi.includes("next_refresh_after_ms") &&
-    gatewayApi.includes("refresh_fingerprint") &&
-    gatewayApi.includes('"gossip_send"') &&
-    gatewayApi.includes('"gossip_recv"') &&
-    gatewayApi.includes("HOME_PEOPLE_DISCOVERY_ENABLED_SECS") &&
-    gatewayApi.includes("enabled_until: Option<u64>") &&
-    gatewayApi.includes("remaining_seconds: Option<u64>") &&
-    gatewayApi.includes("home_people_discovery_active") &&
-    gatewayApi.includes("home_people_discovery_apply_expiry") &&
+    gatewayApi.includes('\"/api/apps/people/summary\"') &&
+    gatewayApi.includes('\"/api/apps/people/profile\"') &&
+    gatewayApi.includes('\"/api/apps/people/contacts/remove\"') &&
+    gatewayApi.includes('\"/api/apps/people/presence\"') &&
+    gatewayApi.includes('\"/api/apps/people/discovery\"') &&
+    gatewayApi.includes('\"/api/apps/people/discovery/refresh\"') &&
+    gatewayApi.includes('\"/api/apps/people/discovery/requests\"') &&
+    !gatewayApi.includes('\"/api/apps/people/discovery/requests/:request_id/accept\"') &&
+    gatewayApi.includes("CollaborationPresenceProductPort") &&
+    !gatewayApi.includes("HOME_PEOPLE_CONTACTS_SCHEMA") &&
+    gatewayApi.includes("HOME_SERVICES_PEER_CONTACTS_SCHEMA") &&
+    !gatewayApi.includes("HOME_PEOPLE_DISCOVERY_TOPIC") &&
+    !gatewayApi.includes("people-discovery-peers.json") &&
+    gatewayApi.includes("HomePeopleDiscoverySummary") &&
     gatewayApi.includes("people_discovery_request_create") &&
-    gatewayApi.includes("people_discovery_request_accept") &&
-    gatewayApi.includes("people_discovery_request_join") &&
-    gatewayApi.includes("home_people_discovery_send_acceptance") &&
-    gatewayApi.includes("home_people_discovery_send_room_acceptance") &&
-    gatewayApi.includes("people discovery delivery failed") &&
-    gatewayApi.includes("home_people_upsert_contact") &&
-    gatewayApi.includes("clean_people_person_display_name") &&
-    gatewayApi.includes("home_people_discovery_request_visible") &&
-    gatewayApi.includes('matches!(request.status.as_str(), "incoming" | "requested")') &&
-    gatewayApi.includes('"connected".to_string()') &&
-    !gatewayApi.includes('"Carrier contact".to_string()') &&
-    !gatewayApi.includes("local Carrier runtime") &&
-    gatewayApi.includes('"Conversation provider".to_string()') &&
-    gatewayApi.includes('"Remote Exit".to_string()') &&
-    !gatewayApi.includes('"Carrier conversation".to_string()') &&
-    !gatewayApi.includes('"Carrier room service".to_string()') &&
-    gatewayApi.includes("apply_home_people_contacts_state") &&
-    gatewayApi.includes("home_people_discovery_sync_contacts") &&
-    gatewayApi.includes("merge_people_discovery_acceptance") &&
-    !sourceBlock(
-      gatewayApi,
-      "pub(super) async fn people_discovery_request_accept",
-      "People discovery accept handler",
-    ).includes("export_room_invite") &&
-    sourceBlock(
-      gatewayApi,
-      "pub(super) async fn people_discovery_request_create",
-      "People discovery request create handler",
-    ).includes('.context("people discovery delivery failed")?') &&
-    sourceBlock(
-      gatewayApi,
-      "pub(super) async fn people_discovery_request_accept",
-      "People discovery request accept handler",
-    ).includes('.context("people discovery delivery failed")?') &&
-    sourceBlock(
-      gatewayApi,
-      "pub(super) async fn people_discovery_request_join",
-      "People discovery request join handler",
-    ).includes('.context("people discovery delivery failed")?') &&
-    !sourceBlock(
-      gatewayApi,
-      "pub(super) async fn people_discovery_request_create",
-      "People discovery request create handler",
-    ).includes("let _ = home_people_discovery_send_request") &&
-    !sourceBlock(
-      gatewayApi,
-      "pub(super) async fn people_discovery_request_accept",
-      "People discovery request accept handler",
-    ).includes("let _ = home_people_discovery_send_acceptance") &&
-    !sourceBlock(
-      gatewayApi,
-      "pub(super) async fn people_discovery_request_join",
-      "People discovery request join handler",
-    ).includes("let _ = home_people_discovery_send_room_acceptance") &&
-    !gatewayApi.includes("home_people_discovery_send_invite") &&
-    gatewayApi.includes("struct HomePeopleDiscoverySummary") &&
-    gatewayApi.includes("discovery: HomePeopleDiscoverySummary") &&
-    gatewayHomeSystemTests.includes("test_people_discovery_toggle_persists_in_home_summary") &&
-    gatewayHomeSystemTests.includes(
-      "test_people_discovery_expired_visibility_reports_off_and_refresh_does_not_publish",
-    ) &&
-    gatewayHomeSystemTests.includes("test_people_discovery_refresh_finds_visible_peer") &&
-    gatewayHomeSystemTests.includes("test_people_profile_card_update_uses_people_launch_token") &&
+    !gatewayApi.includes("people_discovery_request_accept") &&
+    gatewayInboxApi.includes("contact-accept-request:") &&
+    gatewayInboxApi.includes("contact-decline-request:") &&
+    gatewayApi.includes("configured_people_discovery_summary") &&
+    gatewayHomeSystemTests.includes("test_people_profile_update_uses_people_launch_token") &&
     gatewayHomeSystemTests.includes("test_people_summary_requires_people_launch_token") &&
-    gatewayHomeSystemTests.includes("test_people_discovery_request_accept_contact_round_trip") &&
-    gatewayHomeSystemTests.includes(
-      "test_people_discovery_request_send_failure_does_not_save_requested_state",
-    ) &&
-    gatewayHomeSystemTests.includes(
-      "test_people_discovery_accept_send_failure_does_not_save_joined_state",
-    ) &&
-    gatewayHomeSystemTests.includes(
-      "test_people_discovery_join_send_failure_does_not_save_joined_state",
-    ) &&
-    gatewayApi.includes('"/api/apps/people/invites/create"') &&
-    gatewayApi.includes("people_invite_create") &&
-    gatewayApi.includes("ensure_local_principal_room_session") &&
-    gatewayApi.includes("export_room_join_invite") &&
+    gatewayHomeSystemTests.includes('payload["discovery"]["schema"]') &&
+    gatewayHomeSystemTests.includes('payload["discovery"].get("peer_id").is_none()') &&
+    !gatewayApi.includes('\"/api/apps/people/invites/create\"') &&
+    !gatewayApi.includes("people_invite_create") &&
     roomService.includes('invite_url: format!("elastos://peer/invite?token={token}")') &&
     roomService.includes("RoomRole::Member => matches!(invited_role, RoomRole::Member)"),
-  "People Discovery must create People entries while conversation invites remain a separate room policy route",
+  "People must expose opt-in discovery and signed-contact projection without reviving the old raw-peer discovery backend or the stale shared-room invite handoff",
 );
 const finishAttachmentUploadBlock = sourceBlock(
   roomService,
@@ -2543,30 +2467,34 @@ assert(
   "Room attachment upload finish must keep retry state until the attachment commit is proven",
 );
 assert(
-  gatewayApi.includes("CarrierClient::connect_endpoint_addr") &&
-    gatewayApi.includes("room transport trusted-source pull returned messages") &&
-    gatewayTests.includes("Chat Room summary must not expose raw trusted-source ticket authority") &&
-    gatewayTests.includes("Chat Room summary must not expose trusted-source connect_ticket fields") &&
-    read("docs/ARCHITECTURE.md").includes(
-      "Runtime-owned trusted-source Room bootstrap exception",
-    ) &&
-    read("docs/CARRIER.md").includes("raw trusted-source") &&
-    read("docs/CARRIER.md").includes("decoded endpoints") &&
-    read("docs/CARRIER.md").includes("direct Carrier socket authority"),
-  "Room trusted-source bootstrap must be classified as a Runtime-owned Carrier exception and must not expose raw ticket authority to capsules/UI",
-);
-assert(
   gatewayApi.includes('"/api/apps/people/contacts/remove"') &&
     gatewayApi.includes("people_contact_remove") &&
-    gatewayApi.includes("HOME_PEOPLE_REMOVED_CONTACTS_SCHEMA") &&
-    gatewayApi.includes("home_mark_people_contact_removed") &&
-    gatewayApi.includes("filter_removed_people_contacts") &&
+    gatewayApi.includes(
+      ".remove_contact(&authority.store, &authority.profile, &remote_did, now_ts())",
+    ) &&
+    !sourceBlock(
+      gatewayApi,
+      "pub(super) async fn people_contact_remove",
+      "People contact remove handler",
+    ).includes("record_local_contact_revocation") &&
+    gatewayApi.includes('"scope": "profile_contact"') &&
+    !gatewayApi.includes("HOME_PEOPLE_REMOVED_CONTACTS_SCHEMA") &&
+    !gatewayApi.includes("home_mark_people_contact_removed") &&
+    !gatewayApi.includes("filter_removed_people_contacts") &&
     !sourceBlock(
       gatewayApi,
       "pub(super) async fn people_contact_remove",
       "People contact remove handler",
     ).includes("remove_room_member"),
-  "People Remove must be local People state, not conversation member ejection",
+  "People Remove must use Profile-contact authority, not device-contact state or conversation member ejection",
+);
+assert(
+  contactStore.includes("removed_contacts") &&
+    contactStore.includes("fn record_local_contact_revocation") &&
+    contactStore.includes("fn apply_remote_contact_revocation") &&
+    contactStore.includes("removed relationship has no signed acceptance chain") &&
+    contactStore.includes("accepted profile head is not bound to a known relationship"),
+  "Contact removal is signed and visible on both sides: removed pairs trace to acceptance truth, and retained heads bind to known relationships only",
 );
 assert(
   shellJs.includes('scope === "people"') &&
@@ -3741,7 +3669,7 @@ assert(
   "Capsule-kernel bridge must scope Users/self through a principal context or fail closed",
 );
 assert(
-  carrierBridge.includes("protected_principal_root_carrier_response") &&
+  carrierBridge.includes("protected_principal_root_resource_response") &&
     carrierBridge.includes("write_principal_root_object("),
   "Capsule-kernel bridge must route protected Users/self object writes through runtime principal-root encryption",
 );
@@ -3839,15 +3767,14 @@ assert(
     localhostProvider.includes("test_storage_request_body_token_is_optional") &&
     carrierBridge.includes('object.remove("token")') &&
     carrierBridge.includes(
-      "carrier_invoke_localhost_uses_envelope_token_and_redacts_body_token",
+      "resource_invoke_localhost_uses_envelope_token_and_redacts_body_token",
     ) &&
     carrierBridge.includes(
-      "carrier_invoke_localhost_rejects_missing_envelope_token_even_with_body_token",
+      "resource_invoke_localhost_rejects_missing_envelope_token_even_with_body_token",
     ) &&
     !carrierService.includes('"token": ""') &&
     !homeCmd.includes('"token": access.') &&
-    !homeCli.includes('"token": token') &&
-    !chatCarrier.includes('"token": storage_token'),
+    !homeCli.includes('"token": token'),
   "Localhost provider storage authority must use the carrier/provider envelope token, not duplicate body token fields",
 );
 assert(
@@ -3907,7 +3834,7 @@ assert(
 );
 assert(
   operatorControl.includes(
-    "crate::runtime_control::read_operator_runtime_coords",
+    "crate::runtime_control::read_attachable_runtime_coords",
   ),
   "Operator control must use canonical runtime coord validation",
 );
@@ -4124,7 +4051,7 @@ for (const component of [...publishReleaseDefault]) {
     `publish-release default capsule set must not include demo-only capsule ${component}`,
   );
 }
-for (const component of ["chat", "gba-emulator", "gba-ucity", "chat-room", "ipfs-provider", "tunnel-provider"]) {
+for (const component of ["gba-emulator", "gba-ucity", "chat-room", "ipfs-provider", "tunnel-provider"]) {
   assert(
     publishRustDemo.has(component),
     `Rust demo publish profile must include ${component}`,
@@ -5446,12 +5373,11 @@ assert(
     providerRegistry.includes("elastos.provider.invocation/v1") &&
     providerRegistry.includes("runtime-local-provider-plane") &&
     providerRegistry.includes("carrier-provider-plane") &&
-    providerRegistry.includes("struct ProviderCarrierRoute") &&
+    providerRegistry.includes("enum ProviderCarrierRoute") &&
     providerRegistry.includes("enum ProviderInvocationTransport") &&
     providerRegistry.includes("trait ProviderCarrierInvoker") &&
     providerRegistry.includes("set_carrier_invoker") &&
-    providerRegistry.includes("provider_carrier_route_receipt") &&
-    providerRegistry.includes("route.peer_did.as_deref()") &&
+    providerRegistry.includes("peer_did.as_deref()") &&
     providerRegistry.includes(
       "Carrier provider invocation requires registered Carrier invoker",
     ) &&
@@ -5463,7 +5389,9 @@ assert(
     providerRegistry.includes("provider byte range expected {expected} bytes") &&
     providerRegistry.includes("provider invocation request must not predeclare runtime field") &&
     providerRegistry.includes('response["data"]["runtime_invocation"]["schema"]') &&
+    providerRegistry.includes('response["data"]["runtime_invocation"]["carrier"]') &&
     providerRegistry.includes('response["_runtime_transfer"]["capability"]') &&
+    providerRegistry.includes('response["_runtime_transfer"]["carrier"]') &&
     providerRegistry.includes('response["_runtime_transfer"]["transport"]') &&
     providerRegistry.includes("test_provider_invocation_attaches_range_progress_transfer_receipt") &&
     providerRegistry.includes('assert_eq!(sliced, b"abcdefghij");') &&
@@ -5922,12 +5850,14 @@ assert(
     carrierRuntime.includes('"transfer": "stream"') &&
     carrierRuntime.includes("ProviderTransfer::Stream") &&
     carrierRuntime.includes('"carrier_provider_invoke"') &&
-    carrierRuntime.includes('"content" | "availability" | "rights" | "key" | "decrypt" | "drm"') &&
+    /"content"\s*\|\s*"availability"\s*\|\s*"rights"\s*\|\s*"key"\s*\|\s*"decrypt"\s*\|\s*"drm"\s*\|\s*"collaboration"\s*\|\s*"collaboration-direct"\s*\|\s*"collaboration-profile"/.test(
+      carrierRuntime,
+    ) &&
     carrierRuntime.includes("CarrierProviderInvoker") &&
     carrierRuntime.includes("ProviderCarrierInvoker for CarrierProviderInvoker") &&
     carrierRuntime.includes("invoke_provider(") &&
     carrierRuntime.includes("carrier_endpoint_matches_peer") &&
-    carrierRuntime.includes("provider_invoke carrier metadata must not expose connect_ticket") &&
+    carrierRuntime.includes('assert!(!response.to_string().contains("\\\"connect_ticket\\\":"));') &&
     carrierRuntime.includes("test_carrier_provider_invoke_dispatches_runtime_enveloped_request") &&
     carrierRuntime.includes("test_carrier_provider_invoke_accepts_stream_contract_metadata") &&
     carrierRuntime.includes("test_carrier_provider_invoke_rejects_stream_without_contract_metadata") &&
@@ -5953,9 +5883,11 @@ assert(
     carrierRuntime.includes("test_content_availability_replicas_ignore_signed_repair_only_announcements") &&
     carrierRuntime.includes("test_content_availability_replicas_ignore_oversized_candidate_metadata") &&
     carrierRuntime.includes('remote_transfer["transfer"], "stream"') &&
+    carrierRuntime.includes("connect_resolved_peer") &&
+    carrierRuntime.includes("ProviderError::Unavailable") &&
     serverInfra.includes("set_carrier_invoker") &&
     serverInfra.includes("CarrierAvailabilityProvider::with_provider_registry") &&
-    serverInfra.includes("CarrierProviderInvoker::new()") &&
+    serverInfra.includes("CarrierProviderInvoker::with_carrier_endpoint(") &&
     serverInfra.includes("maybe_spawn_content_repair_scheduler") &&
     serverInfra.includes("ELASTOS_CONTENT_REPAIR_SCHEDULER") &&
     serverInfra.includes("invoke_content_repair_worker(") &&

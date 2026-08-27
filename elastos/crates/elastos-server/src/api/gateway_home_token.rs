@@ -8,7 +8,7 @@ use super::*;
 const HOME_LAUNCH_TOKEN_SCHEMA: &str = "elastos.home.launch-token/v4";
 const HOME_LAUNCH_CONTEXT_SCHEMA: &str = "elastos.runtime.browser-launch/v1";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HomeLaunchTokenContext {
     pub principal_id: String,
     pub session_id: String,
@@ -287,7 +287,7 @@ fn issue_home_launch_token_at(
 }
 
 #[cfg(test)]
-fn issue_expired_home_launch_token_with_context(
+pub(crate) fn issue_expired_home_launch_token_with_context(
     data_dir: &std::path::Path,
     app: &str,
     context: &HomeLaunchTokenContext,
@@ -481,7 +481,8 @@ fn require_home_launch_token_for_any_from_with_origin(
     cookie_name: Option<&str>,
     origin_policy: HomeLaunchOriginPolicy,
 ) -> anyhow::Result<RequiredHomeLaunchToken> {
-    if home_launch_token_credential(headers, cookie_name)?.is_none() {
+    let (header_token, cookie_token) = home_launch_token_candidates(headers, cookie_name)?;
+    if header_token.is_none() && cookie_token.is_none() {
         anyhow::bail!("missing home launch token");
     }
     let expected_did = load_existing_gateway_runtime_did(data_dir)
@@ -507,14 +508,52 @@ fn require_home_launch_token_for_any_from_expected_did(
     auth_data_dir: &std::path::Path,
     origin_policy: HomeLaunchOriginPolicy,
 ) -> anyhow::Result<RequiredHomeLaunchToken> {
-    let token = home_launch_token_credential(headers, cookie_name)?
-        .ok_or_else(|| anyhow::anyhow!("missing home launch token"))?;
-    let required = require_home_launch_token_value_from_expected_did(
-        token.as_str(),
-        allowed_apps,
-        expected_did,
-        auth_data_dir,
-    )?;
+    let (header_token, cookie_token) = home_launch_token_candidates(headers, cookie_name)?;
+    let required = match (header_token.as_deref(), cookie_token.as_deref()) {
+        (None, None) => anyhow::bail!("missing home launch token"),
+        (Some(token), None) | (None, Some(token)) => {
+            require_home_launch_token_value_from_expected_did(
+                token,
+                allowed_apps,
+                expected_did,
+                auth_data_dir,
+            )?
+        }
+        (Some(header), Some(cookie)) if header == cookie => {
+            require_home_launch_token_value_from_expected_did(
+                header,
+                allowed_apps,
+                expected_did,
+                auth_data_dir,
+            )?
+        }
+        (Some(header), Some(cookie)) => {
+            // Session refresh rotates the cookie while open tabs still hold
+            // the prior mint, so a divergent pair is only a conflict when the
+            // two tokens verify to different session authorities. Same
+            // authority answers with the cookie, the newest server-set mint.
+            let from_cookie = require_home_launch_token_value_from_expected_did(
+                cookie,
+                allowed_apps,
+                expected_did.clone(),
+                auth_data_dir,
+            );
+            let from_header = require_home_launch_token_value_from_expected_did(
+                header,
+                allowed_apps,
+                expected_did,
+                auth_data_dir,
+            );
+            match (from_cookie, from_header) {
+                (Ok(from_cookie), Ok(from_header))
+                    if from_cookie.context == from_header.context =>
+                {
+                    from_cookie
+                }
+                _ => anyhow::bail!("conflicting Home launch-token authorities"),
+            }
+        }
+    };
     match origin_policy {
         HomeLaunchOriginPolicy::Browser
             if required.launch_context.executable_actor == HOME_CAPSULE_ID =>
@@ -756,21 +795,16 @@ fn single_home_launch_token_header(headers: &HeaderMap) -> anyhow::Result<Option
     Ok(Some(value.to_string()))
 }
 
-fn home_launch_token_credential(
+fn home_launch_token_candidates(
     headers: &HeaderMap,
     cookie_name: Option<&str>,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<(Option<String>, Option<String>)> {
     let header = single_home_launch_token_header(headers)?;
     let cookie = match cookie_name {
         Some(name) => single_cookie_value(headers, name)?,
         None => None,
     };
-    if let (Some(header), Some(cookie)) = (header.as_deref(), cookie.as_deref()) {
-        if header != cookie {
-            anyhow::bail!("conflicting Home launch-token authorities");
-        }
-    }
-    Ok(header.or(cookie))
+    Ok((header, cookie))
 }
 
 fn single_cookie_value(headers: &HeaderMap, name: &str) -> anyhow::Result<Option<String>> {
@@ -1317,12 +1351,10 @@ mod tests {
         .to_string()
         .contains("proofless home launch token"));
 
-        let home_token = issue_home_launch_token_with_context(
-            data_dir.path(),
-            HOME_CAPSULE_ID,
-            &local_home_launch_token_context(data_dir.path()).unwrap(),
-        )
-        .unwrap();
+        let home_context = local_home_launch_token_context(data_dir.path()).unwrap();
+        let home_token =
+            issue_home_launch_token_with_context(data_dir.path(), HOME_CAPSULE_ID, &home_context)
+                .unwrap();
         let mut home = HeaderMap::new();
         home.insert("x-elastos-home-token", home_token.parse().unwrap());
         home.insert("host", "localhost:45542".parse().unwrap());
@@ -1358,6 +1390,20 @@ mod tests {
                 .to_string()
                 .contains("conflicting Home launch-token authorities")
         );
+
+        let rotated_token =
+            issue_home_launch_token_with_context(data_dir.path(), HOME_CAPSULE_ID, &home_context)
+                .unwrap();
+        assert_ne!(rotated_token, home_token);
+        let mut rotated_cookie = home.clone();
+        rotated_cookie.insert(
+            axum::http::header::COOKIE,
+            format!("{HOME_SESSION_COOKIE}={rotated_token}")
+                .parse()
+                .unwrap(),
+        );
+        require_home_token_context(data_dir.path(), &rotated_cookie)
+            .expect("a rotated same-session cookie beside a stale header must stay signed");
 
         let mut sibling = home.clone();
         sibling.insert("origin", "http://localhost:45543".parse().unwrap());

@@ -111,11 +111,25 @@ pub fn file_backed_prefixes() -> Vec<String> {
         .collect()
 }
 
+/// Roots holding per-person protected data. Protected writes refuse a parent
+/// anyone else can read, so these must be owner-only from the moment they
+/// exist — and healed if an earlier boot created them with the process umask,
+/// or no one on that Home can ever save protected state.
+const OWNER_ONLY_ROOTS: &[&str] = &["Users", "UsersAI"];
+
 pub fn ensure_file_backed_roots(base_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut created = Vec::new();
     for root in FILE_BACKED_ROOTS {
         let path = base_dir.join(root);
         std::fs::create_dir_all(&path)?;
+        #[cfg(unix)]
+        if OWNER_ONLY_ROOTS.contains(root) {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.is_dir() && metadata.permissions().mode() & 0o077 != 0 {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
         created.push(path);
     }
     Ok(created)

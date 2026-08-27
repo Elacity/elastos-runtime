@@ -49,6 +49,10 @@ pub(crate) struct LaunchableBrowserCapsule {
     pub name: String,
     pub description: Option<String>,
     pub role: CapsuleRole,
+    /// Capsule-relative entrypoint, the anchor icon routes resolve against.
+    pub entrypoint: String,
+    /// Capsule-relative icon directory as declared in the manifest.
+    pub icon: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -58,6 +62,8 @@ pub(crate) struct ViewerBoundCapsule {
     pub viewer: String,
     pub entrypoint: String,
     pub storage: Vec<String>,
+    /// Capsule-relative icon directory as declared in the manifest.
+    pub icon: Option<String>,
 }
 
 pub async fn serve_browser_app_root(AxumPath(app): AxumPath<String>) -> Response {
@@ -239,6 +245,8 @@ pub(crate) fn list_launchable_browser_capsules(data_dir: &Path) -> Vec<Launchabl
                 name: capsule.manifest.name,
                 description: capsule.manifest.description,
                 role: capsule.manifest.role,
+                entrypoint: capsule.manifest.entrypoint,
+                icon: capsule.manifest.icon,
             },
         );
     }
@@ -267,6 +275,7 @@ pub(crate) fn list_viewer_bound_capsules(data_dir: &Path, viewer: &str) -> Vec<V
                 viewer: viewer.to_string(),
                 entrypoint: manifest.entrypoint,
                 storage: manifest.permissions.storage,
+                icon: manifest.icon,
             },
         );
     }
@@ -310,6 +319,7 @@ pub(crate) fn resolve_viewer_bound_capsule(
             viewer: viewer.to_string(),
             entrypoint: manifest.entrypoint,
             storage: manifest.permissions.storage,
+            icon: manifest.icon,
         });
     }
 
@@ -653,7 +663,8 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         write_test_wasm_browser_capsule(data_dir.path(), "home-cli", "Home CLI", "shell");
         let mut headers = test_request_headers();
-        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("host", "home.example.test".parse().unwrap());
+        headers.insert("origin", "https://home.example.test".parse().unwrap());
 
         let response =
             serve_browser_capsule_path(data_dir.path(), &headers, "home-cli", None).await;
@@ -663,8 +674,8 @@ mod tests {
             .get("content-security-policy")
             .and_then(|value| value.to_str().ok())
             .unwrap();
-        assert!(csp.contains("connect-src https://localhost:61180 wss://localhost:61180"));
-        assert!(!csp.contains("ws://localhost:61180"));
+        assert!(csp.contains("connect-src https://home.example.test wss://home.example.test"));
+        assert!(!csp.contains("ws://home.example.test"));
     }
 
     #[test]

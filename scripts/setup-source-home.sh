@@ -83,6 +83,27 @@ find_cargo() {
     exit 1
 }
 
+require_supported_rust() {
+    local rustc_bin="$1"
+    local output
+    local version
+    local major
+    local minor
+
+    output="$(cd "$ROOT" && "$rustc_bin" --version)"
+    version="$(printf '%s\n' "$output" | awk '{print $2}')"
+    if [[ ! "$version" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?([+-].*)?$ ]]; then
+        echo "Could not parse Rust version from: $output" >&2
+        exit 1
+    fi
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    if (( major < 1 || (major == 1 && minor < 91) )); then
+        echo "Rust 1.91 or newer is required; found ${version}." >&2
+        exit 1
+    fi
+}
+
 find_node() {
     if [[ -n "${ELASTOS_NODE_BIN:-}" && -x "${ELASTOS_NODE_BIN}" ]]; then
         printf '%s\n' "${ELASTOS_NODE_BIN}"
@@ -473,6 +494,7 @@ NODE_BIN="$(find_node)"
 BROWSER_VM_ROOTFS_BACKUP=""
 configure_rust_toolchain_env "$CARGO_BIN"
 export PATH="$(dirname "$CARGO_BIN"):$(dirname "$NODE_BIN"):${PATH}"
+require_supported_rust "$(command -v rustc)"
 
 provider_names() {
     printf '%s\n' \

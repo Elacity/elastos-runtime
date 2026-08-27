@@ -2,7 +2,7 @@
 
 use std::{
     fs::{File, OpenOptions},
-    io::{ErrorKind, Write},
+    io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
@@ -406,18 +406,13 @@ pub struct PrincipalRecord {
     pub updated_at: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimePrincipalRole {
+    // Existing local runtimes with a single pre-role passkey remain recoverable.
+    #[default]
     Admin,
     Guest,
-}
-
-impl Default for RuntimePrincipalRole {
-    fn default() -> Self {
-        // Existing local runtimes with a single pre-role passkey remain recoverable.
-        Self::Admin
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1377,6 +1372,99 @@ pub fn begin_declarative_principal_root_protection_activation(
     Ok(PrincipalRootProtectionActivationGuard { _guard: guard })
 }
 
+pub(crate) struct PrincipalRootProtectionActivationWithPlaintext {
+    pub(crate) guard: PrincipalRootProtectionActivationGuard,
+    pub(crate) plaintext_objects: Vec<PrincipalRootMigrationSelectionV1>,
+}
+
+/// First-time activation cannot demand an already-clean root: the shell
+/// writes declared objects (Home browser state, for one) before a person can
+/// reach Recovery, so the export flow captures the surviving plaintext here
+/// and migrates it under this same guard once the root's protection exists.
+/// Declared encrypted envelopes are still verified against the stored
+/// protection exactly as in the strict entry above.
+pub(crate) fn begin_declarative_principal_root_protection_activation_migrating_plaintext(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    inventory: &[PrincipalRootProtectedObjectDeclarationV1],
+) -> anyhow::Result<PrincipalRootProtectionActivationWithPlaintext> {
+    validate_principal_root_object_binding(principal_id, localhost_root, localhost_root)?;
+    let guard = principal_root_object_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
+    let protection = load_principal_root_protection(data_dir, principal_id, localhost_root)?;
+    let classified = classify_declared_principal_root_objects(
+        data_dir,
+        principal_id,
+        localhost_root,
+        inventory,
+    )?;
+    verify_classified_principal_root_objects_with_stored_protection(
+        data_dir,
+        protection.as_ref(),
+        &classified,
+    )?;
+    Ok(PrincipalRootProtectionActivationWithPlaintext {
+        guard: PrincipalRootProtectionActivationGuard { _guard: guard },
+        plaintext_objects: classified.plaintext_objects,
+    })
+}
+
+/// Can the online path finish what protecting this root would start?
+///
+/// Protecting a root stores the protection before it can encrypt anything
+/// under it, so a migration that fails afterwards leaves exactly the pair
+/// the boot check refuses to start on: a protected root with plaintext
+/// still beside it. The plan validator caps one migration far below the
+/// inventory ceiling, so an ordinary Documents folder can exceed it. Ask
+/// while refusing still costs nothing, and leave the larger migration to
+/// the offline command, which can hold the Home still while it works.
+pub(crate) fn ensure_online_plaintext_migration_is_possible(
+    plaintext_objects: &[PrincipalRootMigrationSelectionV1],
+) -> anyhow::Result<()> {
+    if plaintext_objects.len() > MAX_MIGRATION_OBJECTS {
+        anyhow::bail!(
+            "migration_required: {} unprotected objects exceed the {} this can move while the \
+             Home is running; run the offline principal-root upgrade first",
+            plaintext_objects.len(),
+            MAX_MIGRATION_OBJECTS,
+        );
+    }
+    Ok(())
+}
+
+/// Migrate the plaintext selections captured at activation begin, under the
+/// held activation guard, once the root's protection is stored. Runs the same
+/// journaled plan machinery as the offline command; the backup lands under
+/// the Home's own backups directory.
+pub(crate) fn migrate_principal_root_plaintext_objects_under_activation(
+    _activation: &PrincipalRootProtectionActivationGuard,
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    selections: Vec<PrincipalRootMigrationSelectionV1>,
+) -> anyhow::Result<PrincipalRootMigrationReceiptV1> {
+    let plan = PrincipalRootMigrationPlanV1 {
+        schema: PRINCIPAL_ROOT_MIGRATION_PLAN_SCHEMA.to_string(),
+        principal_id: principal_id.to_string(),
+        localhost_root: localhost_root.to_string(),
+        objects: selections,
+    };
+    validate_principal_root_migration_plan(&plan)?;
+    let plan_bytes = serde_json::to_vec(&plan)?;
+    let plan_sha256 = sha256_label(&plan_bytes);
+    let backups_parent = data_dir.join("backups");
+    ensure_safe_backup_parent(&backups_parent)?;
+    let backup_dir = backups_parent.join(format!(
+        "principal-root-migration-{}-{}",
+        &plan_sha256["sha256:".len()..][..16],
+        now_ts(),
+    ));
+    recover_principal_root_migration_journal(data_dir)?;
+    migrate_principal_root_objects_plan_locked(data_dir, &plan, &plan_sha256, &backup_dir)
+}
+
 pub(crate) fn begin_declarative_principal_root_protection_activation_with_candidate(
     data_dir: &Path,
     candidate: &PrincipalRootProtectionV1,
@@ -1457,7 +1545,7 @@ pub fn read_principal_root_object(
     let _guard = principal_root_object_mutation_lock()
         .lock()
         .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
-    let bytes = std::fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
+    let bytes = read_principal_root_object_bytes(path)?;
     let Some(protection) = load_principal_root_protection(data_dir, principal_id, localhost_root)?
     else {
         return Ok(bytes);
@@ -1488,6 +1576,30 @@ pub fn read_principal_root_object(
     .with_context(|| format!("failed to decrypt protected principal-root object: {object_uri}"))
 }
 
+fn read_principal_root_object_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Err(err).with_context(|| format!("failed to read {path:?}"));
+        }
+        Err(err) => return Err(err).with_context(|| format!("failed to read {path:?}")),
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {path:?}"))?;
+    if !metadata.is_file() {
+        anyhow::bail!("principal-root object must be a regular file");
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {path:?}"))?;
+    Ok(bytes)
+}
+
 pub fn write_principal_root_object(
     data_dir: &Path,
     principal_id: &str,
@@ -1496,11 +1608,54 @@ pub fn write_principal_root_object(
     path: &Path,
     plaintext: &[u8],
 ) -> anyhow::Result<()> {
+    write_principal_root_object_inner(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        path,
+        plaintext,
+        false,
+    )
+}
+
+pub(crate) fn write_protected_principal_root_object(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &Path,
+    plaintext: &[u8],
+) -> anyhow::Result<()> {
+    write_principal_root_object_inner(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        path,
+        plaintext,
+        true,
+    )
+}
+
+fn write_principal_root_object_inner(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &Path,
+    plaintext: &[u8],
+    require_protection: bool,
+) -> anyhow::Result<()> {
     validate_principal_root_object_binding(principal_id, localhost_root, object_uri)?;
+    validate_principal_root_object_path(data_dir, object_uri, path)?;
     let _guard = principal_root_object_mutation_lock()
         .lock()
         .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
     let protection = load_principal_root_protection(data_dir, principal_id, localhost_root)?;
+    if require_protection && protection.is_none() {
+        anyhow::bail!("protected principal-root object requires active principal-root protection");
+    }
     let bytes = if let Some(protection) = protection {
         let data_key = principal_root_data_key_from_protection(data_dir, &protection)?;
         let mut nonce = [0u8; 12];
@@ -1525,6 +1680,9 @@ pub fn write_principal_root_object(
     } else {
         plaintext.to_vec()
     };
+    if require_protection {
+        ensure_protected_principal_root_object_parent(data_dir, path)?;
+    }
     atomic_write(path, &bytes)
 }
 
@@ -2567,6 +2725,19 @@ fn validate_principal_root_object_binding(
             .is_some_and(|rest| rest.starts_with('/'));
     if !under_root {
         anyhow::bail!("principal-root object URI is outside the principal root");
+    }
+    Ok(())
+}
+
+fn validate_principal_root_object_path(
+    data_dir: &Path,
+    object_uri: &str,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let expected = rooted_localhost_fs_path(data_dir, object_uri)
+        .ok_or_else(|| anyhow!("principal-root object URI has no canonical filesystem path"))?;
+    if path != expected {
+        anyhow::bail!("principal-root object path does not match its canonical URI path")
     }
     Ok(())
 }
@@ -3867,6 +4038,56 @@ fn create_owner_only_dir(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Create a principal-root directory and every missing parent owner-only.
+///
+/// Protected writes refuse a parent anyone else can read, and rightly so — a
+/// loose directory can mean the objects under it were already exposed. That
+/// makes it the writer's job to never create one: `create_dir_all` follows
+/// the process umask, so a Home whose shell saved its state before any
+/// protection existed left a world-readable root behind and locked the person
+/// out of ever saving a Profile.
+pub(crate) fn create_owner_only_dir_all(data_dir: &Path, path: &Path) -> anyhow::Result<()> {
+    // Only ever create or narrow inside this Home's own data directory. The
+    // path above it belongs to the person's machine, not to us.
+    if !path.starts_with(data_dir) || path == data_dir {
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("failed to create directory {path:?}"))?;
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        create_owner_only_dir_all(data_dir, parent)?;
+    }
+    if !path.is_dir() {
+        if let Err(err) = create_owner_only_dir(path) {
+            if !path.is_dir() {
+                return Err(err)
+                    .with_context(|| format!("failed to create owner-only directory {path:?}"));
+            }
+        }
+    }
+    // A directory that already exists may predate this rule — earlier writers
+    // used the process umask — so bring our own tree up to it rather than
+    // leave a person permanently unable to save. This does not soften the
+    // check that refuses a loose parent at write time; it stops the Runtime
+    // from creating the loose parent at all, and only ever narrows access on
+    // a directory this process owns.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect owner-only directory {path:?}"))?;
+        if !metadata.file_type().is_symlink()
+            && metadata.is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o077 != 0
+        {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("failed to restrict {path:?} to owner-only"))?;
+        }
+    }
+    Ok(())
+}
+
 fn durable_atomic_replace(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
     let parent = path
         .parent()
@@ -3925,6 +4146,85 @@ fn ensure_no_symlink_components(data_dir: &Path, path: &Path) -> anyhow::Result<
     Ok(())
 }
 
+fn ensure_protected_principal_root_object_parent(
+    data_dir: &Path,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("protected principal-root object path has no parent"))?;
+    let relative = parent.strip_prefix(data_dir).map_err(|_| {
+        anyhow!("protected principal-root object path escapes the Runtime data root")
+    })?;
+    ensure_auth_owner_only_directory(data_dir)?;
+    let mut current = data_dir.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        ensure_auth_owner_only_directory(&current)?;
+    }
+    Ok(())
+}
+
+/// Ensures an auth-owned parent directory is an owner-only real directory.
+///
+/// Protected principal-root objects contain secrets, so this intentionally
+/// differs from the generic unprotected-object writer: it creates each missing
+/// component with 0700 and rejects an existing symlink, non-directory, foreign
+/// owner, or group/world-accessible directory before any object write.
+fn ensure_auth_owner_only_directory(path: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("failed to create protected parent {path:?}"))
+                }
+            }
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect protected parent {path:?}"))
+        }
+    }
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect protected parent {path:?}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("protected principal-root parent must be a real directory")
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        let directory = options
+            .open(path)
+            .with_context(|| format!("failed to open protected parent {path:?}"))?;
+        let metadata = directory
+            .metadata()
+            .with_context(|| format!("failed to inspect opened protected parent {path:?}"))?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            anyhow::bail!("protected principal-root parent must be owner-only: {path:?}")
+        }
+    }
+    Ok(())
+}
+
 fn write_owner_only_new_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
@@ -3961,14 +4261,25 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         ".{file_name}.{:016x}.tmp",
         rand::thread_rng().next_u64()
     ));
-    if let Err(err) = std::fs::write(&temp, bytes) {
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
         let _ = std::fs::remove_file(&temp);
-        return Err(err.into());
+        return Err(err);
     }
     if let Err(err) = std::fs::rename(&temp, path) {
         let _ = std::fs::remove_file(&temp);
         return Err(err.into());
     }
+    sync_parent_directory(path)?;
     Ok(())
 }
 
@@ -4859,6 +5170,30 @@ mod tests {
                 .count(),
             1
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn atomic_write_cleans_up_a_staged_file_when_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(atomic_write(&path, b"replacement").is_err());
+        assert!(path.is_dir());
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -4868,6 +5203,17 @@ mod tests {
         let localhost_root = principal_localhost_root(principal_id);
         let object_uri = format!("{localhost_root}/Documents/plain.md");
         let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::set_permissions(
+                path.parent().unwrap(),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
 
         write_principal_root_object(
             data_dir.path(),
@@ -4880,6 +5226,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), b"plain body");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+        }
         assert_eq!(
             read_principal_root_object(
                 data_dir.path(),
@@ -4930,6 +5289,122 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn protected_principal_root_writes_create_owner_only_parents() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(data_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let principal_id = "person:local:protected-owner-only";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!(
+            "{}/.AppData/ElastOS/People/contact-state.json",
+            protection.localhost_root
+        );
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+
+        write_protected_principal_root_object(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &path,
+            b"protected",
+        )
+        .unwrap();
+
+        let relative_parent = path
+            .parent()
+            .unwrap()
+            .strip_prefix(data_dir.path())
+            .unwrap();
+        let mut current = data_dir.path().to_path_buf();
+        assert_eq!(
+            std::fs::metadata(&current).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for component in relative_parent.components() {
+            current.push(component.as_os_str());
+            assert_eq!(
+                std::fs::metadata(&current).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{} is not owner-only",
+                current.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_principal_root_writes_reject_insecure_or_symlink_parents_without_writing() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        for parent_kind in ["insecure", "symlink"] {
+            let data_dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(data_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let principal_id = format!("person:local:protected-parent-{parent_kind}");
+            let protection = store_test_principal_root_protection(data_dir.path(), &principal_id);
+            let object_uri = format!(
+                "{}/.AppData/ElastOS/People/contact-state.json",
+                protection.localhost_root
+            );
+            let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+            let users = data_dir.path().join("Users");
+
+            if parent_kind == "insecure" {
+                std::fs::create_dir(&users).unwrap();
+                std::fs::set_permissions(&users, std::fs::Permissions::from_mode(0o755)).unwrap();
+            } else {
+                let outside = tempfile::tempdir().unwrap();
+                symlink(outside.path(), &users).unwrap();
+            }
+
+            let error = write_protected_principal_root_object(
+                data_dir.path(),
+                &principal_id,
+                &protection.localhost_root,
+                &object_uri,
+                &path,
+                b"protected",
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("protected principal-root parent"));
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn principal_root_write_rejects_a_path_that_does_not_match_its_uri() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:protected-wrong-path";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!("{}/Documents/expected.md", protection.localhost_root);
+        let escaped = data_dir
+            .path()
+            .join("outside")
+            .join("..")
+            .join("escaped")
+            .join("wrong.md");
+
+        let error = write_protected_principal_root_object(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &escaped,
+            b"protected",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match its canonical URI path"));
+        assert!(!data_dir.path().join("escaped").exists());
+    }
+
     #[test]
     fn principal_root_object_rejects_plaintext_when_root_is_protected() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -4954,6 +5429,44 @@ mod tests {
         assert!(err
             .to_string()
             .contains("protected principal-root object is not encrypted"));
+    }
+
+    #[test]
+    fn principal_root_object_read_rejects_symlink_and_non_regular_paths() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:protected-read-path";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!("{}/Documents/read-check.md", protection.localhost_root);
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(data_dir.path().join("missing-object"), &path).unwrap();
+            let err = read_principal_root_object(
+                data_dir.path(),
+                principal_id,
+                &protection.localhost_root,
+                &object_uri,
+                &path,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("failed to read"));
+            std::fs::remove_file(&path).unwrap();
+        }
+
+        std::fs::create_dir_all(&path).unwrap();
+        let err = read_principal_root_object(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &path,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("regular file"));
     }
 
     #[test]
@@ -4998,6 +5511,63 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn recovery_activation_migrates_first_run_plaintext_under_new_protection() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:first-run-shell-state";
+        let localhost_root = principal_localhost_root(principal_id);
+        // The shell persists Home browser state before a person can reach
+        // Recovery — the exact object that used to deadlock first-run
+        // activation (activation demanded a clean root, migration demanded
+        // existing protection).
+        let object_uri = format!("{localhost_root}/.AppData/ElastOS/Home/browser-state.json");
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"{"schema":"home-state","windows":[]}"#).unwrap();
+        let inventory = [PrincipalRootProtectedObjectDeclarationV1::exact(
+            object_uri.clone(),
+        )];
+
+        let activation =
+            begin_declarative_principal_root_protection_activation_migrating_plaintext(
+                data_dir.path(),
+                principal_id,
+                &localhost_root,
+                &inventory,
+            )
+            .expect("first-run plaintext must not block migrating activation");
+        assert_eq!(activation.plaintext_objects.len(), 1);
+        assert_eq!(activation.plaintext_objects[0].object_uri, object_uri);
+
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        assert_eq!(protection.localhost_root, localhost_root);
+
+        let receipt = migrate_principal_root_plaintext_objects_under_activation(
+            &activation.guard,
+            data_dir.path(),
+            principal_id,
+            &localhost_root,
+            activation.plaintext_objects.clone(),
+        )
+        .expect("plaintext migrates online under the activation guard");
+        assert_eq!(receipt.object_count, 1);
+        drop(activation);
+
+        let migrated = std::fs::read(&path).unwrap();
+        assert!(
+            looks_like_principal_root_object_envelope(&migrated),
+            "migrated object must be an envelope"
+        );
+
+        begin_declarative_principal_root_protection_activation(
+            data_dir.path(),
+            principal_id,
+            &localhost_root,
+            &inventory,
+        )
+        .expect("strict activation passes once the root is clean");
     }
 
     #[test]

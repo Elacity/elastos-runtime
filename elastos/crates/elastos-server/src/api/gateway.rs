@@ -46,6 +46,8 @@ use url::form_urlencoded;
 mod gateway_browser;
 #[path = "gateway_capsule_catalog.rs"]
 mod gateway_capsule_catalog;
+#[path = "gateway_collaboration_presence.rs"]
+mod gateway_collaboration_presence;
 #[path = "gateway_esp.rs"]
 mod gateway_esp;
 #[path = "gateway_home_runtime.rs"]
@@ -64,6 +66,8 @@ mod gateway_inbox;
 mod gateway_inspect_actions;
 #[path = "gateway_marketplace.rs"]
 mod gateway_marketplace;
+#[path = "gateway_origin.rs"]
+mod gateway_origin;
 #[path = "gateway_passkey_step_up.rs"]
 mod gateway_passkey_step_up;
 #[path = "gateway_provider_proxy.rs"]
@@ -83,6 +87,7 @@ mod gateway_wallet_adapter;
 #[cfg(test)]
 use gateway_browser::browser_runtime_stream_socket_path;
 use gateway_capsule_catalog::*;
+use gateway_collaboration_presence::*;
 use gateway_esp::*;
 pub(crate) use gateway_home_runtime::is_wallet_connector_capsule_id;
 use gateway_home_runtime::*;
@@ -99,10 +104,12 @@ pub(crate) fn principal_root_protected_object_inventory(
 }
 
 pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_object_shell_title};
+pub(in crate::api) use gateway_home_system::profile_readiness_for_principal;
 use gateway_home_system::*;
 use gateway_home_terminal::*;
+pub(crate) use gateway_home_token::home_launch_auth_data_dir;
 pub(super) use gateway_home_token::{
-    home_launch_auth_data_dir, home_launch_token_header, home_session_clear_cookie_header,
+    home_launch_token_header, home_session_clear_cookie_header,
     home_session_cookie_header_for_token, issue_home_launch_token_for_auth_grant,
     issue_home_projection_launch_token_with_context, require_carried_home_launch_token,
     require_home_launch_token, require_home_launch_token_binding,
@@ -115,13 +122,15 @@ pub(super) use gateway_home_token::{
 };
 #[cfg(test)]
 pub(crate) use gateway_home_token::{
-    issue_home_launch_token, issue_home_launch_token_with_context, local_home_launch_token_context,
+    issue_expired_home_launch_token_with_context, issue_home_launch_token,
+    issue_home_launch_token_with_context, local_home_launch_token_context,
     set_test_home_launch_auth_data_dir, uuid_like_token,
 };
 use gateway_home_wallet_connector::*;
 use gateway_inbox::*;
 use gateway_inspect_actions::*;
 use gateway_marketplace::*;
+use gateway_origin::*;
 use gateway_passkey_step_up::*;
 pub(super) use gateway_passkey_step_up::{
     consume_or_recover_passkey_step_up_effect, consume_passkey_step_up_token,
@@ -137,6 +146,8 @@ pub(crate) use gateway_room::{
 };
 pub(crate) use gateway_server::advertised_gateway_urls;
 pub use gateway_server::start_gateway_server;
+pub(crate) use gateway_server::start_gateway_server_with_collaboration_context;
+pub use gateway_server::GatewayCollaborationContext;
 use gateway_site::*;
 pub(super) use gateway_site::{content_type, validate_file_path};
 use gateway_transaction_effects::*;
@@ -187,7 +198,6 @@ const WALLET_PRICE_IDS: &[(&str, &str)] = &[
 pub(crate) const ROOM_SESSION_COOKIE: &str = "room-session";
 pub(crate) const BROWSER_SESSION_COOKIE: &str = "browser-session";
 pub(crate) const HOME_SESSION_COOKIE: &str = "home-session";
-const ROOM_SYNC_CONSUMER_ID: &str = "room-sync";
 const HOME_LAUNCH_TOKEN_DOMAIN: &str = "elastos.home.launch.v4";
 const HOME_LAUNCH_TOKEN_TTL_SECS: u64 = 12 * 60 * 60;
 const HOME_BROWSER_STATE_SCHEMA: &str = "elastos.home.browser-state/v1";
@@ -197,6 +207,24 @@ const LIBRARY_CAPSULE_ID: &str = "library";
 const MARKETPLACE_CAPSULE_ID: &str = "marketplace";
 const INBOX_CAPSULE_ID: &str = "inbox";
 const PEOPLE_CAPSULE_ID: &str = "people";
+
+/// Announce this Home's people from the Runtime. See
+/// `gateway_collaboration_presence::publish_runtime_owned_presence`.
+pub fn publish_runtime_owned_presence(
+    data_dir: &std::path::Path,
+    port: &crate::collaboration_presence::CollaborationPresenceProductPort,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
+    now: u64,
+) -> anyhow::Result<usize> {
+    gateway_collaboration_presence::publish_runtime_owned_presence(
+        data_dir,
+        port,
+        discovery_service,
+        now,
+    )
+}
 
 pub fn capsule_catalog_snapshot(data_dir: &std::path::Path) -> serde_json::Value {
     serde_json::to_value(gateway_capsule_catalog::capsule_catalog_summary(data_dir)).unwrap_or_else(
@@ -408,6 +436,12 @@ struct WalletPricePolicy {
 #[derive(Clone)]
 pub struct GatewayState {
     pub provider_registry: Option<Arc<ProviderRegistry>>,
+    pub(crate) collaboration_chat_product_port:
+        Option<crate::collaboration_product::CollaborationChatProductPort>,
+    pub(crate) collaboration_presence_product_port:
+        Option<crate::collaboration_presence::CollaborationPresenceProductPort>,
+    pub(crate) collaboration_discovery_service:
+        Option<crate::collaboration_discovery_runtime::CollaborationDiscoveryService>,
     pub identity_manager: Arc<OnceLock<Arc<tokio::sync::Mutex<IdentityManager>>>>,
     pub cache_dir: PathBuf,
     /// Runtime data directory backing rooted Publisher/Edge/MyWebSite state.
@@ -640,14 +674,6 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route("/api/carrier/bootstrap", get(gateway_carrier_bootstrap))
         .route("/artifacts/*path", get(serve_artifact_file))
         .route("/api/apps/system/summary", get(system_summary))
-        .route(
-            "/api/apps/system/identity/handle",
-            post(system_handle_update),
-        )
-        .route(
-            "/api/apps/system/identity/profile-card",
-            post(system_profile_card_update),
-        )
         .route(
             "/api/apps/system/appearance/background-image",
             post(system_background_image_update)
@@ -910,14 +936,6 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route("/api/apps/inbox/summary", get(inbox_summary))
         .route("/api/apps/inbox/actions", post(inbox_action))
         .route("/api/apps/people/summary", get(people_summary))
-        .route(
-            "/api/apps/people/invites/create",
-            post(people_invite_create),
-        )
-        .route(
-            "/api/apps/people/profile-card",
-            post(people_profile_card_update),
-        )
         .route("/api/apps/people/discovery", post(people_discovery_update))
         .route(
             "/api/apps/people/discovery/refresh",
@@ -928,18 +946,31 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(people_discovery_request_create),
         )
         .route(
-            "/api/apps/people/discovery/requests/:request_id/accept",
-            post(people_discovery_request_accept),
+            "/api/apps/home/collaboration/presence",
+            post(home_collaboration_presence),
         )
         .route(
-            "/api/apps/people/discovery/requests/:request_id/join",
-            post(people_discovery_request_join),
+            "/api/apps/people/presence",
+            get(people_collaboration_presence),
         )
+        .route("/api/apps/people/profile", post(people_profile_update))
         .route(
             "/api/apps/people/contacts/remove",
             post(people_contact_remove),
         )
         .route("/api/apps/chat-room/summary", get(chat_room_summary))
+        .route(
+            "/api/apps/chat-room/direct/conversations",
+            get(chat_direct_conversations),
+        )
+        .route(
+            "/api/apps/chat-room/direct/conversations/:conversation_id/messages",
+            get(chat_direct_conversation_messages),
+        )
+        .route(
+            "/api/apps/chat-room/direct/messages/send",
+            post(chat_direct_message_send),
+        )
         .route(
             "/api/apps/chat-room/requests/:request_id/approve",
             post(chat_room_request_approve),
@@ -1239,8 +1270,8 @@ struct GatewayAttachResponse {
     token: String,
 }
 
-fn load_runtime_coords(data_dir: &std::path::Path) -> Option<GatewayRuntimeCoords> {
-    let path = data_dir.join("runtime-coords.json");
+fn load_home_runtime_coords(data_dir: &std::path::Path) -> Option<GatewayRuntimeCoords> {
+    let path = crate::runtime_control::home_runtime_coord_path(data_dir);
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -1286,7 +1317,10 @@ fn gateway_provider_error_tuple(scheme: &str, err: anyhow::Error) -> (StatusCode
 }
 
 fn inbox_error_response(err: anyhow::Error) -> Response {
-    let text = err.to_string();
+    let profile_required = gateway_home_system::profile_required_message(&err);
+    let text = profile_required
+        .map(str::to_string)
+        .unwrap_or_else(|| err.to_string());
     let status = if text.contains("home launch token")
         || text.contains("fresh passkey")
         || text.contains("passkey step-up")
@@ -1295,6 +1329,8 @@ fn inbox_error_response(err: anyhow::Error) -> Response {
         || text.contains("belongs to a different principal")
     {
         StatusCode::FORBIDDEN
+    } else if profile_required.is_some() {
+        StatusCode::CONFLICT
     } else if text.contains("service access request delivery failed") {
         StatusCode::SERVICE_UNAVAILABLE
     } else if text.contains("unknown inbox action")
@@ -1336,9 +1372,14 @@ fn system_error_response(err: anyhow::Error) -> Response {
 }
 
 fn home_error_response(err: anyhow::Error) -> Response {
-    let text = err.to_string();
+    let profile_required = gateway_home_system::profile_required_message(&err);
+    let text = profile_required
+        .map(str::to_string)
+        .unwrap_or_else(|| err.to_string());
     let status = if text.contains("home launch token") || text.contains("gateway identity") {
         StatusCode::FORBIDDEN
+    } else if profile_required.is_some() {
+        StatusCode::CONFLICT
     } else if text.contains("service access request delivery failed: service offer")
         || text.contains("service access request delivery failed: only Browser Exit")
     {

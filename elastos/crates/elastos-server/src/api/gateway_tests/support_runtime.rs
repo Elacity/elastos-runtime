@@ -370,12 +370,12 @@ fn home_app_token(data_dir: &std::path::Path) -> String {
     issue_home_launch_token(data_dir, HOME_CAPSULE_ID).unwrap()
 }
 
-fn people_app_token(data_dir: &std::path::Path) -> String {
-    issue_home_launch_token(data_dir, PEOPLE_CAPSULE_ID).unwrap()
-}
-
 fn system_app_token(data_dir: &std::path::Path) -> String {
     issue_home_launch_token(data_dir, SYSTEM_CAPSULE_ID).unwrap()
+}
+
+fn people_app_token(data_dir: &std::path::Path) -> String {
+    issue_home_launch_token(data_dir, PEOPLE_CAPSULE_ID).unwrap()
 }
 
 struct TestPasskeyAuthority {
@@ -403,11 +403,90 @@ fn passkey_authority_with_name(
     )
 }
 
+/// Provisions the signed Profile authority a Chat room session requires.
+///
+/// Chat resolves its participant name from the signed Profile document, so a
+/// fixture that expects session, join, or auth results must create the Profile
+/// before calling those routes.
+fn passkey_authority_with_profile(
+    data_dir: &std::path::Path,
+    display_name: &str,
+) -> TestPasskeyAuthority {
+    let authority = passkey_authority_with_name(data_dir, Some(display_name));
+    provision_signed_profile(data_dir, &authority, display_name);
+    authority
+}
+
+/// Creates the protected principal root and signed Profile document for an
+/// already-provisioned passkey authority.
+fn provision_signed_profile(
+    data_dir: &std::path::Path,
+    authority: &TestPasskeyAuthority,
+    display_name: &str,
+) {
+    let protection =
+        crate::auth::store_test_principal_root_protection(data_dir, &authority.principal_id);
+    let _ = elastos_identity::load_or_create_did(data_dir).unwrap();
+    crate::collaboration_profile_authority::update_profile_authority(
+        data_dir,
+        &authority.principal_id,
+        &protection.localhost_root,
+        &authority.proof_binding_id,
+        display_name,
+        None,
+        crate::auth::now_ts(),
+    )
+    .unwrap();
+}
+
+fn load_profile_for_authority(
+    data_dir: &std::path::Path,
+    authority: &TestPasskeyAuthority,
+) -> crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument {
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    crate::collaboration_profile_authority::load_profile_authority(
+        data_dir,
+        &authority.principal_id,
+        &localhost_root,
+    )
+    .unwrap()
+    .unwrap()
+}
+
+fn test_signed_room_profile(
+    data_dir: &std::path::Path,
+    seed: u8,
+    display_name: &str,
+    handle: Option<&str>,
+) -> (
+    String,
+    crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+) {
+    let (_device_key, device_did) = elastos_identity::load_or_create_did(data_dir).unwrap();
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let profile = crate::collaboration_profile_authority::signed_profile_document_for_test(
+        &signing_key,
+        display_name,
+        handle,
+        1,
+        None,
+        100 + seed as u64,
+        vec![device_did.clone()],
+    )
+    .unwrap();
+    (device_did, profile)
+}
+
 fn passkey_authority_with_name_role(
     data_dir: &std::path::Path,
     display_name: Option<&str>,
     role: crate::auth::RuntimePrincipalRole,
 ) -> TestPasskeyAuthority {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let now = crate::auth::now_ts();
     let credential_id = match role {
         crate::auth::RuntimePrincipalRole::Admin => "gateway-test-passkey",
@@ -610,10 +689,8 @@ struct FakeRuntimeState {
 }
 
 struct FakeRuntimeHandle {
-    api_url: String,
     _task: tokio::task::JoinHandle<()>,
     launch_requests: Arc<TokioMutex<Vec<serde_json::Value>>>,
-    provider_requests: Arc<TokioMutex<Vec<serde_json::Value>>>,
 }
 
 fn verifying_key_from_did(did: &str) -> Option<ed25519_dalek::VerifyingKey> {
@@ -632,23 +709,6 @@ async fn start_fake_runtime(
     peer_id: &str,
 ) -> FakeRuntimeHandle {
     start_fake_runtime_configured(data_dir, data_dir, bus, peer_id, false).await
-}
-
-async fn start_fake_runtime_with_pending_capabilities(
-    data_dir: &std::path::Path,
-    bus: Arc<TokioMutex<FakePeerBus>>,
-    peer_id: &str,
-) -> FakeRuntimeHandle {
-    start_fake_runtime_configured(data_dir, data_dir, bus, peer_id, true).await
-}
-
-async fn start_fake_runtime_with_identity_dir(
-    data_dir: &std::path::Path,
-    identity_dir: &std::path::Path,
-    bus: Arc<TokioMutex<FakePeerBus>>,
-    peer_id: &str,
-) -> FakeRuntimeHandle {
-    start_fake_runtime_configured(data_dir, identity_dir, bus, peer_id, false).await
 }
 
 async fn start_fake_runtime_configured(
@@ -718,10 +778,8 @@ async fn start_fake_runtime_configured(
     )
     .unwrap();
     FakeRuntimeHandle {
-        api_url,
         _task: task,
         launch_requests,
-        provider_requests,
     }
 }
 

@@ -1,6 +1,6 @@
 //! Shared provider capability-resource mapping.
 //!
-//! HTTP host adapters and the Carrier bridge must derive the same capability
+//! HTTP host adapters and the resource bridge must derive the same capability
 //! resource from the same provider request. Keeping that logic here prevents
 //! local and capsule-kernel calls from drifting.
 
