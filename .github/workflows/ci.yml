@@ -52,8 +52,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
+      - name: build provider process binaries for tests
+        run: |
+          cargo build --manifest-path capsules/protected-content-protect-provider/Cargo.toml --target-dir capsules/protected-content-protect-provider/target
+          cargo build --manifest-path capsules/protected-content-decrypt-provider/Cargo.toml --target-dir capsules/protected-content-decrypt-provider/target
+          cargo build --manifest-path capsules/custody-provider/Cargo.toml --target-dir capsules/custody-provider/target
       - name: cargo test
         working-directory: elastos
+        env:
+          ELASTOS_TEST_PROTECT_PROVIDER_BIN: ${{ github.workspace }}/capsules/protected-content-protect-provider/target/debug/protected-content-protect-provider
+          ELASTOS_TEST_DECRYPT_PROVIDER_BIN: ${{ github.workspace }}/capsules/protected-content-decrypt-provider/target/debug/protected-content-decrypt-provider
+          ELASTOS_TEST_CUSTODY_PROVIDER_BIN: ${{ github.workspace }}/capsules/custody-provider/target/debug/custody-provider
         run: cargo test --workspace
         # Network-sensitive tests are #[ignore] and won't run.
         # Run them explicitly with: cargo test --workspace -- --ignored

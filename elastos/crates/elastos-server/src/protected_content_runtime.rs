@@ -3334,7 +3334,8 @@ pub(crate) async fn open_runtime_custody_viewer(
     ];
     let coordinator =
         RuntimeReleaseCoordinator::new(runtime_release_journal(data_dir), runtime_issuer, selected)
-            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?
+            .with_response_clock(crate::auth::now_ts);
     let contributions = match coordinator
         .release(
             &release_wallet_request,

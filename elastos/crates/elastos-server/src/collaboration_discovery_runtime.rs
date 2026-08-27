@@ -5984,6 +5984,18 @@ pub(crate) mod tests {
             )
             .unwrap(),
         );
+        local_registry
+            .unregister_sub_provider(
+                crate::collaboration_direct_messages::DIRECT_MESSAGE_PROVIDER_SCHEME,
+            )
+            .await
+            .unwrap();
+        local_registry
+            .unregister_sub_provider(
+                crate::collaboration_profile_updates::PROFILE_UPDATE_PROVIDER_SCHEME,
+            )
+            .await
+            .unwrap();
         let restarted_service = CollaborationDiscoveryService::new(
             SigningKey::from_bytes(&local_service.authority.signing_key.to_bytes()),
             local_service.network_profile(),

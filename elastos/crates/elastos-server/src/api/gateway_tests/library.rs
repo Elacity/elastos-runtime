@@ -567,6 +567,10 @@ async fn publish_runtime_custody(
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test helper binds every fixture fact explicitly"
+)]
 async fn assert_invalid_runtime_custody_media_declaration(
     data_dir: &std::path::Path,
     app: &axum::Router,

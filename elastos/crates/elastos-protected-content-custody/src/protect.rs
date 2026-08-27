@@ -44,6 +44,11 @@ pub fn protect_validated_clear_fmp4_segment_to_cenc_v1(
         .map_err(Into::into)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    reason = "the protect boundary binds the exact CENC inputs and returns the exact protected parts without an intermediate authority struct"
+)]
 pub fn protect_validated_clear_cenc_fmp4_media_v1(
     layout: &ValidatedClearFmp4MediaSessionLayoutV1,
     clear_init_segment: &[u8],
@@ -280,7 +285,7 @@ mod tests {
             protect_validated_clear_cenc_fmp4_media_v1(
                 &clear_layout,
                 &clear_init,
-                &[clear_segment.clone()],
+                std::slice::from_ref(&clear_segment),
                 "video/mp4",
                 "avc1.64001f,mp4a.40.2",
                 &cek,
@@ -378,7 +383,7 @@ mod tests {
             protect_validated_clear_cenc_fmp4_media_v1(
                 &clear_layout,
                 &clear_init,
-                &[clear_segment.clone()],
+                std::slice::from_ref(&clear_segment),
                 "video/mp4",
                 "avc1.64001f,mp4a.40.2",
                 &cek,

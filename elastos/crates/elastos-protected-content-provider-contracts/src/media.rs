@@ -3227,7 +3227,7 @@ mod tests {
 
         let protected_layout = CencFmp4MediaIdentityV1::validate_structure(
             &protected_init,
-            &[protected_segment.clone()],
+            std::slice::from_ref(&protected_segment),
         )
         .unwrap();
         assert_eq!(protected_layout.protected_track_ids(), &[1, 2]);

@@ -483,6 +483,10 @@ async fn renaming_yourself_does_not_stop_your_contacts_reaching_you() {
         "a rename must not move the identity"
     );
 
+    pair.registry_b
+        .unregister_sub_provider(DIRECT_MESSAGE_PROVIDER_SCHEME)
+        .await
+        .unwrap();
     let receiver = CollaborationDirectMessageService::new(
         SigningKey::from_bytes(&pair.key_b.to_bytes()),
         pair.service_b.network_profile(),
@@ -537,6 +541,10 @@ async fn a_running_home_receives_without_a_signed_in_session() {
         .remote_profile_did()
         .to_string();
 
+    pair.registry_b
+        .unregister_sub_provider(DIRECT_MESSAGE_PROVIDER_SCHEME)
+        .await
+        .unwrap();
     let restarted_b = CollaborationDirectMessageService::new(
         SigningKey::from_bytes(&pair.key_b.to_bytes()),
         pair.service_b.network_profile(),
@@ -604,6 +612,10 @@ async fn revoking_the_passkey_stops_the_running_home_receiving() {
         .remote_profile_did()
         .to_string();
 
+    pair.registry_b
+        .unregister_sub_provider(DIRECT_MESSAGE_PROVIDER_SCHEME)
+        .await
+        .unwrap();
     let running_b = CollaborationDirectMessageService::new(
         SigningKey::from_bytes(&pair.key_b.to_bytes()),
         pair.service_b.network_profile(),
@@ -945,6 +957,10 @@ async fn durable_pending_restarts_with_the_exact_envelope_and_settles_once() {
     let exact_message: SignedCollaborationMessage =
         serde_json::from_slice(&exact_envelope).unwrap();
 
+    pair.registry_a
+        .unregister_sub_provider(DIRECT_MESSAGE_PROVIDER_SCHEME)
+        .await
+        .unwrap();
     let restarted = CollaborationDirectMessageService::new(
         SigningKey::from_bytes(&pair.key_a.to_bytes()),
         pair.service_a.network_profile(),

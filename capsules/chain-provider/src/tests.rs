@@ -2544,6 +2544,25 @@ fn resolve_protected_content_policy_rejects_missing_or_ambiguous_sources() {
 }
 
 #[test]
+fn protected_content_creator_royalty_share_value_is_pinned() {
+    // 0x3b6 = 950. The constant is named tenths-of-percent (which would read
+    // as 95%); the deployed Base 8453 AuthorityGateway's actual royalty-share
+    // unit is still unproven and tracked by the deployed-facts verification
+    // task. This pin exists so any change to the mint's money constant is a
+    // reviewed decision instead of silent drift — the exact-call test below
+    // re-derives its expectation from the same constant and cannot catch it.
+    assert_eq!(PROTECTED_CONTENT_CREATOR_ROYALTY_TENTHS_PERCENT, "0x3b6");
+    assert_eq!(
+        u64::from_str_radix(
+            PROTECTED_CONTENT_CREATOR_ROYALTY_TENTHS_PERCENT.trim_start_matches("0x"),
+            16,
+        )
+        .unwrap(),
+        950
+    );
+}
+
+#[test]
 fn resolve_protected_content_creator_mint_returns_exact_call_and_content_access_id() {
     let mut provider = provider_with_creator_mint_rpc("http://127.0.0.1:9".to_string());
     let access_id = [0x41; 16];

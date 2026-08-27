@@ -1990,6 +1990,10 @@ fn persist_runtime_custody_purchase_for_mint(
 }
 
 #[cfg(unix)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test helper binds every fixture fact explicitly"
+)]
 fn persist_runtime_custody_active_viewer_for_purchase(
     data_dir: &Path,
     mint: &PersistedRuntimeMint,
@@ -2038,6 +2042,10 @@ fn persist_runtime_custody_active_viewer_for_purchase(
 }
 
 #[cfg(unix)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test helper binds every fixture fact explicitly"
+)]
 fn persist_runtime_custody_open_pending_viewer_for_purchase(
     data_dir: &Path,
     mint: &PersistedRuntimeMint,
@@ -2519,6 +2527,10 @@ fn wallet_request_response_for_release_at(
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test helper binds every fixture fact explicitly"
+)]
 fn wallet_request_response_for_release_context_at(
     operation: &SignedRuntimeReleaseOperationV1,
     profile: &str,
@@ -3929,8 +3941,7 @@ fn write_owner_only_bytes_failed_replace_preserves_previous_runtime_storage_reco
     let parent = path.parent().unwrap();
     fs::set_permissions(parent, fs::Permissions::from_mode(0o500)).unwrap();
     let error = write_owner_only_bytes(&path, b"{\"state\":\"active\"}")
-        .err()
-        .expect("expected atomic write failure");
+        .expect_err("expected atomic write failure");
     assert!(
         error.to_string().contains("Permission denied") || error.to_string().contains("storage")
     );
@@ -3999,8 +4010,7 @@ fn runtime_custody_viewer_record_persist_rejects_oversized_serialized_state() {
         digest(0x62),
         &record,
     )
-    .err()
-    .expect("expected oversized viewer record rejection");
+    .expect_err("expected oversized viewer record rejection");
     assert!(error
         .to_string()
         .contains("Runtime custody viewer session is unavailable"));
@@ -4962,7 +4972,8 @@ async fn runtime_release_coordinator_process_two_of_three_success_stops_before_t
             ),
         ],
     )
-    .unwrap();
+    .unwrap()
+    .with_response_clock(crate::auth::now_ts);
     let wallet_now = crate::auth::now_ts();
     let (wallet_request, wallet_response) = wallet_request_response_for_release_at(
         &operation,
@@ -5591,7 +5602,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
         0x21,
         &envelope,
         custody_epoch.clone(),
-        prepared_a.recipient_public_key().clone(),
+        *prepared_a.recipient_public_key(),
         prepared_a.recipient_identity().clone(),
         audit_a,
         flow_now,
@@ -5667,7 +5678,8 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
             ),
         ],
     )
-    .unwrap();
+    .unwrap()
+    .with_response_clock(crate::auth::now_ts);
     let outcome = coordinator
         .release(
             &wallet_request,
@@ -5715,7 +5727,8 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
             ),
         ],
     )
-    .unwrap();
+    .unwrap()
+    .with_response_clock(crate::auth::now_ts);
     let replay_outcome = replay_coordinator
         .release(
             &wallet_request,
@@ -7966,8 +7979,7 @@ async fn runtime_custody_viewer_close_rejects_wrong_principal_without_provider_e
         &hex::encode(session.viewer_session_handle()),
     )
     .await
-    .err()
-    .expect("expected wrong-principal close rejection");
+    .expect_err("expected wrong-principal close rejection");
     assert!(error
         .to_string()
         .contains("Runtime custody viewer session is unavailable"));
@@ -8382,8 +8394,7 @@ async fn runtime_custody_open_pending_survives_active_write_failure_and_failed_c
         mint.draft().mint_id(),
         &active,
     )
-    .err()
-    .expect("expected active viewer persist failure");
+    .expect_err("expected active viewer persist failure");
     let _ = persist_error;
     let registry = Arc::new(ProviderRegistry::new());
     let decrypt = SequencedProvider::new(
@@ -9061,8 +9072,7 @@ async fn runtime_custody_viewer_restart_reconciliation_rejects_invalid_active_re
         Arc::new(ProviderRegistry::new()),
     )
     .await
-    .err()
-    .expect("expected invalid active record rejection");
+    .expect_err("expected invalid active record rejection");
     assert!(error.to_string().contains("invalid"));
 }
 

@@ -243,10 +243,31 @@ impl ProtectProvider {
         let request_digest = sha256(request_bytes);
         match request.op() {
             ProtectProviderRequestOpV1::OpenProtectionSession => {
-                let request_id = *request
-                    .protection_session_request_id()
-                    .expect("open request id")
-                    .as_bytes();
+                let (
+                    Some(session_request_id),
+                    Ok(Some(custody_pool)),
+                    Ok(Some(custody_epoch)),
+                    Ok(Some(custody_committee_authorization)),
+                    Some(mime_type),
+                    Some(codecs),
+                    Some(segment_count),
+                ) = (
+                    request.protection_session_request_id(),
+                    request.custody_pool(),
+                    request.custody_epoch(),
+                    request.custody_committee_authorization(),
+                    request.mime_type(),
+                    request.codecs(),
+                    request.segment_count(),
+                )
+                else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
+                let mime_type = mime_type.to_string();
+                let codecs = codecs.to_string();
+                let request_id = *session_request_id.as_bytes();
                 if let Some(replay) = state.open_replays.get(&request_id) {
                     return if replay.request_digest == request_digest {
                         typed_ok(replay.response.clone())
@@ -316,9 +337,12 @@ impl ProtectProvider {
                         ProviderFailureCodeV1::InvalidRequest,
                     ));
                 }
-                let nodes = match request
-                    .nodes()
-                    .expect("validated nodes")
+                let Some(request_nodes) = request.nodes() else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
+                let nodes = match request_nodes
                     .iter()
                     .map(exact_custody_node)
                     .collect::<Result<Vec<_>, _>>()
@@ -348,6 +372,14 @@ impl ProtectProvider {
                             ));
                         }
                     };
+                let aggregate_protected_bytes = match response.protected_init_segment() {
+                    Some(protected_init) => protected_init.len(),
+                    None => {
+                        return typed_response(ProtectProviderResponseV1::new_failure(
+                            ProviderFailureCodeV1::InternalFailure,
+                        ));
+                    }
+                };
                 trim_btree_map(&mut state.open_replays, MAX_TERMINAL_REPLAYS_V1);
                 state.open_replays.insert(
                     request_id,
@@ -359,49 +391,43 @@ impl ProtectProvider {
                 state.sessions.insert(
                     handle,
                     ProtectionSessionEntry {
-                        custody_pool: request.custody_pool().expect("decode pool").expect("pool"),
-                        custody_epoch: request
-                            .custody_epoch()
-                            .expect("decode epoch")
-                            .expect("epoch"),
-                        custody_committee_authorization: request
-                            .custody_committee_authorization()
-                            .expect("decode auth")
-                            .expect("auth"),
+                        custody_pool,
+                        custody_epoch,
+                        custody_committee_authorization,
                         nodes,
-                        mime_type: request.mime_type().expect("mime").to_string(),
-                        codecs: request.codecs().expect("codecs").to_string(),
+                        mime_type,
+                        codecs,
                         clear_session_layout,
                         protected_init_segment,
-                        protected_segments: Vec::with_capacity(
-                            request.segment_count().expect("count") as usize,
-                        ),
+                        protected_segments: Vec::with_capacity(segment_count as usize),
                         segment_replays: BTreeMap::new(),
                         content_key: Some(content_key),
                         iv_prefix,
                         next_iv_counter: 0,
-                        segment_count: request.segment_count().expect("count"),
+                        segment_count,
                         next_segment_index: 0,
-                        aggregate_protected_bytes: response
-                            .protected_init_segment()
-                            .expect("protected init")
-                            .len(),
+                        aggregate_protected_bytes,
                         finalized: None,
                     },
                 );
                 typed_ok(response)
             }
             ProtectProviderRequestOpV1::ProtectMediaSegment => {
-                let handle = request
-                    .protection_session_handle()
-                    .expect("validated handle")
-                    .expect("handle");
+                let Ok(Some(handle)) = request.protection_session_handle() else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
                 let Some(session) = state.sessions.get_mut(&handle) else {
                     return typed_response(ProtectProviderResponseV1::new_failure(
                         ProviderFailureCodeV1::HandleAbsent,
                     ));
                 };
-                let segment_index = request.segment_index().expect("segment index");
+                let Some(segment_index) = request.segment_index() else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
                 if let Some(replay) = session.segment_replays.get(&segment_index) {
                     return if replay.request_digest == request_digest {
                         match session.protected_segments.get(segment_index as usize) {
@@ -514,10 +540,11 @@ impl ProtectProvider {
                 typed_ok(response)
             }
             ProtectProviderRequestOpV1::FinalizeProtectionSession => {
-                let handle = request
-                    .protection_session_handle()
-                    .expect("validated handle")
-                    .expect("handle");
+                let Ok(Some(handle)) = request.protection_session_handle() else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
                 let Some(session) = state.sessions.get_mut(&handle) else {
                     return typed_response(if state.closed_handles.contains(&handle) {
                         ProtectProviderResponseV1::new_already_absent(handle)
@@ -583,10 +610,11 @@ impl ProtectProvider {
                 typed_ok(response)
             }
             ProtectProviderRequestOpV1::CancelProtectionSession => {
-                let handle = request
-                    .protection_session_handle()
-                    .expect("validated handle")
-                    .expect("handle");
+                let Ok(Some(handle)) = request.protection_session_handle() else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
                 if state.sessions.remove(&handle).is_some() {
                     trim_btree_set(&mut state.closed_handles, MAX_TERMINAL_REPLAYS_V1);
                     state.closed_handles.insert(handle);
@@ -596,10 +624,11 @@ impl ProtectProvider {
                 }
             }
             ProtectProviderRequestOpV1::CloseProtectionSession => {
-                let handle = request
-                    .protection_session_handle()
-                    .expect("validated handle")
-                    .expect("handle");
+                let Ok(Some(handle)) = request.protection_session_handle() else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
                 if state.sessions.remove(&handle).is_some() {
                     trim_btree_set(&mut state.closed_handles, MAX_TERMINAL_REPLAYS_V1);
                     state.closed_handles.insert(handle);

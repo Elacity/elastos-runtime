@@ -109,6 +109,10 @@ where
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "envelope provisioning binds every committee identity explicitly instead of hiding them in an intermediate struct"
+)]
 pub(crate) fn provision_custody_envelope_for_exact_nodes_with_rng<RHpke, RShamir>(
     encrypted_content: EncryptedContentIdentityV1,
     content_key: &ContentEncryptionKeyV1,
@@ -157,6 +161,10 @@ where
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "envelope provisioning binds every committee identity explicitly instead of hiding them in an intermediate struct"
+)]
 fn provision_custody_envelope_from_manifest_nodes_with_rng<RHpke, RShamir>(
     encrypted_content: EncryptedContentIdentityV1,
     content_key: &ContentEncryptionKeyV1,
