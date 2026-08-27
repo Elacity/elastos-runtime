@@ -24,10 +24,16 @@ pub const WALLET_RESPONSE_SCHEMA: &str = "elastos.wallet.provider-response/v2";
 pub const ERC1271_EVIDENCE_SCHEMA: &str = "elastos.chain.erc1271_proof/v1";
 pub const MANAGED_RECOVERY_SET_SCHEMA: &str = "elastos.wallet.managed-recovery-set/v1";
 pub const VALIDATED_CHAIN_OUTCOME_SCHEMA: &str = "elastos.wallet.validated-chain-outcome/v1";
+pub const PROTECTED_CONTENT_RIGHTS_SIGNATURE_RESULT_SCHEMA: &str =
+    "elastos.wallet.protected-content-rights-signature-result/v1";
+pub const PROTECTED_CONTENT_RIGHTS_SIGNATURE_INTENT: &str = "protected_content_rights_signature";
+pub const PROTECTED_CONTENT_RIGHTS_SIGNATURE_RESOURCE: &str =
+    "elastos://wallet/protected-content/rights/sign";
 pub const DEFAULT_BITCOIN_NETWORK: &str = "bitcoin";
 pub const MAX_INVOCATION_TTL_SECS: u64 = 300;
 pub const MAX_CLOCK_SKEW_SECS: u64 = 60;
 pub const MAX_APPROVAL_PAYLOAD_BYTES: usize = 32 * 1024;
+pub const MAX_PROTECTED_CONTENT_RIGHTS_WIRE_BYTES: usize = 8 * 1024;
 pub const MAX_RECOVERY_KEY_BYTES: usize = 64 * 1024;
 pub const MAX_MANAGED_RECOVERY_SET_KEYS: usize = 64;
 pub const MAX_MANAGED_RECOVERY_SET_BYTES: usize = 256 * 1024;
@@ -233,6 +239,7 @@ pub enum WalletOperationKind {
     VerifyProof,
     VerifyContractProof,
     VerifyBip322Proof,
+    RequestProtectedContentRightsSignature,
     RequestApproval,
     ListApprovals,
     RejectApproval,
@@ -261,6 +268,9 @@ impl WalletOperationKind {
             Self::VerifyProof => "verify_proof",
             Self::VerifyContractProof => "verify_contract_proof",
             Self::VerifyBip322Proof => "verify_bip322_proof",
+            Self::RequestProtectedContentRightsSignature => {
+                "request_protected_content_rights_signature"
+            }
             Self::RequestApproval => "request_approval",
             Self::ListApprovals => "list_approvals",
             Self::RejectApproval => "reject_approval",
@@ -418,6 +428,55 @@ impl ValidatedChainOutcomeV1 {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProtectedContentRightsSignatureResultV1 {
+    pub schema: String,
+    pub account_id: String,
+    pub signer: String,
+    pub wallet_signed_rights_request_hex: String,
+}
+
+impl ProtectedContentRightsSignatureResultV1 {
+    pub fn new(
+        account_id: impl Into<String>,
+        signer: impl Into<String>,
+        wallet_signed_rights_request_hex: impl Into<String>,
+    ) -> ContractResult<Self> {
+        let value = Self {
+            schema: PROTECTED_CONTENT_RIGHTS_SIGNATURE_RESULT_SCHEMA.to_string(),
+            account_id: account_id.into(),
+            signer: signer.into(),
+            wallet_signed_rights_request_hex: wallet_signed_rights_request_hex.into(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> ContractResult<()> {
+        if self.schema != PROTECTED_CONTENT_RIGHTS_SIGNATURE_RESULT_SCHEMA {
+            return Err(ContractError::new(
+                "unsupported protected-content rights signature result schema",
+            ));
+        }
+        validate_required(
+            "protected-content rights signature result account_id",
+            &self.account_id,
+            256,
+        )?;
+        validate_evm_address(
+            "protected-content rights signature result signer",
+            &self.signer,
+        )?;
+        decode_bounded_lower_hex_field(
+            "protected-content rights signature result signed request",
+            &self.wallet_signed_rights_request_hex,
+            MAX_PROTECTED_CONTENT_RIGHTS_WIRE_BYTES,
+        )
+        .map(|_| ())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedRecoveryKeyEntryV1 {
     pub account_id: String,
     pub recovery_key: Value,
@@ -560,6 +619,11 @@ pub enum WalletProviderOperationV2 {
         signature_type: String,
         public_key: Option<String>,
     },
+    RequestProtectedContentRightsSignature {
+        account_id: String,
+        canonical_rights_request_hex: String,
+        reason: String,
+    },
     RequestApproval {
         account_id: String,
         chain_namespace: String,
@@ -625,6 +689,9 @@ impl WalletProviderOperationV2 {
             Self::VerifyProof { .. } => WalletOperationKind::VerifyProof,
             Self::VerifyContractProof { .. } => WalletOperationKind::VerifyContractProof,
             Self::VerifyBip322Proof { .. } => WalletOperationKind::VerifyBip322Proof,
+            Self::RequestProtectedContentRightsSignature { .. } => {
+                WalletOperationKind::RequestProtectedContentRightsSignature
+            }
             Self::RequestApproval { .. } => WalletOperationKind::RequestApproval,
             Self::ListApprovals { .. } => WalletOperationKind::ListApprovals,
             Self::RejectApproval { .. } => WalletOperationKind::RejectApproval,
@@ -666,6 +733,9 @@ impl WalletProviderOperationV2 {
             Self::VerifyProof { .. }
             | Self::VerifyContractProof { .. }
             | Self::VerifyBip322Proof { .. } => "wallet:proof:verify",
+            Self::RequestProtectedContentRightsSignature { .. } => {
+                "wallet:approval:request-protected-content-rights"
+            }
             Self::RequestApproval { .. } => "wallet:approval:request",
             Self::ListApprovals { .. } => "wallet:approval:read",
             Self::RejectApproval { .. } => "wallet:approval:reject",
@@ -694,6 +764,9 @@ impl WalletProviderOperationV2 {
             Self::VerifyProof { .. } => "wallet.proof.evm.verify-eoa",
             Self::VerifyContractProof { .. } => "wallet.proof.evm.verify-contract",
             Self::VerifyBip322Proof { .. } => "wallet.proof.bitcoin.verify",
+            Self::RequestProtectedContentRightsSignature { .. } => {
+                "wallet.approval.protected-content-rights.request"
+            }
             Self::RequestApproval { .. } => "wallet.approval.request",
             Self::ListApprovals { .. } => "wallet.approval.list",
             Self::RejectApproval { .. } => "wallet.approval.reject",
@@ -713,6 +786,7 @@ impl WalletProviderOperationV2 {
             Self::RevokeAccount { account_id }
             | Self::RenameAccount { account_id, .. }
             | Self::SetDefaultAccount { account_id, .. }
+            | Self::RequestProtectedContentRightsSignature { account_id, .. }
             | Self::RequestApproval { account_id, .. }
             | Self::ExportManagedRecoveryKey { account_id } => Some(account_id),
             Self::AttachValidatedChainOutcome { outcome } => Some(&outcome.account_id),
@@ -835,6 +909,20 @@ impl WalletProviderOperationV2 {
                 validate_token("signature_type", signature_type, 64)?;
                 validate_optional("public_key", public_key.as_deref(), 4096)
             }
+            Self::RequestProtectedContentRightsSignature {
+                account_id,
+                canonical_rights_request_hex,
+                reason,
+            } => {
+                validate_required("account_id", account_id, 256)?;
+                validate_required("reason", reason, 2048)?;
+                decode_bounded_lower_hex_field(
+                    "protected-content rights request",
+                    canonical_rights_request_hex,
+                    MAX_PROTECTED_CONTENT_RIGHTS_WIRE_BYTES,
+                )
+                .map(|_| ())
+            }
             Self::RequestApproval {
                 account_id,
                 chain_namespace,
@@ -849,6 +937,13 @@ impl WalletProviderOperationV2 {
                 validate_token("approval intent", intent, 128)?;
                 validate_required("resource", resource, 2048)?;
                 validate_required("reason", reason, 2048)?;
+                if intent == PROTECTED_CONTENT_RIGHTS_SIGNATURE_INTENT
+                    || resource == PROTECTED_CONTENT_RIGHTS_SIGNATURE_RESOURCE
+                {
+                    return Err(ContractError::new(
+                        "protected-content rights signing requires its dedicated Wallet operation",
+                    ));
+                }
                 if payload.is_null() {
                     return Err(ContractError::new("approval payload is required"));
                 }
@@ -1325,6 +1420,23 @@ fn validate_hash32(label: &str, value: &str) -> ContractResult<()> {
     Ok(())
 }
 
+fn decode_bounded_lower_hex_field(
+    label: &str,
+    value: &str,
+    max_bytes: usize,
+) -> ContractResult<Vec<u8>> {
+    if value.is_empty()
+        || value.len() > max_bytes.saturating_mul(2)
+        || !value.len().is_multiple_of(2)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ContractError::new(format!("{label} must be lowercase hex")));
+    }
+    hex::decode(value).map_err(|_| ContractError::new(format!("{label} must be lowercase hex")))
+}
+
 fn request_hash(operation: &WalletProviderOperationV2) -> ContractResult<String> {
     tagged_hash("request", "elastos.wallet.operation.v2", operation)
 }
@@ -1615,6 +1727,15 @@ mod tests {
                 },
             ),
             (
+                WalletOperationKind::RequestProtectedContentRightsSignature,
+                WalletProviderOperationV2::RequestProtectedContentRightsSignature {
+                    account_id: ACCOUNT_ID.to_string(),
+                    canonical_rights_request_hex: "00".to_string(),
+                    reason: "Review and sign the exact canonical protected-content rights request"
+                        .to_string(),
+                },
+            ),
+            (
                 WalletOperationKind::RequestApproval,
                 WalletProviderOperationV2::RequestApproval {
                     account_id: ACCOUNT_ID.to_string(),
@@ -1866,6 +1987,70 @@ mod tests {
             let decoded = WalletProviderRequestV2::decode_at(&bytes, NOW + 1).unwrap();
             assert_eq!(decoded, request);
             assert_eq!(decoded.operation.kind().as_str(), kind.as_str());
+        }
+    }
+
+    #[test]
+    fn protected_content_rights_signature_operation_is_exact_and_bounded() {
+        let operation = WalletProviderOperationV2::RequestProtectedContentRightsSignature {
+            account_id: ACCOUNT_ID.to_string(),
+            canonical_rights_request_hex: "00".to_string(),
+            reason: "Review and sign the exact canonical protected-content rights request"
+                .to_string(),
+        };
+        operation.validate().unwrap();
+        assert_eq!(
+            operation.kind(),
+            WalletOperationKind::RequestProtectedContentRightsSignature
+        );
+        assert_eq!(
+            operation.capability(),
+            "wallet:approval:request-protected-content-rights"
+        );
+        assert_eq!(
+            operation.authority_intent(),
+            "wallet.approval.protected-content-rights.request"
+        );
+        assert_eq!(operation.account_id(), Some(ACCOUNT_ID));
+
+        let oversized = WalletProviderOperationV2::RequestProtectedContentRightsSignature {
+            account_id: ACCOUNT_ID.to_string(),
+            canonical_rights_request_hex: "aa".repeat(MAX_PROTECTED_CONTENT_RIGHTS_WIRE_BYTES + 1),
+            reason: "too large".to_string(),
+        };
+        assert!(oversized.validate().is_err());
+
+        let uppercase = WalletProviderOperationV2::RequestProtectedContentRightsSignature {
+            account_id: ACCOUNT_ID.to_string(),
+            canonical_rights_request_hex: "AA".to_string(),
+            reason: "uppercase".to_string(),
+        };
+        assert!(uppercase.validate().is_err());
+    }
+
+    #[test]
+    fn generic_request_approval_cannot_use_the_protected_content_intent_or_resource() {
+        for operation in [
+            WalletProviderOperationV2::RequestApproval {
+                account_id: ACCOUNT_ID.to_string(),
+                chain_namespace: "eip155".to_string(),
+                intent: PROTECTED_CONTENT_RIGHTS_SIGNATURE_INTENT.to_string(),
+                resource: "elastos://wallet/eip155/sign/browser_personal_sign".to_string(),
+                reason: "must fail".to_string(),
+                payload: json!({"message": "x"}),
+                expires_at: NOW + 120,
+            },
+            WalletProviderOperationV2::RequestApproval {
+                account_id: ACCOUNT_ID.to_string(),
+                chain_namespace: "eip155".to_string(),
+                intent: "browser_personal_sign".to_string(),
+                resource: PROTECTED_CONTENT_RIGHTS_SIGNATURE_RESOURCE.to_string(),
+                reason: "must fail".to_string(),
+                payload: json!({"message": "x"}),
+                expires_at: NOW + 120,
+            },
+        ] {
+            assert!(operation.validate().is_err());
         }
     }
 

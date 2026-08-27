@@ -41,6 +41,49 @@ impl WalletProvider {
                     "signature": Value::Null,
                 })))
             }
+            WalletProviderOperationV2::RequestProtectedContentRightsSignature { .. } => {
+                let existing = self
+                    .store
+                    .approval_requests
+                    .iter()
+                    .find(|request| request.request_id == wallet_request.request_id)?;
+                let authority_binding = wallet_authority_binding(&wallet_request.authority);
+                if existing.principal_id != wallet_request.authority.principal_id
+                    || existing.wallet_request_sha256 != wallet_request.request_sha256
+                    || existing.authority_binding != authority_binding
+                {
+                    return Some(Response::error(
+                        "approval_identity_conflict",
+                        "Wallet approval identity was reused with substituted semantics or authority",
+                    ));
+                }
+                let mut response = json!({
+                    "approval_request": existing,
+                    "requires_approval": existing.status == ApprovalStatus::Pending,
+                    "signature": Value::Null,
+                });
+                if let Some(stored) = existing.signed_result.as_ref() {
+                    let Ok(result) = serde_json::from_value::<
+                        ProtectedContentRightsSignatureResultV1,
+                    >(stored.clone()) else {
+                        return Some(Response::error(
+                            "signing_error",
+                            "stored protected-content rights result is invalid",
+                        ));
+                    };
+                    if let Err(err) =
+                        validate_protected_content_rights_result_for_request(&result, existing)
+                    {
+                        return Some(Response::error("signing_error", err));
+                    }
+                    response["signed_result"] = stored.clone();
+                }
+                if let Some(receipt) = existing.signature_receipt.as_ref() {
+                    response["signature_receipt"] =
+                        serde_json::to_value(receipt).unwrap_or(Value::Null);
+                }
+                Some(Response::ok(response))
+            }
             WalletProviderOperationV2::AttachValidatedChainOutcome { outcome } => {
                 let existing = self
                     .store
@@ -65,6 +108,55 @@ impl WalletProvider {
             }
             _ => None,
         }
+    }
+
+    pub(super) fn request_protected_content_rights_signature(
+        &mut self,
+        request: &WalletProviderRequestV2,
+        account_id: &str,
+        canonical_rights_request_hex: &str,
+        reason: &str,
+    ) -> Response {
+        if let Err(response) = self.ensure_initialized() {
+            return response;
+        }
+        let now = now_ts();
+        let (rights_request, _) =
+            match protected_content_rights_request_from_hex(canonical_rights_request_hex) {
+                Ok(value) => value,
+                Err(err) => return Response::error("invalid_request", err),
+            };
+        let Some(account) = self
+            .active_account(&request.authority.principal_id, account_id)
+            .cloned()
+        else {
+            return Response::error("not_found", "active linked account not found");
+        };
+        if let Err(err) =
+            validate_protected_content_rights_request_account(&rights_request, &account, now)
+        {
+            return Response::error("invalid_request", err);
+        }
+        let expires_at = rights_request
+            .expires_at()
+            .min(now.saturating_add(MAX_APPROVAL_REQUEST_TTL_SECS));
+        self.request_approval(SignatureRequestInput {
+            request_id: request.request_id.clone(),
+            wallet_request_sha256: request.request_sha256.clone(),
+            authority_binding: wallet_authority_binding(&request.authority),
+            principal_id: request.authority.principal_id.clone(),
+            session_id: request.authority.session_id.clone(),
+            launch_id: request.authority.launch_id.clone(),
+            proof_binding_id: request.authority.proof_binding_id.clone(),
+            account_id: account_id.to_string(),
+            chain_namespace: account.chain_namespace,
+            intent: PROTECTED_CONTENT_RIGHTS_SIGNATURE_INTENT.to_string(),
+            requested_by_actor: request.authority.actor.clone(),
+            resource: PROTECTED_CONTENT_RIGHTS_SIGNATURE_RESOURCE.to_string(),
+            reason: reason.to_string(),
+            payload: protected_content_rights_approval_payload(canonical_rights_request_hex),
+            expires_at,
+        })
     }
 
     pub(super) fn request_approval(&mut self, input: SignatureRequestInput) -> Response {
@@ -116,17 +208,22 @@ impl WalletProvider {
             }
         }
         if input.intent == "browser_account_access" {
-            if let Err(err) = validate_browser_account_access_payload(
-                &input.payload,
-                &account,
-                &input.chain_namespace,
-                &input.session_id,
-                &input.launch_id,
-                input.proof_binding_id.as_deref(),
-                &input.requested_by_actor,
-                now,
-            ) {
+            if let Err(err) =
+                validate_browser_account_access_payload(&input.payload, &account, &input, now)
+            {
                 return Response::error("invalid_browser_account_access", err);
+            }
+        }
+        if input.intent == PROTECTED_CONTENT_RIGHTS_SIGNATURE_INTENT {
+            let (rights_request, _) =
+                match protected_content_rights_request_from_payload(&input.payload) {
+                    Ok(value) => value,
+                    Err(err) => return Response::error("invalid_request", err),
+                };
+            if let Err(err) =
+                validate_protected_content_rights_request_account(&rights_request, &account, now)
+            {
+                return Response::error("invalid_request", err);
             }
         }
         if input.intent == "bitcoin_bip322_proof" {
@@ -585,6 +682,74 @@ impl WalletProvider {
                 return Response::error("invalid_bitcoin_proof", err);
             }
             (bytes_hash(signature.as_bytes()), None)
+        } else if request_snapshot.intent == PROTECTED_CONTENT_RIGHTS_SIGNATURE_INTENT {
+            let Some(signature) = completion.signature else {
+                return Response::error(
+                    "invalid_request",
+                    "external protected-content rights completion requires signature",
+                );
+            };
+            if let Err(err) = validate_signature(signature) {
+                return Response::error("invalid_request", err);
+            }
+            if completion.signature_type != Some("personal_sign") {
+                return Response::error(
+                    "invalid_request",
+                    "protected-content rights completion requires personal_sign",
+                );
+            }
+            let Some(account) = self.store.accounts.iter().find(|account| {
+                account.principal_id == request_snapshot.principal_id
+                    && account.account_id == request_snapshot.account_id
+                    && account.revoked_at.is_none()
+            }) else {
+                return Response::error("not_found", "active linked account not found");
+            };
+            let (rights_request, canonical_bytes) =
+                match protected_content_rights_request_from_payload(&request_snapshot.payload) {
+                    Ok(value) => value,
+                    Err(err) => return Response::error("invalid_request", err),
+                };
+            if let Err(err) =
+                validate_protected_content_rights_request_account(&rights_request, account, now)
+            {
+                return Response::error("invalid_request", err);
+            }
+            let hash = ethereum_signed_message_hash(&canonical_bytes);
+            let recovered = match recover_evm_address_from_hash(&hash, signature) {
+                Ok(recovered) => recovered,
+                Err(err) => return Response::error("invalid_signature", err),
+            };
+            if normalize_evm_address(&recovered) != normalize_evm_address(&request_snapshot.address)
+            {
+                return Response::error("invalid_signature", "wallet signature signer mismatch");
+            }
+            let canonical_signature = match canonicalize_evm_signature(signature) {
+                Ok(signature) => signature,
+                Err(err) => return Response::error("invalid_signature", err),
+            };
+            let signed_request =
+                match WalletSignedRightsRequestV1::new(rights_request, canonical_signature) {
+                    Ok(value) => value,
+                    Err(err) => return Response::error("invalid_signature", err.to_string()),
+                };
+            let signed_request_hex = match signed_request.canonical_bytes() {
+                Ok(bytes) => hex::encode(bytes),
+                Err(err) => return Response::error("invalid_signature", err.to_string()),
+            };
+            let signed_result = match ProtectedContentRightsSignatureResultV1::new(
+                request_snapshot.account_id.clone(),
+                recovered.clone(),
+                signed_request_hex,
+            ) {
+                Ok(value) => value,
+                Err(err) => return Response::error("invalid_signature", err.to_string()),
+            };
+            let signed_result = match serde_json::to_value(signed_result) {
+                Ok(value) => Some(value),
+                Err(err) => return Response::error("invalid_signature", err.to_string()),
+            };
+            (bytes_hash(signature.as_bytes()), signed_result)
         } else {
             let Some(signature) = completion.signature else {
                 return Response::error(
@@ -790,9 +955,12 @@ impl WalletProvider {
             "signed_payload": signed.payload,
         });
         match signed.kind {
-            ManagedSignatureKind::Message => {
+            ManagedSignatureKind::Message
+                if request.intent != PROTECTED_CONTENT_RIGHTS_SIGNATURE_INTENT =>
+            {
                 response["signature"] = Value::String(signed.authority);
             }
+            ManagedSignatureKind::Message => {}
             ManagedSignatureKind::Transaction => {
                 response["signed_transaction"] = Value::String(signed.authority);
             }
@@ -804,11 +972,7 @@ impl WalletProvider {
 fn validate_browser_account_access_payload(
     payload: &Value,
     account: &LinkedAccount,
-    requested_chain_namespace: &str,
-    session_id: &str,
-    launch_id: &str,
-    request_proof_binding_id: Option<&str>,
-    requested_by_actor: &str,
+    input: &SignatureRequestInput,
     now: u64,
 ) -> Result<(), String> {
     const FIELDS: &[&str] = &[
@@ -848,7 +1012,7 @@ fn validate_browser_account_access_payload(
     if text("permission")? != "eth_accounts" {
         return Err("Browser account access permission must be eth_accounts".to_string());
     }
-    if requested_by_actor != "browser" {
+    if input.requested_by_actor != "browser" {
         return Err("Browser account access must be requested by Browser".to_string());
     }
     if !is_managed_proof_type(&account.proof_type) || account.connector_id.is_some() {
@@ -857,21 +1021,21 @@ fn validate_browser_account_access_payload(
     if text("principal_id")? != account.principal_id {
         return Err("Browser account access principal does not match selected account".to_string());
     }
-    if text("session_id")? != session_id || text("launch_id")? != launch_id {
+    if text("session_id")? != input.session_id || text("launch_id")? != input.launch_id {
         return Err(
             "Browser account access session or launch authority does not match".to_string(),
         );
     }
     let proof_binding_id = text("proof_binding_id")?;
     validate_opaque_id(proof_binding_id, "proof_binding_id")?;
-    if Some(proof_binding_id) != request_proof_binding_id {
+    if Some(proof_binding_id) != input.proof_binding_id.as_deref() {
         return Err("Browser account access proof binding does not match authority".to_string());
     }
     if text("account_id")? != account.account_id {
         return Err("Browser account access account does not match selected account".to_string());
     }
     let requested_payload_chain = text("requested_chain_namespace")?;
-    if requested_payload_chain != requested_chain_namespace
+    if requested_payload_chain != input.chain_namespace
         || !chain_namespaces_compatible(&account.chain_namespace, requested_payload_chain)
     {
         return Err("Browser account access chain does not match selected account".to_string());
