@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, Verifier as _};
+use ed25519_dalek::Signature;
 use serde::Serialize;
 use sha2::Digest as _;
 use thiserror::Error;
@@ -259,7 +259,7 @@ impl SignedRecipientKeyAuthorizationV1 {
         )
         .map_err(|_| RecipientAuthorizationError::InvalidProfileSignature)?;
         profile_key
-            .verify(&self.statement.canonical_bytes()?, &signature)
+            .verify_strict(&self.statement.canonical_bytes()?, &signature)
             .map_err(|_| RecipientAuthorizationError::InvalidProfileSignature)?;
         Ok(VerifiedRecipientKeyAuthorizationV1 {
             statement_hash: self.statement.canonical_hash()?,

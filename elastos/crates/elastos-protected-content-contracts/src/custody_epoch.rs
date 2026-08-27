@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, Verifier as _};
+use ed25519_dalek::Signature;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -301,7 +301,7 @@ impl SignedCustodyEpochV1 {
         )
         .map_err(|_| CustodyEpochError::InvalidIssuerSignature)?;
         issuer_key
-            .verify(&self.statement.canonical_bytes()?, &signature)
+            .verify_strict(&self.statement.canonical_bytes()?, &signature)
             .map_err(|_| CustodyEpochError::InvalidIssuerSignature)?;
         Ok(VerifiedCustodyEpochV1 {
             epoch_identity: self.epoch_identity()?,

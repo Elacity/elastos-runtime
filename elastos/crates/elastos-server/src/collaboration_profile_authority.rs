@@ -968,7 +968,7 @@ pub(crate) fn signed_profile_document_with_authority_for_test(
     )?;
     let document = CollaborationProfileDocument {
         schema: COLLABORATION_PROFILE_DOCUMENT_SCHEMA_V1.to_string(),
-        profile_did: crate::crypto::encode_signing_key_did(&signing_key),
+        profile_did: crate::crypto::encode_signing_key_did(signing_key),
         collaboration_endpoint,
         collaboration_signers,
         display_name: clean_profile_display_name(display_name)?,
