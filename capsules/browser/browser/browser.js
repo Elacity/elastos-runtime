@@ -1571,10 +1571,9 @@ function updateSettingsTitle() {
 function remoteCarrierExitLabel(exit) {
   const id = String(exit?.id || "").trim();
   const grant = String(exit?.grant_id || "").trim();
-  const peer = String(exit?.peer_did || exit?.carrier?.peer_did || "").trim();
   const displayName = String(exit?.display_name || exit?.label || "").trim();
-  const label = displayName || id || grant || peer || "shared Exit Node";
-  const marker = `${id} ${grant} ${peer}`.toLowerCase();
+  const label = displayName || id || grant || "shared Exit Node";
+  const marker = `${id} ${grant}`.toLowerCase();
   const kind = marker.includes("seed") ? "Seed Exit Node" : "Shared Exit Node";
   return `${kind}: ${label}`;
 }
@@ -1596,7 +1595,7 @@ function browserExitLabel(remoteExitId = selectedRemoteExitId) {
   const exit = visibleRemoteCarrierExits(browserSummary).find(
     (candidate) => candidate.id === remoteExitId,
   );
-  return exit ? remoteCarrierExitLabel(exit) : `Shared Exit Node: ${remoteExitId}`;
+  return exit ? remoteCarrierExitLabel(exit) : "Shared Exit Node";
 }
 
 function syncExitSelect(summary) {

@@ -232,6 +232,16 @@ Executable capsule isolation remains governed by
 [Principle 18](PRINCIPLES.md#18-executable-capsules-are-isolated-execution-environments)
 and [Capsule model](docs/CAPSULE_MODEL.md).
 
+The gateway already serves read-only content by CID at `/s/<cid>/`. Once
+capsule packages are signed and content-addressed, opening a capsule's CID
+should load the capsule itself: the gateway resolves the package, verifies
+it, and boots it with whatever host it declares — a game capsule loads its
+emulator, and the Home GUI capsule loads the Home host first, the same way
+today's launch path binds a viewer to its executable actor. A capsule's CID
+then works as a shareable link to the running thing, not just to its files.
+This depends on the signed package contract above; an unsigned directory
+served by CID must stay inert content.
+
 ### 7. Keep Home as the Runtime-owned front door
 
 Home is the default user surface. Runtime owns identity, object access,
@@ -307,11 +317,21 @@ operator commands; current acceptance and known limits belong in
 
 People is the trust surface for profiles, contacts, requests, device bindings,
 and service discovery. Chat owns direct, group, and public conversations.
-Inbox owns review of contact, pairing, conversation, and capability requests.
+Inbox owns review of contact, conversation, and capability requests.
+
+The identity split must stay explicit:
+
+- passkeys authorize a local principal; they are never the network identity;
+- a principal-owned Profile DID is the stable person/contact identity;
+- a device DID is endpoint and signing identity only;
+- signed profile documents authorize the current delivery device bindings and
+  must be retained by highest accepted revision plus previous-hash linkage;
+- direct conversations are scoped to Profile DIDs, not to device rotation.
 
 The product must distinguish people from devices and contacts from
 conversations. Discovery is opt-in and describes its actual network scope.
-Deterministic signed invites remain available when discovery is unavailable.
+Deterministic signed invites remain available as an explicit alternate
+onboarding path.
 Stable transport identifiers stay out of ordinary UI.
 
 Service offers can arrive through trusted People and Carrier relationships, but
@@ -325,15 +345,28 @@ Direct messages cannot be presented as private unless their transport and
 storage enforce that claim. Local composition and reading should remain usable
 without waiting for remote transport.
 
+Profile identity and transport routing must not drift:
+
+- the signed public profile document is the public identity truth;
+- older or conflicting profile revisions must fail closed once a newer accepted
+  revision is retained;
+- device revocation becomes effective when the newer signed profile revision is
+  observed, not by transport metadata alone;
+- direct messages need both proofs: the device signature proves the sending
+  endpoint, and the retained signed profile document proves that device is
+  currently authorized for the participant Profile DID;
+- Carrier/bootstrap configuration remains connectivity only and never becomes
+  person, contact, or conversation authority.
+
 The target contract carries authenticated messages, object updates, presence,
 and attachments between runtimes. Runtime must verify the sender, capability,
 replay policy, and destination object. Unauthenticated raw gossip does not meet
 that contract. Compatibility bridges may map external systems into the target
 contract, but they do not define the native model.
 
-See [People and conversations](docs/PEOPLE_CONVERSATIONS.md) for implemented
-behavior and [Tasks](TASKS.md#collaboration-and-messaging) for open
-outcomes.
+See [People and conversations](docs/PEOPLE_CONVERSATIONS.md) for the target
+model and ordered implementation slices, and
+[Tasks](TASKS.md#collaboration-and-messaging) for open outcomes.
 
 ### 10. Keep release, install, share, and sites on truthful paths
 

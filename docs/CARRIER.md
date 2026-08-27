@@ -33,15 +33,17 @@ implementations. Remote failure must stay visible as a typed operation result;
 it must not become transparent remote-object behavior or a silent local
 fallback.
 
-### Trusted-Source Room Bootstrap
+### Signed Collaboration Bootstrap
 
-Chat Room sync normally uses the Runtime peer provider. The install/update
-trusted-source path has one reviewed exception: the Runtime-owned
-trusted-source Room bootstrap exception may read the configured publisher
-Carrier ticket and use it to seed the internal Room gossip topic. This is a
-Runtime transport bootstrap, not a capsule capability. The raw trusted-source
-ticket, decoded endpoints, and direct Carrier socket authority must not appear
-in Home/Room summaries, ordinary capsule payloads, or user-facing receipts.
+A verified signed collaboration-network profile supplies bounded bootstrap
+peers and authenticates the content-addressed default-conversation grant. The
+Runtime collaboration service constructs one durable core and transport driver;
+the driver hands Carrier only opaque signed envelopes and treats broadcast as a
+transport observation, never product acceptance. Configured Chat text receives
+typed projections through the Runtime-owned product port and never receives
+tickets, decoded endpoints, raw sockets, or Carrier topics. The former
+route-owned Room gossip exception no longer exists. People/discovery migration
+remains separate open work.
 
 ```
 ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
@@ -450,10 +452,14 @@ HTTP here is a control-plane protocol. It is not the Carrier substrate.
 Peer discovery, gossip messaging, relay, and peer-to-peer content transfer. Built into the runtime as `carrier.rs`.
 
 **Current implementation:**
-- Built-in Carrier node using **iroh** (QUIC, gossip, mDNS, relay)
+- Built-in Carrier node using **Iroh 1.0.2** with iroh-gossip 0.101.0,
+  distributed-topic-tracker 0.3.5, mDNS, and relay support
 - `tunnel-provider` capsule using **cloudflared** (HTTP tunnel to public internet)
 
-**Transport:** iroh (QUIC + pkarr + relay). Target: interoperability with Elastos Carrier Native / Boson when those ecosystems mature.
+**Transport:** Iroh (QUIC + N0 DNS discovery + relay), with mainline DHT topic
+discovery through `distributed-topic-tracker` and mDNS on the local network.
+Target: interoperability with Elastos Carrier Native / Boson when those
+ecosystems mature.
 
 ### 3. Data Plane (host ↔ VM networking)
 
@@ -480,7 +486,7 @@ The codebase currently uses "Carrier" in a broader way than this document recomm
 | "Carrier control link" | legacy name for host↔VM control plumbing (now serial bridge by default, TAP only for explicit guest-network cases) | Data / Control Plane |
 | `CarrierServiceBridge` | Host-native provider process (stdio JSON) | Node Core / Control Plane |
 | `CapsuleBackend::Carrier` | Capsule runs on host (not in VM) | Node Core / Control Plane |
-| `permissions.carrier: true` | Capsule needs host-level network access | Control + Network |
+| `permissions.host_process: true` | Capsule needs Runtime-owned host-process provider execution with host-level network/system access | Control + Network |
 | `tunnel-provider` | Public HTTP tunnel via cloudflared | Network Plane |
 
 Recommended reading:

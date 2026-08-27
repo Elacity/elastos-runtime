@@ -13,7 +13,17 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
     window, Blob, Document, Element, Event, HtmlButtonElement, HtmlElement, HtmlFormElement,
-    HtmlInputElement, MessageEvent, RequestCredentials, Storage,
+    HtmlInputElement, HtmlTextAreaElement, MessageEvent, Node, RequestCredentials, Storage,
+};
+
+mod direct;
+
+use direct::{
+    apply_direct_messages, encode_path_segment, pending_direct_request_id,
+    remove_unavailable_conversation, requested_conversation_decision, selected_conversation,
+    should_clear_polled_transient_error, valid_direct_send_response, DirectConversationList,
+    DirectMessageDirection, DirectMessageList, DirectSendInput, DirectSendResponse, DirectUiState,
+    RequestedConversationDecision, DIRECT_API_BASE,
 };
 
 const BROWSER_SESSION_API_BASE: &str = "/api/browser/session";
@@ -29,13 +39,19 @@ const APPROVAL_REQUESTED_BADGE: &str = "Waiting";
 const APPROVAL_REQUESTED_DETAIL: &str = "Waiting for approval.";
 const SHELL_ACCESS_UNAVAILABLE_DETAIL: &str =
     "This device is not part of this conversation yet. Join from an invite or connect it first.";
-const EMOJI_BUTTON_IDS: [(&str, &str); 6] = [
+const EMOJI_BUTTON_IDS: [(&str, &str); 12] = [
     ("emoji-wave", "👋"),
+    ("emoji-thumbsup", "👍"),
+    ("emoji-heart", "❤️"),
+    ("emoji-joy", "😂"),
     ("emoji-fire", "🔥"),
     ("emoji-party", "🎉"),
     ("emoji-clap", "👏"),
-    ("emoji-heart", "❤️"),
     ("emoji-eyes", "👀"),
+    ("emoji-pray", "🙏"),
+    ("emoji-sad", "😢"),
+    ("emoji-think", "🤔"),
+    ("emoji-elephant", "🐘"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,14 +65,20 @@ struct AppConfig {
     access_mode: AccessMode,
     home_token: Option<String>,
     initial_join_invite: Option<String>,
+    initial_direct_conversation_id: Option<String>,
     browser_session_request_storage_key: String,
 }
 
 #[derive(Debug, Clone, Default)]
 struct AppState {
     request_id: Option<String>,
+    pending_chat_send: Option<PendingChatSend>,
+    selection_generation: u64,
+    room_mode_known: bool,
+    collaboration_configured: bool,
     session_active: bool,
     close_leave_sent: bool,
+    poll_loop_started: bool,
     show_participants: bool,
     show_access_controls: bool,
     force_message_follow: bool,
@@ -73,9 +95,21 @@ struct AppState {
     pending_requests: Vec<PendingRequestView>,
     active_sessions: Vec<ActiveSessionView>,
     room_control: SummaryRoomControlView,
-    local_runtime_did: Option<String>,
     attachment_urls: BTreeMap<String, String>,
     join_invite_url: Option<String>,
+    direct: DirectUiState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingChatSend {
+    request_id: String,
+    body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionGuard {
+    generation: u64,
+    selected_conversation_id: Option<String>,
 }
 
 struct App {
@@ -89,9 +123,14 @@ struct App {
     error_text: HtmlElement,
     gateway_ui: Option<GatewayUi>,
     chat_card: HtmlElement,
+    conversation_selector: HtmlElement,
+    conversation_avatar: HtmlElement,
+    conversation_title: HtmlElement,
+    conversation_detail: HtmlElement,
+    presence_card: HtmlElement,
     message_list: HtmlElement,
     composer_form: HtmlFormElement,
-    message_input: HtmlInputElement,
+    message_input: HtmlTextAreaElement,
     attach_button: HtmlButtonElement,
     send_button: HtmlButtonElement,
     participant_toggle: HtmlButtonElement,
@@ -114,9 +153,6 @@ struct App {
     conversation_invite_output_row: HtmlElement,
     conversation_invite_output: HtmlInputElement,
     conversation_invite_copy: HtmlButtonElement,
-    node_invite_form: HtmlFormElement,
-    node_did_input: HtmlInputElement,
-    node_invite_submit: HtmlButtonElement,
     node_list: HtmlElement,
 }
 
@@ -142,14 +178,44 @@ struct BrowserSessionStatusOutput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ShellSessionStartOutput {}
+struct ShellSessionStartOutput {
+    poll: RoomPollView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellSessionBootstrapFailure {
+    Unauthorized,
+    Unavailable,
+}
+
+impl ShellSessionBootstrapFailure {
+    fn from_request_error(error: &str) -> Self {
+        if is_session_error(error) {
+            Self::Unauthorized
+        } else {
+            Self::Unavailable
+        }
+    }
+
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Unauthorized => {
+                "Chat session bootstrap was not authorized. Reopen Chat from Home."
+            }
+            Self::Unavailable => "Chat session bootstrap failed. Reopen Chat from Home.",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct ConversationObjectView {
     seq: u64,
     sender: String,
+    /// `Some(true)`: `sender` is the sender's verified Profile display name.
+    /// `Some(false)`/`None`: configured shared Chat omits the row; other modes
+    /// keep their existing server-stamped naming.
     #[serde(default)]
-    sender_member_did: Option<String>,
+    sender_profile_verified: Option<bool>,
     #[serde(default)]
     from_current_session: bool,
     kind: ConversationObjectKind,
@@ -191,10 +257,11 @@ struct AttachmentView {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct ParticipantView {
     display_name: String,
+    /// Same contract as `ConversationObjectView::sender_profile_verified`.
+    #[serde(default)]
+    profile_verified: Option<bool>,
     device_label: String,
     last_seen_at: u64,
-    #[serde(default)]
-    member_did: Option<String>,
     #[serde(default)]
     role: Option<String>,
     #[serde(default)]
@@ -224,7 +291,7 @@ struct ActiveSessionView {
     #[serde(default)]
     capabilities: Vec<String>,
     #[serde(default)]
-    member_did: Option<String>,
+    member_bound: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -260,8 +327,6 @@ struct SummaryView {
     #[serde(default)]
     room_control: SummaryRoomControlView,
     #[serde(default)]
-    local_runtime_did: Option<String>,
-    #[serde(default = "summary_browser_access_allowed_default")]
     browser_access_allowed: bool,
     #[serde(default)]
     browser_access_block_reason: Option<String>,
@@ -269,16 +334,16 @@ struct SummaryView {
     pending_requests: Vec<PendingRequestView>,
     #[serde(default)]
     active_sessions: Vec<ActiveSessionView>,
+    #[serde(default)]
+    transport: RoomTransportView,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 struct RoomTransportView {
-    #[allow(dead_code)]
+    #[serde(default)]
+    configured: bool,
+    #[serde(default)]
     available: bool,
-    #[allow(dead_code)]
-    connected_peer_count: usize,
-    #[allow(dead_code)]
-    topic: Option<String>,
     #[serde(default)]
     status: Option<String>,
 }
@@ -288,8 +353,6 @@ struct SummaryRoomControlView {
     #[serde(default)]
     access_policy: RoomAccessPolicyView,
     #[serde(default)]
-    owner_did: Option<String>,
-    #[serde(default)]
     members: Vec<RoomMemberView>,
     #[serde(default)]
     pending_invites: Vec<RoomInviteView>,
@@ -297,11 +360,11 @@ struct SummaryRoomControlView {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct RoomAccessPolicyView {
-    #[serde(default = "summary_browser_access_allowed_default")]
+    #[serde(default = "room_access_policy_enabled_default")]
     allow_guest_invites: bool,
-    #[serde(default = "summary_browser_access_allowed_default")]
+    #[serde(default = "room_access_policy_enabled_default")]
     allow_member_invites: bool,
-    #[serde(default = "summary_browser_access_allowed_default")]
+    #[serde(default = "room_access_policy_enabled_default")]
     allow_members_to_host_guests: bool,
 }
 
@@ -317,10 +380,8 @@ impl Default for RoomAccessPolicyView {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct RoomMemberView {
-    member_did: String,
     role: String,
     added_at: u64,
-    added_by: String,
     #[serde(default)]
     profile_card: Option<RoomProfileCardView>,
 }
@@ -333,9 +394,7 @@ struct RoomProfileCardView {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct RoomInviteView {
     invite_id: String,
-    invited_did: String,
     role: String,
-    invited_by: String,
     created_at: u64,
     expires_at: u64,
 }
@@ -354,6 +413,7 @@ struct RoomPollInput {
 
 #[derive(Debug, Serialize)]
 struct SendMessageInput<'a> {
+    request_id: &'a str,
     body: &'a str,
 }
 
@@ -378,32 +438,18 @@ struct RoomAccessPolicyInput {
 }
 
 #[derive(Debug, Serialize)]
-struct RoomMemberInviteInput<'a> {
-    member_did: &'a str,
-}
-
-#[derive(Debug, Serialize)]
-struct RoomMemberRemoveInput<'a> {
-    member_did: &'a str,
-}
-
-#[derive(Debug, Serialize)]
 struct RoomInviteRevokeInput<'a> {
     invite_id: &'a str,
 }
 
 #[derive(Debug, Serialize)]
-struct ConversationJoinInviteCreateInput {
-    issuer_gateway: Option<String>,
-}
+struct ConversationJoinInviteCreateInput {}
 
 #[derive(Debug, Deserialize)]
 struct ConversationJoinInviteView {
     invite_url: String,
     #[allow(dead_code)]
     token: String,
-    #[allow(dead_code)]
-    issuer_gateway: String,
     #[allow(dead_code)]
     room_title: String,
     #[allow(dead_code)]
@@ -424,8 +470,6 @@ struct ConversationJoinInviteJoinResponse {
     room_title: String,
     #[allow(dead_code)]
     issuer_gateway: String,
-    #[allow(dead_code)]
-    member_did: String,
     #[allow(dead_code)]
     invite_id: String,
 }
@@ -474,9 +518,14 @@ pub fn start() -> Result<(), JsValue> {
         error_text: element_by_id(&document, "error-text")?,
         gateway_ui,
         chat_card: element_by_id(&document, "chat-card")?,
+        conversation_selector: element_by_id(&document, "conversation-selector")?,
+        conversation_avatar: element_by_id(&document, "conversation-avatar")?,
+        conversation_title: element_by_id(&document, "conversation-title")?,
+        conversation_detail: element_by_id(&document, "conversation-detail")?,
+        presence_card: element_by_id(&document, "presence-card")?,
         message_list: element_by_id(&document, "message-list")?,
         composer_form: form_by_id(&document, "composer-form")?,
-        message_input: input_by_id(&document, "message-input")?,
+        message_input: textarea_by_id(&document, "message-input")?,
         attach_button: button_by_id(&document, "attach-button")?,
         send_button: button_by_id(&document, "send-button")?,
         participant_toggle: button_by_id(&document, "participant-toggle")?,
@@ -502,9 +551,6 @@ pub fn start() -> Result<(), JsValue> {
         conversation_invite_output_row: element_by_id(&document, "conversation-invite-output-row")?,
         conversation_invite_output: input_by_id(&document, "conversation-invite-output")?,
         conversation_invite_copy: button_by_id(&document, "conversation-invite-copy")?,
-        node_invite_form: form_by_id(&document, "node-invite-form")?,
-        node_did_input: input_by_id(&document, "node-did-input")?,
-        node_invite_submit: button_by_id(&document, "node-invite-submit")?,
         node_list: element_by_id(&document, "node-list")?,
     });
 
@@ -514,13 +560,12 @@ pub fn start() -> Result<(), JsValue> {
     }
 
     app.bind_events()?;
-    app.hydrate_defaults();
     app.render()?;
+    app.hydrate_defaults();
     if !app.is_shell_mode() {
         app.restore_session();
+        app.start_poll_loop();
     }
-
-    app.start_poll_loop();
 
     Ok(())
 }
@@ -547,6 +592,13 @@ impl App {
     }
 
     fn start_poll_loop(self: &Rc<Self>) {
+        {
+            let mut state = self.state.borrow_mut();
+            if state.poll_loop_started {
+                return;
+            }
+            state.poll_loop_started = true;
+        }
         let poll_app = Rc::clone(self);
         spawn_local(async move {
             loop {
@@ -557,21 +609,97 @@ impl App {
     }
 
     async fn poll_and_render_once(&self) {
+        if self.is_direct_mode() {
+            let (selection_guard, polled_transient_error) = {
+                let state = self.state.borrow();
+                (
+                    current_selection_guard(&state),
+                    state
+                        .error_transient
+                        .then(|| state.error_text.clone())
+                        .flatten(),
+                )
+            };
+            let result = self
+                .refresh_direct_messages_for_guard(&selection_guard)
+                .await;
+            if !self.selection_guard_is_current(&selection_guard) {
+                return;
+            }
+            match result {
+                Ok(changed) => {
+                    let cleared_transient_error = {
+                        let mut state = self.state.borrow_mut();
+                        if should_clear_polled_transient_error(
+                            polled_transient_error.as_deref(),
+                            state.error_text.as_deref(),
+                            state.error_transient,
+                        ) {
+                            state.error_text = None;
+                            state.error_transient = false;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if changed || cleared_transient_error {
+                        let _ = self.render();
+                    }
+                }
+                Err(403) => {
+                    let stale_id = self.state.borrow().direct.selected_conversation_id.clone();
+                    self.return_to_conversation_selector(stale_id.as_deref());
+                    let _ = self.render();
+                }
+                Err(_) => {
+                    self.set_transient_error(Some(
+                        "Direct messages are temporarily unavailable.".to_string(),
+                    ));
+                    let _ = self.render();
+                }
+            }
+            return;
+        }
+        let shared_selection_guard = self.is_shell_mode().then(|| {
+            let state = self.state.borrow();
+            current_selection_guard(&state)
+        });
         let had_transient_error = {
             let state = self.state.borrow();
             state.error_text.is_some() && state.error_transient
         };
-        match self.poll_once().await {
+        match self
+            .poll_once_for_guard(shared_selection_guard.as_ref())
+            .await
+        {
             Ok(changed) => {
                 let mut shell_summary_changed = false;
                 if self.is_shell_mode() {
-                    match self.refresh_shell_summary().await {
+                    match self
+                        .refresh_shell_summary_for_guard(
+                            shared_selection_guard
+                                .as_ref()
+                                .expect("shell mode must capture a selection guard"),
+                        )
+                        .await
+                    {
                         Ok(changed) => shell_summary_changed = changed,
                         Err(err) => {
-                            self.set_transient_error(Some(err));
-                            shell_summary_changed = true;
+                            if shared_selection_guard
+                                .as_ref()
+                                .is_some_and(|guard| self.selection_guard_is_current(guard))
+                            {
+                                self.set_transient_error(Some(err));
+                                shell_summary_changed = true;
+                            }
                         }
                     }
+                }
+                if shared_selection_guard
+                    .as_ref()
+                    .is_some_and(|guard| !self.selection_guard_is_current(guard))
+                {
+                    return;
                 }
                 if had_transient_error {
                     self.clear_error();
@@ -591,6 +719,18 @@ impl App {
         format!("{}{}", CHAT_ROOM_API_BASE, suffix)
     }
 
+    fn is_direct_mode(&self) -> bool {
+        self.state
+            .borrow()
+            .direct
+            .selected_conversation_id
+            .is_some()
+    }
+
+    fn selection_guard_is_current(&self, guard: &SelectionGuard) -> bool {
+        selection_guard_matches(&self.state.borrow(), guard)
+    }
+
     fn home_token_headers(&self) -> Vec<(&'static str, String)> {
         self.config
             .home_token
@@ -607,60 +747,103 @@ impl App {
         }
     }
 
-    fn apply_summary(&self, summary: &SummaryView) -> bool {
-        let mut state = self.state.borrow_mut();
-        let previous_browser_access_allowed = state.browser_access_allowed;
-        let previous_browser_access_block_reason = state.browser_access_block_reason.clone();
-        let previous_pending_requests = state.pending_requests.clone();
-        let previous_active_sessions = state.active_sessions.clone();
-        let previous_room_control = state.room_control.clone();
-        let previous_local_runtime_did = state.local_runtime_did.clone();
-        let previous_status_badge = state.status_badge.clone();
-        let previous_status_detail = state.status_detail.clone();
-        state.browser_access_allowed = summary.browser_access_allowed;
-        state.browser_access_block_reason = summary.browser_access_block_reason.clone();
-        state.pending_requests = summary.pending_requests.clone();
-        state.active_sessions = summary.active_sessions.clone();
-        state.room_control = summary.room_control.clone();
-        state.local_runtime_did = summary.local_runtime_did.clone();
-        if !state.session_active && state.request_id.is_none() {
-            if self.is_shell_mode() {
-                if summary.local_runtime_role.is_some() || summary.browser_access_allowed {
-                    state.status_badge = self.default_status_badge();
-                    state.status_detail = self.default_status_detail();
-                } else {
-                    state.status_badge = "Unavailable".to_string();
-                    let reason = state
-                        .browser_access_block_reason
-                        .clone()
-                        .unwrap_or_else(|| SHELL_ACCESS_UNAVAILABLE_DETAIL.to_string());
-                    state.status_detail = trim_sentence(&reason);
-                }
-            } else if !state.browser_access_allowed {
-                state.status_badge = "Conversation locked".to_string();
-                let reason = state
-                    .browser_access_block_reason
-                    .clone()
-                    .unwrap_or_else(|| {
-                        "This device is not part of this conversation yet.".to_string()
-                    });
-                state.status_detail = format!(
-                    "{} Open the conversation from Home first, then try again.",
-                    trim_sentence(&reason)
-                );
-            } else {
-                state.status_badge = self.default_status_badge();
-                state.status_detail = self.default_status_detail();
-            }
+    async fn refresh_direct_conversations(&self) -> Result<bool, u16> {
+        if !self.is_shell_mode() {
+            return Ok(false);
         }
-        previous_browser_access_allowed != state.browser_access_allowed
-            || previous_browser_access_block_reason != state.browser_access_block_reason
-            || previous_pending_requests != state.pending_requests
-            || previous_active_sessions != state.active_sessions
-            || previous_room_control != state.room_control
-            || previous_local_runtime_did != state.local_runtime_did
-            || previous_status_badge != state.status_badge
-            || previous_status_detail != state.status_detail
+        let response: DirectConversationList = direct_get_json(
+            &format!("{DIRECT_API_BASE}/conversations"),
+            &self.home_token_headers(),
+        )
+        .await?;
+        if response.conversations.iter().any(|conversation| {
+            conversation.conversation_id.trim().is_empty()
+                || conversation.display_name.trim().is_empty()
+        }) {
+            return Err(500);
+        }
+        let mut state = self.state.borrow_mut();
+        if state.direct.conversations == response.conversations {
+            return Ok(false);
+        }
+        state.direct.conversations = response.conversations;
+        Ok(true)
+    }
+
+    fn return_to_conversation_selector(&self, unavailable_conversation_id: Option<&str>) {
+        let mut state = self.state.borrow_mut();
+        if let Some(unavailable_conversation_id) = unavailable_conversation_id {
+            remove_unavailable_conversation(&mut state.direct, unavailable_conversation_id);
+        } else {
+            clear_selected_direct_conversation(&mut state);
+            state.direct.notice = Some(
+                "That conversation is no longer available. Choose another conversation."
+                    .to_string(),
+            );
+        }
+        state.error_text = state.direct.notice.clone();
+        state.error_transient = false;
+    }
+
+    async fn refresh_direct_messages_for_guard(&self, guard: &SelectionGuard) -> Result<bool, u16> {
+        let conversation_id = guard.selected_conversation_id.clone().ok_or(403u16)?;
+        let conversations_result: Result<DirectConversationList, u16> = direct_get_json(
+            &format!("{DIRECT_API_BASE}/conversations"),
+            &self.home_token_headers(),
+        )
+        .await;
+        if !self.selection_guard_is_current(guard) {
+            return Ok(false);
+        }
+        let conversations = conversations_result?;
+        if conversations.conversations.iter().any(|conversation| {
+            conversation.conversation_id.trim().is_empty()
+                || conversation.display_name.trim().is_empty()
+        }) {
+            return Err(500);
+        }
+        let selected_is_available =
+            selected_conversation(&conversations.conversations, &conversation_id).is_some();
+        if !selected_is_available {
+            return Err(403);
+        }
+        let messages_result: Result<DirectMessageList, u16> = direct_get_json(
+            &format!(
+                "{DIRECT_API_BASE}/conversations/{}/messages",
+                encode_path_segment(&conversation_id)
+            ),
+            &self.home_token_headers(),
+        )
+        .await;
+        if !self.selection_guard_is_current(guard) {
+            return Ok(false);
+        }
+        let response = messages_result?;
+        if response
+            .messages
+            .iter()
+            .any(|message| message.message_id.trim().is_empty() || message.text.trim().is_empty())
+        {
+            return Err(500);
+        }
+        let mut state = self.state.borrow_mut();
+        let Some(result) = apply_direct_refresh_if_current(
+            &mut state,
+            guard,
+            conversations.conversations,
+            response,
+        ) else {
+            return Ok(false);
+        };
+        result
+    }
+
+    fn apply_summary(&self, summary: &SummaryView) -> bool {
+        apply_summary_state(
+            &mut self.state.borrow_mut(),
+            summary,
+            self.config.access_mode,
+        )
     }
 
     fn bind_events(self: &Rc<Self>) -> Result<(), JsValue> {
@@ -769,6 +952,107 @@ impl App {
         self.composer_form
             .add_event_listener_with_callback("submit", send_submit.as_ref().unchecked_ref())?;
         send_submit.forget();
+
+        let edit_app = Rc::clone(self);
+        let message_edit = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+            let body = edit_app.message_input.value().trim().to_string();
+            let mut state = edit_app.state.borrow_mut();
+            if let Some(conversation_id) = state.direct.selected_conversation_id.clone() {
+                if state.direct.pending_send.as_ref().is_some_and(|pending| {
+                    pending.conversation_id != conversation_id || pending.text != body
+                }) {
+                    state.direct.pending_send = None;
+                }
+                return;
+            }
+            if state
+                .pending_chat_send
+                .as_ref()
+                .is_some_and(|pending| pending.body != body)
+            {
+                state.pending_chat_send = None;
+            }
+        }));
+        self.message_input
+            .add_event_listener_with_callback("input", message_edit.as_ref().unchecked_ref())?;
+        message_edit.forget();
+
+        let selector_app = Rc::clone(self);
+        let selector_click = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
+            let Some(target) = event.target() else {
+                return;
+            };
+            let Some(button) = target
+                .dyn_ref::<Element>()
+                .cloned()
+                .or_else(|| {
+                    target
+                        .dyn_ref::<Node>()
+                        .and_then(|node| node.parent_element())
+                })
+                .and_then(|element| element.closest("[data-conversation-choice]").ok().flatten())
+            else {
+                return;
+            };
+            let choice = resolve_conversation_choice(
+                button.get_attribute("data-conversation-choice").as_deref(),
+                target
+                    .dyn_ref::<Node>()
+                    .and_then(|node| node.parent_element())
+                    .and_then(|element| {
+                        element.closest("[data-conversation-choice]").ok().flatten()
+                    })
+                    .and_then(|element| element.get_attribute("data-conversation-choice"))
+                    .as_deref(),
+            );
+            let Some(choice) = choice else {
+                return;
+            };
+            let selection_guard = {
+                let mut state = selector_app.state.borrow_mut();
+                state.error_text = None;
+                state.error_transient = false;
+                if choice == "shared" {
+                    commit_shared_selection(&mut state)
+                } else {
+                    let Some(guard) = commit_direct_selection(&mut state, &choice) else {
+                        return;
+                    };
+                    guard
+                }
+            };
+            let _ = selector_app.render();
+            selector_app.start_poll_loop();
+            let app = Rc::clone(&selector_app);
+            spawn_local(async move {
+                if choice == "shared" {
+                    if let Err(error) = app.ensure_shell_session_for_guard(&selection_guard).await {
+                        if app.selection_guard_is_current(&selection_guard) {
+                            app.set_error(Some(error));
+                        }
+                    }
+                } else if let Err(status) = app
+                    .refresh_direct_messages_for_guard(&selection_guard)
+                    .await
+                {
+                    if app.selection_guard_is_current(&selection_guard) {
+                        if status == 403 {
+                            app.return_to_conversation_selector(Some(&choice));
+                        } else {
+                            app.set_error(Some(
+                                "Direct messages are temporarily unavailable.".to_string(),
+                            ));
+                        }
+                    }
+                }
+                if app.selection_guard_is_current(&selection_guard) {
+                    let _ = app.render();
+                }
+            });
+        }));
+        self.conversation_selector
+            .add_event_listener_with_callback("click", selector_click.as_ref().unchecked_ref())?;
+        selector_click.forget();
 
         let attach_trigger_app = Rc::clone(self);
         let attach_click = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
@@ -932,25 +1216,6 @@ impl App {
             )?;
         copy_invite_click.forget();
 
-        let node_invite_app = Rc::clone(self);
-        let node_invite_submit =
-            Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
-                event.prevent_default();
-                let app = Rc::clone(&node_invite_app);
-                spawn_local(async move {
-                    app.clear_error();
-                    if let Err(err) = app.invite_runtime_node().await {
-                        app.set_error(Some(err));
-                    }
-                    let _ = app.render();
-                });
-            }));
-        self.node_invite_form.add_event_listener_with_callback(
-            "submit",
-            node_invite_submit.as_ref().unchecked_ref(),
-        )?;
-        node_invite_submit.forget();
-
         let room_access_app = Rc::clone(self);
         let room_access_click = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
             let Some(target) = event
@@ -994,19 +1259,10 @@ impl App {
                 let Some(action) = button.get_attribute("data-node-action") else {
                     return;
                 };
-                let member_did = button.get_attribute("data-member-did");
                 let invite_id = button.get_attribute("data-invite-id");
                 spawn_local(async move {
                     app.clear_error();
                     let result = match action.as_str() {
-                        "remove" => {
-                            match member_did
-                                .ok_or_else(|| "missing advanced profile identifier".to_string())
-                            {
-                                Ok(did) => app.remove_runtime_node(&did).await,
-                                Err(err) => Err(err),
-                            }
-                        }
                         "revoke-invite" => {
                             match invite_id.ok_or_else(|| "missing invite".to_string()) {
                                 Ok(invite_id) => app.revoke_runtime_invite(&invite_id).await,
@@ -1328,42 +1584,7 @@ impl App {
     }
 
     fn apply_active_poll(&self, poll: RoomPollView) -> (Vec<AttachmentView>, bool) {
-        let attachments_to_cache = poll
-            .objects
-            .iter()
-            .filter_map(|object| object.attachment.clone())
-            .collect::<Vec<_>>();
-
-        let transport_summary = live_status_detail(&poll.transport);
-        {
-            let mut state = self.state.borrow_mut();
-            let was_session_active = state.session_active;
-            let previous_display_name = state.display_name.clone();
-            let previous_latest_seq = state.latest_seq;
-            let previous_participants = state.participants.clone();
-            let previous_status_badge = state.status_badge.clone();
-            let previous_status_detail = state.status_detail.clone();
-            state.session_active = true;
-            state.close_leave_sent = false;
-            state.display_name = poll.display_name.clone();
-            state.status_badge = "Live".to_string();
-            state.status_detail = transport_summary.clone();
-            state.latest_seq = poll.latest_seq;
-            state.objects.extend(poll.objects);
-            state.participants = poll.participants;
-            dedupe_objects(&mut state.objects);
-            if previous_latest_seq != state.latest_seq {
-                state.force_message_follow = true;
-            }
-
-            let changed = was_session_active != state.session_active
-                || previous_display_name != state.display_name
-                || previous_latest_seq != state.latest_seq
-                || previous_participants != state.participants
-                || previous_status_badge != state.status_badge
-                || previous_status_detail != state.status_detail;
-            return (attachments_to_cache, changed);
-        }
+        apply_active_poll_state(&mut self.state.borrow_mut(), poll)
     }
 
     fn clear_browser_session_request_storage(&self) {
@@ -1443,30 +1664,110 @@ impl App {
 
         let app = Rc::clone(self);
         spawn_local(async move {
-            let Ok(summary) = api_get_json_with_headers::<SummaryView>(
+            let requested_direct = app.config.initial_direct_conversation_id.clone();
+            let bootstrap_generation = app.state.borrow().selection_generation;
+            let direct_loaded = app.refresh_direct_conversations().await.is_ok();
+            if let Some(conversation_id) = requested_direct {
+                let decision = requested_conversation_decision(
+                    direct_loaded,
+                    &app.state.borrow().direct.conversations,
+                    &conversation_id,
+                );
+                match decision {
+                    RequestedConversationDecision::Available => {
+                        let selection_guard = {
+                            let mut state = app.state.borrow_mut();
+                            commit_requested_direct_selection_if_current(
+                                &mut state,
+                                bootstrap_generation,
+                                &conversation_id,
+                            )
+                        };
+                        if let Some(selection_guard) = selection_guard {
+                            match app
+                                .refresh_direct_messages_for_guard(&selection_guard)
+                                .await
+                            {
+                                Ok(_) => {
+                                    if app.selection_guard_is_current(&selection_guard) {
+                                        app.start_poll_loop();
+                                        let _ = app.render();
+                                        return;
+                                    }
+                                }
+                                Err(403) if app.selection_guard_is_current(&selection_guard) => {
+                                    app.return_to_conversation_selector(Some(&conversation_id));
+                                }
+                                Err(_) if app.selection_guard_is_current(&selection_guard) => {
+                                    app.set_error(Some(
+                                        "Direct messages are temporarily unavailable.".to_string(),
+                                    ));
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                    RequestedConversationDecision::Unavailable => {
+                        app.return_to_conversation_selector(Some(&conversation_id));
+                    }
+                    RequestedConversationDecision::TemporarilyUnavailable => {
+                        app.set_transient_error(Some(
+                            "Direct conversations are temporarily unavailable.".to_string(),
+                        ));
+                    }
+                }
+            }
+            let summary = match api_get_json_with_headers::<SummaryView>(
                 &app.room_api_url("/summary"),
                 &app.home_token_headers(),
             )
             .await
-            else {
-                return;
+            {
+                Ok(summary) => summary,
+                Err(error) => {
+                    if app.is_shell_mode() {
+                        app.set_error(Some(
+                            ShellSessionBootstrapFailure::from_request_error(&error)
+                                .detail()
+                                .to_string(),
+                        ));
+                        let _ = app.render();
+                    }
+                    return;
+                }
             };
             let _ = app.apply_summary(&summary);
             if app.is_shell_mode() {
-                if let Some(invite) = app.config.initial_join_invite.as_deref() {
+                let shared_guard = {
+                    let state = app.state.borrow();
+                    current_selection_guard(&state)
+                };
+                let bootstrap = if let Some(invite) = app.config.initial_join_invite.as_deref() {
                     app.conversation_join_input.set_value(invite);
-                    if let Err(err) = app.join_conversation_from_invite().await {
+                    app.join_conversation_from_invite().await
+                } else {
+                    app.ensure_shell_session_for_guard(&shared_guard)
+                        .await
+                        .map(|_| ())
+                };
+                if let Err(err) = bootstrap {
+                    if app.selection_guard_is_current(&shared_guard) {
                         app.set_error(Some(err));
                     }
-                } else if let Err(err) = app.ensure_shell_session().await {
-                    app.set_error(Some(err));
+                } else if app.selection_guard_is_current(&shared_guard)
+                    && app.state.borrow().session_active
+                {
+                    app.start_poll_loop();
                 }
             }
             let _ = app.render();
         });
     }
 
-    async fn refresh_shell_summary(&self) -> Result<bool, String> {
+    async fn refresh_shell_summary_for_guard(
+        &self,
+        guard: &SelectionGuard,
+    ) -> Result<bool, String> {
         if !self.is_shell_mode() {
             return Ok(false);
         }
@@ -1475,7 +1776,14 @@ impl App {
             &self.home_token_headers(),
         )
         .await?;
-        Ok(self.apply_summary(&summary))
+        if !self.selection_guard_is_current(guard) {
+            return Ok(false);
+        }
+        let mut state = self.state.borrow_mut();
+        Ok(
+            apply_summary_if_current(&mut state, guard, &summary, self.config.access_mode)
+                .unwrap_or(false),
+        )
     }
 
     async fn submit_browser_session_request(&self) -> Result<(), String> {
@@ -1539,9 +1847,9 @@ impl App {
         Ok(())
     }
 
-    async fn ensure_shell_session(&self) -> Result<(), String> {
+    async fn ensure_shell_session_for_guard(&self, guard: &SelectionGuard) -> Result<bool, String> {
         if !self.is_shell_mode() || self.state.borrow().session_active {
-            return Ok(());
+            return Ok(false);
         }
 
         let summary = api_get_json_with_headers::<SummaryView>(
@@ -1549,36 +1857,60 @@ impl App {
             &self.home_token_headers(),
         )
         .await?;
-        let _ = self.apply_summary(&summary);
-        if summary.local_runtime_role.is_none() && !summary.browser_access_allowed {
+        if !self.selection_guard_is_current(guard) {
+            return Ok(false);
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            let Some(_changed) =
+                apply_summary_if_current(&mut state, guard, &summary, self.config.access_mode)
+            else {
+                return Ok(false);
+            };
+        }
+        if !shell_summary_allows_session(&summary) {
             let detail = summary
                 .browser_access_block_reason
                 .clone()
                 .unwrap_or_else(|| SHELL_ACCESS_UNAVAILABLE_DETAIL.to_string());
-            self.set_error(Some(detail.clone()));
             let mut state = self.state.borrow_mut();
+            if !selection_guard_matches(&state, guard) {
+                return Ok(false);
+            }
+            state.error_text = Some(detail.clone());
+            state.error_transient = false;
             state.status_badge = "Conversation unavailable".to_string();
             state.status_detail = trim_sentence(&detail);
-            return Ok(());
+            return Ok(true);
         }
 
-        let _: ShellSessionStartOutput = api_post_empty_json_with_headers(
+        let start: ShellSessionStartOutput = api_post_empty_json_with_headers(
             &self.room_api_url("/session/start"),
             &self.home_token_headers(),
         )
-        .await?;
-        let headers = self.room_request_headers();
-        let poll: RoomPollView = api_post_session_json(
-            &self.room_api_url("/poll"),
-            &RoomPollInput { since: 0 },
-            &headers,
-        )
-        .await?;
-        let (attachments_to_cache, _changed) = self.apply_active_poll(poll);
+        .await
+        .map_err(|error| {
+            ShellSessionBootstrapFailure::from_request_error(&error)
+                .detail()
+                .to_string()
+        })?;
+        if !self.selection_guard_is_current(guard) {
+            return Ok(false);
+        }
+        let (attachments_to_cache, changed) = {
+            let mut state = self.state.borrow_mut();
+            let Some(result) = apply_active_poll_if_current(&mut state, guard, start.poll) else {
+                return Ok(false);
+            };
+            result
+        };
         for attachment in attachments_to_cache {
+            if !self.selection_guard_is_current(guard) {
+                return Ok(changed);
+            }
             self.cache_attachment_data_url(&attachment).await?;
         }
-        Ok(())
+        Ok(changed)
     }
 
     async fn approve_browser_access_request(&self, request_id: &str) -> Result<(), String> {
@@ -1590,7 +1922,13 @@ impl App {
             &self.home_token_headers(),
         )
         .await?;
-        let _ = self.refresh_shell_summary().await?;
+        let selection_guard = {
+            let state = self.state.borrow();
+            current_selection_guard(&state)
+        };
+        let _ = self
+            .refresh_shell_summary_for_guard(&selection_guard)
+            .await?;
         Ok(())
     }
 
@@ -1603,7 +1941,13 @@ impl App {
             &self.home_token_headers(),
         )
         .await?;
-        let _ = self.refresh_shell_summary().await?;
+        let selection_guard = {
+            let state = self.state.borrow();
+            current_selection_guard(&state)
+        };
+        let _ = self
+            .refresh_shell_summary_for_guard(&selection_guard)
+            .await?;
         Ok(())
     }
 
@@ -1616,7 +1960,13 @@ impl App {
             &self.home_token_headers(),
         )
         .await?;
-        let _ = self.refresh_shell_summary().await?;
+        let selection_guard = {
+            let state = self.state.borrow();
+            current_selection_guard(&state)
+        };
+        let _ = self
+            .refresh_shell_summary_for_guard(&selection_guard)
+            .await?;
         Ok(())
     }
 
@@ -1651,7 +2001,13 @@ impl App {
             &self.home_token_headers(),
         )
         .await?;
-        let _ = self.refresh_shell_summary().await?;
+        let selection_guard = {
+            let state = self.state.borrow();
+            current_selection_guard(&state)
+        };
+        let _ = self
+            .refresh_shell_summary_for_guard(&selection_guard)
+            .await?;
         Ok(())
     }
 
@@ -1661,9 +2017,7 @@ impl App {
         }
         let invite: ConversationJoinInviteView = api_post_json_with_headers(
             &self.room_api_url("/invites/create-link"),
-            &ConversationJoinInviteCreateInput {
-                issuer_gateway: None,
-            },
+            &ConversationJoinInviteCreateInput {},
             &self.home_token_headers(),
         )
         .await?;
@@ -1708,44 +2062,17 @@ impl App {
         )
         .await?;
         self.conversation_join_input.set_value("");
-        let _ = self.refresh_shell_summary().await?;
-        self.ensure_shell_session().await?;
+        let selection_guard = {
+            let state = self.state.borrow();
+            current_selection_guard(&state)
+        };
+        let _ = self
+            .refresh_shell_summary_for_guard(&selection_guard)
+            .await?;
+        let _ = self
+            .ensure_shell_session_for_guard(&selection_guard)
+            .await?;
         self.set_status("Joined", &format!("Joined {}.", joined.room_title));
-        Ok(())
-    }
-
-    async fn invite_runtime_node(&self) -> Result<(), String> {
-        if !self.is_shell_mode() {
-            return Err("ElastOS user invites are only available from Home".to_string());
-        }
-        let member_did = self.node_did_input.value().trim().to_string();
-        if member_did.is_empty() {
-            return Err("Enter an advanced profile identifier.".to_string());
-        }
-        let _: serde_json::Value = api_post_json_with_headers(
-            &self.room_api_url("/members/invite"),
-            &RoomMemberInviteInput {
-                member_did: &member_did,
-            },
-            &self.home_token_headers(),
-        )
-        .await?;
-        self.node_did_input.set_value("");
-        let _ = self.refresh_shell_summary().await?;
-        Ok(())
-    }
-
-    async fn remove_runtime_node(&self, member_did: &str) -> Result<(), String> {
-        if !self.is_shell_mode() {
-            return Err("ElastOS user removal is only available from Home".to_string());
-        }
-        let _: serde_json::Value = api_post_json_with_headers(
-            &self.room_api_url("/members/remove"),
-            &RoomMemberRemoveInput { member_did },
-            &self.home_token_headers(),
-        )
-        .await?;
-        let _ = self.refresh_shell_summary().await?;
         Ok(())
     }
 
@@ -1759,11 +2086,20 @@ impl App {
             &self.home_token_headers(),
         )
         .await?;
-        let _ = self.refresh_shell_summary().await?;
+        let selection_guard = {
+            let state = self.state.borrow();
+            current_selection_guard(&state)
+        };
+        let _ = self
+            .refresh_shell_summary_for_guard(&selection_guard)
+            .await?;
         Ok(())
     }
 
     async fn send_message(&self) -> Result<(), String> {
+        if self.is_direct_mode() {
+            return self.send_direct_message().await;
+        }
         if !self.state.borrow().session_active {
             return Ok(());
         }
@@ -1772,8 +2108,100 @@ impl App {
             return Ok(());
         }
 
-        self.send_room_text(&body).await?;
+        let request_id = {
+            let mut state = self.state.borrow_mut();
+            pending_chat_request_id(
+                &mut state.pending_chat_send,
+                &body,
+                new_chat_message_request_id,
+            )?
+        };
+        if self.send_room_text(&request_id, &body).await? {
+            let mut state = self.state.borrow_mut();
+            if state
+                .pending_chat_send
+                .as_ref()
+                .is_some_and(|pending| pending.request_id == request_id && pending.body == body)
+            {
+                state.pending_chat_send = None;
+            }
+            drop(state);
+            self.message_input.set_value("");
+        }
+        Ok(())
+    }
+
+    async fn send_direct_message(&self) -> Result<(), String> {
+        let conversation_id = self
+            .state
+            .borrow()
+            .direct
+            .selected_conversation_id
+            .clone()
+            .ok_or_else(|| "Choose a conversation first.".to_string())?;
+        if selected_conversation(&self.state.borrow().direct.conversations, &conversation_id)
+            .is_none()
+        {
+            self.return_to_conversation_selector(Some(&conversation_id));
+            return Err("That conversation is no longer available.".to_string());
+        }
+        let text = self.message_input.value().trim().to_string();
+        if text.is_empty() {
+            return Ok(());
+        }
+        let request_id = {
+            let mut state = self.state.borrow_mut();
+            pending_direct_request_id(
+                &mut state.direct.pending_send,
+                &conversation_id,
+                &text,
+                new_chat_message_request_id,
+            )?
+        };
+        let payload = DirectSendInput {
+            request_id: &request_id,
+            conversation_id: &conversation_id,
+            text: &text,
+        };
+        let response_result: Result<(u16, DirectSendResponse), u16> = direct_post_json(
+            &format!("{DIRECT_API_BASE}/messages/send"),
+            &payload,
+            &self.home_token_headers(),
+        )
+        .await;
+        let current_selection = self.state.borrow().direct.selected_conversation_id.clone();
+        if current_selection.as_deref() != Some(conversation_id.as_str()) {
+            return Ok(());
+        }
+        let (http_status, response) = match response_result {
+            Ok(response) => response,
+            Err(403) => {
+                self.return_to_conversation_selector(Some(&conversation_id));
+                return Err("That conversation is no longer available.".to_string());
+            }
+            Err(_) => return Err("Message could not be sent. Try again.".to_string()),
+        };
+        if !valid_direct_send_response(http_status, response.status) {
+            return Err("Message could not be sent. Try again.".to_string());
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            if state.direct.pending_send.as_ref().is_some_and(|pending| {
+                pending.request_id == request_id
+                    && pending.conversation_id == conversation_id
+                    && pending.text == text
+            }) {
+                state.direct.pending_send = None;
+            }
+        }
         self.message_input.set_value("");
+        let selection_guard = {
+            let state = self.state.borrow();
+            current_selection_guard(&state)
+        };
+        let _ = self
+            .refresh_direct_messages_for_guard(&selection_guard)
+            .await;
         Ok(())
     }
 
@@ -1841,11 +2269,11 @@ impl App {
         Ok(())
     }
 
-    async fn send_room_text(&self, body: &str) -> Result<(), String> {
+    async fn send_room_text(&self, request_id: &str, body: &str) -> Result<bool, String> {
         if !self.state.borrow().session_active {
-            return Ok(());
+            return Ok(false);
         }
-        let payload = SendMessageInput { body };
+        let payload = SendMessageInput { request_id, body };
         let headers = self.room_request_headers();
         let sent: ConversationObjectView =
             match api_post_session_json(&self.room_api_url("/objects/send"), &payload, &headers)
@@ -1854,7 +2282,7 @@ impl App {
                 Ok(sent) => sent,
                 Err(err) if is_session_error(&err) => {
                     self.handle_session_loss(self.session_loss_detail());
-                    return Ok(());
+                    return Ok(false);
                 }
                 Err(err) => return Err(err),
             };
@@ -1863,7 +2291,7 @@ impl App {
         state.latest_seq = sent.seq;
         state.objects.push(sent);
         state.force_message_follow = true;
-        Ok(())
+        Ok(true)
     }
 
     fn open_elastos_uri_from_shell(&self, uri: &str) -> Result<bool, JsValue> {
@@ -2051,7 +2479,7 @@ impl App {
         Ok(true)
     }
 
-    async fn poll_once(&self) -> Result<bool, String> {
+    async fn poll_once_for_guard(&self, guard: Option<&SelectionGuard>) -> Result<bool, String> {
         let session_active = {
             let state = self.state.borrow();
             state.session_active
@@ -2078,8 +2506,27 @@ impl App {
                 Err(err) => return Err(err),
             };
 
-            let (attachments_to_cache, changed) = self.apply_active_poll(poll);
+            if guard
+                .is_some_and(|selection_guard| !self.selection_guard_is_current(selection_guard))
+            {
+                return Ok(false);
+            }
+            let (attachments_to_cache, changed) = if let Some(selection_guard) = guard {
+                let mut state = self.state.borrow_mut();
+                let Some(result) = apply_active_poll_if_current(&mut state, selection_guard, poll)
+                else {
+                    return Ok(false);
+                };
+                result
+            } else {
+                self.apply_active_poll(poll)
+            };
             for attachment in attachments_to_cache {
+                if guard.is_some_and(|selection_guard| {
+                    !self.selection_guard_is_current(selection_guard)
+                }) {
+                    return Ok(changed);
+                }
                 self.cache_attachment_data_url(&attachment).await?;
             }
             return Ok(changed);
@@ -2106,7 +2553,7 @@ impl App {
                     || state.status_detail != APPROVAL_REQUESTED_DETAIL;
                 state.status_badge = APPROVAL_REQUESTED_BADGE.to_string();
                 state.status_detail = APPROVAL_REQUESTED_DETAIL.to_string();
-                return Ok(changed);
+                Ok(changed)
             }
             "approved" => {
                 self.clear_browser_session_request_storage();
@@ -2119,9 +2566,7 @@ impl App {
                 state.status_badge = "Joining".to_string();
                 let _ = status.expires_at;
                 state.status_detail = "Approved. Opening conversation.".to_string();
-                return Ok(
-                    previous_badge != state.status_badge || previous_detail != state.status_detail
-                );
+                Ok(previous_badge != state.status_badge || previous_detail != state.status_detail)
             }
             "denied" => {
                 self.clear_browser_session_request_storage();
@@ -2132,7 +2577,7 @@ impl App {
                     .denial_reason
                     .clone()
                     .unwrap_or_else(|| "This request was denied.".to_string());
-                return Ok(true);
+                Ok(true)
             }
             "expired" => {
                 self.clear_browser_session_request_storage();
@@ -2140,13 +2585,13 @@ impl App {
                 state.request_id = None;
                 state.status_badge = "Expired".to_string();
                 state.status_detail = "This request expired. Try again.".to_string();
-                return Ok(true);
+                Ok(true)
             }
             other => {
                 let mut state = self.state.borrow_mut();
                 state.status_badge = "Unknown".to_string();
                 state.status_detail = format!("Unexpected browser session status: {}.", other);
-                return Ok(true);
+                Ok(true)
             }
         }
     }
@@ -2207,15 +2652,30 @@ impl App {
             status_detail.set_text_content(Some(&state.status_detail));
         }
         let pending = state.request_id.is_some();
-        let session_active = state.session_active;
-        let loading_room = self.is_shell_mode() && !session_active;
-        let participant_count = if loading_room {
-            "Opening conversation".to_string()
-        } else {
-            format_participant_count(state.participants.len())
-        };
+        let projection = render_projection(&state, self.is_shell_mode());
+        let session_active = projection.session_active;
+        let direct_mode = projection.direct_mode;
+        let direct_send_enabled = direct_mode
+            && state
+                .direct
+                .selected_conversation_id
+                .as_deref()
+                .is_some_and(|id| {
+                    // A removed relationship is read-only: history renders,
+                    // the composer stays dark.
+                    selected_conversation(&state.direct.conversations, id)
+                        .is_some_and(|conversation| !conversation.removed)
+                });
+        let controls = chat_control_policy(
+            state.room_mode_known,
+            state.collaboration_configured,
+            self.is_shell_mode(),
+            session_active,
+            state.show_access_controls,
+            !state.pending_requests.is_empty(),
+        );
         self.participant_count
-            .set_text_content(Some(&participant_count));
+            .set_text_content(Some(&projection.participant_count));
         self.browser_access_count
             .set_text_content(Some(&format_browser_access_count(
                 state.pending_requests.len(),
@@ -2238,21 +2698,28 @@ impl App {
             "data-room-session-active",
             if session_active { "true" } else { "false" },
         )?;
+        self.body.set_attribute(
+            "data-chat-mode",
+            if direct_mode { "direct" } else { "shared" },
+        )?;
         self.chat_card.set_attribute(
             "data-roster-open",
-            if state.show_participants {
+            if state.show_participants && !direct_mode {
                 "true"
             } else {
                 "false"
             },
         )?;
-        set_hidden(&self.participant_scrim, !state.show_participants)?;
+        set_hidden(
+            &self.participant_scrim,
+            direct_mode || !state.show_participants,
+        )?;
         self.participant_scrim.set_attribute(
             "aria-hidden",
-            if state.show_participants {
-                "false"
-            } else {
+            if direct_mode || !state.show_participants {
                 "true"
+            } else {
+                "false"
             },
         )?;
 
@@ -2297,11 +2764,14 @@ impl App {
                 .set_disabled(pending || !state.browser_access_allowed);
         }
         set_hidden(&self.chat_card, !show_chat_surface)?;
-        set_hidden(&self.participant_toggle, !session_active)?;
-        set_hidden(&self.participant_close, !session_active)?;
+        set_hidden(&self.conversation_selector, !self.is_shell_mode())?;
+        self.render_conversation_selector(&state.direct)?;
+        set_hidden(&self.presence_card, direct_mode)?;
+        set_hidden(&self.participant_toggle, direct_mode || !session_active)?;
+        set_hidden(&self.participant_close, direct_mode || !session_active)?;
         set_hidden(
             &self.room_access_toggle,
-            !(self.is_shell_mode() && session_active),
+            direct_mode || !controls.show_room_access_toggle,
         )?;
         self.room_access_toggle.set_attribute(
             "aria-expanded",
@@ -2313,18 +2783,18 @@ impl App {
         )?;
         set_hidden(
             &self.browser_access_section,
-            !(self.is_shell_mode() && !state.pending_requests.is_empty()),
+            direct_mode || !controls.show_browser_requests,
         )?;
         set_hidden(
             &self.room_access_section,
-            !(self.is_shell_mode() && session_active && state.show_access_controls),
+            direct_mode || !controls.show_room_access,
         )?;
         set_hidden(
             &self.conversation_join_section,
-            !(self.is_shell_mode() && !session_active),
+            direct_mode || !controls.show_conversation_join,
         )?;
         self.conversation_join_submit
-            .set_disabled(!self.is_shell_mode());
+            .set_disabled(!controls.enable_gateway_controls);
         let invite_url = state.join_invite_url.as_deref().unwrap_or_default();
         self.conversation_invite_output.set_value(invite_url);
         set_hidden(
@@ -2332,30 +2802,191 @@ impl App {
             invite_url.trim().is_empty(),
         )?;
         self.conversation_invite_create
-            .set_disabled(!self.is_shell_mode() || !session_active);
+            .set_disabled(!controls.enable_gateway_controls);
         self.conversation_invite_copy
-            .set_disabled(!self.is_shell_mode() || !session_active || invite_url.trim().is_empty());
-        self.node_did_input
-            .set_disabled(!self.is_shell_mode() || !session_active);
-        self.node_invite_submit
-            .set_disabled(!self.is_shell_mode() || !session_active);
-        self.message_input.set_disabled(!session_active);
-        self.attach_button.set_disabled(!session_active);
-        self.send_button.set_disabled(!session_active);
+            .set_disabled(!controls.enable_gateway_controls || invite_url.trim().is_empty());
+        self.message_input.set_disabled(if direct_mode {
+            !direct_send_enabled
+        } else {
+            !controls.enable_text_send
+        });
+        // Direct conversations are text-only by declared decision, and the
+        // control says so where the person meets it — visibly unavailable,
+        // never silently missing.
+        set_hidden(&self.attach_button, !direct_mode && !controls.show_attach)?;
+        self.attach_button
+            .set_disabled(direct_mode || !controls.enable_attach);
+        if direct_mode {
+            self.attach_button.set_title(DIRECT_ATTACHMENTS_UNAVAILABLE);
+            self.attach_button
+                .set_attribute("aria-label", DIRECT_ATTACHMENTS_UNAVAILABLE)?;
+        } else {
+            self.attach_button.set_title("");
+            self.attach_button.remove_attribute("aria-label")?;
+        }
+        self.send_button.set_disabled(if direct_mode {
+            !direct_send_enabled
+        } else {
+            !controls.enable_text_send
+        });
         for button in &self.emoji_buttons {
-            button.set_disabled(!session_active);
+            button.set_disabled(if direct_mode {
+                !direct_send_enabled
+            } else {
+                !controls.enable_text_send
+            });
         }
 
-        self.render_participants(&state.participants, loading_room)?;
-        self.render_browser_access_requests(&state.pending_requests)?;
-        self.render_room_access(&state)?;
-        self.render_objects(&state.objects, &state.attachment_urls)?;
+        if direct_mode {
+            self.participant_list.set_inner_html("");
+            self.browser_access_list.set_inner_html("");
+            self.room_policy_list.set_inner_html("");
+            self.node_list.set_inner_html("");
+            self.render_direct_messages(&state.direct)?;
+        } else {
+            self.render_participants(
+                &state.participants,
+                projection.participant_count == "Opening conversation",
+            )?;
+            self.render_browser_access_requests(&state.pending_requests)?;
+            self.render_room_access(&state)?;
+            self.render_objects(&state.objects, &state.attachment_urls)?;
+        }
         restore_scroll_position(&self.participant_list, previous_participant_scroll_top);
         if force_message_follow || follow_messages {
             scroll_to_bottom(&self.message_list);
             schedule_scroll_to_bottom(self.message_list.clone());
         } else {
             restore_scroll_position(&self.message_list, previous_message_scroll_top);
+        }
+        Ok(())
+    }
+
+    fn render_conversation_selector(&self, direct: &DirectUiState) -> Result<(), JsValue> {
+        self.conversation_selector.set_inner_html("");
+        let shared = self.document.create_element("button")?;
+        shared.set_attribute("type", "button")?;
+        shared.set_attribute("data-conversation-choice", "shared")?;
+        shared.set_attribute("title", "Community")?;
+        shared.set_attribute(
+            "aria-current",
+            if direct.selected_conversation_id.is_none() {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
+        shared.set_class_name(if direct.selected_conversation_id.is_none() {
+            "conversation-choice active"
+        } else {
+            "conversation-choice"
+        });
+        append_conversation_choice_content(
+            &self.document,
+            &shared,
+            "#",
+            "Community",
+            "Shared room",
+        )?;
+        self.conversation_selector.append_child(&shared)?;
+
+        for conversation in &direct.conversations {
+            let button = self.document.create_element("button")?;
+            button.set_attribute("type", "button")?;
+            button.set_attribute("data-conversation-choice", &conversation.conversation_id)?;
+            button.set_attribute("title", &conversation.display_name)?;
+            let selected = direct.selected_conversation_id.as_deref()
+                == Some(conversation.conversation_id.as_str());
+            button.set_attribute("aria-current", if selected { "true" } else { "false" })?;
+            button.set_class_name(if selected {
+                "conversation-choice active"
+            } else {
+                "conversation-choice"
+            });
+            append_conversation_choice_content(
+                &self.document,
+                &button,
+                &conversation_initial(&conversation.display_name),
+                &conversation.display_name,
+                if conversation.removed {
+                    "Removed contact"
+                } else {
+                    "Direct message"
+                },
+            )?;
+            self.conversation_selector.append_child(&button)?;
+        }
+
+        let selected = direct
+            .selected_conversation_id
+            .as_deref()
+            .and_then(|id| selected_conversation(&direct.conversations, id));
+        let (avatar, title, detail) = selected.map_or(
+            ("#".to_string(), "Community".to_string(), "Shared room"),
+            |conversation| {
+                (
+                    conversation_initial(&conversation.display_name),
+                    conversation.display_name.clone(),
+                    if conversation.removed {
+                        "Removed contact"
+                    } else {
+                        "Direct message"
+                    },
+                )
+            },
+        );
+        self.conversation_avatar.set_text_content(Some(&avatar));
+        self.conversation_title.set_text_content(Some(&title));
+        self.conversation_detail.set_text_content(Some(detail));
+        Ok(())
+    }
+
+    fn render_direct_messages(&self, direct: &DirectUiState) -> Result<(), JsValue> {
+        self.message_list.set_inner_html("");
+        let Some(conversation_id) = direct.selected_conversation_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(conversation) = selected_conversation(&direct.conversations, conversation_id)
+        else {
+            return Ok(());
+        };
+        if direct.messages.is_empty() {
+            let empty = self.document.create_element("li")?;
+            empty.set_class_name("empty");
+            empty.set_text_content(Some("No messages yet."));
+            self.message_list.append_child(&empty)?;
+            return Ok(());
+        }
+        for message in &direct.messages {
+            let outgoing = message.direction == DirectMessageDirection::Outgoing;
+            let item = self.document.create_element("li")?;
+            item.set_class_name(if outgoing {
+                "message self-message"
+            } else {
+                "message"
+            });
+            let meta = self.document.create_element("div")?;
+            meta.set_class_name("message-meta");
+            let sender = self.document.create_element("span")?;
+            sender.set_text_content(Some(if outgoing {
+                "You"
+            } else {
+                &conversation.display_name
+            }));
+            let detail = self.document.create_element("span")?;
+            detail.set_text_content(Some(&format!(
+                "{} · {}",
+                format_time(message.created_at),
+                message.delivery_state.label()
+            )));
+            meta.append_child(&sender)?;
+            meta.append_child(&detail)?;
+            let body = self.document.create_element("div")?;
+            body.set_class_name("message-body");
+            body.set_text_content(Some(&message.text));
+            item.append_child(&meta)?;
+            item.append_child(&body)?;
+            self.message_list.append_child(&item)?;
         }
         Ok(())
     }
@@ -2412,9 +3043,10 @@ impl App {
                 "participant"
             });
 
+            let shown_name = participant_shown_name(participant);
             let avatar = self.document.create_element("div")?;
             avatar.set_class_name("participant-avatar");
-            avatar.set_text_content(Some(&participant_initial(&participant.display_name)));
+            avatar.set_text_content(Some(&participant_initial(shown_name)));
 
             let content = self.document.create_element("div")?;
             content.set_class_name("participant-content");
@@ -2424,7 +3056,7 @@ impl App {
 
             let name = self.document.create_element("div")?;
             name.set_class_name("participant-name");
-            name.set_text_content(Some(&participant.display_name));
+            name.set_text_content(Some(shown_name));
             header.append_child(&name)?;
 
             let badge_text = if is_local {
@@ -2534,7 +3166,7 @@ impl App {
         self.append_policy_row(
             "member",
             "ElastOS user invites",
-            "Invite another trusted ElastOS profile by DID.",
+            "Invite another trusted ElastOS profile.",
             policy.allow_member_invites,
         )?;
         self.append_policy_row(
@@ -2547,7 +3179,7 @@ impl App {
         let guest_sessions = state
             .active_sessions
             .iter()
-            .filter(|session| session.member_did.is_none())
+            .filter(|session| !session.member_bound)
             .collect::<Vec<_>>();
         for session in guest_sessions {
             let item = self.document.create_element("li")?;
@@ -2601,21 +3233,6 @@ impl App {
             head.append_child(&detail)?;
             item.append_child(&head)?;
 
-            let can_remove = member.role != "owner"
-                && state.local_runtime_did.as_deref() != Some(member.member_did.as_str());
-            if can_remove {
-                let actions = self.document.create_element("div")?;
-                actions.set_class_name("node-row-actions");
-                let block = self.document.create_element("button")?;
-                block.set_class_name("secondary danger");
-                block.set_attribute("type", "button")?;
-                block.set_attribute("data-node-action", "remove")?;
-                block.set_attribute("data-member-did", &member.member_did)?;
-                block.set_text_content(Some("Block"));
-                actions.append_child(&block)?;
-                item.append_child(&actions)?;
-            }
-
             self.node_list.append_child(&item)?;
         }
 
@@ -2628,7 +3245,7 @@ impl App {
 
             let name = self.document.create_element("div")?;
             name.set_class_name("node-row-name");
-            name.set_text_content(Some(&short_did(&invite.invited_did)));
+            name.set_text_content(Some("Pending profile invite"));
 
             let detail = self.document.create_element("div")?;
             detail.set_class_name("node-row-detail");
@@ -2719,7 +3336,8 @@ impl App {
             let meta = self.document.create_element("div")?;
             meta.set_class_name("message-meta");
             let sender = self.document.create_element("span")?;
-            sender.set_text_content(Some(if is_self { "You" } else { &object.sender }));
+            let sender_name = object_sender_name(object);
+            sender.set_text_content(Some(if is_self { "You" } else { sender_name }));
             let time = self.document.create_element("span")?;
             time.set_text_content(Some(&format_time(object.created_at)));
             meta.append_child(&sender)?;
@@ -2730,12 +3348,13 @@ impl App {
                 ConversationObjectKind::System => {
                     item.set_class_name("message system-message");
                     body.set_class_name("message-body system-body");
+                    let system_sender = object_sender_name(object);
                     body.set_text_content(Some(
                         &object
                             .body
                             .clone()
-                            .map(|body| format!("{} {}", object.sender, body))
-                            .unwrap_or_else(|| object.sender.clone()),
+                            .map(|body| format!("{system_sender} {body}"))
+                            .unwrap_or_else(|| system_sender.to_string()),
                     ));
                 }
                 ConversationObjectKind::Text => {
@@ -2858,12 +3477,315 @@ fn load_config(document: &Document) -> Result<AppConfig, JsValue> {
     let initial_join_invite = ["invite", "join", "join_invite"]
         .into_iter()
         .find_map(|key| extract_query_param(&url, key));
+    let initial_direct_conversation_id = extract_query_param(&url, "conversation_id");
     Ok(AppConfig {
         access_mode,
         home_token,
         initial_join_invite,
+        initial_direct_conversation_id,
         browser_session_request_storage_key: BROWSER_SESSION_REQUEST_STORAGE_KEY.to_string(),
     })
+}
+
+fn bump_selection_generation(state: &mut AppState) {
+    state.selection_generation = state.selection_generation.wrapping_add(1);
+    if state.selection_generation == 0 {
+        state.selection_generation = 1;
+    }
+}
+
+fn current_selection_guard(state: &AppState) -> SelectionGuard {
+    SelectionGuard {
+        generation: state.selection_generation,
+        selected_conversation_id: state.direct.selected_conversation_id.clone(),
+    }
+}
+
+fn selection_guard_matches(state: &AppState, guard: &SelectionGuard) -> bool {
+    state.selection_generation == guard.generation
+        && state.direct.selected_conversation_id == guard.selected_conversation_id
+}
+
+fn resolve_conversation_choice(
+    direct_target_choice: Option<&str>,
+    ancestor_choice: Option<&str>,
+) -> Option<String> {
+    direct_target_choice
+        .or(ancestor_choice)
+        .map(str::trim)
+        .filter(|choice| !choice.is_empty())
+        .map(str::to_string)
+}
+
+fn conversation_initial(display_name: &str) -> String {
+    display_name
+        .trim()
+        .chars()
+        .next()
+        .map(|character| character.to_uppercase().collect())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn append_conversation_choice_content(
+    document: &Document,
+    button: &Element,
+    avatar_text: &str,
+    title: &str,
+    detail: &str,
+) -> Result<(), JsValue> {
+    let avatar = document.create_element("span")?;
+    avatar.set_class_name("conversation-avatar");
+    avatar.set_attribute("aria-hidden", "true")?;
+    avatar.set_text_content(Some(avatar_text));
+
+    let copy = document.create_element("span")?;
+    copy.set_class_name("conversation-choice-copy");
+    let name = document.create_element("span")?;
+    name.set_class_name("conversation-choice-name");
+    name.set_text_content(Some(title));
+    let meta = document.create_element("span")?;
+    meta.set_class_name("conversation-choice-detail");
+    meta.set_text_content(Some(detail));
+    copy.append_child(&name)?;
+    copy.append_child(&meta)?;
+
+    button.append_child(&avatar)?;
+    button.append_child(&copy)?;
+    Ok(())
+}
+
+fn clear_selected_direct_conversation(state: &mut AppState) {
+    state.direct.selected_conversation_id = None;
+    state.direct.messages.clear();
+    state.direct.pending_send = None;
+    state.direct.notice = None;
+}
+
+fn commit_shared_selection(state: &mut AppState) -> SelectionGuard {
+    bump_selection_generation(state);
+    clear_selected_direct_conversation(state);
+    current_selection_guard(state)
+}
+
+fn commit_direct_selection(state: &mut AppState, conversation_id: &str) -> Option<SelectionGuard> {
+    let clean_id = conversation_id.trim();
+    if selected_conversation(&state.direct.conversations, clean_id).is_none() {
+        return None;
+    }
+    if state.direct.selected_conversation_id.as_deref() != Some(clean_id) {
+        bump_selection_generation(state);
+        state.direct.selected_conversation_id = Some(clean_id.to_string());
+        state.direct.messages.clear();
+        state.direct.pending_send = None;
+    }
+    state.direct.notice = None;
+    Some(current_selection_guard(state))
+}
+
+fn commit_requested_direct_selection_if_current(
+    state: &mut AppState,
+    expected_generation: u64,
+    conversation_id: &str,
+) -> Option<SelectionGuard> {
+    if state.selection_generation != expected_generation {
+        return None;
+    }
+    commit_direct_selection(state, conversation_id)
+}
+
+fn apply_active_poll_state(
+    state: &mut AppState,
+    mut poll: RoomPollView,
+) -> (Vec<AttachmentView>, bool) {
+    filter_configured_shared_poll(&mut poll);
+    let attachments_to_cache = poll
+        .objects
+        .iter()
+        .filter_map(|object| object.attachment.clone())
+        .collect::<Vec<_>>();
+
+    let transport_summary = live_status_detail(&poll.transport);
+    let was_session_active = state.session_active;
+    let previous_display_name = state.display_name.clone();
+    let previous_latest_seq = state.latest_seq;
+    let previous_participants = state.participants.clone();
+    let previous_status_badge = state.status_badge.clone();
+    let previous_status_detail = state.status_detail.clone();
+    let previous_collaboration_configured = state.collaboration_configured;
+    state.collaboration_configured = poll.transport.configured;
+    state.session_active = true;
+    state.close_leave_sent = false;
+    state.display_name = poll.display_name.clone();
+    state.status_badge = "Live".to_string();
+    state.status_detail = transport_summary;
+    state.latest_seq = poll.latest_seq;
+    state.objects.extend(poll.objects);
+    state.participants = poll.participants;
+    dedupe_objects(&mut state.objects);
+    if state.collaboration_configured {
+        state.objects.retain(configured_shared_object_visible);
+        state
+            .participants
+            .retain(configured_shared_participant_visible);
+    }
+    if previous_latest_seq != state.latest_seq {
+        state.force_message_follow = true;
+    }
+
+    let changed = previous_collaboration_configured != state.collaboration_configured
+        || was_session_active != state.session_active
+        || previous_display_name != state.display_name
+        || previous_latest_seq != state.latest_seq
+        || previous_participants != state.participants
+        || previous_status_badge != state.status_badge
+        || previous_status_detail != state.status_detail;
+    (attachments_to_cache, changed)
+}
+
+fn apply_active_poll_if_current(
+    state: &mut AppState,
+    guard: &SelectionGuard,
+    poll: RoomPollView,
+) -> Option<(Vec<AttachmentView>, bool)> {
+    selection_guard_matches(state, guard).then(|| apply_active_poll_state(state, poll))
+}
+
+fn filter_configured_shared_poll(poll: &mut RoomPollView) {
+    if !poll.transport.configured {
+        return;
+    }
+    poll.objects.retain(configured_shared_object_visible);
+    poll.participants
+        .retain(configured_shared_participant_visible);
+}
+
+fn configured_shared_object_visible(object: &ConversationObjectView) -> bool {
+    object.sender_profile_verified == Some(true) && !object.sender.trim().is_empty()
+}
+
+fn configured_shared_participant_visible(participant: &ParticipantView) -> bool {
+    participant.profile_verified == Some(true) && !participant.display_name.trim().is_empty()
+}
+
+fn apply_direct_refresh_if_current(
+    state: &mut AppState,
+    guard: &SelectionGuard,
+    conversations: Vec<direct::DirectConversationView>,
+    response: DirectMessageList,
+) -> Option<Result<bool, u16>> {
+    if !selection_guard_matches(state, guard) {
+        return None;
+    }
+    let conversations_changed = state.direct.conversations != conversations;
+    state.direct.conversations = conversations;
+    Some(
+        apply_direct_messages(&mut state.direct, response)
+            .map(|messages_changed| conversations_changed || messages_changed)
+            .map_err(|_| 500u16),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderProjection {
+    session_active: bool,
+    direct_mode: bool,
+    participant_count: String,
+}
+
+fn render_projection(state: &AppState, shell_mode: bool) -> RenderProjection {
+    let direct_mode = state.direct.selected_conversation_id.is_some();
+    let loading_room = shell_mode && !state.session_active && !direct_mode;
+    RenderProjection {
+        session_active: state.session_active,
+        direct_mode,
+        participant_count: if loading_room {
+            "Opening conversation".to_string()
+        } else {
+            format_participant_count(state.participants.len())
+        },
+    }
+}
+
+fn apply_summary_state(
+    state: &mut AppState,
+    summary: &SummaryView,
+    access_mode: AccessMode,
+) -> bool {
+    let previous_room_mode_known = state.room_mode_known;
+    let previous_collaboration_configured = state.collaboration_configured;
+    let previous_browser_access_allowed = state.browser_access_allowed;
+    let previous_browser_access_block_reason = state.browser_access_block_reason.clone();
+    let previous_pending_requests = state.pending_requests.clone();
+    let previous_active_sessions = state.active_sessions.clone();
+    let previous_room_control = state.room_control.clone();
+    let previous_status_badge = state.status_badge.clone();
+    let previous_status_detail = state.status_detail.clone();
+    state.room_mode_known = true;
+    state.collaboration_configured = summary.transport.configured;
+    if state.collaboration_configured {
+        state.browser_access_allowed = summary.browser_access_allowed;
+        state.browser_access_block_reason = summary.browser_access_block_reason.clone();
+        state.pending_requests.clear();
+        state.active_sessions.clear();
+        state.room_control = SummaryRoomControlView::default();
+        state.show_access_controls = false;
+        state.join_invite_url = None;
+    } else {
+        state.browser_access_allowed = summary.browser_access_allowed;
+        state.browser_access_block_reason = summary.browser_access_block_reason.clone();
+        state.pending_requests = summary.pending_requests.clone();
+        state.active_sessions = summary.active_sessions.clone();
+        state.room_control = summary.room_control.clone();
+    }
+    if !state.session_active && state.request_id.is_none() {
+        if access_mode == AccessMode::Shell {
+            if state.collaboration_configured
+                || summary.local_runtime_role.is_some()
+                || summary.browser_access_allowed
+            {
+                state.status_badge = default_status_badge_for_mode(access_mode);
+                state.status_detail = default_status_detail_for_mode(access_mode);
+            } else {
+                state.status_badge = "Unavailable".to_string();
+                let reason = state
+                    .browser_access_block_reason
+                    .clone()
+                    .unwrap_or_else(|| SHELL_ACCESS_UNAVAILABLE_DETAIL.to_string());
+                state.status_detail = trim_sentence(&reason);
+            }
+        } else if !state.browser_access_allowed {
+            state.status_badge = "Conversation locked".to_string();
+            let reason = state
+                .browser_access_block_reason
+                .clone()
+                .unwrap_or_else(|| "This device is not part of this conversation yet.".to_string());
+            state.status_detail = format!(
+                "{} Open the conversation from Home first, then try again.",
+                trim_sentence(&reason)
+            );
+        } else {
+            state.status_badge = default_status_badge_for_mode(access_mode);
+            state.status_detail = default_status_detail_for_mode(access_mode);
+        }
+    }
+    previous_room_mode_known != state.room_mode_known
+        || previous_collaboration_configured != state.collaboration_configured
+        || previous_browser_access_allowed != state.browser_access_allowed
+        || previous_browser_access_block_reason != state.browser_access_block_reason
+        || previous_pending_requests != state.pending_requests
+        || previous_active_sessions != state.active_sessions
+        || previous_room_control != state.room_control
+        || previous_status_badge != state.status_badge
+        || previous_status_detail != state.status_detail
+}
+
+fn apply_summary_if_current(
+    state: &mut AppState,
+    guard: &SelectionGuard,
+    summary: &SummaryView,
+    access_mode: AccessMode,
+) -> Option<bool> {
+    selection_guard_matches(state, guard).then(|| apply_summary_state(state, summary, access_mode))
 }
 
 fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState {
@@ -2878,8 +3800,13 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         } else {
             None
         },
+        pending_chat_send: None,
+        selection_generation: 0,
+        room_mode_known: false,
+        collaboration_configured: false,
         session_active: false,
         close_leave_sent: false,
+        poll_loop_started: false,
         show_participants: false,
         show_access_controls: false,
         force_message_follow: true,
@@ -2887,7 +3814,7 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         status_badge: default_status_badge_for_mode(config.access_mode),
         status_detail: default_status_detail_for_mode(config.access_mode),
         error_transient: false,
-        browser_access_allowed: true,
+        browser_access_allowed: false,
         browser_access_block_reason: None,
         latest_seq: 0,
         objects: Vec::new(),
@@ -2895,9 +3822,9 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         pending_requests: Vec::new(),
         active_sessions: Vec::new(),
         room_control: SummaryRoomControlView::default(),
-        local_runtime_did: None,
         attachment_urls: BTreeMap::new(),
         join_invite_url: None,
+        direct: DirectUiState::default(),
         error_text: None,
     }
 }
@@ -2966,16 +3893,47 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_query_value, extract_fragment_param, extract_query_param};
+    use super::direct::{
+        DirectConversationView, DirectMessageList, DirectUiState, PendingDirectSend,
+    };
+    use super::{
+        apply_active_poll_if_current, apply_active_poll_state, apply_direct_refresh_if_current,
+        chat_control_policy, clear_selected_direct_conversation, commit_direct_selection,
+        commit_requested_direct_selection_if_current, commit_shared_selection,
+        conversation_initial, current_selection_guard, decode_query_value, extract_fragment_param,
+        extract_query_param, format_chat_message_request_id, object_sender_name,
+        participant_detail, participant_shown_name, pending_chat_request_id, render_projection,
+        resolve_conversation_choice, selection_guard_matches, shell_summary_allows_session,
+        AccessMode, AppConfig, AppState, ConversationObjectKind, ConversationObjectView,
+        ParticipantView, PendingChatSend, RenderProjection, RoomPollView, RoomTransportView,
+        ShellSessionBootstrapFailure, ShellSessionStartOutput, SummaryView,
+    };
+
+    #[test]
+    fn shell_session_bootstrap_errors_are_typed_and_bounded() {
+        assert_eq!(
+            ShellSessionBootstrapFailure::from_request_error("request failed: 401 secret").detail(),
+            "Chat session bootstrap was not authorized. Reopen Chat from Home."
+        );
+        assert!(
+            !ShellSessionBootstrapFailure::from_request_error("provider secret")
+                .detail()
+                .contains("provider secret")
+        );
+    }
 
     #[test]
     fn reads_shell_authority_only_from_the_fragment() {
-        let url = "http://localhost/apps/chat-room/?invite=peer#home_token=scope%2D123";
+        let url = "http://localhost/apps/chat-room/?invite=peer&conversation_id=direct%3Aone#home_token=scope%2D123";
         assert_eq!(
             extract_fragment_param(url, "home_token").as_deref(),
             Some("scope-123")
         );
         assert_eq!(extract_query_param(url, "home_token"), None);
+        assert_eq!(
+            extract_query_param(url, "conversation_id").as_deref(),
+            Some("direct:one")
+        );
     }
 
     #[test]
@@ -2989,6 +3947,541 @@ mod tests {
     #[test]
     fn preserves_invalid_percent_escapes() {
         assert_eq!(decode_query_value("abc%ZZ%2"), "abc%ZZ%2");
+    }
+
+    #[test]
+    fn configured_chat_is_home_only_and_hides_every_gateway_control() {
+        let summary: SummaryView = serde_json::from_value(serde_json::json!({
+            "room_slug": "chat-room",
+            "pending_count": 0,
+            "active_session_count": 0,
+            "browser_access_allowed": false,
+            "transport": {
+                "configured": true,
+                "available": true
+            },
+        }))
+        .unwrap();
+        assert!(shell_summary_allows_session(&summary));
+        assert!(!summary.browser_access_allowed);
+
+        let policy = chat_control_policy(true, true, true, true, true, true);
+        assert!(policy.enable_text_send);
+        assert!(!policy.show_attach);
+        assert!(!policy.enable_attach);
+        assert!(!policy.show_browser_requests);
+        assert!(!policy.show_room_access_toggle);
+        assert!(!policy.show_room_access);
+        assert!(!policy.show_conversation_join);
+        assert!(!policy.enable_gateway_controls);
+
+        let public_policy = chat_control_policy(true, true, false, false, true, true);
+        assert!(!public_policy.enable_text_send);
+        assert!(!public_policy.show_browser_requests);
+        assert!(!public_policy.show_conversation_join);
+    }
+
+    #[test]
+    fn configured_chat_uses_verified_profile_names_without_device_details() {
+        let participant = ParticipantView {
+            display_name: "Owner".to_string(),
+            profile_verified: Some(true),
+            device_label: "MacBook".to_string(),
+            last_seen_at: 0,
+            role: Some("owner".to_string()),
+            local_session_count: 1,
+            is_current_session: false,
+        };
+        assert_eq!(participant_shown_name(&participant), "Owner");
+        assert_eq!(participant_detail(&participant, false, false), "active now");
+
+        let object = ConversationObjectView {
+            seq: 1,
+            sender: "Owner".to_string(),
+            sender_profile_verified: Some(true),
+            from_current_session: false,
+            kind: ConversationObjectKind::Text,
+            body: Some("hello".to_string()),
+            emoji: None,
+            link: None,
+            attachment: None,
+            created_at: 1,
+        };
+        assert_eq!(object_sender_name(&object), "Owner");
+    }
+
+    #[test]
+    fn configured_chat_defensively_omits_false_or_none_rows_before_render() {
+        let mut state = AppState::default();
+        let poll = RoomPollView {
+            room_slug: "chat-room".to_string(),
+            display_name: "Shared room".to_string(),
+            latest_seq: 4,
+            participants: vec![
+                ParticipantView {
+                    display_name: "Owner".to_string(),
+                    profile_verified: Some(true),
+                    device_label: String::new(),
+                    last_seen_at: 1,
+                    role: Some("owner".to_string()),
+                    local_session_count: 1,
+                    is_current_session: true,
+                },
+                ParticipantView {
+                    display_name: "Wrong endpoint".to_string(),
+                    profile_verified: Some(false),
+                    device_label: "Laptop".to_string(),
+                    last_seen_at: 1,
+                    role: Some("member".to_string()),
+                    local_session_count: 1,
+                    is_current_session: false,
+                },
+                ParticipantView {
+                    display_name: "Unsigned guest".to_string(),
+                    profile_verified: None,
+                    device_label: "Browser".to_string(),
+                    last_seen_at: 1,
+                    role: None,
+                    local_session_count: 1,
+                    is_current_session: false,
+                },
+                ParticipantView {
+                    display_name: String::new(),
+                    profile_verified: Some(true),
+                    device_label: String::new(),
+                    last_seen_at: 1,
+                    role: Some("member".to_string()),
+                    local_session_count: 1,
+                    is_current_session: false,
+                },
+            ],
+            objects: vec![
+                ConversationObjectView {
+                    seq: 1,
+                    sender: "Owner".to_string(),
+                    sender_profile_verified: Some(true),
+                    from_current_session: true,
+                    kind: ConversationObjectKind::Text,
+                    body: Some("hello".to_string()),
+                    emoji: None,
+                    link: None,
+                    attachment: None,
+                    created_at: 1,
+                },
+                ConversationObjectView {
+                    seq: 2,
+                    sender: "Wrong profile".to_string(),
+                    sender_profile_verified: Some(false),
+                    from_current_session: false,
+                    kind: ConversationObjectKind::Text,
+                    body: Some("bad-profile".to_string()),
+                    emoji: None,
+                    link: None,
+                    attachment: None,
+                    created_at: 2,
+                },
+                ConversationObjectView {
+                    seq: 3,
+                    sender: "Wrong endpoint".to_string(),
+                    sender_profile_verified: Some(false),
+                    from_current_session: false,
+                    kind: ConversationObjectKind::Text,
+                    body: Some("bad-endpoint".to_string()),
+                    emoji: None,
+                    link: None,
+                    attachment: None,
+                    created_at: 3,
+                },
+                ConversationObjectView {
+                    seq: 4,
+                    sender: String::new(),
+                    sender_profile_verified: None,
+                    from_current_session: false,
+                    kind: ConversationObjectKind::Text,
+                    body: Some("unsigned".to_string()),
+                    emoji: None,
+                    link: None,
+                    attachment: None,
+                    created_at: 4,
+                },
+            ],
+            transport: RoomTransportView {
+                configured: true,
+                available: true,
+                status: None,
+            },
+        };
+
+        // This is display defense only: configured shared Chat refuses to
+        // render rows not already marked verified by the server projection.
+        let (_attachments, changed) = apply_active_poll_state(&mut state, poll);
+        assert!(changed);
+        assert!(state.collaboration_configured);
+        assert_eq!(state.participants.len(), 1);
+        assert_eq!(state.participants[0].display_name, "Owner");
+        assert_eq!(state.participants[0].profile_verified, Some(true));
+        assert_eq!(state.objects.len(), 1);
+        assert_eq!(state.objects[0].body.as_deref(), Some("hello"));
+        assert_eq!(object_sender_name(&state.objects[0]), "Owner");
+    }
+
+    #[test]
+    fn browser_access_defaults_fail_closed_without_exposing_gateway_controls_in_shell_mode() {
+        let summary: SummaryView = serde_json::from_value(serde_json::json!({
+            "room_slug": "chat-room",
+            "pending_count": 0,
+            "active_session_count": 0,
+        }))
+        .unwrap();
+        assert!(!summary.browser_access_allowed);
+        assert!(summary.room_control.access_policy.allow_guest_invites);
+        assert!(summary.room_control.access_policy.allow_member_invites);
+        assert!(
+            summary
+                .room_control
+                .access_policy
+                .allow_members_to_host_guests
+        );
+
+        let shell_isolated = chat_control_policy(true, false, true, true, true, true);
+        assert!(shell_isolated.enable_text_send);
+        assert!(shell_isolated.show_attach);
+        assert!(shell_isolated.enable_attach);
+        assert!(!shell_isolated.show_browser_requests);
+        assert!(!shell_isolated.show_room_access_toggle);
+        assert!(!shell_isolated.show_room_access);
+        assert!(!shell_isolated.show_conversation_join);
+        assert!(!shell_isolated.enable_gateway_controls);
+
+        let gateway_isolated = chat_control_policy(true, false, false, true, true, true);
+        assert!(gateway_isolated.show_browser_requests);
+        assert!(gateway_isolated.show_room_access_toggle);
+        assert!(gateway_isolated.show_room_access);
+        assert!(!gateway_isolated.show_conversation_join);
+        assert!(gateway_isolated.enable_gateway_controls);
+    }
+
+    #[test]
+    fn chat_controls_require_an_explicitly_known_room_mode() {
+        let unknown = chat_control_policy(false, false, true, false, true, true);
+        assert!(!unknown.show_attach);
+        assert!(!unknown.enable_attach);
+        assert!(!unknown.show_browser_requests);
+        assert!(!unknown.show_room_access_toggle);
+        assert!(!unknown.show_room_access);
+        assert!(!unknown.show_conversation_join);
+        assert!(!unknown.enable_gateway_controls);
+
+        let configured = chat_control_policy(true, true, true, false, true, true);
+        assert!(!configured.show_conversation_join);
+
+        let unconfigured_gateway = chat_control_policy(true, false, false, false, false, false);
+        assert!(unconfigured_gateway.show_conversation_join);
+
+        let unconfigured_shell = chat_control_policy(true, false, true, false, false, false);
+        assert!(!unconfigured_shell.show_conversation_join);
+    }
+
+    #[test]
+    fn chat_request_id_is_stable_for_failed_retry_and_changes_only_with_intent() {
+        let mut pending = None;
+        let first = pending_chat_request_id(&mut pending, "hello", || {
+            Ok("chat-message:00000000000000000000000000000001".to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            pending_chat_request_id(&mut pending, "hello", || {
+                panic!("same-body retry must not generate another request ID")
+            })
+            .unwrap(),
+            first
+        );
+
+        let changed = pending_chat_request_id(&mut pending, "changed", || {
+            Ok("chat-message:00000000000000000000000000000002".to_string())
+        })
+        .unwrap();
+        assert_ne!(changed, first);
+        assert_eq!(
+            pending,
+            Some(PendingChatSend {
+                request_id: changed,
+                body: "changed".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn chat_request_id_has_one_fixed_bounded_lowercase_hex_shape() {
+        let request_id = format_chat_message_request_id([0xab; 16]);
+        assert_eq!(request_id, "chat-message:abababababababababababababababab");
+        assert_eq!(request_id.len(), 45);
+    }
+
+    #[test]
+    fn shared_selection_clears_direct_state_and_valid_shell_start_activates_shared_projection() {
+        let config = AppConfig {
+            access_mode: AccessMode::Shell,
+            home_token: Some("test-token".to_string()),
+            initial_join_invite: None,
+            initial_direct_conversation_id: None,
+            browser_session_request_storage_key: "test-key".to_string(),
+        };
+        let direct_messages: DirectMessageList = serde_json::from_value(serde_json::json!({
+            "conversation_id": "direct:sha256:fixture-conversation",
+            "messages": [{
+                "message_id": "message:fixture-direct",
+                "direction": "incoming",
+                "text": "hello from direct",
+                "created_at": 1_725_000_000u64,
+                "delivery_state": "received"
+            }]
+        }))
+        .unwrap();
+        let mut state = AppState {
+            session_active: false,
+            direct: DirectUiState {
+                selected_conversation_id: Some("direct:sha256:fixture-conversation".to_string()),
+                messages: direct_messages.messages,
+                pending_send: Some(PendingDirectSend {
+                    request_id: "chat-message:fixture".to_string(),
+                    conversation_id: "direct:sha256:fixture-conversation".to_string(),
+                    text: "hello".to_string(),
+                }),
+                notice: Some("temporary".to_string()),
+                ..DirectUiState::default()
+            },
+            ..super::load_state(None, &config)
+        };
+
+        clear_selected_direct_conversation(&mut state);
+        assert!(state.direct.selected_conversation_id.is_none());
+        assert!(state.direct.messages.is_empty());
+        assert!(state.direct.pending_send.is_none());
+        assert!(state.direct.notice.is_none());
+
+        let start: ShellSessionStartOutput = serde_json::from_value(serde_json::json!({
+            "poll": {
+                "room_slug": "chat-room",
+                "display_name": "Configured User",
+                "latest_seq": 0,
+                "participants": [{
+                    "display_name": "Configured User",
+                    "device_label": "ElastOS shell",
+                    "last_seen_at": 1,
+                    "role": null,
+                    "local_session_count": 1,
+                    "is_current_session": true
+                }],
+                "objects": [],
+                "transport": {
+                    "configured": true,
+                    "available": true,
+                    "status": "Collaboration is configured."
+                }
+            }
+        }))
+        .unwrap();
+
+        let (attachments, changed) = apply_active_poll_state(&mut state, start.poll);
+        assert!(attachments.is_empty());
+        assert!(changed);
+        assert!(state.session_active);
+
+        assert_eq!(
+            render_projection(&state, config.access_mode == AccessMode::Shell),
+            RenderProjection {
+                session_active: true,
+                direct_mode: false,
+                participant_count: super::format_participant_count(1),
+            }
+        );
+    }
+
+    #[test]
+    fn direct_to_shared_commits_shared_loading_synchronously() {
+        let config = AppConfig {
+            access_mode: AccessMode::Shell,
+            home_token: Some("test-token".to_string()),
+            initial_join_invite: None,
+            initial_direct_conversation_id: None,
+            browser_session_request_storage_key: "test-key".to_string(),
+        };
+        let mut state = AppState {
+            direct: DirectUiState {
+                selected_conversation_id: Some("direct:sha256:fixture-conversation".to_string()),
+                messages: vec![serde_json::from_value(serde_json::json!({
+                    "message_id": "message:fixture-direct",
+                    "direction": "incoming",
+                    "text": "hello from direct",
+                    "created_at": 1_725_000_000u64,
+                    "delivery_state": "received"
+                }))
+                .unwrap()],
+                pending_send: Some(PendingDirectSend {
+                    request_id: "chat-message:fixture".to_string(),
+                    conversation_id: "direct:sha256:fixture-conversation".to_string(),
+                    text: "hello".to_string(),
+                }),
+                notice: Some("temporary".to_string()),
+                ..DirectUiState::default()
+            },
+            ..super::load_state(None, &config)
+        };
+        let guard = commit_shared_selection(&mut state);
+        assert_eq!(guard.selected_conversation_id, None);
+        assert!(selection_guard_matches(&state, &guard));
+        assert_eq!(state.selection_generation, 1);
+        assert_eq!(
+            render_projection(&state, true),
+            RenderProjection {
+                session_active: false,
+                direct_mode: false,
+                participant_count: "Opening conversation".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn stale_requested_direct_selection_after_shared_choice_is_ignored() {
+        let config = AppConfig {
+            access_mode: AccessMode::Shell,
+            home_token: Some("test-token".to_string()),
+            initial_join_invite: None,
+            initial_direct_conversation_id: Some("direct:sha256:fixture-conversation".to_string()),
+            browser_session_request_storage_key: "test-key".to_string(),
+        };
+        let mut state = super::load_state(None, &config);
+        state.direct.conversations = vec![DirectConversationView {
+            conversation_id: "direct:sha256:fixture-conversation".to_string(),
+            display_name: "Fixture Friend".to_string(),
+            removed: false,
+        }];
+        let bootstrap_generation = state.selection_generation;
+        let shared_guard = commit_shared_selection(&mut state);
+        let stale = commit_requested_direct_selection_if_current(
+            &mut state,
+            bootstrap_generation,
+            "direct:sha256:fixture-conversation",
+        );
+        assert!(stale.is_none());
+        assert!(selection_guard_matches(&state, &shared_guard));
+        assert!(state.direct.selected_conversation_id.is_none());
+    }
+
+    #[test]
+    fn stale_direct_completion_after_shared_selection_is_ignored() {
+        let config = AppConfig {
+            access_mode: AccessMode::Shell,
+            home_token: Some("test-token".to_string()),
+            initial_join_invite: None,
+            initial_direct_conversation_id: None,
+            browser_session_request_storage_key: "test-key".to_string(),
+        };
+        let mut state = super::load_state(None, &config);
+        state.direct.conversations = vec![DirectConversationView {
+            conversation_id: "direct:sha256:fixture-conversation".to_string(),
+            display_name: "Fixture Friend".to_string(),
+            removed: false,
+        }];
+        let direct_guard =
+            commit_direct_selection(&mut state, "direct:sha256:fixture-conversation")
+                .expect("direct selection should be available");
+        let shared_guard = commit_shared_selection(&mut state);
+        let direct_messages: DirectMessageList = serde_json::from_value(serde_json::json!({
+            "conversation_id": "direct:sha256:fixture-conversation",
+            "messages": [{
+                "message_id": "message:fixture-direct",
+                "direction": "incoming",
+                "text": "hello from direct",
+                "created_at": 1_725_000_000u64,
+                "delivery_state": "received"
+            }]
+        }))
+        .unwrap();
+        let stale = apply_direct_refresh_if_current(
+            &mut state,
+            &direct_guard,
+            vec![DirectConversationView {
+                conversation_id: "direct:sha256:fixture-conversation".to_string(),
+                display_name: "Fixture Friend".to_string(),
+                removed: false,
+            }],
+            direct_messages,
+        );
+        assert!(stale.is_none());
+        assert!(selection_guard_matches(&state, &shared_guard));
+        assert!(state.direct.selected_conversation_id.is_none());
+    }
+
+    #[test]
+    fn stale_shared_completion_after_later_direct_selection_is_ignored() {
+        let config = AppConfig {
+            access_mode: AccessMode::Shell,
+            home_token: Some("test-token".to_string()),
+            initial_join_invite: None,
+            initial_direct_conversation_id: None,
+            browser_session_request_storage_key: "test-key".to_string(),
+        };
+        let mut state = super::load_state(None, &config);
+        state.direct.conversations = vec![DirectConversationView {
+            conversation_id: "direct:sha256:fixture-conversation".to_string(),
+            display_name: "Fixture Friend".to_string(),
+            removed: false,
+        }];
+        let shared_guard = current_selection_guard(&state);
+        let direct_guard =
+            commit_direct_selection(&mut state, "direct:sha256:fixture-conversation")
+                .expect("direct selection should be available");
+        let poll: super::RoomPollView = serde_json::from_value(serde_json::json!({
+            "room_slug": "chat-room",
+            "display_name": "Configured User",
+            "latest_seq": 0,
+            "participants": [{
+                "display_name": "Configured User",
+                "device_label": "ElastOS shell",
+                "last_seen_at": 1,
+                "role": null,
+                "local_session_count": 1,
+                "is_current_session": true
+            }],
+            "objects": [],
+            "transport": {
+                "configured": true,
+                "available": true,
+                "status": "Collaboration is configured."
+            }
+        }))
+        .unwrap();
+        let stale = apply_active_poll_if_current(&mut state, &shared_guard, poll);
+        assert!(stale.is_none());
+        assert!(selection_guard_matches(&state, &direct_guard));
+        assert_eq!(
+            state.direct.selected_conversation_id.as_deref(),
+            Some("direct:sha256:fixture-conversation")
+        );
+        assert!(!state.session_active);
+    }
+
+    #[test]
+    fn text_node_clicks_resolve_to_the_same_choice_intent() {
+        assert_eq!(
+            resolve_conversation_choice(None, Some("shared")).as_deref(),
+            Some("shared")
+        );
+        assert_eq!(
+            resolve_conversation_choice(Some("direct:sha256:fixture-conversation"), None)
+                .as_deref(),
+            Some("direct:sha256:fixture-conversation")
+        );
+        assert_eq!(resolve_conversation_choice(None, None), None);
+    }
+
+    #[test]
+    fn conversation_initial_uses_the_first_visible_character() {
+        assert_eq!(conversation_initial("  alice"), "A");
+        assert_eq!(conversation_initial("Élodie"), "É");
+        assert_eq!(conversation_initial("   "), "?");
     }
 }
 
@@ -3059,23 +4552,103 @@ fn schedule_scroll_to_bottom(element: HtmlElement) {
     late_timeout.forget();
 }
 
+fn new_chat_message_request_id() -> Result<String, String> {
+    let crypto = window()
+        .ok_or_else(|| "window unavailable".to_string())?
+        .crypto()
+        .map_err(js_error)?;
+    let mut random = [0u8; 16];
+    crypto
+        .get_random_values_with_u8_array(&mut random)
+        .map_err(js_error)?;
+    Ok(format_chat_message_request_id(random))
+}
+
+fn format_chat_message_request_id(random: [u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut request_id = String::with_capacity("chat-message:".len() + 32);
+    request_id.push_str("chat-message:");
+    for byte in random {
+        request_id.push(HEX[usize::from(byte >> 4)] as char);
+        request_id.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    request_id
+}
+
+fn pending_chat_request_id<F>(
+    pending: &mut Option<PendingChatSend>,
+    body: &str,
+    generate: F,
+) -> Result<String, String>
+where
+    F: FnOnce() -> Result<String, String>,
+{
+    if let Some(existing) = pending.as_ref().filter(|existing| existing.body == body) {
+        return Ok(existing.request_id.clone());
+    }
+    let request_id = generate()?;
+    *pending = Some(PendingChatSend {
+        request_id: request_id.clone(),
+        body: body.to_string(),
+    });
+    Ok(request_id)
+}
+
 fn is_session_error(err: &str) -> bool {
     err.contains("invalid or expired session") || err.contains("request failed: 401")
 }
 
-fn live_status_detail(transport: &RoomTransportView) -> String {
-    if transport.connected_peer_count > 0 {
-        return format!(
-            "Connected to {} ElastOS peer{}.",
-            transport.connected_peer_count,
-            if transport.connected_peer_count == 1 {
-                ""
-            } else {
-                "s"
-            }
-        );
+fn shell_summary_allows_session(summary: &SummaryView) -> bool {
+    summary.transport.configured
+        || summary.local_runtime_role.is_some()
+        || summary.browser_access_allowed
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChatControlPolicy {
+    enable_text_send: bool,
+    show_attach: bool,
+    enable_attach: bool,
+    show_browser_requests: bool,
+    show_room_access_toggle: bool,
+    show_room_access: bool,
+    show_conversation_join: bool,
+    enable_gateway_controls: bool,
+}
+
+fn chat_control_policy(
+    room_mode_known: bool,
+    configured: bool,
+    shell_mode: bool,
+    session_active: bool,
+    show_access_controls: bool,
+    has_pending_requests: bool,
+) -> ChatControlPolicy {
+    let gateway_surface = room_mode_known && !shell_mode && !configured;
+    ChatControlPolicy {
+        enable_text_send: session_active,
+        show_attach: room_mode_known && !configured,
+        enable_attach: room_mode_known && !configured && session_active,
+        show_browser_requests: gateway_surface && has_pending_requests,
+        show_room_access_toggle: gateway_surface && session_active,
+        show_room_access: gateway_surface && session_active && show_access_controls,
+        show_conversation_join: gateway_surface && !session_active,
+        enable_gateway_controls: gateway_surface && session_active,
     }
-    "Conversation live.".to_string()
+}
+
+fn live_status_detail(transport: &RoomTransportView) -> String {
+    if !transport.available {
+        return transport
+            .status
+            .clone()
+            .unwrap_or_else(|| "Collaboration is isolated on this Runtime.".to_string());
+    }
+    transport
+        .status
+        .clone()
+        .unwrap_or_else(|| "Collaboration is configured.".to_string())
 }
 
 fn format_participant_count(count: usize) -> String {
@@ -3123,18 +4696,20 @@ fn member_display_name(member: &RoomMemberView) -> String {
         .map(|profile| profile.display_name.trim())
         .filter(|name| !name.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| short_did(&member.member_did))
+        .unwrap_or_else(|| UNVERIFIED_ROOM_MEMBER_NAME.to_string())
 }
 
 fn participant_detail(participant: &ParticipantView, is_local: bool, shell_mode: bool) -> String {
     let mut parts = Vec::new();
     let local_runtime_participant =
         participant.is_current_session && participant.device_label.trim() == "ElastOS shell";
+    let verified_profile_identity = participant.profile_verified == Some(true);
     let generic_browser_label = matches!(
         participant.device_label.trim(),
         "" | "Browser" | "This browser"
     );
     if !participant.device_label.trim().is_empty()
+        && !verified_profile_identity
         && !local_runtime_participant
         && !generic_browser_label
     {
@@ -3155,6 +4730,25 @@ fn participant_detail(participant: &ParticipantView, is_local: bool, shell_mode:
     parts.join(" · ")
 }
 
+/// The declared direct-conversation attachment policy, stated where the
+/// person meets it. Attachments need object handling and a delivery path of
+/// their own, designed on the unified delivery layer — until then the attach
+/// control in direct mode is visibly unavailable, never silently missing.
+const DIRECT_ATTACHMENTS_UNAVAILABLE: &str = "Direct conversations are text-only for now.";
+
+/// Unconfigured room-control membership may still lack a profile card; keep
+/// that legacy surface unchanged. Configured shared Chat never renders this
+/// marker because it hides room controls and filters person rows earlier.
+const UNVERIFIED_ROOM_MEMBER_NAME: &str = "Unverified member";
+
+fn object_sender_name(object: &ConversationObjectView) -> &str {
+    &object.sender
+}
+
+fn participant_shown_name(participant: &ParticipantView) -> &str {
+    &participant.display_name
+}
+
 fn participant_initial(name: &str) -> String {
     name.chars()
         .find(|ch| ch.is_alphanumeric())
@@ -3170,14 +4764,6 @@ fn title_case(value: &str) -> String {
     }
 }
 
-fn short_did(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.len() <= 24 {
-        return trimmed.to_string();
-    }
-    format!("{}...{}", &trimmed[..14], &trimmed[trimmed.len() - 8..])
-}
-
 fn trim_sentence(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.ends_with('.') {
@@ -3187,7 +4773,7 @@ fn trim_sentence(value: &str) -> String {
     }
 }
 
-fn summary_browser_access_allowed_default() -> bool {
+fn room_access_policy_enabled_default() -> bool {
     true
 }
 
@@ -3229,13 +4815,11 @@ fn set_hidden(element: &HtmlElement, hidden: bool) -> Result<(), JsValue> {
 
 async fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
     let window = window().ok_or_else(|| "window unavailable".to_string())?;
-    let clipboard = Reflect::get(window.navigator().as_ref(), &JsValue::from_str("clipboard"))
-        .map_err(js_error)?;
-    let write_text = Reflect::get(&clipboard, &JsValue::from_str("writeText"))
+    let write_text = Reflect::get(window.as_ref(), &JsValue::from_str("elastosChatCopyInvite"))
         .and_then(|value| value.dyn_into::<Function>())
-        .map_err(js_error)?;
+        .map_err(|_| "Trusted Home Clipboard is unavailable.".to_string())?;
     let promise = write_text
-        .call1(&clipboard, &JsValue::from_str(text))
+        .call1(&JsValue::UNDEFINED, &JsValue::from_str(text))
         .map_err(js_error)?;
     JsFuture::from(Promise::from(promise))
         .await
@@ -3248,6 +4832,47 @@ async fn api_post_json<TReq: Serialize, TResp: DeserializeOwned>(
     body: &TReq,
 ) -> Result<TResp, String> {
     api_post_json_with_headers(path, body, &[]).await
+}
+
+async fn direct_get_json<T: DeserializeOwned>(
+    path: &str,
+    extra_headers: &[(&str, String)],
+) -> Result<T, u16> {
+    let mut request = Request::get(path).credentials(RequestCredentials::SameOrigin);
+    for (name, value) in extra_headers {
+        request = request.header(name, value);
+    }
+    let response = request.send().await.map_err(|_| 0u16)?;
+    if response.status() != 200 {
+        return Err(response.status());
+    }
+    response.json::<T>().await.map_err(|_| 500)
+}
+
+async fn direct_post_json<TReq: Serialize, TResp: DeserializeOwned>(
+    path: &str,
+    body: &TReq,
+    extra_headers: &[(&str, String)],
+) -> Result<(u16, TResp), u16> {
+    let mut request = Request::post(path).credentials(RequestCredentials::SameOrigin);
+    for (name, value) in extra_headers {
+        request = request.header(name, value);
+    }
+    let response = request
+        .json(body)
+        .map_err(|_| 400u16)?
+        .send()
+        .await
+        .map_err(|_| 0u16)?;
+    let status = response.status();
+    if status != 200 && status != 202 {
+        return Err(response.status());
+    }
+    response
+        .json::<TResp>()
+        .await
+        .map(|body| (status, body))
+        .map_err(|_| 500)
 }
 
 async fn api_post_session_json<TReq: Serialize, TResp: DeserializeOwned>(
@@ -3457,6 +5082,13 @@ fn input_by_id(document: &Document, id: &str) -> Result<HtmlInputElement, JsValu
         .get_element_by_id(id)
         .ok_or_else(|| JsValue::from_str(&format!("missing input #{id}")))?
         .dyn_into::<HtmlInputElement>()?)
+}
+
+fn textarea_by_id(document: &Document, id: &str) -> Result<HtmlTextAreaElement, JsValue> {
+    Ok(document
+        .get_element_by_id(id)
+        .ok_or_else(|| JsValue::from_str(&format!("missing textarea #{id}")))?
+        .dyn_into::<HtmlTextAreaElement>()?)
 }
 
 fn button_by_id(document: &Document, id: &str) -> Result<HtmlButtonElement, JsValue> {

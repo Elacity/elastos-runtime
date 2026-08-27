@@ -352,6 +352,7 @@ function assertMarkdownLocalLinksResolve() {
 
 function assertUsersSelfReferencesAreApproved() {
   const allowed = new Set([
+    // Retained, unshipped operator-path evidence. Product packaging is rejected below.
     "capsules/browser-engine-adapter/src/main.rs",
     "capsules/browser-engine-adapter/src/tests.rs",
     "capsules/browser-engine-adapter/src/validation.rs",
@@ -768,8 +769,10 @@ for (const file of activeHtmlFiles) {
   assertStaticControlsAreNamed(file);
 }
 
+// Documents still owns its palette. Chat Room took the shared token sheet, so
+// it is checked below by the stronger rule instead: names must resolve to
+// shared tokens, and the file must name no colour of its own.
 const lightTokenFiles = [
-  "capsules/chat-room/browser/style.css",
   "capsules/documents/browser/index.html",
 ];
 
@@ -798,22 +801,85 @@ for (const file of lightTokenFiles) {
   }
 }
 
+const chatRoomStyle = read("capsules/chat-room/browser/style.css");
+for (const [token, value] of new Map([
+  ["--bg", "var(--el-bg)"],
+  ["--panel", "var(--el-surface)"],
+  ["--panel-strong", "var(--el-surface-raised)"],
+  ["--panel-soft", "var(--el-inset)"],
+  ["--line", "var(--el-hairline)"],
+  ["--line-strong", "var(--el-hairline-strong)"],
+  ["--ink", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "var(--el-accent)"],
+  ["--accent-soft", "var(--el-accent-soft)"],
+  ["--accent-deep", "var(--el-accent-strong)"],
+  ["--accent-ink", "var(--el-accent-ink)"],
+  ["--danger", "var(--el-danger)"],
+])) {
+  assertToken(chatRoomStyle, "capsules/chat-room/browser/style.css", token, value);
+}
+{
+  const literalColours = chatRoomStyle
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /#[0-9a-fA-F]{3,8}\b|rgba?\(/.test(line))
+    .filter((line) => !line.includes("var(--el-") && !line.includes("color-mix"));
+  assert(
+    literalColours.length === 0,
+    "Chat Room must take every colour from the shared token sheet, never name one itself",
+    literalColours,
+  );
+  assert(
+    !chatRoomStyle.includes("color: #f8fbff"),
+    "Text on an accent fill must use --accent-ink, which flips with the chosen accent",
+  );
+  const chatRoomIndex = read("capsules/chat-room/browser/index.html");
+  assert(
+    chatRoomIndex.includes('<link rel="stylesheet" href="./elastos-ui.css" />') &&
+      chatRoomIndex.includes('<script src="./elastos-theme.js"></script>'),
+    "Chat Room must load the vendored token sheet and theme runtime it maps onto",
+  );
+}
+
+// Inbox took the shared token sheet, so pinning its own hex palette here
+// would pin a copy of someone else's decision. The stronger rule: every name
+// it uses must resolve to a shared token, and it must name no colour of its
+// own. `just vendor-ui --check` guards the token sheet itself against drift.
 const inboxStyle = read("capsules/inbox/browser/index.html");
 for (const [token, value] of new Map([
-  ["--bg", "#ffffff"],
-  ["--sidebar-bg", "#f9f9f9"],
-  ["--toolbar-bg", "#fafafa"],
-  ["--panel", "#ffffff"],
-  ["--panel-soft", "#f9f9f9"],
-  ["--line", "#e5e7eb"],
-  ["--line-strong", "#d1d5db"],
-  ["--ink", "#1f2937"],
-  ["--muted", "#6b7280"],
-  ["--brand", "#f6921a"],
-  ["--accent", "#007aff"],
-  ["--accent-soft", "#e5f0ff"],
+  ["--bg", "var(--el-bg)"],
+  ["--sidebar-bg", "var(--el-surface)"],
+  ["--toolbar-bg", "var(--el-surface)"],
+  ["--panel", "var(--el-surface-raised)"],
+  ["--panel-soft", "var(--el-inset)"],
+  ["--line", "var(--el-hairline)"],
+  ["--line-strong", "var(--el-hairline-strong)"],
+  ["--ink", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "var(--el-accent)"],
+  ["--accent-soft", "var(--el-accent-soft)"],
 ])) {
   assertToken(inboxStyle, "capsules/inbox/browser/index.html", token, value);
+}
+{
+  const inboxOwnStyle = (inboxStyle.match(/<style>([\s\S]*?)<\/style>/g) || []).join("\n");
+  const literalColours = inboxOwnStyle
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /#[0-9a-fA-F]{3,8}\b|rgba?\(/.test(line));
+  assert(
+    literalColours.length === 0,
+    "Inbox must take every colour from the shared token sheet, never name one itself",
+    literalColours,
+  );
+  assert(
+    inboxStyle.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+      inboxStyle.includes('<script src="./elastos-theme.js"></script>'),
+    "Inbox must load the vendored token sheet and theme runtime it maps onto",
+  );
 }
 
 const systemSettingsStyle = read("capsules/system/browser/style.css");
@@ -880,9 +946,13 @@ assert(
   "Each independent Home document should define hover orange once as --brand-strong",
 );
 assert(
-  shellHostStyle.includes("min-height: 100dvh;") &&
-    homeGuiStyle.includes("font-family: \"Inter\", \"Segoe UI\", \"SF Pro Text\", sans-serif;"),
+  shellHostStyle.includes("min-height: 100dvh;"),
   "Home must use dynamic viewport height for mobile browsers",
+);
+assert(
+  homeGuiStyle.includes("font-family: var(--el-font);") &&
+    !/font-family:\s*"Inter"/.test(homeGuiStyle),
+  "Home GUI must take its type from the shared token sheet rather than repeating a font stack",
 );
 assert(
   shellStyle.includes("env(safe-area-inset-top"),
@@ -922,7 +992,32 @@ const homeGuiTemplateHtml = read("capsules/home-gui/browser/home-gui-template.ht
 const homeGuiJs = read("capsules/home-gui/browser/home-gui.js");
 const homeGuiCore = read("capsules/home-gui/browser/shell-core.js");
 const shellSurface = read("capsules/home-gui/browser/shell-surface.js");
+const shellMenubar = read("capsules/home-gui/browser/shell-menubar.js");
+const shellSpotlight = read("capsules/home-gui/browser/shell-spotlight.js");
+const shellStages = read("capsules/home-gui/browser/shell-stages.js");
+const shellExpose = read("capsules/home-gui/browser/shell-expose.js");
+const shellKeyboard = read("capsules/home-gui/browser/shell-keyboard.js");
+const shellQuickLook = read("capsules/home-gui/browser/shell-quicklook.js");
 const shellJs = read("capsules/home/browser/home-shell-host.js");
+const contactStore = read("elastos/crates/elastos-server/src/collaboration_contact_store.rs");
+const profileUpdates = read(
+  "elastos/crates/elastos-server/src/collaboration_profile_updates.rs",
+);
+const notificationsStore = read("elastos/crates/elastos-server/src/notifications.rs");
+const collaborationDelivery = read(
+  "elastos/crates/elastos-server/src/collaboration_delivery.rs",
+);
+const collaborationProtocol = read(
+  "elastos/crates/elastos-server/src/collaboration_protocol.rs",
+);
+const discoveryRuntime = read(
+  "elastos/crates/elastos-server/src/collaboration_discovery_runtime.rs",
+);
+const systemCapsuleJs = read("capsules/system/browser/system.js");
+const profileAuthority = read(
+  "elastos/crates/elastos-server/src/collaboration_profile_authority.rs",
+);
+const directMessages = read("elastos/crates/elastos-server/src/collaboration_direct_messages.rs");
 const homeBrowserContext = read("capsules/home/browser/home-browser-context.js");
 const homeClipboardHost = read(
   "capsules/home/browser/home-clipboard-host.js",
@@ -1109,6 +1204,8 @@ const peopleCapsule = read("capsules/people/capsule.json");
 const peopleIndex = read("capsules/people/browser/index.html");
 const peopleScript = read("capsules/people/browser/people.js");
 const peopleStyle = read("capsules/people/browser/style.css");
+const peopleDiscoverySmoke = read("scripts/people-discovery-smoke.mjs");
+const debugGuide = read("DEBUG.md");
 const servicesIndex = read("capsules/services/browser/index.html");
 const servicesScript = read("capsules/services/browser/services.js");
 const servicesStyle = read("capsules/services/browser/style.css");
@@ -1129,6 +1226,7 @@ const homeCliTerminal = read("capsules/home-cli/src/terminal.rs");
 const homeCliText = read("capsules/home-cli/src/text.rs");
 const homeCliTests = read("capsules/home-cli/src/tests.rs");
 const homeCli = [homeCliMain, homeCliTerminal, homeCliText, homeCliTests].join("\n");
+const carrier = read("elastos/crates/elastos-server/src/carrier.rs");
 const carrierService = read("elastos/crates/elastos-server/src/carrier_service.rs");
 const localhostProvider = read("elastos/capsules/localhost-provider/src/main.rs");
 const operatorControl = read(
@@ -1144,6 +1242,8 @@ const chatRoomIndex = read("capsules/chat-room/browser/index.html");
 const roomService = read("elastos/crates/elastos-server/src/room_service.rs");
 const gatewayApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway.rs",
+  "elastos/crates/elastos-server/src/api/gateway_collaboration_presence.rs",
+  "elastos/crates/elastos-server/src/api/browser_sessions.rs",
   "elastos/crates/elastos-server/src/api/gateway_home_runtime.rs",
   "elastos/crates/elastos-server/src/api/gateway_esp.rs",
   "elastos/crates/elastos-server/src/api/gateway_home_system.rs",
@@ -1175,7 +1275,6 @@ const gatewayHomeTerminal = read(
   "elastos/crates/elastos-server/src/api/gateway_home_terminal.rs",
 );
 const gatewayInboxApi = read("elastos/crates/elastos-server/src/api/gateway_inbox.rs");
-const contactStore = read("elastos/crates/elastos-server/src/collaboration_contact_store.rs");
 const gatewayBrowserApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway_browser.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_engine.rs",
@@ -1568,8 +1667,8 @@ assert(
     agentsContract.includes("## Public Live Deployment") &&
     agentsContract.includes("## Staging Machines") &&
     agentsContract.includes("## Browser Claim Discipline") &&
-    agentsContract.includes("`main` is the stable release line; it currently represents 0.5.0") &&
-    agentsContract.includes("`upstream/0.6-dev` is the current 0.6 development integration line") &&
+    agentsContract.includes("`main` is the stable release line; it currently represents 0.6.0") &&
+    agentsContract.includes("`upstream/0.7-dev` is the current development integration line") &&
     agentsContract.includes("Do not assume a `review/*` or `live` ref exists") &&
     agentsContract.includes("reporting its exact branch, commit, tree id, dirty status") &&
     agentsContract.includes("Target proof must cite the exact source tree") &&
@@ -1596,25 +1695,28 @@ const gbaOpaqueBrowserProof = read("scripts/fixtures/gba-opaque-frame-browser-pr
 const gbaOpaqueBrowserInput = read("scripts/fixtures/gba-opaque-frame-browser-proof/cdp-input.mjs");
 const gbaOpaqueBrowserServer = read("scripts/fixtures/gba-opaque-frame-browser-proof/server.py");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
-const homeAssetVersion = "home-20260725a";
+const homeAssetVersion = "home-20260805a";
 const homeClipboardAssetVersion = "home-20260726a";
-const homeGuiAssetVersion = "home-20260731b";
-const homeShellHostAssetVersion = "home-20260731b";
+const homeGuiAssetVersion = "home-20260812a";
+const homeShellHostAssetVersion = "home-20260802a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
   ["home-shell-no-hint-boot-smoke.mjs", homeShellNoHintBootSmoke],
   ["home-shell-recovery-smoke.mjs", homeShellRecoverySmoke],
-  ["home-shell-regression-smoke.mjs", homeShellRegressionSmoke],
   ["home-shell-stale-hint-boot-smoke.mjs", homeShellStaleHintBootSmoke],
   ["home-shell-switchback-recovery-smoke.mjs", homeShellSwitchbackRecoverySmoke],
   ["home-shell-system-switch-smoke.mjs", homeShellSystemSwitchSmoke],
 ]) {
   assert(
-    source.includes(`const moduleVersion = "${homeAssetVersion}";`),
+    source.includes(`const moduleVersion = "${homeShellHostAssetVersion}";`),
     `${file} must load the same Home module graph as the production shell`,
   );
 }
+assert(
+  homeShellRegressionSmoke.includes(`const moduleVersion = "${homeGuiAssetVersion}";`),
+  "home-shell-regression-smoke.mjs must load the same Home GUI module graph as production",
+);
 assertUsersSelfReferencesAreApproved();
 assert(
   homeGuiTemplateHtml.includes('role="listbox"'),
@@ -1643,6 +1745,90 @@ assert(
 assert(
   homeGuiTemplateHtml.includes('data-action="close"'),
   "Window close action must remain explicit",
+);
+assert(
+  !/fetch\(/.test(shellQuickLook) &&
+    shellQuickLook.includes("Deliberately NO byte-level preview") &&
+    shellQuickLook.includes('import { openFileObject } from "./shell-surface.js') &&
+    !/fetch\(/.test(shellKeyboard),
+  "Quick Look previews glyph and metadata only — object bytes stay behind viewer authority, and Open routes through the guarded path",
+);
+assert(
+  shellKeyboard.includes("function homeGuiOwnsKeys()") &&
+    shellKeyboard.includes("shellState.homeGuiMounted === true") &&
+    homeGuiJs.includes("retireKeyboardSurfaces();"),
+  "The keyboard layer sleeps while an alternate root shell owns the surface, and its overlays retire on shell switch",
+);
+assert(
+  !homeGuiJs.includes('event.code === "Space"') &&
+    shellKeyboard.includes("toggleSpotlight();"),
+  "Shell chords live in the keyboard layer alone — a second binding in home-gui.js would toggle surfaces straight back closed",
+);
+assert(
+  homeGuiTemplateHtml.includes('id="wallet-rail"') ||
+    !/shortcuts-row"><dt>Wallet<\/dt>/.test(homeGuiTemplateHtml),
+  "The shortcuts overlay documents only surfaces that exist: no Wallet row until the wallet rail lands",
+);
+assert(
+  !/agent|harness/i.test(shellStages) &&
+    !/agent|harness/i.test(shellExpose) &&
+    !shellWindows.includes("AgentWorkspace") &&
+    !homeGuiTemplateHtml.includes("agent"),
+  "Stages and Mission Control migrate without the agent harness: no Agent Space, no shelf morph, no workspace snapshot hook",
+);
+assert(
+  !/fetch\(/.test(shellStages) &&
+    !/fetch\(/.test(shellExpose) &&
+    shellStages.includes("UI ≠ authority: Space switches never mint Capsule/Carrier grants."),
+  "Stages and Mission Control are presentation only: no server calls, and a Space switch mints no authority",
+);
+assert(
+  shellWindows.includes("toggleFullscreenStage(id);") &&
+    shellWindows.includes(`export function minimizeWindow(id) {
+  const entry = shellState.windows.get(id);
+  // Same rule as the yellow control — never leave a hidden fullscreen Space ghost.
+  if (entry?.fullscreenStage) {
+    exitFullscreenStage(id);
+    return;
+  }
+  hideWindow(id);
+}`) &&
+    shellWindows.includes("minimizeWindow(id);"),
+  "The green button enters a fullscreen Space and minimize exits one — never a hidden Space ghost",
+);
+assert(
+  shellWindows.includes("active_stage: stableSpaceKeyForId(getActiveStageId())") &&
+    shellWindows.includes("function resolveStableSpaceKey(key, restoredEntries)") &&
+    shellWindows.includes("restoreExtraDesktops(storedSession?.desktops)") &&
+    shellWindows.includes("fs:${entry.targetId}:${inst}"),
+  "The session persists the Space ring under stable keys and restores the Space the user was on, not whichever window was focused",
+);
+assert(
+  shellSpotlight.includes('import { openFileObject } from "./shell-surface.js') &&
+    !shellSpotlight.includes("desktopObjectViewer") &&
+    !/fetch\(/.test(shellSpotlight),
+  "Spotlight must search what the shell already holds and open objects through the capability-guarded path, never resolve a viewer or sweep the server itself",
+);
+assert(
+  shellMenubar.includes("textContent") &&
+    !shellMenubar.includes("innerHTML") &&
+    shellMenubar.includes("const MAX_MENUS = 6;") &&
+    shellMenubar.includes("const MAX_ITEMS = 20;") &&
+    shellMenubar.includes("const MAX_LABEL = 48;") &&
+    shellMenubar.includes("const CMD_PATTERN = /^[a-z0-9:._-]{1,64}$/i;"),
+  "App menu manifests are data, not markup: labels render as text and titles, items, length and command shape stay capped",
+);
+assert(
+  shellJs.includes('data.type === "home:menu-manifest"') &&
+    shellJs.includes('console.warn("home ignored unauthorized menu-manifest message"') &&
+    shellJs.includes("homeToken: context.homeToken,") &&
+    !shellJs.includes("windowId: data.windowId"),
+  "Home must bind a menu manifest to the sending app frame's own launch token and never take a window id from the sender",
+);
+assert(
+  homeGuiShell.includes('hasExactKeys(message, ["type", "command", "homeToken", "menus"])') &&
+    homeGuiJs.includes("function setHomeGuiMenuManifest(homeToken, menus)"),
+  "Home GUI must resolve a menu manifest through the sender's token against its own windows",
 );
 assert(
   shellIndex.includes('rel="manifest"'),
@@ -1885,7 +2071,7 @@ assert(
 );
 assert(
   !shellIndex.includes(`/apps/home-gui/style.css?v=${homeAssetVersion}`) &&
-    homeGuiIndex.includes(`./style.css?v=${homeAssetVersion}`) &&
+    homeGuiIndex.includes(`./style.css?v=${homeGuiAssetVersion}`) &&
     homeGuiIndex.includes(`./home-gui-shell.js?v=${homeGuiAssetVersion}`) &&
     homeGuiShell.includes(`./home-gui.js?v=${homeGuiAssetVersion}`),
   "Home GUI must own its document, stylesheet, and entry module on its isolated capsule origin",
@@ -1898,8 +2084,20 @@ assert(
   "Home must launch Home GUI as an isolated shell document instead of importing GUI code into its trusted DOM",
 );
 assert(
-  shellJs.includes(`shell-core.js?v=${homeAssetVersion}`),
+  shellJs.includes(`shell-core.js?v=${homeShellHostAssetVersion}`) &&
+    shellJs.includes(`shell-auth.js?v=${homeShellHostAssetVersion}`) &&
+    shellJs.includes(`home-wallet-connector-host.js?v=${homeShellHostAssetVersion}`) &&
+    shellAuthJs.includes(`shell-core.js?v=${homeShellHostAssetVersion}`) &&
+    homeWalletConnectorHost.includes(`shell-core.js?v=${homeShellHostAssetVersion}`),
   "Home home-shell-host.js must import the current shell-core module instance",
+);
+assert(
+  shellJs.includes('fetchJson("/api/apps/home/collaboration/presence"') &&
+    shellJs.includes("homeSummaryHasProofBoundSession") &&
+    shellJs.includes("stopHomePresenceHeartbeat") &&
+    shellJs.includes("isHomeAuthError(error)") &&
+    shellCore.includes('url === "/api/apps/home/collaboration/presence"'),
+  "trusted Home presence must remain proof-bound, singular, and fail closed on authorization errors",
 );
 assert(
   shellJs.includes(`home-browser-context.js?v=${homeAssetVersion}`),
@@ -1920,13 +2118,13 @@ assert(
   "Home home-shell-host.js must not statically import the GUI window manager",
 );
 assert(
-  homeGuiJs.includes(`./shell-core.js?v=${homeAssetVersion}`) &&
+  homeGuiJs.includes(`./shell-core.js?v=${homeGuiAssetVersion}`) &&
     homeGuiJs.includes(`./shell-surface.js?v=${homeGuiAssetVersion}`) &&
     homeGuiJs.includes(`./shell-windows.js?v=${homeGuiAssetVersion}`),
   "Home home-gui facade must import the current GUI surface/window module instances",
 );
 assert(
-  shellSurface.includes(`./shell-core.js?v=${homeAssetVersion}`),
+  shellSurface.includes(`./shell-core.js?v=${homeGuiAssetVersion}`),
   "Home shell-surface must import the home-gui-owned shell-core module instance",
 );
 assert(
@@ -2224,24 +2422,55 @@ assert(
     peopleIndex.includes("Open People from Home.") &&
     peopleIndex.includes('id="profile-form"') &&
     peopleIndex.includes('id="discovery"') &&
+    peopleIndex.includes("people-20260805a") &&
     peopleScript.includes("/api/apps/people/summary") &&
-    peopleScript.includes("/api/apps/people/profile-card") &&
+    peopleScript.includes("/api/apps/people/profile") &&
     peopleScript.includes("/api/apps/people/discovery") &&
     peopleScript.includes("/api/apps/people/discovery/refresh") &&
     peopleScript.includes("/api/apps/people/discovery/requests") &&
     peopleScript.includes("/api/apps/people/contacts/remove") &&
+    peopleScript.includes("Refresh requested.") &&
+    !peopleScript.includes("DISCOVERY_REFRESH_") &&
+    !peopleScript.includes("discoveryRefreshInFlight") &&
+    !peopleScript.includes("startDiscoveryRefresh") &&
+    !peopleScript.includes("stopDiscoveryRefresh") &&
+    !peopleScript.includes("refreshDiscovery") &&
+    !peopleScript.includes("next_refresh_after_ms") &&
+    peopleScript.includes("function publicError") &&
+    !peopleScript.includes("/api/apps/people/presence") &&
+    !peopleScript.includes("connect_ticket") &&
+    !peopleScript.includes("peer_id") &&
+    !peopleScript.includes("topic") &&
     peopleScript.includes('type: "home:open-target"') &&
-    peopleScript.includes('target !== "chat-room"') &&
+    peopleScript.includes('target: "chat-room"') &&
+    peopleScript.includes("conversation_id: selector") &&
+    !peopleScript.includes("data-contact-route") &&
+    peopleScript.includes('const KNOWN_RELATIONSHIPS = new Map([') &&
+    !peopleScript.includes('readText(contact?.relationship) || "connected"') &&
+    peopleScript.includes("Unknown state") &&
     peopleStyle.includes(".people-shell") &&
     peopleStyle.includes(".people-sidebar") &&
-    peopleStyle.includes(".discovery-grid") &&
+    peopleStyle.includes(".people-sidebar-icon-discovery") &&
+    peopleStyle.includes(".discovery-header") &&
+    !peopleStyle.includes(".online-badge") &&
+    peopleDiscoverySmoke.includes("people-discovery-smoke: PASS") &&
+    peopleCapsule.includes('"id": "presence.read"') &&
     !shellWindows.includes("renderPeopleWindowBody") &&
     !shellWindows.includes("/api/apps/people/") &&
     !shellStyle.includes(".home-people-") &&
     shellWindows.includes('"people",') &&
-    shellJs.includes('people: new Set(["chat-room"])') &&
+    shellJs.includes('people: new Set(["chat-room", "system"])') &&
     homeCmd.includes("issue_capsule_launch_token(&data_dir, PEOPLE_CAPSULE_NAME)"),
   "People must be a standalone app capsule while Home remains only its launch and message host",
+);
+assert(
+  debugGuide.includes("## People Discovery And Presence Invariant") &&
+    debugGuide.includes("People Discovery is explicit and opt-in.") &&
+    debugGuide.includes("The seed/relay may help") &&
+    debugGuide.includes("Signed presence is separate.") &&
+    debugGuide.includes("accepted contacts and active group participants") &&
+    debugGuide.includes("contact, admission, or authorization"),
+  "DEBUG.md must describe opt-in signed Discovery separately from signed presence annotations",
 );
 
 assert(
@@ -2467,6 +2696,22 @@ assert(
   "Room attachment upload finish must keep retry state until the attachment commit is proven",
 );
 assert(
+  gatewayApi.includes("collaboration_chat_product_port") &&
+    gatewayApi.includes("port.conversation_poll") &&
+    gatewayApi.includes("port.prepare_message") &&
+    gatewayApi.includes("port.project_prepared_message") &&
+    gatewayApi.includes("start_configured_chat_room_session") &&
+    gatewayApi.includes("configured_legacy_room_control_unsupported_response") &&
+    gatewayApi.includes("configured_collaboration_browser_session_unsupported_response") &&
+    chatRoomUi.includes("transport.configured") &&
+    chatRoomUi.includes("chat_control_policy") &&
+    !gatewayApi.includes(["RoomTransport", "Bridge"].join("")) &&
+    !carrier.includes(["CHAT_ROOM", "SYNC_TOPIC"].join("_")) &&
+    !carrier.includes(["room-sync", "-v1"].join("")) &&
+    gatewayTests.includes("retired Chat room-sync topic must be absent"),
+  "Configured Chat must use the Runtime collaboration product port without legacy room/browser authority or a Carrier room-sync bridge",
+);
+assert(
   gatewayApi.includes('"/api/apps/people/contacts/remove"') &&
     gatewayApi.includes("people_contact_remove") &&
     gatewayApi.includes(
@@ -2495,6 +2740,269 @@ assert(
     contactStore.includes("removed relationship has no signed acceptance chain") &&
     contactStore.includes("accepted profile head is not bound to a known relationship"),
   "Contact removal is signed and visible on both sides: removed pairs trace to acceptance truth, and retained heads bind to known relationships only",
+);
+assert(
+  directMessages.includes("enum DirectHistoryPolicy") &&
+    directMessages.includes("DECLARED_DIRECT_HISTORY_POLICY") &&
+    directMessages.includes("ReadableAfterRemoval => removed"),
+  "Post-removal read behaviour is an explicit declared policy the Runtime enforces, not an emergent refusal",
+);
+assert(
+  gatewayApi.includes("fn room_profile_attribution_names") &&
+    !gatewayApi.includes("verified_presence_display_name") &&
+    sourceBlock(
+      gatewayApi,
+      "pub(super) async fn room_service_poll",
+      "Chat poll handler",
+    ).includes("apply_profile_attribution_to_room_poll") &&
+    !sourceBlock(
+      gatewayApi,
+      "pub(super) async fn room_service_poll",
+      "Chat poll handler",
+    ).includes("presence_port") &&
+    sourceBlock(
+      gatewayApi,
+      "pub(super) async fn chat_room_session_start",
+      "Chat session start handler",
+    ).includes("apply_profile_attribution_to_room_poll") &&
+    !sourceBlock(
+      gatewayApi,
+      "pub(super) async fn chat_room_session_start",
+      "Chat session start handler",
+    ).includes("presence_port"),
+  "Shared-room attribution binds names to signed Profile heads: presence proves liveness, never identity",
+);
+assert(
+  sourceBlock(
+    gatewayApi,
+    "pub(super) fn apply_profile_attribution_to_room_poll",
+    "Room attribution projection",
+  ).includes("object.sender_profile_verified != Some(true)") &&
+    !sourceBlock(
+      gatewayApi,
+      "pub(super) fn apply_profile_attribution_to_room_poll",
+      "Room attribution projection",
+    ).includes("String::new()") &&
+    sourceBlock(
+      gatewayApi,
+      "pub(super) fn apply_profile_attribution_to_participants",
+      "Participant attribution projection",
+    ).includes("participant.profile_verified != Some(true)") &&
+    !sourceBlock(
+      gatewayApi,
+      "pub(super) fn apply_profile_attribution_to_participants",
+      "Participant attribution projection",
+    ).includes("String::new()") &&
+    !gatewayApi.includes("fn home_people_fallback_display_name") &&
+    !gatewayApi.includes("Conversation member "),
+  "Configured shared Chat name refresh never upgrades authority: gateway renames only rows already verified by room_service",
+);
+assert(
+  chatRoomUi.includes("filter_configured_shared_poll") &&
+    chatRoomUi.includes("configured_shared_object_visible") &&
+    chatRoomUi.includes("configured_shared_participant_visible") &&
+    !chatRoomUi.includes("const UNVERIFIED_MEMBER_NAME") &&
+    !chatRoomUi.includes("participant-name-unverified") &&
+    !chatRoomUi.includes("sender-unverified"),
+  "Configured shared Chat omits false/None rows defensively instead of rendering placeholder people",
+);
+assert(
+  authGatewayApi.includes('schema: "elastos.auth.passkey.verify/v2"') &&
+    authGatewayApi.includes("profile_readiness_for_principal") &&
+    !authGatewayApi.includes("create_initial_profile_for_registration") &&
+    !authGatewayApi.includes("profile creation at registration failed") &&
+    gatewayApi.includes('const SCHEMA: &\'static str = "elastos.profile.readiness/v1"') &&
+    gatewayApi.includes('status: "ready"') &&
+    gatewayApi.includes('status: "setup_required"') &&
+    gatewayApi.includes('status: "unavailable"'),
+  "Passkey verification and Home identity must share one derived Profile readiness state, with no swallowed registration-time Profile creation",
+);
+assert(
+  shellAuthJs.includes("profileReadinessActionTarget") &&
+    shellAuthJs.includes('return "people"') &&
+    shellAuthJs.includes('return "system"') &&
+    shellJs.includes("openTargetFromHomeGui(profileActionTarget)") &&
+    peopleScript.includes('readiness.schema === "elastos.profile.readiness/v1"') &&
+    peopleScript.includes('profileForm?.dataset.profileState === "unavailable"') &&
+    !peopleScript.includes("identity.profile ?") &&
+    !peopleDiscoverySmoke.includes("identity.profile ?"),
+  "First-run Profile UX must consume typed Runtime readiness: only setup-required opens People, while unavailable, missing, or unknown authority fails closed through System without browser identity inference",
+);
+const peopleProfileSave = sourceBlock(
+  gatewayApi,
+  "pub(super) async fn people_profile_update",
+  "People Profile save",
+);
+assert(
+  peopleProfileSave.includes("validate_profile_authority_update") &&
+    peopleProfileSave.includes("principal_root_recovery_status_for_context") &&
+    peopleProfileSave.includes("PeopleProfileProtectionRequiredResponse") &&
+    gatewayApi.includes("elastos.people.profile-protection-required/v1") &&
+    !peopleProfileSave.includes("ensure_principal_root_protection") &&
+    !peopleProfileSave.includes("RecoveryKitDelivery") &&
+    peopleScript.includes("elastos.people.profile-protection-required/v1") &&
+    peopleScript.includes("Open System") &&
+    peopleScript.includes("choose Security") &&
+    authGatewayApi.includes("mark_recovery_kit_handed_to_person") &&
+    gatewayHomeSystemTests.includes(
+      "test_people_profile_creation_requires_completed_system_recovery_without_partial_state",
+    ),
+  "People Profile creation must remain mutation-free until verified System Recovery protection exists; People never mints or retains unseen Recovery material",
+);
+assert(
+  profileUpdates.includes(
+    'PROFILE_UPDATE_PROVIDER_SCHEME: &str = "collaboration-profile"',
+  ) &&
+    sourceBlock(
+      profileUpdates,
+      "fn receive(",
+      "Profile update receive path",
+    ).includes("apply_accepted_profile_chain") &&
+    !directMessages.includes("collaboration-profile") &&
+    profileUpdates.includes("acknowledged: Mutex<BTreeMap<(String, String), u64>>") &&
+    profileUpdates.includes("restart re-announces, and the receiver treats that as an idempotent"),
+  "Profile updates travel their own Runtime provider, resolve by Profile DID, apply through the store's chain rules, and need no durable outbox: announcement is a pure function of the local head",
+);
+assert(
+  gatewayApi.includes(".AppData/ElastOS/Home/services-peer-contacts.json") &&
+    gatewayApi.includes(
+      'HOME_SERVICES_PEER_CONTACTS_SCHEMA: &str = "elastos.services.peer-contacts-state/v1"',
+    ) &&
+    sourceBlock(
+      gatewayApi,
+      "fn migrate_legacy_services_peer_contacts",
+      "Services peer contacts migration",
+    ).includes("LEGACY_HOME_SERVICES_PEER_CONTACTS_SCHEMA") &&
+    sourceBlock(
+      gatewayApi,
+      "pub(super) async fn home_launch",
+      "Home launch mutation boundary",
+    ).includes("migrate_legacy_services_peer_contacts") &&
+    sourceBlock(
+      gatewayApi,
+      "fn home_services_peer_contacts_state",
+      "Services peer contacts read",
+    ).includes("migrate_legacy_services_peer_contacts") === false,
+  "The Services peer contact object is named as what it holds, and the released People-named object migrates whole — name and schema together — only at explicit Home launch",
+);
+assert(
+  collaborationDelivery.includes("fn run_bounded_delivery_pass") &&
+    collaborationDelivery.includes("enum DeliveryEndOfLife") &&
+    sourceBlock(
+      directMessages,
+      "pub(crate) async fn retry_pending",
+      "Direct message retry pass",
+    ).includes("run_bounded_delivery_pass") &&
+    sourceBlock(
+      discoveryRuntime,
+      "async fn retry_contact_revocations",
+      "Contact revocation retry pass",
+    ).includes("run_bounded_delivery_pass") &&
+    sourceBlock(
+      profileUpdates,
+      "pub(crate) async fn announce_pending",
+      "Profile update announce pass",
+    ).includes("run_bounded_delivery_pass"),
+  "Every request/response collaboration retry is one shared bounded delivery pass — a new transport extends the engine, never adds another hand-rolled loop",
+);
+assert(
+  /DECLARED_DIRECT_MESSAGE_END_OF_LIFE[^;]{0,220}TerminalExpired;/s.test(directMessages) &&
+    /DECLARED_CONTACT_REVOCATION_END_OF_LIFE[^;]{0,220}RemintExact;/s.test(discoveryRuntime) &&
+    /DECLARED_PROFILE_UPDATE_END_OF_LIFE[^;]{0,220}RegenerateFromTruth;/s.test(profileUpdates),
+  "What happens at an envelope's end of life is a declared per-source product decision — terminal for messages, re-mint for revocations, regenerate for Profile announcements — never an emergent property of a retry loop",
+);
+assert(
+  sourceBlock(
+    authGatewayApi,
+    "async fn full_recovery_bundle_export_inner",
+    "Full recovery bundle export",
+  ).includes("people_identity_for_full_bundle") &&
+    sourceBlock(
+      authGatewayApi,
+      "async fn full_recovery_bundle_import_inner",
+      "Full recovery bundle import",
+    ).includes("restore_people_identity_from_full_bundle") &&
+    sourceBlock(
+      authGatewayApi,
+      "fn restore_people_identity_inner",
+      "People identity restore",
+    ).includes("update_profile_authority") &&
+    profileAuthority.includes(
+      "recovered profile signing seed does not control the recovered Profile DID",
+    ) &&
+    contactStore.includes("recovered contact state is bound to another Profile"),
+  "Recovery carries the signed People identity: the bundle exports the seed and contacts, the import restores them fail-closed, and the new device is authorized through the normal signed-revision path, never a bespoke signer",
+);
+assert(
+  systemCapsuleJs.includes("people_identity_restore") &&
+    systemCapsuleJs.includes("not a complete account restore"),
+  "The recovery UI reports the People identity outcome and never claims a complete account restore when it is not",
+);
+assert(
+  notificationsStore.includes('CONTACT_REQUEST_KIND: &str = "contact_request"') &&
+    notificationsStore.includes('DIRECT_MESSAGE_KIND: &str = "direct_message"') &&
+    !notificationsStore.includes("collaboration_contact_store") &&
+    !notificationsStore.includes("submit_contact_decision") &&
+    sourceBlock(
+      directMessages,
+      "fn receive(",
+      "Direct message receive path",
+    ).includes("upsert_direct_message_notification") &&
+    sourceBlock(
+      gatewayApi,
+      "pub(super) async fn chat_direct_conversation_messages",
+      "Chat direct conversation read",
+    ).includes("direct_message_notification_action_id"),
+  "Incoming contact requests and direct messages notify the person durably: the verified receive mints, the conversation read resolves, and the notification store never touches collaboration state or decisions",
+);
+assert(
+  carrier.includes("let source_endpoint_id = conn.remote_id();") &&
+    carrier.includes('"source_endpoint_did": public_key_to_did(source_endpoint_id)') &&
+    collaborationProtocol.includes("authenticated_carrier_source_endpoint") &&
+    directMessages.includes("sender_profile.sole_endpoint_did()? != source_endpoint_did") &&
+    directMessages.includes("authenticated_carrier_source_endpoint(runtime.get(\"carrier\"))") &&
+    profileUpdates.includes("source_endpoint_did") &&
+    contactStore.includes(
+      "profile update did not arrive from the signed Profile endpoint",
+    ),
+  "Carrier provider ingress derives the source endpoint from the authenticated connection; direct messages, revocations, and Profile updates compare that route independently from Profile-authorized application signing",
+);
+const peopleConversationsDoc = read("docs/PEOPLE_CONVERSATIONS.md");
+assert(
+  chatRoomUi.includes(
+    'DIRECT_ATTACHMENTS_UNAVAILABLE: &str = "Direct conversations are text-only for now."',
+  ) &&
+    chatRoomUi.includes("set_hidden(&self.attach_button, !direct_mode && !controls.show_attach)") &&
+    peopleConversationsDoc.includes("Direct conversations are text-only for now.") &&
+    peopleConversationsDoc.includes("Attachments in direct conversations. Deferred by decision, not omission"),
+  "Direct attachments are deferred by declared decision: the product doc says so, and the direct-mode control is visibly unavailable, never silently missing",
+);
+assert(
+  notificationsStore.includes("pub fn project_contact_request_notifications") &&
+    !gatewayApi.includes("sync_people_notifications_for_context") &&
+    sourceBlock(
+      gatewayApi,
+      "fn apply_contact_request_notification_projection",
+      "Home contact-request projection",
+    ).includes("project_contact_request_notifications") &&
+    sourceBlock(
+      gatewayApi,
+      "pub(super) async fn inbox_summary",
+      "Inbox summary",
+    ).includes("apply_contact_request_notification_projection"),
+  "Contact requests remain durable only in the protected contact store; Home and Inbox project the same pending facts in memory without writing a duplicate notification truth",
+);
+assert(
+  contactStore.includes("accepted profile chain rolls the revision back") &&
+    contactStore.includes("accepted profile chain skips a revision") &&
+    contactStore.includes("accepted profile chain breaks the chain hash") &&
+    contactStore.includes("accepted profile chain is not contiguous") &&
+    contactStore.includes("accepted profile chain mixes profiles") &&
+    contactStore.includes(
+      "profile update did not arrive from the signed Profile endpoint",
+    ) &&
+    profileAuthority.includes("MAX_RETAINED_PROFILE_REVISIONS: usize = 8"),
+  "A Profile update is an exact bounded signed chain: rollback, gaps, hash breaks, mixed profiles, and unauthorized source endpoints fail closed",
 );
 assert(
   shellJs.includes('scope === "people"') &&
@@ -2600,10 +3108,11 @@ assert(
   "Chat Room shell close must send a scoped leave request before Home removes the capsule frame",
 );
 assert(
-  chatRoomUi.includes(
-    "summary.local_runtime_role.is_none() && !summary.browser_access_allowed",
-  ),
-  "Chat Room shell sessions must remain openable when guest requests are disabled for active members",
+  chatRoomUi.includes("fn shell_summary_allows_session") &&
+    chatRoomUi.includes("summary.transport.configured") &&
+    chatRoomUi.includes("summary.local_runtime_role.is_some()") &&
+    chatRoomUi.includes("summary.browser_access_allowed"),
+  "Chat Room shell sessions must distinguish configured Home authority from isolated local membership and guest access",
 );
 assert(
   gatewayApi.includes('"/api/apps/chat-room/guests/:session_id/kick"'),
@@ -3459,9 +3968,13 @@ assert(
     homeCliMain.includes("fn people_contact_id_for_reference(") &&
     homeCli.includes("people_tab_uses_people_model_and_keeps_transport_in_debug") &&
     homeCli.includes("people_line_mode_resolves_visible_contacts_and_requires_message_route") &&
-    homeCli.includes('"Add People"') &&
+    homeCli.includes('"Online"') &&
+    homeCli.includes("Open People from Home to see signed online presence.") &&
     homeCli.includes("ContactsSchema") &&
-    homeCli.includes("DiscoverySchema") &&
+    !homeCli.includes("PeopleDiscovery") &&
+    !homeCli.includes("people-discovery-") &&
+    !homeCli.includes("people-request-peer") &&
+    !homeCli.includes("people-accept-request") &&
     !homeCliMain.includes("direct contact threads are not available yet") &&
     !homeCliMain.includes('"Visible People"') &&
     homeCli.includes("system_tab_stays_short_and_actionable") &&
@@ -3865,6 +4378,16 @@ assert(
     ),
   "obsolete ESP Shell capsule must not be packaged",
 );
+for (const obsolete of ["chat", "agent"]) {
+  assert(
+    !components.capsules?.[obsolete] &&
+      !components.external?.[obsolete] &&
+      Object.values(components.profiles).every(
+        (profile) => !new Set(profile.components || []).has(obsolete),
+      ),
+    `obsolete transport-facing ${obsolete} capsule must not be packaged`,
+  );
+}
 const publishRust = read("elastos/crates/elastos-server/src/publish.rs");
 function shellArrayItems(text, name) {
   const pattern = new RegExp(`^${name}=\\(([\\s\\S]*?)^\\)`, "m");
@@ -6259,14 +6782,25 @@ assert(
   "Library mobile panels must use compact Home-aligned spacing",
 );
 assert(
-  chatStyle.includes("width: 100%;") &&
-    chatStyle.includes("padding-top: 0.35rem;"),
-  "Chat Room mobile shell must avoid nested browser gutters",
+  chatStyle.includes("grid-template-columns: 220px minmax(0, 1fr);") &&
+    chatStyle.includes("width: 100%;") &&
+    chatStyle.includes("height: 100%;"),
+  "Chat must use one full-window conversation shell",
 );
 assert(
-  chatStyle.includes("border-radius: 0.82rem;") &&
-    chatStyle.includes("padding: 0.48rem;"),
-  "Chat Room mobile cards must use compact Home-aligned spacing",
+  chatStyle.includes(".conversation-selector") &&
+    chatStyle.includes("flex-direction: column;") &&
+    chatStyle.includes("grid-template-columns: 72px minmax(0, 1fr);") &&
+    chatStyle.includes(".conversation-choice-copy") &&
+    !chatStyle.includes("repeat(auto-fit, minmax(min(9rem, 100%), 1fr))"),
+  "Chat conversations must use one vertical list with a compact narrow rail",
+);
+assert(
+  chatStyle.includes("border-radius: 8px;") &&
+    chatStyle.includes("padding: 0.42rem 0.55rem;") &&
+    chatStyle.includes(".chat-people") &&
+    chatStyle.includes('data-roster-open="true"'),
+  "Chat rows and the conversation details drawer must stay compact",
 );
 assert(
   gba.includes('id="canvas"') &&
@@ -6843,9 +7377,12 @@ assert(
   "Home must expose an explicit sign-out path that clears the browser session through Runtime",
 );
 assert(
-  shellStyle.includes(".sign-out-btn") &&
-    shellStyle.includes('background-image: url("data:image/svg+xml'),
-  "Home sign-out toolbar icon must use a complete SVG glyph",
+  homeGuiTemplateHtml.includes('id="toolbar-sign-out"') &&
+    homeGuiTemplateHtml.includes(
+      "<path d=\"M6.5 3.5H4.2A1.7 1.7 0 0 0 2.5 5.2v5.6A1.7 1.7 0 0 0 4.2 12.5h2.3M7 8h6.5M11.2 5.5 13.5 8l-2.3 2.5\"",
+    ) &&
+    !shellStyle.includes('.sign-out-btn .toolbar-identity-item-icon {\n  background-image: url("data:image/svg+xml'),
+  "Home sign-out toolbar icon must use the inline SVG glyph without a duplicate CSS background image",
 );
 assert(
   !shellStyle.includes(".sign-out-btn::before") &&
@@ -9630,6 +10167,9 @@ assert(
     shellWindows.includes("fitWindowToLargestBrowserAspect") &&
     shellWindows.includes("dataset.browserMaximized") &&
     shellWindows.includes(`syncBrowserWindow(entry, launched);
+  if (restoredPlacement) {
+    applyFullscreenStageFromPlacement(entry, restoredPlacement);
+  }
   if (entry.targetId === "browser") {
     fitLaunchedWindow(entry);
   }`) &&

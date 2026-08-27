@@ -7,7 +7,7 @@
 #   ./scripts/publish-release.sh --version 0.10.0 --key path/to/release.key
 #   ./scripts/publish-release.sh --version 0.10.0 --key release.key --channel canary
 #   ./scripts/publish-release.sh --version 0.10.0 --key release.key --skip-build
-#   ./scripts/publish-release.sh --version 0.10.0 --key release.key --capsules chat,chat-room
+#   ./scripts/publish-release.sh --version 0.10.0 --key release.key --capsules chat-room
 #   ./scripts/publish-release.sh --version 0.10.0 --key release.key --no-public-url
 #   ./scripts/publish-release.sh --version 0.10.0 --key release.key --public-with-sudo
 #   ./scripts/publish-release.sh --help
@@ -644,32 +644,6 @@ stage_wasm_capsule() {
     fi
 }
 
-build_chat_archive() {
-    local platform="$1"
-    local use_cross="${2:-false}"
-    local artifacts_dir artifact stage_root archive
-
-    if [[ "$use_cross" == true ]]; then
-        artifacts_dir="${CROSS_ARTIFACTS_DIR:-}"
-    else
-        artifacts_dir="${ARTIFACTS_DIR:-}"
-    fi
-
-    [[ -n "$artifacts_dir" ]] || die "chat archive requested before rootfs artifacts were prepared"
-    artifact="${artifacts_dir}/chat.capsule.tar.gz"
-    [[ -f "$artifact" ]] || die "chat capsule artifact missing at ${artifact}"
-
-    stage_root="${TMPDIR}/support-assets-${platform}"
-    archive="${stage_root}/chat.tar.gz"
-    rm -rf "${stage_root}/chat"
-    mkdir -p "${stage_root}/chat"
-    tar -xzf "$artifact" -C "${stage_root}/chat"
-    [[ -f "${stage_root}/chat/capsule.json" ]] || die "chat archive staging missing capsule.json after extraction"
-    [[ -f "${stage_root}/chat/rootfs.ext4" ]] || die "chat archive staging missing rootfs.ext4 after extraction"
-    tar -czf "$archive" -C "$stage_root" chat
-    echo "$archive"
-}
-
 record_direct_asset() {
     local updates_json="$1"
     local name="$2"
@@ -750,13 +724,6 @@ build_supported_direct_assets() {
         install_path="bin/${name}"
         updates_json=$(record_direct_asset "$updates_json" "$name" "$staged" "$install_path" "$release_path")
     done
-
-    local chat_archive chat_staged
-    chat_archive=$(build_chat_archive "$platform" "$use_cross")
-    release_path="chat-${setup_platform}.tar.gz"
-    chat_staged="${stage_dir}/${release_path}"
-    cp "$chat_archive" "$chat_staged"
-    updates_json=$(record_direct_asset "$updates_json" "chat" "$chat_staged" "capsules/chat" "$release_path" "chat")
 
     stamp_direct_assets "$setup_platform" "$updates_json"
 }
@@ -2290,24 +2257,6 @@ echo "    curl -fsSL https://<explicit-gateway>/ipfs/${INSTALL_SCRIPT_CID}/insta
 echo "    # Optional explicit anchors:"
 echo "    #   --head-cid ${HEAD_CID} --maintainer-did ${SIGNER_DID}"
 echo ""
-echo -e "${BOLD}  Host Chat After Install:${NC}"
-echo "    elastos setup"
-echo "    elastos chat --nick host"
-if [[ -n "$CROSS_BINARY_CID" ]]; then
-    echo ""
-    if [[ -n "$PUBLIC_INSTALL_URL" ]]; then
-        echo -e "${BOLD}  Jetson Chat After Install:${NC}"
-        echo "    curl -fsSL ${PUBLIC_INSTALL_URL} | bash"
-        echo "    ~/.local/bin/elastos setup"
-        echo "    ~/.local/bin/elastos chat --nick jetson"
-        echo ""
-        echo -e "${BOLD}  Jetson TUI Chat (microVM):${NC}"
-        echo "    ~/.local/bin/elastos setup --profile chat"
-        echo "    ~/.local/bin/elastos capsule chat --lifecycle interactive --interactive --config '{\"nick\":\"jetson\"}'"
-    else
-        echo -e "${DIM}  Jetson: requires public gateway for remote install${NC}"
-    fi
-fi
 if [[ -n "$PUBLIC_GATEWAY_PID" ]]; then
     echo ""
     echo -e "${DIM}  Gateway process: PID ${PUBLIC_GATEWAY_PID}${NC}"

@@ -245,6 +245,11 @@ export function createHomeClipboardPrompt({
       "Continue to copy this resource URI to this device clipboard.",
       "Copy",
     ],
+    "chat-room:conversation.invite:write": [
+      "Copy conversation invite?",
+      "Continue to copy this short-lived conversation invite to this device clipboard.",
+      "Copy invite",
+    ],
   };
 
   return {

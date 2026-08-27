@@ -13,6 +13,23 @@ import {
 
 test("target and purpose lookup accepts own policy entries only", () => {
   assert.equal(homeClipboardTargetSupported("browser"), true);
+  assert.equal(homeClipboardTargetSupported("chat-room"), true);
+  assert.equal(
+    homeClipboardOperationAllowed(
+      "chat-room",
+      "conversation.invite",
+      "write",
+    ),
+    true,
+  );
+  assert.equal(
+    homeClipboardOperationAllowed(
+      "chat-room",
+      "conversation.invite",
+      "read",
+    ),
+    false,
+  );
   assert.equal(
     homeClipboardOperationAllowed("library", "resource.identifier", "write"),
     true,

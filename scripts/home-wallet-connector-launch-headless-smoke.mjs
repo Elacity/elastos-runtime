@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createServer } from "node:http";
-import { existsSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -347,6 +347,25 @@ function playwrightSpecifier() {
   ).href;
 }
 
+function configuredBrowserExecutable() {
+  const configured = (process.env.ELASTOS_BROWSER_EXECUTABLE || "").trim();
+  if (!configured) {
+    return null;
+  }
+  const absolute = isAbsolute(configured) ? configured : resolve(configured);
+  assert(existsSync(absolute), "configured browser executable does not exist", {
+    executablePath: absolute,
+  });
+  try {
+    accessSync(absolute, constants.X_OK);
+  } catch {
+    throw new Error(
+      `configured browser executable is not executable\n${JSON.stringify({ executablePath: absolute }, null, 2)}`,
+    );
+  }
+  return absolute;
+}
+
 function frameFor(page, target) {
   return page.frames().find((frame) => frame.url().includes(`/apps/${target}/`)) || null;
 }
@@ -459,8 +478,10 @@ let browser = null;
 try {
   const imported = await import(playwrightSpecifier());
   const { chromium } = imported.default || imported;
+  const executablePath = configuredBrowserExecutable();
   browser = await chromium.launch({
     headless: true,
+    ...(executablePath ? { executablePath } : {}),
     args: [
       "--disable-background-networking",
       "--disable-breakpad",

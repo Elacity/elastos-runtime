@@ -139,7 +139,7 @@ fn install_signed_profile(
 }
 
 #[test]
-fn room_attribution_binds_to_profile_names_not_presence_and_reapplies_after_reopen() {
+fn room_attribution_name_map_never_upgrades_false_or_none_rows_after_reopen() {
     let local_dir = tempfile::tempdir().unwrap();
     let (_, local_presence) = configured_presence_state(local_dir.path());
     let now = crate::auth::now_ts();
@@ -150,21 +150,31 @@ fn room_attribution_binds_to_profile_names_not_presence_and_reapplies_after_reop
     assert_eq!(snapshot.records()[0].display_name(), "Remote");
 
     let named_did = "did:key:zNamedByProfileHead".to_string();
-    let names = std::collections::HashMap::from([(named_did.clone(), "Signed Name".to_string())]);
+    let wrong_profile_did = "did:key:zWrongProfileHead".to_string();
+    let names = std::collections::HashMap::from([
+        (named_did.clone(), "Signed Name".to_string()),
+        (remote_did.clone(), "Remote Signed".to_string()),
+        (wrong_profile_did.clone(), "Wrong Profile".to_string()),
+    ]);
     let participant =
-        |display_name: &str, member_did: Option<String>| crate::room_service::ParticipantView {
-            profile_verified: None,
-            display_name: display_name.to_string(),
-            device_label: "ElastOS device".to_string(),
-            last_seen_at: now,
-            member_did,
-            role: None,
-            local_session_count: 0,
-            is_current_session: false,
+        |display_name: &str, member_did: Option<String>, profile_verified: Option<bool>| {
+            crate::room_service::ParticipantView {
+                profile_verified,
+                display_name: display_name.to_string(),
+                device_label: "ElastOS device".to_string(),
+                last_seen_at: now,
+                member_did,
+                role: None,
+                local_session_count: 0,
+                is_current_session: false,
+            }
         };
-    let object = |seq: u64, sender: &str, member_did: Option<String>| {
+    let object = |seq: u64,
+                  sender: &str,
+                  member_did: Option<String>,
+                  sender_profile_verified: Option<bool>| {
         crate::room_service::ConversationObjectView {
-            sender_profile_verified: None,
+            sender_profile_verified,
             seq,
             sender: sender.to_string(),
             sender_member_did: member_did,
@@ -181,16 +191,27 @@ fn room_attribution_binds_to_profile_names_not_presence_and_reapplies_after_reop
         room_slug: "chat-room".to_string(),
         display_name: "Local".to_string(),
         expires_at: now + 300,
-        latest_seq: 3,
+        latest_seq: 4,
         participants: vec![
-            participant("Device fallback", Some(named_did.clone())),
-            participant("Device fallback", Some(remote_did.clone())),
-            participant("Invited guest", None),
+            participant("Device fallback", Some(named_did.clone()), Some(true)),
+            participant("Device fallback", Some(remote_did.clone()), Some(false)),
+            participant(
+                "Wrong profile session",
+                Some(wrong_profile_did.clone()),
+                Some(false),
+            ),
+            participant("Invited guest", None, None),
         ],
         objects: vec![
-            object(1, "Device 1234abcd", Some(named_did.clone())),
-            object(2, "Device 5678ef01", Some(remote_did.clone())),
-            object(3, "Invited guest", None),
+            object(1, "Device 1234abcd", Some(named_did.clone()), Some(true)),
+            object(2, "Device 5678ef01", Some(remote_did.clone()), Some(false)),
+            object(
+                3,
+                "Wrong profile device",
+                Some(wrong_profile_did.clone()),
+                Some(false),
+            ),
+            object(4, "Invited guest", None, None),
         ],
         transport: crate::room_service::RoomTransportView::default(),
     };
@@ -203,18 +224,26 @@ fn room_attribution_binds_to_profile_names_not_presence_and_reapplies_after_reop
         assert_eq!(reopened.objects[0].sender_profile_verified, Some(true));
         assert_eq!(reopened.participants[0].display_name, "Signed Name");
         assert_eq!(reopened.participants[0].profile_verified, Some(true));
-        // Live verified presence is not a name source: a member device with
-        // no signed head is explicitly unverified, never presence-named and
-        // never a stored device label.
-        assert_eq!(reopened.objects[1].sender, "");
+        // False/None rows stay false/None here. This test proves only that the
+        // gateway name map does not upgrade authority; room-service authority
+        // semantics are covered by its own tests.
+        assert_eq!(reopened.objects[1].sender, "Device 5678ef01");
         assert_eq!(reopened.objects[1].sender_profile_verified, Some(false));
-        assert_eq!(reopened.participants[1].display_name, "");
+        assert_eq!(reopened.participants[1].display_name, "Device fallback");
         assert_eq!(reopened.participants[1].profile_verified, Some(false));
-        // Session rows without a member DID are invited guests: session-named.
-        assert_eq!(reopened.objects[2].sender, "Invited guest");
-        assert_eq!(reopened.objects[2].sender_profile_verified, None);
-        assert_eq!(reopened.participants[2].display_name, "Invited guest");
-        assert_eq!(reopened.participants[2].profile_verified, None);
+        assert_eq!(reopened.objects[2].sender, "Wrong profile device");
+        assert_eq!(reopened.objects[2].sender_profile_verified, Some(false));
+        assert_eq!(
+            reopened.participants[2].display_name,
+            "Wrong profile session"
+        );
+        assert_eq!(reopened.participants[2].profile_verified, Some(false));
+        // Session rows without a member DID keep their guest/session identity;
+        // configured product code filters them later instead of upgrading them.
+        assert_eq!(reopened.objects[3].sender, "Invited guest");
+        assert_eq!(reopened.objects[3].sender_profile_verified, None);
+        assert_eq!(reopened.participants[3].display_name, "Invited guest");
+        assert_eq!(reopened.participants[3].profile_verified, None);
     }
     assert_eq!(file_snapshot(local_dir.path()), before_reads);
 }

@@ -217,4 +217,4 @@ A conforming provider MAY:
 - **Gossip:** iroh-gossip (ALPN-based)
 - **Dependencies:** ~470 unique crates (heavy crypto stack)
 - **Binary size:** ~16MB release
-- **Status:** Frozen for stability. Rebuild with `./scripts/chat.sh --rebuild`
+- **Status:** Frozen for stability in the current unpublished branch.

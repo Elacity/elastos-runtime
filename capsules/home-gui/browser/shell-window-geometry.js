@@ -10,14 +10,14 @@ import {
   beginShellInteraction,
   clamp,
   endShellInteraction,
-} from "./shell-core.js?v=home-20260725a";
+} from "./shell-core.js?v=home-20260812a";
 
 const WINDOW_MIN_VISIBLE_DRAG_WIDTH = 96;
 const WINDOW_MIN_VISIBLE_DRAG_HEIGHT = 32;
 const WINDOW_SNAP_ACTIVATION_DISTANCE = 12;
 const BROWSER_TARGET_ID = "browser";
 const BROWSER_REMOTE_ASPECT_RATIO = 16 / 9;
-const BROWSER_DEFAULT_CHROME_HEIGHT = 46;
+const BROWSER_DEFAULT_CHROME_HEIGHT = 52;
 
 function safeClamp(value, min, max) {
   return max < min ? min : clamp(value, min, max);
@@ -218,14 +218,7 @@ export function fitWindowToBrowserAspect(node) {
 }
 
 export function fitWindowToLargestBrowserAspect(node) {
-  const config = browserAspectConfig(node);
-  if (!config) {
-    return;
-  }
-  applyWindowBounds(
-    node,
-    browserAspectBoundsForState(node, snappedWindowBounds("maximize"), "maximize"),
-  );
+  fitWindowToBrowserAspect(node);
 }
 
 export function rememberWindowRestoreBounds(node) {
@@ -277,12 +270,6 @@ export function applyWindowPlacement(node, placement) {
 
   if (placement?.maximized) {
     node.dataset.snap = "";
-    if (node.dataset.target === BROWSER_TARGET_ID) {
-      node.dataset.maximized = "false";
-      node.dataset.browserMaximized = "true";
-      fitWindowToLargestBrowserAspect(node);
-      return;
-    }
     node.dataset.maximized = "true";
     node.dataset.browserMaximized = "false";
     return;
@@ -564,6 +551,22 @@ function restoreWindowForDrag(node, clientX, clientY) {
   return nextBounds;
 }
 
+export function applyWindowSnapState(node, state) {
+  if (!node || !state) {
+    return;
+  }
+  rememberWindowRestoreBounds(node);
+  node.dataset.maximized = "false";
+  node.dataset.browserMaximized = "false";
+  node.dataset.snap = state;
+  applyWindowBounds(
+    node,
+    node.dataset.target === BROWSER_TARGET_ID
+      ? browserAspectBoundsForState(node, snappedWindowBounds(state), state)
+      : snappedWindowBounds(state),
+  );
+}
+
 function snappedWindowBounds(state) {
   const workspaceRect = desktop.getBoundingClientRect();
   const availableWidth = Math.max(
@@ -666,12 +669,6 @@ function applyWindowSnap(node, target) {
   hideWindowSnapPreview();
   if (target.state === "maximize") {
     node.dataset.snap = "";
-    if (node.dataset.target === BROWSER_TARGET_ID) {
-      node.dataset.maximized = "false";
-      node.dataset.browserMaximized = "true";
-      fitWindowToLargestBrowserAspect(node);
-      return;
-    }
     node.dataset.maximized = "true";
     node.dataset.browserMaximized = "false";
     return;
