@@ -269,7 +269,7 @@ mod tests {
         previous: Option<&VerifiedCollaborationNetworkProfile>,
         grant_cid: Option<String>,
     ) -> VerifiedCollaborationNetworkProfile {
-        let signer_did = crate::crypto::encode_did_key(&signing_key.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(signing_key);
         let payload = CollaborationNetworkProfile {
             schema: COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
             network_id: network_id.to_string(),
@@ -358,7 +358,7 @@ mod tests {
             1,
             None,
             NOW,
-            vec![crate::crypto::encode_did_key(&endpoint.verifying_key())],
+            vec![crate::crypto::encode_signing_key_did(endpoint)],
         )
         .unwrap()
     }
@@ -530,7 +530,7 @@ mod tests {
         let authorized = authorize_default_conversation_transport_message(
             &verified_grant,
             &verified,
-            &crate::crypto::encode_did_key(&device.verifying_key()),
+            &crate::crypto::encode_signing_key_did(&device),
         )
         .unwrap();
         assert_eq!(authorized.message(), &verified);
@@ -552,7 +552,7 @@ mod tests {
         assert!(authorize_default_conversation_transport_message(
             &verified_grant,
             &wrong_conversation,
-            &crate::crypto::encode_did_key(&device.verifying_key()),
+            &crate::crypto::encode_signing_key_did(&device),
         )
         .is_err());
 
@@ -572,7 +572,7 @@ mod tests {
         assert!(authorize_default_conversation_transport_message(
             &verified_grant,
             &wrong_service,
-            &crate::crypto::encode_did_key(&device.verifying_key()),
+            &crate::crypto::encode_signing_key_did(&device),
         )
         .is_err());
 
@@ -594,7 +594,7 @@ mod tests {
         assert!(authorize_default_conversation_transport_message(
             &verified_grant,
             &wrong_network,
-            &crate::crypto::encode_did_key(&device.verifying_key()),
+            &crate::crypto::encode_signing_key_did(&device),
         )
         .is_err());
 
@@ -608,7 +608,7 @@ mod tests {
                 SERVICE,
                 CollaborationRecipient {
                     kind: CollaborationRecipientKind::Profile,
-                    id: crate::crypto::encode_did_key(&device.verifying_key()),
+                    id: crate::crypto::encode_signing_key_did(&device),
                 },
             ),
         );
@@ -617,7 +617,7 @@ mod tests {
         assert!(authorize_default_conversation_transport_message(
             &verified_grant,
             &direct_device,
-            &crate::crypto::encode_did_key(&device.verifying_key()),
+            &crate::crypto::encode_signing_key_did(&device),
         )
         .is_err());
 
@@ -634,7 +634,7 @@ mod tests {
         assert!(authorize_default_conversation_transport_message(
             &verified_grant,
             &missing_profile,
-            &crate::crypto::encode_did_key(&device.verifying_key()),
+            &crate::crypto::encode_signing_key_did(&device),
         )
         .is_err());
 
@@ -660,7 +660,7 @@ mod tests {
         assert!(authorize_default_conversation_transport_message(
             &verified_grant,
             &wrong_endpoint,
-            &crate::crypto::encode_did_key(&device.verifying_key()),
+            &crate::crypto::encode_signing_key_did(&device),
         )
         .is_err());
 
@@ -675,12 +675,8 @@ mod tests {
                 None,
                 NOW,
                 crate::collaboration_profile_authority::ProfileAuthorityForTest {
-                    endpoint_dids: vec![crate::crypto::encode_did_key(
-                        &device.verifying_key(),
-                    )],
-                    signer_dids: vec![crate::crypto::encode_did_key(
-                        &foreign_signer.verifying_key(),
-                    )],
+                    endpoint_dids: vec![crate::crypto::encode_signing_key_did(&device)],
+                    signer_dids: vec![crate::crypto::encode_signing_key_did(&foreign_signer)],
                 },
             )
             .unwrap();
@@ -704,7 +700,7 @@ mod tests {
         assert!(authorize_default_conversation_transport_message(
             &verified_grant,
             &wrong_signer,
-            &crate::crypto::encode_did_key(&device.verifying_key()),
+            &crate::crypto::encode_signing_key_did(&device),
         )
         .is_err());
 
@@ -712,7 +708,7 @@ mod tests {
         assert!(authorize_default_conversation_transport_message(
             &verified_grant,
             &verified,
-            &crate::crypto::encode_did_key(&transport_substitute.verifying_key()),
+            &crate::crypto::encode_signing_key_did(&transport_substitute),
         )
         .is_err());
     }

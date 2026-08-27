@@ -6,6 +6,12 @@ capsules:
 
 `capsule -> runtime capability -> elastos://key/* -> key-provider -> dKMS backend`
 
+This page describes the older provisional provider surface. It does not
+describe or prove the canonical source-only v1 contract in
+[`PROTECTED_CONTENT_CONTRACTS_V1.md`](PROTECTED_CONTENT_CONTRACTS_V1.md). Future
+integration must replace the provisional surface atomically, with no parallel
+decoder, fallback, or migration path.
+
 Capsules do not receive raw CEKs, KMS node credentials, chain RPC, wallet RPC,
 or provider credentials.
 
@@ -15,7 +21,8 @@ or provider credentials.
 - `release`: validate a `KeyReleaseRequestV1` and request scoped key release.
 
 Current implementation is intentionally fail-closed. It validates schema,
-principal/session/object/action fields, an allowed
+principal/session/object/action fields in the provisional
+`elastos_common::protected_content::KeyReleaseRequestV1`, an allowed
 `elastos.rights.decision.receipt/v1` bound to the same
 principal/session/object/action, supported schemes, and PQ-hybrid algorithm
 metadata, then refuses backend work until an ElastOS dKMS adapter exists.

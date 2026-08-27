@@ -113,7 +113,7 @@ async fn json_response(response: Response) -> serde_json::Value {
 async fn wait_for_direct_peer_ready(
     peer: &crate::collaboration_discovery_runtime::tests::DirectGatewayPeerFixture,
 ) {
-    let remote_did = crate::crypto::encode_did_key(&peer.remote_key.verifying_key());
+    let remote_did = crate::crypto::encode_signing_key_did(&peer.remote_key);
     let endpoint_id = crate::carrier::did_to_public_key(&remote_did).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
@@ -518,7 +518,7 @@ async fn direct_api_pending_retry_settles_the_same_durable_envelope() {
     assert!(!pending[0].receipt_settled);
     let exact_envelope = pending[0].envelope_bytes.clone();
 
-    let remote_did = crate::crypto::encode_did_key(&fixture.peer.remote_key.verifying_key());
+    let remote_did = crate::crypto::encode_signing_key_did(&fixture.peer.remote_key);
     let _restarted = crate::carrier::start_carrier_node_with_registry(
         &fixture.peer.remote_key,
         &remote_did,

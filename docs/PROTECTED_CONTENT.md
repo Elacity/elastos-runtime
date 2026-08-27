@@ -1,18 +1,34 @@
-# Protected Content Provider
+# Protected content
 
 Protected content is Runtime-mediated. App, viewer, and content capsules ask to
 open an object; they do not receive raw wallet, chain, IPFS, Elacity, or key
 authority.
 
-The contract is:
+The source tree currently has two protected-content layers:
+
+- The canonical v1 review candidate is the source-only
+  `elastos-protected-content-contracts` crate, documented in
+  [Protected-content v1 contracts](PROTECTED_CONTENT_CONTRACTS_V1.md). It is
+  not yet wired into Runtime orchestration, provider integration, custody,
+  threshold reconstruction, recipient encryption proof, decryption, playback,
+  installation, or deployment.
+- The current installed/provider surface is the older provisional
+  `elastos_common::protected_content` DTO set plus the fail-closed
+  `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
+  capsules. That provisional surface does not consume or prove the new v1
+  contract. Future integration must replace it atomically, with no parallel
+  decoder, fallback, or migration path.
+
+The current provider chain is:
 
 `capsule -> runtime capability -> elastos://drm/open -> drm-provider -> rights/key/decrypt providers`
 
-## Current Slice
+## Current provider slice
 
-The repo now has the contract and fail-closed boundary, not production DRM:
+The repo currently has the provisional fail-closed provider boundary, not
+production DRM:
 
-- shared protected-content schemas in `elastos-common`
+- shared provisional protected-content schemas in `elastos-common`
 - `drm-provider` registered as `elastos://drm/*`
 - `rights-provider` registered as `elastos://rights/*`
 - `key-provider` registered as `elastos://key/*`
@@ -35,8 +51,9 @@ The repo now has the contract and fail-closed boundary, not production DRM:
   `sealed.json`, payload, rights policy, availability receipt, provenance, and
   approved key-envelope algorithms are required
 
-This is intentional. The first safe step is to make the authority boundary
-unambiguous before adding dDRM contract reads or ElastOS dKMS.
+This is intentional. The first safe steps are to make the authority boundary
+unambiguous in the canonical v1 contract and keep the current provider chain
+fail closed until the reviewed integration slice exists.
 
 PC2's dDRM contracts and WASM decrypt/render/media crates are useful
 implementation references. They should enter Runtime only as provider-internal
@@ -179,15 +196,17 @@ The provider plane should expose typed questions instead:
 - `elastos://decrypt/session/open`
 - `elastos://decrypt/render`
 
-## Remaining Sequence
+## Remaining sequence
 
-1. Wire real `elastos://drm/open` orchestration behind the declared sequence:
-   content status/fetch, typed rights checks, rights-bound key release,
-   release-receipt-bound decrypt/render sessions, sealed decrypt material, and
-   signed release receipts.
-2. Wire `key-provider` to an ElastOS PQ-hybrid threshold release backend.
-3. Wire `decrypt-provider` to a real decrypt/render backend that keeps CEKs
-   inside the provider boundary.
+1. Finish independent review of the source-only canonical v1 contract and the
+   related custody, encryption, replay, recipient-key, and policy decisions.
+2. Replace the provisional `elastos_common::protected_content` DTO/provider
+   surface atomically with Runtime-owned orchestration over the reviewed v1
+   contract: content status/fetch, typed rights checks, rights-bound key
+   release, release-receipt-bound decrypt/render sessions, sealed decrypt
+   material, and signed terminal receipts.
+3. Wire `rights-provider`, `key-provider`, and `decrypt-provider` to reviewed
+   policy, custody, and decrypt/render backends behind that one contract.
 4. Wire real protected-content producers to the existing sealed-object publish
    contract after payload encryption, rights policy, availability receipt,
    provenance, key-envelope, and viewer-interface generation exist.
@@ -204,7 +223,8 @@ render readiness.
 
 Run `scripts/protected-content-provider-contract-smoke.sh` after changing
 protected-content provider capsules. It exercises the real provider binaries
-over their JSON line protocol and verifies the current journey contract:
+over their JSON line protocol and verifies the current provisional provider
+journey, not the canonical v1 contract crate:
 
 - status exposes blocked raw authority
 - valid requests fail closed until backends are configured

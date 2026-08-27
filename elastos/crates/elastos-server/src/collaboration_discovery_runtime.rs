@@ -48,7 +48,7 @@ use crate::collaboration_network::{
 };
 use crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument;
 use crate::collaboration_protocol::validate_id;
-use crate::crypto::{domain_separated_sign, encode_did_key};
+use crate::crypto::domain_separated_sign;
 
 const COLLABORATION_DISCOVERY_PROVIDER_SCHEME: &str = "collaboration";
 const MAX_DISCOVERY_CLIENT_STATES: usize = 32;
@@ -1452,6 +1452,25 @@ impl CollaborationDiscoveryService {
     ) -> anyhow::Result<serde_json::Value> {
         let mut errors = Vec::new();
         for peer in self.bootstrap_peers.iter() {
+            // `node_id` is a canonical raw Carrier endpoint id by contract
+            // (validate_collaboration_bootstrap_peer); the provider route pins
+            // peers by DID, so convert strictly and fail closed per peer.
+            let peer_did = match peer
+                .node_id
+                .parse::<iroh::EndpointId>()
+                .ok()
+                .filter(|endpoint_id| endpoint_id.to_string() == peer.node_id)
+                .map(|endpoint_id| crate::carrier::public_key_to_did(&endpoint_id))
+            {
+                Some(Ok(peer_did)) => peer_did,
+                _ => {
+                    errors.push(format!(
+                        "bootstrap peer node_id '{}' is not a canonical Carrier endpoint id",
+                        peer.node_id
+                    ));
+                    continue;
+                }
+            };
             match self
                 .registry
                 .invoke_provider(ProviderInvocation {
@@ -1469,7 +1488,7 @@ impl CollaborationDiscoveryService {
                     transport: ProviderInvocationTransport::Carrier(
                         ProviderCarrierRoute::ConnectTicket {
                             connect_ticket: peer.connect_ticket.clone(),
-                            peer_did: Some(peer.node_id.clone()),
+                            peer_did: Some(peer_did),
                             timeout_ms: Some(DISCOVERY_PROVIDER_TIMEOUT_MS),
                         },
                     ),
@@ -2043,7 +2062,7 @@ impl CollaborationDiscoveryAuthority {
     }
 
     fn local_device_did(&self) -> String {
-        encode_did_key(&self.signing_key.verifying_key())
+        crate::crypto::encode_signing_key_did(&self.signing_key)
     }
 }
 
@@ -2921,7 +2940,7 @@ pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use elastos_common::collaboration_protocol::collaboration_message_envelope_sha256;
@@ -2955,6 +2974,39 @@ pub(crate) mod tests {
         withdrawal_response: Mutex<Option<serde_json::Value>>,
         request_submission_response: Mutex<Option<serde_json::Value>>,
         submission_log: Mutex<Vec<LoggedRelayOperation>>,
+    }
+
+    #[derive(Default)]
+    struct CountingDiscoveryProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for CountingDiscoveryProvider {
+        fn schemes(&self) -> Vec<&'static str> {
+            vec![COLLABORATION_DISCOVERY_PROVIDER_SCHEME]
+        }
+
+        fn name(&self) -> &'static str {
+            "counting-collaboration-discovery"
+        }
+
+        async fn handle(
+            &self,
+            _request: elastos_runtime::provider::ResourceRequest,
+        ) -> Result<elastos_runtime::provider::ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "counting provider has no resource routes".to_string(),
+            ))
+        }
+
+        async fn send_raw(
+            &self,
+            _request: &serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({ "status": "ok" }))
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3142,7 +3194,7 @@ pub(crate) mod tests {
         trusted_signing_key: &SigningKey,
         bootstrap_peers: Vec<CollaborationBootstrapPeer>,
     ) -> VerifiedCollaborationNetworkProfile {
-        let signer_did = encode_did_key(&trusted_signing_key.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(trusted_signing_key);
         let profile = CollaborationNetworkProfile {
             schema: COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
             network_id: network_id.to_string(),
@@ -3171,7 +3223,7 @@ pub(crate) mod tests {
                 .unwrap(),
             ),
             network_id,
-            &[encode_did_key(&trusted_signing_key.verifying_key())],
+            &[crate::crypto::encode_signing_key_did(trusted_signing_key)],
             None,
         )
         .unwrap()
@@ -3205,7 +3257,7 @@ pub(crate) mod tests {
     ) {
         std::fs::create_dir_all(root).unwrap();
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let did = encode_did_key(&device_signing_key.verifying_key());
+        let did = crate::crypto::encode_signing_key_did(device_signing_key);
         let principal_id = format!("person:local:{}", &did[8..16]);
         let protection = crate::auth::store_test_principal_root_protection(root, &principal_id);
         let local_profile =
@@ -3243,7 +3295,7 @@ pub(crate) mod tests {
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let profile = signed_profile(NETWORK, trusted_signing_key, bootstrap_peers);
         let registry = Arc::new(ProviderRegistry::new());
-        let did = encode_did_key(&device_signing_key.verifying_key());
+        let did = crate::crypto::encode_signing_key_did(device_signing_key);
         let node = start_carrier_node_with_registry(
             device_signing_key,
             &did,
@@ -3255,8 +3307,9 @@ pub(crate) mod tests {
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
         registry
             .set_carrier_invoker(Arc::new(
-                crate::carrier::CarrierProviderInvoker::with_carrier_endpoint(
+                crate::carrier::CarrierProviderInvoker::with_carrier_endpoint_and_registry(
                     node.endpoint.clone(),
+                    Arc::downgrade(&registry),
                 ),
             ))
             .await;
@@ -3302,6 +3355,19 @@ pub(crate) mod tests {
         pub(crate) conversation_id: String,
         pub(crate) _node_a: crate::carrier::CarrierNode,
         pub(crate) _node_b: crate::carrier::CarrierNode,
+    }
+
+    pub(crate) struct SameRuntimeProfilePair {
+        pub(crate) endpoint_key: SigningKey,
+        pub(crate) profile_key_b: SigningKey,
+        pub(crate) registry: Arc<ProviderRegistry>,
+        pub(crate) service: CollaborationDiscoveryService,
+        pub(crate) store_a: Arc<CollaborationContactStore>,
+        pub(crate) store_b: Arc<CollaborationContactStore>,
+        pub(crate) profile_a: VerifiedCollaborationProfileDocument,
+        pub(crate) profile_b: VerifiedCollaborationProfileDocument,
+        pub(crate) conversation_id: String,
+        pub(crate) node: Option<crate::carrier::CarrierNode>,
     }
 
     /// A real passkey principal on disk for a fixture's principal id, so a
@@ -3425,6 +3491,174 @@ pub(crate) mod tests {
         }
     }
 
+    /// Two accepted Profiles hosted by one Runtime and one Carrier endpoint.
+    /// The Profiles remain distinct person identities while Runtime owns their
+    /// shared endpoint route and provider lifecycle.
+    pub(crate) async fn same_runtime_profile_pair(root: &Path) -> SameRuntimeProfilePair {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let endpoint_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let profile_key_a = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let profile_key_b = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let endpoint_did = crate::crypto::encode_signing_key_did(&endpoint_key);
+        let now = current_timestamp();
+        let profile_a = signed_profile_document_for_test(
+            &profile_key_a,
+            "Alice",
+            Some("alice"),
+            1,
+            None,
+            now,
+            vec![endpoint_did.clone()],
+        )
+        .unwrap();
+        let profile_b = signed_profile_document_for_test(
+            &profile_key_b,
+            "Bob",
+            Some("bob"),
+            1,
+            None,
+            now,
+            vec![endpoint_did.clone()],
+        )
+        .unwrap();
+        let network = signed_profile(NETWORK, &trusted, vec![]);
+        let registry = Arc::new(ProviderRegistry::new());
+        let node = start_carrier_node_with_registry(
+            &endpoint_key,
+            &endpoint_did,
+            root.to_path_buf(),
+            Some(Arc::downgrade(&registry)),
+        )
+        .await
+        .unwrap();
+        registry
+            .set_carrier_invoker(Arc::new(
+                crate::carrier::CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                    node.endpoint.clone(),
+                    Arc::downgrade(&registry),
+                ),
+            ))
+            .await;
+
+        let principal_a = format!("person:local:{}", &profile_a.document().profile_did[8..16]);
+        let principal_b = format!("person:local:{}", &profile_b.document().profile_did[8..16]);
+        let protection_a = crate::auth::store_test_principal_root_protection(root, &principal_a);
+        let protection_b = crate::auth::store_test_principal_root_protection(root, &principal_b);
+        let store_a = Arc::new(
+            CollaborationContactStore::new(
+                root,
+                &principal_a,
+                &protection_a.localhost_root,
+                network.clone(),
+                &profile_a,
+                &endpoint_did,
+            )
+            .unwrap(),
+        );
+        let store_b = Arc::new(
+            CollaborationContactStore::new(
+                root,
+                &principal_b,
+                &protection_b.localhost_root,
+                network.clone(),
+                &profile_b,
+                &endpoint_did,
+            )
+            .unwrap(),
+        );
+        let service = CollaborationDiscoveryService::new(
+            SigningKey::from_bytes(&endpoint_key.to_bytes()),
+            network,
+            registry,
+        )
+        .await
+        .unwrap();
+
+        let advertisement = service
+            .authority
+            .prepare_advertisement(&profile_b, now)
+            .unwrap();
+        store_b
+            .store_local_advertisement(&advertisement, now)
+            .unwrap();
+        let verified_advertisement = verify_collaboration_discovery_advertisement(
+            &advertisement,
+            &service.authority.profile,
+            now,
+        )
+        .unwrap();
+        let request = service
+            .authority
+            .prepare_contact_request(&verified_advertisement, &profile_a, now)
+            .unwrap();
+        store_a
+            .record_outgoing_contact_request(&request, &advertisement, now)
+            .unwrap();
+        store_b
+            .record_incoming_contact_request(&request, now)
+            .unwrap();
+        let verified_request = verify_collaboration_contact_request(
+            &request,
+            &service.authority.profile,
+            &verified_advertisement,
+            now,
+        )
+        .unwrap();
+        let decision = service
+            .authority
+            .prepare_contact_decision_receipt(
+                &verified_request,
+                &profile_b,
+                CollaborationContactDecision::Accepted,
+                now,
+            )
+            .unwrap();
+        store_b
+            .record_contact_decision_receipt(&decision, now)
+            .unwrap();
+        store_a
+            .record_contact_decision_receipt(&decision, now)
+            .unwrap();
+        let conversation_id = store_a.snapshot().unwrap().contacts()[0]
+            .conversation_id()
+            .to_string();
+        assert_eq!(
+            conversation_id,
+            store_b.snapshot().unwrap().contacts()[0].conversation_id()
+        );
+        service
+            .direct_messages
+            .register_verified_context_for_test(store_a.clone(), profile_a.clone())
+            .unwrap();
+        service
+            .direct_messages
+            .register_verified_context_for_test(store_b.clone(), profile_b.clone())
+            .unwrap();
+        service
+            .profile_updates
+            .register_verified_context_for_test(store_a.clone(), profile_a.clone())
+            .unwrap();
+        service
+            .profile_updates
+            .register_verified_context_for_test(store_b.clone(), profile_b.clone())
+            .unwrap();
+
+        SameRuntimeProfilePair {
+            endpoint_key,
+            profile_key_b,
+            registry: service.registry.clone(),
+            service,
+            store_a,
+            store_b,
+            profile_a,
+            profile_b,
+            conversation_id,
+            node: Some(node),
+        }
+    }
+
     /// A runtime identity whose Profile is the durable on-disk authority: a
     /// real device key, a protected principal root, a passkey proof binding,
     /// and a signed Profile bundle written through `update_profile_authority`.
@@ -3450,7 +3684,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(root).unwrap();
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (device_key, _) = elastos_identity::load_or_create_did(root).unwrap();
-        let did = encode_did_key(&device_key.verifying_key());
+        let did = crate::crypto::encode_signing_key_did(&device_key);
         let principal_id = format!("person:local:{}", &did[8..16]);
         let protection = crate::auth::store_test_principal_root_protection(root, &principal_id);
         let binding = elastos_runtime::auth::ProofBinding::passkey_webauthn(
@@ -3702,7 +3936,7 @@ pub(crate) mod tests {
         let remote_profile = service_profile(&remote_service, "Remote Person", Some("remote"));
         let network = remote_service.network_profile();
         let registry = Arc::new(ProviderRegistry::new());
-        let local_did = encode_did_key(&local_key.verifying_key());
+        let local_did = crate::crypto::encode_signing_key_did(local_key);
         let local_node = start_carrier_node_with_registry(
             local_key,
             &local_did,
@@ -3872,7 +4106,7 @@ pub(crate) mod tests {
             revision,
             previous_profile_sha256,
             updated_at,
-            vec![encode_did_key(&device_signing_key.verifying_key())],
+            vec![crate::crypto::encode_signing_key_did(device_signing_key)],
         )
         .unwrap()
     }
@@ -3885,7 +4119,7 @@ pub(crate) mod tests {
         verified_discovery_profile(&service.authority.signing_key, display_name, handle)
     }
 
-    fn profile_hash(profile: &VerifiedCollaborationProfileDocument) -> String {
+    pub(crate) fn profile_hash(profile: &VerifiedCollaborationProfileDocument) -> String {
         let bytes = serde_json::to_vec(profile.signed_envelope()).unwrap();
         format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
     }
@@ -4105,7 +4339,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -4245,7 +4479,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -4661,7 +4895,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -4820,7 +5054,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -4984,7 +5218,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -5172,7 +5406,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -5319,7 +5553,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -5530,7 +5764,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -5854,7 +6088,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -5944,7 +6178,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -6088,7 +6322,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -6191,7 +6425,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -6259,7 +6493,229 @@ pub(crate) mod tests {
             )
             .await
             .unwrap_err();
-        assert!(format!("{error:#}").contains("peer_did does not match connect_ticket"));
+        assert!(
+            format!("{error:#}").contains("is not a canonical Carrier endpoint id"),
+            "non-canonical substituted node_id must fail closed before any route is built"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_bootstrap_self_peer_uses_carrier_loopback_without_network_connect() {
+        let temp = tempfile::tempdir().unwrap();
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let device_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let root = temp.path().join("seed");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let registry = Arc::new(ProviderRegistry::new());
+        let did = crate::crypto::encode_signing_key_did(&device_key);
+        let node = start_carrier_node_with_registry(
+            &device_key,
+            &did,
+            root.clone(),
+            Some(Arc::downgrade(&registry)),
+        )
+        .await
+        .unwrap();
+        registry
+            .set_carrier_invoker(Arc::new(
+                crate::carrier::CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                    node.endpoint.clone(),
+                    Arc::downgrade(&registry),
+                ),
+            ))
+            .await;
+        registry
+            .register_sub_provider(
+                "peer",
+                Arc::new(CarrierGossipProvider::new(node.gossip_state.clone())),
+            )
+            .await
+            .unwrap();
+
+        let self_ticket = ticket_from_peer_provider(&registry).await;
+        assert_eq!(self_ticket.node_id, node.endpoint.id().to_string());
+        let profile = signed_profile(NETWORK, &trusted, vec![self_ticket.clone()]);
+        let principal_id = format!("person:local:{}", &did[8..16]);
+        let protection = crate::auth::store_test_principal_root_protection(&root, &principal_id);
+        let local_profile = verified_discovery_profile(&device_key, "Seed", Some("seed"));
+        let store = Arc::new(
+            CollaborationContactStore::new(
+                &root,
+                &principal_id,
+                &protection.localhost_root,
+                profile.clone(),
+                &local_profile,
+                &did,
+            )
+            .unwrap(),
+        );
+        let service = CollaborationDiscoveryService::new(
+            SigningKey::from_bytes(&device_key.to_bytes()),
+            profile,
+            registry.clone(),
+        )
+        .await
+        .unwrap();
+
+        let cached = service
+            .prepare_and_store_local_advertisement(
+                store.as_ref(),
+                &local_profile,
+                current_timestamp(),
+            )
+            .unwrap();
+        node.shutdown().await;
+        let response = service
+            .invoke_bootstrap(
+                "query",
+                serde_json::to_value(DiscoveryProviderQueryRequest {
+                    op: "query".to_string(),
+                    advertisement: encode_bytes(&cached.envelope_bytes),
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("self-bootstrap must use authenticated Carrier loopback");
+        assert_eq!(
+            response.get("status").and_then(|status| status.as_str()),
+            Some("ok")
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_bootstrap_rejects_local_node_id_with_foreign_ticket() {
+        let temp = tempfile::tempdir().unwrap();
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let device_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let root = temp.path().join("seed");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let registry = Arc::new(ProviderRegistry::new());
+        let did = crate::crypto::encode_signing_key_did(&device_key);
+        let node = start_carrier_node_with_registry(
+            &device_key,
+            &did,
+            root.clone(),
+            Some(Arc::downgrade(&registry)),
+        )
+        .await
+        .unwrap();
+        registry
+            .set_carrier_invoker(Arc::new(
+                crate::carrier::CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                    node.endpoint.clone(),
+                    Arc::downgrade(&registry),
+                ),
+            ))
+            .await;
+        registry
+            .register_sub_provider(
+                "peer",
+                Arc::new(CarrierGossipProvider::new(node.gossip_state.clone())),
+            )
+            .await
+            .unwrap();
+        let self_ticket = ticket_from_peer_provider(&registry).await;
+        let profile = signed_profile(NETWORK, &trusted, vec![self_ticket.clone()]);
+        let principal_id = format!("person:local:{}", &did[8..16]);
+        let protection = crate::auth::store_test_principal_root_protection(&root, &principal_id);
+        let local_profile = verified_discovery_profile(&device_key, "Seed", Some("seed"));
+        let store = Arc::new(
+            CollaborationContactStore::new(
+                &root,
+                &principal_id,
+                &protection.localhost_root,
+                profile.clone(),
+                &local_profile,
+                &did,
+            )
+            .unwrap(),
+        );
+        let service = CollaborationDiscoveryService::new(
+            SigningKey::from_bytes(&device_key.to_bytes()),
+            profile,
+            registry.clone(),
+        )
+        .await
+        .unwrap();
+        let cached = service
+            .prepare_and_store_local_advertisement(
+                store.as_ref(),
+                &local_profile,
+                current_timestamp(),
+            )
+            .unwrap();
+
+        let foreign_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let foreign_root = temp.path().join("foreign");
+        std::fs::create_dir_all(&foreign_root).unwrap();
+        std::fs::set_permissions(&foreign_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let foreign_did = crate::crypto::encode_signing_key_did(&foreign_key);
+        let foreign_registry = Arc::new(ProviderRegistry::new());
+        let foreign_node = start_carrier_node_with_registry(
+            &foreign_key,
+            &foreign_did,
+            foreign_root,
+            Some(Arc::downgrade(&foreign_registry)),
+        )
+        .await
+        .unwrap();
+        foreign_registry
+            .set_carrier_invoker(Arc::new(
+                crate::carrier::CarrierProviderInvoker::with_carrier_endpoint(
+                    foreign_node.endpoint.clone(),
+                ),
+            ))
+            .await;
+        foreign_registry
+            .register_sub_provider(
+                "peer",
+                Arc::new(CarrierGossipProvider::new(
+                    foreign_node.gossip_state.clone(),
+                )),
+            )
+            .await
+            .unwrap();
+        let foreign_ticket = ticket_from_peer_provider(&foreign_registry).await;
+        let effects = Arc::new(CountingDiscoveryProvider::default());
+        registry.register(effects.clone()).await;
+
+        let mismatched = CollaborationDiscoveryService {
+            authority: service.authority.clone(),
+            registry: service.registry.clone(),
+            bootstrap_peers: Arc::new(vec![CollaborationBootstrapPeer {
+                node_id: self_ticket.node_id.clone(),
+                connect_ticket: foreign_ticket.connect_ticket,
+            }]),
+            state: service.state.clone(),
+            profile_updates: service.profile_updates.clone(),
+            sync_contexts: service.sync_contexts.clone(),
+            sync_pass_lock: service.sync_pass_lock.clone(),
+            intent_mutex: service.intent_mutex.clone(),
+            direct_messages: service.direct_messages.clone(),
+        };
+        let error = mismatched
+            .invoke_bootstrap(
+                "query",
+                serde_json::to_value(DiscoveryProviderQueryRequest {
+                    op: "query".to_string(),
+                    advertisement: encode_bytes(&cached.envelope_bytes),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("peer_did does not match connect_ticket"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(effects.calls.load(Ordering::SeqCst), 0);
+        foreign_node.shutdown().await;
+        node.shutdown().await;
     }
 
     #[tokio::test]
@@ -7810,8 +8266,8 @@ pub(crate) mod tests {
             None,
             10,
             vec![
-                encode_did_key(&device_a.verifying_key()),
-                encode_did_key(&device_b.verifying_key()),
+                crate::crypto::encode_signing_key_did(&device_a),
+                crate::crypto::encode_signing_key_did(&device_b),
             ],
         )
         .unwrap();
@@ -8101,7 +8557,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,

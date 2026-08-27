@@ -1199,7 +1199,7 @@ mod discovery_summary_tests {
         )
         .to_string();
         let (profile_signer, _) = generate_keypair();
-        let signer_did = crate::crypto::encode_did_key(&profile_signer.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&profile_signer);
         let payload = CollaborationNetworkProfile {
             schema: COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
             network_id: CONFIGURED_NETWORK.to_string(),
@@ -1238,7 +1238,7 @@ mod discovery_summary_tests {
         };
         let grant = verify_default_conversation_grant(&profile, &grant_bytes).unwrap();
         let (local_key, _) = generate_keypair();
-        let local_did = crate::crypto::encode_did_key(&local_key.verifying_key());
+        let local_did = crate::crypto::encode_signing_key_did(&local_key);
         let principal_id = "person:local:configured-people-fixture";
         let protection =
             crate::auth::store_test_principal_root_protection(&data_root, principal_id);
@@ -1343,7 +1343,7 @@ mod discovery_summary_tests {
                 1,
                 None,
                 created_at,
-                vec![crate::crypto::encode_did_key(&signing_key.verifying_key())],
+                vec![crate::crypto::encode_signing_key_did(signing_key)],
             )
             .unwrap();
         signed_discovery_message(
@@ -1413,7 +1413,7 @@ mod discovery_summary_tests {
             request_message_id: request.payload.message_id,
             request_message_nonce: request.payload.nonce,
             recipient_profile_did: recipient_profile_did.to_string(),
-            recipient_endpoint_did: crate::crypto::encode_did_key(&recipient_key.verifying_key()),
+            recipient_endpoint_did: crate::crypto::encode_signing_key_did(recipient_key),
             decision,
             decided_at,
         };

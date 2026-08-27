@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn valid_initial_profile_and_chained_update() {
         let (signing_key, _) = generate_keypair();
-        let signer_did = crate::crypto::encode_did_key(&signing_key.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
         let trusted = vec![signer_did.clone()];
         let initial_bytes = sign_profile(&signing_key, profile(&signer_did, 1));
         let initial = configured(
@@ -479,11 +479,11 @@ mod tests {
     #[test]
     fn rejects_untrusted_signer_and_invalid_signature() {
         let (signing_key, _) = generate_keypair();
-        let signer_did = crate::crypto::encode_did_key(&signing_key.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
         let trusted = vec![signer_did.clone()];
         let bytes = sign_profile(&signing_key, profile(&signer_did, 1));
         let (other_key, _) = generate_keypair();
-        let other_did = crate::crypto::encode_did_key(&other_key.verifying_key());
+        let other_did = crate::crypto::encode_signing_key_did(&other_key);
         let err = validate_collaboration_network_profile(
             Some(&bytes),
             "elastos-collaboration-test",
@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn rejects_revision_rollback_gap_and_previous_hash_errors() {
         let (signing_key, _) = generate_keypair();
-        let signer_did = crate::crypto::encode_did_key(&signing_key.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
         let trusted = vec![signer_did.clone()];
         let initial_bytes = sign_profile(&signing_key, profile(&signer_did, 1));
         let initial = configured(
@@ -584,7 +584,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_conflicting_and_mismatched_bootstrap_peers() {
         let (signing_key, _) = generate_keypair();
-        let signer_did = crate::crypto::encode_did_key(&signing_key.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
         let trusted = vec![signer_did.clone()];
         let peer = ticket_for(7);
 
@@ -651,7 +651,7 @@ mod tests {
     #[test]
     fn rejects_non_v1_or_partially_malformed_connect_tickets() {
         let (signing_key, _) = generate_keypair();
-        let signer_did = crate::crypto::encode_did_key(&signing_key.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
         let trusted = vec![signer_did.clone()];
         let valid_peer = ticket_for(7);
         let ticket_bytes = data_encoding::BASE32_NOPAD
@@ -697,7 +697,7 @@ mod tests {
     #[test]
     fn rejects_bounds_unknown_fields_wrong_schema_network_and_noncanonical_bytes() {
         let (signing_key, _) = generate_keypair();
-        let signer_did = crate::crypto::encode_did_key(&signing_key.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
         let trusted = vec![signer_did.clone()];
 
         let mut oversized_list = profile(&signer_did, 1);
@@ -796,7 +796,7 @@ mod tests {
     #[test]
     fn default_conversation_is_hash_bound_and_validation_is_deterministic_and_pure() {
         let (signing_key, _) = generate_keypair();
-        let signer_did = crate::crypto::encode_did_key(&signing_key.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
         let trusted = vec![signer_did.clone()];
         let mut payload = profile(&signer_did, 1);
         payload.default_conversation = Some(DefaultConversationGrantDescriptor {

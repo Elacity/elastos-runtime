@@ -10,16 +10,16 @@ import {
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
-} from "./home-gui.js?v=home-20260812a";
+} from "./home-gui.js?v=home-20260813a";
 import {
   acceptHomeBrowserContextId,
   hasHomeBrowserContextId,
   setHomeGuiLaunchToken,
-} from "./shell-core.js?v=home-20260812a";
+} from "./shell-core.js?v=home-20260813a";
 import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
-} from "./home-gui-authority.js?v=home-20260812a";
+} from "./home-gui-authority.js?v=home-20260813a";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));

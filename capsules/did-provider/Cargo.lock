@@ -274,7 +274,6 @@ name = "did-provider"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
- "bs58",
  "ed25519-dalek",
  "elastos-common",
  "elastos-guest",
@@ -376,6 +375,7 @@ dependencies = [
  "base64",
  "bs58",
  "ciborium",
+ "curve25519-dalek",
  "ed25519-dalek",
  "hex",
  "hkdf",

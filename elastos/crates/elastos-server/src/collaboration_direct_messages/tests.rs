@@ -957,7 +957,7 @@ async fn durable_pending_restarts_with_the_exact_envelope_and_settles_once() {
         .unwrap();
     let restarted_b = crate::carrier::start_carrier_node_with_registry(
         &pair.key_b,
-        &encode_did_key(&pair.key_b.verifying_key()),
+        &crate::crypto::encode_signing_key_did(&pair.key_b),
         temp.path().join("b-restarted"),
         Some(Arc::downgrade(&pair.registry_b)),
     )
@@ -1044,7 +1044,7 @@ async fn retry_filters_invalid_and_removed_records_before_its_bounded_budget() {
 
     let removed_key =
         SigningKey::from_bytes(&elastos_runtime::signature::generate_keypair().0.to_bytes());
-    let removed_did = encode_did_key(&removed_key.verifying_key());
+    let removed_did = crate::crypto::encode_signing_key_did(&removed_key);
     for index in 0..4 {
         let removed = test_message(
             &pair,
@@ -1235,11 +1235,8 @@ async fn persistence_rejects_invalid_messages_receipts_and_state_without_mutatio
         .persist_message(&valid, false, now)
         .unwrap();
     let receiver_before_substitution = protected_store_bytes(&context_b.message_store);
-    let foreign_endpoint = encode_did_key(
-        &elastos_runtime::signature::generate_keypair()
-            .0
-            .verifying_key(),
-    );
+    let foreign_endpoint =
+        crate::crypto::encode_signing_key_did(&elastos_runtime::signature::generate_keypair().0);
     assert!(direct_b.receive(&valid, &foreign_endpoint, now).is_err());
     assert_eq!(
         protected_store_bytes(&context_b.message_store),
@@ -1253,7 +1250,7 @@ async fn persistence_rejects_invalid_messages_receipts_and_state_without_mutatio
 
     let other_key =
         SigningKey::from_bytes(&elastos_runtime::signature::generate_keypair().0.to_bytes());
-    let other_did = encode_did_key(&other_key.verifying_key());
+    let other_did = crate::crypto::encode_signing_key_did(&other_key);
     let wrong_network = resign_message(&valid, &pair.key_a, |message| {
         message.network_id = "other-network".to_string();
     });
@@ -1641,7 +1638,7 @@ async fn direct_delivery_leaves_on_the_peer_did_route_without_bootstrap_transpor
         .is_empty());
 
     let invoker = std::sync::Arc::new(RecordingDirectCarrierInvoker {
-        source_endpoint_did: encode_did_key(&pair.key_a.verifying_key()),
+        source_endpoint_did: crate::crypto::encode_signing_key_did(&pair.key_a),
         remote: pair.service_b.direct_message_service(),
         calls: tokio::sync::Mutex::new(Vec::new()),
     });
@@ -1702,6 +1699,222 @@ async fn direct_delivery_leaves_on_the_peer_did_route_without_bootstrap_transpor
 }
 
 #[tokio::test]
+async fn direct_provider_rejects_a_self_route_rewritten_to_runtime_local() {
+    let temp = tempfile::tempdir().unwrap();
+    let pair = crate::collaboration_discovery_runtime::tests::direct_peer_pair(temp.path()).await;
+    let now = now_ts();
+    let message = test_message(
+        &pair,
+        "self-local-rewrite",
+        &pair.conversation_id,
+        &pair.profile_b.document().profile_did,
+        "must retain Carrier admission",
+        now,
+    );
+    let before = pair
+        .service_b
+        .direct_message_service()
+        .records_for_test(&pair.profile_b.document().profile_did, now)
+        .unwrap();
+
+    let error = pair
+        .registry_b
+        .invoke_provider(ProviderInvocation {
+            source: DIRECT_MESSAGE_PROVIDER_SCHEME.to_string(),
+            target: DIRECT_MESSAGE_PROVIDER_SCHEME.to_string(),
+            op: DIRECT_MESSAGE_PROVIDER_OP.to_string(),
+            request: serde_json::to_value(DirectDeliveryRequest {
+                op: DIRECT_MESSAGE_PROVIDER_OP.to_string(),
+                message: encode(&message),
+            })
+            .unwrap(),
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Local,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("invalid direct message provider invocation"));
+    assert_eq!(
+        pair.service_b
+            .direct_message_service()
+            .records_for_test(&pair.profile_b.document().profile_did, now)
+            .unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn same_runtime_profiles_settle_through_authenticated_carrier_loopback_without_a_dial() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pair =
+        crate::collaboration_discovery_runtime::tests::same_runtime_profile_pair(temp.path()).await;
+    let endpoint_did = crate::crypto::encode_signing_key_did(&pair.endpoint_key);
+    pair.node
+        .take()
+        .expect("fixture Carrier node")
+        .shutdown()
+        .await;
+
+    let direct = pair.service.direct_message_service();
+    let now = now_ts();
+    assert_eq!(
+        direct
+            .send_text(
+                &pair.profile_a.document().profile_did,
+                "same-runtime-direct",
+                &pair.conversation_id,
+                "one Runtime, exact Carrier admission",
+                now,
+            )
+            .await
+            .unwrap(),
+        DirectDeliveryStatus::ReceiptSettled,
+    );
+
+    let sender = direct
+        .context(&pair.profile_a.document().profile_did, now)
+        .unwrap();
+    let recipient = direct
+        .context(&pair.profile_b.document().profile_did, now)
+        .unwrap();
+    let sender_records = sender.message_store.records().unwrap();
+    let recipient_records = recipient.message_store.records().unwrap();
+    assert_eq!(sender_records.len(), 1);
+    assert!(!sender_records[0].incoming);
+    assert!(sender_records[0].receipt_settled);
+    assert_eq!(recipient_records.len(), 1);
+    assert!(recipient_records[0].incoming);
+    assert_eq!(
+        recipient_records[0].envelope_bytes,
+        sender_records[0].envelope_bytes
+    );
+
+    let message_hash = collaboration_message_envelope_sha256(&sender_records[0].envelope_bytes);
+    let sender_receipt = sender
+        .message_store
+        .receipt(&message_hash)
+        .unwrap()
+        .expect("sender persisted terminal receipt");
+    let receiver_receipt = direct
+        .receive(&sender_records[0].envelope_bytes, &endpoint_did, now + 1)
+        .unwrap();
+    assert_eq!(sender_receipt, receiver_receipt);
+}
+
+#[tokio::test]
+async fn same_runtime_carrier_loopback_rejects_wrong_authority_and_recipient_bindings() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pair =
+        crate::collaboration_discovery_runtime::tests::same_runtime_profile_pair(temp.path()).await;
+    let endpoint_did = crate::crypto::encode_signing_key_did(&pair.endpoint_key);
+    pair.node
+        .take()
+        .expect("fixture Carrier node")
+        .shutdown()
+        .await;
+    let now = now_ts();
+    let valid = prepare_direct_message(
+        &pair.endpoint_key,
+        &pair.service.network_profile(),
+        &pair.profile_a,
+        DirectMessageIntent {
+            request_id: "same-runtime-negative",
+            conversation_id: &pair.conversation_id,
+            recipient_profile_did: &pair.profile_b.document().profile_did,
+            text: "must stay authority bound",
+        },
+        now,
+    )
+    .unwrap();
+    let invocation = |target: &str, op: &str, message: &[u8]| ProviderInvocation {
+        source: DIRECT_MESSAGE_PROVIDER_SCHEME.to_string(),
+        target: target.to_string(),
+        op: op.to_string(),
+        request: serde_json::json!({
+            "op": op,
+            "message": encode(message),
+        }),
+        transfer: ProviderTransfer::Json,
+        range: None,
+        progress: None,
+        transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+            peer_did: endpoint_did.clone(),
+            timeout_ms: Some(DIRECT_PROVIDER_TIMEOUT_MS),
+        }),
+    };
+    let before = pair
+        .service
+        .direct_message_service()
+        .records_for_test(&pair.profile_b.document().profile_did, now)
+        .unwrap();
+
+    assert!(pair
+        .registry
+        .invoke_provider(invocation(
+            crate::collaboration_profile_updates::PROFILE_UPDATE_PROVIDER_SCHEME,
+            DIRECT_MESSAGE_PROVIDER_OP,
+            &valid,
+        ))
+        .await
+        .is_err());
+    assert!(pair
+        .registry
+        .invoke_provider(invocation(DIRECT_MESSAGE_PROVIDER_SCHEME, "query", &valid))
+        .await
+        .is_err());
+
+    let mut forged = invocation(
+        DIRECT_MESSAGE_PROVIDER_SCHEME,
+        DIRECT_MESSAGE_PROVIDER_OP,
+        &valid,
+    );
+    forged.request["_runtime_invocation"] = serde_json::json!({
+        "transport": "carrier-provider-plane",
+        "carrier": { "source_endpoint_did": endpoint_did },
+    });
+    assert!(pair.registry.invoke_provider(forged).await.is_err());
+
+    let wrong_registered_recipient = resign_message(&valid, &pair.endpoint_key, |message| {
+        message.recipient.id = pair.profile_a.document().profile_did.clone();
+    });
+    assert!(pair
+        .registry
+        .invoke_provider(invocation(
+            DIRECT_MESSAGE_PROVIDER_SCHEME,
+            DIRECT_MESSAGE_PROVIDER_OP,
+            &wrong_registered_recipient,
+        ))
+        .await
+        .is_err());
+    let unregistered_profile =
+        crate::crypto::encode_signing_key_did(&elastos_runtime::signature::generate_keypair().0);
+    let unregistered_recipient = resign_message(&valid, &pair.endpoint_key, |message| {
+        message.recipient.id = unregistered_profile;
+    });
+    assert!(pair
+        .registry
+        .invoke_provider(invocation(
+            DIRECT_MESSAGE_PROVIDER_SCHEME,
+            DIRECT_MESSAGE_PROVIDER_OP,
+            &unregistered_recipient,
+        ))
+        .await
+        .is_err());
+    assert_eq!(
+        pair.service
+            .direct_message_service()
+            .records_for_test(&pair.profile_b.document().profile_did, now)
+            .unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
 async fn non_recipient_runtime_cannot_admit_another_profiles_direct_message() {
     let temp = tempfile::tempdir().unwrap();
     let pair = crate::collaboration_discovery_runtime::tests::direct_peer_pair(temp.path()).await;
@@ -1732,11 +1945,8 @@ async fn non_recipient_runtime_cannot_admit_another_profiles_direct_message() {
 
 #[test]
 fn direct_provider_runtime_metadata_is_exact() {
-    let source_endpoint_did = encode_did_key(
-        &elastos_runtime::signature::generate_keypair()
-            .0
-            .verifying_key(),
-    );
+    let source_endpoint_did =
+        crate::crypto::encode_signing_key_did(&elastos_runtime::signature::generate_keypair().0);
     let valid = serde_json::json!({
         "schema":"elastos.provider.invocation/v1",
         "source":DIRECT_MESSAGE_PROVIDER_SCHEME,
@@ -1781,8 +1991,8 @@ fn direct_message_signer_and_carrier_endpoint_are_independent_profile_roles() {
     let message_key = SigningKey::from_bytes(&[73u8; 32]);
     let recipient_profile_key = SigningKey::from_bytes(&[74u8; 32]);
     let recipient_endpoint_key = SigningKey::from_bytes(&[75u8; 32]);
-    let endpoint_did = encode_did_key(&endpoint_key.verifying_key());
-    let message_signer_did = encode_did_key(&message_key.verifying_key());
+    let endpoint_did = crate::crypto::encode_signing_key_did(&endpoint_key);
+    let message_signer_did = crate::crypto::encode_signing_key_did(&message_key);
     let sender_profile =
         crate::collaboration_profile_authority::signed_profile_document_with_authority_for_test(
             &profile_key,
@@ -1805,7 +2015,9 @@ fn direct_message_signer_and_carrier_endpoint_are_independent_profile_roles() {
             1,
             None,
             1_800_000_000,
-            vec![encode_did_key(&recipient_endpoint_key.verifying_key())],
+            vec![crate::crypto::encode_signing_key_did(
+                &recipient_endpoint_key,
+            )],
         )
         .unwrap();
     let trusted = SigningKey::from_bytes(&[76u8; 32]);

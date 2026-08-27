@@ -576,7 +576,7 @@ fn load_or_create_release_key(path_override: Option<&Path>) -> anyhow::Result<Pu
             .map_err(|_| anyhow::anyhow!("Release signing key must be 32 bytes"))?;
         let signing_key = signature::SigningKey::from_bytes(&arr);
         return Ok(PublishKey {
-            signer_did: elastos_server::crypto::encode_did_key(&signing_key.verifying_key()),
+            signer_did: elastos_server::crypto::encode_signing_key_did(&signing_key),
             path,
         });
     }
@@ -593,7 +593,7 @@ fn load_or_create_release_key(path_override: Option<&Path>) -> anyhow::Result<Pu
     }
 
     Ok(PublishKey {
-        signer_did: elastos_server::crypto::encode_did_key(&verifying_key),
+        signer_did: elastos_server::crypto::encode_did_key(&verifying_key)?,
         path,
     })
 }
@@ -615,9 +615,7 @@ fn inspect_release_key(path_override: Option<&Path>) -> anyhow::Result<PublishKe
         .map_err(|_| anyhow::anyhow!("Release signing key must be 32 bytes"))?;
     let signing_key = signature::SigningKey::from_bytes(&arr);
     Ok(PublishKeyPreview {
-        signer_did: Some(elastos_server::crypto::encode_did_key(
-            &signing_key.verifying_key(),
-        )),
+        signer_did: Some(elastos_server::crypto::encode_signing_key_did(&signing_key)),
         path,
     })
 }

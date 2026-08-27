@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
-const moduleVersion = "home-20260812a";
+const moduleVersion = "home-20260813a";
 const savedStatePatches = [];
 const requests = [];
 const windowEventListeners = new Map();
@@ -293,6 +293,7 @@ const inboxSource = readFileSync(
   new URL("../capsules/inbox/browser/index.html", import.meta.url),
   "utf8",
 );
+const collaborationChromeSources = [peopleStyle, chatStyle, inboxSource].join("\n");
 const browserStyle = readFileSync(
   new URL("../capsules/browser/browser/style.css", import.meta.url),
   "utf8",
@@ -305,10 +306,26 @@ const homeGuiStyle = readFileSync(
   new URL("../capsules/home-gui/browser/style.css", import.meta.url),
   "utf8",
 );
+const homeGuiTemplate = readFileSync(
+  new URL("../capsules/home-gui/browser/home-gui-template.html", import.meta.url),
+  "utf8",
+);
+const launcherDarkDockIcon = new URL(
+  "../capsules/home-gui/browser/icons/apps-launcher/dark-dock/icon-64.png",
+  import.meta.url,
+);
+const launcherLightDockIcon = new URL(
+  "../capsules/home-gui/browser/icons/apps-launcher/light-dock/icon-64.png",
+  import.meta.url,
+);
+const canonicalWindowHeadMarkup =
+  /<div class="window-head">\s*<div class="window-traffic-lights">\s*<button class="window-action-btn" data-action="close"[\s\S]*?<button class="window-action-btn" data-action="minimize"[\s\S]*?<button class="window-action-btn" data-action="maximize"[\s\S]*?<\/div>\s*<div class="window-head-draggable">[\s\S]*?<\/div>\s*<div class="window-head-balance" aria-hidden="true"><\/div>\s*<\/div>/;
+const canonicalLauncherMarkup =
+  /<aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>\s*<div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">\s*<div class="launcher-header">[\s\S]*?<p class="launcher-browse-label">Apps<\/p>[\s\S]*?<button\s+id="launcher-view-toggle"[\s\S]*?<\/button>\s*<\/div>\s*<div class="launcher-scroll hide-scrollbar">[\s\S]*?<h1 class="launcher-heading visually-hidden">Apps<\/h1>[\s\S]*?<div id="launcher-grid" class="launcher-sections"><\/div>[\s\S]*?<\/div>\s*<\/div>\s*<\/aside>/;
 
 assert(
-  !peopleStyle.includes("window-chrome-safe-top"),
-  "People still reserves host titlebar space inside the capsule",
+  peopleStyle.includes("padding: var(--window-chrome-safe-top, 52px) 12px 16px;"),
+  "People unified-sidebar must reserve the Home safe-top inset in its sidebar column",
 );
 assert(
   !chatStyle.includes("window-chrome-safe-top"),
@@ -319,6 +336,12 @@ assert(
   "Inbox still reserves host titlebar space inside the capsule",
 );
 assert(
+  !/window-action-btn|window-traffic-lights|data-action="(?:minimize|maximize|close)"/.test(
+    collaborationChromeSources,
+  ),
+  "People, Chat, or Inbox reintroduced capsule-owned outer window chrome",
+);
+assert(
   browserStyle.includes("padding: 8px 10px 8px var(--window-chrome-safe-leading, 96px);"),
   "Browser no longer applies the Home-owned toolbar content inset",
 );
@@ -327,10 +350,40 @@ assert(
   "Home toolbar fullscreen control still writes visible label text into the menubar",
 );
 assert(
+  canonicalWindowHeadMarkup.test(homeGuiTemplate),
+  "Home window template must keep one traffic-light group in close/minimize/maximize order before the draggable title and balance shim",
+);
+assert(
+  canonicalLauncherMarkup.test(homeGuiTemplate) &&
+    !homeGuiTemplate.includes('id="close-launcher"') &&
+    !homeGuiTemplate.includes('placeholder="Search Home"'),
+  "Home launcher template must keep one complete canonical launcher generation",
+);
+assert(
+  existsSync(launcherDarkDockIcon) && existsSync(launcherLightDockIcon),
+  "Home launcher dock raster assets must exist for both themes",
+);
+assert(
   homeGuiStyle.includes("@media (max-width: 1100px)") &&
     homeGuiStyle.includes(".toolbar-active-title") &&
     homeGuiStyle.includes("display: none;"),
   "Home toolbar still lacks the narrow-width title fallback",
+);
+assert(
+  homeGuiTemplate.includes('id="toolbar-system"') &&
+    homeGuiTemplate.includes('id="toolbar-active-title"') &&
+    homeGuiTemplate.includes('id="toolbar-menubar"') &&
+    homeGuiTemplate.includes('id="toolbar-control-centre"') &&
+    homeGuiTemplate.includes('id="control-centre-fullscreen"') &&
+    homeGuiTemplate.includes('id="identity-menu-sign-out"') &&
+    !homeGuiTemplate.includes('id="toolbar-fullscreen"') &&
+    !homeGuiTemplate.includes('id="toolbar-sign-out"'),
+  "Home template still mixes the obsolete naked top bar with the canonical system bar structure",
+);
+assert(
+  homeGuiStyle.includes("--toolbar-h: 36px;") &&
+    homeGuiStyle.includes(".toolbar-status-cluster") === false,
+  "Home toolbar geometry contract drifted from the bounded 36px system bar",
 );
 
 assert(!positionsOverlap(layout.wallet, layout.people), "People and Wallet desktop positions still overlap", layout);
@@ -434,6 +487,7 @@ shellWindows.configureWindowHooks({
 });
 for (const launch of [
   { target: "people", title: "People", route: "/apps/people/", attach_kind: "iframe", launch_status: "launched" },
+  { target: "chat", title: "Chat", route: "/apps/chat/", attach_kind: "iframe", launch_status: "launched" },
   { target: "chat-room", title: "Chat", route: "/apps/chat-room/", attach_kind: "iframe", launch_status: "launched" },
   { target: "inbox", title: "Inbox", route: "/apps/inbox/", attach_kind: "iframe", launch_status: "launched" },
   { target: "wallet", title: "Wallet", route: "/apps/wallet/", attach_kind: "iframe", launch_status: "launched" },
@@ -444,6 +498,10 @@ for (const launch of [
 
 const expectedWindowChrome = {
   people: {
+    mode: "unified-sidebar",
+    className: "window-chrome-unified-sidebar",
+  },
+  chat: {
     mode: "unified-sidebar",
     className: "window-chrome-unified-sidebar",
   },
@@ -472,11 +530,13 @@ for (const entry of shellCore.shellState.windows.values()) {
     "first-party window did not receive the intended Home chrome mode",
     { target: entry.targetId, mode: entry.node.dataset.windowChromeMode, expected },
   );
-  assert(
-    entry.node.classList.contains(expected.className),
-    "first-party window did not receive the expected Home chrome class",
-    { target: entry.targetId, classes: [...entry.node.classList.values] },
-  );
+  if (expected.className) {
+    assert(
+      entry.node.classList.contains(expected.className),
+      "first-party window did not receive the expected Home chrome class",
+      { target: entry.targetId, classes: [...entry.node.classList.values] },
+    );
+  }
 }
 
 const browserEntry = [...shellCore.shellState.windows.values()].find((entry) => entry.targetId === "browser");

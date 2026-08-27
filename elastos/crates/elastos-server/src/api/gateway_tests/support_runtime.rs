@@ -694,13 +694,7 @@ struct FakeRuntimeHandle {
 }
 
 fn verifying_key_from_did(did: &str) -> Option<ed25519_dalek::VerifyingKey> {
-    let multibase = did.strip_prefix("did:key:z")?;
-    let bytes = bs58::decode(multibase).into_vec().ok()?;
-    if bytes.len() != 34 || bytes[0] != 0xed || bytes[1] != 0x01 {
-        return None;
-    }
-    let key_bytes: [u8; 32] = bytes[2..34].try_into().ok()?;
-    ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).ok()
+    elastos_identity::decode_did_key(did).ok()
 }
 
 async fn start_fake_runtime(

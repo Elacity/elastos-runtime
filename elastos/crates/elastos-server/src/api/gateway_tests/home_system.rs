@@ -82,7 +82,7 @@ pub(super) fn configured_discovery_network_profile_for_test(
     trusted_signing_key: &SigningKey,
     network_id: &str,
 ) -> crate::collaboration_network::VerifiedCollaborationNetworkProfile {
-    let signer_did = crate::crypto::encode_did_key(&trusted_signing_key.verifying_key());
+    let signer_did = crate::crypto::encode_signing_key_did(trusted_signing_key);
     let payload = crate::collaboration_network::CollaborationNetworkProfile {
         schema: crate::collaboration_network::COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
         network_id: network_id.to_string(),
@@ -206,7 +206,7 @@ fn signed_contact_decision_for_test(
         request_message_id: request.payload.message_id,
         request_message_nonce: request.payload.nonce,
         recipient_profile_did: recipient_profile_did.to_string(),
-        recipient_endpoint_did: crate::crypto::encode_did_key(&recipient_key.verifying_key()),
+        recipient_endpoint_did: crate::crypto::encode_signing_key_did(recipient_key),
         decision: crate::collaboration_discovery::CollaborationContactDecision::Accepted,
         decided_at,
     };
@@ -2309,7 +2309,7 @@ async fn test_people_contact_remove_removes_exact_profile_contact_locally() {
 
     let (remote_device_key, _) = generate_keypair();
     let remote_device_key = SigningKey::from_bytes(&remote_device_key.to_bytes());
-    let remote_device_did = crate::crypto::encode_did_key(&remote_device_key.verifying_key());
+    let remote_device_did = crate::crypto::encode_signing_key_did(&remote_device_key);
     let (remote_profile_key, _) = generate_keypair();
     let remote_profile = crate::collaboration_profile_authority::signed_profile_document_for_test(
         &SigningKey::from_bytes(&remote_profile_key.to_bytes()),
@@ -3817,7 +3817,7 @@ async fn authenticated_home_people_inbox_and_realtime_reads_are_observationally_
 
     let (remote_device_key, _) = generate_keypair();
     let remote_device_key = SigningKey::from_bytes(&remote_device_key.to_bytes());
-    let remote_device_did = crate::crypto::encode_did_key(&remote_device_key.verifying_key());
+    let remote_device_did = crate::crypto::encode_signing_key_did(&remote_device_key);
     let (remote_profile_key, _) = generate_keypair();
     let remote_profile = crate::collaboration_profile_authority::signed_profile_document_for_test(
         &SigningKey::from_bytes(&remote_profile_key.to_bytes()),
