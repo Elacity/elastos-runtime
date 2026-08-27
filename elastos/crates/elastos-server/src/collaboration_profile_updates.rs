@@ -686,7 +686,7 @@ pub(crate) fn prepare_profile_update(
     validate_id(conversation_id, "profile update conversation_id")?;
     crate::crypto::decode_did_key(recipient_profile_did)
         .context("invalid profile update recipient Profile DID")?;
-    let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
+    let signer_did = crate::crypto::encode_signing_key_did(signing_key);
     if !sender_profile.authorizes_signer(
         &signer_did,
         PROFILE_UPDATE_SENDER_SERVICE,
@@ -832,7 +832,7 @@ mod tests {
                 revision,
                 previous.as_deref(),
                 1_785_900_000 + revision,
-                vec![crate::crypto::encode_signing_key_did(&device)],
+                vec![crate::crypto::encode_signing_key_did(device)],
             )
             .unwrap();
             let signed = verified.signed_envelope().clone();

@@ -553,9 +553,11 @@ fn run_provider_loop<R: BufRead, W: Write>(
             Ok(Some(Ok(frame))) => provider.handle_frame(&frame),
             Ok(Some(Err(()))) => (invalid_request(), false),
             Ok(None) => break,
+            // A transport read error is not recoverable: retrying re-reads the
+            // same failing descriptor and spins. Report once, then exit.
             Err(_) => (
                 ProviderResponse::error(REQUEST_ERROR_CODE, "custody provider request is invalid"),
-                false,
+                true,
             ),
         };
         if serde_json::to_writer(&mut *output, &response).is_err() {
@@ -655,6 +657,37 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    struct FailingReader;
+
+    impl io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("persistent transport failure"))
+        }
+    }
+
+    impl BufRead for FailingReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Err(io::Error::other("persistent transport failure"))
+        }
+
+        fn consume(&mut self, _amount: usize) {}
+    }
+
+    #[test]
+    fn provider_loop_exits_after_one_error_frame_on_transport_read_failure() {
+        let mut input = FailingReader;
+        let mut output = Vec::new();
+        let mut provider = CustodyProvider::new();
+        run_provider_loop(&mut input, &mut output, &mut provider);
+        let responses: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["status"], "error");
     }
 
     fn oversized_frame_for(op: &str) -> Vec<u8> {

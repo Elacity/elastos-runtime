@@ -745,7 +745,7 @@ mod tests {
             1,
             None,
             NOW,
-            vec![crate::crypto::encode_signing_key_did(&endpoint_key)],
+            vec![crate::crypto::encode_signing_key_did(endpoint_key)],
         )
         .unwrap()
     }
