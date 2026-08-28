@@ -6685,7 +6685,7 @@ assert(
     carrierRuntime.includes('"transfer": "stream"') &&
     carrierRuntime.includes("ProviderTransfer::Stream") &&
     carrierRuntime.includes('"carrier_provider_invoke"') &&
-    /"content"\s*\|\s*"availability"\s*\|\s*"rights"\s*\|\s*"key"\s*\|\s*"decrypt"\s*\|\s*"drm"\s*\|\s*"collaboration"\s*\|\s*"collaboration-direct"\s*\|\s*"collaboration-profile"/.test(
+    /"content"\s*\|\s*"availability"\s*\|\s*"custody"\s*\|\s*"rights"\s*\|\s*"key"\s*\|\s*"decrypt"\s*\|\s*"drm"\s*\|\s*"collaboration"\s*\|\s*"collaboration-direct"\s*\|\s*"collaboration-profile"/.test(
       carrierRuntime,
     ) &&
     carrierRuntime.includes("CarrierProviderInvoker") &&
@@ -6702,6 +6702,10 @@ assert(
     carrierRuntime.includes("test_carrier_provider_invoke_accepts_stream_contract_metadata") &&
     carrierRuntime.includes("test_carrier_provider_invoke_rejects_stream_without_contract_metadata") &&
     carrierRuntime.includes("test_carrier_provider_invoke_rejects_raw_backend_target") &&
+    carrierRuntime.includes(
+      "test_carrier_provider_target_admission_keeps_protected_runtime_targets_narrow",
+    ) &&
+    carrierRuntime.includes("test_peer_did_route_reaches_runtime_only_custody_target") &&
     carrierRuntime.includes(
       "test_peer_did_self_route_uses_carrier_admission_without_network_connect",
     ) &&

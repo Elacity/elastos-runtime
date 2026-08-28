@@ -658,14 +658,13 @@ async fn register_media_provider(
     media_provider: Arc<dyn provider::Provider>,
 ) -> anyhow::Result<()> {
     if registry
-        .registration_for_uri("elastos://media/status")
+        .has_ready_runtime_provider_target(MEDIA_PROVIDER_ROUTE)
         .await
-        .is_some()
     {
         anyhow::bail!("failed to register media provider: route already registered");
     }
     registry
-        .register_sub_provider(MEDIA_PROVIDER_ROUTE, media_provider)
+        .register_runtime_provider_target(MEDIA_PROVIDER_ROUTE, media_provider)
         .await
         .map_err(|err| anyhow::anyhow!("failed to register media provider: {err}"))
 }
@@ -1444,7 +1443,7 @@ async fn setup_server_infrastructure_impl(
             .await
         {
             tracing::warn!(
-                "Failed to register inactive elastos://custody sub-provider: {}",
+                "Failed to register inactive Runtime-only custody provider: {}",
                 e
             );
         } else {
@@ -2582,12 +2581,15 @@ mod tests {
             .await
             .unwrap();
 
-        let registration = registry
+        assert!(registry
             .registration_for_uri("elastos://media/status")
             .await
-            .unwrap();
-        assert_eq!(registration.route, MEDIA_PROVIDER_ROUTE);
-        assert_eq!(registration.provider, "capsule-provider");
+            .is_none());
+        assert!(
+            registry
+                .has_ready_runtime_provider_target(MEDIA_PROVIDER_ROUTE)
+                .await
+        );
         provider.abort();
     }
 
@@ -2623,6 +2625,11 @@ mod tests {
                 .registration_for_uri("elastos://media/status")
                 .await
                 .is_none());
+            assert!(
+                !registry
+                    .has_ready_runtime_provider_target(MEDIA_PROVIDER_ROUTE)
+                    .await
+            );
             let requests = provider.await.unwrap();
             assert_eq!(requests[0]["op"], "status");
             assert_eq!(requests[1]["op"], "shutdown");
@@ -2646,6 +2653,11 @@ mod tests {
             .registration_for_uri("elastos://media/status")
             .await
             .is_none());
+        assert!(
+            !registry
+                .has_ready_runtime_provider_target(MEDIA_PROVIDER_ROUTE)
+                .await
+        );
         let requests = provider.await.unwrap();
         assert_eq!(requests[0]["op"], "status");
         assert_eq!(requests[1]["op"], "shutdown");
@@ -2667,6 +2679,11 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("failed to register"));
+        assert!(
+            registry
+                .has_ready_runtime_provider_target(MEDIA_PROVIDER_ROUTE)
+                .await
+        );
         let requests = second_provider.await.unwrap();
         assert_eq!(requests[0]["op"], "status");
         assert_eq!(requests[1]["op"], "shutdown");

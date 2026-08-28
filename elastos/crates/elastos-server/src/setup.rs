@@ -2303,6 +2303,7 @@ mod tests {
                 "content-block-graph-provider".to_string(),
                 "elastos://block-graph/*".to_string(),
             ),
+            ("custody-provider".to_string(), "custody".to_string()),
             ("did-provider".to_string(), "elastos://did/*".to_string()),
             ("exit-provider".to_string(), "elastos://exit/*".to_string()),
             ("ipfs-provider".to_string(), "elastos://ipfs/*".to_string()),
@@ -2314,10 +2315,7 @@ mod tests {
                 "model-provider".to_string(),
                 "elastos://model/*".to_string(),
             ),
-            (
-                "media-provider".to_string(),
-                "elastos://media/*".to_string(),
-            ),
+            ("media-provider".to_string(), "media".to_string()),
             ("net-provider".to_string(), "elastos://net/*".to_string()),
             (
                 "object-provider".to_string(),
@@ -2326,6 +2324,10 @@ mod tests {
             (
                 "protected-content-decrypt-provider".to_string(),
                 "protected-content-decrypt".to_string(),
+            ),
+            (
+                "protected-content-protect-provider".to_string(),
+                "protect".to_string(),
             ),
             (
                 "wallet-provider".to_string(),
@@ -2370,7 +2372,13 @@ mod tests {
             assert_eq!(runtime.provides, provides);
             assert_eq!(
                 runtime.runtime_only,
-                name == "protected-content-decrypt-provider"
+                matches!(
+                    name.as_str(),
+                    "custody-provider"
+                        | "media-provider"
+                        | "protected-content-decrypt-provider"
+                        | "protected-content-protect-provider"
+                )
             );
             if runtime.runtime_only {
                 assert!(first_party_provider_manifest_path(&root, &name).is_none());

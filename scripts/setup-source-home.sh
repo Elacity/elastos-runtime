@@ -568,9 +568,6 @@ source_home_helper_binary_names() {
             browser-native-proxy-engine \
             browser-stream-bridge
     fi
-    printf '%s\n' \
-        custody-provider \
-        protected-content-protect-provider
 }
 
 source_home_binary_names() {

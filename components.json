@@ -698,6 +698,14 @@
     "custody-provider": {
       "install_path": "bin/custody-provider",
       "description": "Host protected-content custody node provider binary for owner-only node provisioning and inactive Runtime-selected custody routes",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "custody",
+        "runtime_only": true
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -725,6 +733,14 @@
     "protected-content-protect-provider": {
       "install_path": "bin/protected-content-protect-provider",
       "description": "Host protected-content protect provider binary for inactive Runtime-selected CENC origin packaging",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "protect",
+        "runtime_only": true
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -757,7 +773,8 @@
         "substrate": "native",
         "runtime_abi": "elastos.provider-stdio/v1",
         "execution": "native-provider",
-        "provides": "elastos://media/*"
+        "provides": "media",
+        "runtime_only": true
       },
       "platforms": {
         "linux-amd64": {

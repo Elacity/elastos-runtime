@@ -497,19 +497,17 @@ const RESERVED_SUB_NAMES: &[&str] = &[
     "rights",
     "key",
     "decrypt",
-    "protect",
-    "media",
     "inspect",
     "availability",
     "block-graph",
     "object",
     "collaboration-direct",
     "collaboration-profile",
-    "custody",
 ];
 
 /// Reserved names for provider targets that only Runtime invocation can reach.
-const RESERVED_RUNTIME_PROVIDER_TARGETS: &[&str] = &["protected-content-decrypt"];
+const RESERVED_RUNTIME_PROVIDER_TARGETS: &[&str] =
+    &["protect", "media", "custody", "protected-content-decrypt"];
 
 /// Registry of providers
 pub struct ProviderRegistry {
@@ -948,6 +946,21 @@ impl ProviderRegistry {
         providers.contains_key(scheme)
     }
 
+    /// Check whether a Runtime-only provider target is ready for invocation.
+    pub async fn has_ready_runtime_provider_target(&self, target: &str) -> bool {
+        let key = target.to_lowercase();
+        if !RESERVED_RUNTIME_PROVIDER_TARGETS.contains(&key.as_str()) {
+            return false;
+        }
+        matches!(
+            self.sub_providers.read().await.get(&key),
+            Some(SubProviderRegistration::Ready {
+                visibility: ProviderTargetVisibility::RuntimeOnly,
+                ..
+            })
+        )
+    }
+
     /// Snapshot the routes actually registered in this Runtime process.
     pub async fn registrations(&self) -> Vec<ProviderRegistration> {
         let providers = self.providers.read().await;
@@ -1035,6 +1048,36 @@ impl ProviderRegistry {
     ) -> Result<serde_json::Value, ProviderError> {
         self.send_raw_with_target_visibility(scheme, request, false)
             .await
+    }
+
+    /// Send an already validated Runtime envelope to one exact private target.
+    pub async fn send_runtime_provider_target_raw(
+        &self,
+        target: &str,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let key = target.to_lowercase();
+        if !RESERVED_RUNTIME_PROVIDER_TARGETS.contains(&key.as_str()) {
+            return Err(ProviderError::NoProvider(target.to_string()));
+        }
+        let provider = self
+            .sub_providers
+            .read()
+            .await
+            .get(&key)
+            .and_then(|entry| match entry {
+                SubProviderRegistration::Ready {
+                    provider,
+                    visibility: ProviderTargetVisibility::RuntimeOnly,
+                } => Some(provider.clone()),
+                SubProviderRegistration::Ready {
+                    visibility: ProviderTargetVisibility::CapsuleResource,
+                    ..
+                }
+                | SubProviderRegistration::Settling { .. } => None,
+            })
+            .ok_or_else(|| ProviderError::NoProvider(target.to_string()))?;
+        provider.send_raw(request).await
     }
 
     async fn send_raw_with_target_visibility(
@@ -2719,9 +2762,6 @@ mod tests {
             "rights",
             "key",
             "decrypt",
-            "protect",
-            "media",
-            "custody",
             "availability",
             "block-graph",
             "object",
@@ -2739,19 +2779,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_only_target_coexists_without_capsule_resource_exposure() {
+    async fn runtime_only_targets_coexist_without_capsule_resource_exposure() {
         let registry = ProviderRegistry::new();
         registry
             .register_sub_provider("decrypt", Arc::new(RawMockProvider))
             .await
             .unwrap();
-        registry
-            .register_runtime_provider_target(
-                "protected-content-decrypt",
-                Arc::new(RawMockProvider),
-            )
-            .await
-            .unwrap();
+        for target in ["protect", "media", "custody", "protected-content-decrypt"] {
+            registry
+                .register_runtime_provider_target(target, Arc::new(RawMockProvider))
+                .await
+                .unwrap();
+        }
 
         let provisional = registry
             .invoke_provider(ProviderInvocation {
@@ -2766,58 +2805,58 @@ mod tests {
             })
             .await
             .unwrap();
-        let protected = registry
-            .invoke_provider(ProviderInvocation {
-                source: "runtime".to_string(),
-                target: "protected-content-decrypt".to_string(),
-                op: "status".to_string(),
-                request: serde_json::json!({"op":"status"}),
-                transfer: ProviderTransfer::Json,
-                range: None,
-                progress: None,
-                transport: ProviderInvocationTransport::Local,
-            })
-            .await
-            .unwrap();
-
         assert_eq!(
             provisional["data"]["runtime_invocation"]["target"],
             "decrypt"
         );
-        assert_eq!(
-            protected["data"]["runtime_invocation"]["target"],
-            "protected-content-decrypt"
-        );
         assert_eq!(registry.sub_provider_schemes().await, vec!["decrypt"]);
-        assert!(registry
-            .registration_for_uri("elastos://protected-content-decrypt/status")
-            .await
-            .is_none());
-        assert!(!registry
-            .registrations()
-            .await
-            .iter()
-            .any(|registration| { registration.route == "protected-content-decrypt" }));
-        assert!(matches!(
-            registry
-                .send_raw(
-                    "protected-content-decrypt",
-                    &serde_json::json!({"op":"status"}),
-                )
-                .await,
-            Err(ProviderError::NoProvider(target)) if target == "protected-content-decrypt"
-        ));
-        assert!(matches!(
-            registry
-                .route(
-                    "elastos://protected-content-decrypt/status",
-                    "capsule:test",
-                    ResourceAction::Read,
-                    None,
-                )
-                .await,
-            Err(ProviderError::NoProvider(scheme)) if scheme == "elastos"
-        ));
+        assert!(!registry.has_ready_runtime_provider_target("decrypt").await);
+        let registrations = registry.registrations().await;
+        for target in ["protect", "media", "custody", "protected-content-decrypt"] {
+            let protected = registry
+                .invoke_provider(ProviderInvocation {
+                    source: "runtime".to_string(),
+                    target: target.to_string(),
+                    op: "status".to_string(),
+                    request: serde_json::json!({"op":"status"}),
+                    transfer: ProviderTransfer::Json,
+                    range: None,
+                    progress: None,
+                    transport: ProviderInvocationTransport::Local,
+                })
+                .await
+                .unwrap();
+            assert_eq!(protected["data"]["runtime_invocation"]["target"], target);
+            assert!(registry.has_ready_runtime_provider_target(target).await);
+            assert!(registry
+                .registration_for_uri(&format!("elastos://{target}/status"))
+                .await
+                .is_none());
+            assert!(!registrations
+                .iter()
+                .any(|registration| registration.route == target));
+            assert!(matches!(
+                registry
+                    .send_raw(target, &serde_json::json!({"op":"status"}))
+                    .await,
+                Err(ProviderError::NoProvider(hidden)) if hidden == target
+            ));
+            assert!(registry
+                .send_runtime_provider_target_raw(target, &serde_json::json!({"op":"status"}),)
+                .await
+                .is_ok());
+            assert!(matches!(
+                registry
+                    .route(
+                        &format!("elastos://{target}/status"),
+                        "capsule:test",
+                        ResourceAction::Read,
+                        None,
+                    )
+                    .await,
+                Err(ProviderError::NoProvider(scheme)) if scheme == "elastos"
+            ));
+        }
     }
 
     #[tokio::test]
@@ -2827,38 +2866,31 @@ mod tests {
             .register_sub_provider("decrypt", Arc::new(MockProvider::new()))
             .await
             .unwrap();
-        registry
-            .register_runtime_provider_target(
-                "protected-content-decrypt",
-                Arc::new(RawMockProvider),
-            )
-            .await
-            .unwrap();
+        for target in ["protect", "media", "custody", "protected-content-decrypt"] {
+            registry
+                .register_runtime_provider_target(target, Arc::new(RawMockProvider))
+                .await
+                .unwrap();
 
-        let wrong_capsule_api = registry
-            .unregister_sub_provider("protected-content-decrypt")
-            .await
-            .unwrap_err();
-        assert!(wrong_capsule_api
-            .to_string()
-            .contains("not a reserved name"));
-        let protected = registry
-            .invoke_provider(ProviderInvocation {
-                source: "runtime".to_string(),
-                target: "protected-content-decrypt".to_string(),
-                op: "status".to_string(),
-                request: serde_json::json!({"op":"status"}),
-                transfer: ProviderTransfer::Json,
-                range: None,
-                progress: None,
-                transport: ProviderInvocationTransport::Local,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            protected["data"]["runtime_invocation"]["target"],
-            "protected-content-decrypt"
-        );
+            let wrong_capsule_api = registry.unregister_sub_provider(target).await.unwrap_err();
+            assert!(wrong_capsule_api
+                .to_string()
+                .contains("not a reserved name"));
+            let protected = registry
+                .invoke_provider(ProviderInvocation {
+                    source: "runtime".to_string(),
+                    target: target.to_string(),
+                    op: "status".to_string(),
+                    request: serde_json::json!({"op":"status"}),
+                    transfer: ProviderTransfer::Json,
+                    range: None,
+                    progress: None,
+                    transport: ProviderInvocationTransport::Local,
+                })
+                .await
+                .unwrap();
+            assert_eq!(protected["data"]["runtime_invocation"]["target"], target);
+        }
 
         let wrong_runtime_api = registry
             .unregister_runtime_provider_target("decrypt")
@@ -2897,6 +2929,12 @@ mod tests {
                 .unwrap();
         });
         provider.entered_shutdown.notified().await;
+
+        assert!(
+            !registry
+                .has_ready_runtime_provider_target("protected-content-decrypt")
+                .await
+        );
 
         let invocation = ProviderInvocation {
             source: "runtime".to_string(),
@@ -2983,14 +3021,14 @@ mod tests {
         let registry = Arc::new(ProviderRegistry::new());
         let provider = Arc::new(BlockingShutdownProvider::new());
         registry
-            .register_sub_provider("custody", provider.clone())
+            .register_sub_provider("storage", provider.clone())
             .await
             .unwrap();
 
         let unregister_registry = registry.clone();
         let unregister_task = tokio::spawn(async move {
             unregister_registry
-                .unregister_sub_provider("custody")
+                .unregister_sub_provider("storage")
                 .await
                 .unwrap();
         });
@@ -3001,10 +3039,10 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(100), registry.sub_provider_schemes())
                 .await
                 .expect("registry reads should not block on shutdown");
-        assert!(!schemes.iter().any(|scheme| scheme == "custody"));
-        assert!(registry.get_sub_provider("custody").await.is_none());
+        assert!(!schemes.iter().any(|scheme| scheme == "storage"));
+        assert!(registry.get_sub_provider("storage").await.is_none());
         let replacement = registry
-            .register_sub_provider("custody", Arc::new(MockProvider::new()))
+            .register_sub_provider("storage", Arc::new(MockProvider::new()))
             .await
             .unwrap_err();
         assert!(replacement.to_string().contains("already registered"));
@@ -3013,7 +3051,7 @@ mod tests {
         unregister_task.await.unwrap();
 
         registry
-            .register_sub_provider("custody", Arc::new(MockProvider::new()))
+            .register_sub_provider("storage", Arc::new(MockProvider::new()))
             .await
             .unwrap();
     }
@@ -3023,14 +3061,14 @@ mod tests {
         let registry = Arc::new(ProviderRegistry::new());
         let provider = Arc::new(BlockingShutdownProvider::failing());
         registry
-            .register_sub_provider("custody", provider.clone())
+            .register_sub_provider("storage", provider.clone())
             .await
             .unwrap();
 
         let unregister_registry = registry.clone();
         let unregister_task = tokio::spawn(async move {
             unregister_registry
-                .unregister_sub_provider("custody")
+                .unregister_sub_provider("storage")
                 .await
                 .unwrap_err()
         });
@@ -3042,11 +3080,11 @@ mod tests {
         assert!(error
             .to_string()
             .contains("blocking shutdown failed to settle"));
-        assert!(registry.get_sub_provider("custody").await.is_none());
+        assert!(registry.get_sub_provider("storage").await.is_none());
         let schemes = registry.sub_provider_schemes().await;
-        assert!(!schemes.iter().any(|scheme| scheme == "custody"));
+        assert!(!schemes.iter().any(|scheme| scheme == "storage"));
         let replacement = registry
-            .register_sub_provider("custody", Arc::new(MockProvider::new()))
+            .register_sub_provider("storage", Arc::new(MockProvider::new()))
             .await
             .unwrap_err();
         assert!(replacement.to_string().contains("already registered"));
@@ -3056,34 +3094,34 @@ mod tests {
     async fn test_unregister_sub_provider_retries_settling_provider_after_unclean_shutdown() {
         let registry = Arc::new(ProviderRegistry::new());
         registry
-            .register_sub_provider("custody", Arc::new(RetryOnceShutdownProvider::new()))
+            .register_sub_provider("storage", Arc::new(RetryOnceShutdownProvider::new()))
             .await
             .unwrap();
 
         let first_error = registry
-            .unregister_sub_provider("custody")
+            .unregister_sub_provider("storage")
             .await
             .unwrap_err();
         assert!(first_error
             .to_string()
             .contains("unclean shutdown receipt after child exit"));
-        assert!(registry.get_sub_provider("custody").await.is_none());
+        assert!(registry.get_sub_provider("storage").await.is_none());
         let replacement = registry
-            .register_sub_provider("custody", Arc::new(MockProvider::new()))
+            .register_sub_provider("storage", Arc::new(MockProvider::new()))
             .await
             .unwrap_err();
         assert!(replacement.to_string().contains("already registered"));
 
-        registry.unregister_sub_provider("custody").await.unwrap();
-        assert!(registry.get_sub_provider("custody").await.is_none());
+        registry.unregister_sub_provider("storage").await.unwrap();
+        assert!(registry.get_sub_provider("storage").await.is_none());
         assert!(!registry
             .sub_provider_schemes()
             .await
             .iter()
-            .any(|scheme| scheme == "custody"));
+            .any(|scheme| scheme == "storage"));
 
         registry
-            .register_sub_provider("custody", Arc::new(MockProvider::new()))
+            .register_sub_provider("storage", Arc::new(MockProvider::new()))
             .await
             .unwrap();
     }

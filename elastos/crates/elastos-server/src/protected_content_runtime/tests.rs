@@ -53,7 +53,7 @@ use super::{
     load_runtime_custody_composition, load_runtime_custody_composition_config,
     prepare_runtime_custody_library_source, publish_runtime_custody_library_object,
     publish_runtime_custody_library_source, register_inactive_custody_provider,
-    register_inactive_custody_sub_provider, register_protect_provider,
+    register_inactive_custody_runtime_provider_target, register_protect_provider,
     register_protected_content_decrypt_provider, resolve_runtime_rights_policy,
     runtime_mint_journal, runtime_protected_content_id, runtime_purchase_path, source_media_digest,
     unresolved_release_audit_records, write_owner_only_bytes, InactiveCustodyProvider,
@@ -4457,7 +4457,7 @@ async fn runtime_invokes_custody_not_the_provisional_key_route() {
         .register_sub_provider("key", key.clone())
         .await
         .unwrap();
-    register_inactive_custody_sub_provider(registry.as_ref(), custody.clone())
+    register_inactive_custody_runtime_provider_target(registry.as_ref(), custody.clone())
         .await
         .unwrap();
 
@@ -4500,7 +4500,7 @@ async fn runtime_custody_invoke_fails_closed_on_provider_errors() {
         "custody",
         json!({"status": "error", "code": "invalid_request"}),
     );
-    register_inactive_custody_sub_provider(registry.as_ref(), custody)
+    register_inactive_custody_runtime_provider_target(registry.as_ref(), custody)
         .await
         .unwrap();
     let err = invoke_json_provider(
@@ -4537,12 +4537,12 @@ async fn inactive_custody_registration_does_not_replace_key() {
     );
     let key = RecordingProvider::new("key", json!({"status": "ok", "data": {"echo": "key"}}));
     registry.register_sub_provider("key", key).await.unwrap();
-    register_inactive_custody_sub_provider(&registry, custody)
+    register_inactive_custody_runtime_provider_target(&registry, custody)
         .await
         .unwrap();
     let mut schemes = registry.sub_provider_schemes().await;
     schemes.sort();
-    assert_eq!(schemes, vec!["custody".to_string(), "key".to_string()]);
+    assert_eq!(schemes, vec!["key".to_string()]);
 }
 
 #[tokio::test]
@@ -4631,9 +4631,12 @@ async fn inactive_custody_registration_passes_only_base_path_and_no_extra_truth(
     register_inactive_custody_provider(&registry, &binary, &data_dir)
         .await
         .unwrap();
-    let mut schemes = registry.sub_provider_schemes().await;
-    schemes.sort();
-    assert_eq!(schemes, vec![CUSTODY_PROVIDER_ID.to_string()]);
+    assert!(registry.sub_provider_schemes().await.is_empty());
+    assert!(
+        registry
+            .has_ready_runtime_provider_target(CUSTODY_PROVIDER_ID)
+            .await
+    );
 
     let response = invoke_json_provider(
         registry.as_ref(),
@@ -4794,6 +4797,15 @@ async fn inactive_custody_wrapper_status_surface_matches_public_dispatch() {
 
 #[cfg(unix)]
 fn inactive_custody_runtime_envelope(op: &str, transport: &str) -> Value {
+    let carrier = if transport == "carrier-provider-plane" {
+        let endpoint = iroh::SecretKey::from_bytes(&[0x51; 32]).public();
+        json!({
+            "source_endpoint_did": crate::carrier::public_key_to_did(&endpoint)
+                .expect("test endpoint must have a canonical DID"),
+        })
+    } else {
+        Value::Null
+    };
     json!({
         "schema": "elastos.provider.invocation/v1",
         "source": RUNTIME_PROVIDER_ID,
@@ -4801,7 +4813,7 @@ fn inactive_custody_runtime_envelope(op: &str, transport: &str) -> Value {
         "op": op,
         "capability": format!("provider:{RUNTIME_PROVIDER_ID}->{CUSTODY_PROVIDER_ID}:{op}"),
         "transport": transport,
-        "carrier": Value::Null,
+        "carrier": carrier,
         "transfer": "json",
         "range": Value::Null,
         "progress": Value::Null,
@@ -4875,6 +4887,7 @@ async fn inactive_custody_wrapper_accepts_local_and_carrier_envelopes() {
         assert_eq!(forwarded["op"], "release_contribution");
         assert!(forwarded.get("_runtime_invocation").is_none());
         assert!(forwarded.get("carrier").is_none());
+        assert!(!forwarded.to_string().contains("source_endpoint_did"));
     }
 }
 
@@ -4916,6 +4929,54 @@ async fn inactive_custody_wrapper_rejects_invalid_transport_and_injected_carrier
     assert!(injected_carrier
         .to_string()
         .contains("unsupported injected carrier data"));
+
+    for (name, transport, carrier) in [
+        (
+            "missing authenticated Carrier endpoint",
+            "carrier-provider-plane",
+            Value::Null,
+        ),
+        (
+            "invalid Carrier endpoint DID",
+            "carrier-provider-plane",
+            json!({"source_endpoint_did": "did:key:invalid"}),
+        ),
+        (
+            "extra Carrier metadata",
+            "carrier-provider-plane",
+            json!({
+                "source_endpoint_did": crate::carrier::public_key_to_did(
+                    &iroh::SecretKey::from_bytes(&[0x52; 32]).public(),
+                )
+                .unwrap(),
+                "route": "forbidden",
+            }),
+        ),
+        (
+            "Carrier metadata on a local request",
+            "runtime-local-provider-plane",
+            json!({
+                "source_endpoint_did": crate::carrier::public_key_to_did(
+                    &iroh::SecretKey::from_bytes(&[0x53; 32]).public(),
+                )
+                .unwrap(),
+            }),
+        ),
+    ] {
+        let mut envelope = inactive_custody_runtime_envelope("release_contribution", transport);
+        envelope["carrier"] = carrier;
+        let error = provider
+            .send_raw(&json!({
+                "op": "release_contribution",
+                "_runtime_invocation": envelope,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("runtime envelope is invalid"),
+            "{name}: {error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -4936,7 +4997,7 @@ async fn runtime_custody_registry_adapter_invokes_selected_custody_endpoint_for_
         ok_provider_response(json!({"echo": "provisional"})),
     );
     registry
-        .register_sub_provider("custody", custody.clone())
+        .register_runtime_provider_target(CUSTODY_PROVIDER_ID, custody.clone())
         .await
         .unwrap();
     registry
@@ -4999,7 +5060,7 @@ async fn runtime_custody_registry_adapter_invokes_selected_custody_endpoint_for_
     let provisional =
         RecordingProvider::new("key", ok_provider_response(json!({"echo": "provisional"})));
     registry
-        .register_sub_provider("custody", custody.clone())
+        .register_runtime_provider_target(CUSTODY_PROVIDER_ID, custody.clone())
         .await
         .unwrap();
     registry
@@ -5554,7 +5615,7 @@ async fn runtime_release_coordinator_process_two_of_three_success_stops_before_t
             .unwrap();
         fixture
             .registry
-            .unregister_sub_provider(CUSTODY_PROVIDER_ID)
+            .unregister_runtime_provider_target(CUSTODY_PROVIDER_ID)
             .await
             .unwrap();
     }
@@ -5642,7 +5703,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
         "protect",
     ));
     protect_registry
-        .register_sub_provider("protect", protect_provider)
+        .register_runtime_provider_target(PROTECT_PROVIDER_ID, protect_provider)
         .await
         .unwrap();
     let protect_nodes = ordered_fixtures
@@ -6221,7 +6282,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     schemes.sort();
     assert_eq!(schemes, Vec::<String>::new());
     protect_registry
-        .unregister_sub_provider("protect")
+        .unregister_runtime_provider_target(PROTECT_PROVIDER_ID)
         .await
         .unwrap();
     let mut protect_schemes = protect_registry.sub_provider_schemes().await;
@@ -6251,7 +6312,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     for fixture in ordered_fixtures {
         fixture
             .registry
-            .unregister_sub_provider(CUSTODY_PROVIDER_ID)
+            .unregister_runtime_provider_target(CUSTODY_PROVIDER_ID)
             .await
             .unwrap();
     }
@@ -6304,7 +6365,7 @@ async fn inactive_custody_registry_unregisters_shutdowns_and_restarts_bridge() {
     let first_pid = read_pid(&pid_file);
 
     registry
-        .unregister_sub_provider(CUSTODY_PROVIDER_ID)
+        .unregister_runtime_provider_target(CUSTODY_PROVIDER_ID)
         .await
         .unwrap();
     assert!(!process_is_running(first_pid));
@@ -6325,7 +6386,7 @@ async fn inactive_custody_registry_unregisters_shutdowns_and_restarts_bridge() {
     assert_eq!(response["echo"], "custody");
 
     registry
-        .unregister_sub_provider(CUSTODY_PROVIDER_ID)
+        .unregister_runtime_provider_target(CUSTODY_PROVIDER_ID)
         .await
         .unwrap();
     assert!(!process_is_running(second_pid));
@@ -6361,7 +6422,7 @@ async fn inactive_custody_duplicate_registration_rejects_and_settles_rejected_ch
     assert!(!process_is_running(rejected_pid));
 
     registry
-        .unregister_sub_provider(CUSTODY_PROVIDER_ID)
+        .unregister_runtime_provider_target(CUSTODY_PROVIDER_ID)
         .await
         .unwrap();
 }
@@ -6948,7 +7009,7 @@ async fn runtime_media_preparation_reuses_exact_settled_output_and_rejects_sourc
     });
     let registry = Arc::new(ProviderRegistry::new());
     registry
-        .register_sub_provider(MEDIA_PROVIDER_ID, provider.clone())
+        .register_runtime_provider_target(MEDIA_PROVIDER_ID, provider.clone())
         .await
         .unwrap();
 
@@ -7007,7 +7068,7 @@ async fn runtime_media_preparation_unknown_settlement_never_redispatches() {
     });
     let registry = Arc::new(ProviderRegistry::new());
     registry
-        .register_sub_provider(MEDIA_PROVIDER_ID, provider.clone())
+        .register_runtime_provider_target(MEDIA_PROVIDER_ID, provider.clone())
         .await
         .unwrap();
 
@@ -7046,7 +7107,7 @@ async fn runtime_media_preparation_settled_failure_is_terminal_and_cleans_stagin
     });
     let registry = Arc::new(ProviderRegistry::new());
     registry
-        .register_sub_provider(MEDIA_PROVIDER_ID, provider.clone())
+        .register_runtime_provider_target(MEDIA_PROVIDER_ID, provider.clone())
         .await
         .unwrap();
 
@@ -7275,7 +7336,10 @@ async fn runtime_custody_library_publish_fails_closed_without_chain_policy() {
     assert!(intent.protect_terminal_before_draft());
     assert_eq!(intent.protect_terminal_settlement_label(), Some("closed"));
 
-    registry.unregister(PROTECT_PROVIDER_ID).await;
+    registry
+        .unregister_runtime_provider_target(PROTECT_PROVIDER_ID)
+        .await
+        .unwrap();
     let replay = publish_runtime_custody_library_object(
         &data_dir,
         registry,
@@ -7374,9 +7438,12 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
     assert_eq!(reloaded.content_access_id(), expected_access_id);
     assert_eq!(reloaded.completed_mint_id(), Some(published.mint_id));
 
-    registry.unregister(PROTECT_PROVIDER_ID).await;
     registry
-        .unregister_sub_provider(CUSTODY_PROVIDER_ID)
+        .unregister_runtime_provider_target(PROTECT_PROVIDER_ID)
+        .await
+        .unwrap();
+    registry
+        .unregister_runtime_provider_target(CUSTODY_PROVIDER_ID)
         .await
         .unwrap();
     registry

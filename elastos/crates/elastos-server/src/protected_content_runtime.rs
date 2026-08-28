@@ -375,6 +375,24 @@ impl InactiveCustodyProvider {
                 "custody request runtime envelope is invalid".into(),
             ));
         }
+        let carrier_is_valid = match transport {
+            "runtime-local-provider-plane" => envelope.get("carrier") == Some(&Value::Null),
+            "carrier-provider-plane" => envelope
+                .get("carrier")
+                .and_then(Value::as_object)
+                .filter(|carrier| carrier.len() == 1)
+                .and_then(|carrier| carrier.get("source_endpoint_did"))
+                .and_then(Value::as_str)
+                .and_then(|did| {
+                    crate::carrier::did_to_public_key(did).and_then(|public_key| {
+                        crate::carrier::public_key_to_did(&public_key)
+                            .ok()
+                            .filter(|canonical| canonical == did)
+                    })
+                })
+                .is_some(),
+            _ => false,
+        };
         if envelope.len() != 11
             || envelope.get("schema").and_then(Value::as_str) != Some(PROVIDER_INVOCATION_SCHEMA_V1)
             || envelope.get("source").and_then(Value::as_str) != Some(RUNTIME_PROVIDER_ID)
@@ -384,7 +402,7 @@ impl InactiveCustodyProvider {
                 != Some(&format!(
                     "provider:{RUNTIME_PROVIDER_ID}->{CUSTODY_PROVIDER_ID}:{op}"
                 ))
-            || envelope.get("carrier") != Some(&Value::Null)
+            || !carrier_is_valid
             || envelope.get("transfer").and_then(Value::as_str) != Some("json")
             || envelope.get("range") != Some(&Value::Null)
             || envelope.get("progress") != Some(&Value::Null)
@@ -988,7 +1006,9 @@ pub async fn register_inactive_custody_provider(
         Arc::new(bridge),
         Arc::downgrade(registry),
     ));
-    if let Err(error) = register_inactive_custody_sub_provider(registry, provider.clone()).await {
+    if let Err(error) =
+        register_inactive_custody_runtime_provider_target(registry, provider.clone()).await
+    {
         if let Err(shutdown_error) = provider.shutdown().await {
             return Err(anyhow::anyhow!(
                 "failed to register inactive custody route: {error}; failed to settle rejected inactive custody provider: {shutdown_error}"
@@ -1014,12 +1034,25 @@ pub async fn register_protect_provider(
     )
     .await
     .map_err(|error| anyhow::anyhow!("failed to spawn protect provider: {error}"))?;
+    let bridge = Arc::new(bridge);
     let provider: Arc<dyn Provider> =
         Arc::new(elastos_runtime::provider::CapsuleProvider::with_scheme(
-            Arc::new(bridge),
+            bridge.clone(),
             PROTECT_PROVIDER_ID,
         ));
-    registry.register(provider).await;
+    if let Err(error) = registry
+        .register_runtime_provider_target(PROTECT_PROVIDER_ID, provider)
+        .await
+    {
+        if let Err(shutdown_error) = bridge.shutdown().await {
+            return Err(anyhow::anyhow!(
+                "failed to register protect provider: {error}; protect provider shutdown/reap also failed: {shutdown_error}"
+            ));
+        }
+        return Err(anyhow::anyhow!(
+            "failed to register protect provider: {error}"
+        ));
+    }
     Ok(())
 }
 
@@ -1150,12 +1183,12 @@ fn require_protected_content_decrypt_provider_status(status: &Value) -> anyhow::
     Ok(())
 }
 
-async fn register_inactive_custody_sub_provider(
+async fn register_inactive_custody_runtime_provider_target(
     registry: &ProviderRegistry,
     provider: Arc<dyn Provider>,
 ) -> Result<(), ProviderError> {
     registry
-        .register_sub_provider(CUSTODY_PROVIDER_ID, provider)
+        .register_runtime_provider_target(CUSTODY_PROVIDER_ID, provider)
         .await
 }
 
@@ -2815,10 +2848,8 @@ async fn prepare_runtime_custody_library_source(
 
 async fn runtime_media_provider_is_registered(registry: &ProviderRegistry) -> bool {
     registry
-        .sub_provider_schemes()
+        .has_ready_runtime_provider_target(MEDIA_PROVIDER_ID)
         .await
-        .iter()
-        .any(|scheme| scheme == MEDIA_PROVIDER_ID)
 }
 
 pub(crate) async fn publish_runtime_custody_library_source(
@@ -3064,7 +3095,10 @@ async fn protect_runtime_custody_media(
             anyhow::bail!(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE);
         }
         RuntimeProtectRecoveryDisposition::ReplayOpenAndSettleCancel => {
-            if !registry.has_provider(PROTECT_PROVIDER_ID).await {
+            if !registry
+                .has_ready_runtime_provider_target(PROTECT_PROVIDER_ID)
+                .await
+            {
                 anyhow::bail!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE);
             }
             let opened =
@@ -3098,7 +3132,10 @@ async fn protect_runtime_custody_media(
         RuntimeProtectRecoveryDisposition::Fresh => {}
     }
 
-    if !registry.has_provider(PROTECT_PROVIDER_ID).await {
+    if !registry
+        .has_ready_runtime_provider_target(PROTECT_PROVIDER_ID)
+        .await
+    {
         anyhow::bail!("Runtime custody protect provider is unavailable");
     }
     journal

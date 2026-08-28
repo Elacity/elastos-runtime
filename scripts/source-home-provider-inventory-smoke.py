@@ -13,14 +13,18 @@ COMPONENTS = ROOT / "components.json"
 INTEGRITY = ROOT / "scripts" / "components-release-integrity-check.py"
 SCHEMA = "elastos.source-home-provider-inventory-smoke/v1"
 
-PROTECTED_CONTENT_HELPERS = (
+RUNTIME_ONLY_PROVIDERS = (
     "custody-provider",
+    "media-provider",
     "protected-content-protect-provider",
+    "protected-content-decrypt-provider",
 )
 REQUIRED_PROVIDER_RUNTIMES = (
+    "custody-provider",
     "localhost-provider",
     "media-provider",
     "model-provider",
+    "protected-content-protect-provider",
     "protected-content-decrypt-provider",
 )
 
@@ -35,14 +39,11 @@ def assert_provider_names_and_loops(setup_text: str) -> None:
     helper_fn = setup_text.split("source_home_helper_binary_names() {", 1)[1].split(
         "}\n\nsource_home_binary_names", 1
     )[0]
-    for name in PROTECTED_CONTENT_HELPERS:
-        needle = f"        {name}"
-        if needle not in helper_fn:
-            raise AssertionError(f"source_home_helper_binary_names() missing {name}")
-    if "        protected-content-decrypt-provider" in helper_fn:
-        raise AssertionError(
-            "source_home_helper_binary_names() must not duplicate the Runtime provider inventory"
-        )
+    for name in RUNTIME_ONLY_PROVIDERS:
+        if f"        {name}" in helper_fn:
+            raise AssertionError(
+                f"source_home_helper_binary_names() must not duplicate Runtime provider {name}"
+            )
 
     build_loop = 'source_home_binary_names | while IFS= read -r provider; do'
     if setup_text.count(build_loop) < 2:
@@ -63,8 +64,8 @@ def assert_provider_names_and_loops(setup_text: str) -> None:
 def assert_external_metadata(components: dict) -> None:
     capsules = components["capsules"]
     external = components["external"]
-    for name in (*PROTECTED_CONTENT_HELPERS, *REQUIRED_PROVIDER_RUNTIMES):
-        if name in PROTECTED_CONTENT_HELPERS and name in capsules:
+    for name in REQUIRED_PROVIDER_RUNTIMES:
+        if name in RUNTIME_ONLY_PROVIDERS and name in capsules:
             raise AssertionError(f"components.json must not list {name} under capsules")
         entry = external.get(name)
         if not isinstance(entry, dict):
@@ -82,8 +83,10 @@ def assert_external_metadata(components: dict) -> None:
                 raise AssertionError(f"{name} {platform} release_path mismatch")
 
     for name, provides in (
-        ("media-provider", "elastos://media/*"),
+        ("custody-provider", "custody"),
+        ("media-provider", "media"),
         ("model-provider", "elastos://model/*"),
+        ("protected-content-protect-provider", "protect"),
         ("protected-content-decrypt-provider", "protected-content-decrypt"),
     ):
         runtime = external[name].get("provider_runtime") or {}
@@ -94,7 +97,7 @@ def assert_external_metadata(components: dict) -> None:
             "execution": "native-provider",
             "provides": provides,
         }
-        if name == "protected-content-decrypt-provider":
+        if name in RUNTIME_ONLY_PROVIDERS:
             expected_runtime["runtime_only"] = True
         if runtime != expected_runtime:
             raise AssertionError(f"{name} runtime contract mismatch")
@@ -111,7 +114,6 @@ def run_integrity_smoke(components: dict) -> None:
         host_names = [
             "shell",
             *REQUIRED_PROVIDER_RUNTIMES,
-            *PROTECTED_CONTENT_HELPERS,
         ]
         manifest = {
             "schema": components["schema"],
@@ -169,10 +171,7 @@ def main() -> None:
             {
                 "schema": SCHEMA,
                 "ok": True,
-                "providers": [
-                    *REQUIRED_PROVIDER_RUNTIMES,
-                    *PROTECTED_CONTENT_HELPERS,
-                ],
+                "providers": [*REQUIRED_PROVIDER_RUNTIMES],
             }
         )
     )

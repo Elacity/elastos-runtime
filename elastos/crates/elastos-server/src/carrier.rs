@@ -1653,7 +1653,14 @@ async fn carrier_provider_invoke_registry(
         }),
     );
 
-    match registry.send_raw(target, &request).await {
+    let result = if target == "custody" {
+        registry
+            .send_runtime_provider_target_raw(target, &request)
+            .await
+    } else {
+        registry.send_raw(target, &request).await
+    };
+    match result {
         Ok(result) => Ok(serde_json::json!({
             "ok": true,
             "result": result,
@@ -1671,6 +1678,7 @@ fn carrier_provider_target_allowed(target: &str) -> bool {
         target,
         "content"
             | "availability"
+            | "custody"
             | "rights"
             | "key"
             | "decrypt"
@@ -8369,6 +8377,16 @@ mod tests {
         assert!(!response.to_string().contains("\"connect_ticket\":"));
     }
 
+    #[test]
+    fn test_carrier_provider_target_admission_keeps_protected_runtime_targets_narrow() {
+        assert!(carrier_provider_target_allowed("custody"));
+        assert!(!carrier_provider_target_allowed("protect"));
+        assert!(!carrier_provider_target_allowed("media"));
+        assert!(!carrier_provider_target_allowed(
+            "protected-content-decrypt"
+        ));
+    }
+
     struct PeerDidRouteFixture {
         local_registry: Arc<ProviderRegistry>,
         remote_requests: Arc<StdMutex<Vec<serde_json::Value>>>,
@@ -8420,6 +8438,15 @@ mod tests {
             )
             .await
             .unwrap();
+        remote_registry
+            .register_runtime_provider_target(
+                "custody",
+                Arc::new(RecordingCarrierContentProvider {
+                    requests: remote_requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
         let remote_dir = tempfile::tempdir().unwrap();
         let (remote_sk, remote_did) = elastos_identity::derive_did(&[remote_seed; 32]);
         let remote_node = start_carrier_node_with_registry(
@@ -8456,6 +8483,22 @@ mod tests {
             target: "content".to_string(),
             op: "fetch".to_string(),
             request: serde_json::json!({ "op": "fetch" }),
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                peer_did: peer_did.to_string(),
+                timeout_ms: Some(5_000),
+            }),
+        }
+    }
+
+    fn peer_did_custody_invocation(peer_did: &str) -> ProviderInvocation {
+        ProviderInvocation {
+            source: "runtime".to_string(),
+            target: "custody".to_string(),
+            op: "evaluate".to_string(),
+            request: serde_json::json!({ "op": "evaluate" }),
             transfer: ProviderTransfer::Json,
             range: None,
             progress: None,
@@ -8524,6 +8567,48 @@ mod tests {
             "content-provider"
         );
         assert_eq!(requests[0]["_runtime_invocation"]["target"], "content");
+        drop(requests);
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn test_peer_did_route_reaches_runtime_only_custody_target() {
+        let fixture = peer_did_route_fixture(62, 63).await;
+
+        let response = fixture
+            .local_registry
+            .invoke_provider(peer_did_custody_invocation(&fixture.remote_did))
+            .await
+            .unwrap();
+
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["data"]["op"], "evaluate");
+        assert_eq!(
+            response["data"]["runtime_invocation"]["transport"],
+            "carrier-provider-plane"
+        );
+        assert_eq!(
+            response["data"]["runtime_invocation"]["carrier"],
+            serde_json::Value::Null
+        );
+        assert!(!response.to_string().contains("connect_ticket"));
+        assert!(!response.to_string().contains("127.0.0.1"));
+
+        let requests = fixture.remote_requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["_runtime_invocation"]["source"], "runtime");
+        assert_eq!(requests[0]["_runtime_invocation"]["target"], "custody");
+        assert_eq!(
+            requests[0]["_runtime_invocation"]["capability"],
+            "provider:runtime->custody:evaluate"
+        );
+        assert_eq!(
+            requests[0]["_runtime_invocation"]["carrier"]["source_endpoint_did"],
+            public_key_to_did(&fixture.local_node.endpoint.id())
+                .expect("test endpoint must encode as DID")
+        );
         drop(requests);
 
         shutdown_test_carrier_node(fixture.remote_node).await;
