@@ -529,7 +529,7 @@ async fn start_media_provider(
 ) -> anyhow::Result<()> {
     let startup = async {
         let status = request_media_provider_status(&bridge, status_timeout).await?;
-        require_media_provider_status(&status)?;
+        elastos_server::protected_content_runtime::require_media_provider_status(&status)?;
         let media_provider: Arc<dyn provider::Provider> = Arc::new(
             provider::CapsuleProvider::with_scheme(bridge.clone(), MEDIA_PROVIDER_ROUTE),
         );
@@ -585,43 +585,6 @@ fn require_model_provider_status(status: &serde_json::Value) -> anyhow::Result<(
         != Some(MODEL_PROVIDER_PROTOCOL_VERSION)
     {
         anyhow::bail!("model-provider status has an unsupported protocol version");
-    }
-    Ok(())
-}
-
-fn require_media_provider_status(status: &serde_json::Value) -> anyhow::Result<()> {
-    if status.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
-        anyhow::bail!("media-provider status request did not succeed");
-    }
-    let data = status
-        .get("data")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| anyhow::anyhow!("media-provider status is missing data"))?;
-    if data.get("provider").and_then(serde_json::Value::as_str) != Some(MEDIA_PROVIDER_ID) {
-        anyhow::bail!("media-provider status has an unsupported provider identity");
-    }
-    if data
-        .get("protocol_version")
-        .and_then(serde_json::Value::as_str)
-        != Some(MEDIA_PROVIDER_PROTOCOL_VERSION)
-    {
-        anyhow::bail!("media-provider status has an unsupported protocol version");
-    }
-    if data.get("version").and_then(serde_json::Value::as_str) != Some(MEDIA_PROVIDER_VERSION) {
-        anyhow::bail!("media-provider status has an unsupported version");
-    }
-    if data.get("configured").and_then(serde_json::Value::as_bool) != Some(true) {
-        anyhow::bail!("media-provider is not configured");
-    }
-    let operations = data
-        .get("supported_operations")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("media-provider status is missing operations"))?;
-    if operations.len() != 2
-        || operations[0].as_str() != Some("status")
-        || operations[1].as_str() != Some("prepare")
-    {
-        anyhow::bail!("media-provider status has unsupported operations");
     }
     Ok(())
 }
@@ -2037,9 +2000,13 @@ fn provider_config_from_env_or_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::ffi::CString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
     use std::sync::Mutex;
     use tempfile::TempDir;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -2180,6 +2147,11 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn read_pid(path: &Path) -> libc::pid_t {
+        fs::read_to_string(path).unwrap().trim().parse().unwrap()
+    }
+
+    #[cfg(unix)]
     fn assert_pid_absent(pid: libc::pid_t) {
         let result = unsafe { libc::kill(pid, 0) };
         let err = std::io::Error::last_os_error();
@@ -2189,6 +2161,56 @@ mod tests {
             Some(libc::ESRCH),
             "pid {pid} should be reaped"
         );
+    }
+
+    #[cfg(unix)]
+    fn create_test_fifo(path: &Path) {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
+    #[cfg(unix)]
+    fn write_initialized_media_provider_script(
+        root: &Path,
+        name: &str,
+        status_response: &serde_json::Value,
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let binary = root.join(format!("{name}.sh"));
+        let pid_file = root.join(format!("{name}.pid"));
+        let request_log = root.join(format!("{name}.requests"));
+        let script = format!(
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" > '{}'\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{}'\n  case \"$line\" in\n    *'\"op\":\"init\"'*) printf '%s\\n' '{{\"status\":\"ok\"}}' ;;\n    *'\"op\":\"status\"'*) printf '%s\\n' '{}' ;;\n    *'\"op\":\"shutdown\"'*) printf '%s\\n' '{{\"status\":\"ok\"}}'; exit 0 ;;\n    *) exit 1 ;;\n  esac\ndone\n",
+            pid_file.display(),
+            request_log.display(),
+            status_response,
+        );
+        fs::write(&binary, script).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        (binary, pid_file, request_log)
+    }
+
+    #[cfg(unix)]
+    fn write_blocking_media_status_script(
+        root: &Path,
+    ) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let binary = root.join("media-provider-timeout.sh");
+        let pid_file = root.join("media-provider-timeout.pid");
+        let request_log = root.join("media-provider-timeout.requests");
+        let status_signal = root.join("media-provider-status.signal");
+        let status_release = root.join("media-provider-status.release");
+        create_test_fifo(&status_signal);
+        create_test_fifo(&status_release);
+        let script = format!(
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" > '{}'\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{}'\n  case \"$line\" in\n    *'\"op\":\"init\"'*) printf '%s\\n' '{{\"status\":\"ok\"}}' ;;\n    *'\"op\":\"status\"'*) printf x > '{}'; cat '{}' >/dev/null; printf '%s\\n' '{}' ;;\n    *'\"op\":\"shutdown\"'*) printf '%s\\n' '{{\"status\":\"ok\"}}'; exit 0 ;;\n    *) exit 1 ;;\n  esac\ndone\n",
+            pid_file.display(),
+            request_log.display(),
+            status_signal.display(),
+            status_release.display(),
+            media_provider_status(),
+        );
+        fs::write(&binary, script).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        (binary, pid_file, request_log, status_signal, status_release)
     }
 
     #[tokio::test]
@@ -2612,6 +2634,21 @@ mod tests {
         wrong_operations["data"]["supported_operations"] =
             serde_json::json!(["status", "prepare", "publish"]);
         cases.push(wrong_operations);
+        let mut reordered_operations = media_provider_status();
+        reordered_operations["data"]["supported_operations"] =
+            serde_json::json!(["prepare", "status"]);
+        cases.push(reordered_operations);
+        let mut missing_operations = media_provider_status();
+        missing_operations["data"]["supported_operations"] = serde_json::json!(["status"]);
+        cases.push(missing_operations);
+        let mut extra_data = media_provider_status();
+        extra_data["data"]["route"] = serde_json::json!("private");
+        cases.push(extra_data);
+        let mut extra_top = media_provider_status();
+        extra_top["route"] = serde_json::json!("private");
+        cases.push(extra_top);
+        cases.push(serde_json::json!({"status": "ok"}));
+        cases.push(serde_json::json!({"status": "error", "data": {}}));
 
         for status in cases {
             let registry = provider::ProviderRegistry::new();
@@ -2688,6 +2725,149 @@ mod tests {
         assert_eq!(requests[0]["op"], "status");
         assert_eq!(requests[1]["op"], "shutdown");
         first_provider.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn media_provider_startup_reaps_real_child_after_status_rejection() {
+        let tempdir = TempDir::new().unwrap();
+        let registry = provider::ProviderRegistry::new();
+        let mut status = media_provider_status();
+        status["data"]["provider"] = serde_json::json!("wrong-provider");
+        let (script_path, pid_path, request_log) = write_initialized_media_provider_script(
+            tempdir.path(),
+            "media-provider-rejected",
+            &status,
+        );
+        let bridge = Arc::new(
+            provider::ProviderBridge::spawn(&script_path, Default::default())
+                .await
+                .unwrap(),
+        );
+
+        let error = start_media_provider(&registry, bridge, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("unsupported provider identity"));
+        assert!(
+            !registry
+                .has_ready_runtime_provider_target(MEDIA_PROVIDER_ROUTE)
+                .await
+        );
+        let pid = read_pid(&pid_path);
+        assert_pid_absent(pid);
+        let requests = fs::read_to_string(request_log).unwrap();
+        assert!(requests.contains(r#""op":"status""#));
+        assert!(requests.contains(r#""op":"shutdown""#));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn media_provider_duplicate_registration_reaps_real_rejected_child() {
+        let tempdir = TempDir::new().unwrap();
+        let registry = provider::ProviderRegistry::new();
+        let first_root = tempdir.path().join("first");
+        let second_root = tempdir.path().join("second");
+        fs::create_dir_all(&first_root).unwrap();
+        fs::create_dir_all(&second_root).unwrap();
+        let (first_binary, first_pid_path, _) = write_initialized_media_provider_script(
+            &first_root,
+            "media-provider",
+            &media_provider_status(),
+        );
+        let (second_binary, second_pid_path, second_log) = write_initialized_media_provider_script(
+            &second_root,
+            "media-provider",
+            &media_provider_status(),
+        );
+        let first_bridge = Arc::new(
+            provider::ProviderBridge::spawn(&first_binary, Default::default())
+                .await
+                .unwrap(),
+        );
+        start_media_provider(&registry, first_bridge, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let first_pid = read_pid(&first_pid_path);
+
+        let second_bridge = Arc::new(
+            provider::ProviderBridge::spawn(&second_binary, Default::default())
+                .await
+                .unwrap(),
+        );
+        let error = start_media_provider(&registry, second_bridge, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("failed to register"));
+        assert_pid_absent(read_pid(&second_pid_path));
+        let requests = fs::read_to_string(second_log).unwrap();
+        assert!(requests.contains(r#""op":"status""#));
+        assert!(requests.contains(r#""op":"shutdown""#));
+        registry
+            .unregister_runtime_provider_target(MEDIA_PROVIDER_ROUTE)
+            .await
+            .unwrap();
+        assert_pid_absent(first_pid);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn media_provider_status_timeout_sends_shutdown_and_reaps_real_child() {
+        let tempdir = TempDir::new().unwrap();
+        let registry = Arc::new(provider::ProviderRegistry::new());
+        let (binary, pid_path, request_log, status_signal, status_release) =
+            write_blocking_media_status_script(tempdir.path());
+        let bridge = Arc::new(
+            provider::ProviderBridge::spawn(&binary, Default::default())
+                .await
+                .unwrap(),
+        );
+        let task_registry = registry.clone();
+        let registration = tokio::spawn(async move {
+            start_media_provider(&task_registry, bridge, Duration::from_secs(5)).await
+        });
+
+        let mut signal = tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(&status_signal)
+            .await
+            .unwrap();
+        let mut marker = [0u8; 1];
+        signal.read_exact(&mut marker).await.unwrap();
+        assert_eq!(marker, [b'x']);
+        tokio::time::pause();
+        let release_status = tokio::spawn(async move {
+            let release = tokio::time::timeout(
+                Duration::from_secs(5) + Duration::from_millis(1),
+                std::future::pending::<()>(),
+            )
+            .await;
+            assert!(release.is_err());
+            let mut release = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&status_release)
+                .await
+                .unwrap();
+            release.write_all(b"x").await.unwrap();
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5) + Duration::from_millis(1)).await;
+        tokio::time::resume();
+        release_status.await.unwrap();
+
+        let error = registration.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("status request timed out"));
+        assert_pid_absent(read_pid(&pid_path));
+        let requests = fs::read_to_string(request_log).unwrap();
+        assert!(requests.contains(r#""op":"status""#));
+        assert!(requests.contains(r#""op":"shutdown""#));
+        assert!(
+            !registry
+                .has_ready_runtime_provider_target(MEDIA_PROVIDER_ROUTE)
+                .await
+        );
     }
 
     #[cfg(unix)]

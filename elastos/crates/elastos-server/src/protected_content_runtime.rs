@@ -37,8 +37,10 @@ use elastos_protected_content_provider_contracts::{
     ProtectProviderResponseV1, ProtectionSessionNodeV1, RightsProviderRequestV1,
     RightsProviderResponseV1, ValidatedCencFmp4MediaSessionLayoutV1,
     ValidatedClearFmp4MediaSessionLayoutV1, ViewerMediaPartSelectorV1,
+    CUSTODY_PROVIDER_REQUEST_SCHEMA_V1, CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1,
     DECRYPT_PROVIDER_REQUEST_SCHEMA_V1, DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1,
     MAX_PROTECT_MEDIA_SEGMENTS_V1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
+    PROTECT_PROVIDER_REQUEST_SCHEMA_V1, PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
 };
 use elastos_protected_content_rights::{
     PrivateCustodyRightsRequestV1, CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP,
@@ -140,13 +142,44 @@ const CONTENT_AVAILABILITY_RECEIPT_DOMAIN: &str = "elastos.content.availability.
 const MAX_RUNTIME_VIEWER_RECONCILE_MINT_DIRS: usize = 256;
 const MAX_RUNTIME_VIEWER_RECONCILE_RECORDS: usize = 1024;
 const MAX_RUNTIME_VIEWER_RECORD_BYTES: u64 = 64 * 1024;
+const PROTECT_PROVIDER_PROCESS_ID: &str = "protected-content-protect";
+const MEDIA_PROVIDER_PROCESS_ID: &str = "media-provider";
+const MEDIA_PROVIDER_PROTOCOL_VERSION: &str = "elastos.media-provider/v1";
+const PROTECT_PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
+    Some(version) => version,
+    None => "0.1.0-dev",
+};
+const MEDIA_PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
+    Some(version) => version,
+    None => "0.1.0-dev",
+};
+const CUSTODY_PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
+    Some(version) => version,
+    None => "0.1.0-dev",
+};
 const PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION: &str =
     match option_env!("ELASTOS_RELEASE_VERSION") {
         Some(version) => version,
         None => "0.1.0-dev",
     };
-const PROTECTED_CONTENT_DECRYPT_PROVIDER_STATUS_TIMEOUT: std::time::Duration =
+const PROTECTED_CONTENT_PROVIDER_STATUS_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
+const PROTECT_PROVIDER_OPERATIONS: &[&str] = &[
+    "status",
+    "open_protection_session",
+    "protect_media_segment",
+    "finalize_protection_session",
+    "cancel_protection_session",
+    "close_protection_session",
+    "shutdown",
+];
+const MEDIA_PROVIDER_OPERATIONS: &[&str] = &["status", "prepare"];
+const CUSTODY_PROVIDER_OPERATIONS: &[&str] = &[
+    "status",
+    "provision_node_share",
+    "release_contribution",
+    "shutdown",
+];
 const PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS: &[&str] = &[
     "status",
     "prepare_recipient",
@@ -999,61 +1032,59 @@ pub async fn register_inactive_custody_provider(
         base_path,
         ..Default::default()
     };
-    let bridge = elastos_runtime::provider::ProviderBridge::spawn(binary_path, bridge_config)
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to spawn inactive custody provider: {error}"))?;
-    let provider: Arc<dyn Provider> = Arc::new(InactiveCustodyProvider::new(
-        Arc::new(bridge),
-        Arc::downgrade(registry),
-    ));
-    if let Err(error) =
-        register_inactive_custody_runtime_provider_target(registry, provider.clone()).await
-    {
-        if let Err(shutdown_error) = provider.shutdown().await {
-            return Err(anyhow::anyhow!(
-                "failed to register inactive custody route: {error}; failed to settle rejected inactive custody provider: {shutdown_error}"
-            ));
-        }
-        return Err(anyhow::anyhow!(
-            "failed to register inactive custody route: {error}"
+    let bridge = Arc::new(
+        elastos_runtime::provider::ProviderBridge::spawn(binary_path, bridge_config)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("failed to spawn inactive custody provider: {error}")
+            })?,
+    );
+    let startup = async {
+        let status =
+            request_protected_provider_startup_status(&bridge, "inactive custody provider").await?;
+        require_inactive_custody_provider_status(&status)?;
+        let provider: Arc<dyn Provider> = Arc::new(InactiveCustodyProvider::new(
+            bridge.clone(),
+            Arc::downgrade(registry),
         ));
+        register_inactive_custody_runtime_provider_target(registry, provider)
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to register inactive custody route: {error}"))
     }
-    Ok(())
+    .await;
+    settle_protected_provider_startup(&bridge, startup, "inactive custody provider").await
 }
 
 pub async fn register_protect_provider(
     registry: &Arc<ProviderRegistry>,
     binary_path: &Path,
 ) -> anyhow::Result<()> {
-    let bridge = elastos_runtime::provider::ProviderBridge::spawn(
-        binary_path,
-        ProviderConfig {
-            extra: json!({}),
-            ..Default::default()
-        },
-    )
-    .await
-    .map_err(|error| anyhow::anyhow!("failed to spawn protect provider: {error}"))?;
-    let bridge = Arc::new(bridge);
-    let provider: Arc<dyn Provider> =
-        Arc::new(elastos_runtime::provider::CapsuleProvider::with_scheme(
-            bridge.clone(),
-            PROTECT_PROVIDER_ID,
-        ));
-    if let Err(error) = registry
-        .register_runtime_provider_target(PROTECT_PROVIDER_ID, provider)
+    let bridge = Arc::new(
+        elastos_runtime::provider::ProviderBridge::spawn(
+            binary_path,
+            ProviderConfig {
+                extra: json!({}),
+                ..Default::default()
+            },
+        )
         .await
-    {
-        if let Err(shutdown_error) = bridge.shutdown().await {
-            return Err(anyhow::anyhow!(
-                "failed to register protect provider: {error}; protect provider shutdown/reap also failed: {shutdown_error}"
+        .map_err(|error| anyhow::anyhow!("failed to spawn protect provider: {error}"))?,
+    );
+    let startup = async {
+        let status = request_protected_provider_startup_status(&bridge, "protect provider").await?;
+        require_protect_provider_status(&status)?;
+        let provider: Arc<dyn Provider> =
+            Arc::new(elastos_runtime::provider::CapsuleProvider::with_scheme(
+                bridge.clone(),
+                PROTECT_PROVIDER_ID,
             ));
-        }
-        return Err(anyhow::anyhow!(
-            "failed to register protect provider: {error}"
-        ));
+        registry
+            .register_runtime_provider_target(PROTECT_PROVIDER_ID, provider)
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to register protect provider: {error}"))
     }
-    Ok(())
+    .await;
+    settle_protected_provider_startup(&bridge, startup, "protect provider").await
 }
 
 pub async fn register_protected_content_decrypt_provider(
@@ -1080,15 +1111,11 @@ pub async fn register_protected_content_decrypt_provider(
         })?,
     );
     let startup = async {
-        let status = tokio::time::timeout(
-            PROTECTED_CONTENT_DECRYPT_PROVIDER_STATUS_TIMEOUT,
-            bridge.send_raw(&json!({"op":"status"})),
+        let status = request_protected_provider_startup_status(
+            &bridge,
+            "protected-content decrypt provider",
         )
-        .await
-        .map_err(|_| anyhow::anyhow!("protected-content decrypt provider status timed out"))?
-        .map_err(|error| {
-            anyhow::anyhow!("protected-content decrypt provider status failed: {error}")
-        })?;
+        .await?;
         require_protected_content_decrypt_provider_status(&status)?;
         let provider: Arc<dyn Provider> =
             Arc::new(elastos_runtime::provider::CapsuleProvider::with_scheme(
@@ -1103,49 +1130,147 @@ pub async fn register_protected_content_decrypt_provider(
             })
     }
     .await;
-    if let Err(startup_error) = startup {
-        if let Err(shutdown_error) = bridge.shutdown().await {
-            return Err(anyhow::anyhow!(
-                "{startup_error}; protected-content decrypt provider shutdown/reap also failed: {shutdown_error}"
-            ));
-        }
-        return Err(startup_error);
+    settle_protected_provider_startup(&bridge, startup, "protected-content decrypt provider").await
+}
+
+async fn request_protected_provider_startup_status(
+    bridge: &ProviderBridge,
+    label: &str,
+) -> anyhow::Result<Value> {
+    tokio::time::timeout(
+        PROTECTED_CONTENT_PROVIDER_STATUS_TIMEOUT,
+        bridge.send_raw(&json!({"op":"status"})),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("{label} status timed out"))?
+    .map_err(|error| anyhow::anyhow!("{label} status failed: {error}"))
+}
+
+async fn settle_protected_provider_startup(
+    bridge: &ProviderBridge,
+    startup: anyhow::Result<()>,
+    label: &str,
+) -> anyhow::Result<()> {
+    let Err(startup_error) = startup else {
+        return Ok(());
+    };
+    if let Err(shutdown_error) = bridge.shutdown().await {
+        return Err(anyhow::anyhow!(
+            "{startup_error}; {label} shutdown/reap also failed: {shutdown_error}"
+        ));
     }
-    Ok(())
+    Err(startup_error)
+}
+
+fn require_protect_provider_status(status: &Value) -> anyhow::Result<()> {
+    let data = require_exact_provider_status_data(
+        status,
+        "protect provider",
+        &[
+            "provider",
+            "version",
+            "configured",
+            "supported_operations",
+            "request_schema",
+            "response_schema",
+        ],
+    )?;
+    if data.get("provider").and_then(Value::as_str) != Some(PROTECT_PROVIDER_PROCESS_ID) {
+        anyhow::bail!("protect provider status has an unsupported identity");
+    }
+    if data.get("version").and_then(Value::as_str) != Some(PROTECT_PROVIDER_VERSION) {
+        anyhow::bail!("protect provider status has an unsupported version");
+    }
+    if data.get("configured").and_then(Value::as_bool) != Some(true) {
+        anyhow::bail!("protect provider is not configured");
+    }
+    if data.get("request_schema").and_then(Value::as_str)
+        != Some(PROTECT_PROVIDER_REQUEST_SCHEMA_V1)
+        || data.get("response_schema").and_then(Value::as_str)
+            != Some(PROTECT_PROVIDER_RESPONSE_SCHEMA_V1)
+    {
+        anyhow::bail!("protect provider status has unsupported schemas");
+    }
+    require_exact_provider_operations(data, PROTECT_PROVIDER_OPERATIONS, "protect provider")
+}
+
+pub fn require_media_provider_status(status: &Value) -> anyhow::Result<()> {
+    let data = require_exact_provider_status_data(
+        status,
+        "media-provider",
+        &[
+            "provider",
+            "protocol_version",
+            "version",
+            "configured",
+            "supported_operations",
+        ],
+    )?;
+    if data.get("provider").and_then(Value::as_str) != Some(MEDIA_PROVIDER_PROCESS_ID) {
+        anyhow::bail!("media-provider status has an unsupported provider identity");
+    }
+    if data.get("protocol_version").and_then(Value::as_str) != Some(MEDIA_PROVIDER_PROTOCOL_VERSION)
+    {
+        anyhow::bail!("media-provider status has an unsupported protocol version");
+    }
+    if data.get("version").and_then(Value::as_str) != Some(MEDIA_PROVIDER_VERSION) {
+        anyhow::bail!("media-provider status has an unsupported version");
+    }
+    if data.get("configured").and_then(Value::as_bool) != Some(true) {
+        anyhow::bail!("media-provider is not configured");
+    }
+    require_exact_provider_operations(data, MEDIA_PROVIDER_OPERATIONS, "media-provider")
+}
+
+fn require_inactive_custody_provider_status(status: &Value) -> anyhow::Result<()> {
+    let data = require_exact_provider_status_data(
+        status,
+        "inactive custody provider",
+        &[
+            "provider",
+            "version",
+            "configured",
+            "supported_operations",
+            "request_schema",
+            "response_schema",
+        ],
+    )?;
+    if data.get("provider").and_then(Value::as_str) != Some(CUSTODY_PROVIDER_ID) {
+        anyhow::bail!("inactive custody provider status has an unsupported identity");
+    }
+    if data.get("version").and_then(Value::as_str) != Some(CUSTODY_PROVIDER_VERSION) {
+        anyhow::bail!("inactive custody provider status has an unsupported version");
+    }
+    if data.get("configured").and_then(Value::as_bool) != Some(true) {
+        anyhow::bail!("inactive custody provider is not configured");
+    }
+    if data.get("request_schema").and_then(Value::as_str)
+        != Some(CUSTODY_PROVIDER_REQUEST_SCHEMA_V1)
+        || data.get("response_schema").and_then(Value::as_str)
+            != Some(CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1)
+    {
+        anyhow::bail!("inactive custody provider status has unsupported schemas");
+    }
+    require_exact_provider_operations(
+        data,
+        CUSTODY_PROVIDER_OPERATIONS,
+        "inactive custody provider",
+    )
 }
 
 fn require_protected_content_decrypt_provider_status(status: &Value) -> anyhow::Result<()> {
-    let status_object = status
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("protected-content decrypt provider status is invalid"))?;
-    if status_object.len() != 2
-        || !status_object.contains_key("status")
-        || !status_object.contains_key("data")
-        || status.get("status").and_then(Value::as_str) != Some("ok")
-    {
-        anyhow::bail!("protected-content decrypt provider status did not succeed");
-    }
-    let data = status
-        .get("data")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            anyhow::anyhow!("protected-content decrypt provider status is missing data")
-        })?;
-    let expected_fields = [
-        "provider",
-        "version",
-        "configured",
-        "supported_operations",
-        "request_schema",
-        "response_schema",
-    ];
-    if data.len() != expected_fields.len()
-        || expected_fields
-            .iter()
-            .any(|field| !data.contains_key(*field))
-    {
-        anyhow::bail!("protected-content decrypt provider status has an unsupported shape");
-    }
+    let data = require_exact_provider_status_data(
+        status,
+        "protected-content decrypt provider",
+        &[
+            "provider",
+            "version",
+            "configured",
+            "supported_operations",
+            "request_schema",
+            "response_schema",
+        ],
+    )?;
     if data.get("provider").and_then(Value::as_str) != Some(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID) {
         anyhow::bail!("protected-content decrypt provider status has an unsupported identity");
     }
@@ -1164,21 +1289,58 @@ fn require_protected_content_decrypt_provider_status(status: &Value) -> anyhow::
     {
         anyhow::bail!("protected-content decrypt provider status has unsupported schemas");
     }
+    require_exact_provider_operations(
+        data,
+        PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS,
+        "protected-content decrypt provider",
+    )
+}
+
+fn require_exact_provider_status_data<'a>(
+    status: &'a Value,
+    label: &str,
+    expected_fields: &[&str],
+) -> anyhow::Result<&'a serde_json::Map<String, Value>> {
+    let status_object = status
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("{label} status is invalid"))?;
+    if status_object.len() != 2
+        || !status_object.contains_key("status")
+        || !status_object.contains_key("data")
+        || status.get("status").and_then(Value::as_str) != Some("ok")
+    {
+        anyhow::bail!("{label} status did not succeed");
+    }
+    let data = status
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("{label} status is missing data"))?;
+    if data.len() != expected_fields.len()
+        || expected_fields
+            .iter()
+            .any(|field| !data.contains_key(*field))
+    {
+        anyhow::bail!("{label} status has an unsupported shape");
+    }
+    Ok(data)
+}
+
+fn require_exact_provider_operations(
+    data: &serde_json::Map<String, Value>,
+    expected: &[&str],
+    label: &str,
+) -> anyhow::Result<()> {
     let supported_operations = data
         .get("supported_operations")
         .and_then(Value::as_array)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "protected-content decrypt provider status is missing supported operations"
-            )
-        })?;
-    if supported_operations.len() != PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS.len()
+        .ok_or_else(|| anyhow::anyhow!("{label} status is missing supported operations"))?;
+    if supported_operations.len() != expected.len()
         || supported_operations
             .iter()
-            .zip(PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS)
+            .zip(expected)
             .any(|(actual, expected)| actual.as_str() != Some(*expected))
     {
-        anyhow::bail!("protected-content decrypt provider status has unsupported operations");
+        anyhow::bail!("{label} status has unsupported operations");
     }
     Ok(())
 }

@@ -12,7 +12,8 @@ use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, ProtectProviderRequestOpV1, ProtectProviderRequestV1,
     ProtectProviderResponseV1, ProtectionSessionNodeV1, ProviderFailureCodeV1,
     ValidatedClearFmp4MediaSessionLayoutV1, MAX_PROVIDER_FRAME_BYTES_V1,
-    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
+    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1, PROTECT_PROVIDER_REQUEST_SCHEMA_V1,
+    PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -214,6 +215,8 @@ impl ProtectProvider {
             "provider": "protected-content-protect",
             "version": PROVIDER_VERSION,
             "configured": self.state.is_some(),
+            "request_schema": PROTECT_PROVIDER_REQUEST_SCHEMA_V1,
+            "response_schema": PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
             "supported_operations": [
                 "status",
                 "open_protection_session",
@@ -1137,6 +1140,35 @@ mod tests {
                 serde_json::to_string(&other).unwrap()
             ),
         }
+    }
+
+    #[test]
+    fn status_exposes_exact_runtime_readiness_contract() {
+        let mut provider = init_provider();
+        let (response, should_shutdown) = provider.handle_frame(br#"{"op":"status"}"#);
+        assert!(!should_shutdown);
+        let ProviderResponse::Ok { data: Some(data) } = response else {
+            panic!("status must return readiness data");
+        };
+        assert_eq!(
+            data,
+            json!({
+                "provider": "protected-content-protect",
+                "version": PROVIDER_VERSION,
+                "configured": true,
+                "request_schema": PROTECT_PROVIDER_REQUEST_SCHEMA_V1,
+                "response_schema": PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
+                "supported_operations": [
+                    "status",
+                    "open_protection_session",
+                    "protect_media_segment",
+                    "finalize_protection_session",
+                    "cancel_protection_session",
+                    "close_protection_session",
+                    "shutdown"
+                ],
+            })
+        );
     }
 
     fn open_request(

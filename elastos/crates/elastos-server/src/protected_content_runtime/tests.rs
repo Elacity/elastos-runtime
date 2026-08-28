@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -44,6 +48,8 @@ use k256::ecdsa::SigningKey as WalletSigningKey;
 use serde_json::{json, Value};
 use sha2::Digest as _;
 use sha3::Keccak256;
+#[cfg(unix)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify};
 use x_wing::kem::{Decapsulator as _, KeyExport as _};
 use x_wing::TryKeyInit as _;
@@ -64,9 +70,11 @@ use super::{
     RuntimeCustodyRouteBindingConfig, RuntimeCustodyRouteTransportConfig,
     RuntimeCustodyTerminalPurchaseRecord, RuntimeDecryptRegistryAdapter,
     RuntimeLibraryMediaPreparation, CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1,
-    CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID, MEDIA_PROVIDER_ID,
-    PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS,
-    PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION, PROTECT_PROVIDER_ID,
+    CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID, CUSTODY_PROVIDER_OPERATIONS,
+    CUSTODY_PROVIDER_VERSION, MEDIA_PROVIDER_ID, PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+    PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS, PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION,
+    PROTECTED_CONTENT_PROVIDER_STATUS_TIMEOUT, PROTECT_PROVIDER_ID, PROTECT_PROVIDER_OPERATIONS,
+    PROTECT_PROVIDER_PROCESS_ID, PROTECT_PROVIDER_VERSION,
     RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE, RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE,
     RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE,
     RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE, RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE,
@@ -106,8 +114,10 @@ use elastos_protected_content_provider_contracts::{
     RightsProviderResponseV1, ValidatedClearFmp4MediaSessionLayoutV1,
     ValidatedCustodyProviderRequestV1, ValidatedDecryptProviderRequestV1,
     ValidatedRightsProviderRequestV1, ViewerMediaPartSelectorV1,
+    CUSTODY_PROVIDER_REQUEST_SCHEMA_V1, CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1,
     DECRYPT_PROVIDER_REQUEST_SCHEMA_V1, DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1,
-    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
+    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1, PROTECT_PROVIDER_REQUEST_SCHEMA_V1,
+    PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
 };
 
 const TEST_VIEWER_LAUNCH_ID: &str = "launch:11111111111111111111111111111111";
@@ -3634,18 +3644,241 @@ fn inactive_custody_state_root(data_dir: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum ProtectedStartupProvider {
+    Protect,
+    Custody,
+    Decrypt,
+}
+
+#[cfg(unix)]
+impl ProtectedStartupProvider {
+    const ALL: [Self; 3] = [Self::Protect, Self::Custody, Self::Decrypt];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Protect => "protect-provider",
+            Self::Custody => "custody-provider",
+            Self::Decrypt => "protected-content-decrypt-provider",
+        }
+    }
+
+    fn target(self) -> &'static str {
+        match self {
+            Self::Protect => PROTECT_PROVIDER_ID,
+            Self::Custody => CUSTODY_PROVIDER_ID,
+            Self::Decrypt => PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+        }
+    }
+
+    fn status(self) -> Value {
+        match self {
+            Self::Protect => json!({
+                "status": "ok",
+                "data": {
+                    "provider": PROTECT_PROVIDER_PROCESS_ID,
+                    "version": PROTECT_PROVIDER_VERSION,
+                    "configured": true,
+                    "supported_operations": PROTECT_PROVIDER_OPERATIONS,
+                    "request_schema": PROTECT_PROVIDER_REQUEST_SCHEMA_V1,
+                    "response_schema": PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
+                }
+            }),
+            Self::Custody => json!({
+                "status": "ok",
+                "data": {
+                    "provider": CUSTODY_PROVIDER_ID,
+                    "version": CUSTODY_PROVIDER_VERSION,
+                    "configured": true,
+                    "supported_operations": CUSTODY_PROVIDER_OPERATIONS,
+                    "request_schema": CUSTODY_PROVIDER_REQUEST_SCHEMA_V1,
+                    "response_schema": CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1,
+                }
+            }),
+            Self::Decrypt => protected_content_decrypt_provider_status(),
+        }
+    }
+
+    fn prepare_private_config(self, data_dir: &Path) {
+        owner_only_dir(data_dir);
+        if matches!(self, Self::Custody) {
+            owner_only_dir(&inactive_custody_state_root(data_dir));
+        }
+    }
+
+    async fn register(
+        self,
+        registry: &Arc<ProviderRegistry>,
+        binary: &Path,
+        data_dir: &Path,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Protect => register_protect_provider(registry, binary).await,
+            Self::Custody => register_inactive_custody_provider(registry, binary, data_dir).await,
+            Self::Decrypt => {
+                register_protected_content_decrypt_provider(
+                    registry,
+                    binary,
+                    runtime_operation_issuer_for_seed(0x41),
+                )
+                .await
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 fn write_mock_custody_provider(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let binary = root.join("mock-custody-provider.sh");
     let request_log = root.join("mock-custody-provider.requests");
     let pid_file = root.join("mock-custody-provider.pid");
     let script = format!(
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" >> '{}'\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{}'\n  case \"$line\" in\n    *'\"op\":\"shutdown\"'*) printf '%s\\n' '{{\"status\":\"ok\"}}'; exit 0 ;;\n    *'\"unexpected\"'* ) printf '%s\\n' '{{\"status\":\"error\",\"code\":\"invalid_request\"}}' ;;\n    *'\"op\":\"status\"'*) printf '%s\\n' '{{\"status\":\"ok\",\"data\":{{\"provider\":\"custody\",\"version\":\"test-version\",\"configured\":true,\"supported_operations\":[\"status\",\"provision_node_share\",\"release_contribution\",\"shutdown\"],\"request_schema\":\"req-schema\",\"response_schema\":\"resp-schema\"}}}}' ;;\n    *'\"op\":\"release_contribution\"'*) printf '%s\\n' '{{\"status\":\"ok\",\"data\":{{\"echo\":\"custody\"}}}}' ;;\n    *) printf '%s\\n' '{{\"status\":\"ok\",\"data\":{{\"echo\":\"init\"}}}}' ;;\n  esac\ndone\n",
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" >> '{}'\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{}'\n  case \"$line\" in\n    *'\"op\":\"shutdown\"'*) printf '%s\\n' '{{\"status\":\"ok\"}}'; exit 0 ;;\n    *'\"unexpected\"'* ) printf '%s\\n' '{{\"status\":\"error\",\"code\":\"invalid_request\"}}' ;;\n    *'\"op\":\"status\"'*) printf '%s\\n' '{}' ;;\n    *'\"op\":\"release_contribution\"'*) printf '%s\\n' '{{\"status\":\"ok\",\"data\":{{\"echo\":\"custody\"}}}}' ;;\n    *) printf '%s\\n' '{{\"status\":\"ok\",\"data\":{{\"echo\":\"init\"}}}}' ;;\n  esac\ndone\n",
         pid_file.display(),
-        request_log.display()
+        request_log.display(),
+        ProtectedStartupProvider::Custody.status(),
     );
     fs::write(&binary, script).unwrap();
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
     (binary, pid_file, request_log)
+}
+
+#[cfg(unix)]
+fn write_mock_protected_startup_provider(
+    root: &Path,
+    provider_name: &str,
+    status_response: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    write_mock_protected_startup_provider_with_shutdown(
+        root,
+        provider_name,
+        status_response,
+        r#"{"status":"ok"}"#,
+    )
+}
+
+#[cfg(unix)]
+fn write_mock_protected_startup_provider_with_shutdown(
+    root: &Path,
+    provider_name: &str,
+    status_response: &str,
+    shutdown_response: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let binary = root.join(format!("mock-{provider_name}.sh"));
+    let request_log = root.join(format!("mock-{provider_name}.requests"));
+    let pid_file = root.join(format!("mock-{provider_name}.pid"));
+    let script = format!(
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" >> '{}'\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{}'\n  case \"$line\" in\n    *'\"op\":\"shutdown\"'*) printf '%s\\n' '{}'; exit 0 ;;\n    *'\"op\":\"status\"'*) printf '%s\\n' '{}' ;;\n    *'\"op\":\"init\"'*) printf '%s\\n' '{{\"status\":\"ok\"}}' ;;\n    *) printf '%s\\n' '{{\"status\":\"error\",\"code\":\"unexpected\"}}' ;;\n  esac\ndone\n",
+        pid_file.display(),
+        request_log.display(),
+        shutdown_response,
+        status_response,
+    );
+    fs::write(&binary, script).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    (binary, pid_file, request_log)
+}
+
+#[cfg(unix)]
+fn create_test_fifo(path: &Path) {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+
+#[cfg(unix)]
+fn write_blocking_protected_status_provider(
+    root: &Path,
+    provider: ProtectedStartupProvider,
+) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+    let binary = root.join(format!("mock-{}-timeout.sh", provider.name()));
+    let request_log = root.join(format!("mock-{}-timeout.requests", provider.name()));
+    let pid_file = root.join(format!("mock-{}-timeout.pid", provider.name()));
+    let status_signal = root.join(format!("mock-{}-status.signal", provider.name()));
+    let status_release = root.join(format!("mock-{}-status.release", provider.name()));
+    create_test_fifo(&status_signal);
+    create_test_fifo(&status_release);
+    let script = format!(
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" >> '{}'\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{}'\n  case \"$line\" in\n    *'\"op\":\"shutdown\"'*) printf '%s\\n' '{{\"status\":\"ok\"}}'; exit 0 ;;\n    *'\"op\":\"status\"'*) printf x > '{}'; cat '{}' >/dev/null; printf '%s\\n' '{}' ;;\n    *'\"op\":\"init\"'*) printf '%s\\n' '{{\"status\":\"ok\"}}' ;;\n    *) printf '%s\\n' '{{\"status\":\"error\",\"code\":\"unexpected\"}}' ;;\n  esac\ndone\n",
+        pid_file.display(),
+        request_log.display(),
+        status_signal.display(),
+        status_release.display(),
+        provider.status(),
+    );
+    fs::write(&binary, script).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    (binary, pid_file, request_log, status_signal, status_release)
+}
+
+#[cfg(unix)]
+fn status_with_field(provider: ProtectedStartupProvider, field: &str, value: Value) -> Value {
+    let mut status = provider.status();
+    status["data"][field] = value;
+    status
+}
+
+#[cfg(unix)]
+fn protected_startup_status_mismatches(
+    provider: ProtectedStartupProvider,
+) -> Vec<(&'static str, Value)> {
+    let mut extra_operations = provider.status()["data"]["supported_operations"]
+        .as_array()
+        .unwrap()
+        .clone();
+    extra_operations.push(json!("unexpected"));
+    let mut reordered_operations = provider.status()["data"]["supported_operations"]
+        .as_array()
+        .unwrap()
+        .clone();
+    reordered_operations.swap(0, 1);
+    let mut extra_data = provider.status();
+    extra_data["data"]["route"] = json!("private");
+    let mut extra_top = provider.status();
+    extra_top["route"] = json!("private");
+    vec![
+        (
+            "identity",
+            status_with_field(provider, "provider", json!("wrong-provider")),
+        ),
+        (
+            "version",
+            status_with_field(provider, "version", json!("wrong-version")),
+        ),
+        (
+            "configured",
+            status_with_field(provider, "configured", json!(false)),
+        ),
+        (
+            "request-schema",
+            status_with_field(provider, "request_schema", json!("wrong-request-schema")),
+        ),
+        (
+            "response-schema",
+            status_with_field(provider, "response_schema", json!("wrong-response-schema")),
+        ),
+        (
+            "operations-missing",
+            status_with_field(provider, "supported_operations", json!(["status"])),
+        ),
+        (
+            "operations-extra",
+            status_with_field(
+                provider,
+                "supported_operations",
+                Value::Array(extra_operations),
+            ),
+        ),
+        (
+            "operations-reordered",
+            status_with_field(
+                provider,
+                "supported_operations",
+                Value::Array(reordered_operations),
+            ),
+        ),
+        ("extra-data", extra_data),
+        ("extra-top", extra_top),
+    ]
 }
 
 #[cfg(unix)]
@@ -3695,6 +3928,260 @@ fn read_pid(path: &Path) -> u32 {
         .trim()
         .parse()
         .unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn protected_provider_startup_rejects_status_mismatches_and_reaps_child() {
+    for provider in ProtectedStartupProvider::ALL {
+        for (case, status) in protected_startup_status_mismatches(provider) {
+            let temp = tempfile::tempdir().unwrap();
+            let case_root = temp.path().join(case);
+            fs::create_dir_all(&case_root).unwrap();
+            let data_dir = case_root.join("data");
+            provider.prepare_private_config(&data_dir);
+            let (binary, pid_file, request_log) = write_mock_protected_startup_provider(
+                &case_root,
+                provider.name(),
+                &status.to_string(),
+            );
+            let registry = Arc::new(ProviderRegistry::new());
+
+            provider
+                .register(&registry, &binary, &data_dir)
+                .await
+                .expect_err("mismatched provider status must fail closed");
+
+            assert!(
+                !process_is_running(read_pid(&pid_file)),
+                "{provider:?} {case}"
+            );
+            let requests = fs::read_to_string(request_log).unwrap();
+            assert!(requests.contains(r#""op":"status""#), "{provider:?} {case}");
+            assert!(
+                requests.contains(r#""op":"shutdown""#),
+                "{provider:?} {case}"
+            );
+            assert!(
+                !registry
+                    .has_ready_runtime_provider_target(provider.target())
+                    .await
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn protected_provider_startup_rejects_invalid_status_and_reaps_child() {
+    for provider in ProtectedStartupProvider::ALL {
+        for (case, status) in [
+            ("malformed-json", "not-json"),
+            ("missing-data", r#"{"status":"ok"}"#),
+            (
+                "error",
+                r#"{"status":"error","code":"not_ready","message":"not ready"}"#,
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let case_root = temp.path().join(case);
+            fs::create_dir_all(&case_root).unwrap();
+            let data_dir = case_root.join("data");
+            provider.prepare_private_config(&data_dir);
+            let (binary, pid_file, request_log) =
+                write_mock_protected_startup_provider(&case_root, provider.name(), status);
+            let registry = Arc::new(ProviderRegistry::new());
+
+            provider
+                .register(&registry, &binary, &data_dir)
+                .await
+                .expect_err("invalid provider status must fail closed");
+
+            assert!(
+                !process_is_running(read_pid(&pid_file)),
+                "{provider:?} {case}"
+            );
+            let requests = fs::read_to_string(request_log).unwrap();
+            assert!(requests.contains(r#""op":"status""#), "{provider:?} {case}");
+            assert!(
+                requests.contains(r#""op":"shutdown""#),
+                "{provider:?} {case}"
+            );
+            assert!(
+                !registry
+                    .has_ready_runtime_provider_target(provider.target())
+                    .await
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn protected_provider_startup_timeout_sends_shutdown_and_reaps_child() {
+    for provider in ProtectedStartupProvider::ALL {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        provider.prepare_private_config(&data_dir);
+        let (binary, pid_file, request_log, status_signal, status_release) =
+            write_blocking_protected_status_provider(temp.path(), provider);
+        let registry = Arc::new(ProviderRegistry::new());
+        let task_registry = registry.clone();
+        let task_data_dir = data_dir.clone();
+        let registration = tokio::spawn(async move {
+            provider
+                .register(&task_registry, &binary, &task_data_dir)
+                .await
+        });
+
+        let mut signal = tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(&status_signal)
+            .await
+            .unwrap();
+        let mut marker = [0u8; 1];
+        signal.read_exact(&mut marker).await.unwrap();
+        assert_eq!(marker, [b'x']);
+        tokio::time::pause();
+        let release_status = tokio::spawn(async move {
+            let release = tokio::time::timeout(
+                PROTECTED_CONTENT_PROVIDER_STATUS_TIMEOUT + std::time::Duration::from_millis(1),
+                std::future::pending::<()>(),
+            )
+            .await;
+            assert!(release.is_err());
+            let mut release = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&status_release)
+                .await
+                .unwrap();
+            release.write_all(b"x").await.unwrap();
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(
+            PROTECTED_CONTENT_PROVIDER_STATUS_TIMEOUT + std::time::Duration::from_millis(1),
+        )
+        .await;
+        tokio::time::resume();
+        release_status.await.unwrap();
+
+        let error = registration.await.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("status timed out"),
+            "{provider:?}: {error}"
+        );
+        let requests = fs::read_to_string(request_log).unwrap();
+        assert!(
+            !process_is_running(read_pid(&pid_file)),
+            "{provider:?}: {error}; requests={requests}"
+        );
+        assert!(requests.contains(r#""op":"status""#), "{provider:?}");
+        assert!(requests.contains(r#""op":"shutdown""#), "{provider:?}");
+        assert!(
+            !registry
+                .has_ready_runtime_provider_target(provider.target())
+                .await
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn protected_provider_duplicate_unregister_and_restart_settle_exact_processes() {
+    for provider in ProtectedStartupProvider::ALL {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        provider.prepare_private_config(&data_dir);
+        let (binary, pid_file, request_log) = write_mock_protected_startup_provider(
+            temp.path(),
+            provider.name(),
+            &provider.status().to_string(),
+        );
+        let registry = Arc::new(ProviderRegistry::new());
+
+        provider
+            .register(&registry, &binary, &data_dir)
+            .await
+            .unwrap();
+        let first_pid = read_pid(&pid_file);
+        assert!(process_is_running(first_pid), "{provider:?}");
+        assert!(
+            registry
+                .has_ready_runtime_provider_target(provider.target())
+                .await
+        );
+
+        let duplicate = provider
+            .register(&registry, &binary, &data_dir)
+            .await
+            .unwrap_err();
+        assert!(duplicate.to_string().contains("already registered"));
+        let pids = read_pids(&pid_file);
+        assert_eq!(pids.len(), 2, "{provider:?}");
+        let rejected_pid = pids[1];
+        assert!(process_is_running(first_pid), "{provider:?}");
+        assert!(!process_is_running(rejected_pid), "{provider:?}");
+
+        registry
+            .unregister_runtime_provider_target(provider.target())
+            .await
+            .unwrap();
+        assert!(!process_is_running(first_pid), "{provider:?}");
+
+        provider
+            .register(&registry, &binary, &data_dir)
+            .await
+            .unwrap();
+        let replacement_pid = read_pid(&pid_file);
+        assert_ne!(replacement_pid, first_pid);
+        assert_ne!(replacement_pid, rejected_pid);
+        assert!(process_is_running(replacement_pid), "{provider:?}");
+        registry
+            .unregister_runtime_provider_target(provider.target())
+            .await
+            .unwrap();
+        assert!(!process_is_running(replacement_pid), "{provider:?}");
+        assert_eq!(
+            fs::read_to_string(request_log)
+                .unwrap()
+                .matches(r#""op":"shutdown""#)
+                .count(),
+            3,
+            "{provider:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn protected_provider_startup_keeps_primary_error_with_shutdown_failure_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = ProtectedStartupProvider::Protect;
+    let data_dir = temp.path().join("data");
+    provider.prepare_private_config(&data_dir);
+    let mut status = provider.status();
+    status["data"]["provider"] = json!("wrong-provider");
+    let (binary, pid_file, request_log) = write_mock_protected_startup_provider_with_shutdown(
+        temp.path(),
+        provider.name(),
+        &status.to_string(),
+        r#"{"status":"error","code":"shutdown_failed","message":"denied"}"#,
+    );
+    let registry = Arc::new(ProviderRegistry::new());
+
+    let error = provider
+        .register(&registry, &binary, &data_dir)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    let primary = error.find("unsupported identity").unwrap();
+    let cleanup = error.find("shutdown/reap also failed").unwrap();
+    assert!(primary < cleanup, "{error}");
+    assert!(!process_is_running(read_pid(&pid_file)));
+    assert!(fs::read_to_string(request_log)
+        .unwrap()
+        .contains(r#""op":"shutdown""#));
 }
 
 #[cfg(unix)]
@@ -4653,7 +5140,7 @@ async fn inactive_custody_registration_passes_only_base_path_and_no_extra_truth(
         .lines()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     let init: Value = serde_json::from_str(&requests.remove(0)).unwrap();
     assert_eq!(init["op"], "init");
     assert_eq!(
@@ -4664,6 +5151,8 @@ async fn inactive_custody_registration_passes_only_base_path_and_no_extra_truth(
     assert_eq!(init["config"]["read_only"], false);
     assert_eq!(init["config"]["encryption_key"], "");
     assert!(init["config"]["extra"].is_null());
+    let status: Value = serde_json::from_str(&requests.remove(0)).unwrap();
+    assert_eq!(status, json!({"op": "status"}));
     let forwarded: Value = serde_json::from_str(&requests.remove(0)).unwrap();
     assert_eq!(forwarded["op"], "release_contribution");
     assert!(forwarded.get("_runtime_invocation").is_none());
@@ -4738,10 +5227,12 @@ async fn inactive_custody_wrapper_rejects_public_private_op_and_evidence_injecti
         .lines()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     let init: Value = serde_json::from_str(&requests[0]).unwrap();
     assert_eq!(init["op"], "init");
-    let forwarded: Value = serde_json::from_str(&requests[1]).unwrap();
+    let status: Value = serde_json::from_str(&requests[1]).unwrap();
+    assert_eq!(status, json!({"op": "status"}));
+    let forwarded: Value = serde_json::from_str(&requests[2]).unwrap();
     assert_eq!(forwarded["op"], "release_contribution");
     assert_eq!(forwarded["unexpected"], true);
     assert!(forwarded.get("_runtime_invocation").is_none());
@@ -4773,7 +5264,7 @@ async fn inactive_custody_wrapper_status_surface_matches_public_dispatch() {
     .unwrap();
 
     assert_eq!(status["provider"], "custody");
-    assert_eq!(status["version"], "test-version");
+    assert_eq!(status["version"], CUSTODY_PROVIDER_VERSION);
     assert_eq!(status["configured"], Value::Bool(true));
     assert_eq!(
         status["supported_operations"],
@@ -4791,8 +5282,11 @@ async fn inactive_custody_wrapper_status_surface_matches_public_dispatch() {
         .all(|value| value != "shutdown"
             && value != "prepare_evidence"
             && value != "settle_evidence"));
-    assert_eq!(status["request_schema"], "req-schema");
-    assert_eq!(status["response_schema"], "resp-schema");
+    assert_eq!(status["request_schema"], CUSTODY_PROVIDER_REQUEST_SCHEMA_V1);
+    assert_eq!(
+        status["response_schema"],
+        CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1
+    );
 }
 
 #[cfg(unix)]
