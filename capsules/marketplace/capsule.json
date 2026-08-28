@@ -11,6 +11,7 @@
   "projections": ["web", "facts", "affordances", "gates"],
   "author": "elastos",
   "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
   "interfaces": [
     {
       "id": "elastos.marketplace.catalog",

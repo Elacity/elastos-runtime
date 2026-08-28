@@ -11,6 +11,7 @@
   "execution": "web-projection",
   "projections": ["web", "terminal", "cli", "facts", "affordances", "gates"],
   "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
   "interfaces": [
     {
       "id": "elastos.shell.cli",

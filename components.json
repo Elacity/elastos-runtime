@@ -1117,6 +1117,20 @@
         }
       }
     },
+    "gba-nonogram": {
+      "install_path": "capsules/gba-nonogram",
+      "description": "Nonogram Advance — MIT homebrew cartridge for the browser GBA viewer",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "gba-nonogram.tar.gz",
+          "extract_path": "gba-nonogram",
+          "install_path": "capsules/gba-nonogram"
+        }
+      }
+    },
     "chat-room": {
       "install_path": "capsules/chat-room",
       "description": "Runtime-launched Chat Room capsule",
@@ -1325,6 +1339,7 @@
         "browser",
         "gba-emulator",
         "gba-ucity",
+        "gba-nonogram",
         "chat-room",
         "site-provider",
         "tunnel-provider",
@@ -1477,6 +1492,7 @@
         "browser",
         "gba-emulator",
         "gba-ucity",
+        "gba-nonogram",
         "chat-room",
         "ipfs-provider",
         "availability-provider",

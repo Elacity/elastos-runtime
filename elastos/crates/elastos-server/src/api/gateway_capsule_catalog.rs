@@ -999,8 +999,13 @@ mod tests {
         assert_eq!(gba.role, CapsuleRole::Viewer);
         assert!(gba.installed);
         assert!(gba.launchable);
-        assert_eq!(gba.accepted_content.len(), 1);
-        assert_eq!(gba.accepted_content[0].name, "gba-ucity");
+        assert_eq!(
+            gba.accepted_content
+                .iter()
+                .map(|content| content.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gba-nonogram", "gba-ucity"]
+        );
         let ucity = catalog
             .capsules
             .iter()

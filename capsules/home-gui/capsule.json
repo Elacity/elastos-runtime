@@ -48,6 +48,7 @@
     }
   ],
   "requires": [],
+  "icon": "browser/icons",
   "resources": {
     "memory_mb": 64,
     "gpu": false

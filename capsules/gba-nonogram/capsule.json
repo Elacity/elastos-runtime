@@ -1,0 +1,38 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "gba-nonogram",
+  "version": "0.9.5",
+  "description": "Nonogram Advance — 108 picross puzzles for Game Boy Advance",
+  "role": "content",
+  "type": "data",
+  "author": "Emma Britton",
+  "entrypoint": "nonogram.gba",
+  "viewer": "gba-emulator",
+  "icon": "icons",
+  "permissions": {
+    "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/nonogram/*"]
+  },
+  "interfaces": [
+    {
+      "id": "elastos.content.asset",
+      "version": "0.5.0",
+      "description": "GBA game content",
+      "methods": [
+        {
+          "id": "asset.open",
+          "description": "Open this game with GBA Emulator",
+          "risk": "launch",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://content/asset",
+          "operation": "open",
+          "output_schema": {
+            "schema": "elastos.content.asset-opened/v1",
+            "content_type": "application/x-gba-rom",
+            "viewer": "gba-emulator"
+          }
+        }
+      ]
+    }
+  ]
+}

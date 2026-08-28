@@ -7,6 +7,7 @@
   "type": "data",
   "author": "elastos",
   "entrypoint": "ucity.gba",
+  "icon": "icons",
   "viewer": "gba-emulator",
   "permissions": {
     "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/ucity/*"]
