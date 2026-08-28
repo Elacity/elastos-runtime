@@ -7,11 +7,13 @@ COMPONENTS_JSON="${ELASTOS_COMPONENTS_JSON:-$DATA_DIR/components.json}"
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [component ...]
+Usage: $(basename "$0") [--require-verified] [component ...]
 
 Verifies installed external component binaries against the installed
 components.json manifest. With no component arguments, verifies every installed
 external component that has an install_path and binary present.
+
+  --require-verified  Reject an explicitly named component that verification skips.
 
 Environment:
   ELASTOS_DATA_DIR         Installed runtime data dir. Default: \$XDG_DATA_HOME/elastos
@@ -157,6 +159,12 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     exit 0
 fi
 
+REQUIRE_VERIFIED=0
+if [[ "${1:-}" == "--require-verified" ]]; then
+    REQUIRE_VERIFIED=1
+    shift
+fi
+
 need_cmd jq
 need_cmd awk
 if ! command -v sha256sum >/dev/null 2>&1 || ! command -v sha512sum >/dev/null 2>&1; then
@@ -184,6 +192,10 @@ cd "$ROOT"
 if [[ "$#" -gt 0 ]]; then
     for component in "$@"; do
         verify_component "$component" "1"
+        if [[ "$REQUIRE_VERIFIED" == "1" && "$VERIFY_COMPONENT_VERDICT" != "verified" ]]; then
+            echo "[installed-provider-verify] $component was not verified" >&2
+            exit 1
+        fi
     done
 else
     verified=0
