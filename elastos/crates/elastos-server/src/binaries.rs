@@ -101,14 +101,18 @@ pub fn resolve_verified_native_provider_binary_with_data_dir(
     name: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
     let manifest_path = data_dir.join("components.json");
-    let manifest_bytes = std::fs::read(&manifest_path).map_err(|err| {
-        anyhow::anyhow!(
-            "cannot resolve native provider '{}': failed to read {}: {}",
-            name,
-            manifest_path.display(),
-            err
-        )
-    })?;
+    let manifest_bytes = match std::fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "cannot resolve native provider '{}': failed to read {}: {}",
+                name,
+                manifest_path.display(),
+                err
+            ));
+        }
+    };
     let manifest: setup::ComponentsManifest =
         serde_json::from_slice(&manifest_bytes).map_err(|err| {
             anyhow::anyhow!(
@@ -222,6 +226,17 @@ mod tests {
 
         let result =
             resolve_verified_native_provider_binary_with_data_dir(&data_dir, "did-provider")
+                .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_verified_native_provider_binary_returns_none_when_manifest_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let result =
+            resolve_verified_native_provider_binary_with_data_dir(temp.path(), "did-provider")
                 .unwrap();
 
         assert!(result.is_none());

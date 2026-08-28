@@ -2,6 +2,7 @@ import {
   createHomeClipboardClient,
   MAX_HOME_CLIPBOARD_TEXT_UTF8_BYTES,
 } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+import { renderToString as renderMathToString } from "./vendor/katex/katex.mjs";
 
 const MODEL_TEXT_INPUT_SCHEMA = "elastos.model.input.text/v1";
 const MODEL_IMAGE_INPUT_SCHEMA = "elastos.model.input.image/v1";
@@ -1301,6 +1302,243 @@ function escapeHtml(text) {
     .replaceAll('"', "&quot;");
 }
 
+function unescapeForMath(text) {
+  return String(text ?? "")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&amp;", "&");
+}
+
+function renderMath(text, displayMode) {
+  try {
+    return (
+      `<span class="assistant-md-math${displayMode ? " assistant-md-math-display" : ""}">` +
+      renderMathToString(unescapeForMath(text), {
+        displayMode,
+        trust: false,
+        strict: "error",
+        throwOnError: true,
+      }) +
+      "</span>"
+    );
+  } catch {
+    return `<code class="assistant-md-math-raw">${escapeHtml(text)}</code>`;
+  }
+}
+
+function formatInlineMarkdown(escaped) {
+  const placeholders = [];
+  const stash = (html) => {
+    const token = `\u0000${placeholders.length}\u0000`;
+    placeholders.push(html);
+    return token;
+  };
+  const formatted = escaped
+    .replaceAll(
+      /`([^`]+)`/g,
+      (_, text) => stash(`<code class="assistant-md-inline">${text}</code>`),
+    )
+    .replaceAll(
+      /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+      (_, label, href) =>
+        stash(
+          `<span class="assistant-md-link">${label}</span> ` +
+            `<span class="assistant-md-link-url">(${href})</span>`,
+        ),
+    )
+    .replaceAll(/\\\((.+?)\\\)/g, (_, text) => stash(renderMath(text, false)))
+    .replaceAll(/\\\[(.+?)\\\]/g, (_, text) => stash(renderMath(text, true)))
+    .replaceAll(/\$\$([^$]+?)\$\$/g, (_, text) => stash(renderMath(text, true)))
+    .replaceAll(/\$([^\s$](?:[^$\n]*[^\s$])?)\$(?!\d)/g, (_, text) => stash(renderMath(text, false)))
+    .replaceAll(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replaceAll(/\*([^*\n]+)\*/g, "<em>$1</em>");
+  return formatted.replaceAll(/\u0000(\d+)\u0000/g, (_, index) => placeholders[Number(index)] ?? "");
+}
+
+function renderMarkdownBlocks(raw) {
+  const lines = String(raw ?? "").replace(/\r\n/g, "\n").split("\n");
+  let html = "";
+  let index = 0;
+  const isTableDivider = (line) => /^\s*\|?[\s:|\-]+\|?\s*$/.test(line);
+  const isTableStart = (cursor) =>
+    lines[cursor].includes("|") &&
+    cursor + 1 < lines.length &&
+    isTableDivider(lines[cursor + 1]);
+
+  const flushParagraph = (buffer) => {
+    const trimmed = buffer.join("\n").trim();
+    if (!trimmed) {
+      return;
+    }
+    html += `<p class="assistant-md-p">${formatInlineMarkdown(escapeHtml(trimmed)).replaceAll("\n", "<br>")}</p>`;
+  };
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    if (isTableStart(index)) {
+      const rows = [];
+      while (index < lines.length && lines[index].includes("|")) {
+        rows.push(lines[index]);
+        index += 1;
+        if (rows.length === 1 && index < lines.length && isTableDivider(lines[index])) {
+          index += 1;
+        } else if (rows.length > 1 && (!lines[index] || !lines[index].includes("|"))) {
+          break;
+        }
+      }
+      if (rows.length) {
+        const cells = (row) =>
+          row
+            .trim()
+            .replace(/^\|/, "")
+            .replace(/\|$/, "")
+            .split("|")
+            .map((cell) => formatInlineMarkdown(escapeHtml(cell.trim())));
+        const head = cells(rows[0]);
+        html += `<div class="assistant-md-table-wrap"><table class="assistant-md-table"><thead><tr>${head.map((cell) => `<th>${cell}</th>`).join("")}</tr></thead><tbody>`;
+        for (const row of rows.slice(1)) {
+          html += `<tr>${cells(row).map((cell) => `<td>${cell}</td>`).join("")}</tr>`;
+        }
+        html += "</tbody></table></div>";
+        continue;
+      }
+    }
+
+    const mathOpen = /^\s*(\\\[|\$\$)/.exec(line);
+    if (mathOpen) {
+      const open = mathOpen[1];
+      const close = open === "\\[" ? "\\]" : "$$";
+      const trimmedLine = line.trim();
+      const first = trimmedLine.slice(trimmedLine.indexOf(open) + open.length);
+      let text = null;
+      let nextIndex = index + 1;
+      const inlineAt = first.lastIndexOf(close);
+      if (inlineAt !== -1 && !first.slice(inlineAt + close.length).trim()) {
+        text = first.slice(0, inlineAt);
+      } else if (inlineAt === -1) {
+        const buffer = [first];
+        let cursor = index + 1;
+        while (cursor < lines.length) {
+          const at = lines[cursor].indexOf(close);
+          if (at !== -1) {
+            if (!lines[cursor].slice(at + close.length).trim()) {
+              buffer.push(lines[cursor].slice(0, at));
+              text = buffer.join("\n");
+              nextIndex = cursor + 1;
+            }
+            break;
+          }
+          buffer.push(lines[cursor]);
+          cursor += 1;
+        }
+      }
+      if (text !== null) {
+        if (text.trim()) {
+          html += `<div class="assistant-md-math-block">${renderMath(text, true)}</div>`;
+        }
+        index = nextIndex;
+        continue;
+      }
+      html += `<p class="assistant-md-p">${escapeHtml(line.trim())}</p>`;
+      index += 1;
+      continue;
+    }
+
+    const heading = /^(#{1,3})\s+(.+)$/.exec(line.trim());
+    if (heading) {
+      const level = heading[1].length;
+      html += `<h${level} class="assistant-md-h assistant-md-h${level}">${formatInlineMarkdown(
+        escapeHtml(heading[2]),
+      )}</h${level}>`;
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
+      const ordered = /^\s*\d+\.\s+/.test(line);
+      const tag = ordered ? "ol" : "ul";
+      html += `<${tag} class="assistant-md-list">`;
+      while (index < lines.length && /^\s*([-*+]|\d+\.)\s+/.test(lines[index])) {
+        const item = lines[index].replace(/^\s*([-*+]|\d+\.)\s+/, "");
+        html += `<li>${formatInlineMarkdown(escapeHtml(item))}</li>`;
+        index += 1;
+      }
+      html += `</${tag}>`;
+      continue;
+    }
+
+    if (/^>\s?/.test(line.trim())) {
+      const quote = [];
+      while (index < lines.length && /^>\s?/.test(lines[index].trim())) {
+        quote.push(lines[index].replace(/^\s*>\s?/, ""));
+        index += 1;
+      }
+      html += `<blockquote class="assistant-md-quote">${formatInlineMarkdown(
+        escapeHtml(quote.join("\n")),
+      ).replaceAll("\n", "<br>")}</blockquote>`;
+      continue;
+    }
+
+    const paragraph = [];
+    while (
+      index < lines.length &&
+      lines[index].trim() &&
+      !isTableStart(index) &&
+      !/^(#{1,3})\s+/.test(lines[index].trim()) &&
+      !/^\s*([-*+]|\d+\.)\s+/.test(lines[index]) &&
+      !/^>\s?/.test(lines[index].trim()) &&
+      !/^\s*(\\\[|\$\$)/.test(lines[index])
+    ) {
+      paragraph.push(lines[index]);
+      index += 1;
+    }
+    flushParagraph(paragraph);
+  }
+
+  return html;
+}
+
+function renderMarkdown(text, { streaming = false } = {}) {
+  let source = String(text ?? "");
+  if (streaming) {
+    const fenceCount = source.split("```").length - 1;
+    if (fenceCount % 2 === 1) {
+      source += "\n```";
+    }
+  }
+  const parts = source.split(/```([\s\S]*?)```/g);
+  let html = "";
+  for (let index = 0; index < parts.length; index += 1) {
+    if (index % 2 === 1) {
+      const fence = parts[index];
+      const newline = fence.indexOf("\n");
+      const language = newline === -1 ? "" : fence.slice(0, newline).trim();
+      const code = newline === -1 ? fence : fence.slice(newline + 1);
+      html +=
+        `<div class="assistant-md-code">` +
+        `<div class="assistant-md-code-head"><span>${escapeHtml(language || "code")}</span></div>` +
+        `<pre><code>${escapeHtml(code.replace(/\n$/, ""))}</code></pre></div>`;
+      continue;
+    }
+    html += renderMarkdownBlocks(parts[index]);
+  }
+  return html;
+}
+
+function renderMessageBody(message, { streaming = false } = {}) {
+  const content = String(message?.content ?? "");
+  if (message?.role === "assistant") {
+    return renderMarkdown(content, { streaming });
+  }
+  return `<p class="assistant-md-p assistant-md-p-plain">${escapeHtml(content).replaceAll("\n", "<br>")}</p>`;
+}
+
 function renderSessionList(view) {
   if (!view.filteredSessions.length) {
     return `<p class="assistant-session-count">No sessions match</p>`;
@@ -1381,7 +1619,7 @@ function renderMessages(view) {
       return `
         <article class="assistant-message assistant-message-${escapeHtml(message.role)}${streaming ? " is-streaming" : ""}">
           <div class="assistant-message-role">${roleLabel}</div>
-          <p class="assistant-message-body">${escapeHtml(message.content)}</p>
+          <div class="assistant-message-body">${renderMessageBody(message, { streaming })}</div>
         </article>
       `;
     })

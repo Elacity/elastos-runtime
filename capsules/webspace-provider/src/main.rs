@@ -2498,7 +2498,7 @@ fn known_mounts(state: &ProviderState) -> Vec<WebSpaceHandle> {
         Some("elastos://".to_string()),
         "Local interpreted handle into the broader elastos:// namespace.",
         Some(
-            "List this handle to discover typed child spaces such as content, peer, did, and ai."
+            "List this handle to discover typed child spaces such as content, peer, and did."
                 .to_string(),
         ),
     )];
@@ -3092,7 +3092,7 @@ fn resolve_elastos_handle(parts: &[&str]) -> Result<WebSpaceHandle, String> {
             Some("elastos://".to_string()),
             "Local interpreted handle into the broader elastos:// namespace.",
             Some(
-                "List this handle to discover typed child spaces such as content, peer, did, and ai."
+                "List this handle to discover typed child spaces such as content, peer, and did."
                     .to_string(),
             ),
         )),

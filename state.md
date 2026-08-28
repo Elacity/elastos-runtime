@@ -11,23 +11,10 @@ repository.
 ## Release Posture
 
 - `main` at `d358dedb` is the released 0.6.0 line.
-- The published collaboration review stack is
-  `origin/review/collaboration-foundation` ->
-  `origin/review/collaboration-product-integration` ->
-  `origin/review/collaboration-candidate`. Each review branch depends on its
-  parent; installed and live claims remain separate target evidence, not branch
-  truth.
-- Bottom-up review of the stacked chain is in progress. The
-  `review/collaboration-foundation` and `review/collaboration-product-integration`
-  tips carry the chat/agent retirement packaging and source-gate alignment
-  needed to pass CI at each checkpoint, and both tips are CI-green on the
-  shared upstream (2026-08-27). `review/collaboration-candidate` additionally
-  carries the browser-local-exit orphan-reaping hotfix merge (`46e51a77`,
-  2026-08-27); that hotfix and the system-map docs merge are not yet contained
-  in the extraction stack.
-- `codex/post-0.6-consolidation` remains an unpublished local integration line
-  for additional collaboration and UI work. It has no upstream and is not
-  installed or published product truth.
+- `origin/feat/0.7-uiux-candidate` at `8b547590` is published source evidence
+  for the reviewed collaboration, Home/platform, Wallet, GBA, model-provider,
+  and Assistant UIUX groups. It is not installed, live, release, or manual
+  acceptance evidence.
 - `feat/protected-content-contracts` is a published source-only contract
   branch, stacked for review on
   `origin/review/collaboration-product-integration`. It adds the
@@ -92,12 +79,11 @@ repository.
   hash/number binding, binds contract/method selector, has bounded freshness,
   redacts upstream failures, and does not accept caller-supplied rights facts.
   It remains source-only and unregistered.
-- The current `feat/protected-content-runtime-lifecycle` branch is stacked on
-  published `origin/feat/protected-content-runtime-lifecycle` at `34465959`,
-  which in turn is stacked on published
+- Published `origin/feat/protected-content-runtime-lifecycle` at `854d9dc9`
+  is stacked on published
   `origin/feat/protected-content-rights` at `43a83e5b`. The inactive
   Runtime-owned mint -> availability -> creator mint/list -> buy -> open ->
-  play -> close path is complete in source on the current branch:
+  play -> close path is complete on that published source line:
   Runtime-owned mint durability, fresh pre-buy availability, verified creator
   mint/list binding, Runtime-owned buy with finalized access corroboration,
   durable viewer lifecycle, and the inactive combined mint -> buy -> open ->
@@ -128,9 +114,9 @@ repository.
   `escrow.json` is historical dev evidence only because it aggregates wrapped
   shares. The producer smoke writes and reloads `cek_commitment_b64`; the older
   Creator path carried the missing-commitment writer/reloader inconsistency.
-- Current protected-content source proof is complete for the inactive
+- Published protected-content lifecycle source proof is complete for the inactive
   Runtime-owned mint -> availability -> creator mint/list -> buy -> open ->
-  play -> close path on `feat/protected-content-runtime-lifecycle`, but it is
+  play -> close path through `854d9dc9`, but it is
   still not installed or product-complete.
   Runtime tests prove durable 2-of-3 custody provisioning, exact pre-buy
   signed availability rechecks, Runtime-owned creator mint/list settlement,
@@ -184,18 +170,23 @@ repository.
   released-threshold mismatch, and missing reconstructed-key commitment check
   now corrected on the custody branch. That review is useful source
   review evidence, not a professional external cryptographic audit.
-- The collaboration review stack adds Runtime-backed People/Chat collaboration
+- The collaboration source adds Runtime-backed People/Chat collaboration
   and selected shell UI work. The source boundary is complete for review:
   Profile authority, Runtime lifecycle, Carrier routing, People/Chat
   projections, and the strict fixture-owned two-Runtime acceptance all pass.
   Normal localhost and public seed installation remain separate product gates.
-- The first normal cross-Runtime Chat send on the installed candidate aborted
-  inside the old Iroh 0.96.1 `iroh-quinn` transport. The source candidate now
-  uses one coordinated Carrier generation: Iroh 1.0.2, iroh-gossip 0.101.0,
-  mDNS 0.4.0, and distributed-topic-tracker 0.3.5. Focused Carrier,
-  collaboration, and two-node source tests pass. Localhost artifact parity and
-  machine Browser open/connect/close/zero-residue proof now exist; public-seed
-  retesting and manual Browser visible video/input usability remain open.
+- The integrated source uses one coordinated Carrier generation: Iroh 1.0.2,
+  iroh-gossip 0.101.0, mDNS 0.4.0, and distributed-topic-tracker 0.3.5.
+  Localhost, public-seed, and manual Browser proof require fresh evidence for
+  the exact integrated commit.
+- The integrated source keeps the Runtime-owned protected-content,
+  collaboration, Carrier, Wallet, Chain, provider lifecycle, and audit
+  boundaries while adding the reviewed UIUX presentation groups. Source
+  presence does not establish installation or product acceptance.
+- Source-home CI defines Linux x86_64, Linux aarch64, and macOS matrix jobs with
+  a 10 percent free-space gate and job-shared Cargo targets. The workflow
+  definition is source configuration; its execution result is separate CI
+  evidence.
 - The Runtime implements the WASM Component Model path through
   `elastos.component/v1` and the Runtime-mediated `elastos:bus@v1` authority
   contract. The conformance fixture and authoring template exercise it; all 18
@@ -319,16 +310,10 @@ repository.
 
 - Browser is included in 0.6.0 as a bounded Runtime Browser, not as a fully
   reliable general-purpose Browser claim.
-- On the installed collaboration candidate at localhost, accepted machine proof
-  now covers Browser launch, TURN/media-relay connection, Runtime-mediated
-  traffic, exact terminal close, and zero remaining ownership, stream, and
-  reconciliation files for that page/session.
-- That localhost machine proof does not yet prove human-visible decoded video,
-  Browser text input, scrolling, or audio. Manual Browser usability remains
-  open.
-- Accepted localhost evidence covers the installed macOS VZ candidate's launch,
-  decoded display, navigation through Runtime-only networking, and injected
-  provider availability.
+- Browser launch, TURN/media-relay connection, Runtime-mediated traffic, exact
+  terminal close, and zero-residue behavior require fresh target evidence for
+  the exact integrated commit. Human-visible video, input, scrolling, and audio
+  remain manual proof gates.
 - Deterministic proof confirmed `window.ethereum`, one EIP-6963 provider,
   `isElastOS=true`, `isMetaMask=true`, the Runtime Wallet binding, chain `0x14`,
   and exactly one `eth_requestAccounts` handoff producing one pending Wallet
@@ -400,10 +385,37 @@ repository.
   disposable Chromium: opaque `Origin: null` topology, parent DOM denial,
   changing nonzero framebuffer writes, trusted keyboard input, nonzero emulator
   audio output, on-screen controls, save/reload persistence, and process cleanup.
-- Installed macOS proof covers uCity and Library `.gba` launch, moving frames,
-  keyboard/on-screen input, user-enabled audio, save/reload, source-installed-
-  served artifact parity, and view cleanup. GBA remains outside the default
-  profile and is installed only by explicit `demo` or `full` profiles.
+- The GBA source catalog contains exactly `gba-nonogram` and `gba-ucity`.
+  Shared visual tokens remain inside the GBA capsule. GBA stays outside the
+  default profile and belongs only to explicit `demo` or `full` profiles.
+  Installation, target media, input, save/reload, and cleanup proof remain
+  separate gates.
+
+## Model And Assistant Truth
+
+- `model-provider` is the single active model execution path. Runtime registers
+  it as a verified native provider and authorizes only the typed
+  `offers_list`, `runs_create`, `runs_get`, `runs_events`, and `runs_cancel`
+  operations.
+- The operator-owned model-provider config lives under the Runtime data root at
+  `providers/model-provider/config.json`. Runtime validates the fixed path and
+  file security, passes only the raw top-level offers value through Init, and
+  keeps backend URLs, credentials, and adapter details below the provider
+  boundary.
+- A missing installed components manifest or model-provider entry leaves the
+  provider unconfigured and unavailable. Runtime does not select a fallback.
+- Missing model-provider config is an honest zero-offer state: Runtime may
+  start/register the provider with no offers, writes no config file, and
+  Assistant shows that no model offers are available.
+- Assistant is a standalone first-party capsule. Chat, Build, and Studio use
+  only typed Runtime model resources and the protected Assistant workspace;
+  transcript copy goes only through the trusted Home Clipboard path.
+- Assistant model messages render a self-contained safe markdown subset with
+  escaped HTML, inert links, headings/lists/blockquotes/tables, fenced and
+  inline code, and inline/display math through vendored KaTeX 0.18.3. Focused
+  source proof lives in `scripts/assistant-shell-smoke.mjs`; no install,
+  localhost, or human acceptance claim is recorded yet for Assistant
+  workflows.
 
 ## System Truth
 
@@ -525,8 +537,8 @@ repository.
   live in `capsules/home-gui/browser/shell-core.js`. A normal Home CLI action
   stays in CLI; opening a GUI-only target requires an explicit, launch-token-
   gated `switch shell and open` intent.
-- The Home shell implementation, source gates, and machine smokes pass for the
-  current working tree. The origin-isolation change requires a fresh
+- The Home shell source gates assert these ownership rules. The
+  origin-isolation change requires a fresh
   commit-bound operator pass covering passkey sign-in, System switching to
   `home-cli`, CLI ownership of the full viewport, no desktop first-paint or
   hidden GUI bleed-through, hard reload into the selected shell, and return to
@@ -534,7 +546,7 @@ repository.
 - `scripts/home-shell-objective-audit.mjs` remains the fail-closed completion
   audit. Manual evidence is commit-bound and intentionally not stored in the
   repository; any later Home shell behavior change requires a new or re-reviewed
-  report against the exact candidate commit.
+  report against the exact reviewed commit.
 
 ## Collaboration Truth
 
@@ -606,15 +618,10 @@ repository.
   learn the rebound endpoint from one announcement. An import whose identity
   restore fails is reported incomplete and never claims a complete account
   recovery.
-- The collaboration path on `codex/post-0.6-consolidation` is unpublished and
-  has no upstream. Its disposable, fixture-owned two-Runtime product journey
-  passed on exact source-built artifacts. The current candidate is installed on
-  normal localhost with source/installed artifact parity, HTTP 200, accepted
-  People/Chat/Inbox/Clipboard/restart evidence, and machine Browser
-  open/connect/close/zero-residue proof, but its one-Runtime product acceptance
-  is not complete because manual Browser visible video/input usability remains
-  open. The public seed has not been updated to this candidate and is not
-  matching product evidence.
+- Historical verification at `b07160cf` records a disposable, fixture-owned
+  two-Runtime collaboration journey. Current localhost and public-seed product
+  claims require fresh artifact and target evidence for the exact integrated
+  commit.
 - Bilateral signed contact removal is implemented with the complete People
   states: a pair-scoped signed revocation delivered over the direct channel
   with durable retry, visible removed state on both sides, retained heads as
@@ -630,7 +637,7 @@ repository.
   wire gap: the Carrier peer provider plane had never admitted the profile
   provider. Design and boundaries live in
   [docs/COLLABORATION_HANDOFF.md](docs/COLLABORATION_HANDOFF.md); the
-  strict fixture-owned installed two-runtime acceptance now passes: Recovery,
+  strict fixture-owned two-Runtime source proof covers Recovery,
   distinct Runtime/Profile evidence, opt-in Discovery, exact Inbox approval,
   direct messages both ways, rename, bilateral removal, re-add, shared-room
   continuity, restart continuity, Clipboard, narrow UI, and final People/Chat
@@ -657,7 +664,7 @@ repository.
 - Branch-override public smokes require a staged or published 0.6.0-compatible
   manifest with the current `home` profile and checksummed artifacts.
 - Source/local Carrier setup proof stays in `scripts/local-carrier-setup-smoke.sh`.
-- Public install proof for this candidate requires a staged or published
+- Public install proof for an integrated candidate requires a staged or published
   0.6.0-compatible manifest with the current `home` profile and checksummed
   artifacts.
 - Set `ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1` only when the publisher relay

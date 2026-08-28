@@ -2840,7 +2840,7 @@ async fn test_library_gateway_lists_webspaces_through_runtime_provider() {
         .iter()
         .filter_map(|object| object["name"].as_str())
         .collect();
-    for expected in ["_meta.json", "content", "peer", "did", "ai"] {
+    for expected in ["_meta.json", "content", "peer", "did"] {
         assert!(
             names.contains(&expected),
             "missing WebSpace child {expected}"

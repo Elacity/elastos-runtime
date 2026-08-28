@@ -9203,7 +9203,7 @@ assert(
     currentState.includes("signed virtual-passkey System picker switch") &&
     includesNormalized(currentState, "failed signed switchback recovery without mounting `home-gui`") &&
     includesNormalized(currentState, "Home CLI Apps showing GUI-only Browser/GBA targets read-only without implicit launch") &&
-    includesNormalized(currentState, "Home shell implementation, source gates, and machine smokes pass") &&
+    includesNormalized(currentState, "Home shell source gates assert these ownership rules") &&
     includesNormalized(currentState, "origin-isolation change requires a fresh commit-bound operator pass") &&
     currentState.includes("any later Home shell behavior change requires a new or re-reviewed") &&
     !tasks.includes("finish operator-profile proof for the reduced CLI dispatch boundary") &&
@@ -11666,6 +11666,11 @@ assert(
 assert(
   !tasks.includes("- [x]"),
   "TASKS.md must contain open work only; completed work belongs in elastos/CHANGELOG.md",
+);
+assert(
+  read("scripts/local-carrier-setup-smoke.sh").includes("printf 'q\\n' | XDG_DATA_HOME=\"${XDG_DATA_HOME}\" \\\n    \"${ELASTOS_BIN}\" >\"${HOME_OUT}\"") &&
+    !read("scripts/local-carrier-setup-smoke.sh").includes("script -qec"),
+  "Local carrier setup smoke must exercise the direct Home CLI contract, not a PTY wrapper path",
 );
 const productionStorageTaskLines =
   tasks.match(/^- \[ \] BLOCKER - production multi-peer availability\/storage markets .+$/gm) ??
