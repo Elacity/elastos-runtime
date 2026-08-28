@@ -14,6 +14,7 @@ enum MockProtectedContentChainMode {
     Success,
     ReceiptError,
     ListingError,
+    CreatorMintResolveDrift,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -205,6 +206,11 @@ fn set_mock_protected_content_chain_receipt_error() {
 fn set_mock_protected_content_chain_listing_error() {
     *mock_protected_content_chain_mode().lock().unwrap() =
         MockProtectedContentChainMode::ListingError;
+}
+
+fn set_mock_protected_content_chain_creator_mint_resolve_drift() {
+    *mock_protected_content_chain_mode().lock().unwrap() =
+        MockProtectedContentChainMode::CreatorMintResolveDrift;
 }
 
 fn mock_protected_content_purchase_fixture(
@@ -586,7 +592,13 @@ impl Provider for MockChainProvider {
                     "chain_namespace": "eip155:8453",
                     "function": "mint(string,uint16,bytes,bytes)",
                     "ledger": MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
-                    "pay_token": MOCK_PROTECTED_CONTENT_PAY_TOKEN,
+                    "pay_token": if *mock_protected_content_chain_mode().lock().unwrap()
+                        == MockProtectedContentChainMode::CreatorMintResolveDrift
+                    {
+                        "0x00000000000000000000000000000000000000cc"
+                    } else {
+                        MOCK_PROTECTED_CONTENT_PAY_TOKEN
+                    },
                     "to": MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
                     "data": format!(
                         "0x{}",
@@ -605,6 +617,18 @@ impl Provider for MockChainProvider {
                     "content_access_id": required_test_str(request, "content_access_id")?
                         .to_ascii_lowercase(),
                     "signed": false
+                }
+            })),
+            Some("describe_protected_content_creator_mint_source") => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.chain.protected-content-creator-mint-source/v1",
+                    "network": "base-mainnet",
+                    "chain_namespace": "eip155:8453",
+                    "ledger": MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
+                    "pay_token": MOCK_PROTECTED_CONTENT_PAY_TOKEN,
+                    "abi": "elacity_mint_v1",
+                    "function": "mint(string,uint16,bytes,bytes)"
                 }
             })),
             Some("resolve_protected_content_mint_receipt") => {

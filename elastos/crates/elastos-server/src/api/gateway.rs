@@ -145,6 +145,7 @@ pub(super) use gateway_passkey_step_up::{
 pub(crate) use gateway_passkey_step_up::{
     issue_passkey_step_up_token_at_for_test, issue_passkey_step_up_token_for_test,
 };
+pub(crate) use gateway_provider_proxy::resolve_runtime_custody_creator_publish_binding;
 pub(crate) use gateway_provider_proxy::runtime_custody_buy_via_gateway;
 #[cfg(test)]
 pub(crate) use gateway_provider_proxy::runtime_custody_publish_creator_tail_for_test;

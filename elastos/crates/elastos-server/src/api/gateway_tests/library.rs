@@ -4,6 +4,24 @@ fn provider_body(value: serde_json::Value) -> Body {
     Body::from(serde_json::to_vec(&value).unwrap())
 }
 
+async fn set_mock_wallet_transaction_default(
+    wallet_provider: &MockWalletProvider,
+    principal_id: &str,
+    chain_namespace: &str,
+    account_id: &str,
+    set_at: u64,
+) {
+    let mut defaults = wallet_provider.defaults.lock().await;
+    defaults.push(json!({
+        "schema": "elastos.wallet.default_account/v1",
+        "principal_id": principal_id,
+        "chain_namespace": chain_namespace,
+        "intent": "transaction_intent",
+        "account_id": account_id,
+        "set_at": set_at,
+    }));
+}
+
 fn protected_content_gateway_mock_test_guard() -> &'static tokio::sync::Mutex<()> {
     static GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -202,18 +220,43 @@ fn runtime_custody_creator_test_input(
     wallet_account_id: &str,
 ) -> crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput {
     let (clear_init_segment, clear_segments) = clear_runtime_custody_media(seed);
+    let wallet_account_address = wallet_account_id
+        .rsplit(':')
+        .next()
+        .filter(|value| value.starts_with("0x") && value.len() == 42)
+        .unwrap_or("0x1111111111111111111111111111111111111111")
+        .to_string();
     crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput {
         object_uri: object_uri.to_string(),
         principal_id: principal_id.to_string(),
         mime_type: "video/mp4".to_string(),
         codecs: "avc1.64001f,mp4a.40.2".to_string(),
         wallet_account_id: wallet_account_id.to_string(),
+        wallet_account_address,
+        creator_mint_source_digest: runtime_custody_creator_source_digest(),
         copies: "0x2".to_string(),
         price: MOCK_PROTECTED_CONTENT_LISTING_PRICE.to_string(),
         clear_init_segment,
         clear_segments,
         source_storage: "protected_principal_root".to_string(),
     }
+}
+
+fn runtime_custody_creator_source_digest() -> elastos_protected_content_contracts::Digest32 {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"elastos.runtime-custody.creator-mint-source/v1");
+    for field in [
+        "base-mainnet",
+        "eip155:8453",
+        MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
+        MOCK_PROTECTED_CONTENT_PAY_TOKEN,
+        "elacity_mint_v1",
+        "mint(string,uint16,bytes,bytes)",
+    ] {
+        hasher.update((field.len() as u32).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    elastos_protected_content_contracts::Digest32::new(hasher.finalize().into())
 }
 
 fn seed_completed_runtime_custody_mint(
@@ -335,6 +378,9 @@ fn seed_completed_runtime_custody_mint(
         input.principal_id.clone(),
         &input.object_uri,
         &input.source_storage,
+        input.wallet_account_id.clone(),
+        input.wallet_account_address.clone(),
+        input.creator_mint_source_digest,
         input.mime_type.clone(),
         input.codecs.clone(),
         &input.clear_init_segment,
@@ -422,6 +468,9 @@ fn seed_completed_runtime_custody_mint(
         content_cid: TEST_CIDV1.to_string(),
         mint_id: draft.mint_id(),
         content_id,
+        display_name: "protected-tail.mp4".to_string(),
+        mime_type: input.mime_type.clone(),
+        codecs: input.codecs.clone(),
         availability: json!({
             "status": "local_pinned",
             "provider": "mock-content-provider",
@@ -464,10 +513,12 @@ fn seed_runtime_custody_creator_listing_for_buy(
         MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY.to_ascii_lowercase(),
         MOCK_PROTECTED_CONTENT_TOKEN_ID,
         MOCK_PROTECTED_CONTENT_OPERATIVE.to_ascii_lowercase(),
+        if native_purchase { "0x1" } else { "0x2" },
         MOCK_PROTECTED_CONTENT_LISTING_PRICE,
         pay_token,
         (!native_purchase).then_some(MOCK_PROTECTED_CONTENT_PAYMENT_PROCESSOR.to_ascii_lowercase()),
         format!("0x{}", hex::encode([0xc1; 32])),
+        crate::auth::now_ts(),
     )
     .unwrap();
     crate::protected_content_runtime::persist_runtime_custody_creator_listing(
@@ -558,7 +609,6 @@ async fn publish_runtime_custody(
             "uri": uri,
             "protection": {
                 "mode": "runtime_custody",
-                "wallet_account_id": "wallet-account-1",
                 "copies": "0x1",
                 "price": "0xde0b6b3a7640000"
             }
@@ -586,10 +636,6 @@ async fn assert_rejected_runtime_custody_protection_field(
         "mode".into(),
         serde_json::Value::String("runtime_custody".into()),
     );
-    protection.insert(
-        "wallet_account_id".into(),
-        serde_json::Value::String("wallet-account-1".into()),
-    );
     protection.insert("copies".into(), serde_json::Value::String("0x1".into()));
     protection.insert(
         "price".into(),
@@ -609,7 +655,10 @@ async fn assert_rejected_runtime_custody_protection_field(
     assert_eq!(publish_status, StatusCode::OK);
     assert_eq!(publish["status"], "error");
     let message = publish["message"].as_str().unwrap();
-    assert_eq!(message, expected_message);
+    assert!(
+        message.contains(expected_message),
+        "expected `{expected_message}` in `{message}`"
+    );
     assert!(!message.contains(uri));
     assert!(!message.contains(&data_dir.display().to_string()));
     assert_no_publish_records(data_dir, principal_id);
@@ -6022,7 +6071,6 @@ async fn test_library_provider_publish_rejects_removed_fixture_and_unknown_prote
                 "uri": uri,
                 "protection": {
                     "mode": "runtime_custody",
-                    "wallet_account_id": "wallet-account-1",
                     "copies": "0x1",
                     "price": "0xde0b6b3a7640000",
                     "extra": true
@@ -6045,25 +6093,14 @@ async fn test_library_provider_publish_rejects_removed_fixture_and_unknown_prote
 
     for (field, value, expected_message) in [
         (
-            "mime_type",
-            "",
-            "unknown field `mime_type`, expected one of `wallet_account_id`, `copies`, `price`",
+            "wallet_account_id",
+            "wallet-account-1",
+            "unknown field `wallet_account_id`",
         ),
-        (
-            "mime_type",
-            "video/mp4",
-            "unknown field `mime_type`, expected one of `wallet_account_id`, `copies`, `price`",
-        ),
-        (
-            "codecs",
-            "",
-            "unknown field `codecs`, expected one of `wallet_account_id`, `copies`, `price`",
-        ),
-        (
-            "codecs",
-            "avc1.64001f,mp4a.40.2",
-            "unknown field `codecs`, expected one of `wallet_account_id`, `copies`, `price`",
-        ),
+        ("mime_type", "", "unknown field `mime_type`"),
+        ("mime_type", "video/mp4", "unknown field `mime_type`"),
+        ("codecs", "", "unknown field `codecs`"),
+        ("codecs", "avc1.64001f,mp4a.40.2", "unknown field `codecs`"),
     ] {
         assert_rejected_runtime_custody_protection_field(
             dir.path(),
@@ -6186,6 +6223,9 @@ async fn test_runtime_custody_creator_tail_pending_or_failed_never_persists_list
         content_cid: replay_content_cid,
         mint_id,
         content_id: replay_content_id,
+        display_name: "protected-tail.mp4".to_string(),
+        mime_type: input.mime_type.clone(),
+        codecs: input.codecs.clone(),
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
@@ -6282,6 +6322,9 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
         content_cid: replay_content_cid.clone(),
         mint_id,
         content_id: replay_content_id.clone(),
+        display_name: "protected-tail.mp4".to_string(),
+        mime_type: input.mime_type.clone(),
+        codecs: input.codecs.clone(),
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
@@ -6296,32 +6339,34 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
     .await
     .unwrap();
     assert_eq!(ok.mint_id, mint_id);
-    let listing_path = dir
-        .path()
-        .join("protected-content/runtime-listings")
-        .join(format!("{}.json", hex::encode(mint_id.as_bytes())));
-    let listing: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(listing_path).unwrap()).unwrap();
-    assert_eq!(listing["cid"], replay_content_cid);
-    assert_eq!(listing["content_id"], replay_content_id);
+    let listing =
+        crate::protected_content_runtime::load_runtime_custody_listing(dir.path(), mint_id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(listing.cid, replay_content_cid);
+    assert_eq!(listing.content_id, replay_content_id);
+    assert_eq!(listing.display_name, "protected-tail.mp4");
+    assert_eq!(listing.mime_type, input.mime_type);
+    assert_eq!(listing.codecs, input.codecs);
+    assert_eq!(listing.quantity, "0x2");
     assert_eq!(
-        listing["seller_address"],
+        listing.seller_address,
         MOCK_MANAGED_EVM_ADDRESS.to_ascii_lowercase()
     );
-    assert_eq!(listing["chain_namespace"], "eip155:8453");
-    assert_eq!(listing["network"], "base-mainnet");
+    assert_eq!(listing.chain_namespace, "eip155:8453");
+    assert_eq!(listing.network, "base-mainnet");
     assert_eq!(
-        listing["ledger"],
+        listing.ledger,
         MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY.to_ascii_lowercase()
     );
-    assert_eq!(listing["token_id"], MOCK_PROTECTED_CONTENT_TOKEN_ID);
+    assert_eq!(listing.token_id, MOCK_PROTECTED_CONTENT_TOKEN_ID);
     assert_eq!(
-        listing["operative"],
+        listing.operative,
         MOCK_PROTECTED_CONTENT_OPERATIVE.to_ascii_lowercase()
     );
-    assert_eq!(listing["price"], MOCK_PROTECTED_CONTENT_LISTING_PRICE);
+    assert_eq!(listing.price, MOCK_PROTECTED_CONTENT_LISTING_PRICE);
     assert_eq!(
-        listing["pay_token"],
+        listing.pay_token,
         MOCK_PROTECTED_CONTENT_PAY_TOKEN.to_ascii_lowercase()
     );
     assert_eq!(mock_content_publish_request_count(), 1);
@@ -6333,6 +6378,9 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
         content_cid: replay_content_cid,
         mint_id,
         content_id: replay_content_id,
+        display_name: "protected-tail.mp4".to_string(),
+        mime_type: input.mime_type.clone(),
+        codecs: input.codecs.clone(),
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
@@ -6347,6 +6395,11 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
     .await
     .unwrap();
     assert_eq!(replay.mint_id, mint_id);
+    let replayed_listing =
+        crate::protected_content_runtime::load_runtime_custody_listing(dir.path(), mint_id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(replayed_listing, listing);
     assert_eq!(mock_content_publish_request_count(), 1);
     assert_eq!(
         wallet_provider
@@ -6437,6 +6490,9 @@ async fn test_runtime_custody_creator_tail_listing_error_is_unavailable_without_
         content_cid: replay_content_cid.clone(),
         mint_id,
         content_id: replay_content_id.clone(),
+        display_name: "protected-tail.mp4".to_string(),
+        mime_type: input.mime_type.clone(),
+        codecs: input.codecs.clone(),
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
@@ -6494,6 +6550,9 @@ async fn test_runtime_custody_creator_tail_listing_error_is_unavailable_without_
         content_cid: replay_content_cid,
         mint_id,
         content_id: replay_content_id,
+        display_name: "protected-tail.mp4".to_string(),
+        mime_type: input.mime_type.clone(),
+        codecs: input.codecs.clone(),
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
@@ -6551,16 +6610,8 @@ async fn test_library_provider_runtime_custody_buy_is_denied_before_purchase() {
     let app = gateway_router(library_test_state_without_content(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
-    let (status, payload) = post_library(
-        app,
-        &token,
-        "buy",
-        json!({
-            "mint_id": "00".repeat(32),
-            "account_id": "wallet:eip155:8453:0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
-        }),
-    )
-    .await;
+    let (status, payload) =
+        post_library(app, &token, "buy", json!({ "mint_id": "00".repeat(32) })).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "error");
     assert_eq!(
@@ -6575,16 +6626,8 @@ async fn test_library_provider_runtime_custody_marketplace_buy_is_denied_before_
     let app = gateway_router(library_test_state_without_content(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let token = app_token_for_authority(dir.path(), MARKETPLACE_CAPSULE_ID, &authority);
-    let (status, payload) = post_library(
-        app,
-        &token,
-        "buy",
-        json!({
-            "mint_id": "00".repeat(32),
-            "account_id": "wallet:eip155:8453:0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
-        }),
-    )
-    .await;
+    let (status, payload) =
+        post_library(app, &token, "buy", json!({ "mint_id": "00".repeat(32) })).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "error");
     assert_eq!(
@@ -6606,7 +6649,7 @@ async fn test_library_provider_runtime_custody_buy_rejects_caller_supplied_purch
         "buy",
         json!({
             "mint_id": "00".repeat(32),
-            "wallet_request_hex": "00",
+            "account_id": "wallet:eip155:8453:0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
         }),
     )
     .await;
@@ -6631,7 +6674,6 @@ async fn test_runtime_custody_buy_raw_provider_call_requires_gateway_wallet_auth
             "op": "buy",
             "principal_id": "person:local:raw-provider-buy",
             "mint_id": "00".repeat(32),
-            "account_id": "wallet:eip155:8453:0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
         }),
         None,
     )
@@ -6658,6 +6700,14 @@ async fn test_runtime_custody_buy_fails_before_effects_when_fresh_availability_i
         .provider
         .seed_managed_evm_account_for_principal(&authority.principal_id)
         .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &wallet_account_id,
+        10,
+    )
+    .await;
     let uri = format!(
         "{}/Documents/protected-buy-no-availability",
         crate::auth::principal_localhost_root(&authority.principal_id)
@@ -6679,7 +6729,6 @@ async fn test_runtime_custody_buy_fails_before_effects_when_fresh_availability_i
         "buy",
         json!({
             "mint_id": hex::encode(facts.mint_id.as_bytes()),
-            "account_id": wallet_account_id,
         }),
     )
     .await;
@@ -6729,6 +6778,14 @@ async fn test_runtime_custody_buy_native_terminal_replay_is_exact_and_listing_st
         .provider
         .seed_managed_evm_account_for_principal(&authority.principal_id)
         .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &wallet_account_id,
+        10,
+    )
+    .await;
     let uri = format!(
         "{}/Documents/protected-buy-native",
         crate::auth::principal_localhost_root(&authority.principal_id)
@@ -6753,7 +6810,6 @@ async fn test_runtime_custody_buy_native_terminal_replay_is_exact_and_listing_st
         "buy",
         json!({
             "mint_id": hex::encode(facts.mint_id.as_bytes()),
-            "account_id": wallet_account_id,
         }),
     )
     .await;
@@ -6785,7 +6841,6 @@ async fn test_runtime_custody_buy_native_terminal_replay_is_exact_and_listing_st
         "buy",
         json!({
             "mint_id": hex::encode(facts.mint_id.as_bytes()),
-            "account_id": wallet_account_id,
         }),
     )
     .await;
@@ -6816,6 +6871,18 @@ async fn test_runtime_custody_buy_native_terminal_replay_is_exact_and_listing_st
     assert!(!purchase_json.contains("http://"));
 
     set_mock_protected_content_listing_quantity("0x0");
+    let replacement_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&authority.principal_id, 2)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &replacement_account_id,
+        20,
+    )
+    .await;
     let replay_again_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
     let (replay_status, replay_payload) = post_library(
         app,
@@ -6823,7 +6890,6 @@ async fn test_runtime_custody_buy_native_terminal_replay_is_exact_and_listing_st
         "buy",
         json!({
             "mint_id": hex::encode(facts.mint_id.as_bytes()),
-            "account_id": wallet_account_id,
         }),
     )
     .await;
@@ -6847,6 +6913,14 @@ async fn test_runtime_custody_buy_native_terminal_replay_is_exact_and_listing_st
     );
     assert_eq!(mock_chain_broadcast_count(&signed_transaction), 1);
     assert_eq!(std::fs::read(listing_path).unwrap(), listing_before);
+    let replayed_purchase = crate::protected_content_runtime::load_runtime_custody_purchase(
+        dir.path(),
+        &authority.principal_id,
+        facts.mint_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(replayed_purchase.account_id, wallet_account_id);
 }
 
 #[tokio::test]
@@ -6870,6 +6944,14 @@ async fn test_runtime_custody_buy_erc20_orders_approval_then_buy_without_duplica
         .provider
         .seed_managed_evm_account_for_principal(&authority.principal_id)
         .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &wallet_account_id,
+        10,
+    )
+    .await;
     let uri = format!(
         "{}/Documents/protected-buy-erc20",
         crate::auth::principal_localhost_root(&authority.principal_id)
@@ -6892,7 +6974,6 @@ async fn test_runtime_custody_buy_erc20_orders_approval_then_buy_without_duplica
         "buy",
         json!({
             "mint_id": hex::encode(facts.mint_id.as_bytes()),
-            "account_id": wallet_account_id,
         }),
     )
     .await;
@@ -6925,7 +7006,6 @@ async fn test_runtime_custody_buy_erc20_orders_approval_then_buy_without_duplica
         "buy",
         json!({
             "mint_id": hex::encode(facts.mint_id.as_bytes()),
-            "account_id": wallet_account_id,
         }),
     )
     .await;
@@ -6964,7 +7044,6 @@ async fn test_runtime_custody_buy_erc20_orders_approval_then_buy_without_duplica
         "buy",
         json!({
             "mint_id": hex::encode(facts.mint_id.as_bytes()),
-            "account_id": wallet_account_id,
         }),
     )
     .await;
@@ -6985,7 +7064,6 @@ async fn test_runtime_custody_buy_erc20_orders_approval_then_buy_without_duplica
         "buy",
         json!({
             "mint_id": hex::encode(facts.mint_id.as_bytes()),
-            "account_id": wallet_account_id,
         }),
     )
     .await;
@@ -7021,6 +7099,14 @@ async fn test_runtime_custody_buy_access_corroboration_stays_nonterminal_until_a
         .provider
         .seed_managed_evm_account_for_principal(&authority.principal_id)
         .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &wallet_account_id,
+        10,
+    )
+    .await;
     let uri = format!(
         "{}/Documents/protected-buy-access-pending",
         crate::auth::principal_localhost_root(&authority.principal_id)
@@ -7042,7 +7128,6 @@ async fn test_runtime_custody_buy_access_corroboration_stays_nonterminal_until_a
         "buy",
         json!({
             "mint_id": hex::encode(facts.mint_id.as_bytes()),
-            "account_id": wallet_account_id,
         }),
     )
     .await;
@@ -7071,7 +7156,6 @@ async fn test_runtime_custody_buy_access_corroboration_stays_nonterminal_until_a
             "buy",
             json!({
                 "mint_id": hex::encode(facts.mint_id.as_bytes()),
-                "account_id": wallet_account_id,
             }),
         )
         .await;
@@ -7105,13 +7189,569 @@ async fn test_runtime_custody_buy_access_corroboration_stays_nonterminal_until_a
         "buy",
         json!({
             "mint_id": hex::encode(facts.mint_id.as_bytes()),
-            "account_id": wallet_account_id,
         }),
     )
     .await;
     assert_eq!(ok_status, StatusCode::OK);
     assert_eq!(ok_payload["status"], "ok");
     assert_eq!(ok_payload["data"]["availability"]["status"], "buyer_owned");
+}
+
+#[tokio::test]
+async fn test_runtime_custody_buy_selects_latest_chain_transaction_default() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let older_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&authority.principal_id, 1)
+        .await;
+    let latest_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&authority.principal_id, 2)
+        .await;
+    let other_chain_address = mock_managed_evm_address(3).unwrap();
+    let other_chain_account_id = format!("wallet:eip155:20:{other_chain_address}");
+    wallet_provider.provider.accounts.lock().await.push(json!({
+        "account_id": other_chain_account_id,
+        "principal_id": authority.principal_id,
+        "proof_binding_id": format!("proof:wallet:managed:eip155:20:{other_chain_address}"),
+        "chain_namespace": "eip155:20",
+        "address": other_chain_address,
+        "proof_type": "managed_evm",
+        "signing_available": true,
+        "signing_status": "managed_key_available",
+        "label": "Managed",
+        "linked_at": crate::auth::now_ts()
+    }));
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:20",
+        &other_chain_account_id,
+        30,
+    )
+    .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &older_account_id,
+        10,
+    )
+    .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &latest_account_id,
+        20,
+    )
+    .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-select-default",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x95, &older_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        true,
+    );
+    let app = gateway_router(state);
+
+    let (pending_status, pending_payload) = post_library(
+        app,
+        &token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+        }),
+    )
+    .await;
+    assert_eq!(pending_status, StatusCode::OK);
+    assert_eq!(pending_payload["status"], "error");
+    assert_eq!(
+        pending_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+    let purchase = crate::protected_content_runtime::load_runtime_custody_purchase(
+        dir.path(),
+        &authority.principal_id,
+        facts.mint_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(purchase.account_id, latest_account_id);
+    assert_eq!(purchase.chain_namespace, "eip155:8453");
+}
+
+#[tokio::test]
+async fn test_runtime_custody_creator_publish_binding_selects_latest_chain_transaction_default() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "creator");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let runtime_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &token);
+    let older_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&authority.principal_id, 1)
+        .await;
+    let latest_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&authority.principal_id, 2)
+        .await;
+    let latest_address = mock_managed_evm_address(2).unwrap();
+    let other_chain_address = mock_managed_evm_address(3).unwrap();
+    let other_chain_account_id = format!("wallet:eip155:20:{other_chain_address}");
+    wallet_provider.provider.accounts.lock().await.push(json!({
+        "account_id": other_chain_account_id,
+        "principal_id": authority.principal_id,
+        "proof_binding_id": format!("proof:wallet:managed:eip155:20:{other_chain_address}"),
+        "chain_namespace": "eip155:20",
+        "address": other_chain_address,
+        "proof_type": "managed_evm",
+        "signing_available": true,
+        "signing_status": "managed_key_available",
+        "label": "Managed",
+        "linked_at": crate::auth::now_ts()
+    }));
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:20",
+        &other_chain_account_id,
+        30,
+    )
+    .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &older_account_id,
+        10,
+    )
+    .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &latest_account_id,
+        20,
+    )
+    .await;
+
+    let binding = crate::api::gateway::resolve_runtime_custody_creator_publish_binding(
+        &state,
+        &runtime_authority,
+        &authority.principal_id,
+        &format!(
+            "{}/Documents/protected-select-default",
+            crate::auth::principal_localhost_root(&authority.principal_id)
+        ),
+        "plain_localhost_root",
+    )
+    .await
+    .unwrap();
+    assert_eq!(binding.account_id, latest_account_id);
+    assert_eq!(binding.address, latest_address.to_ascii_lowercase());
+}
+
+#[tokio::test]
+async fn test_runtime_custody_creator_publish_binding_reuses_media_preparation_authority() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "creator");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let runtime_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &token);
+    let bound_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&authority.principal_id, 1)
+        .await;
+    let newer_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&authority.principal_id, 2)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &newer_account_id,
+        20,
+    )
+    .await;
+    let object_uri = format!(
+        "{}/Documents/protected-media-bound-default",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let protected_content_root = dir.path().join("protected-content");
+    std::fs::create_dir_all(&protected_content_root).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &protected_content_root,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+    let preparation = elastos_protected_content_runtime::RuntimeMediaPreparationRecord::new(
+        &authority.principal_id,
+        &object_uri,
+        "plain_localhost_root",
+        elastos_protected_content_contracts::Digest32::new([0x51; 32]),
+        "media",
+        &bound_account_id,
+        mock_managed_evm_address(1).unwrap(),
+        runtime_custody_creator_source_digest(),
+    )
+    .unwrap();
+    crate::protected_content_runtime::runtime_mint_journal(dir.path())
+        .persist_media_preparation(&preparation)
+        .unwrap();
+
+    let binding = crate::api::gateway::resolve_runtime_custody_creator_publish_binding(
+        &state,
+        &runtime_authority,
+        &authority.principal_id,
+        &object_uri,
+        "plain_localhost_root",
+    )
+    .await
+    .unwrap();
+    assert_eq!(binding.account_id, bound_account_id);
+    assert_eq!(binding.address, mock_managed_evm_address(1).unwrap());
+}
+
+#[tokio::test]
+async fn test_runtime_custody_creator_publish_binding_requires_a_valid_chain_transaction_default() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "creator");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let runtime_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &token);
+    let valid_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&authority.principal_id, 1)
+        .await;
+    let other_valid_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&authority.principal_id, 2)
+        .await;
+    let object_uri = format!(
+        "{}/Documents/protected-invalid-default",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+
+    let cases = [
+        ("missing", vec![], None),
+        (
+            "wrong_chain",
+            vec![json!({
+                "schema": "elastos.wallet.default_account/v1",
+                "principal_id": authority.principal_id,
+                "chain_namespace": "eip155:20",
+                "intent": "transaction_intent",
+                "account_id": valid_account_id,
+                "set_at": 10,
+            })],
+            None,
+        ),
+        (
+            "stale",
+            vec![json!({
+                "schema": "elastos.wallet.default_account/v1",
+                "principal_id": authority.principal_id,
+                "chain_namespace": "eip155:8453",
+                "intent": "transaction_intent",
+                "account_id": "wallet:eip155:8453:0x0000000000000000000000000000000000000000",
+                "set_at": 10,
+            })],
+            None,
+        ),
+        (
+            "ambiguous",
+            vec![
+                json!({
+                    "schema": "elastos.wallet.default_account/v1",
+                    "principal_id": authority.principal_id,
+                    "chain_namespace": "eip155:8453",
+                    "intent": "transaction_intent",
+                    "account_id": valid_account_id,
+                    "set_at": 10,
+                }),
+                json!({
+                    "schema": "elastos.wallet.default_account/v1",
+                    "principal_id": authority.principal_id,
+                    "chain_namespace": "eip155:8453",
+                    "intent": "transaction_intent",
+                    "account_id": other_valid_account_id,
+                    "set_at": 10,
+                }),
+            ],
+            None,
+        ),
+        (
+            "external_only",
+            vec![json!({
+                "schema": "elastos.wallet.default_account/v1",
+                "principal_id": authority.principal_id,
+                "chain_namespace": "eip155:8453",
+                "intent": "transaction_intent",
+                "account_id": valid_account_id,
+                "set_at": 10,
+            })],
+            Some(json!({
+                "account_id": valid_account_id,
+                "principal_id": authority.principal_id,
+                "proof_binding_id": format!("proof:wallet:connector:eip155:8453:{}", mock_managed_evm_address(1).unwrap()),
+                "chain_namespace": "eip155:8453",
+                "address": mock_managed_evm_address(1).unwrap(),
+                "proof_type": "connector_evm",
+                "signing_available": false,
+                "signing_status": "connector_only",
+                "label": "External",
+                "linked_at": crate::auth::now_ts(),
+            })),
+        ),
+    ];
+
+    for (label, defaults, replacement_account) in cases {
+        wallet_provider.provider.defaults.lock().await.clear();
+        wallet_provider
+            .provider
+            .accounts
+            .lock()
+            .await
+            .retain(|account| account["proof_type"].as_str() != Some("connector_evm"));
+        wallet_provider
+            .provider
+            .defaults
+            .lock()
+            .await
+            .extend(defaults);
+        if let Some(account) = replacement_account {
+            let mut accounts = wallet_provider.provider.accounts.lock().await;
+            if let Some(existing) = accounts.iter_mut().find(|existing| {
+                existing.get("account_id").and_then(Value::as_str)
+                    == account.get("account_id").and_then(Value::as_str)
+            }) {
+                *existing = account;
+            }
+        }
+        let error = crate::api::gateway::resolve_runtime_custody_creator_publish_binding(
+            &state,
+            &runtime_authority,
+            &authority.principal_id,
+            &object_uri,
+            "plain_localhost_root",
+        )
+        .await
+        .expect_err("invalid creator default must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "Runtime custody creator mint is unavailable",
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_runtime_custody_buy_requires_a_valid_chain_transaction_default() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let valid_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&authority.principal_id, 1)
+        .await;
+    let other_valid_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&authority.principal_id, 2)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-invalid-default",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x96, &valid_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        true,
+    );
+    let app = gateway_router(state);
+
+    let cases = [
+        ("missing", vec![], None),
+        (
+            "wrong_chain",
+            vec![json!({
+                "schema": "elastos.wallet.default_account/v1",
+                "principal_id": authority.principal_id,
+                "chain_namespace": "eip155:20",
+                "intent": "transaction_intent",
+                "account_id": valid_account_id,
+                "set_at": 10,
+            })],
+            None,
+        ),
+        (
+            "stale",
+            vec![json!({
+                "schema": "elastos.wallet.default_account/v1",
+                "principal_id": authority.principal_id,
+                "chain_namespace": "eip155:8453",
+                "intent": "transaction_intent",
+                "account_id": "wallet:eip155:8453:0x0000000000000000000000000000000000000000",
+                "set_at": 10,
+            })],
+            None,
+        ),
+        (
+            "ambiguous",
+            vec![
+                json!({
+                    "schema": "elastos.wallet.default_account/v1",
+                    "principal_id": authority.principal_id,
+                    "chain_namespace": "eip155:8453",
+                    "intent": "transaction_intent",
+                    "account_id": valid_account_id,
+                    "set_at": 10,
+                }),
+                json!({
+                    "schema": "elastos.wallet.default_account/v1",
+                    "principal_id": authority.principal_id,
+                    "chain_namespace": "eip155:8453",
+                    "intent": "transaction_intent",
+                    "account_id": other_valid_account_id,
+                    "set_at": 10,
+                }),
+            ],
+            None,
+        ),
+        (
+            "external_only",
+            vec![json!({
+                "schema": "elastos.wallet.default_account/v1",
+                "principal_id": authority.principal_id,
+                "chain_namespace": "eip155:8453",
+                "intent": "transaction_intent",
+                "account_id": valid_account_id,
+                "set_at": 10,
+            })],
+            Some(json!({
+                "account_id": valid_account_id,
+                "principal_id": authority.principal_id,
+                "proof_binding_id": format!("proof:wallet:connector:eip155:8453:{}", mock_managed_evm_address(1).unwrap()),
+                "chain_namespace": "eip155:8453",
+                "address": mock_managed_evm_address(1).unwrap(),
+                "proof_type": "connector_evm",
+                "signing_available": false,
+                "signing_status": "connector_only",
+                "label": "External",
+                "linked_at": crate::auth::now_ts(),
+            })),
+        ),
+    ];
+
+    for (_name, defaults, replacement_account) in cases {
+        {
+            let mut stored_defaults = wallet_provider.provider.defaults.lock().await;
+            stored_defaults.clear();
+            stored_defaults.extend(defaults);
+        }
+        if let Some(replacement_account) = replacement_account.clone() {
+            let mut accounts = wallet_provider.provider.accounts.lock().await;
+            if let Some(existing) = accounts.iter_mut().find(|account| {
+                account.get("account_id").and_then(Value::as_str)
+                    == replacement_account
+                        .get("account_id")
+                        .and_then(Value::as_str)
+            }) {
+                *existing = replacement_account;
+            }
+        }
+        wallet_provider.clear_requests().await;
+        let (status, payload) = post_library(
+            app.clone(),
+            &token,
+            "buy",
+            json!({
+                "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["status"], "error");
+        assert_eq!(
+            payload["message"],
+            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+        );
+        assert_eq!(
+            wallet_provider
+                .provider
+                .latest_transaction_approval_request_id()
+                .await,
+            None
+        );
+        assert!(
+            crate::protected_content_runtime::load_runtime_custody_purchase(
+                dir.path(),
+                &authority.principal_id,
+                facts.mint_id,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -7174,10 +7814,30 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
         .provider
         .seed_managed_evm_account_for_principal_with_index(&creator.principal_id, 1)
         .await;
+    let replacement_creator_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&creator.principal_id, 3)
+        .await;
     let buyer_account_id = wallet_provider
         .provider
         .seed_managed_evm_account_for_principal_with_index(&buyer.principal_id, 2)
         .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &creator.principal_id,
+        "eip155:8453",
+        &creator_account_id,
+        10,
+    )
+    .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &buyer.principal_id,
+        "eip155:8453",
+        &buyer_account_id,
+        10,
+    )
+    .await;
     let app = gateway_router(state.clone());
 
     let creator_root = crate::auth::principal_localhost_root(&creator.principal_id);
@@ -7189,7 +7849,6 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
         "uri": uri,
         "protection": {
             "mode": "runtime_custody",
-            "wallet_account_id": creator_account_id,
             "copies": "0x2",
             "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
         },
@@ -7202,6 +7861,14 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
         publish_pending["message"],
         "Runtime custody creator mint is pending exact Wallet or Chain settlement"
     );
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &creator.principal_id,
+        "eip155:8453",
+        &replacement_creator_account_id,
+        20,
+    )
+    .await;
     let creator_signed_transaction = {
         let _ = wallet_provider
             .provider
@@ -7226,6 +7893,17 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
     let mint_id = elastos_protected_content_contracts::Digest32::new(
         hex::decode(&mint_id_hex).unwrap().try_into().unwrap(),
     );
+    let persisted_mint = crate::protected_content_runtime::runtime_mint_journal(dir.path())
+        .load(mint_id)
+        .unwrap();
+    assert_eq!(
+        persisted_mint
+            .creator_state()
+            .unwrap()
+            .desired_terms()
+            .wallet_account_id(),
+        creator_account_id
+    );
     let listing_path = runtime_custody_listing_path_for_test(dir.path(), mint_id);
     let listing_before_buy = std::fs::read(&listing_path).unwrap();
     assert_eq!(mock_content_publish_request_count(), 2);
@@ -7237,7 +7915,6 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
         "buy",
         json!({
             "mint_id": mint_id_hex,
-            "account_id": buyer_account_id.clone(),
         }),
     )
     .await;
@@ -7271,7 +7948,6 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
         "buy",
         json!({
             "mint_id": hex::encode(mint_id.as_bytes()),
-            "account_id": buyer_account_id.clone(),
         }),
     )
     .await;
@@ -7308,7 +7984,6 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
         "buy",
         json!({
             "mint_id": hex::encode(mint_id.as_bytes()),
-            "account_id": buyer_account_id.clone(),
         }),
     )
     .await;
@@ -7482,6 +8157,133 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
     assert!(viewer_record["pending_close_result"].is_null());
     assert!(viewer_record["pending_cancel_result"].is_null());
     assert_eq!(std::fs::read(&listing_path).unwrap(), listing_before_buy);
+}
+
+#[tokio::test]
+async fn test_runtime_custody_creator_tail_rejects_resolved_source_drift_before_chain_effect() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_content_publish_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let runtime_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &token);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-tail-source-drift",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x84, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &input);
+    let mint_id = facts.mint_id;
+    let replay_content_cid = facts.content_cid.clone();
+    let replay_content_id = facts.content_id.clone();
+
+    let pending = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &runtime_authority,
+        registry.clone(),
+        input.clone(),
+        facts,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        pending.to_string(),
+        "Runtime custody creator mint is pending exact Wallet or Chain settlement"
+    );
+    let approval_request_id = wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    let initial_mint = crate::protected_content_runtime::runtime_mint_journal(dir.path())
+        .load(mint_id)
+        .unwrap();
+    let initial_effect = initial_mint
+        .creator_state()
+        .and_then(|state| state.effect())
+        .cloned()
+        .expect("creator effect bound after pending result");
+    let _tx_hash = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    let signed_transaction = wallet_provider
+        .provider
+        .latest_transaction_signed_transaction()
+        .await
+        .expect("completed mock transaction");
+    reset_mock_chain_broadcast_count(&signed_transaction);
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 0);
+    set_mock_protected_content_chain_creator_mint_resolve_drift();
+
+    let replay_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let replay_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &replay_token);
+    let replay_facts = crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts {
+        content_cid: replay_content_cid,
+        mint_id,
+        content_id: replay_content_id,
+        display_name: "protected-tail.mp4".to_string(),
+        mime_type: input.mime_type.clone(),
+        codecs: input.codecs.clone(),
+        availability: json!({"status": "local_pinned"}),
+        receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
+        content_security: json!({"mode": "runtime_custody"}),
+    };
+    let err = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &replay_authority,
+        registry.clone(),
+        input,
+        replay_facts,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Runtime custody creator mint is unavailable"
+    );
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 0);
+    assert_eq!(mock_content_publish_request_count(), 1);
+    assert!(
+        crate::protected_content_runtime::load_runtime_custody_listing(dir.path(), mint_id)
+            .unwrap()
+            .is_none()
+    );
+    let reloaded = crate::protected_content_runtime::runtime_mint_journal(dir.path())
+        .load(mint_id)
+        .unwrap();
+    assert!(
+        reloaded
+            .creator_state()
+            .and_then(|state| state.effect())
+            .cloned()
+            == Some(initial_effect)
+    );
+    assert_eq!(
+        wallet_provider
+            .provider
+            .latest_transaction_approval_request_id()
+            .await
+            .as_deref(),
+        Some(approval_request_id.as_str())
+    );
 }
 
 #[tokio::test]

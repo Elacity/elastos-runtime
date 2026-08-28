@@ -1099,6 +1099,38 @@ struct RuntimeCustodyPrebuyAvailabilityHarness {
     mint_id: Digest32,
 }
 
+fn runtime_custody_listing_record_for_test(
+    mint_id: Digest32,
+    publisher_principal_id: &str,
+    display_name: &str,
+    published_at: u64,
+) -> super::RuntimeCustodyListingRecord {
+    super::RuntimeCustodyListingRecord {
+        schema: super::RUNTIME_LISTING_SCHEMA_V1.to_string(),
+        mint_id: hex::encode(mint_id.as_bytes()),
+        content_id: format!("content:{}", hex::encode([mint_id.as_bytes()[0]; 16])),
+        content_access_id: format!("0x{}", hex::encode([mint_id.as_bytes()[1]; 16])),
+        cid: format!("bafybei{}", "a".repeat(16)),
+        metadata_cid: format!("bafybei{}", "b".repeat(16)),
+        token_uri: "ipfs://bafybeicreatormetadata/metadata.json".to_string(),
+        publisher_principal_id: publisher_principal_id.to_string(),
+        display_name: display_name.to_string(),
+        mime_type: MEDIA_MIME_TYPE_V1.to_string(),
+        codecs: MEDIA_CODECS_V1.to_string(),
+        quantity: "0x2".to_string(),
+        seller_address: "0x0000000000000000000000000000000000000011".to_string(),
+        chain_namespace: "eip155:8453".to_string(),
+        network: "base-mainnet".to_string(),
+        ledger: "0x0000000000000000000000000000000000000022".to_string(),
+        token_id: "0x1".to_string(),
+        operative: "0x0000000000000000000000000000000000000033".to_string(),
+        price: "0x5".to_string(),
+        pay_token: "0x0000000000000000000000000000000000000044".to_string(),
+        payment_processor: Some("0x0000000000000000000000000000000000000055".to_string()),
+        published_at,
+    }
+}
+
 async fn runtime_custody_prebuy_availability_harness(
     provider_seed: u8,
     provider_config: ContentAvailabilityTestConfig,
@@ -1175,6 +1207,10 @@ async fn runtime_custody_prebuy_availability_harness(
             metadata_cid: "bafybeicreatormetadata".to_string(),
             token_uri: "ipfs://bafybeicreatormetadata/metadata.json".to_string(),
             publisher_principal_id: "person:local:creator".to_string(),
+            display_name: "protected-video.mp4".to_string(),
+            mime_type: MEDIA_MIME_TYPE_V1.to_string(),
+            codecs: MEDIA_CODECS_V1.to_string(),
+            quantity: "0x2".to_string(),
             seller_address: "0x0000000000000000000000000000000000000011".to_string(),
             chain_namespace: "eip155:8453".to_string(),
             network: "base-mainnet".to_string(),
@@ -1221,6 +1257,174 @@ async fn runtime_custody_prebuy_availability_harness(
         content_provider,
         mint_id: mint_draft.mint_id(),
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_listings_project_public_summary_and_access_state() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let availability = mint.content_availability().unwrap();
+    let buyer_principal_id = "person:local:buyer";
+    install_profile_authority_keeping_device_key(&harness.data_dir, buyer_principal_id);
+    let buyer_profile_did = load_profile_did_for_test(&harness.data_dir, buyer_principal_id);
+    persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        buyer_principal_id,
+        &buyer_profile_did,
+        crate::auth::now_ts(),
+    );
+
+    let creator_view =
+        super::list_runtime_custody_listings(&harness.data_dir, "person:local:creator").unwrap();
+    assert_eq!(
+        creator_view["schema"],
+        super::RUNTIME_CUSTODY_LISTINGS_RESPONSE_SCHEMA_V1
+    );
+    assert_eq!(creator_view["truncated"], false);
+    let creator_listing = creator_view["listings"][0].as_object().unwrap();
+    assert_eq!(
+        creator_listing.keys().cloned().collect::<Vec<_>>(),
+        vec![
+            "access_state",
+            "availability",
+            "codecs",
+            "display_name",
+            "mime_type",
+            "mint_id",
+            "pay_token",
+            "price",
+            "published_at",
+            "quantity",
+            "schema",
+            "seller_address",
+            "token_id",
+        ]
+    );
+    assert_eq!(creator_listing["display_name"], "protected-video.mp4");
+    assert_eq!(creator_listing["mime_type"], MEDIA_MIME_TYPE_V1);
+    assert_eq!(creator_listing["codecs"], MEDIA_CODECS_V1);
+    assert_eq!(creator_listing["quantity"], "0x2");
+    assert_eq!(creator_listing["price"], "0x5");
+    let expected_availability = json!({
+        "schema": super::RUNTIME_CUSTODY_LISTING_AVAILABILITY_SCHEMA_V1,
+        "status": "last_verified_receipt",
+        "checked_at": availability.checked_at(),
+        "required_replicas": availability.required_replicas(),
+        "observed_replicas": availability.observed_replicas(),
+        "recheck_before_buy": true,
+        "recheck_before_open": true,
+    });
+    assert_eq!(creator_listing["availability"], expected_availability);
+    assert_eq!(creator_listing["access_state"], "creator");
+
+    let buyer_view =
+        super::list_runtime_custody_listings(&harness.data_dir, buyer_principal_id).unwrap();
+    assert_eq!(buyer_view["listings"][0]["access_state"], "purchased");
+    assert_eq!(
+        buyer_view["listings"][0]["availability"],
+        expected_availability
+    );
+
+    let other_view =
+        super::list_runtime_custody_listings(&harness.data_dir, "person:local:other").unwrap();
+    assert_eq!(other_view["listings"][0]["access_state"], "available");
+    assert_eq!(
+        other_view["listings"][0]["availability"],
+        expected_availability
+    );
+    for hidden in [
+        "publisher_principal_id",
+        "content_id",
+        "cid",
+        "metadata_cid",
+        "token_uri",
+        "chain_namespace",
+        "network",
+        "ledger",
+        "operative",
+        "payment_processor",
+    ] {
+        assert!(
+            creator_view["listings"][0].get(hidden).is_none(),
+            "{hidden}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_custody_listing_selection_is_stable_and_truncated_by_mint_filename() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    owner_only_dir(&data_dir.join("protected-content"));
+    let listings_root = data_dir.join(super::RUNTIME_LISTING_ROOT);
+    owner_only_dir(&listings_root);
+
+    for index in (0..(super::MAX_RUNTIME_CUSTODY_LISTINGS + 3)).rev() {
+        let mint_id = Digest32::new([u8::try_from(index + 1).unwrap(); 32]);
+        let path = super::runtime_listing_path(&data_dir, mint_id);
+        write_owner_only_bytes(&path, b"{}").unwrap();
+    }
+
+    let (first_paths, first_truncated) =
+        super::select_runtime_custody_listing_paths(&listings_root).unwrap();
+    let (second_paths, second_truncated) =
+        super::select_runtime_custody_listing_paths(&listings_root).unwrap();
+    assert_eq!(first_truncated, true);
+    assert_eq!(second_truncated, true);
+    assert_eq!(first_paths, second_paths);
+    assert_eq!(first_paths.len(), super::MAX_RUNTIME_CUSTODY_LISTINGS);
+    let selected = first_paths
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let expected = (0..super::MAX_RUNTIME_CUSTODY_LISTINGS)
+        .map(|index| {
+            format!(
+                "{}.json",
+                hex::encode([u8::try_from(index + 1).unwrap(); 32])
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(selected, expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_custody_listings_reject_malformed_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    owner_only_dir(&data_dir.join("protected-content"));
+
+    let mint_id = digest(0x90);
+    let mut invalid = serde_json::to_value(runtime_custody_listing_record_for_test(
+        mint_id,
+        "person:local:creator",
+        "Valid name",
+        123,
+    ))
+    .unwrap();
+    invalid["display_name"] = Value::String(String::new());
+    write_owner_only_bytes(
+        &super::runtime_listing_path(&data_dir, mint_id),
+        &serde_json::to_vec(&invalid).unwrap(),
+    )
+    .unwrap();
+
+    let error = super::list_runtime_custody_listings(&data_dir, "person:local:creator")
+        .err()
+        .expect("expected malformed record rejection");
+    assert_eq!(error.to_string(), "Runtime custody listing is invalid");
 }
 
 #[tokio::test]
@@ -6518,6 +6722,8 @@ fn media_preparation_source_input(
         principal_id: principal_id.to_string(),
         source_file_path: root.join("source.mp4"),
         wallet_account_id: "wallet-account-1".to_string(),
+        wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
+        creator_mint_source_digest: digest(0x71),
         copies: "0x1".to_string(),
         price: "0x5".to_string(),
         source_storage: "protected_principal_root".to_string(),
@@ -6687,6 +6893,8 @@ async fn runtime_custody_library_publish_fails_closed_without_composition() {
             mime_type: MEDIA_MIME_TYPE_V1.to_string(),
             codecs: MEDIA_CODECS_V1.to_string(),
             wallet_account_id: "wallet-account-1".to_string(),
+            wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
+            creator_mint_source_digest: digest(0x71),
             copies: "0x1".to_string(),
             price: "0x5".to_string(),
             clear_init_segment,
@@ -6739,6 +6947,8 @@ async fn runtime_custody_library_publish_fails_closed_without_device_key() {
             mime_type: MEDIA_MIME_TYPE_V1.to_string(),
             codecs: MEDIA_CODECS_V1.to_string(),
             wallet_account_id: "wallet-account-1".to_string(),
+            wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
+            creator_mint_source_digest: digest(0x71),
             copies: "0x1".to_string(),
             price: "0x5".to_string(),
             clear_init_segment,
@@ -6784,6 +6994,8 @@ fn library_publish_test_input(principal_id: &str) -> RuntimeCustodyLibraryPublis
         mime_type: MEDIA_MIME_TYPE_V1.to_string(),
         codecs: MEDIA_CODECS_V1.to_string(),
         wallet_account_id: "wallet-account-1".to_string(),
+        wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
+        creator_mint_source_digest: digest(0x71),
         copies: "0x1".to_string(),
         price: "0x5".to_string(),
         clear_init_segment,
@@ -6995,6 +7207,8 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
         principal_id: "person:local:runtime-custody-pre-dispatch-retry".to_string(),
         source_file_path: source_file_path.clone(),
         wallet_account_id: "wallet-account-1".to_string(),
+        wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
+        creator_mint_source_digest: digest(0x71),
         copies: "0x1".to_string(),
         price: "0x5".to_string(),
         source_storage: "plain_localhost_root".to_string(),
@@ -7005,6 +7219,9 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
         &source.source_storage,
         source_media_digest(&source_file_path).unwrap(),
         MEDIA_PROVIDER_ID,
+        source.wallet_account_id.clone(),
+        source.wallet_account_address.clone(),
+        source.creator_mint_source_digest,
     )
     .unwrap();
     let preparation_receipt = digest(0xd1);
@@ -7041,6 +7258,51 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
     assert_eq!(replay.content_cid, published.content_cid);
     assert_eq!(replay.content_id, published.content_id);
     assert_eq!(replay.mint_id, published.mint_id);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_publish_rejects_creator_account_switch_before_protect_effects() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    write_device_key(&data_dir, 0x21);
+    write_library_publish_test_composition(&data_dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    let input = library_publish_test_input("person:local:runtime-custody-creator-account-switch");
+    let request_id = library_publish_request_id(&input);
+    let first = publish_runtime_custody_library_object(&data_dir, registry.clone(), input.clone())
+        .await
+        .expect_err("missing protect provider must fail closed");
+    assert!(
+        first
+            .to_string()
+            .contains("Runtime custody protect provider is unavailable"),
+        "{first}"
+    );
+
+    let mut switched = input;
+    switched.wallet_account_id = "wallet-account-2".to_string();
+    switched.wallet_account_address = "0x2222222222222222222222222222222222222222".to_string();
+    let second = publish_runtime_custody_library_object(&data_dir, registry, switched)
+        .await
+        .expect_err("creator account drift must fail closed");
+    assert!(
+        second
+            .to_string()
+            .contains("Runtime custody mint intent conflicts with existing authority"),
+        "{second}"
+    );
+
+    let intent = runtime_mint_journal(&data_dir)
+        .load_intent(request_id)
+        .unwrap();
+    assert_eq!(intent.creator_wallet_account_id(), "wallet-account-1");
+    assert_eq!(
+        intent.creator_wallet_address(),
+        "0x1111111111111111111111111111111111111111"
+    );
+    assert_eq!(intent.protect_state_label(), "not_started");
 }
 
 #[cfg(unix)]
@@ -7117,6 +7379,60 @@ async fn runtime_custody_library_publish_blocks_exact_retry_after_ambiguous_prot
     assert_eq!(requests[1]["op"], "open_protection_session");
     assert_eq!(requests[0], requests[1]);
     assert_eq!(requests[2]["op"], "cancel_protection_session");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_publish_rejects_creator_source_drift_during_open_request_pending()
+{
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    write_device_key(&data_dir, 0x21);
+    write_library_publish_test_composition(&data_dir);
+    let protect = SequencedProvider::new(
+        PROTECT_PROVIDER_ID,
+        vec![Err(ProviderError::Provider(
+            "simulated protect bridge failure".to_string(),
+        ))],
+    );
+    let registry = Arc::new(ProviderRegistry::new());
+    registry.register(protect.clone()).await;
+    let input = library_publish_test_input("person:local:runtime-custody-source-drift");
+    let request_id = library_publish_request_id(&input);
+    let first = publish_runtime_custody_library_object(&data_dir, registry.clone(), input.clone())
+        .await
+        .expect_err("ambiguous protect dispatch must fail closed");
+    assert!(
+        first
+            .to_string()
+            .contains("Runtime custody protect provider is unavailable"),
+        "{first}"
+    );
+    let pending = runtime_mint_journal(&data_dir)
+        .load_intent(request_id)
+        .unwrap();
+    assert_eq!(pending.protect_state_label(), "open_request_pending");
+
+    let mut drifted = input;
+    drifted.creator_mint_source_digest = digest(0x72);
+    let second = publish_runtime_custody_library_object(&data_dir, registry, drifted)
+        .await
+        .expect_err("creator source drift must fail closed");
+    assert!(
+        second
+            .to_string()
+            .contains("Runtime custody mint intent conflicts with existing authority"),
+        "{second}"
+    );
+
+    let reloaded = runtime_mint_journal(&data_dir)
+        .load_intent(request_id)
+        .unwrap();
+    assert_eq!(reloaded.protect_state_label(), "open_request_pending");
+    let requests = protect.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["op"], "open_protection_session");
 }
 
 #[cfg(unix)]

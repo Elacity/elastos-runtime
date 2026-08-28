@@ -2628,6 +2628,25 @@ fn resolve_protected_content_creator_mint_returns_exact_call_and_content_access_
 }
 
 #[test]
+fn describe_protected_content_creator_mint_source_returns_exact_configured_facts() {
+    let mut provider = provider_with_creator_mint_rpc("http://127.0.0.1:9".to_string());
+    let data = ok_data(provider.handle(Request::DescribeProtectedContentCreatorMintSource));
+    assert_eq!(data["schema"], PROTECTED_CONTENT_CREATOR_MINT_SOURCE_SCHEMA);
+    assert_eq!(data["network"], "base-local");
+    assert_eq!(data["chain_namespace"], "eip155:8453");
+    assert_eq!(data["ledger"], "0x0000000000000000000000000000000000000022");
+    assert_eq!(
+        data["pay_token"],
+        "0x0000000000000000000000000000000000000033"
+    );
+    assert_eq!(data["abi"], "elacity_mint_v1");
+    assert_eq!(
+        data["function"],
+        ProtectedContentCreatorMintAbi::ElacityMintV1.function()
+    );
+}
+
+#[test]
 fn resolve_protected_content_creator_mint_rejects_missing_or_ambiguous_creator_network() {
     let mut unconfigured = ChainProvider::new();
     let init = unconfigured.handle(Request::Init {
@@ -2653,6 +2672,10 @@ fn resolve_protected_content_creator_mint_rejects_missing_or_ambiguous_creator_n
         }),
     });
     assert!(matches!(init, Response::Ok { .. }));
+    assert_eq!(
+        error_code(unconfigured.handle(Request::DescribeProtectedContentCreatorMintSource)),
+        "protected_content_creator_mint_not_configured"
+    );
     assert_eq!(
         error_code(
             unconfigured.handle(Request::ResolveProtectedContentCreatorMint {
@@ -2712,6 +2735,10 @@ fn resolve_protected_content_creator_mint_rejects_missing_or_ambiguous_creator_n
         }),
     });
     assert!(matches!(init, Response::Ok { .. }));
+    assert_eq!(
+        error_code(ambiguous.handle(Request::DescribeProtectedContentCreatorMintSource)),
+        "ambiguous_protected_content_creator_mint_source"
+    );
     assert_eq!(
         error_code(
             ambiguous.handle(Request::ResolveProtectedContentCreatorMint {

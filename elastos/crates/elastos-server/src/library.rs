@@ -327,7 +327,6 @@ enum ObjectProviderRequest {
     Buy {
         principal_id: String,
         mint_id: String,
-        account_id: String,
     },
     OpenViewer {
         principal_id: String,
@@ -374,15 +373,10 @@ enum ObjectProviderRequest {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 enum LibraryPublishProtectionRequest {
-    RuntimeCustody {
-        wallet_account_id: String,
-        copies: String,
-        price: String,
-    },
+    RuntimeCustody { copies: String, price: String },
 }
 
 struct LoadedRuntimeCustodyPublishInput {
-    wallet_account_id: String,
     copies: String,
     price: String,
 }
@@ -1875,7 +1869,6 @@ async fn handle_runtime_custody_library_request(
         ObjectProviderRequest::Buy {
             principal_id,
             mint_id,
-            account_id,
         } => {
             let Some((state, authority)) = gateway_authority else {
                 anyhow::bail!(
@@ -1889,7 +1882,6 @@ async fn handle_runtime_custody_library_request(
                 crate::protected_content_runtime::RuntimeCustodyBuyInput {
                     principal_id,
                     mint_id,
-                    account_id,
                 },
             )
             .await
@@ -1983,19 +1975,30 @@ async fn library_publish(
     if let Some(protection) = protection {
         let loaded =
             validate_runtime_custody_publish_input(data_dir, principal_id, &target, protection)?;
-        let runtime_input = crate::protected_content_runtime::RuntimeCustodyLibrarySourceInput {
-            object_uri: target.uri.clone(),
-            principal_id: principal_id.to_string(),
-            source_file_path: target.path.clone(),
-            wallet_account_id: loaded.wallet_account_id,
-            copies: loaded.copies,
-            price: loaded.price,
-            source_storage: published_source_storage(data_dir, principal_id, &target)?.to_string(),
-        };
+        let source_storage = published_source_storage(data_dir, principal_id, &target)?.to_string();
         let Some((state, authority)) = gateway_authority else {
             anyhow::bail!(
                 "Runtime custody creator mint requires verified gateway Wallet authority"
             );
+        };
+        let creator_binding = crate::api::gateway::resolve_runtime_custody_creator_publish_binding(
+            state,
+            authority,
+            principal_id,
+            &target.uri,
+            &source_storage,
+        )
+        .await?;
+        let runtime_input = crate::protected_content_runtime::RuntimeCustodyLibrarySourceInput {
+            object_uri: target.uri.clone(),
+            principal_id: principal_id.to_string(),
+            source_file_path: target.path.clone(),
+            wallet_account_id: creator_binding.account_id,
+            wallet_account_address: creator_binding.address,
+            creator_mint_source_digest: creator_binding.source_digest,
+            copies: loaded.copies,
+            price: loaded.price,
+            source_storage,
         };
         let facts = crate::api::gateway::runtime_custody_publish_via_gateway(
             state,
@@ -5966,22 +5969,14 @@ fn validate_runtime_custody_publish_input(
     target: &LibraryTarget,
     protection: LibraryPublishProtectionRequest,
 ) -> anyhow::Result<LoadedRuntimeCustodyPublishInput> {
-    let LibraryPublishProtectionRequest::RuntimeCustody {
-        wallet_account_id,
-        copies,
-        price,
-    } = protection;
+    let LibraryPublishProtectionRequest::RuntimeCustody { copies, price } = protection;
     let target_metadata = fs::symlink_metadata(&target.path)
         .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
     if target_metadata.file_type().is_symlink() || !target_metadata.is_file() {
         bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
     }
     let _ = (data_dir, principal_id);
-    Ok(LoadedRuntimeCustodyPublishInput {
-        wallet_account_id,
-        copies,
-        price,
-    })
+    Ok(LoadedRuntimeCustodyPublishInput { copies, price })
 }
 
 fn protected_content_sealed_object_from_security(

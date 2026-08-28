@@ -1060,6 +1060,15 @@ mod tests {
         assert!(
             build_capability_resource(
                 "chain",
+                "describe_protected_content_creator_mint_source",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content creator mint source description must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
                 "resolve_protected_content_creator_mint",
                 &serde_json::json!({})
             )

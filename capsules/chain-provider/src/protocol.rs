@@ -9,6 +9,8 @@ pub(super) const PROTECTED_CONTENT_POLICY_SCHEMA: &str =
     "elastos.chain.protected-content-policy/v1";
 pub(super) const PROTECTED_CONTENT_CREATOR_MINT_SCHEMA: &str =
     "elastos.chain.protected-content-creator-mint/v1";
+pub(super) const PROTECTED_CONTENT_CREATOR_MINT_SOURCE_SCHEMA: &str =
+    "elastos.chain.protected-content-creator-mint-source/v1";
 pub(super) const PROTECTED_CONTENT_MINT_RECEIPT_SCHEMA: &str =
     "elastos.chain.protected-content-mint-receipt/v1";
 pub(super) const PROTECTED_CONTENT_VERIFIED_LISTING_SCHEMA: &str =
@@ -246,6 +248,7 @@ pub(super) enum Request {
         content_access_id: String,
         action: ProtectedContentPolicyAction,
     },
+    DescribeProtectedContentCreatorMintSource,
     ResolveProtectedContentCreatorMint {
         creator: String,
         token_uri: String,

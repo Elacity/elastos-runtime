@@ -200,6 +200,13 @@ struct RuntimeCustodyCreatorAccount {
     address: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeCustodyCreatorPublishBinding {
+    pub account_id: String,
+    pub address: String,
+    pub source_digest: Digest32,
+}
+
 #[derive(Clone)]
 struct RuntimeCustodyCreatorChainPlan {
     network: String,
@@ -209,6 +216,48 @@ struct RuntimeCustodyCreatorChainPlan {
     to: String,
     data: String,
     value: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedProtectedContentCreatorMintSource {
+    schema: String,
+    network: String,
+    chain_namespace: String,
+    ledger: String,
+    pay_token: String,
+    abi: String,
+    function: String,
+}
+
+fn runtime_custody_creator_mint_source_digest(
+    network: &str,
+    chain_namespace: &str,
+    ledger: &str,
+    pay_token: &str,
+    abi: &str,
+    function: &str,
+) -> Digest32 {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"elastos.runtime-custody.creator-mint-source/v1");
+    for field in [network, chain_namespace, ledger, pay_token, abi, function] {
+        hasher.update((field.len() as u32).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    Digest32::new(hasher.finalize().into())
+}
+
+fn runtime_custody_creator_mint_source_digest_for_source(
+    source: &ResolvedProtectedContentCreatorMintSource,
+) -> Digest32 {
+    runtime_custody_creator_mint_source_digest(
+        &source.network,
+        &source.chain_namespace,
+        &source.ledger,
+        &source.pay_token,
+        &source.abi,
+        &source.function,
+    )
 }
 
 pub(super) async fn gateway_library_upload(
@@ -1910,30 +1959,179 @@ async fn resolve_runtime_custody_creator_account(
     })
 }
 
-async fn resolve_runtime_custody_buyer_account(
+async fn resolve_runtime_custody_wallet_default_account(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
-    wallet_account_id: &str,
+    chain_namespace: &str,
+    unavailable_message: &'static str,
 ) -> anyhow::Result<RuntimeCustodyCreatorAccount> {
     let accounts = system_wallet_accounts_summary(state, authority).await;
+    let latest_default = accounts
+        .default_accounts
+        .iter()
+        .filter(|default| {
+            default.intent == "transaction_intent" && default.chain_namespace == chain_namespace
+        })
+        .max_by_key(|default| default.set_at)
+        .ok_or_else(|| anyhow::anyhow!(unavailable_message))?;
+    if accounts.default_accounts.iter().any(|default| {
+        default.intent == "transaction_intent"
+            && default.chain_namespace == chain_namespace
+            && default.set_at == latest_default.set_at
+            && default.account_id != latest_default.account_id
+    }) {
+        anyhow::bail!(unavailable_message);
+    }
     let account = accounts
         .accounts
         .iter()
-        .find(|account| account.account_id == wallet_account_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
-            )
-        })?;
+        .find(|account| {
+            account.account_id == latest_default.account_id
+                && account.chain_namespace == chain_namespace
+        })
+        .ok_or_else(|| anyhow::anyhow!(unavailable_message))?;
     if !account.signing_available || !is_managed_wallet_proof_type(&account.proof_type) {
-        anyhow::bail!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
+        anyhow::bail!(unavailable_message);
     }
-    validate_wallet_evm_address(&account.address, "buyer").map_err(|(_, _)| {
-        anyhow::anyhow!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE)
-    })?;
+    validate_wallet_evm_address(&account.address, "wallet")
+        .map_err(|_| anyhow::anyhow!(unavailable_message))?;
     Ok(RuntimeCustodyCreatorAccount {
         account_id: account.account_id.clone(),
         address: account.address.to_ascii_lowercase(),
+    })
+}
+
+async fn resolve_runtime_custody_buyer_account(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    chain_namespace: &str,
+) -> anyhow::Result<RuntimeCustodyCreatorAccount> {
+    resolve_runtime_custody_wallet_default_account(
+        state,
+        authority,
+        chain_namespace,
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE,
+    )
+    .await
+}
+
+async fn resolve_runtime_custody_creator_mint_source(
+    state: &GatewayState,
+) -> anyhow::Result<ResolvedProtectedContentCreatorMintSource> {
+    let response = wallet_chain_provider_data(
+        state,
+        serde_json::json!({
+            "op": "describe_protected_content_creator_mint_source",
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    let source: ResolvedProtectedContentCreatorMintSource = serde_json::from_value(response)
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    if source.schema != "elastos.chain.protected-content-creator-mint-source/v1"
+        || source.abi != "elacity_mint_v1"
+        || source.function != "mint(string,uint16,bytes,bytes)"
+        || wallet_chain_namespace_network(&source.chain_namespace) != Some(source.network.as_str())
+    {
+        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+    }
+    validate_wallet_evm_address(&source.ledger, "creator ledger")
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    validate_wallet_evm_address(&source.pay_token, "creator pay token")
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    Ok(source)
+}
+
+async fn resolve_runtime_custody_bound_creator_account(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    account_id: &str,
+    expected_address: &str,
+) -> anyhow::Result<RuntimeCustodyCreatorAccount> {
+    let account = resolve_runtime_custody_creator_account(state, authority, account_id).await?;
+    if account.address != expected_address {
+        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+    }
+    Ok(account)
+}
+
+pub(crate) async fn resolve_runtime_custody_creator_publish_binding(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    principal_id: &str,
+    object_uri: &str,
+    source_storage: &str,
+) -> anyhow::Result<RuntimeCustodyCreatorPublishBinding> {
+    let request_id = elastos_protected_content_runtime::RuntimeMintIntent::request_id_for_source(
+        principal_id,
+        object_uri,
+        source_storage,
+    )
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    let mint_journal = crate::protected_content_runtime::runtime_mint_journal(&state.data_dir);
+    let mint_journal_root =
+        crate::protected_content_runtime::runtime_mint_journal_root(&state.data_dir);
+    let source = resolve_runtime_custody_creator_mint_source(state).await?;
+    let source_digest = runtime_custody_creator_mint_source_digest_for_source(&source);
+    match std::fs::symlink_metadata(&mint_journal_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE),
+        Ok(_) => {
+            match mint_journal.load_intent(request_id) {
+                Ok(intent) => {
+                    if intent.creator_mint_source_digest() != source_digest {
+                        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+                    }
+                    let account = resolve_runtime_custody_bound_creator_account(
+                        state,
+                        authority,
+                        intent.creator_wallet_account_id(),
+                        intent.creator_wallet_address(),
+                    )
+                    .await?;
+                    return Ok(RuntimeCustodyCreatorPublishBinding {
+                        account_id: account.account_id,
+                        address: account.address,
+                        source_digest,
+                    });
+                }
+                Err(elastos_protected_content_runtime::RuntimeMintJournalError::NotFound) => {}
+                Err(_) => anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE),
+            }
+            match mint_journal.load_media_preparation(request_id) {
+                Ok(preparation) => {
+                    if preparation.creator_mint_source_digest() != source_digest {
+                        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+                    }
+                    let account = resolve_runtime_custody_bound_creator_account(
+                        state,
+                        authority,
+                        preparation.creator_wallet_account_id(),
+                        preparation.creator_wallet_address(),
+                    )
+                    .await?;
+                    return Ok(RuntimeCustodyCreatorPublishBinding {
+                        account_id: account.account_id,
+                        address: account.address,
+                        source_digest,
+                    });
+                }
+                Err(elastos_protected_content_runtime::RuntimeMintJournalError::NotFound) => {}
+                Err(_) => anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE),
+            }
+        }
+    }
+    let account = resolve_runtime_custody_wallet_default_account(
+        state,
+        authority,
+        &source.chain_namespace,
+        RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE,
+    )
+    .await?;
+    Ok(RuntimeCustodyCreatorPublishBinding {
+        account_id: account.account_id,
+        address: account.address,
+        source_digest,
     })
 }
 
@@ -2411,6 +2609,8 @@ fn runtime_custody_creator_chain_id(chain_namespace: &str) -> anyhow::Result<u64
 
 async fn resolve_runtime_custody_creator_chain_plan(
     state: &GatewayState,
+    expected_source_digest: Digest32,
+    source: &ResolvedProtectedContentCreatorMintSource,
     creator_state: &elastos_protected_content_runtime::RuntimeMintCreatorState,
     creator_address: &str,
     content_access_id: elastos_protected_content_contracts::ContentAccessIdV1,
@@ -2431,14 +2631,25 @@ async fn resolve_runtime_custody_creator_chain_plan(
     .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
     let resolved: ResolvedProtectedContentCreatorMint = serde_json::from_value(response)
         .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    let resolved_source_digest = runtime_custody_creator_mint_source_digest(
+        &resolved.network,
+        &resolved.chain_namespace,
+        &resolved.ledger,
+        &resolved.pay_token,
+        "elacity_mint_v1",
+        &resolved.function,
+    );
     if resolved.schema != "elastos.chain.protected-content-creator-mint/v1"
         || resolved.signed
         || resolved.function != "mint(string,uint16,bytes,bytes)"
+        || resolved_source_digest != expected_source_digest
+        || resolved.network != source.network
+        || resolved.chain_namespace != source.chain_namespace
         || !resolved
             .content_access_id
             .eq_ignore_ascii_case(&format!("0x{}", hex::encode(content_access_id.as_bytes())))
-        || wallet_chain_namespace_network(&resolved.chain_namespace)
-            != Some(resolved.network.as_str())
+        || !resolved.ledger.eq_ignore_ascii_case(&source.ledger)
+        || !resolved.pay_token.eq_ignore_ascii_case(&source.pay_token)
     {
         anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
     }
@@ -2573,12 +2784,14 @@ async fn finalize_runtime_custody_creator_listing(
         &chain_plan.ledger,
         listing.token_id,
         listing.operative,
+        listing.quantity,
         listing.price,
         listing.pay_token,
         listing
             .payment_processor
             .map(|value| value.to_ascii_lowercase()),
         transaction_hash,
+        crate::auth::now_ts(),
     )
     .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))
 }
@@ -2654,8 +2867,6 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                 crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
             )
         })?;
-    let buyer_account =
-        resolve_runtime_custody_buyer_account(state, authority, &input.account_id).await?;
     let listing_bytes = crate::protected_content_runtime::load_runtime_custody_listing_bytes(
         &state.data_dir,
         mint_id,
@@ -2664,6 +2875,11 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
         anyhow::anyhow!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE)
     })?;
     let listing = parse_runtime_custody_listing_bytes(&listing_bytes)?;
+    let persisted_purchase = crate::protected_content_runtime::load_runtime_custody_purchase(
+        &state.data_dir,
+        &input.principal_id,
+        mint_id,
+    )?;
     let listing_sha256 = runtime_custody_listing_sha256(&listing_bytes);
     let mint = crate::protected_content_runtime::runtime_mint_journal(&state.data_dir)
         .load(mint_id)
@@ -2703,12 +2919,17 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
     })?;
     let profile_did = profile.document().profile_did.clone();
     let now = crate::auth::now_ts();
-    let mut purchase = match crate::protected_content_runtime::load_runtime_custody_purchase(
-        &state.data_dir,
-        &input.principal_id,
-        mint_id,
-    )? {
+    let (mut purchase, buyer_account) = match persisted_purchase {
         Some(existing) => {
+            validate_wallet_evm_address(&existing.address, "buyer").map_err(|(_, _)| {
+                anyhow::anyhow!(
+                    crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+                )
+            })?;
+            let buyer_account = RuntimeCustodyCreatorAccount {
+                account_id: existing.account_id.clone(),
+                address: existing.address.clone(),
+            };
             let expected_identity = RuntimeCustodyExpectedPurchaseIdentity {
                 principal_id: &input.principal_id,
                 profile_did: &profile_did,
@@ -2720,9 +2941,12 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                 buyer_account: &buyer_account,
             };
             validate_runtime_custody_purchase_record_identity(&existing, &expected_identity)?;
-            existing
+            (existing, buyer_account)
         }
         None => {
+            let buyer_account =
+                resolve_runtime_custody_buyer_account(state, authority, &listing.chain_namespace)
+                    .await?;
             let purchase_plan = resolve_runtime_custody_purchase_plan(state, &listing).await?;
             let mut steps = purchase_plan.steps.iter();
             let approval_request = match purchase_plan.steps.as_slice() {
@@ -2805,7 +3029,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                 &state.data_dir,
                 &purchase,
             )?;
-            purchase
+            (purchase, buyer_account)
         }
     };
 
@@ -2981,18 +3205,27 @@ async fn runtime_custody_publish_creator_tail_from_facts(
     input: crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput,
     facts: crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
 ) -> anyhow::Result<crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts> {
-    let creator_account =
-        resolve_runtime_custody_creator_account(state, authority, &input.wallet_account_id).await?;
-    let desired_terms = elastos_protected_content_runtime::RuntimeMintCreatorDesiredTerms::new(
-        input.wallet_account_id.clone(),
-        input.copies.clone(),
-        input.price.clone(),
-    )
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
     let mint_journal = crate::protected_content_runtime::runtime_mint_journal(&state.data_dir);
     let mut mint = mint_journal
         .load(facts.mint_id)
         .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    let source = resolve_runtime_custody_creator_mint_source(state).await?;
+    if runtime_custody_creator_mint_source_digest_for_source(&source)
+        != input.creator_mint_source_digest
+    {
+        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+    }
+    let creator_account =
+        resolve_runtime_custody_creator_account(state, authority, &input.wallet_account_id).await?;
+    if creator_account.address != input.wallet_account_address {
+        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+    }
+    let desired_terms = elastos_protected_content_runtime::RuntimeMintCreatorDesiredTerms::new(
+        creator_account.account_id.clone(),
+        input.copies.clone(),
+        input.price.clone(),
+    )
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
     if let Some(existing) = mint.creator_state() {
         if existing.desired_terms() != &desired_terms {
             anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
@@ -3041,6 +3274,8 @@ async fn runtime_custody_publish_creator_tail_from_facts(
     };
     let chain_plan = resolve_runtime_custody_creator_chain_plan(
         state,
+        input.creator_mint_source_digest,
+        &source,
         &creator_state,
         &creator_account.address,
         mint.draft().content_access_id(),

@@ -159,6 +159,9 @@ impl ChainProvider {
                 &content_access_id,
                 action,
             ),
+            Request::DescribeProtectedContentCreatorMintSource => {
+                self.describe_protected_content_creator_mint_source()
+            }
             Request::ResolveProtectedContentCreatorMint {
                 creator,
                 token_uri,
@@ -1014,6 +1017,28 @@ impl ChainProvider {
         Response::ok(json!({
             "schema": PROTECTED_CONTENT_POLICY_SCHEMA,
             "policy_body": format!("0x{}", encode_hex(&policy_bytes)),
+        }))
+    }
+
+    fn describe_protected_content_creator_mint_source(&self) -> Response {
+        let (network, mint) = match self.configured_global_protected_content_creator_mint_source() {
+            Ok(source) => source,
+            Err(response) => return response,
+        };
+        let Some(chain_id) = network.chain_id else {
+            return Response::error(
+                "protected_content_creator_mint_not_configured",
+                "configured protected-content creator mint network is missing chain id",
+            );
+        };
+        Response::ok(json!({
+            "schema": PROTECTED_CONTENT_CREATOR_MINT_SOURCE_SCHEMA,
+            "network": network.id,
+            "chain_namespace": format!("eip155:{chain_id}"),
+            "ledger": mint.ledger,
+            "pay_token": mint.pay_token,
+            "abi": mint.abi,
+            "function": mint.abi.function(),
         }))
     }
 

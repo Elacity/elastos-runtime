@@ -9,7 +9,7 @@
 #[cfg(test)]
 pub(crate) mod tests;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read as _, Write as _};
 #[cfg(unix)]
@@ -124,6 +124,15 @@ const PROTECTED_CONTENT_INIT_PATH: &str = "protected-content/v1/init.mp4";
 const PROTECTED_CONTENT_SEGMENTS_PREFIX: &str = "protected-content/v1/segments/";
 const PROTECTED_CONTENT_SEGMENTS_SUFFIX: &str = ".m4s";
 const PROTECTED_CONTENT_AVAILABLE_STATUS: &str = "network_available";
+const RUNTIME_CUSTODY_LISTINGS_RESPONSE_SCHEMA_V1: &str =
+    "elastos.library.runtime-custody-listings/v1";
+const RUNTIME_CUSTODY_LISTING_AVAILABILITY_SCHEMA_V1: &str =
+    "elastos.library.runtime-custody-availability-summary/v1";
+const RUNTIME_CUSTODY_LISTING_ACCESS_AVAILABLE: &str = "available";
+const RUNTIME_CUSTODY_LISTING_ACCESS_CREATOR: &str = "creator";
+const RUNTIME_CUSTODY_LISTING_ACCESS_PURCHASED: &str = "purchased";
+const MAX_RUNTIME_CUSTODY_LISTINGS: usize = 128;
+const MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES: usize = 256;
 const CONTENT_AVAILABILITY_RECEIPT_SCHEMA: &str = "elastos.content.availability.receipt/v1";
 const CONTENT_AVAILABILITY_RECEIPT_DOMAIN: &str = "elastos.content.availability.receipt.v1";
 const MAX_RUNTIME_VIEWER_RECONCILE_MINT_DIRS: usize = 256;
@@ -808,8 +817,12 @@ pub fn runtime_release_journal(data_dir: &Path) -> RuntimeReleaseJournal {
     RuntimeReleaseJournal::new(data_dir.join("protected-content").join("runtime-release"))
 }
 
+pub(crate) fn runtime_mint_journal_root(data_dir: &Path) -> PathBuf {
+    data_dir.join(RUNTIME_MINT_JOURNAL_ROOT)
+}
+
 pub(crate) fn runtime_mint_journal(data_dir: &Path) -> RuntimeMintJournal {
-    RuntimeMintJournal::new(data_dir.join(RUNTIME_MINT_JOURNAL_ROOT))
+    RuntimeMintJournal::new(runtime_mint_journal_root(data_dir))
 }
 
 fn generate_runtime_content_access_id() -> anyhow::Result<ContentAccessIdV1> {
@@ -832,6 +845,9 @@ fn runtime_mint_intent_with_access_id(
         input.principal_id.clone(),
         &input.object_uri,
         &input.source_storage,
+        input.wallet_account_id.clone(),
+        input.wallet_account_address.clone(),
+        input.creator_mint_source_digest,
         input.mime_type.clone(),
         input.codecs.clone(),
         &input.clear_init_segment,
@@ -2392,6 +2408,8 @@ pub(crate) struct RuntimeCustodyLibraryPublishInput {
     pub mime_type: String,
     pub codecs: String,
     pub wallet_account_id: String,
+    pub wallet_account_address: String,
+    pub creator_mint_source_digest: Digest32,
     pub copies: String,
     pub price: String,
     pub clear_init_segment: Vec<u8>,
@@ -2405,6 +2423,8 @@ pub(crate) struct RuntimeCustodyLibrarySourceInput {
     pub principal_id: String,
     pub source_file_path: PathBuf,
     pub wallet_account_id: String,
+    pub wallet_account_address: String,
+    pub creator_mint_source_digest: Digest32,
     pub copies: String,
     pub price: String,
     pub source_storage: String,
@@ -2417,7 +2437,12 @@ impl std::fmt::Debug for RuntimeCustodyLibrarySourceInput {
             .field("object_uri", &self.object_uri)
             .field("principal_id", &self.principal_id)
             .field("source_file_path", &"[private]")
-            .field("wallet_account_id", &self.wallet_account_id)
+            .field("wallet_account_id", &"[redacted]")
+            .field("wallet_account_address", &"[redacted]")
+            .field(
+                "creator_mint_source_digest",
+                &self.creator_mint_source_digest,
+            )
             .field("copies", &self.copies)
             .field("price", &self.price)
             .field("source_storage", &self.source_storage)
@@ -2433,7 +2458,12 @@ impl std::fmt::Debug for RuntimeCustodyLibraryPublishInput {
             .field("principal_id", &self.principal_id)
             .field("mime_type", &self.mime_type)
             .field("codecs", &self.codecs)
-            .field("wallet_account_id", &self.wallet_account_id)
+            .field("wallet_account_id", &"[redacted]")
+            .field("wallet_account_address", &"[redacted]")
+            .field(
+                "creator_mint_source_digest",
+                &self.creator_mint_source_digest,
+            )
             .field("copies", &self.copies)
             .field("price", &self.price)
             .field("clear_init_segment_bytes", &self.clear_init_segment.len())
@@ -2448,6 +2478,9 @@ pub(crate) struct RuntimeCustodyLibraryPublishFacts {
     pub content_cid: String,
     pub mint_id: Digest32,
     pub content_id: String,
+    pub display_name: String,
+    pub mime_type: String,
+    pub codecs: String,
     pub availability: Value,
     pub receipt: Value,
     pub content_security: Value,
@@ -2466,6 +2499,9 @@ async fn prepare_runtime_custody_library_source(
         &source.source_storage,
         source_object_digest,
         MEDIA_PROVIDER_ID,
+        source.wallet_account_id.clone(),
+        source.wallet_account_address.clone(),
+        source.creator_mint_source_digest,
     )
     .map_err(|_| anyhow::anyhow!("Runtime custody media preparation intent is invalid"))?;
     let journal = runtime_mint_journal(data_dir);
@@ -2547,6 +2583,8 @@ async fn prepare_runtime_custody_library_source(
                         mime_type: media.mime_type,
                         codecs: media.codecs,
                         wallet_account_id: source.wallet_account_id.clone(),
+                        wallet_account_address: source.wallet_account_address.clone(),
+                        creator_mint_source_digest: source.creator_mint_source_digest,
                         copies: source.copies.clone(),
                         price: source.price.clone(),
                         clear_init_segment: media.clear_init_segment,
@@ -2616,6 +2654,8 @@ async fn prepare_runtime_custody_library_source(
                 mime_type: media.mime_type,
                 codecs: media.codecs,
                 wallet_account_id: source.wallet_account_id.clone(),
+                wallet_account_address: source.wallet_account_address.clone(),
+                creator_mint_source_digest: source.creator_mint_source_digest,
                 copies: source.copies.clone(),
                 price: source.price.clone(),
                 clear_init_segment: media.clear_init_segment,
@@ -2688,6 +2728,8 @@ pub(crate) async fn publish_runtime_custody_library_source(
                 mime_type: persisted.draft().media_identity().mime_type().to_string(),
                 codecs: persisted.draft().media_identity().codecs().to_string(),
                 wallet_account_id: source.wallet_account_id,
+                wallet_account_address: source.wallet_account_address,
+                creator_mint_source_digest: source.creator_mint_source_digest,
                 copies: source.copies,
                 price: source.price,
                 clear_init_segment: Vec::new(),
@@ -3265,6 +3307,9 @@ fn runtime_custody_library_publish_facts(
         content_cid: evidence.content_cid().to_string(),
         mint_id: draft.mint_id(),
         content_id: content_id.to_string(),
+        display_name: runtime_custody_display_name(&input.object_uri),
+        mime_type: input.mime_type.clone(),
+        codecs: input.codecs.clone(),
         availability: availability.clone(),
         receipt: json!({
             "schema": "elastos.library.runtime-custody-receipt/v1",
@@ -3284,7 +3329,7 @@ fn runtime_custody_library_publish_facts(
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeCustodyListingRecord {
     pub(crate) schema: String,
@@ -3295,6 +3340,10 @@ pub(crate) struct RuntimeCustodyListingRecord {
     pub(crate) metadata_cid: String,
     pub(crate) token_uri: String,
     pub(crate) publisher_principal_id: String,
+    pub(crate) display_name: String,
+    pub(crate) mime_type: String,
+    pub(crate) codecs: String,
+    pub(crate) quantity: String,
     pub(crate) seller_address: String,
     pub(crate) chain_namespace: String,
     pub(crate) network: String,
@@ -3306,6 +3355,40 @@ pub(crate) struct RuntimeCustodyListingRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) payment_processor: Option<String>,
     pub(crate) published_at: u64,
+}
+
+impl RuntimeCustodyListingRecord {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.schema != RUNTIME_LISTING_SCHEMA_V1 {
+            anyhow::bail!("Runtime custody listing is invalid");
+        }
+        let _ = parse_mint_id_hex(&self.mint_id)?;
+        validate_runtime_custody_public_text(&self.content_id)?;
+        validate_runtime_custody_public_text(&self.content_access_id)?;
+        validate_runtime_custody_public_text(&self.cid)?;
+        validate_runtime_custody_public_text(&self.metadata_cid)?;
+        validate_runtime_custody_public_text(&self.token_uri)?;
+        validate_runtime_custody_public_text(&self.publisher_principal_id)?;
+        validate_runtime_custody_display_name(&self.display_name)?;
+        validate_runtime_custody_public_text(&self.mime_type)?;
+        validate_runtime_custody_public_text(&self.codecs)?;
+        validate_runtime_custody_canonical_quantity(&self.quantity)?;
+        validate_runtime_custody_evm_address(&self.seller_address)?;
+        validate_runtime_custody_public_text(&self.chain_namespace)?;
+        validate_runtime_custody_public_text(&self.network)?;
+        validate_runtime_custody_evm_address(&self.ledger)?;
+        validate_runtime_custody_canonical_quantity(&self.token_id)?;
+        validate_runtime_custody_evm_address(&self.operative)?;
+        validate_runtime_custody_canonical_quantity(&self.price)?;
+        validate_runtime_custody_evm_address(&self.pay_token)?;
+        if let Some(payment_processor) = &self.payment_processor {
+            validate_runtime_custody_evm_address(payment_processor)?;
+        }
+        if self.published_at == 0 {
+            anyhow::bail!("Runtime custody listing is invalid");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3404,7 +3487,6 @@ pub(crate) struct RuntimeCustodyPurchaseRecord {
 pub(crate) struct RuntimeCustodyBuyInput {
     pub principal_id: String,
     pub mint_id: String,
-    pub account_id: String,
 }
 
 pub(crate) struct RuntimeCustodyViewerOpenInput {
@@ -3682,44 +3764,218 @@ pub(crate) fn list_runtime_custody_listings(
         anyhow::bail!("Runtime custody listing principal is invalid");
     }
     let root = data_dir.join(RUNTIME_LISTING_ROOT);
-    let mut listings = Vec::new();
-    if root.is_dir() {
-        for entry in fs::read_dir(&root)? {
-            let entry = entry?;
-            if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
-                continue;
-            }
-            let record: RuntimeCustodyListingRecord =
-                serde_json::from_slice(&fs::read(entry.path())?)?;
-            if record.schema != RUNTIME_LISTING_SCHEMA_V1 {
-                anyhow::bail!("Runtime custody listing is invalid");
-            }
-            listings.push(json!({
-                "schema": RUNTIME_LISTING_SCHEMA_V1,
-                "mint_id": record.mint_id,
-                "content_id": record.content_id,
-                "cid": record.cid,
-                "publisher_principal_id": record.publisher_principal_id,
-                "published_at": record.published_at,
-                "availability": {
-                    "schema": "elastos.library.runtime-custody-availability/v1",
-                    "status": PROTECTED_CONTENT_AVAILABLE_STATUS,
-                    "cid": record.cid,
-                    "content_id": record.content_id,
-                    "mint_id": record.mint_id,
-                },
-            }));
-        }
+    let (listing_paths, truncated) = select_runtime_custody_listing_paths(&root)?;
+    let mut listings = Vec::with_capacity(listing_paths.len());
+    for path in listing_paths {
+        let bytes = fs::read(path)?;
+        let record: RuntimeCustodyListingRecord = serde_json::from_slice(&bytes)?;
+        record.validate()?;
+        listings.push(runtime_custody_listing_summary(
+            data_dir,
+            principal_id,
+            &bytes,
+            &record,
+        )?);
     }
-    listings.sort_by(|left, right| {
-        left.get("mint_id")
-            .and_then(Value::as_str)
-            .cmp(&right.get("mint_id").and_then(Value::as_str))
-    });
     Ok(json!({
-        "schema": "elastos.library.runtime-custody-listings/v1",
+        "schema": RUNTIME_CUSTODY_LISTINGS_RESPONSE_SCHEMA_V1,
+        "truncated": truncated,
         "listings": listings,
     }))
+}
+
+fn select_runtime_custody_listing_paths(root: &Path) -> anyhow::Result<(Vec<PathBuf>, bool)> {
+    if !root.is_dir() {
+        return Ok((Vec::new(), false));
+    }
+    let mut selected = BTreeMap::<String, PathBuf>::new();
+    let mut truncated = false;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let name = name.to_string();
+        if selected.len() < MAX_RUNTIME_CUSTODY_LISTINGS {
+            selected.insert(name, path);
+            continue;
+        }
+        truncated = true;
+        let Some(last_name) = selected.keys().next_back().cloned() else {
+            continue;
+        };
+        if name < last_name {
+            selected.remove(&last_name);
+            selected.insert(name, path);
+        }
+    }
+    Ok((selected.into_values().collect(), truncated))
+}
+
+fn runtime_custody_listing_summary(
+    data_dir: &Path,
+    principal_id: &str,
+    listing_bytes: &[u8],
+    record: &RuntimeCustodyListingRecord,
+) -> anyhow::Result<Value> {
+    let availability = runtime_custody_listing_availability(data_dir, record)?;
+    let access_state =
+        runtime_custody_listing_access_state(data_dir, principal_id, listing_bytes, record)?;
+    Ok(json!({
+        "schema": RUNTIME_LISTING_SCHEMA_V1,
+        "mint_id": record.mint_id,
+        "display_name": record.display_name,
+        "mime_type": record.mime_type,
+        "codecs": record.codecs,
+        "quantity": record.quantity,
+        "price": record.price,
+        "pay_token": record.pay_token,
+        "seller_address": record.seller_address,
+        "token_id": record.token_id,
+        "published_at": record.published_at,
+        "availability": availability,
+        "access_state": access_state,
+    }))
+}
+
+fn runtime_custody_listing_availability(
+    data_dir: &Path,
+    record: &RuntimeCustodyListingRecord,
+) -> anyhow::Result<Value> {
+    let mint_id = parse_mint_id_hex(&record.mint_id)?;
+    let mint = runtime_mint_journal(data_dir)
+        .load(mint_id)
+        .map_err(|_| anyhow::anyhow!("Runtime custody listing is invalid"))?;
+    let evidence = mint
+        .content_availability()
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody listing is invalid"))?;
+    let expected_content_id = runtime_protected_content_id(mint.draft().encrypted_content())
+        .map_err(|_| anyhow::anyhow!("Runtime custody listing is invalid"))?;
+    if record.content_id != expected_content_id || record.cid != evidence.content_cid() {
+        anyhow::bail!("Runtime custody listing is invalid");
+    }
+    Ok(json!({
+        "schema": RUNTIME_CUSTODY_LISTING_AVAILABILITY_SCHEMA_V1,
+        "status": "last_verified_receipt",
+        "checked_at": evidence.checked_at(),
+        "required_replicas": evidence.required_replicas(),
+        "observed_replicas": evidence.observed_replicas(),
+        "recheck_before_buy": true,
+        "recheck_before_open": true,
+    }))
+}
+
+fn runtime_custody_listing_access_state(
+    data_dir: &Path,
+    principal_id: &str,
+    listing_bytes: &[u8],
+    record: &RuntimeCustodyListingRecord,
+) -> anyhow::Result<&'static str> {
+    if record.publisher_principal_id == principal_id {
+        return Ok(RUNTIME_CUSTODY_LISTING_ACCESS_CREATOR);
+    }
+    let mint_id = parse_mint_id_hex(&record.mint_id)?;
+    let Some(purchase) = load_runtime_custody_purchase(data_dir, principal_id, mint_id)? else {
+        return Ok(RUNTIME_CUSTODY_LISTING_ACCESS_AVAILABLE);
+    };
+    if purchase.mint_id != record.mint_id || purchase.content_id != record.content_id {
+        anyhow::bail!("Runtime custody purchase is invalid");
+    }
+    let listing_sha256 = format!(
+        "sha256:{}",
+        hex::encode(sha2::Sha256::digest(listing_bytes))
+    );
+    let purchased = matches!(
+        purchase.progress,
+        RuntimeCustodyPurchaseProgress::Complete { .. }
+    ) && purchase.listing_sha256 == listing_sha256;
+    Ok(if purchased {
+        RUNTIME_CUSTODY_LISTING_ACCESS_PURCHASED
+    } else {
+        RUNTIME_CUSTODY_LISTING_ACCESS_AVAILABLE
+    })
+}
+
+fn runtime_custody_display_name(object_uri: &str) -> String {
+    let raw = object_uri
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or("protected-content");
+    let cleaned = raw
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        return "protected-content".to_string();
+    }
+    truncate_utf8_to_bytes(&cleaned, MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES)
+}
+
+fn truncate_utf8_to_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn validate_runtime_custody_display_name(value: &str) -> anyhow::Result<()> {
+    validate_runtime_custody_public_text(value)?;
+    if value.chars().all(char::is_whitespace) {
+        anyhow::bail!("Runtime custody listing is invalid");
+    }
+    Ok(())
+}
+
+fn validate_runtime_custody_public_text(value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || value.len() > MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES
+        || value.chars().any(char::is_control)
+    {
+        anyhow::bail!("Runtime custody listing is invalid");
+    }
+    Ok(())
+}
+
+fn validate_runtime_custody_canonical_quantity(value: &str) -> anyhow::Result<()> {
+    let raw = value
+        .strip_prefix("0x")
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody listing is invalid"))?;
+    if raw.is_empty()
+        || raw.len() > 64
+        || !raw
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        anyhow::bail!("Runtime custody listing is invalid");
+    }
+    if raw.len() > 1 && raw.starts_with('0') {
+        anyhow::bail!("Runtime custody listing is invalid");
+    }
+    Ok(())
+}
+
+fn validate_runtime_custody_evm_address(value: &str) -> anyhow::Result<()> {
+    let raw = value
+        .strip_prefix("0x")
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody listing is invalid"))?;
+    if raw.len() != 40
+        || !raw
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        anyhow::bail!("Runtime custody listing is invalid");
+    }
+    Ok(())
 }
 
 pub(crate) async fn verify_fresh_runtime_custody_buy_availability(
@@ -4509,9 +4765,7 @@ pub(crate) fn load_runtime_custody_listing(
         return Ok(None);
     }
     let record: RuntimeCustodyListingRecord = serde_json::from_slice(&fs::read(path)?)?;
-    if record.schema != RUNTIME_LISTING_SCHEMA_V1 {
-        anyhow::bail!("Runtime custody listing is invalid");
-    }
+    record.validate()?;
     Ok(Some(record))
 }
 
@@ -4546,45 +4800,24 @@ pub(crate) fn persist_runtime_custody_creator_listing(
         metadata_cid: terminal.metadata_cid().to_string(),
         token_uri: terminal.token_uri().to_string(),
         publisher_principal_id: publisher_principal_id.to_string(),
-        seller_address: terminal.seller().to_string(),
+        display_name: facts.display_name.clone(),
+        mime_type: facts.mime_type.clone(),
+        codecs: facts.codecs.clone(),
+        quantity: terminal.quantity().to_string(),
+        seller_address: terminal.seller().to_ascii_lowercase(),
         chain_namespace: terminal.chain_namespace().to_string(),
         network: terminal.network().to_string(),
-        ledger: terminal.ledger().to_string(),
-        token_id: terminal.token_id().to_string(),
-        operative: terminal.operative().to_string(),
+        ledger: terminal.ledger().to_ascii_lowercase(),
+        token_id: terminal.token_id().to_ascii_lowercase(),
+        operative: terminal.operative().to_ascii_lowercase(),
         price: terminal.price().to_string(),
-        pay_token: terminal.pay_token().to_string(),
-        payment_processor: terminal.payment_processor().map(str::to_string),
-        published_at: crate::auth::now_ts(),
+        pay_token: terminal.pay_token().to_ascii_lowercase(),
+        payment_processor: terminal.payment_processor().map(str::to_ascii_lowercase),
+        published_at: terminal.published_at(),
     };
+    expected.validate()?;
     if let Some(existing) = load_runtime_custody_listing(data_dir, mint_id)? {
-        if existing.schema == expected.schema
-            && existing.mint_id == expected.mint_id
-            && existing.content_id == expected.content_id
-            && existing.content_access_id == expected.content_access_id
-            && existing.cid == expected.cid
-            && existing.metadata_cid == expected.metadata_cid
-            && existing.token_uri == expected.token_uri
-            && existing.publisher_principal_id == expected.publisher_principal_id
-            && existing
-                .seller_address
-                .eq_ignore_ascii_case(&expected.seller_address)
-            && existing.chain_namespace == expected.chain_namespace
-            && existing.network == expected.network
-            && existing.ledger.eq_ignore_ascii_case(&expected.ledger)
-            && existing.token_id.eq_ignore_ascii_case(&expected.token_id)
-            && existing.operative.eq_ignore_ascii_case(&expected.operative)
-            && existing.price == expected.price
-            && existing.pay_token.eq_ignore_ascii_case(&expected.pay_token)
-            && existing
-                .payment_processor
-                .as_deref()
-                .map(str::to_ascii_lowercase)
-                == expected
-                    .payment_processor
-                    .as_deref()
-                    .map(str::to_ascii_lowercase)
-        {
+        if existing == expected {
             return Ok(());
         }
         anyhow::bail!("Runtime custody listing is invalid");
