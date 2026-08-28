@@ -50,10 +50,11 @@ volatile proof logs remain outside the repository.
   reconstructs from the authenticated release operation, verified signed
   epoch, released contributions and terminal receipt, recipient possession,
   and public CEK commitment. Provisioning still uses `CustodyEnvelopeV1`.
-- The broad combined protected-content gateway proof currently stops at a stale
-  fixture that registers private custody through the public sub-provider path:
-  `sub-provider 'custody' is not a reserved name`. This is the next test
-  boundary, not a product authority change.
+- The combined one-Runtime protected-content gateway proof now uses the private
+  Runtime targets for protect, media, custody, and decrypt. Its Carrier fixture
+  supplies authenticated source endpoint identity before the selected custody
+  target handles the request. Public provider projection still excludes these
+  targets.
 
 ## Branch Hygiene
 

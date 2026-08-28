@@ -9168,14 +9168,33 @@ struct LoopbackCustodyCarrierInvoker {
 impl ProviderCarrierInvoker for LoopbackCustodyCarrierInvoker {
     async fn invoke_carrier_provider(
         &self,
-        _route: &ProviderCarrierRoute,
+        route: &ProviderCarrierRoute,
         invocation: &ProviderInvocation,
-        request: Value,
+        mut request: Value,
     ) -> Result<Value, ProviderError> {
+        if !matches!(route, ProviderCarrierRoute::PeerDid { .. }) {
+            return Err(ProviderError::Provider(
+                "library custody loopback requires an endpoint DID route".to_string(),
+            ));
+        }
+        let runtime = request
+            .get_mut("_runtime_invocation")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                ProviderError::Provider(
+                    "library custody loopback requires a Runtime invocation envelope".to_string(),
+                )
+            })?;
+        runtime.insert(
+            "carrier".to_string(),
+            json!({"source_endpoint_did": peer_did_for_seed(0xa0)}),
+        );
         let registry = self.registry.upgrade().ok_or_else(|| {
             ProviderError::Provider("library mint carrier loopback registry is gone".to_string())
         })?;
-        registry.send_raw(&invocation.target, &request).await
+        registry
+            .send_runtime_provider_target_raw(&invocation.target, &request)
+            .await
     }
 }
 
@@ -9347,7 +9366,9 @@ impl Provider for LibraryProcessCustodyDispatcher {
 
     async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
         let registry = self.node_registry(request)?;
-        registry.send_raw(CUSTODY_PROVIDER_ID, request).await
+        registry
+            .send_runtime_provider_target_raw(CUSTODY_PROVIDER_ID, request)
+            .await
     }
 }
 
@@ -11832,7 +11853,7 @@ pub(crate) async fn register_runtime_custody_process_providers_for_test_registry
         .await
         .unwrap();
     registry
-        .register_sub_provider(
+        .register_runtime_provider_target(
             CUSTODY_PROVIDER_ID,
             Arc::new(LibraryProcessCustodyDispatcher {
                 expected_issuer: runtime_issuer,
@@ -11870,7 +11891,7 @@ pub(crate) async fn register_runtime_custody_mock_media_provider_for_test_regist
     let staging_root = provider_root.join("staging");
     owner_only_dir(&staging_root);
     registry
-        .register_sub_provider(
+        .register_runtime_provider_target(
             MEDIA_PROVIDER_ID,
             Arc::new(TestMediaPreparationProvider {
                 staging_root,
