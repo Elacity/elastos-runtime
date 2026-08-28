@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SETUP = ROOT / "scripts" / "setup-source-home.sh"
 COMPONENTS = ROOT / "components.json"
 INTEGRITY = ROOT / "scripts" / "components-release-integrity-check.py"
+PUBLISH_RELEASE = ROOT / "scripts" / "publish-release.sh"
 SCHEMA = "elastos.source-home-provider-inventory-smoke/v1"
 
 RUNTIME_ONLY_PROVIDERS = (
@@ -60,6 +61,46 @@ def assert_provider_names_and_loops(setup_text: str) -> None:
     if 'SOURCE_HOME_BINARY_NAMES_JSON="${SOURCE_HOME_BINARY_NAMES_JSON}"' not in setup_text:
         raise AssertionError("source-home stamp must receive SOURCE_HOME_BINARY_NAMES_JSON")
 
+    for private_state in (
+        "protected-content/chain-provider.json",
+        "protected-content/custody-composition.json",
+        "node-custody-secret",
+        "evidence_rpc_urls",
+    ):
+        if private_state in setup_text:
+            raise AssertionError(
+                f"source-home packaging must not create protected operator state: {private_state}"
+            )
+
+
+def shell_array_entries(text: str, name: str) -> list[str]:
+    body = text.split(f"{name}=(", 1)[1].split("\n)", 1)[0]
+    return [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def assert_release_support_inventory() -> None:
+    publish_text = PUBLISH_RELEASE.read_text(encoding="utf-8")
+    support = shell_array_entries(publish_text, "SUPPORT_BINARY_ASSETS")
+    for provider in RUNTIME_ONLY_PROVIDERS:
+        if support.count(provider) != 1:
+            raise AssertionError(
+                f"release support inventory must include {provider} exactly once"
+            )
+    for private_state in (
+        "protected-content/chain-provider.json",
+        "protected-content/custody-composition.json",
+        "node-custody-secret",
+        "evidence_rpc_urls",
+    ):
+        if private_state in publish_text:
+            raise AssertionError(
+                f"release packaging must not create protected operator state: {private_state}"
+            )
+
 
 def assert_external_metadata(components: dict) -> None:
     capsules = components["capsules"]
@@ -72,6 +113,13 @@ def assert_external_metadata(components: dict) -> None:
             raise AssertionError(f"components.json missing external metadata for {name}")
         if entry.get("install_path") != f"bin/{name}":
             raise AssertionError(f"{name} install_path mismatch")
+        source_manifests = (
+            ROOT / "capsules" / name / "Cargo.toml",
+            ROOT / "elastos" / "capsules" / name / "Cargo.toml",
+            ROOT / "elastos" / "tools" / name / "Cargo.toml",
+        )
+        if not any(path.is_file() for path in source_manifests):
+            raise AssertionError(f"{name} source manifest is unavailable for clean builds")
         platforms = entry.get("platforms") or {}
         for platform in ("linux-amd64", "linux-arm64", "darwin-arm64"):
             info = platforms.get(platform)
@@ -163,6 +211,7 @@ def main() -> None:
     components = json.loads(COMPONENTS.read_text(encoding="utf-8"))
 
     assert_provider_names_and_loops(setup_text)
+    assert_release_support_inventory()
     assert_external_metadata(components)
     run_integrity_smoke(components)
 

@@ -521,6 +521,7 @@ PLATFORM="$(detect_platform)"
 CARGO_BIN="$(find_cargo)"
 NODE_BIN="$(find_node)"
 BROWSER_VM_ROOTFS_BACKUP=""
+SOURCE_HOME_KUBO_INSTALLED="0"
 configure_rust_toolchain_env "$CARGO_BIN"
 export PATH="$(dirname "$CARGO_BIN"):$(dirname "$NODE_BIN"):${PATH}"
 require_supported_rust "$(command -v rustc)"
@@ -1613,6 +1614,7 @@ stamp_source_home_components_manifest() {
     SETUP_PLATFORM="${PLATFORM}" \
     SOURCE_HOME_BINARY_NAMES_JSON="${SOURCE_HOME_BINARY_NAMES_JSON}" \
     APP_CAPSULES_JSON="${APP_CAPSULES_JSON}" \
+    SOURCE_HOME_KUBO_INSTALLED="${SOURCE_HOME_KUBO_INSTALLED}" \
     python3 - <<'PY'
 import hashlib
 import json
@@ -1632,6 +1634,11 @@ host_components = [
 source_home_components = list(
     dict.fromkeys([*host_components, *json.loads(os.environ["APP_CAPSULES_JSON"])])
 )
+if os.environ["SOURCE_HOME_KUBO_INSTALLED"] == "1":
+    kubo = data_dir / "bin" / "kubo"
+    if not kubo.is_file():
+        raise SystemExit("successful Kubo setup did not install bin/kubo")
+    source_home_components.append("kubo")
 
 for name in host_components:
     platforms = manifest["external"][name].setdefault("platforms", {})
@@ -1693,6 +1700,11 @@ install_content_publish_backend() {
     HOME="${HOME}" \
     ELASTOS_COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
         "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)" setup --with kubo
+    if [[ ! -f "${DATA_DIR}/bin/kubo" || ! -x "${DATA_DIR}/bin/kubo" ]]; then
+        echo "Kubo setup succeeded without an installed executable: ${DATA_DIR}/bin/kubo" >&2
+        exit 1
+    fi
+    SOURCE_HOME_KUBO_INSTALLED="1"
 }
 
 echo "[setup-source-home] repo: ${ROOT}"
@@ -1792,6 +1804,9 @@ stamp_source_home_components_manifest
 
 echo "[setup-source-home] install content publish backend before final manifest stamp"
 install_content_publish_backend
+
+echo "[setup-source-home] finalize source-home component selection"
+stamp_source_home_components_manifest
 
 echo "[setup-source-home] install app capsules and manifest entrypoints"
 install_app_capsules

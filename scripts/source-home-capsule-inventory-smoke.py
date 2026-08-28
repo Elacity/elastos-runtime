@@ -2,6 +2,7 @@
 import hashlib
 import importlib.util
 import json
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -221,18 +222,40 @@ def make_kubo_rewritten_components(path):
 def assert_setup_order():
     setup = (ROOT / "scripts" / "setup-source-home.sh").read_text(encoding="utf-8")
     main = setup.split('echo "[setup-source-home] repo:', 1)[1]
-    ordered = [
-        "stamp_source_home_components_manifest\n",
-        "install_content_publish_backend\n",
-        "install_app_capsules\n",
-        "stamp_source_home_capsule_artifacts_manifest\n",
-        'python3 "${ROOT}/scripts/components-release-integrity-check.py"',
+    stamps = [
+        match.start()
+        for match in re.finditer(r"^stamp_source_home_components_manifest$", main, re.MULTILINE)
     ]
-    positions = [main.index(marker) for marker in ordered]
+    if len(stamps) != 2:
+        raise AssertionError("source-home setup must stamp components before and after Kubo setup")
+    positions = [
+        stamps[0],
+        main.index("install_content_publish_backend\n"),
+        stamps[1],
+        main.index("install_app_capsules\n"),
+        main.index("stamp_source_home_capsule_artifacts_manifest\n"),
+        main.index('python3 "${ROOT}/scripts/components-release-integrity-check.py"'),
+    ]
     if positions != sorted(positions):
         raise AssertionError(
             "components.json mutators must finish before the final capsule stamp and integrity check"
         )
+    install_function = setup.split("install_content_publish_backend() {", 1)[1].split(
+        "\n}\n\necho \"[setup-source-home] repo:", 1
+    )[0]
+    success_index = install_function.index('SOURCE_HOME_KUBO_INSTALLED="1"')
+    for marker in [
+        'if [[ "$mode" == "0" ]]',
+        'if [[ "$mode" != "1" && "$PLATFORM" != "darwin-arm64" ]]',
+        'setup --with kubo',
+        'if [[ ! -f "${DATA_DIR}/bin/kubo" || ! -x "${DATA_DIR}/bin/kubo" ]]',
+    ]:
+        if install_function.index(marker) >= success_index:
+            raise AssertionError("source-home must mark Kubo only after setup and executable verification")
+    if install_function.count('SOURCE_HOME_KUBO_INSTALLED="1"') != 1:
+        raise AssertionError("source-home setup must record Kubo only after successful setup")
+    if 'source_home_components.append("kubo")' not in setup:
+        raise AssertionError("source-home final profile must include successfully installed Kubo")
     if 'manifest.setdefault("profiles", {})["source-home"]' not in setup:
         raise AssertionError("source-home setup must stamp the exact components it installs")
     integrity_call = main.split(

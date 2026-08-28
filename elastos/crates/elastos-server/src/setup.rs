@@ -2153,7 +2153,7 @@ mod tests {
     use super::*;
     use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
     use elastos_common::{CapsuleManifest, CapsuleRole};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -2240,6 +2240,87 @@ mod tests {
                 }
             }
         }
+        let protected_home_dependencies = [
+            "chain-provider",
+            "wallet-provider",
+            "kubo",
+            "ipfs-provider",
+            "protected-content-protect-provider",
+            "media-provider",
+            "protected-content-decrypt-provider",
+            "library",
+            "marketplace",
+            "elacity-player",
+        ];
+        for profile_name in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
+            let profile = &manifest.profiles[profile_name];
+            for dependency in protected_home_dependencies {
+                assert_eq!(
+                    profile
+                        .components
+                        .iter()
+                        .filter(|component| component.as_str() == dependency)
+                        .count(),
+                    1,
+                    "{profile_name} protected-content Home profile must include {dependency} exactly once"
+                );
+            }
+        }
+        let private_providers = [
+            "protected-content-protect-provider",
+            "media-provider",
+            "custody-provider",
+            "protected-content-decrypt-provider",
+        ];
+        let provisional_providers = [
+            "drm-provider",
+            "rights-provider",
+            "key-provider",
+            "decrypt-provider",
+        ];
+        for profile_name in ["blockchain", "full"] {
+            let profile = &manifest.profiles[profile_name];
+            for provider in private_providers.into_iter().chain(provisional_providers) {
+                assert_eq!(
+                    profile
+                        .components
+                        .iter()
+                        .filter(|component| component.as_str() == provider)
+                        .count(),
+                    1,
+                    "{profile_name} profile must include {provider} exactly once"
+                );
+            }
+        }
+        let custody_profiles = manifest
+            .profiles
+            .iter()
+            .filter_map(|(name, profile)| {
+                profile
+                    .components
+                    .iter()
+                    .any(|component| component == "custody-provider")
+                    .then_some(name.as_str())
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(custody_profiles, BTreeSet::from(["blockchain", "full"]));
+        let operator_with_custody = resolve_components(
+            &manifest,
+            Some("operator"),
+            &["chain-provider".to_string(), "custody-provider".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            operator_with_custody,
+            [
+                "shell",
+                "localhost-provider",
+                "did-provider",
+                "chain-provider",
+                "custody-provider",
+            ]
+        );
         assert!(!manifest.profiles.contains_key("chat"));
         assert!(manifest.profiles.contains_key("blockchain"));
         assert!(manifest.profiles.contains_key("operator"));

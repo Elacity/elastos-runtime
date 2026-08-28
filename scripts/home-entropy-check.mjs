@@ -4645,16 +4645,17 @@ for (const obsolete of ["chat", "agent"]) {
   );
 }
 const publishRust = read("elastos/crates/elastos-server/src/publish.rs");
-function shellArrayItems(text, name) {
+function shellArrayEntries(text, name) {
   const pattern = new RegExp(`^${name}=\\(([\\s\\S]*?)^\\)`, "m");
   const match = text.match(pattern);
   assert(Boolean(match), `publish-release must define ${name}`);
-  return new Set(
-    match[1]
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => /^[A-Za-z0-9_-]+$/.test(line)),
-  );
+  return match[1]
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^[A-Za-z0-9_-]+$/.test(line));
+}
+function shellArrayItems(text, name) {
+  return new Set(shellArrayEntries(text, name));
 }
 function rustConstItems(text, name) {
   const pattern = new RegExp(
@@ -4673,6 +4674,10 @@ const publishReleaseSupport = shellArrayItems(
   publishReleaseScript,
   "SUPPORT_BINARY_ASSETS",
 );
+const publishReleaseSupportEntries = shellArrayEntries(
+  publishReleaseScript,
+  "SUPPORT_BINARY_ASSETS",
+);
 const publishRustHome = rustConstItems(publishRust, "HOME_PUBLISH_CAPSULES");
 const publishRustDemo = rustConstItems(publishRust, "DEMO_PUBLISH_CAPSULES");
 const publishRustRequired = rustConstItems(
@@ -4681,6 +4686,58 @@ const publishRustRequired = rustConstItems(
 );
 const homeProfile = new Set(components.profiles.home.components);
 const demoProfile = new Set(components.profiles.demo.components);
+const protectedRuntimeProviders = new Set([
+  "protected-content-protect-provider",
+  "media-provider",
+  "custody-provider",
+  "protected-content-decrypt-provider",
+]);
+const protectedHomeDependencies = new Set([
+  "chain-provider",
+  "wallet-provider",
+  "kubo",
+  "ipfs-provider",
+  "protected-content-protect-provider",
+  "media-provider",
+  "protected-content-decrypt-provider",
+]);
+const protectedHomeSurface = ["library", "marketplace", "elacity-player"];
+for (const [profileName, profile] of Object.entries(components.profiles)) {
+  const profileList = profile.components || [];
+  const profileComponents = new Set(profileList);
+  if (protectedHomeSurface.every((component) => profileComponents.has(component))) {
+    for (const dependency of protectedHomeDependencies) {
+      assert(
+        profileList.filter((component) => component === dependency).length === 1,
+        `${profileName} protected-content Home profile must install ${dependency} exactly once`,
+      );
+    }
+  }
+}
+for (const provider of protectedRuntimeProviders) {
+  assert(
+    publishReleaseSupportEntries.filter((component) => component === provider).length === 1,
+    `publish-release support assets must include ${provider} exactly once`,
+  );
+  assert(
+    components.external?.[provider]?.provider_runtime?.runtime_only === true,
+    `${provider} must remain a Runtime-only native provider`,
+  );
+  assert(
+    !components.capsules?.[provider] &&
+      !existsSync(new URL(`capsules/${provider}/capsule.json`, repoRoot)) &&
+      !existsSync(new URL(`elastos/capsules/${provider}/capsule.json`, repoRoot)),
+    `${provider} must stay out of capsule-facing inventories`,
+  );
+}
+const custodyProfiles = Object.entries(components.profiles)
+  .filter(([, profile]) => new Set(profile.components || []).has("custody-provider"))
+  .map(([profileName]) => profileName)
+  .sort();
+assert(
+  JSON.stringify(custodyProfiles) === JSON.stringify(["blockchain", "full"]),
+  "custody-provider must stay in blockchain/full profiles only",
+);
 assert(
   !components.external?.["capsule-inspector"] &&
     Object.values(components.profiles).every(
@@ -4830,7 +4887,7 @@ for (const component of [...publishReleaseDefault]) {
     `publish-release default capsule set must not include demo-only capsule ${component}`,
   );
 }
-for (const component of ["gba-emulator", "gba-ucity", "chat-room", "ipfs-provider", "tunnel-provider"]) {
+for (const component of ["gba-emulator", "gba-ucity", "chat-room", "tunnel-provider"]) {
   assert(
     publishRustDemo.has(component),
     `Rust demo publish profile must include ${component}`,
