@@ -463,7 +463,9 @@ impl Supervisor {
 
     /// Handle a supervisor request from the shell.
     pub async fn handle_request(&self, req: SupervisorRequest) -> SupervisorResponse {
-        self.reap_dead_capsules().await;
+        if let Err(error) = self.reap_dead_capsules().await {
+            return SupervisorResponse::err(format!("reap_dead_capsules failed: {error}"));
+        }
         match req {
             SupervisorRequest::EnsureCapsule { name } => match self.ensure_capsule(&name).await {
                 Ok(path) => SupervisorResponse::ok_with_path(path.display().to_string()),
@@ -661,22 +663,26 @@ impl Supervisor {
         }
     }
 
-    async fn unregister_provider_route(&self, route: &ProviderRoute) {
+    async fn unregister_provider_route(&self, route: &ProviderRoute) -> Result<()> {
         let Some(registry) = &self.provider_registry else {
-            return;
+            return Ok(());
         };
         match route {
             ProviderRoute::SubProvider(sub) => {
-                registry.unregister_sub_provider(sub).await;
+                registry
+                    .unregister_sub_provider(sub)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("sub-provider unregister failed: {error}"))?;
             }
             ProviderRoute::Scheme(scheme) => {
                 registry.unregister(scheme).await;
             }
         }
+        Ok(())
     }
 
-    async fn reap_dead_capsules(&self) {
-        let mut dead: Vec<(String, Option<ProviderRoute>)> = Vec::new();
+    async fn reap_dead_capsules(&self) -> Result<()> {
+        let mut dead: Vec<(String, RunningCapsule)> = Vec::new();
         {
             let mut running = self.running.write().await;
             let dead_handles: Vec<String> = running
@@ -695,14 +701,18 @@ impl Supervisor {
                 .collect();
             for handle in dead_handles {
                 if let Some(capsule) = running.remove(&handle) {
-                    dead.push((handle, capsule.provider_route));
+                    dead.push((handle, capsule));
                 }
             }
         }
 
-        for (handle, route) in dead {
-            if let Some(route) = route.as_ref() {
-                self.unregister_provider_route(route).await;
+        for (handle, capsule) in dead {
+            if let Some(route) = capsule.provider_route.as_ref() {
+                if let Err(error) = self.unregister_provider_route(route).await {
+                    let mut running = self.running.write().await;
+                    running.insert(handle, capsule);
+                    return Err(error);
+                }
             }
             let overlay_path = self
                 .crosvm_config
@@ -715,6 +725,7 @@ impl Supervisor {
                 handle
             );
         }
+        Ok(())
     }
 
     async fn load_capsule_manifest(
@@ -1296,13 +1307,19 @@ impl Supervisor {
 
     /// Stop a running capsule.
     async fn stop_capsule(&self, handle: &str) -> Result<()> {
-        let mut running = self.running.write().await;
-        let capsule = running
-            .remove(handle)
-            .ok_or_else(|| anyhow::anyhow!("no capsule with handle '{handle}'"))?;
+        let capsule = {
+            let mut running = self.running.write().await;
+            running
+                .remove(handle)
+                .ok_or_else(|| anyhow::anyhow!("no capsule with handle '{handle}'"))?
+        };
 
         if let Some(route) = capsule.provider_route.as_ref() {
-            self.unregister_provider_route(route).await;
+            if let Err(error) = self.unregister_provider_route(route).await {
+                let mut running = self.running.write().await;
+                running.insert(handle.to_string(), capsule);
+                return Err(error);
+            }
         }
 
         match capsule.backend {
@@ -1342,7 +1359,11 @@ impl Supervisor {
         };
 
         if let Some(route) = capsule.provider_route.as_ref() {
-            self.unregister_provider_route(route).await;
+            if let Err(error) = self.unregister_provider_route(route).await {
+                let mut running = self.running.write().await;
+                running.insert(handle.to_string(), capsule);
+                return Err(error);
+            }
         }
 
         let exit_code = match capsule.backend {
@@ -1549,7 +1570,10 @@ mod tests {
         Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse,
     };
     use sha2::Digest;
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     #[test]
     fn test_supervisor_request_serialization() {
@@ -1747,6 +1771,11 @@ mod tests {
         response: serde_json::Value,
     }
 
+    #[derive(Default)]
+    struct RetryOnceShutdownProvider {
+        attempts: AtomicUsize,
+    }
+
     #[async_trait::async_trait]
     impl Provider for MockIpfsProvider {
         async fn handle(
@@ -1774,6 +1803,34 @@ mod tests {
                 Some(TEST_SUPERVISOR_CID)
             );
             Ok(self.response.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RetryOnceShutdownProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("not used in this test".into()))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            vec![]
+        }
+
+        fn name(&self) -> &'static str {
+            "retry-once-shutdown-provider"
+        }
+
+        async fn shutdown(&self) -> Result<(), ProviderError> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(ProviderError::Provider(
+                    "unclean shutdown receipt after child exit".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1820,6 +1877,59 @@ mod tests {
             description: None,
             platforms,
         }
+    }
+
+    fn test_capsule_manifest(name: &str) -> elastos_common::CapsuleManifest {
+        serde_json::from_value(serde_json::json!({
+            "schema": "elastos.capsule/v1",
+            "name": name,
+            "version": "0.1.0",
+            "role": "provider",
+            "type": "microvm",
+            "entrypoint": "rootfs.ext4",
+        }))
+        .unwrap()
+    }
+
+    fn dead_vm_capsule(handle: &str, route: ProviderRoute) -> RunningCapsule {
+        let capsule_dir = tempfile::tempdir().unwrap().keep();
+        let socket_dir = tempfile::tempdir().unwrap().keep();
+        let manifest = test_capsule_manifest("custody-provider");
+        let vm = RunningVm::new(
+            VmConfig::from_manifest(&manifest, &capsule_dir, &capsule_dir.join("vmlinux")),
+            manifest.clone(),
+            socket_dir.join(format!("{handle}.sock")),
+        );
+        RunningCapsule {
+            name: "custody-provider".to_string(),
+            handle: handle.to_string(),
+            vsock_cid: 0,
+            started_at: std::time::Instant::now(),
+            provider_route: Some(route),
+            backend: CapsuleBackend::Vm(Box::new(vm)),
+        }
+    }
+
+    fn host_process_capsule(handle: &str, route: ProviderRoute) -> RunningCapsule {
+        RunningCapsule {
+            name: "custody-provider".to_string(),
+            handle: handle.to_string(),
+            vsock_cid: 0,
+            started_at: std::time::Instant::now(),
+            provider_route: Some(route),
+            backend: CapsuleBackend::HostProcess,
+        }
+    }
+
+    async fn supervisor_with_retrying_subprovider() -> (Supervisor, Arc<ProviderRegistry>) {
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_sub_provider("custody", Arc::new(RetryOnceShutdownProvider::default()))
+            .await
+            .unwrap();
+        let mut supervisor = make_test_supervisor();
+        supervisor.set_provider_registry(Arc::clone(&registry));
+        (supervisor, registry)
     }
 
     fn write_installed_manifest(
@@ -2129,5 +2239,81 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("kubo not found"));
+    }
+
+    #[tokio::test]
+    async fn test_stop_capsule_retains_retry_ownership_until_unregister_succeeds() {
+        let (supervisor, registry) = supervisor_with_retrying_subprovider().await;
+        let handle = "host-custody-stop";
+        {
+            let mut running = supervisor.running.write().await;
+            running.insert(
+                handle.to_string(),
+                host_process_capsule(handle, ProviderRoute::SubProvider("custody".to_string())),
+            );
+        }
+
+        let first = supervisor.stop_capsule(handle).await.unwrap_err();
+        assert!(first.to_string().contains("sub-provider unregister failed"));
+        assert!(supervisor.running.read().await.contains_key(handle));
+        assert!(registry
+            .register_sub_provider("custody", Arc::new(RetryOnceShutdownProvider::default()))
+            .await
+            .is_err());
+
+        supervisor.stop_capsule(handle).await.unwrap();
+        assert!(!supervisor.running.read().await.contains_key(handle));
+        registry
+            .register_sub_provider("custody", Arc::new(RetryOnceShutdownProvider::default()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_exit_retains_retry_ownership_until_unregister_succeeds() {
+        let (supervisor, registry) = supervisor_with_retrying_subprovider().await;
+        let handle = "host-custody-wait";
+        {
+            let mut running = supervisor.running.write().await;
+            running.insert(
+                handle.to_string(),
+                host_process_capsule(handle, ProviderRoute::SubProvider("custody".to_string())),
+            );
+        }
+
+        let first = supervisor.wait_for_exit(handle).await.unwrap_err();
+        assert!(first.to_string().contains("sub-provider unregister failed"));
+        assert!(supervisor.running.read().await.contains_key(handle));
+        assert!(registry
+            .register_sub_provider("custody", Arc::new(RetryOnceShutdownProvider::default()))
+            .await
+            .is_err());
+
+        assert_eq!(supervisor.wait_for_exit(handle).await.unwrap(), 0);
+        assert!(!supervisor.running.read().await.contains_key(handle));
+    }
+
+    #[tokio::test]
+    async fn test_reap_dead_capsules_retains_retry_ownership_until_unregister_succeeds() {
+        let (supervisor, registry) = supervisor_with_retrying_subprovider().await;
+        let handle = "vm-custody-reap";
+        {
+            let mut running = supervisor.running.write().await;
+            running.insert(
+                handle.to_string(),
+                dead_vm_capsule(handle, ProviderRoute::SubProvider("custody".to_string())),
+            );
+        }
+
+        let first = supervisor.reap_dead_capsules().await.unwrap_err();
+        assert!(first.to_string().contains("sub-provider unregister failed"));
+        assert!(supervisor.running.read().await.contains_key(handle));
+        assert!(registry
+            .register_sub_provider("custody", Arc::new(RetryOnceShutdownProvider::default()))
+            .await
+            .is_err());
+
+        supervisor.reap_dead_capsules().await.unwrap();
+        assert!(!supervisor.running.read().await.contains_key(handle));
     }
 }

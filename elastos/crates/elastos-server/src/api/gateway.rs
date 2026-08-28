@@ -108,6 +108,8 @@ pub(in crate::api) use gateway_home_system::profile_readiness_for_principal;
 use gateway_home_system::*;
 use gateway_home_terminal::*;
 pub(crate) use gateway_home_token::home_launch_auth_data_dir;
+pub(super) use gateway_home_token::HomeLaunchTokenContext;
+pub(crate) use gateway_home_token::RuntimeWalletAuthority;
 pub(super) use gateway_home_token::{
     home_launch_token_header, home_session_clear_cookie_header,
     home_session_cookie_header_for_token, issue_home_launch_token_for_auth_grant,
@@ -118,10 +120,10 @@ pub(super) use gateway_home_token::{
     require_home_runtime_wallet_authority, require_home_token, require_home_token_context,
     require_home_viewer_launch_token_context, require_internal_shell_launch_grant_for_any_context,
     require_runtime_wallet_authority, runtime_wallet_authority, HomeLaunchContext,
-    HomeLaunchTokenContext, RequiredHomeLaunchToken, RuntimeWalletAuthority,
+    RequiredHomeLaunchToken,
 };
 #[cfg(test)]
-pub(crate) use gateway_home_token::{
+pub(in crate::api) use gateway_home_token::{
     issue_expired_home_launch_token_with_context, issue_home_launch_token,
     issue_home_launch_token_with_context, local_home_launch_token_context,
     set_test_home_launch_auth_data_dir, uuid_like_token,
@@ -139,6 +141,10 @@ pub(super) use gateway_passkey_step_up::{
 pub(crate) use gateway_passkey_step_up::{
     issue_passkey_step_up_token_at_for_test, issue_passkey_step_up_token_for_test,
 };
+pub(crate) use gateway_provider_proxy::runtime_custody_buy_via_gateway;
+#[cfg(test)]
+pub(crate) use gateway_provider_proxy::runtime_custody_publish_creator_tail_for_test;
+pub(crate) use gateway_provider_proxy::runtime_custody_publish_via_gateway;
 use gateway_provider_proxy::*;
 use gateway_room::*;
 pub(crate) use gateway_room::{

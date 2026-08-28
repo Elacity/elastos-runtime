@@ -29,9 +29,36 @@ list-capsules:
 check crate="elastos-server":
     cd elastos && cargo check -p {{crate}}
 
-# Run workspace tests
-test *args:
-    cd elastos && cargo test --workspace {{args}}
+# --target-dir is pinned so the binary paths below stay correct even when the
+# environment sets a global CARGO_TARGET_DIR.
+# Build the provider process binaries the protected-content process tests spawn
+prepare-providers:
+    cd capsules/protected-content-protect-provider && cargo build --release --target-dir target
+    cd capsules/protected-content-decrypt-provider && cargo build --release --target-dir target
+    cd capsules/custody-provider && cargo build --release --target-dir target
+
+# Run workspace tests (provider process tests need the capsule binaries)
+test-elastos *args: prepare-providers
+    cd elastos && \
+      ELASTOS_TEST_PROTECT_PROVIDER_BIN="$(pwd)/../capsules/protected-content-protect-provider/target/release/protected-content-protect-provider" \
+      ELASTOS_TEST_DECRYPT_PROVIDER_BIN="$(pwd)/../capsules/protected-content-decrypt-provider/target/release/protected-content-decrypt-provider" \
+      ELASTOS_TEST_CUSTODY_PROVIDER_BIN="$(pwd)/../capsules/custody-provider/target/release/custody-provider" \
+      cargo test --workspace {{args}}
+
+# The elastos workspace suite (and CI's `cargo test --workspace`) never
+# builds or tests own-workspace capsules; this covers them.
+# Test every capsule that is its own cargo workspace
+test-capsules:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for lock in capsules/*/Cargo.lock; do
+        capsule="$(dirname "$lock")"
+        echo "== testing $capsule =="
+        (cd "$capsule" && cargo test --target-dir target)
+    done
+
+# Run the workspace suite and every own-workspace capsule suite
+test: test-elastos test-capsules
 
 # Test a single crate (fastest iteration)
 test-crate crate *args:
@@ -52,7 +79,7 @@ fmt:
 
 # Pre-commit gate: alignment, entropy, smoke tests, fmt/lint/test
 verify:
-    git diff --check
+    git --no-pager diff --check
     just alignment-check
     node scripts/check-elastos-bus-wit.mjs
     node scripts/check-capsule-templates.mjs
@@ -69,7 +96,7 @@ verify:
     just candidate-command-audit
     cd elastos && cargo fmt --all -- --check
     cd elastos && cargo clippy --workspace --all-targets -- -D warnings
-    cd elastos && cargo test --workspace
+    just test
 
 product-ui-source:
     node scripts/home-shell-regression-smoke.mjs

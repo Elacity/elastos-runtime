@@ -242,6 +242,7 @@ async fn setup_server_infrastructure_impl(
     };
 
     ensure_file_backed_roots(&data_dir).ok();
+    elastos_server::protected_content_runtime::log_unresolved_runtime_releases(&data_dir);
     let provider_registry = Arc::new(provider::ProviderRegistry::new());
     let mut managed_host_processes = Vec::new();
     let mut external_availability_registered = false;
@@ -949,6 +950,53 @@ async fn setup_server_infrastructure_impl(
         }
     }
 
+    if let Some(path) = crate::find_installed_provider_binary("protected-content-protect-provider")
+    {
+        if let Err(e) = verify_provider_binary("protected-content-protect-provider", &path) {
+            tracing::warn!(
+                "Skipping protected-content-protect-provider due to verification failure: {}",
+                e
+            );
+        } else if let Err(e) = elastos_server::protected_content_runtime::register_protect_provider(
+            &provider_registry,
+            &path,
+        )
+        .await
+        {
+            tracing::warn!("Failed to register Runtime-only protect provider: {}", e);
+        } else {
+            tracing::info!(
+                "protected-content-protect-provider capsule from {}",
+                path.display()
+            );
+        }
+    }
+
+    if let Some(path) = crate::find_installed_provider_binary("custody-provider") {
+        if let Err(e) = verify_provider_binary("custody-provider", &path) {
+            tracing::warn!(
+                "Skipping custody-provider due to verification failure: {}",
+                e
+            );
+        } else if let Err(e) =
+            elastos_server::protected_content_runtime::register_inactive_custody_provider(
+                &provider_registry,
+                &path,
+                &data_dir,
+            )
+            .await
+        {
+            tracing::warn!(
+                "Failed to register inactive elastos://custody sub-provider: {}",
+                e
+            );
+        } else {
+            tracing::info!(
+                "custody-provider registered as inactive Runtime custody route; provisional key-provider remains the product path"
+            );
+        }
+    }
+
     // Built-in Carrier node — ALWAYS starts, not conditional on spawn_host_providers.
     // Carrier is fundamental infrastructure: gossip, content, identity.
     // Identity is DID (derived from device_key), not raw device_key.
@@ -1375,10 +1423,18 @@ fn maybe_spawn_content_repair_scheduler(registry: Arc<provider::ProviderRegistry
                     let data = response.get("data").unwrap_or(&response);
                     tracing::debug!(
                         "content repair scheduler run completed: checked={} repaired={} failed={} skipped={}",
-                        data.get("checked").and_then(|value| value.as_u64()).unwrap_or(0),
-                        data.get("repaired").and_then(|value| value.as_u64()).unwrap_or(0),
-                        data.get("failed").and_then(|value| value.as_u64()).unwrap_or(0),
-                        data.get("skipped").and_then(|value| value.as_u64()).unwrap_or(0),
+                        data.get("checked")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0),
+                        data.get("repaired")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0),
+                        data.get("failed")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0),
+                        data.get("skipped")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0),
                     );
                 }
                 Err(err) => {

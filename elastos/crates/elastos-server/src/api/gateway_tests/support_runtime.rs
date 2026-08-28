@@ -176,7 +176,9 @@ fn seed_test_browser_capsules(data_dir: &std::path::Path) {
         HOME_CAPSULE_ID,
         "shell",
         "Test Home capsule",
-        Some(r#"<!doctype html><title>Home · ElastOS</title><script src="./home-shell-host.js"></script>"#),
+        Some(
+            r#"<!doctype html><title>Home · ElastOS</title><script src="./home-shell-host.js"></script>"#,
+        ),
     );
     std::fs::write(
         data_dir
@@ -482,16 +484,41 @@ fn passkey_authority_with_name_role(
     display_name: Option<&str>,
     role: crate::auth::RuntimePrincipalRole,
 ) -> TestPasskeyAuthority {
+    let credential_id = match role {
+        crate::auth::RuntimePrincipalRole::Admin => "gateway-test-passkey",
+        crate::auth::RuntimePrincipalRole::Guest => "gateway-test-guest-passkey",
+    };
+    passkey_authority_with_name_role_credential(data_dir, display_name, role, credential_id)
+}
+
+fn passkey_authority_with_profile_role_credential(
+    data_dir: &std::path::Path,
+    display_name: &str,
+    role: crate::auth::RuntimePrincipalRole,
+    credential_id: &str,
+) -> TestPasskeyAuthority {
+    let authority = passkey_authority_with_name_role_credential(
+        data_dir,
+        Some(display_name),
+        role,
+        credential_id,
+    );
+    provision_signed_profile(data_dir, &authority, display_name);
+    authority
+}
+
+fn passkey_authority_with_name_role_credential(
+    data_dir: &std::path::Path,
+    display_name: Option<&str>,
+    role: crate::auth::RuntimePrincipalRole,
+    credential_id: &str,
+) -> TestPasskeyAuthority {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     let now = crate::auth::now_ts();
-    let credential_id = match role {
-        crate::auth::RuntimePrincipalRole::Admin => "gateway-test-passkey",
-        crate::auth::RuntimePrincipalRole::Guest => "gateway-test-guest-passkey",
-    };
     let rp_id = "elastos.elacitylabs.com";
     let binding = ProofBinding::passkey_webauthn(PasskeyWebAuthnBinding {
         credential_id: credential_id.to_string(),
@@ -1091,7 +1118,10 @@ async fn fake_runtime_provider(
             let mut bus = state.bus.lock().await;
             let peers = bus.topic_members.get(topic).cloned().unwrap_or_default();
             let remote_peer_count = peers.iter().filter(|peer| *peer != &state.peer_id).count();
-            let message = body.get("message").and_then(|value| value.as_str()).unwrap_or("");
+            let message = body
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
             let fail_index = bus
                 .fail_message_substrings
                 .iter()

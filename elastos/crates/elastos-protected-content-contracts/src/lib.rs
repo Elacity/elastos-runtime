@@ -29,10 +29,12 @@ mod test_support;
 
 pub use canonical::{CanonicalContract, ContractError};
 pub use custody_envelope::{
-    CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyNodeIdentityV1, HpkeCiphertextV1,
-    NodeCustodyPublicKeyV1, ShareCoordinateV1, CONTENT_KEY_COMMITMENT_DOMAIN_V1,
-    CUSTODY_HPKE_SUITE_ID_V1, HPKE_ENCAPPED_KEY_BYTES, HPKE_SEALED_SHARE_BYTES,
-    RELEASED_SHARE_HPKE_INFO_V1, STORED_SHARE_HPKE_INFO_V1,
+    CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyNodeIdentityV1, NodeCustodyPublicKeyV1,
+    PqHybridSealedShareV1, ShareCoordinateV1, CONTENT_KEY_COMMITMENT_DOMAIN_V1,
+    CUSTODY_X_WING_AES256GCM_SUITE_ID_V1, PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES,
+    PQ_HYBRID_SEALED_SHARE_MAX_BYTES, PQ_HYBRID_SEALED_SHARE_MIN_BYTES,
+    PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES, RELEASED_SHARE_HPKE_INFO_V1, STORED_SHARE_HPKE_INFO_V1,
+    X_WING_DRAFT06_CIPHERTEXT_BYTES,
 };
 pub use custody_epoch::{
     CustodyApprovedSuitesV1, CustodyEpochError, CustodyEpochIdentityV1, CustodyEpochIssuerKeyV1,
@@ -69,7 +71,7 @@ pub use node_decision::{
 };
 pub use node_set::{NodePublicKey, NodeSetV1};
 pub use policy::{
-    EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1,
+    ContentAccessIdV1, EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1,
     RightsEvaluationEvidenceRequestV1, RightsEvaluationEvidenceV1, RightsObservationFinalityV1,
     RightsPolicyBodyV1, RightsSubjectSourceV1, MAX_RIGHTS_EVIDENCE_LIFETIME_SECS,
 };

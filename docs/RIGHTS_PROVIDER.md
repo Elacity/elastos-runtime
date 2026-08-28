@@ -18,8 +18,11 @@ transports, endpoint DIDs, IP addresses, ports, or credentials.
 
 The canonical source-only contract is `RightsPolicyBodyV1` with matching typed
 evidence request and result values in
-`elastos-protected-content-contracts`. It is not yet wired into Runtime or an
-installed rights provider.
+`elastos-protected-content-contracts`. `elastos-protected-content-rights`
+evaluates those contracts and can acquire Chain evidence through a
+Runtime-owned `ProviderRegistry` invoke of `chain` /
+`protected_content_rights_evidence`. That adapter is source-only. It does not
+replace the installed provisional `rights-provider`.
 
 Released 0.6 also contains an older provisional `rights-provider` capsule. It
 uses the old `elastos_common::protected_content` DTO and supports a wider set of
@@ -32,6 +35,8 @@ Canonical source-only contract:
 
 ```bash
 (cd elastos && cargo test -p elastos-protected-content-contracts)
+(cd elastos && cargo test -p elastos-protected-content-rights -- --nocapture)
+(cd elastos && cargo test -p elastos-server protected_content_runtime -- --nocapture)
 ```
 
 Provisional retirement guard only:

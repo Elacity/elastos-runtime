@@ -1,8 +1,8 @@
 use elastos_protected_content_contracts::{
     AuthenticatedRuntimeCustodyProvisioningV1, AuthenticatedRuntimeReleaseOperationV1,
     CanonicalContract, CustodyEnvelopeManifestV1, CustodyNodeIdentityV1,
-    CustodyNodeProvisioningRecordV1, HpkeCiphertextV1, KeyEnvelopeIdentityV1, NodePublicKey,
-    NodeSetV1, RuntimeReleaseOperationError,
+    CustodyNodeProvisioningRecordV1, KeyEnvelopeIdentityV1, NodePublicKey, NodeSetV1,
+    PqHybridSealedShareV1, RuntimeReleaseOperationError,
 };
 
 use crate::{secrets::NodeCustodySecretKeyV1, CustodyError};
@@ -19,7 +19,7 @@ pub struct NodeLocalStoredShareV1 {
     key_envelope_identity: KeyEnvelopeIdentityV1,
     manifest: CustodyEnvelopeManifestV1,
     node_public_key: NodePublicKey,
-    stored_share: HpkeCiphertextV1,
+    stored_share: PqHybridSealedShareV1,
 }
 
 impl std::fmt::Debug for NodeLocalStoredShareV1 {
@@ -112,7 +112,7 @@ impl NodeLocalStoredShareV1 {
         Ok(self.manifest.node_set()?)
     }
 
-    pub fn stored_share(&self) -> &HpkeCiphertextV1 {
+    pub fn stored_share(&self) -> &PqHybridSealedShareV1 {
         &self.stored_share
     }
 
@@ -746,7 +746,6 @@ mod tests {
         let stored_share = envelope.stored_share_for_node(node_public_key(1)).unwrap();
         assert!(debug.contains("NodeLocalStoredShareV1"));
         assert!(debug.contains("[redacted]"));
-        assert!(!debug.contains(&format!("{:?}", stored_share.encapped_key())));
-        assert!(!debug.contains(&format!("{:?}", stored_share.ciphertext())));
+        assert!(!debug.contains(&format!("{:?}", stored_share.envelope())));
     }
 }

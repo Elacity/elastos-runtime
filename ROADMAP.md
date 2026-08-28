@@ -155,22 +155,80 @@ B. define source-only provider protocols and custody-node state without making
    them active product paths;
 C. add Wallet-rights, typed Chain evidence, and Runtime-owned durable
    coordination as source-only prerequisites;
-D. implement inactive Runtime provider lifecycle, registration, routing, and
-   durable reconciliation before or with a typed rights-provider adapter;
-E. implement producer minting, three-node custody provisioning, recipient
-   possession, private decrypt output, and a full inactive end-to-end proof; and
-F. only then atomically replace the provisional DTO/provider surface and prove
-   the installed mint -> buy -> open -> play path.
+D. implement inactive Runtime provider lifecycle, registration, routing, audit,
+   and exact identity-bound reconciliation
+   (`feat/protected-content-runtime-lifecycle` from rights `43a83e5b`); do not
+   continue `feat/protected-content-runtime-coordinator-v1`;
+E. PQ-hybrid share wrap, recipient possession, decrypt-session wrap, and the
+   Runtime mint journal/2-of-3 provision are on the current review tree
+   (`elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1`, X-Wing draft-06
+   confidentiality only). This remains a source-only permissioned draft; the
+   current authority signatures remain classical and are not claimed
+   quantum-safe. Full PQ authorization remains a pre-activation decision.
+   External cryptographic review is still required. The Runtime mint journal
+   separates durable 2-of-3 custody provisioning from identity-only verified
+   content availability. The private server adapter publishes the fixed
+   descriptor/init/indexed-segment directory through existing `elastos://content`,
+   reads its signed status receipt, and refetches its generic manifest/files.
+   It pins Runtime-selected provider, object, and publisher identities plus
+   exact CENC media identity, policy, replica requirement, and freshness before
+   buy/open. A separate inactive Runtime test-provider composition covers
+   mint -> availability -> buy -> open ->
+   init/segment read -> close; it is not the process-backed product proof.
+   The decrypt provider generates each operation-scoped recipient key and keeps
+   its secret private; the authenticated Profile must authorize that exact
+   public key. Separate focused tests now prove the passkey-bound Profile
+   signing adapter and Runtime release-operation assembly seams.
+   Separate lower-level Runtime lifecycle tests and decrypt-provider process
+   tests prove PQ-hybrid reconstruction, CENC media reads, close replay,
+   restart, and old-handle absence. The current process-backed inactive proof
+   now uses production rights wiring, three independently addressed
+   custody-provider processes, one protect-provider process, and the
+   decrypt-provider process, and already covers the combined wrong-object/media
+   binding and durable replay cases. The remaining ordered product gates are:
+   A. package and provision the new protect provider, three custody instances,
+      and decrypt provider through the existing component/install/supervisor
+      model, internal and inactive only;
+   B. make protect and decrypt production-callable through the existing
+      `ProviderRegistry`, and add one Runtime-owned protected-content product
+      service for mint/buy/open/read/close orchestration and journals, still
+      inactive;
+   C. wire the existing Library creator import/mint/list flow to
+      protect -> custody -> content availability with identity-only Runtime
+      state;
+   D. wire the existing Marketplace buy flow and Library open/viewer flow to
+      the existing Wallet/transaction/Chain and release/decrypt path;
+   E. land one atomic cutover commit that activates the new route and removes
+      the provisional `drm` / `rights` / `key` / old `decrypt` startup, DTO,
+      provider-resource/catalog, build/install/component/WCI/test/doc surface,
+      with no fallback or dual path; and
+   F. prove the minimum installed one-Runtime/two-principal product acceptance.
 
-The published protected-content review line now reaches
-`origin/feat/protected-content-custody-provider` (`f7cd6c3d`), which is still
-source-only and unregistered. Local descendants add Wallet-rights, a private
-Runtime coordinator, typed Chain evidence, and a typed rights evaluator; those
-remain unpublished source work. PR #15 / `feat/dkms-esp-port` is research
-evidence for threshold crypto, node-local custody, lifecycle scenarios, and UX
-shape; its public `shares[]` metadata, raw-CEK/reference operations, old DRM
-orchestration, direct TCP/IP topology, and standalone harness must not become
-the product path.
+The first honest product proof is one installed Runtime with two human
+principals. Current source pins one local Runtime device issuer; multi-Runtime
+issuer admission and cross-Runtime protected-content exchange are later
+explicit pre-public-network gates.
+
+Share wrap on this current review tree is PQ-hybrid. It is still not a product
+mint path. First minted objects must stay PQ-hybrid; do not add a classical
+journey. PR #15 / `feat/dkms-esp-port` is research evidence for
+PQ-hybrid envelope crypto, threshold tests, node-local custody, lifecycle
+scenarios, CENC/play, and UX shape. Its public `shares[]` metadata, PQ-off
+decrypt defaults, raw-CEK/reference operations, old DRM orchestration, direct
+TCP/IP topology, and standalone harness must not become the product path.
+
+The published protected-content lifecycle prefix currently reaches
+`origin/feat/protected-content-runtime-lifecycle` at `34465959`. The earlier
+published `origin/feat/protected-content-custody-provider` branch remains
+historical source-only evidence for the custody-provider introduction. Local
+`feat/protected-content-runtime-lifecycle` adds the inactive Runtime-owned
+mint/list/buy/open/release/decrypt/close source path without changing
+installed product behavior. It also adds Wallet-rights, a private Runtime
+coordinator, typed Chain evidence, and a typed rights evaluator on that source
+line. Do not continue `feat/protected-content-runtime-coordinator-v1`. Rights
+evaluation invokes existing `chain` evidence through the Runtime registry. The
+remaining-work plan is the
+[Protected-content integration plan](docs/PROTECTED_CONTENT_EXTRACTION.md).
 
 Carrier remains transport only throughout that sequence. It carries
 Runtime-selected traffic, but it does not define rights authority, custody
@@ -183,13 +241,16 @@ identities. Public metadata must not carry custody shares. `CustodyEnvelopeV1`
 remains a private ephemeral provisioning bundle; durable custody storage is one
 node-sealed share per selected custody node. The first product proof must use
 three distinct custody provider identities and state roots for a 2-of-3
-committee. Cryptographic upgrades use versioned envelopes and migration rules.
+committee. First minted objects use PQ-hybrid envelopes. Later cryptographic
+successors use versioned envelopes and migration rules; 0.7 does not mint
+classical-only objects to migrate later.
 A permissioned key service can precede a public network, but production claims
 require independent review and operational evidence.
 
 The repository now has a canonical source-only v1 review line in
-[Protected-content v1 contracts](docs/PROTECTED_CONTENT_CONTRACTS_V1.md) and
-[Protected content](docs/PROTECTED_CONTENT.md). The current installed/provider
+[Protected-content v1 contracts](docs/PROTECTED_CONTENT_CONTRACTS_V1.md),
+[Protected content](docs/PROTECTED_CONTENT.md), and
+[Protected-content integration plan](docs/PROTECTED_CONTENT_EXTRACTION.md). The current installed/provider
 path still uses the older provisional `elastos_common::protected_content` DTOs
 plus fail-closed provider stubs. The canonical source line is not product proof
 until Runtime, providers, Library, Wallet, Chain, custody, decrypt output, and

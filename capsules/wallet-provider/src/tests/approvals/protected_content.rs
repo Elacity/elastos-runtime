@@ -1,13 +1,13 @@
 use super::super::support::*;
 use super::super::*;
 use elastos_protected_content_contracts::{
-    AtomicReplayClaimer, CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIdentityV1,
-    CustodyPoolIdentityV1, Digest32, EncryptedContentIdentityV1, EvmContractAddressV1,
-    EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyEnvelopeIdentityV1, ProfileIdentityV1,
-    ProtectedContentBindingV1, RecipientKeyIdentityV1, ReplayClaimError, ReplayClaimKeyV1,
-    ReplayNonce16, RightsActionV1, RightsObservationFinalityV1, RightsPolicyBodyV1,
-    RightsSubjectSourceV1, RightsVerificationContextV1, RuntimeSessionBindingV1, ThresholdV1,
-    WalletAddress, WalletSignedRightsRequestV1,
+    AtomicReplayClaimer, ContentAccessIdV1, CustodyCommitteeAuthorizationIdentityV1,
+    CustodyEpochIdentityV1, CustodyPoolIdentityV1, Digest32, EncryptedContentIdentityV1,
+    EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyEnvelopeIdentityV1,
+    ProfileIdentityV1, ProtectedContentBindingV1, RecipientKeyIdentityV1, ReplayClaimError,
+    ReplayClaimKeyV1, ReplayNonce16, RightsActionV1, RightsObservationFinalityV1,
+    RightsPolicyBodyV1, RightsSubjectSourceV1, RightsVerificationContextV1,
+    RuntimeSessionBindingV1, ThresholdV1, WalletAddress, WalletSignedRightsRequestV1,
 };
 use elastos_wallet_contract::{
     ProtectedContentRightsSignatureResultV1, PROTECTED_CONTENT_RIGHTS_SIGNATURE_INTENT,
@@ -107,18 +107,15 @@ impl RightsRequestFixture {
         )
         .unwrap();
         let policy = RightsPolicyBodyV1::new(
-            format!(
-                "elastos-content:wallet-rights-test-{:02x}",
-                self.policy_content_seed
-            ),
-            RightsActionV1::View,
-            "view",
+            encrypted_content.clone(),
+            ContentAccessIdV1::new([self.policy_content_seed; 16]).unwrap(),
+            self.action,
             RightsSubjectSourceV1::WalletAddress,
             20,
             EvmContractAddressV1::new([0x44; 20]).unwrap(),
             EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
-            EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
-            RightsObservationFinalityV1::new(1),
+            EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+            RightsObservationFinalityV1::finalized(),
         )
         .unwrap();
         let binding = ProtectedContentBindingV1::new(

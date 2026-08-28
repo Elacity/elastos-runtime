@@ -1,5 +1,4 @@
 use ed25519_dalek::SigningKey;
-use hpke::{kem::Kem as KemTrait, Deserializable, Serializable};
 use rand09::{rngs::StdRng, RngCore as _, SeedableRng as _};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq;
@@ -7,10 +6,12 @@ use zeroize::Zeroizing;
 
 use elastos_protected_content_contracts::{
     Digest32, NodeCustodyPublicKeyV1, NodePublicKey, RecipientKeyIdentityV1,
-    CONTENT_KEY_COMMITMENT_DOMAIN_V1, CUSTODY_HPKE_SUITE_ID_V1,
+    CONTENT_KEY_COMMITMENT_DOMAIN_V1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+    PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES,
 };
 
-use crate::{hpke_helpers::HpkeKem, CustodyError, CONTENT_KEY_BYTES};
+use crate::pq_hybrid::session_public_bytes_from_secret_bytes;
+use crate::{CustodyError, CONTENT_KEY_BYTES};
 
 pub struct ContentEncryptionKeyV1(Zeroizing<[u8; CONTENT_KEY_BYTES]>);
 
@@ -67,7 +68,7 @@ impl NodeCustodySecretKeyV1 {
     }
 
     pub fn public_key(&self) -> Result<NodeCustodyPublicKeyV1, CustodyError> {
-        NodeCustodyPublicKeyV1::new(public_key_bytes_from_secret(&self.0)?).map_err(Into::into)
+        hybrid_wrap_public_key(*self.0)
     }
 
     pub fn matches_node_entry(
@@ -103,22 +104,22 @@ impl std::fmt::Debug for NodeCustodySecretKeyV1 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecipientPublicKeyV1([u8; 32]);
+pub struct RecipientPublicKeyV1([u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES]);
 
 impl RecipientPublicKeyV1 {
-    pub fn new(bytes: [u8; 32]) -> Result<Self, CustodyError> {
+    pub fn new(bytes: [u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES]) -> Result<Self, CustodyError> {
         NodeCustodyPublicKeyV1::new(bytes)
             .map(|_| Self(bytes))
             .map_err(|_| CustodyError::BindingMismatch("recipient_public_key"))
     }
 
-    pub const fn as_bytes(&self) -> &[u8; 32] {
+    pub const fn as_bytes(&self) -> &[u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES] {
         &self.0
     }
 
     pub fn identity(&self) -> Result<RecipientKeyIdentityV1, CustodyError> {
         Ok(RecipientKeyIdentityV1::new(
-            CUSTODY_HPKE_SUITE_ID_V1,
+            CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
             Digest32::new(Sha256::digest(self.0).into()),
         )?)
     }
@@ -131,8 +132,17 @@ impl RecipientSecretKeyV1 {
         Ok(Self(random_bytes()?))
     }
 
+    pub fn from_guarded_bytes(bytes: Zeroizing<[u8; 32]>) -> Result<Self, CustodyError> {
+        if bytes.ct_eq(&[0u8; 32]).into() {
+            return Err(CustodyError::BindingMismatch("recipient_secret"));
+        }
+        let value = Self(bytes);
+        value.public_key()?;
+        Ok(value)
+    }
+
     pub fn public_key(&self) -> Result<RecipientPublicKeyV1, CustodyError> {
-        RecipientPublicKeyV1::new(public_key_bytes_from_secret(&self.0)?)
+        RecipientPublicKeyV1::new(hybrid_wrap_public_key_bytes(*self.0)?)
     }
 
     pub fn identity(&self) -> Result<RecipientKeyIdentityV1, CustodyError> {
@@ -141,6 +151,10 @@ impl RecipientSecretKeyV1 {
 
     pub(crate) fn secret_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    pub(crate) fn duplicate(&self) -> Self {
+        Self(Zeroizing::new(*self.0))
     }
 
     #[cfg(test)]
@@ -155,9 +169,16 @@ impl std::fmt::Debug for RecipientSecretKeyV1 {
     }
 }
 
-fn public_key_bytes_from_secret(secret_bytes: &[u8; 32]) -> Result<[u8; 32], CustodyError> {
-    let secret = <HpkeKem as KemTrait>::PrivateKey::from_bytes(secret_bytes)?;
-    Ok(<HpkeKem as KemTrait>::sk_to_pk(&secret).to_bytes().into())
+fn hybrid_wrap_public_key_bytes(
+    seed: [u8; 32],
+) -> Result<[u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES], CustodyError> {
+    Ok(session_public_bytes_from_secret_bytes(seed))
+}
+
+fn hybrid_wrap_public_key(seed: [u8; 32]) -> Result<NodeCustodyPublicKeyV1, CustodyError> {
+    Ok(NodeCustodyPublicKeyV1::new(hybrid_wrap_public_key_bytes(
+        seed,
+    )?)?)
 }
 
 fn content_key_commitment(bytes: &[u8; CONTENT_KEY_BYTES]) -> Digest32 {
@@ -219,24 +240,27 @@ mod tests {
     }
 
     #[test]
-    fn recipient_public_key_rejects_invalid_x25519_bytes() {
-        let low_order = {
-            let mut bytes = [0u8; 32];
-            bytes[0] = 1;
-            bytes
-        };
-        let mut high_bit_alias = RecipientSecretKeyV1::from_test_bytes([0x41; 32])
-            .public_key()
-            .unwrap()
-            .0;
-        high_bit_alias[31] |= 0x80;
+    fn recipient_public_key_rejects_invalid_xwing_bytes() {
         let valid = RecipientSecretKeyV1::from_test_bytes([0x42; 32])
             .public_key()
             .unwrap()
             .0;
+        let mut low_order = valid;
+        let x25519_offset = low_order.len() - 32;
+        low_order[x25519_offset..].fill(0);
+        low_order[x25519_offset] = 1;
+        let mut high_bit_alias = RecipientSecretKeyV1::from_test_bytes([0x41; 32])
+            .public_key()
+            .unwrap()
+            .0;
+        high_bit_alias[high_bit_alias.len() - 1] |= 0x80;
+        let mut old_wire_order = [0u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES];
+        let ml_kem_len = valid.len() - 32;
+        old_wire_order[..32].copy_from_slice(&valid[ml_kem_len..]);
+        old_wire_order[32..].copy_from_slice(&valid[..ml_kem_len]);
 
         assert!(matches!(
-            RecipientPublicKeyV1::new([0; 32]),
+            RecipientPublicKeyV1::new([0u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES]),
             Err(CustodyError::BindingMismatch("recipient_public_key"))
         ));
         assert!(matches!(
@@ -245,6 +269,10 @@ mod tests {
         ));
         assert!(matches!(
             RecipientPublicKeyV1::new(high_bit_alias),
+            Err(CustodyError::BindingMismatch("recipient_public_key"))
+        ));
+        assert!(matches!(
+            RecipientPublicKeyV1::new(old_wire_order),
             Err(CustodyError::BindingMismatch("recipient_public_key"))
         ));
         assert!(RecipientPublicKeyV1::new(valid).is_ok());

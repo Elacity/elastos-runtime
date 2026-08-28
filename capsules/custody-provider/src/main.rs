@@ -1,17 +1,21 @@
 //! ElastOS protected-content custody node provider capsule.
 //!
-//! This source-only provider is intentionally unregistered in the current
-//! product. It proves the one-node custody authority path without replacing the
-//! still-active provisional key-provider route.
+//! This source-only provider may be registered by Runtime as the inactive
+//! `custody` route. It does not replace the still-active provisional
+//! key-provider product path.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, Read as _, Write};
-use std::path::{Component, Path, PathBuf};
+use std::env;
+use std::io::{self, BufRead, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use custody_provider::{
+    load_state_from_root, parse_runtime_issuer_hex, parse_state_root_from_provider_init,
+    provision_state_root, provisioning_receipt, PROVISIONING_SCHEMA_V1,
+};
 use ed25519_dalek::SigningKey;
 use elastos_protected_content_contracts::{
-    KeyReleaseError, NodePublicKey, RuntimeOperationIssuerKeyV1,
+    CanonicalContract, KeyReleaseError, NodePublicKey, RuntimeOperationIssuerKeyV1,
+    SignedRuntimeReleaseOperationV1,
 };
 use elastos_protected_content_custody::{
     CustodyError, DurableReplayClaimStoreV1, NodeCustodySecretKeyV1, NodeLocalShareStoreV1,
@@ -19,19 +23,21 @@ use elastos_protected_content_custody::{
 };
 use elastos_protected_content_provider_contracts::{
     CustodyProviderRequestOpV1, CustodyProviderRequestValidationErrorV1, CustodyProviderResponseV1,
-    ProviderFailureCodeV1, ValidatedCustodyProviderRequestV1, CUSTODY_PROVIDER_REQUEST_SCHEMA_V1,
+    ProviderFailureCodeV1, RightsProviderResponseV1, ValidatedCustodyProviderRequestV1,
+    ValidatedRightsProviderRequestV1, CUSTODY_PROVIDER_REQUEST_SCHEMA_V1,
     CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1, MAX_PROVIDER_FRAME_BYTES_V1,
+};
+use elastos_protected_content_rights::{
+    chain_rights_evidence_request, evaluate_validated_rights_with_evidence_at,
+    parse_chain_rights_evidence_data, PrivateCustodyRightsRequestV1,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use zeroize::Zeroizing;
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
 };
-const MAX_CONFIG_PATH_BYTES: usize = 4096;
-const MAX_SECRET_FILE_BYTES: usize = 128;
 const INIT_ERROR_CODE: &str = "invalid_config";
 const REQUEST_ERROR_CODE: &str = "invalid_request";
 const BACKEND_ERROR_CODE: &str = "backend_unavailable";
@@ -43,15 +49,6 @@ enum ControlRequest {
     Init { config: Value },
     Status,
     Shutdown,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProviderInitConfigV1 {
-    trusted_runtime_issuer_path: String,
-    node_custody_secret_path: String,
-    node_signing_key_path: String,
-    data_root_path: String,
 }
 
 #[derive(Serialize)]
@@ -104,6 +101,9 @@ impl CustodyProvider {
             Ok(value) => value,
             Err(_) => return (invalid_request(), false),
         };
+        if reject_runtime_envelope_fields(&value).is_err() {
+            return (invalid_request(), false);
+        }
         let op = value.get("op").and_then(Value::as_str).map(str::to_owned);
         match op.as_deref() {
             Some("init" | "status" | "shutdown") => {
@@ -118,7 +118,13 @@ impl CustodyProvider {
                 }
             }
             Some("provision_node_share" | "release_contribution") => {
-                (self.handle_custody_request(frame), false)
+                let Ok(bytes) = serde_json::to_vec(&value) else {
+                    return (invalid_request(), false);
+                };
+                (self.handle_custody_request(&bytes), false)
+            }
+            Some("prepare_evidence" | "settle_evidence") => {
+                (self.handle_private_rights_request(&value), false)
             }
             _ => (invalid_request(), false),
         }
@@ -244,6 +250,98 @@ impl CustodyProvider {
             }
         }
     }
+
+    fn handle_private_rights_request(&mut self, value: &Value) -> ProviderResponse {
+        let Some(state) = self.state.as_ref() else {
+            return ProviderResponse::error(
+                BACKEND_ERROR_CODE,
+                "custody provider is not configured",
+            );
+        };
+        let now = now_unix_seconds();
+        let frame = match serde_json::to_vec(value)
+            .ok()
+            .and_then(|bytes| PrivateCustodyRightsRequestV1::from_json_slice(&bytes).ok())
+        {
+            Some(frame) => frame,
+            None => return invalid_request(),
+        };
+        let request_bytes = match serde_json::to_vec(frame.request_json()) {
+            Ok(bytes) => bytes,
+            Err(_) => return invalid_request(),
+        };
+        let request = match ValidatedRightsProviderRequestV1::decode_and_validate_at(
+            &request_bytes,
+            state.expected_runtime_issuer,
+            now,
+        ) {
+            Ok(request) => request,
+            Err(_) => return invalid_request(),
+        };
+        if request.selected_node_public_key() != state.node_public_key {
+            return invalid_request();
+        }
+        match frame {
+            PrivateCustodyRightsRequestV1::PrepareEvidence { .. } => {
+                match chain_rights_evidence_request_from_validated_request(frame.request_json()) {
+                    Ok(chain_request) => ProviderResponse::ok(chain_request),
+                    Err(()) => invalid_request(),
+                }
+            }
+            PrivateCustodyRightsRequestV1::SettleEvidence { .. } => {
+                let evidence = match frame
+                    .chain_data()
+                    .and_then(|data| parse_chain_rights_evidence_data(data).ok())
+                {
+                    Some(evidence) => evidence,
+                    None => return invalid_request(),
+                };
+                match evaluate_validated_rights_with_evidence_at(
+                    &state.node_signing_key,
+                    &request,
+                    evidence,
+                    now,
+                ) {
+                    Ok(response) => typed_rights_response(response),
+                    Err(_) => invalid_request(),
+                }
+            }
+        }
+    }
+}
+
+enum CliCommand {
+    Serve,
+    Provision {
+        base_path: String,
+        trusted_runtime_issuer: String,
+    },
+}
+
+fn parse_cli_command() -> Result<CliCommand, ()> {
+    let mut args = env::args().skip(1);
+    let Some(command) = args.next() else {
+        return Ok(CliCommand::Serve);
+    };
+    if command != "provision" {
+        return Err(());
+    }
+    let mut base_path = None;
+    let mut trusted_runtime_issuer = None;
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--base-path" => base_path = args.next(),
+            "--trusted-runtime-issuer" => trusted_runtime_issuer = args.next(),
+            _ => return Err(()),
+        }
+    }
+    match (base_path, trusted_runtime_issuer) {
+        (Some(base_path), Some(trusted_runtime_issuer)) => Ok(CliCommand::Provision {
+            base_path,
+            trusted_runtime_issuer,
+        }),
+        _ => Err(()),
+    }
 }
 
 fn typed_response(
@@ -252,6 +350,16 @@ fn typed_response(
     let Ok(response) = result else {
         return ProviderResponse::error(BACKEND_ERROR_CODE, "custody provider response failed");
     };
+    let Ok(bytes) = response.to_json_vec() else {
+        return ProviderResponse::error(BACKEND_ERROR_CODE, "custody provider response failed");
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => ProviderResponse::ok(value),
+        Err(_) => ProviderResponse::error(BACKEND_ERROR_CODE, "custody provider response failed"),
+    }
+}
+
+fn typed_rights_response(response: RightsProviderResponseV1) -> ProviderResponse {
     let Ok(bytes) = response.to_json_vec() else {
         return ProviderResponse::error(BACKEND_ERROR_CODE, "custody provider response failed");
     };
@@ -283,220 +391,48 @@ fn control_request_has_exact_fields(value: &Value, op: &str) -> bool {
     }
 }
 
-fn load_provider_state(config: Value) -> Result<ConfiguredCustodyProvider, ()> {
-    let extra = config
-        .get("extra")
-        .filter(|value| value.is_object())
-        .ok_or(())?;
-    let parsed: ProviderInitConfigV1 = serde_json::from_value(extra.clone()).map_err(|_| ())?;
-    let expected_runtime_issuer_bytes =
-        read_hex32_file(path_from_config(&parsed.trusted_runtime_issuer_path)?)?;
-    let expected_runtime_issuer =
-        RuntimeOperationIssuerKeyV1::new(*expected_runtime_issuer_bytes).map_err(|_| ())?;
-    let node_custody_secret = NodeCustodySecretKeyV1::from_guarded_bytes(read_hex32_file(
-        path_from_config(&parsed.node_custody_secret_path)?,
-    )?)
+fn reject_runtime_envelope_fields(value: &Value) -> Result<(), ()> {
+    let object = value.as_object().ok_or(())?;
+    if object.contains_key("_runtime_invocation") || object.contains_key("_runtime_transfer") {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn chain_rights_evidence_request_from_validated_request(request: &Value) -> Result<Value, ()> {
+    let object = request.as_object().ok_or(())?;
+    if object.get("op").and_then(Value::as_str) != Some("evaluate") {
+        return Err(());
+    }
+    let signed_runtime_release_operation_bytes = object
+        .get("signed_runtime_release_operation")
+        .cloned()
+        .ok_or(())
+        .and_then(|value| serde_json::from_value::<Vec<u8>>(value).map_err(|_| ()))?;
+    let signed_runtime_release_operation = SignedRuntimeReleaseOperationV1::from_canonical_bytes(
+        &signed_runtime_release_operation_bytes,
+    )
     .map_err(|_| ())?;
-    let node_signing_seed = read_hex32_file(path_from_config(&parsed.node_signing_key_path)?)?;
-    let node_signing_key = SigningKey::from_bytes(&node_signing_seed);
-    let node_public_key =
-        NodePublicKey::new(node_signing_key.verifying_key().to_bytes()).map_err(|_| ())?;
-    let data_root = path_from_config(&parsed.data_root_path)?;
-    validate_owner_only_directory(&data_root)?;
+    chain_rights_evidence_request(&signed_runtime_release_operation).map_err(|_| ())
+}
+
+fn load_provider_state(config: Value) -> Result<ConfiguredCustodyProvider, ()> {
+    let root = parse_state_root_from_provider_init(&config).map_err(|_| ())?;
+    let loaded = load_state_from_root(&root).map_err(|_| ())?;
     Ok(ConfiguredCustodyProvider {
-        expected_runtime_issuer,
-        node_public_key,
-        share_store: NodeLocalShareStoreV1::new(node_public_key, data_root.join("node-shares")),
-        replay_store: DurableReplayClaimStoreV1::new(node_public_key, data_root.join("replay")),
-        node_signing_key,
-        node_custody_secret,
+        expected_runtime_issuer: loaded.expected_runtime_issuer,
+        node_public_key: loaded.node_public_key,
+        share_store: NodeLocalShareStoreV1::new(
+            loaded.node_public_key,
+            loaded.data_root.join("node-shares"),
+        ),
+        replay_store: DurableReplayClaimStoreV1::new(
+            loaded.node_public_key,
+            loaded.data_root.join("replay"),
+        ),
+        node_signing_key: loaded.node_signing_key,
+        node_custody_secret: loaded.node_custody_secret,
     })
-}
-
-fn path_from_config(value: &str) -> Result<PathBuf, ()> {
-    if value.is_empty()
-        || value.len() > MAX_CONFIG_PATH_BYTES
-        || value
-            .bytes()
-            .any(|byte| byte == 0 || byte.is_ascii_control())
-    {
-        return Err(());
-    }
-    let path = PathBuf::from(value);
-    validate_absolute_components(&path)?;
-    Ok(path)
-}
-
-fn validate_absolute_components(path: &Path) -> Result<(), ()> {
-    if !path.is_absolute() {
-        return Err(());
-    }
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir => current.push(component.as_os_str()),
-            Component::Normal(name) => {
-                current.push(name);
-                let metadata = fs::symlink_metadata(&current).map_err(|_| ())?;
-                if metadata.file_type().is_symlink() {
-                    return Err(());
-                }
-                validate_component_owner_and_mode(&metadata, current.parent().is_none())?;
-            }
-            Component::Prefix(_) | Component::CurDir | Component::ParentDir => return Err(()),
-        }
-    }
-    Ok(())
-}
-
-fn read_hex32_file(path: PathBuf) -> Result<Zeroizing<[u8; 32]>, ()> {
-    let metadata = fs::symlink_metadata(&path).map_err(|_| ())?;
-    validate_owner_only_file_metadata(&metadata)?;
-    let file = open_owner_only_file(&path)?;
-    let open_metadata = file.metadata().map_err(|_| ())?;
-    validate_owner_only_file_metadata(&open_metadata)?;
-    require_same_file(&metadata, &open_metadata)?;
-    if open_metadata.len() as usize > MAX_SECRET_FILE_BYTES {
-        return Err(());
-    }
-    let mut raw = Zeroizing::new(Vec::with_capacity(open_metadata.len() as usize));
-    file.take((MAX_SECRET_FILE_BYTES + 1) as u64)
-        .read_to_end(&mut raw)
-        .map_err(|_| ())?;
-    if raw.len() > MAX_SECRET_FILE_BYTES {
-        return Err(());
-    }
-    parse_hex32_bytes(&raw)
-}
-
-fn parse_hex32_bytes(raw: &[u8]) -> Result<Zeroizing<[u8; 32]>, ()> {
-    let value = std::str::from_utf8(raw)
-        .map_err(|_| ())?
-        .trim_end_matches('\n');
-    let hex = value.strip_prefix("0x").unwrap_or(value);
-    if hex.len() != 64
-        || !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(());
-    }
-    let mut out = [0u8; 32];
-    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
-        out[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
-    }
-    Ok(Zeroizing::new(out))
-}
-
-fn hex_nibble(byte: u8) -> Result<u8, ()> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        _ => Err(()),
-    }
-}
-
-fn validate_owner_only_directory(path: &Path) -> Result<(), ()> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| ())?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(());
-    }
-    validate_owner_mode_and_links(&metadata, 0o700, None)
-}
-
-fn validate_owner_only_file_metadata(metadata: &fs::Metadata) -> Result<(), ()> {
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(());
-    }
-    validate_owner_mode_and_links(metadata, 0o600, Some(1))
-}
-
-fn validate_owner_mode_and_links(
-    metadata: &fs::Metadata,
-    exact_mode: u32,
-    expected_links: Option<u64>,
-) -> Result<(), ()> {
-    #[cfg(unix)]
-    {
-        use nix::unistd::geteuid;
-        use std::os::unix::fs::MetadataExt;
-
-        if metadata.uid() != geteuid().as_raw() || metadata.mode() & 0o777 != exact_mode {
-            return Err(());
-        }
-        if let Some(expected) = expected_links {
-            if metadata.nlink() != expected {
-                return Err(());
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = exact_mode;
-        let _ = expected_links;
-    }
-    Ok(())
-}
-
-fn validate_component_owner_and_mode(
-    metadata: &fs::Metadata,
-    is_filesystem_root: bool,
-) -> Result<(), ()> {
-    #[cfg(unix)]
-    {
-        use nix::unistd::geteuid;
-        use std::os::unix::fs::MetadataExt;
-
-        if is_filesystem_root {
-            return Ok(());
-        }
-        let uid = metadata.uid();
-        if uid != geteuid().as_raw() && uid != 0 {
-            return Err(());
-        }
-        let mode = metadata.mode() & 0o7777;
-        let writable_by_others = mode & 0o022 != 0;
-        let sticky = mode & 0o1000 != 0;
-        if writable_by_others && !sticky {
-            return Err(());
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        let _ = is_filesystem_root;
-    }
-    Ok(())
-}
-
-fn require_same_file(pre: &fs::Metadata, opened: &fs::Metadata) -> Result<(), ()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        if pre.dev() != opened.dev() || pre.ino() != opened.ino() || pre.len() != opened.len() {
-            return Err(());
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        if pre.len() != opened.len() {
-            return Err(());
-        }
-    }
-    Ok(())
-}
-
-fn open_owner_only_file(path: &Path) -> Result<File, ()> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options.custom_flags(nix::libc::O_NOFOLLOW);
-    }
-    options.open(path).map_err(|_| ())
 }
 
 fn now_unix_seconds() -> u64 {
@@ -573,6 +509,23 @@ fn run_provider_loop<R: BufRead, W: Write>(
 }
 
 fn main() {
+    match parse_cli_command() {
+        Ok(CliCommand::Serve) => {}
+        Ok(CliCommand::Provision {
+            base_path,
+            trusted_runtime_issuer,
+        }) => {
+            if run_provision_command(&base_path, &trusted_runtime_issuer).is_err() {
+                eprintln!("custody-provider: provisioning failed");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Err(()) => {
+            eprintln!("custody-provider: usage: custody-provider provision --base-path <abs-root> --trusted-runtime-issuer <0x...>");
+            std::process::exit(2);
+        }
+    }
     eprintln!("custody-provider: starting v{PROVIDER_VERSION}");
     let stdin = io::stdin();
     let mut input = stdin.lock();
@@ -581,11 +534,54 @@ fn main() {
     run_provider_loop(&mut input, &mut stdout, &mut provider);
 }
 
+fn run_provision_command(base_path: &str, trusted_runtime_issuer: &str) -> Result<(), ()> {
+    let root = parse_state_root_from_provider_init(&json!({
+        "base_path": base_path,
+        "allowed_paths": [],
+        "read_only": false,
+        "encryption_key": "",
+        "extra": null,
+    }))
+    .map_err(|_| ())?;
+    let runtime_issuer = parse_runtime_issuer_hex(trusted_runtime_issuer).map_err(|_| ())?;
+    let provisioned = provision_state_root(&root, runtime_issuer).map_err(|_| ())?;
+    let receipt = provisioning_receipt(
+        runtime_issuer,
+        provisioned.node_public_key,
+        provisioned.node_custody_public_key,
+    );
+    serde_json::to_writer(
+        io::stdout(),
+        &json!({
+            "status": "ok",
+            "data": {
+                "schema": PROVISIONING_SCHEMA_V1,
+                "provider": "custody",
+                "node_public_key": format!("0x{}", hex_bytes(provisioned.node_public_key.as_bytes())),
+                "node_custody_public_key": format!("0x{}", hex_bytes(provisioned.node_custody_public_key.as_bytes())),
+                "receipt": format!("0x{}", hex_bytes(&receipt)),
+            }
+        }),
+    )
+    .map_err(|_| ())?;
+    println!();
+    Ok(())
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self};
     use std::io::Cursor;
-    use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static CONFIG_ID: AtomicUsize = AtomicUsize::new(0);
@@ -596,50 +592,26 @@ mod tests {
         temp
     }
 
-    fn write_owner_only(path: &Path, value: &str) {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true).mode(0o600);
-        let mut file = options.open(path).unwrap();
-        file.write_all(value.as_bytes()).unwrap();
-        file.sync_all().unwrap();
-    }
-
-    fn hex32(seed: u8) -> String {
-        format!(
-            "0x{}",
-            [seed; 32]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        )
+    fn runtime_issuer_hex(seed: u8) -> String {
+        let key = SigningKey::from_bytes(&[seed; 32]);
+        format!("0x{}", hex_bytes(&key.verifying_key().to_bytes()))
     }
 
     fn init_config(root: &Path) -> Value {
         let root = fs::canonicalize(root).unwrap();
         let id = CONFIG_ID.fetch_add(1, Ordering::Relaxed);
         let case = root.join(format!("case-{id}"));
-        fs::create_dir(&case).unwrap();
-        fs::set_permissions(&case, fs::Permissions::from_mode(0o700)).unwrap();
-        let data = case.join("data");
-        fs::create_dir(&data).unwrap();
-        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
-        let runtime = case.join("runtime");
-        let custody = case.join("custody");
-        let signing = case.join("signing");
-        let runtime_key = SigningKey::from_bytes(&[0x42; 32]);
-        write_owner_only(
-            &runtime,
-            &format!("0x{}", hex_bytes(&runtime_key.verifying_key().to_bytes())),
-        );
-        write_owner_only(&custody, &hex32(1));
-        write_owner_only(&signing, &hex32(1));
+        provision_state_root(
+            &case,
+            parse_runtime_issuer_hex(&runtime_issuer_hex(0x42)).unwrap(),
+        )
+        .unwrap();
         json!({
-            "extra": {
-                "trusted_runtime_issuer_path": runtime,
-                "node_custody_secret_path": custody,
-                "node_signing_key_path": signing,
-                "data_root_path": data
-            }
+            "base_path": case,
+            "allowed_paths": [],
+            "read_only": false,
+            "encryption_key": "",
+            "extra": null
         })
     }
 
@@ -715,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn init_rejects_missing_direct_unsafe_or_linked_config_inputs_and_clears_state() {
+    fn init_rejects_missing_unsafe_and_extra_config_inputs_and_clears_state() {
         let temp = temp_root();
         let mut provider = CustodyProvider::new();
         assert!(matches!(
@@ -723,7 +695,7 @@ mod tests {
             ProviderResponse::Ok { .. }
         ));
 
-        let bad = provider.init(json!({"trusted_runtime_issuer_path": "direct"}));
+        let bad = provider.init(json!({"base_path": "direct"}));
         assert!(matches!(
             bad,
             ProviderResponse::Error {
@@ -734,21 +706,20 @@ mod tests {
         assert!(provider.state.is_none());
 
         let config = init_config(temp.path());
-        let runtime = config["extra"]["trusted_runtime_issuer_path"]
-            .as_str()
-            .unwrap();
-        fs::set_permissions(runtime, fs::Permissions::from_mode(0o644)).unwrap();
+        let root = PathBuf::from(config["base_path"].as_str().unwrap());
+        fs::set_permissions(
+            root.join("node-signing-key"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
         assert!(matches!(
             provider.init(config),
             ProviderResponse::Error { .. }
         ));
 
         let config = init_config(temp.path());
-        let custody = PathBuf::from(
-            config["extra"]["node_custody_secret_path"]
-                .as_str()
-                .unwrap(),
-        );
+        let root = PathBuf::from(config["base_path"].as_str().unwrap());
+        let custody = root.join("node-custody-secret");
         fs::remove_file(&custody).unwrap();
         symlink(temp.path().join("missing"), &custody).unwrap();
         assert!(matches!(
@@ -756,10 +727,8 @@ mod tests {
             ProviderResponse::Error { .. }
         ));
 
-        let config = init_config(temp.path());
-        let signing = PathBuf::from(config["extra"]["node_signing_key_path"].as_str().unwrap());
-        let hard = temp.path().join("signing-hardlink");
-        fs::hard_link(&signing, &hard).unwrap();
+        let mut config = init_config(temp.path());
+        config["extra"] = json!({"unexpected": true});
         assert!(matches!(
             provider.init(config),
             ProviderResponse::Error { .. }
@@ -772,7 +741,7 @@ mod tests {
         let mut provider = CustodyProvider::new();
 
         let mut relative = init_config(temp.path());
-        relative["extra"]["trusted_runtime_issuer_path"] = json!("runtime");
+        relative["base_path"] = json!("runtime");
         assert!(matches!(
             provider.init(relative),
             ProviderResponse::Error {
@@ -787,17 +756,16 @@ mod tests {
         fs::set_permissions(&real_parent, fs::Permissions::from_mode(0o700)).unwrap();
         let linked_parent = safe_root.join("linked-parent");
         symlink(&real_parent, &linked_parent).unwrap();
-        let linked_runtime = linked_parent.join("runtime");
-        write_owner_only(&real_parent.join("runtime"), &hex32(0x42));
         let mut symlinked_parent = init_config(temp.path());
-        symlinked_parent["extra"]["trusted_runtime_issuer_path"] = json!(linked_runtime);
+        symlinked_parent["base_path"] = json!(linked_parent);
         assert!(matches!(
             provider.init(symlinked_parent),
             ProviderResponse::Error { .. }
         ));
 
         let symlinked_data = init_config(temp.path());
-        let data = PathBuf::from(symlinked_data["extra"]["data_root_path"].as_str().unwrap());
+        let root = PathBuf::from(symlinked_data["base_path"].as_str().unwrap());
+        let data = root.join("data");
         fs::remove_dir(&data).unwrap();
         let target = safe_root.join("actual-data-root");
         fs::create_dir(&target).unwrap();
@@ -849,5 +817,96 @@ mod tests {
             assert!(!encoded.contains("custody_envelope"));
             assert!(!encoded.contains("has_access"));
         }
+    }
+
+    fn runtime_invocation(op: &str, target: &str, carrier: Value) -> Value {
+        json!({
+            "schema": "elastos.provider.invocation/v1",
+            "source": "runtime",
+            "target": target,
+            "op": op,
+            "capability": format!("provider:runtime->{target}:{op}"),
+            "transport": "runtime-local-provider-plane",
+            "carrier": carrier,
+            "transfer": "json",
+            "range": null,
+            "progress": null,
+            "abi": {}
+        })
+    }
+
+    #[test]
+    fn status_rejects_runtime_invocation_and_transfer_envelopes() {
+        let mut provider = CustodyProvider::new();
+        for envelope in [
+            runtime_invocation("status", "key", Value::Null),
+            runtime_invocation("status", "custody", json!({"peer_did": "did:key:zX"})),
+            json!({
+                "schema": "elastos.provider.invocation/v1",
+                "source": "runtime",
+                "target": "custody",
+                "op": "status",
+                "transport": "carrier-provider-plane",
+                "carrier": Value::Null
+            }),
+        ] {
+            assert!(matches!(
+                provider.handle_line(
+                    &json!({
+                        "op": "status",
+                        "_runtime_invocation": envelope,
+                    })
+                    .to_string(),
+                ),
+                ProviderResponse::Error {
+                    code: REQUEST_ERROR_CODE,
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            provider.handle_line(
+                &json!({
+                    "op": "status",
+                    "_runtime_transfer": {
+                        "schema": "elastos.provider.transfer/v1"
+                    },
+                })
+                .to_string(),
+            ),
+            ProviderResponse::Error {
+                code: REQUEST_ERROR_CODE,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn chain_request_rejects_string_signed_runtime_release_operation() {
+        let mut request_value = json!({
+            "op": "evaluate",
+            "signed_runtime_release_operation": "0xdeadbeef",
+        });
+        request_value["signed_runtime_release_operation"] = Value::String("0xdeadbeef".to_string());
+        assert!(chain_rights_evidence_request_from_validated_request(&request_value).is_err());
+    }
+
+    #[test]
+    fn chain_request_rejects_malformed_canonical_bytes() {
+        let mut request_value = json!({
+            "op": "evaluate",
+            "signed_runtime_release_operation": [1, 2, 3],
+        });
+        request_value["signed_runtime_release_operation"] = json!([1, 2, 3]);
+        assert!(chain_rights_evidence_request_from_validated_request(&request_value).is_err());
+    }
+
+    #[test]
+    fn chain_request_rejects_wrong_op() {
+        let request_value = json!({
+            "op": "status",
+            "signed_runtime_release_operation": [1, 2, 3],
+        });
+        assert!(chain_rights_evidence_request_from_validated_request(&request_value).is_err());
     }
 }

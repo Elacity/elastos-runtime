@@ -1118,6 +1118,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
+ "getrandom 0.4.3",
  "hybrid-array",
  "rand_core 0.10.1",
 ]
@@ -1184,6 +1185,23 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "custody-provider"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "elastos-protected-content-contracts",
+ "elastos-protected-content-custody",
+ "elastos-protected-content-provider-contracts",
+ "elastos-protected-content-rights",
+ "getrandom 0.2.17",
+ "nix",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "zeroize",
 ]
 
 [[package]]
@@ -1523,7 +1541,7 @@ dependencies = [
  "ed25519-dalek 3.0.0-rc.0",
  "hpke",
  "rand 0.9.5",
- "x25519-dalek",
+ "x25519-dalek 2.0.1",
 ]
 
 [[package]]
@@ -1542,7 +1560,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "sha3",
+ "sha3 0.10.9",
 ]
 
 [[package]]
@@ -1654,10 +1672,12 @@ dependencies = [
  "elastos-identity",
  "hex",
  "k256",
+ "rand 0.10.2",
  "serde",
  "sha2 0.10.9",
- "sha3",
+ "sha3 0.10.9",
  "thiserror 1.0.69",
+ "x-wing",
 ]
 
 [[package]]
@@ -1666,21 +1686,27 @@ version = "0.6.0"
 dependencies = [
  "aes",
  "aes-gcm",
+ "ctr",
  "ed25519-dalek 2.2.0",
  "elastos-auth",
  "elastos-protected-content-contracts",
+ "elastos-protected-content-provider-contracts",
  "ghash",
+ "hkdf",
  "hpke",
  "k256",
  "nix",
  "rand 0.10.2",
  "rand 0.9.5",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
  "sha2 0.10.9",
- "sha3",
+ "sha3 0.10.9",
  "subtle",
  "tempfile",
  "thiserror 1.0.69",
  "vsss-rs",
+ "x-wing",
  "zeroize",
 ]
 
@@ -1694,7 +1720,9 @@ dependencies = [
  "k256",
  "serde",
  "serde_json",
- "sha3",
+ "sha2 0.10.9",
+ "sha3 0.10.9",
+ "x-wing",
 ]
 
 [[package]]
@@ -1705,16 +1733,20 @@ dependencies = [
  "elastos-auth",
  "elastos-protected-content-contracts",
  "elastos-protected-content-provider-contracts",
+ "hex",
  "k256",
+ "serde",
  "serde_json",
- "sha3",
+ "sha3 0.10.9",
  "thiserror 1.0.69",
+ "x-wing",
 ]
 
 [[package]]
 name = "elastos-protected-content-runtime"
 version = "0.6.0"
 dependencies = [
+ "async-trait",
  "ed25519-dalek 2.2.0",
  "elastos-auth",
  "elastos-protected-content-contracts",
@@ -1723,11 +1755,14 @@ dependencies = [
  "hex",
  "k256",
  "nix",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
- "sha3",
+ "sha3 0.10.9",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
+ "x-wing",
 ]
 
 [[package]]
@@ -1772,16 +1807,23 @@ dependencies = [
  "bs58",
  "cid",
  "clap",
+ "custody-provider",
  "data-encoding",
  "dirs",
  "distributed-topic-tracker",
  "ed25519-dalek 2.2.0",
  "ed25519-dalek 3.0.0-rc.0",
+ "elastos-auth",
  "elastos-common",
  "elastos-compute",
  "elastos-crosvm",
  "elastos-identity",
  "elastos-namespace",
+ "elastos-protected-content-contracts",
+ "elastos-protected-content-custody",
+ "elastos-protected-content-provider-contracts",
+ "elastos-protected-content-rights",
+ "elastos-protected-content-runtime",
  "elastos-runtime",
  "elastos-storage",
  "elastos-tls",
@@ -1805,7 +1847,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2 0.10.9",
- "sha3",
+ "sha3 0.10.9",
  "tar",
  "tempfile",
  "tokio",
@@ -1817,6 +1859,7 @@ dependencies = [
  "url",
  "wasm-encoder 0.236.1",
  "wasmparser 0.236.1",
+ "x-wing",
  "zip",
 ]
 
@@ -2623,7 +2666,7 @@ dependencies = [
  "rand_core 0.9.5",
  "sha2 0.10.9",
  "subtle",
- "x25519-dalek",
+ "x25519-dalek 2.0.1",
  "zeroize",
 ]
 
@@ -2684,6 +2727,7 @@ version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
 dependencies = [
+ "ctutils",
  "subtle",
  "typenum",
  "zeroize",
@@ -3352,6 +3396,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "keccak"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffd9697dc4a9a62e2da93389f34400b77a28f0287711263cabb203b3ccb9c0e4"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+]
+
+[[package]]
+name = "kem"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01737161ba802849cfd486b5bd209d38ba4943494c249a8126005170c7621edd"
+dependencies = [
+ "crypto-common 0.2.2",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3595,6 +3659,32 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ml-kem"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e15f3e5b957493873e396a66914e83e616b6afe335cdef7efe5c6e1216aba66"
+dependencies = [
+ "hybrid-array",
+ "kem",
+ "module-lattice",
+ "rand_core 0.10.1",
+ "sha3 0.11.0",
+ "zeroize",
+]
+
+[[package]]
+name = "module-lattice"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c61b87c9683ab7cb1c6871d261ad5479b6b10ceb52c4352aaca3b5d35a8febe"
+dependencies = [
+ "ctutils",
+ "hybrid-array",
+ "num-traits",
+ "zeroize",
 ]
 
 [[package]]
@@ -5258,7 +5348,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77fd7028345d415a4034cf8777cd4f8ab1851274233b45f84e3d955502d93874"
 dependencies = [
  "digest 0.10.7",
- "keccak",
+ "keccak 0.1.6",
+]
+
+[[package]]
+name = "sha3"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be176f1a57ce4e3d31c1a166222d9768de5954f811601fb7ca06fc8203905ce1"
+dependencies = [
+ "digest 0.11.3",
+ "keccak 0.2.1",
+]
+
+[[package]]
+name = "sha3"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc9bad02c26382724b2d2692c6f179285e4b54eeecd7968f52a50059c3c11759"
+dependencies = [
+ "digest 0.11.3",
+ "keccak 0.2.1",
+ "sponge-cursor",
+]
+
+[[package]]
+name = "shake"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09057cb2149ad4cbd2da1e26b351f9a4c354219421229c69c3063e6f61947c4a"
+dependencies = [
+ "digest 0.11.3",
+ "keccak 0.2.1",
+ "sponge-cursor",
 ]
 
 [[package]]
@@ -5425,6 +5547,12 @@ dependencies = [
  "base64ct",
  "der 0.8.1",
 ]
+
+[[package]]
+name = "sponge-cursor"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
 name = "stable_deref_trait"
@@ -7353,6 +7481,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "x-wing"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b51507b887016c3925c84591108dadb8c099f776eb04fec6a60ae3519fee856f"
+dependencies = [
+ "kem",
+ "ml-kem",
+ "sha3 0.12.0",
+ "shake",
+ "x25519-dalek 3.0.0",
+ "zeroize",
+]
+
+[[package]]
 name = "x25519-dalek"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7361,6 +7503,17 @@ dependencies = [
  "curve25519-dalek 4.1.3",
  "rand_core 0.6.4",
  "serde",
+ "zeroize",
+]
+
+[[package]]
+name = "x25519-dalek"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
+dependencies = [
+ "curve25519-dalek 5.0.0",
+ "rand_core 0.10.1",
  "zeroize",
 ]
 

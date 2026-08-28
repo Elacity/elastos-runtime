@@ -9,10 +9,10 @@ use elastos_protected_content_contracts::{
 };
 
 use crate::{
-    hpke_helpers::seal_share,
     node_share::NodeLocalStoredShareV1,
     replay_store::ClaimedNodeReleaseOperationV1,
     secrets::{NodeCustodySecretKeyV1, RecipientPublicKeyV1},
+    share_wrap::seal_share,
     CustodyError,
 };
 
@@ -60,7 +60,7 @@ pub(crate) fn produce_node_contribution_with_rng<R: HpkeCryptoRng + HpkeRngCore>
 ) -> Result<SignedNodeContributionV1, CustodyError> {
     operation.validate_node_share(node_share, now)?;
     if operation.recipient().encryption_suite_id()
-        != elastos_protected_content_contracts::CUSTODY_HPKE_SUITE_ID_V1
+        != elastos_protected_content_contracts::CUSTODY_X_WING_AES256GCM_SUITE_ID_V1
     {
         return Err(CustodyError::BindingMismatch(
             "recipient_encryption_suite_id",
@@ -95,7 +95,7 @@ pub(crate) fn produce_node_contribution_with_rng<R: HpkeCryptoRng + HpkeRngCore>
 
     let stored_share = node_share.stored_share();
     let stored_aad = node_share.stored_share_aad_bytes()?;
-    let plaintext_share = crate::hpke_helpers::open_share(
+    let plaintext_share = crate::share_wrap::open_share(
         stored_share,
         node_custody_secret.secret_bytes(),
         elastos_protected_content_contracts::STORED_SHARE_HPKE_INFO_V1,
@@ -140,7 +140,7 @@ mod tests {
     use rand09::{rngs::StdRng, SeedableRng as _};
 
     use super::*;
-    use crate::hpke_helpers::{open_share, seal_share};
+    use crate::share_wrap::{open_share, seal_share};
     use crate::test_support::{
         claimed_runtime_release_operation_for_envelope_and_node_seed, node_custody_secret,
         node_signing_key, provisioned_envelope, recipient_public_key, signed_node_decision,
@@ -326,13 +326,7 @@ mod tests {
         let envelope = provisioned_envelope();
         let mut stored_shares = envelope.stored_shares().to_vec();
         let index = node_share_index(&envelope, 1);
-        let mut ciphertext = *stored_shares[index].ciphertext();
-        ciphertext[0] ^= 0x55;
-        stored_shares[index] = elastos_protected_content_contracts::HpkeCiphertextV1::new(
-            *stored_shares[index].encapped_key(),
-            ciphertext,
-        )
-        .unwrap();
+        stored_shares[index] = stored_shares[index].tamper_envelope();
         let tampered = CustodyEnvelopeV1::new(envelope.manifest().clone(), stored_shares).unwrap();
         let err = produce_node_contribution_with_rng(
             &claimed_operation(&envelope, 1),
@@ -355,13 +349,7 @@ mod tests {
         let envelope = provisioned_envelope();
         let mut stored_shares = envelope.stored_shares().to_vec();
         let index = node_share_index(&envelope, 1);
-        let mut ciphertext = *stored_shares[index].ciphertext();
-        ciphertext[0] ^= 0x55;
-        stored_shares[index] = elastos_protected_content_contracts::HpkeCiphertextV1::new(
-            *stored_shares[index].encapped_key(),
-            ciphertext,
-        )
-        .unwrap();
+        stored_shares[index] = stored_shares[index].tamper_envelope();
         let tampered = CustodyEnvelopeV1::new(envelope.manifest().clone(), stored_shares).unwrap();
         let request = verified_release_request_for_envelope(&tampered);
         let err = produce_node_contribution_with_rng(
@@ -377,7 +365,7 @@ mod tests {
             &mut StdRng::from_seed([0x71; 32]),
         )
         .unwrap_err();
-        assert!(matches!(err, CustodyError::Hpke(_)));
+        assert!(matches!(err, CustodyError::PqHybrid(_)));
     }
 
     #[test]
@@ -437,7 +425,7 @@ mod tests {
             &mut StdRng::from_seed([0x71; 32]),
         )
         .unwrap_err();
-        assert!(matches!(err, CustodyError::Hpke(_)));
+        assert!(matches!(err, CustodyError::PqHybrid(_)));
     }
 
     #[test]
@@ -445,13 +433,7 @@ mod tests {
         let envelope = provisioned_envelope();
         let mut stored_shares = envelope.stored_shares().to_vec();
         let index = node_share_index(&envelope, 1);
-        let mut ciphertext = *stored_shares[index].ciphertext();
-        ciphertext[0] ^= 0x55;
-        stored_shares[index] = elastos_protected_content_contracts::HpkeCiphertextV1::new(
-            *stored_shares[index].encapped_key(),
-            ciphertext,
-        )
-        .unwrap();
+        stored_shares[index] = stored_shares[index].tamper_envelope();
         let tampered = CustodyEnvelopeV1::new(envelope.manifest().clone(), stored_shares).unwrap();
         let request = verified_release_request_for_envelope(&tampered);
         let err = produce_node_contribution_with_rng(
@@ -474,20 +456,19 @@ mod tests {
     }
 
     #[test]
-    fn release_contract_rejects_noncanonical_encapped_key_before_hpke_open() {
+    fn release_contract_rejects_noncanonical_eph_before_pq_hybrid_open() {
         let envelope = provisioned_envelope();
         let index = node_share_index(&envelope, 1);
-        let noncanonical = [
+        let share = envelope.stored_shares()[index].clone();
+        let mut tampered = share.envelope().to_vec();
+        tampered[1088..1120].copy_from_slice(&[
             0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             0xff, 0xff, 0xff, 0x7f,
-        ];
-        let err = elastos_protected_content_contracts::HpkeCiphertextV1::new(
-            noncanonical,
-            *envelope.stored_shares()[index].ciphertext(),
-        )
-        .unwrap_err();
-        assert_eq!(err, ContractError::InvalidField("hpke_encapped_key"));
+        ]);
+        let err =
+            elastos_protected_content_contracts::PqHybridSealedShareV1::new(tampered).unwrap_err();
+        assert_eq!(err, ContractError::InvalidField("pq_hybrid_eph_x25519"));
     }
 
     #[test]

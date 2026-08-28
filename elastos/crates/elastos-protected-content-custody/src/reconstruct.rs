@@ -10,9 +10,16 @@ use elastos_protected_content_contracts::{
     TerminalReceiptIssuerKey, VerifiedNodeContributionV1,
 };
 
+use hpke::rand_core::{CryptoRng, RngCore};
+
 use crate::{
-    hpke_helpers::{decode_ciphertext_bytes, open_share},
+    possession::{
+        possession_transcript_v1, require_recipient_possession,
+        wrap_content_key_to_decrypt_session, DecryptSessionPublicKeyV1,
+        DecryptSessionWrappedContentKeyV1,
+    },
     secrets::{ContentEncryptionKeyV1, RecipientSecretKeyV1},
+    share_wrap::{decode_ciphertext_bytes, open_share},
     CustodyError, CONTENT_KEY_BYTES,
 };
 
@@ -26,6 +33,12 @@ fn reconstruct_content_key(
     recipient_secret: &RecipientSecretKeyV1,
     now: u64,
 ) -> Result<ContentEncryptionKeyV1, CustodyError> {
+    let possession = require_recipient_possession(
+        recipient_secret,
+        request.binding(),
+        request.recipient(),
+        request.request_hash(),
+    )?;
     let context = ReconstructionContext {
         binding: request.binding(),
         recipient: request.recipient(),
@@ -34,7 +47,7 @@ fn reconstruct_content_key(
         contributions,
         terminal_receipt,
         expected_terminal_issuer,
-        recipient_secret,
+        recipient_secret: possession.secret(),
         now,
     };
     reconstruct_content_key_impl(
@@ -46,7 +59,7 @@ fn reconstruct_content_key(
     )
 }
 
-pub fn reconstruct_content_key_from_authenticated_operation(
+pub(crate) fn reconstruct_content_key_from_authenticated_operation(
     operation: &AuthenticatedRuntimeReleaseOperationV1,
     envelope: &CustodyEnvelopeV1,
     contributions: &[SignedNodeContributionV1],
@@ -55,6 +68,12 @@ pub fn reconstruct_content_key_from_authenticated_operation(
     recipient_secret: &RecipientSecretKeyV1,
     now: u64,
 ) -> Result<ContentEncryptionKeyV1, CustodyError> {
+    let possession = require_recipient_possession(
+        recipient_secret,
+        operation.binding(),
+        operation.recipient(),
+        operation.release_request_hash(),
+    )?;
     let context = ReconstructionContext {
         binding: operation.binding(),
         recipient: operation.recipient(),
@@ -63,7 +82,7 @@ pub fn reconstruct_content_key_from_authenticated_operation(
         contributions,
         terminal_receipt,
         expected_terminal_issuer,
-        recipient_secret,
+        recipient_secret: possession.secret(),
         now,
     };
     reconstruct_content_key_impl(
@@ -79,6 +98,45 @@ pub fn reconstruct_content_key_from_authenticated_operation(
                 now,
             )
         },
+    )
+}
+
+pub struct DecryptSessionReconstructionInputsV1<'a> {
+    pub operation: &'a AuthenticatedRuntimeReleaseOperationV1,
+    pub envelope: &'a CustodyEnvelopeV1,
+    pub contributions: &'a [SignedNodeContributionV1],
+    pub terminal_receipt: &'a SignedTerminalReceiptV1,
+    pub expected_terminal_issuer: TerminalReceiptIssuerKey,
+    pub recipient_secret: &'a RecipientSecretKeyV1,
+    pub decrypt_session_public: &'a DecryptSessionPublicKeyV1,
+    pub now: u64,
+}
+
+pub fn reconstruct_content_key_into_decrypt_session<R: CryptoRng + RngCore>(
+    inputs: &DecryptSessionReconstructionInputsV1<'_>,
+    rng: &mut R,
+) -> Result<DecryptSessionWrappedContentKeyV1, CustodyError> {
+    let content_key = reconstruct_content_key_from_authenticated_operation(
+        inputs.operation,
+        inputs.envelope,
+        inputs.contributions,
+        inputs.terminal_receipt,
+        inputs.expected_terminal_issuer,
+        inputs.recipient_secret,
+        inputs.now,
+    )?;
+    let mut wrap_transcript = possession_transcript_v1(
+        inputs.operation.binding().profile(),
+        inputs.operation.binding().runtime_session_binding(),
+        inputs.operation.recipient(),
+        inputs.operation.release_request_hash(),
+    )?;
+    wrap_transcript.extend_from_slice(inputs.decrypt_session_public.as_bytes());
+    wrap_content_key_to_decrypt_session(
+        &content_key,
+        inputs.decrypt_session_public,
+        &wrap_transcript,
+        rng,
     )
 }
 
@@ -239,16 +297,16 @@ mod tests {
     use rand10::SeedableRng as _;
 
     use elastos_protected_content_contracts::{
-        CanonicalContract, EncryptedContentIdentityV1, HpkeCiphertextV1, KeyReleaseError,
-        KeyReleaseOutcomeV1, NodeContributionRefV1, NodeContributionStatementV1,
-        RecipientSealedContributionV1, SignedNodeContributionV1, SignedTerminalReceiptV1,
-        TerminalReceiptIssuerKey, TerminalReceiptStatementV1, VerifiedKeyReleaseRequestV1,
+        CanonicalContract, EncryptedContentIdentityV1, KeyReleaseError, KeyReleaseOutcomeV1,
+        NodeContributionRefV1, NodeContributionStatementV1, RecipientSealedContributionV1,
+        SignedNodeContributionV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
+        TerminalReceiptStatementV1, VerifiedKeyReleaseRequestV1,
     };
 
     use crate::{
-        hpke_helpers::{open_share, seal_share},
         provision::provision_custody_envelope_with_rng,
         release::produce_node_contribution_with_rng,
+        share_wrap::{open_share, seal_share},
         test_support::{
             authenticated_runtime_release_operation_for_envelope_and_recipient_seed,
             claimed_runtime_release_operation_for_envelope_and_node_seed, content_key, digest,
@@ -350,9 +408,7 @@ mod tests {
                 .sealed_bytes(),
         )
         .unwrap();
-        let mut sealed = *ciphertext.ciphertext();
-        sealed[0] ^= 0x55;
-        ciphertext = HpkeCiphertextV1::new(*ciphertext.encapped_key(), sealed).unwrap();
+        ciphertext = ciphertext.tamper_envelope();
         let sealed = RecipientSealedContributionV1::new(
             request.recipient().clone(),
             ciphertext.canonical_bytes().unwrap(),
@@ -528,6 +584,62 @@ mod tests {
             recovered.with_bytes(|bytes| *bytes),
             content_key().with_bytes(|bytes| *bytes)
         );
+    }
+
+    #[test]
+    fn authenticated_operation_wraps_reconstructed_cek_to_decrypt_session() {
+        let envelope = provisioned_envelope();
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        let request = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x30);
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+        let (session_secret, session_public) =
+            crate::mint_decrypt_session_from_seed([0x51; 32]).unwrap();
+        let inputs = DecryptSessionReconstructionInputsV1 {
+            operation: &operation,
+            envelope: &envelope,
+            contributions: &contributions,
+            terminal_receipt: &terminal,
+            expected_terminal_issuer: terminal.statement().issuer(),
+            recipient_secret: &recipient_secret(0x30),
+            decrypt_session_public: &session_public,
+            now: NOW + 8,
+        };
+        let wrapped = reconstruct_content_key_into_decrypt_session(
+            &inputs,
+            &mut StdRng::from_seed([0x71; 32]),
+        )
+        .unwrap();
+        let cek = content_key().with_bytes(|bytes| *bytes);
+        let sealed_bytes = wrapped.sealed_share().canonical_bytes().unwrap();
+        assert!(!sealed_bytes.windows(cek.len()).any(|window| window == cek));
+
+        let mut wrap_transcript = crate::possession_transcript_v1(
+            operation.binding().profile(),
+            operation.binding().runtime_session_binding(),
+            operation.recipient(),
+            operation.release_request_hash(),
+        )
+        .unwrap();
+        wrap_transcript.extend_from_slice(session_public.as_bytes());
+        let opened = crate::unwrap_content_key_in_decrypt_session(
+            &session_secret,
+            &wrapped,
+            &wrap_transcript,
+        )
+        .unwrap();
+        assert_eq!(opened.with_bytes(|bytes| *bytes), cek);
     }
 
     #[test]
@@ -973,7 +1085,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, CustodyError::Hpke(_)));
+        assert!(matches!(err, CustodyError::PqHybrid(_)));
     }
 
     #[test]

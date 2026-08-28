@@ -15,12 +15,20 @@ Do not add new product surface area until the `Now` section is materially tighte
 Read this section as strict priority order for this branch. Do not start a lower
 section if a higher section is incoherent, unverified, or too large to review.
 
+Active priority index:
+
+- current source work: protected-content review correction under
+  [Trusted content and access rights](#trusted-content-and-access-rights)
+- separate remaining product proof: collaboration installed localhost and
+  public-seed gates, with no scope expansion
+- all other work remains queued below
+
 ### Collaboration candidate closeout
 
-This is the only active closeout for `codex/post-0.6-consolidation`. It is based
-on released `main` at `d358dedb` and is a candidate for the next 0.7 development
-line. Do not resume work from superseded hardening, network-profile, or
-collaboration worktrees.
+This is the remaining collaboration closeout for
+`codex/post-0.6-consolidation`. It is based on released `main` at `d358dedb`
+and is a candidate for the next 0.7 development line. Do not resume work from
+superseded hardening, network-profile, or collaboration worktrees.
 
 The source boundary is complete: a person is a signed Profile, a Runtime owns
 authority and collaboration state, Carrier transports authenticated endpoint
@@ -399,21 +407,21 @@ whose own comments describe behaviour that was never implemented.
 ### 0. Branch readiness and reviewability
 
 Branch assumptions: `main` is the released 0.6.0 line at `d358dedb`;
-`codex/post-0.6-consolidation` is the sole active local post-release
+`codex/post-0.6-consolidation` is the remaining unpublished collaboration
 integration line and remains unpublished until this checklist's verification
-and review items pass.
+and review items pass; protected-content correction on
+`feat/protected-content-runtime-lifecycle` is separate current source work.
 
 - [ ] Keep this branch reviewable: split changes into coherent commit slices with no corrective commits, no hidden migrations, and no unrelated local artifacts.
 - [ ] Keep oversized-file cleanup frozen unless branch review exposes a concrete no-behavior blocker. The existing Browser/Wallet/provider cleanup is already split into focused sibling modules: Browser gateway, Wallet gateway, Wallet UI send/receive/create/request/state/preference flows, wallet-provider EVM crypto, and wallet-provider approval test groups. Keep those seams stable and verified. Do not split `capsules/browser/browser/browser.js` further unless a diagnostic-frame/session seam is proven mechanical and behavior-free. Treat `gateway_tests/room.rs`, `gateway_room.rs`, `gateway_tests/home_system.rs`, `room_service.rs`, `auth_gateway.rs`, and `home_cmd.rs` as later cleanup unless they become direct release-review blockers. Keep `scripts/home-entropy-check.mjs` as a broad alignment gate for now, but do not let it accumulate new product logic. Each future split must be no-behavior, separately testable, and covered by the narrow Rust/JS smoke commands for that surface.
 - [ ] Review this branch in authority-bound slices, not as one Browser mega-diff: content availability/protected content providers, chain provider core, auth/recovery core, Wallet authority surface, Home/System UX, Chat/Carrier updates, capsule authority manifests, Browser ABI/adapter, Browser proof tooling, shared runtime/gateway, then release/registry/docs. Each slice must be a coherent commit with its own verification commands. Shared runtime/gateway hunks require manual hunk-level review because they cross provider boundaries. Keep `chain_provider_core` separate from Browser: typed proof, prepare, broadcast, sync health, and node lifecycle are blockchain-quadrant provider work, even when Browser consumes them through Wallet. Keep `auth_recovery_core` separate from route wiring: passkey/WebAuthn verification, proof-bound sessions, principal roots, and Recovery Kit helpers are authority primitives consumed by Home/System/Wallet gateway routes. The Wallet authority surface should be reviewed as provider authority core, Wallet app and connector capsules, then gateway/Inbox/audit wiring only after shared gateway hunks are isolated. For Home/System UX, run `node scripts/home-passkey-virtual-auth-smoke.mjs` on loopback Home to prove signed passkey journeys without a human cookie, then run the Camofox smokes for layout coverage. For Browser ABI/provider work, run the Browser Rust tests, `scripts/check-wci-alignment.sh`, `node scripts/home-entropy-check.mjs`, `node scripts/browser-display-mode-smoke.mjs`, `scripts/browser-wallet-bridge-smoke.sh`, and `scripts/browser-glide-wallet-smoke.sh`. Browser proof tooling must keep provider decision reports, objective audits, and runbooks structured and fail closed while product media/manual evidence is missing. Each slice must name its verification commands and must not claim Browser completion unless `scripts/browser-objective-audit.mjs` passes with accepted product media plus matching manual UX evidence.
-- [ ] Keep the accepted 0.6 reconciliation closed and reviewable: ESP, Wallet,
-  Recovery, Home authority, GBA, and the bounded Browser continuation are
-  reconciled in [state.md](state.md). Carrier reconciliation, the shell UI
+- [ ] Do not reopen the accepted 0.6 reconciliation except for a newly proven
+  released-line defect with a named owner and verification command. ESP,
+  Wallet, Recovery, Home authority, GBA, and the bounded Browser continuation
+  are reconciled in [state.md](state.md). Carrier reconciliation, the shell UI
   redesign, and extended AI UI work remain excluded. Before claiming
   completeness, run `git diff --check`, the Home and Browser entropy checks,
   WCI alignment, `just candidate-command-audit`, and touched-surface tests.
-  Reopen a slice only for a newly proven release-candidate defect with a named
-  owner and verification command.
 - [ ] Treat Remote Carrier Exit as part of the Carrier slice: two-runtime evidence must cite the exact source/exit runtime DIDs and endpoint evidence; the installed artifact readiness report and route-readiness report must be hash-bound; evidence for route readiness, installed artifact readiness, discovery, policy, accounting, stream transport, Browser proof, and cleanup must cite reviewed route nouns; the local Browser machine-proof artifact must cite the reviewed route target or target host; local artifacts must stay redacted, and remote paths need an explicit digest and review trail. Compose Inspector, typed Runtime authority, installed artifact readiness, route-readiness, operator evidence, Browser handoff, manual UX, performance/zoom, and clean-worktree proof before any full-goal claim.
 - [ ] Keep the verification gate green after each slice: run Rust workspace commands from `elastos/` such as `cargo fmt --all -- --check`, the narrow Rust tests for touched crates, `cargo check` for changed capsules, `git diff --check`, `scripts/check-wci-alignment.sh`, `scripts/protected-content-provider-contract-smoke.sh` only as the provisional provider retirement guard where those old capsules are touched, `node scripts/home-entropy-check.mjs` where Home UI is touched, `scripts/auth-wallet-focus-smoke.sh` after auth/wallet/chain changes, `scripts/installed-provider-verify.sh <provider>` after installed provider binary changes, and a live `/apps/home/` proof before handing browser-visible changes back for testing.
 - [ ] Do not add visible UI, protocol surface, provider behavior, or blockchain hooks unless the runtime capability path, fail-closed behavior, and docs contract are already explicit.
@@ -425,9 +433,9 @@ and review items pass.
 - [ ] Keep the Browser provider proof language explicit: Selkies is the current self-hosted baseline, not the acceptance answer. Native/browser-product proof must stay tied to `browser-native-supervisor-smoke.sh`, `browser-native-proxy-engine-smoke.sh`, `browser-native-supervisor-proxy-smoke.sh`, `browser-native-operator-config.mjs`, and `browser-native-target-preflight.sh`; Browser wallet connector effects must keep `wallet-connector-transaction-smoke.mjs` in the verification set.
 - [ ] Keep protected-content release claims exact: `scripts/browser-ela-city-protected-content-open-smoke.sh` proves that Runtime Browser can open the known `ela.city` protected-content route and cleanly release the page session, and the current branch has a funded live purchase/playback proof for the known test path. Release notes may cite that current user journey, but must not claim arbitrary protected-content readiness, production dDRM completeness, dKMS readiness, or generic decrypt/render provider completion.
 
-### 0.6.0 release-candidate preservation
-- [ ] Review execution order for preserving the accepted 0.6.0 candidate on
-  its `upstream/0.6-dev` base:
+### Released 0.6.x product-proof and follow-up debt
+- [ ] Review execution order for maintaining and rechecking released 0.6.x
+  follow-up evidence and product-proof debt against released `main`:
   1. Keep reusable source/review gates green on this branch:
      `git diff --check`, `node scripts/home-entropy-check.mjs`,
      `node scripts/browser-entropy-check.mjs`,
@@ -449,11 +457,12 @@ and review items pass.
      and close at least one app, then return Home cleanly. Source-home proof does
      not close this item.
   5. Keep source/local Carrier setup proof green with
-     `scripts/local-carrier-setup-smoke.sh` before a candidate gateway exists.
-     Candidate public install proof with the branch binary needs a staged or
-     published 0.6.0-compatible manifest with the current `home` profile and
-     checksummed artifacts; then rerun `scripts/public-install-identity-smoke.sh`
-     and `scripts/public-install-home-frontdoor-smoke.sh` with
+     `scripts/local-carrier-setup-smoke.sh` before a staged or published
+     gateway exists for branch-override install proof. Branch-override public
+     install proof with the branch binary needs a staged or published
+     0.6.0-compatible manifest with the current `home` profile and checksummed
+     artifacts; then rerun `scripts/public-install-identity-smoke.sh` and
+     `scripts/public-install-home-frontdoor-smoke.sh` with
      `ELASTOS_PUBLISHER_GATEWAY=<candidate-url>` and the branch binary override.
      After final publish, rerun both without overrides.
   6. If Browser product readiness is in scope, keep
@@ -709,125 +718,73 @@ and review items pass.
 
 ### Trusted content and access rights
 
-Protected-content work stays source-only until the complete mint -> buy -> open
--> play path is proven through Runtime. Carrier remains transport only, Home
-launch tokens remain HTTP-edge credentials, and capsules never receive CEKs,
-raw shares, provider routes, host/IP/port data, credentials, or transferable
-playback URLs.
+Current protected-content source status lives in [state.md](state.md) and
+[Protected-content integration plan](docs/PROTECTED_CONTENT_EXTRACTION.md).
+The current `feat/protected-content-runtime-lifecycle` source line proves the
+inactive Runtime-owned mint -> availability -> creator mint/list -> buy ->
+open -> 2-of-3 release -> decrypt -> close path in source, but it is not
+installed, not cut over, and not installed-product truth.
 
-Source prerequisites already present in this branch ancestry:
+- [ ] Installed prerequisites — deployed-contract and installed proof. Keep these
+  open facts exact:
 
-- Published review stack through
-  `origin/feat/protected-content-key-reconstruction` at `a8d0a9a6`: canonical
-  protected-content contracts, custody-envelope provisioning, recipient-sealed
-  node release, exact-threshold reconstruction inside the decrypt boundary,
-  commitment checking, replay-pending release authority, and fail-closed
-  tamper/expiry/wrong-binding tests.
-- Published source-only custody-provider review line at
-  `origin/feat/protected-content-custody-provider` / `f7cd6c3d`: object-bound
-  pool/epoch/committee-authorization identity, authenticated chunk payload and
-  staged decrypt-output helpers, one selected node/one sealed share per record,
-  expected Runtime issuer pinning, owner-only durable node-share storage, exact
-  duplicate/conflict/restart behavior, signed-rights-gated release, bounded
-  provider frames, strict shutdown, and no CEK/share/topology exposure. It is
-  unregistered and not installed product behavior.
-- Local source-only Wallet-rights branch at `2c69d0c2`: a dedicated Wallet
-  operation signs the exact canonical `RightsRequestV1` bytes for the selected
-  active EVM account through the existing verified Wallet invocation context;
-  generic approval cannot substitute for it.
-- Local source-only Runtime coordinator branch at `b00bfeeb`: private
-  durable Runtime release state plus typed internal coordination over existing
-  Wallet, rights, and custody provider contracts. It persists before provider
-  effects, records effect-started state, replays only exact terminal results,
-  leaves ambiguous post-dispatch outcomes nonterminal, and does not expose or
-  accept provider topology.
-- Local source-only chain-rights evidence branch at `7c747253` and rights
-  evaluator branch at `a32ae85a` (the latest code commit before this docs-only
-  planning commit): typed chain-rights evidence plus a typed rights evaluator
-  using EIP-1898-style exact block hash/number binding, live chain-id
-  verification, selector/method binding, bounded freshness, Runtime-operation
-  hash binding, redacted upstream failures, and no caller-supplied rights
-  evidence. Current planning truth lives on the `feat/protected-content-rights`
-  branch, not on a self-referential code hash.
+  - AuthorityGateway access reads use
+    `hasAccessByContentId(address holder, bytes16 contentId) -> bool`.
+  - The exact bytes16 KID is separate from `EncryptedContentIdentityV1`.
+  - `UnboundContentId(bytes16)` means unknown/unbound object, not deny.
+  - AuthorityGateway read resolution goes through
+    `CentralStorage.ipReference(bytes16)`.
+  - The exact KID-binding write operation and its authorization remain
+    unverified; do not claim `bindIP` or any binding write path is proven.
+  - Deployed `View` / `Download` contract semantics remain open.
+  - The exact `buyAccess` ABI/receipt/event and whether Runtime must issue it
+    for canonical purchase state remain open.
+  - Deployed proof still needs one known bound KID with one allowed and one
+    denied wallet against the reviewed proxy.
+  - Installed prerequisites still need one signed owner-only three-node 2-of-3
+    custody composition, private multi-source Chain config, packaged protect +
+    custody + decrypt provider registration, and an installed three-replica
+    availability plus repair-after-one-loss proof.
+  - External cryptographic review remains open.
 
-Remaining work, in strict dependency order. Review/publish hygiene still applies
-before any local source-only child branch is used as a parent, but it is not a
-product implementation stage:
+- [ ] Atomic cutover — Entry: the installed prerequisites are green while the
+  current path remains inactive. Exit: activate the Runtime-owned
+  protected-content path and remove the provisional `drm` / `rights` / `key` /
+  old `decrypt` startup, DTO, provider-resource, catalog, build, install,
+  component, WCI, test, and doc surfaces in the same commit. No fallback, no
+  dual route, no compatibility decoder, no dual write, no dual authority, and
+  no second registry/supervisor/coordinator/journal.
 
-- [ ] Implement the inactive Runtime provider lifecycle, registration, routing,
-  and durable reconciliation seam before or in the same slice as any typed
-  rights-provider process adapter. Runtime must own provider selection,
-  readiness, registration, durable journal, audit, retry, and terminal
-  settlement. It must reconcile identity-bound durable claims or operations that
-  survive a crash after provider effects but before a terminal result, require a
-  terminal receipt before retirement, and never use time, path absence, provider
-  absence, fallback, or dual authority as settlement truth. Carrier may
-  transport selected endpoint calls; capsules must not choose providers, nodes,
-  routes, endpoints, hosts, IP addresses, ports, or credentials.
-- [ ] Add the typed provider-process adapter for the rights evaluator through
-  that Runtime-owned/provider-registry seam only. It must not use direct RPC,
-  static evidence, caller-supplied evidence, fallback, or topology in
-  requests/results.
-- [ ] Implement recipient possession and decrypt-session authority: Runtime
-  derives a recipient public key from the authenticated Profile/session and
-  proves holder-only possession before the decrypt boundary reconstructs or
-  uses the CEK. The existing Profile signature authorizes one public key; it is
-  not possession proof.
-- [ ] Implement the Runtime-owned producer/mint journal/state machine for one
-  media flow only: stage ciphertext and object bytes; bind exact encrypted
-  object, key envelope, custody pool, custody epoch, committee authorization,
-  node set, threshold, CEK commitment, rights policy, viewer interface, and
-  availability requirements; record exact per-stage receipts; provision one
-  sealed share to each selected custody node; recover cleanly after restart;
-  commit availability; then list. On partial custody provisioning, Runtime must
-  record a durable terminal mint abort, never list or expose the object, and
-  retain any accepted orphan shares as unreachable by every valid release
-  operation. Later garbage collection of those orphans requires a separately
-  reviewed signed custody retirement operation with terminal receipts; that
-  operation does not exist now. Before installed acceptance, choose one explicit
-  policy: implement that exact retirement operation, or prove bounded orphan
-  retention is the accepted first-release policy. Listing must never commit
-  before ciphertext/object availability and required custody provisioning are
-  durable. The first proof must use three distinct custody-provider instances
-  for 2-of-3: three distinct node identities, three distinct owner-only state
-  roots, distinct operators/failure domains, exact duplicate/conflict/restart
-  proof, and no one-node shortcut.
-- [ ] Connect buy/open to real Wallet and Chain evidence. Wallet signs the exact
-  approved action; Chain supplies final typed rights evidence; approval and
-  broadcast use the existing durable Runtime transaction coordinator. Runtime
-  then coordinates private reconstruction/decryption and scoped viewer output.
-  Playback output must be short-lived and bound to exact principal, launch or
-  Runtime session, viewer, object identity, action, and expiry. Runtime resolves
-  object identity; docs and APIs must not specify a bearer `play_url`. Home
-  launch tokens must not become Wallet or protected-content authority.
-- [ ] Prove the full inactive Runtime product path before removing the
-  provisional path: mint -> buy -> open -> play for two principals; three
-  custody nodes; allow, deny, tamper, wrong object,
-  wrong/missing/duplicate/malicious contribution, replay, restart/crash,
-  cleanup, durable reconciliation, terminal receipts, and no
-  CEK/share/topology leakage.
-- [ ] Atomically replace the provisional `elastos_common::protected_content`,
-  `drm-provider`, `key-provider`, and provisional decrypt authority only after
-  the complete inactive replacement path is proven. Delete the superseded
-  authority surface in that cutover slice; do not keep compatibility decoders,
-  fallbacks, dual writes, dual authority, or a second journal.
-- [ ] Update the minimum UI only after the authority path is green, then prove
-  installed two-principal acceptance: Create for one media asset, Store
-  listing/detail/buy, Library open, Wallet/Home approval, and one
-  Runtime-selected viewer. Documents, Store consolidation, broad UI redesign,
-  extra formats, migration, compatibility, Iroh upgrades, deployment, and
-  release remain later work unless the first flow proves they are required.
+- [ ] Installed acceptance — one Runtime, two principals. After atomic
+  cutover, prove installed creator mint/list, buyer deny-before-purchase, real
+  Wallet approval, real Chain result, fresh availability before purchase,
+  buyer open -> 2-of-3 release -> init/segment read -> close, wrong-object
+  rejection, tampered-segment rejection, exact replay, restart/cleanup, zero
+  unresolved state, immutable creator listing bytes, and no CEK/share/
+  ciphertext/clear-media/topology/credential/bearer-URL leakage.
 
-PR #15 / `feat/dkms-esp-port` remains source evidence only: keep its mint/open
-playback behavior, threshold crypto shape, node-local custody direction,
-recipient-sealed contributions, CEK commitment, lifecycle scenarios, and
-fail-closed negative tests. Reimplement durable shard storage, DKG/rotation/
-re-share/revocation, pool/governance policy, provider roles, Runtime-open
-scenarios, and UX at the canonical boundaries above. Reject public aggregate
-`shares[]` metadata, capsule-owned authority, raw CEK operations,
-`rail_shim`/reference fallbacks, old DRM orchestration, direct TCP/IP/port
-topology in capsules or contracts, static authorization fallbacks, and the
-standalone harness as a product route.
+- [ ] Hard stop if any remaining step requires:
+  1. clear media being published before protection or sent to the content
+     provider on the protected path;
+  2. fixture fields or fixture authority in the production path;
+  3. a fake 2-of-3 made from one node or one route;
+  4. test keys or deterministic signed fixtures in production code;
+  5. changing a frozen public protected-content contract merely for routing;
+  6. exposing Carrier/topology in a capsule or public contract;
+  7. migration, fallback, dual authority, or dual write to keep the old path
+     alive;
+  8. a second provider registry, supervisor, coordinator, or journal;
+  9. route/path/host/port/credential, CEK, share, ciphertext, or clear-media
+     bytes entering Runtime or Library journals; or
+  10. proceeding without the signed custody profile or Chain contract config,
+      starting atomic cutover early, or running below 10% free disk.
+
+PR #15 keep/reject note: keep its threshold crypto, recipient-sealed
+contributions, CEK commitment, node-local custody direction, and negative-test
+research; reject public aggregated `shares[]` metadata, capsule-owned
+authority, raw CEK operations, `rail_shim`/reference fallbacks, old DRM
+orchestration, and any claim that `bindIP` or other KID-binding writes are
+already proven.
 
 ### Operator and audit hardening
 - [ ] Keep the existing SHA-256 audit chain canonical for 0.6 unless an explicit
@@ -844,7 +801,7 @@ standalone harness as a product route.
 - [ ] Re-audit `provider/registry.rs` from current source, not from the stale dead-code list that existed before the 2026-03-31 cleanup. Only remove API surface that is now proven unused on the installed path.
 - [ ] Continue the crate-by-crate orphaned-code audit with the same fail-closed rule: delete only after proving the installed path does not use it.
 
-## Later
+## Long term
 
 - [ ] Evaluate WebAuthn PRF and passkey-derived wallet keys only after passkeys are stable as runtime-session and wallet-provider approval gates.
 - [ ] Define the browser host-adapter model without faking Linux parity, using the Browser/Net/Exit ABI above so server, desktop, mobile, and kiosk hosts expose the same capability contract.

@@ -4271,7 +4271,8 @@ mod tests {
                     "last_seen_at": 1,
                     "role": null,
                     "local_session_count": 1,
-                    "is_current_session": true
+                    "is_current_session": true,
+                    "profile_verified": true
                 }],
                 "objects": [],
                 "transport": {

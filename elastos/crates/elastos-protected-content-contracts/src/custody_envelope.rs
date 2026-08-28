@@ -1,4 +1,5 @@
 use curve25519_dalek::{constants::X25519_LOW_ORDER_POINTS, montgomery::MontgomeryPoint};
+use x_wing::TryKeyInit as _;
 
 use crate::canonical::{CanonicalBody, ContractError, Decoder, Encoder};
 use crate::custody_epoch::validate_custody_node_set;
@@ -8,33 +9,61 @@ use crate::{
     NodePublicKey, NodeSetV1, ProtectedContentBindingV1, RecipientKeyIdentityV1, ThresholdV1,
 };
 
-pub const CUSTODY_HPKE_SUITE_ID_V1: &str = "hpke-rfc9180-base-x25519-hkdf-sha256-aes256gcm/v1";
+pub const CUSTODY_X_WING_AES256GCM_SUITE_ID_V1: &str =
+    "elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1";
 pub const CONTENT_KEY_COMMITMENT_DOMAIN_V1: &[u8] =
     b"elastos.protected-content.content-key-commitment/v1";
 pub const STORED_SHARE_HPKE_INFO_V1: &[u8] = b"elastos.protected-content.stored-share/v1";
 pub const RELEASED_SHARE_HPKE_INFO_V1: &[u8] = b"elastos.protected-content.released-share/v1";
-pub const HPKE_ENCAPPED_KEY_BYTES: usize = 32;
-pub const HPKE_SEALED_SHARE_BYTES: usize = 48;
+pub const PQ_HYBRID_ML_KEM_768_EK_BYTES: usize = 1184;
+pub const PQ_HYBRID_X25519_PUBLIC_KEY_BYTES: usize = 32;
+pub const PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES: usize =
+    PQ_HYBRID_ML_KEM_768_EK_BYTES + PQ_HYBRID_X25519_PUBLIC_KEY_BYTES;
+pub const X_WING_DRAFT06_CIPHERTEXT_BYTES: usize = 1120;
+pub const PQ_HYBRID_AEAD_NONCE_BYTES: usize = 12;
+pub const PQ_HYBRID_WRAPPED_SHARE_BYTES: usize = 48;
+pub const PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES: usize =
+    X_WING_DRAFT06_CIPHERTEXT_BYTES + PQ_HYBRID_AEAD_NONCE_BYTES + PQ_HYBRID_WRAPPED_SHARE_BYTES;
+pub const PQ_HYBRID_SEALED_SHARE_MIN_BYTES: usize = PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES;
+pub const PQ_HYBRID_SEALED_SHARE_MAX_BYTES: usize = PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES;
 
 const X25519_MODULUS: [u8; 32] = [
     0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
 ];
 
+pub(crate) fn validate_pq_hybrid_wrap_public_key(
+    bytes: &[u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES],
+    field: &'static str,
+) -> Result<(), ContractError> {
+    let mut x25519 = [0u8; PQ_HYBRID_X25519_PUBLIC_KEY_BYTES];
+    x25519.copy_from_slice(&bytes[PQ_HYBRID_ML_KEM_768_EK_BYTES..]);
+    validate_canonical_x25519_public_key(x25519, field)?;
+    if bytes[..PQ_HYBRID_ML_KEM_768_EK_BYTES]
+        .iter()
+        .all(|byte| *byte == 0)
+    {
+        return Err(ContractError::InvalidField(field));
+    }
+    x_wing::EncapsulationKey::new_from_slice(bytes)
+        .map_err(|_| ContractError::InvalidField(field))?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NodeCustodyPublicKeyV1([u8; 32]);
+pub struct NodeCustodyPublicKeyV1([u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES]);
 
 impl NodeCustodyPublicKeyV1 {
-    pub fn new(bytes: [u8; 32]) -> Result<Self, ContractError> {
-        validate_canonical_x25519_public_key(bytes, "node_custody_public_key")?;
+    pub fn new(bytes: [u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES]) -> Result<Self, ContractError> {
+        validate_pq_hybrid_wrap_public_key(&bytes, "node_custody_public_key")?;
         Ok(Self(bytes))
     }
 
-    pub const fn as_bytes(&self) -> &[u8; 32] {
+    pub const fn as_bytes(&self) -> &[u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES] {
         &self.0
     }
 
-    pub fn matches_public_key_bytes(&self, bytes: &[u8; 32]) -> bool {
+    pub fn matches_public_key_bytes(&self, bytes: &[u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES]) -> bool {
         &self.0 == bytes
     }
 }
@@ -296,72 +325,73 @@ impl CanonicalBody for CustodyEnvelopeManifestV1 {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct HpkeCiphertextV1 {
-    encapped_key: [u8; HPKE_ENCAPPED_KEY_BYTES],
-    ciphertext: [u8; HPKE_SEALED_SHARE_BYTES],
+pub struct PqHybridSealedShareV1 {
+    envelope: Vec<u8>,
 }
 
-impl std::fmt::Debug for HpkeCiphertextV1 {
+impl std::fmt::Debug for PqHybridSealedShareV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("HpkeCiphertextV1")
-            .field("encapped_key", &"[redacted]")
-            .field("ciphertext", &"[redacted]")
+            .debug_struct("PqHybridSealedShareV1")
+            .field("envelope", &"[redacted]")
             .finish()
     }
 }
 
-impl HpkeCiphertextV1 {
-    pub fn new(
-        encapped_key: [u8; HPKE_ENCAPPED_KEY_BYTES],
-        ciphertext: [u8; HPKE_SEALED_SHARE_BYTES],
-    ) -> Result<Self, ContractError> {
-        let value = Self {
-            encapped_key,
-            ciphertext,
-        };
+impl PqHybridSealedShareV1 {
+    pub fn new(envelope: Vec<u8>) -> Result<Self, ContractError> {
+        let value = Self { envelope };
         value.validate()?;
         Ok(value)
     }
 
-    pub const fn encapped_key(&self) -> &[u8; HPKE_ENCAPPED_KEY_BYTES] {
-        &self.encapped_key
+    pub fn envelope(&self) -> &[u8] {
+        &self.envelope
     }
 
-    pub const fn ciphertext(&self) -> &[u8; HPKE_SEALED_SHARE_BYTES] {
-        &self.ciphertext
+    pub fn tamper_envelope(&self) -> Self {
+        let mut envelope = self.envelope.clone();
+        let index = X_WING_DRAFT06_CIPHERTEXT_BYTES + PQ_HYBRID_AEAD_NONCE_BYTES;
+        envelope[index] ^= 0x55;
+        Self::new(envelope).expect("tamper keeps PQ-hybrid share structure")
     }
 }
 
-impl CanonicalBody for HpkeCiphertextV1 {
-    const DOMAIN: &'static str = "elastos.protected-content.hpke-ciphertext/v1";
+impl CanonicalBody for PqHybridSealedShareV1 {
+    const DOMAIN: &'static str = "elastos.protected-content.pq-hybrid-sealed-share/v1";
 
     fn validate(&self) -> Result<(), ContractError> {
-        validate_canonical_x25519_public_key(self.encapped_key, "hpke_encapped_key")?;
+        if self.envelope.len() != PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES {
+            return Err(ContractError::InvalidField("pq_hybrid_envelope"));
+        }
+        let eph: [u8; PQ_HYBRID_X25519_PUBLIC_KEY_BYTES] = self.envelope
+            [X_WING_DRAFT06_CIPHERTEXT_BYTES - PQ_HYBRID_X25519_PUBLIC_KEY_BYTES
+                ..X_WING_DRAFT06_CIPHERTEXT_BYTES]
+            .try_into()
+            .map_err(|_| ContractError::InvalidField("pq_hybrid_eph_x25519"))?;
+        validate_canonical_x25519_public_key(eph, "pq_hybrid_eph_x25519")?;
         Ok(())
     }
 
     fn encode_fields(&self, encoder: &mut Encoder) -> Result<(), ContractError> {
-        encoder.fixed(&self.encapped_key);
-        encoder.fixed(&self.ciphertext);
-        Ok(())
+        encoder.bytes(&self.envelope)
     }
 
     fn decode_fields(decoder: &mut Decoder<'_>) -> Result<Self, ContractError> {
-        Self::new(decoder.fixed()?, decoder.fixed()?)
+        Self::new(decoder.bytes("pq_hybrid_envelope", PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES)?)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustodyEnvelopeV1 {
     manifest: CustodyEnvelopeManifestV1,
-    stored_shares: Vec<HpkeCiphertextV1>,
+    stored_shares: Vec<PqHybridSealedShareV1>,
 }
 
 impl CustodyEnvelopeV1 {
     pub fn new(
         manifest: CustodyEnvelopeManifestV1,
-        stored_shares: Vec<HpkeCiphertextV1>,
+        stored_shares: Vec<PqHybridSealedShareV1>,
     ) -> Result<Self, ContractError> {
         let value = Self {
             manifest,
@@ -375,14 +405,14 @@ impl CustodyEnvelopeV1 {
         &self.manifest
     }
 
-    pub fn stored_shares(&self) -> &[HpkeCiphertextV1] {
+    pub fn stored_shares(&self) -> &[PqHybridSealedShareV1] {
         &self.stored_shares
     }
 
     pub fn stored_share_for_node(
         &self,
         node_public_key: NodePublicKey,
-    ) -> Option<&HpkeCiphertextV1> {
+    ) -> Option<&PqHybridSealedShareV1> {
         self.manifest
             .node_index(node_public_key)
             .map(|index| &self.stored_shares[index])
@@ -571,11 +601,16 @@ fn le_bytes_ge(lhs: [u8; 32], rhs: [u8; 32]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use curve25519_dalek::{constants::X25519_LOW_ORDER_POINTS, montgomery::MontgomeryPoint};
+    use curve25519_dalek::constants::X25519_LOW_ORDER_POINTS;
     use ed25519_dalek::SigningKey;
     use hex::encode;
+    use x_wing::TryKeyInit as _;
 
     use super::*;
+    use crate::test_support::{
+        node_custody_public_key as shared_node_custody_public_key,
+        sealed_share as shared_sealed_share, xwing_public_key_bytes,
+    };
 
     fn digest(byte: u8) -> Digest32 {
         Digest32::new([byte; 32])
@@ -587,7 +622,7 @@ mod tests {
     }
 
     fn custody_public_key(seed: u8) -> NodeCustodyPublicKeyV1 {
-        NodeCustodyPublicKeyV1::new(valid_x25519_public_key_bytes(seed)).unwrap()
+        shared_node_custody_public_key(seed)
     }
 
     fn node(seed: u8, coordinate: u8) -> CustodyNodeIdentityV1 {
@@ -634,19 +669,17 @@ mod tests {
         .unwrap()
     }
 
-    fn stored_share(seed: u8) -> HpkeCiphertextV1 {
-        let encapped_key = valid_x25519_public_key_bytes(seed.wrapping_add(0x40));
-        let mut ciphertext = [0u8; HPKE_SEALED_SHARE_BYTES];
-        ciphertext.fill(seed.wrapping_add(0x40));
-        HpkeCiphertextV1::new(encapped_key, ciphertext).unwrap()
+    fn stored_share(seed: u8) -> PqHybridSealedShareV1 {
+        shared_sealed_share(seed)
     }
 
     fn valid_x25519_public_key_bytes(seed: u8) -> [u8; 32] {
-        MontgomeryPoint::mul_base_clamped([seed; 32]).to_bytes()
+        let bytes = xwing_public_key_bytes(seed);
+        bytes[PQ_HYBRID_ML_KEM_768_EK_BYTES..].try_into().unwrap()
     }
 
     fn recipient(seed: u8) -> RecipientKeyIdentityV1 {
-        RecipientKeyIdentityV1::new(CUSTODY_HPKE_SUITE_ID_V1, digest(seed)).unwrap()
+        RecipientKeyIdentityV1::new(CUSTODY_X_WING_AES256GCM_SUITE_ID_V1, digest(seed)).unwrap()
     }
 
     #[test]
@@ -685,7 +718,7 @@ mod tests {
 
         assert_eq!(
             encode(envelope.canonical_hash().unwrap().as_bytes()),
-            "c1c630d08bb721375d8b17cf9cf7babe62a6bee1de4f572386bea626aeb8b87a"
+            "508a9c5d23d00158b1373f183cf9be9749c87f6bad6ce3436efcf8551eed19de"
         );
 
         let key_envelope = envelope.key_envelope_identity().unwrap();
@@ -759,32 +792,57 @@ mod tests {
     #[test]
     fn custody_public_key_rejects_low_order_noncanonical_and_high_bit_alias_bytes() {
         for low_order in X25519_LOW_ORDER_POINTS.iter() {
+            let mut bytes = xwing_public_key_bytes(0x41);
+            bytes[PQ_HYBRID_ML_KEM_768_EK_BYTES..].copy_from_slice(&low_order.to_bytes());
             assert_eq!(
-                NodeCustodyPublicKeyV1::new(low_order.to_bytes()),
+                NodeCustodyPublicKeyV1::new(bytes),
                 Err(ContractError::InvalidField("node_custody_public_key"))
             );
         }
+        let mut modulus = xwing_public_key_bytes(0x41);
+        modulus[PQ_HYBRID_ML_KEM_768_EK_BYTES..].copy_from_slice(&X25519_MODULUS);
         assert_eq!(
-            NodeCustodyPublicKeyV1::new(X25519_MODULUS),
+            NodeCustodyPublicKeyV1::new(modulus),
             Err(ContractError::InvalidField("node_custody_public_key"))
         );
         let mut p_plus_one = X25519_MODULUS;
         p_plus_one[0] = p_plus_one[0].wrapping_add(1);
+        let mut p_plus_one_bytes = xwing_public_key_bytes(0x41);
+        p_plus_one_bytes[PQ_HYBRID_ML_KEM_768_EK_BYTES..].copy_from_slice(&p_plus_one);
         assert_eq!(
-            NodeCustodyPublicKeyV1::new(p_plus_one),
+            NodeCustodyPublicKeyV1::new(p_plus_one_bytes),
             Err(ContractError::InvalidField("node_custody_public_key"))
         );
         let mut high_bit_alias = valid_x25519_public_key_bytes(0x51);
         high_bit_alias[31] |= 0x80;
+        let mut high_bit_alias_bytes = xwing_public_key_bytes(0x51);
+        high_bit_alias_bytes[PQ_HYBRID_ML_KEM_768_EK_BYTES..].copy_from_slice(&high_bit_alias);
         assert_eq!(
-            NodeCustodyPublicKeyV1::new(high_bit_alias),
+            NodeCustodyPublicKeyV1::new(high_bit_alias_bytes),
+            Err(ContractError::InvalidField("node_custody_public_key"))
+        );
+        let mut zero_mlkem = xwing_public_key_bytes(0x41);
+        zero_mlkem[..PQ_HYBRID_ML_KEM_768_EK_BYTES].fill(0);
+        assert_eq!(
+            NodeCustodyPublicKeyV1::new(zero_mlkem),
             Err(ContractError::InvalidField("node_custody_public_key"))
         );
     }
 
     #[test]
-    fn custody_public_key_accepts_generated_valid_bytes() {
-        assert!(NodeCustodyPublicKeyV1::new(valid_x25519_public_key_bytes(0x41)).is_ok());
+    fn custody_public_key_accepts_generated_valid_bytes_and_rejects_old_wire_order() {
+        let valid = xwing_public_key_bytes(0x41);
+        assert!(NodeCustodyPublicKeyV1::new(valid).is_ok());
+        let mut old_order = [0u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES];
+        old_order[..PQ_HYBRID_X25519_PUBLIC_KEY_BYTES]
+            .copy_from_slice(&valid[PQ_HYBRID_ML_KEM_768_EK_BYTES..]);
+        old_order[PQ_HYBRID_X25519_PUBLIC_KEY_BYTES..]
+            .copy_from_slice(&valid[..PQ_HYBRID_ML_KEM_768_EK_BYTES]);
+        assert!(x_wing::EncapsulationKey::new_from_slice(&old_order).is_err());
+        assert_eq!(
+            NodeCustodyPublicKeyV1::new(old_order),
+            Err(ContractError::InvalidField("node_custody_public_key"))
+        );
     }
 
     #[test]
@@ -797,37 +855,27 @@ mod tests {
 
         let canonical = stored_share(1).canonical_bytes().unwrap();
         assert_eq!(
-            HpkeCiphertextV1::from_canonical_bytes(&canonical[..canonical.len() - 1]),
+            PqHybridSealedShareV1::from_canonical_bytes(&canonical[..canonical.len() - 1]),
             Err(ContractError::UnexpectedEnd)
         );
     }
 
     #[test]
-    fn hpke_ciphertext_rejects_invalid_encapped_keys_at_constructor_and_decode() {
-        let ciphertext = [0x55; HPKE_SEALED_SHARE_BYTES];
+    fn pq_hybrid_sealed_share_rejects_invalid_ciphertext_component() {
+        let valid = shared_sealed_share(0x62);
+        let mut envelope = valid.envelope().to_vec();
+        envelope[X_WING_DRAFT06_CIPHERTEXT_BYTES - PQ_HYBRID_X25519_PUBLIC_KEY_BYTES
+            ..X_WING_DRAFT06_CIPHERTEXT_BYTES]
+            .copy_from_slice(&[0u8; 32]);
         assert_eq!(
-            HpkeCiphertextV1::new([0; HPKE_ENCAPPED_KEY_BYTES], ciphertext),
-            Err(ContractError::InvalidField("hpke_encapped_key"))
+            PqHybridSealedShareV1::new(envelope),
+            Err(ContractError::InvalidField("pq_hybrid_eph_x25519"))
         );
+        let mut high_bit = valid.envelope().to_vec();
+        high_bit[X_WING_DRAFT06_CIPHERTEXT_BYTES - 1] |= 0x80;
         assert_eq!(
-            HpkeCiphertextV1::new(X25519_MODULUS, ciphertext),
-            Err(ContractError::InvalidField("hpke_encapped_key"))
-        );
-        let mut high_bit_alias = valid_x25519_public_key_bytes(0x61);
-        high_bit_alias[31] |= 0x80;
-        assert_eq!(
-            HpkeCiphertextV1::new(high_bit_alias, ciphertext),
-            Err(ContractError::InvalidField("hpke_encapped_key"))
-        );
-
-        let valid = HpkeCiphertextV1::new(valid_x25519_public_key_bytes(0x62), ciphertext).unwrap();
-        let mut canonical = valid.canonical_bytes().unwrap();
-        let offset = <HpkeCiphertextV1 as CanonicalBody>::DOMAIN.len() + 1;
-        canonical[offset..offset + HPKE_ENCAPPED_KEY_BYTES]
-            .copy_from_slice(X25519_LOW_ORDER_POINTS[2].as_bytes());
-        assert_eq!(
-            HpkeCiphertextV1::from_canonical_bytes(&canonical),
-            Err(ContractError::InvalidField("hpke_encapped_key"))
+            PqHybridSealedShareV1::new(high_bit),
+            Err(ContractError::InvalidField("pq_hybrid_eph_x25519"))
         );
     }
 

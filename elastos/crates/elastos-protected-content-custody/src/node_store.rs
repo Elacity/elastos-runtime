@@ -1166,7 +1166,7 @@ mod tests {
         let debug = format!("{stored:?}");
         assert!(debug.contains("ProvisionedNodeLocalShareV1"));
         assert!(debug.contains("[redacted]"));
-        assert!(!debug.contains(&format!("{:?}", record.sealed_share().ciphertext())));
+        assert!(!debug.contains(&format!("{:?}", record.sealed_share().envelope())));
     }
 
     #[test]
@@ -1192,13 +1192,7 @@ mod tests {
         ));
 
         let mut changed_share = record.sealed_share().clone();
-        let mut ciphertext = *changed_share.ciphertext();
-        ciphertext[0] ^= 0x01;
-        changed_share = elastos_protected_content_contracts::HpkeCiphertextV1::new(
-            *changed_share.encapped_key(),
-            ciphertext,
-        )
-        .unwrap();
+        changed_share = changed_share.tamper_envelope();
         let different_record = CustodyNodeProvisioningRecordV1::new(
             record.key_envelope_identity().clone(),
             record.manifest().clone(),
@@ -1555,9 +1549,7 @@ mod tests {
         assert!(!debug.contains(temp.path().to_str().unwrap()));
         assert!(!debug.contains("node-share-store.lock"));
         assert!(!debug.contains("shares"));
-        assert!(!debug.contains(&format!("{:?}", record.sealed_share().encapped_key())));
-        assert!(!debug.contains(&format!("{:?}", record.sealed_share().ciphertext())));
-        assert!(!debug.contains("cek"));
+        assert!(!debug.contains(&format!("{:?}", record.sealed_share().envelope())));
         assert!(!debug.contains("share_bytes"));
         assert!(!NodeLocalShareStoreErrorV1::Conflict
             .to_string()

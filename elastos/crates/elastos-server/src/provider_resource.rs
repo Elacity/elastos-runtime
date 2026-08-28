@@ -279,9 +279,19 @@ fn ipfs_op_required_action(op: &str) -> Option<Action> {
 
 fn object_op_required_action(op: &str) -> Option<Action> {
     match op {
-        "roots" | "list" | "stat" | "read" | "download" | "status" | "events" => Some(Action::Read),
+        "roots"
+        | "list"
+        | "stat"
+        | "read"
+        | "download"
+        | "status"
+        | "events"
+        | "list_runtime_custody"
+        | "open_viewer"
+        | "read_viewer"
+        | "close_viewer" => Some(Action::Read),
         "write" | "mkdir" | "rename" | "move" | "copy" | "trash" | "restore" | "publish"
-        | "unpublish" | "repair" | "share" => Some(Action::Write),
+        | "unpublish" | "repair" | "share" | "buy" => Some(Action::Write),
         "delete_permanently" | "empty_trash" => Some(Action::Delete),
         _ => None,
     }
@@ -412,6 +422,11 @@ fn object_resource(op: &str) -> Result<String, String> {
             "unpublish",
             "repair",
             "share",
+            "list_runtime_custody",
+            "buy",
+            "open_viewer",
+            "read_viewer",
+            "close_viewer",
         ],
     )
 }
@@ -844,6 +859,69 @@ mod tests {
             "the active provisional rights-provider mapping is preserved until product cutover"
         );
         assert!(
+            build_capability_resource("custody", "release_contribution", &serde_json::json!({}))
+                .is_err(),
+            "inactive custody registration is Runtime-internal until product cutover"
+        );
+        assert!(
+            build_capability_resource("custody", "status", &serde_json::json!({})).is_err(),
+            "inactive custody registration is Runtime-internal until product cutover"
+        );
+        assert!(
+            build_capability_resource("protect", "open_protection_session", &serde_json::json!({}))
+                .is_err(),
+            "protect registration is Runtime-internal until product cutover"
+        );
+        assert!(
+            build_capability_resource("protect", "status", &serde_json::json!({})).is_err(),
+            "protect registration is Runtime-internal until product cutover"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "resolve_protected_content_creator_mint",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content creator mint resolution must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "resolve_protected_content_mint_receipt",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content mint receipt bind must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "resolve_protected_content_verified_listing",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content verified listing resolution must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "resolve_protected_content_purchase",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content purchase assembly must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "resolve_protected_content_purchase_access",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content purchase access corroboration must stay Runtime-internal"
+        );
+        assert!(
             build_capability_resource(
                 "chain",
                 "protected_content_rights_evidence",
@@ -851,6 +929,15 @@ mod tests {
             )
             .is_err(),
             "protected-content rights evidence must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "resolve_protected_content_policy",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content policy resolution must stay Runtime-internal"
         );
         assert!(
             build_capability_resource(

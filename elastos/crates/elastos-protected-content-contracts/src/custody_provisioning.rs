@@ -5,8 +5,8 @@ use thiserror::Error;
 use crate::canonical::{CanonicalBody, ContractError, Decoder, Encoder};
 use crate::rights::{validate_time_window, RIGHTS_CLOCK_SKEW_SECS};
 use crate::{
-    CanonicalContract, CustodyEnvelopeManifestV1, Digest32, HpkeCiphertextV1,
-    KeyEnvelopeIdentityV1, NodePublicKey, NodeSetV1, RuntimeOperationIssuerKeyV1, ThresholdV1,
+    CanonicalContract, CustodyEnvelopeManifestV1, Digest32, KeyEnvelopeIdentityV1, NodePublicKey,
+    NodeSetV1, PqHybridSealedShareV1, RuntimeOperationIssuerKeyV1, ThresholdV1,
 };
 
 pub const MAX_RUNTIME_CUSTODY_PROVISIONING_LIFETIME_SECS: u64 = 60;
@@ -108,7 +108,7 @@ pub struct CustodyNodeProvisioningRecordV1 {
     key_envelope_identity: KeyEnvelopeIdentityV1,
     manifest: CustodyEnvelopeManifestV1,
     selected_node_public_key: NodePublicKey,
-    sealed_share: HpkeCiphertextV1,
+    sealed_share: PqHybridSealedShareV1,
 }
 
 impl CustodyNodeProvisioningRecordV1 {
@@ -116,7 +116,7 @@ impl CustodyNodeProvisioningRecordV1 {
         key_envelope_identity: KeyEnvelopeIdentityV1,
         manifest: CustodyEnvelopeManifestV1,
         selected_node_public_key: NodePublicKey,
-        sealed_share: HpkeCiphertextV1,
+        sealed_share: PqHybridSealedShareV1,
     ) -> Result<Self, ContractError> {
         let value = Self {
             key_envelope_identity,
@@ -140,7 +140,7 @@ impl CustodyNodeProvisioningRecordV1 {
         self.selected_node_public_key
     }
 
-    pub fn sealed_share(&self) -> &HpkeCiphertextV1 {
+    pub fn sealed_share(&self) -> &PqHybridSealedShareV1 {
         &self.sealed_share
     }
 
@@ -458,7 +458,7 @@ mod tests {
     use crate::{
         CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIdentityV1, CustodyNodeIdentityV1,
         CustodyPoolIdentityV1, EncryptedContentIdentityV1, NodeCustodyPublicKeyV1,
-        ShareCoordinateV1, HPKE_ENCAPPED_KEY_BYTES, HPKE_SEALED_SHARE_BYTES,
+        ShareCoordinateV1,
     };
 
     fn digest(byte: u8) -> Digest32 {
@@ -478,7 +478,7 @@ mod tests {
     }
 
     fn custody_public_key(seed: u8) -> NodeCustodyPublicKeyV1 {
-        NodeCustodyPublicKeyV1::new([seed; 32]).unwrap()
+        crate::test_support::node_custody_public_key(seed)
     }
 
     fn encrypted_content(seed: u8) -> EncryptedContentIdentityV1 {
@@ -565,10 +565,8 @@ mod tests {
         .unwrap()
     }
 
-    fn sealed_share(seed: u8) -> HpkeCiphertextV1 {
-        let mut encapped = [seed; HPKE_ENCAPPED_KEY_BYTES];
-        encapped[0] = 9;
-        HpkeCiphertextV1::new(encapped, [seed ^ 0x55; HPKE_SEALED_SHARE_BYTES]).unwrap()
+    fn sealed_share(seed: u8) -> PqHybridSealedShareV1 {
+        crate::test_support::sealed_share(seed)
     }
 
     fn record() -> CustodyNodeProvisioningRecordV1 {
@@ -618,9 +616,9 @@ mod tests {
         assert_eq!(decoded, record);
         assert_eq!(
             hex::encode(record.record_identity().unwrap().record_sha256().as_bytes()),
-            "31f8d2a51bb3e2f1dbaa2e12c51d97eb1086a056ae5e12aa4244dc909a54e64e"
+            "4f26eeabb842e3c407f428b6b0e6fdcc5c1f7c88b401a08d6c44d8bbb30ef673"
         );
-        assert_eq!(record.record_identity().unwrap().record_bytes(), 1533);
+        assert_eq!(record.record_identity().unwrap().record_bytes(), 6194);
         assert_eq!(decoded.selected_node_public_key(), node_public_key(1));
         assert_eq!(
             decoded.node_set().unwrap().threshold(),
@@ -648,11 +646,11 @@ mod tests {
         assert_eq!(authenticated.provisioning_id(), provisioning_id());
         assert_eq!(
             hex::encode(signed.runtime_signature),
-            "2d458f1ec4c5d1a533680ff87a7459f79ee1e5db1f824a8ab8264c0f4d705da928a7b781d6f34a72e381854e1f6e086ec98f9160b53ea44af9296ab15ff13a0d"
+            "5a0d032522f63a29335db80350f62135934898e3f4cd3c1c1024023de5aa7ff3a9fef3a60d847f33d8135a3f378a1e101c2e5d0b130db2a6c663b21d49fa7808"
         );
         assert_eq!(
             hex::encode(authenticated.operation_hash().as_bytes()),
-            "74951bb7515c63704a1514b2f17175d37a56ce5192c90d87225d60cfe597948a"
+            "6a799b54e9ff73c4f6948e97c2c9c854fc3417c774255104456215d73ed75ab0"
         );
     }
 

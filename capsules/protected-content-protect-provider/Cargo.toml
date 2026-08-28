@@ -1,0 +1,28 @@
+[package]
+name = "protected-content-protect-provider"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS protected-content protect provider capsule"
+license = "MIT"
+
+[[bin]]
+name = "protected-content-protect-provider"
+path = "src/main.rs"
+
+[dependencies]
+elastos-protected-content-contracts = { path = "../../elastos/crates/elastos-protected-content-contracts" }
+elastos-protected-content-custody = { path = "../../elastos/crates/elastos-protected-content-custody" }
+elastos-protected-content-provider-contracts = { path = "../../elastos/crates/elastos-protected-content-provider-contracts" }
+getrandom = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+
+[dev-dependencies]
+ed25519-dalek = "2.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

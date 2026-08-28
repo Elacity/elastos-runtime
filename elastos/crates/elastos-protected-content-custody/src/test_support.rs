@@ -8,7 +8,7 @@ use sha3::Keccak256;
 use elastos_auth::ethereum_signed_message_hash;
 use elastos_protected_content_contracts::{
     AtomicReplayClaimer, AuthenticatedRuntimeReleaseOperationV1, CanonicalContract,
-    CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
+    ContentAccessIdV1, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
     CustodyCommitteeAuthorizationStatementV1, CustodyEnvelopeV1, CustodyEpochIdentityV1,
     CustodyEpochIssuerKeyV1, CustodyEpochStatementV1, CustodyPoolFailureDomainIdV1,
     CustodyPoolIdentityV1, CustodyPoolMemberStateV1, CustodyPoolMemberV1, CustodyPoolOperatorIdV1,
@@ -23,7 +23,7 @@ use elastos_protected_content_contracts::{
     SignedCustodyPoolV1, SignedNodeRightsDecisionV1, SignedRecipientKeyAuthorizationV1,
     SignedRuntimeReleaseOperationV1, ThresholdV1, ValidatedCustodyCommitteeV1,
     VerifiedKeyReleaseRequestV1, WalletAddress, WalletSignedRightsRequestV1,
-    CUSTODY_HPKE_SUITE_ID_V1,
+    CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
 };
 
 use crate::{
@@ -82,7 +82,7 @@ fn recipient_identity_with_suite(seed: u8, suite: &str) -> RecipientKeyIdentityV
     RecipientKeyIdentityV1::new(suite, digest_key(key.as_bytes())).unwrap()
 }
 
-fn digest_key(bytes: &[u8; 32]) -> Digest32 {
+fn digest_key(bytes: &[u8]) -> Digest32 {
     Digest32::new(sha2::Sha256::digest(bytes).into())
 }
 
@@ -112,9 +112,9 @@ pub(crate) fn signed_custody_epoch() -> SignedCustodyEpochV1 {
     let statement = CustodyEpochStatementV1::new(
         CustodyEpochIssuerKeyV1::new(issuer_key.verifying_key().to_bytes()).unwrap(),
         CustodyApprovedSuitesV1::new(
-            CUSTODY_HPKE_SUITE_ID_V1,
-            CUSTODY_HPKE_SUITE_ID_V1,
-            CUSTODY_HPKE_SUITE_ID_V1,
+            CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+            CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+            CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
         )
         .unwrap(),
         ThresholdV1::new(2, 3).unwrap(),
@@ -165,9 +165,9 @@ fn custody_pool_member(
         CustodyPoolOperatorIdV1::new([0x80 + node_seed; 32]),
         CustodyPoolFailureDomainIdV1::new([0x90 + node_seed; 32]),
         CustodyApprovedSuitesV1::new(
-            CUSTODY_HPKE_SUITE_ID_V1,
-            CUSTODY_HPKE_SUITE_ID_V1,
-            CUSTODY_HPKE_SUITE_ID_V1,
+            CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+            CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+            CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
         )
         .unwrap(),
         active_window,
@@ -286,15 +286,15 @@ fn binding_for_wallet_with_envelope(
 
 fn policy_body() -> RightsPolicyBodyV1 {
     RightsPolicyBodyV1::new(
-        "content:alpha",
+        EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
+        ContentAccessIdV1::new([0x41; 16]).unwrap(),
         RightsActionV1::View,
-        "view",
         RightsSubjectSourceV1::WalletAddress,
         11155111,
         EvmContractAddressV1::new([0x11; 20]).unwrap(),
         EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
-        EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
-        RightsObservationFinalityV1::new(12),
+        EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+        RightsObservationFinalityV1::finalized(),
     )
     .unwrap()
 }
@@ -302,7 +302,7 @@ fn policy_body() -> RightsPolicyBodyV1 {
 pub(crate) fn verified_release_request() -> VerifiedKeyReleaseRequestV1 {
     verified_release_request_for_envelope_with_suite_and_recipient_seed(
         &provisioned_envelope(),
-        CUSTODY_HPKE_SUITE_ID_V1,
+        CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
         0x30,
     )
 }
@@ -312,7 +312,7 @@ pub(crate) fn verified_release_request_for_envelope(
 ) -> VerifiedKeyReleaseRequestV1 {
     verified_release_request_for_envelope_with_suite_and_recipient_seed(
         envelope,
-        CUSTODY_HPKE_SUITE_ID_V1,
+        CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
         0x30,
     )
 }
@@ -323,7 +323,7 @@ pub(crate) fn verified_release_request_for_envelope_and_recipient_seed(
 ) -> VerifiedKeyReleaseRequestV1 {
     verified_release_request_for_envelope_with_suite_and_recipient_seed(
         envelope,
-        CUSTODY_HPKE_SUITE_ID_V1,
+        CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
         recipient_seed,
     )
 }
@@ -394,7 +394,7 @@ pub(crate) fn authenticated_runtime_release_operation_for_envelope_and_recipient
     let recipient_public_key_bytes =
         RecipientPublicKeyBytesV1::new(*recipient_public_key.as_bytes()).unwrap();
     let rights_request = signed_rights_request_with_suite_for_envelope(
-        CUSTODY_HPKE_SUITE_ID_V1,
+        CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
         envelope,
         recipient_seed,
     );

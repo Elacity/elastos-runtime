@@ -5277,6 +5277,10 @@ async fn test_browser_pending_cleanup_rejects_foreign_authority_and_effect_subst
 
     let foreign_provider_close_calls = Arc::new(TokioMutex::new(Vec::new()));
     registry
+        .unregister_sub_provider("browser-engine")
+        .await
+        .unwrap();
+    registry
         .register_sub_provider(
             "browser-engine",
             Arc::new(MockForeignIdentityBrowserEngineProvider {
@@ -5307,6 +5311,10 @@ async fn test_browser_pending_cleanup_rejects_foreign_authority_and_effect_subst
     assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 1);
 
     let restored_close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    registry
+        .unregister_sub_provider("browser-engine")
+        .await
+        .unwrap();
     registry
         .register_sub_provider(
             "browser-engine",
