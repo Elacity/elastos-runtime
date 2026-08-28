@@ -33,7 +33,7 @@ use elastos_protected_content_runtime::{
 use elastos_runtime::provider::{
     bridge::ProviderConfig, CapsuleProvider, Provider, ProviderBridge, ProviderCarrierInvoker,
     ProviderCarrierRoute, ProviderError, ProviderInvocation, ProviderInvocationTransport,
-    ProviderRegistry, ResourceRequest, ResourceResponse,
+    ProviderRegistry, ProviderTransfer, ResourceRequest, ResourceResponse,
 };
 use elastos_wallet_contract::{
     ProtectedContentRightsSignatureResultV1, ValidatedChainOutcomeBindingV1,
@@ -54,17 +54,19 @@ use super::{
     prepare_runtime_custody_library_source, publish_runtime_custody_library_object,
     publish_runtime_custody_library_source, register_inactive_custody_provider,
     register_inactive_custody_sub_provider, register_protect_provider,
-    resolve_runtime_rights_policy, runtime_mint_journal, runtime_protected_content_id,
-    runtime_purchase_path, source_media_digest, unresolved_release_audit_records,
-    write_owner_only_bytes, InactiveCustodyProvider, RuntimeCustodyComposition,
-    RuntimeCustodyCompositionConfigFile, RuntimeCustodyLibraryPublishInput,
-    RuntimeCustodyLibrarySourceInput, RuntimeCustodyPurchaseAccessEvidenceRecord,
-    RuntimeCustodyPurchaseProgress, RuntimeCustodyPurchaseRecord,
-    RuntimeCustodyPurchaseStageRecord, RuntimeCustodyRegistryAdapter,
+    register_protected_content_decrypt_provider, resolve_runtime_rights_policy,
+    runtime_mint_journal, runtime_protected_content_id, runtime_purchase_path, source_media_digest,
+    unresolved_release_audit_records, write_owner_only_bytes, InactiveCustodyProvider,
+    RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile,
+    RuntimeCustodyLibraryPublishInput, RuntimeCustodyLibrarySourceInput,
+    RuntimeCustodyPurchaseAccessEvidenceRecord, RuntimeCustodyPurchaseProgress,
+    RuntimeCustodyPurchaseRecord, RuntimeCustodyPurchaseStageRecord, RuntimeCustodyRegistryAdapter,
     RuntimeCustodyRouteBindingConfig, RuntimeCustodyRouteTransportConfig,
     RuntimeCustodyTerminalPurchaseRecord, RuntimeDecryptRegistryAdapter,
     RuntimeLibraryMediaPreparation, CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1,
-    CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID, MEDIA_PROVIDER_ID, PROTECT_PROVIDER_ID,
+    CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID, MEDIA_PROVIDER_ID,
+    PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS,
+    PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION, PROTECT_PROVIDER_ID,
     RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE, RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE,
     RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE,
     RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE, RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE,
@@ -104,6 +106,7 @@ use elastos_protected_content_provider_contracts::{
     RightsProviderResponseV1, ValidatedClearFmp4MediaSessionLayoutV1,
     ValidatedCustodyProviderRequestV1, ValidatedDecryptProviderRequestV1,
     ValidatedRightsProviderRequestV1, ViewerMediaPartSelectorV1,
+    DECRYPT_PROVIDER_REQUEST_SCHEMA_V1, DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1,
     MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
 };
 
@@ -3106,7 +3109,10 @@ fn assert_exact_runtime_decrypt_invocation(
         recorded["_runtime_invocation"]["source"],
         RUNTIME_PROVIDER_ID
     );
-    assert_eq!(recorded["_runtime_invocation"]["target"], "decrypt");
+    assert_eq!(
+        recorded["_runtime_invocation"]["target"],
+        PROTECTED_CONTENT_DECRYPT_PROVIDER_ID
+    );
     assert_eq!(
         recorded["_runtime_invocation"]["transport"],
         "runtime-local-provider-plane"
@@ -3636,6 +3642,43 @@ fn write_mock_custody_provider(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
         "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" >> '{}'\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{}'\n  case \"$line\" in\n    *'\"op\":\"shutdown\"'*) printf '%s\\n' '{{\"status\":\"ok\"}}'; exit 0 ;;\n    *'\"unexpected\"'* ) printf '%s\\n' '{{\"status\":\"error\",\"code\":\"invalid_request\"}}' ;;\n    *'\"op\":\"status\"'*) printf '%s\\n' '{{\"status\":\"ok\",\"data\":{{\"provider\":\"custody\",\"version\":\"test-version\",\"configured\":true,\"supported_operations\":[\"status\",\"provision_node_share\",\"release_contribution\",\"shutdown\"],\"request_schema\":\"req-schema\",\"response_schema\":\"resp-schema\"}}}}' ;;\n    *'\"op\":\"release_contribution\"'*) printf '%s\\n' '{{\"status\":\"ok\",\"data\":{{\"echo\":\"custody\"}}}}' ;;\n    *) printf '%s\\n' '{{\"status\":\"ok\",\"data\":{{\"echo\":\"init\"}}}}' ;;\n  esac\ndone\n",
         pid_file.display(),
         request_log.display()
+    );
+    fs::write(&binary, script).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    (binary, pid_file, request_log)
+}
+
+#[cfg(unix)]
+fn protected_content_decrypt_provider_status() -> Value {
+    json!({
+        "status": "ok",
+        "data": {
+            "provider": PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+            "version": PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION,
+            "configured": true,
+            "supported_operations": PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS,
+            "request_schema": DECRYPT_PROVIDER_REQUEST_SCHEMA_V1,
+            "response_schema": DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1,
+        }
+    })
+}
+
+#[cfg(unix)]
+fn write_mock_protected_content_decrypt_provider(
+    root: &Path,
+    expected_issuer: RuntimeOperationIssuerKeyV1,
+    status: &Value,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let binary = root.join("mock-protected-content-decrypt-provider.sh");
+    let request_log = root.join("mock-protected-content-decrypt-provider.requests");
+    let pid_file = root.join("mock-protected-content-decrypt-provider.pid");
+    let expected_issuer = format!("0x{}", hex::encode(expected_issuer.as_bytes()));
+    let script = format!(
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" >> '{}'\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{}'\n  case \"$line\" in\n    *'\"op\":\"shutdown\"'*) printf '%s\\n' '{{\"status\":\"ok\"}}'; exit 0 ;;\n    *'\"op\":\"init\"'*)\n      case \"$line\" in\n        *'\"trusted_runtime_issuer\":\"{}\"'*) printf '%s\\n' '{{\"status\":\"ok\"}}' ;;\n        *) printf '%s\\n' '{{\"status\":\"error\",\"code\":\"invalid_config\",\"message\":\"wrong issuer\"}}' ;;\n      esac ;;\n    *'\"op\":\"status\"'*) printf '%s\\n' '{}' ;;\n    *) printf '%s\\n' '{{\"status\":\"error\",\"code\":\"unexpected\",\"message\":\"unexpected\"}}' ;;\n  esac\ndone\n",
+        pid_file.display(),
+        request_log.display(),
+        expected_issuer,
+        status,
     );
     fs::write(&binary, script).unwrap();
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
@@ -5848,25 +5891,13 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     assert_eq!(preliminary_buy.action(), RightsActionV1::View);
 
     let decrypt_registry = Arc::new(ProviderRegistry::new());
-    let decrypt_bridge = ProviderBridge::spawn(
+    register_protected_content_decrypt_provider(
+        &decrypt_registry,
         &decrypt_binary,
-        ProviderConfig {
-            extra: json!({
-                "trusted_runtime_issuer": runtime_issuer_hex(0x21),
-            }),
-            ..Default::default()
-        },
+        runtime_operation_issuer_for_seed(0x21),
     )
     .await
     .unwrap();
-    let decrypt_provider: Arc<dyn Provider> = Arc::new(CapsuleProvider::with_scheme(
-        Arc::new(decrypt_bridge),
-        "decrypt",
-    ));
-    decrypt_registry
-        .register_sub_provider("decrypt", decrypt_provider)
-        .await
-        .unwrap();
     let decrypt = RuntimeDecryptRegistryAdapter::new(decrypt_registry.clone());
 
     let audit_a = RuntimeReleaseAuditIdV1::new(digest(0xa1)).unwrap();
@@ -6183,7 +6214,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     assert!(!any_file_contains(&runtime_data_dir, &clear_segments[0]));
 
     decrypt_registry
-        .unregister_sub_provider("decrypt")
+        .unregister_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID)
         .await
         .unwrap();
     let mut schemes = decrypt_registry.sub_provider_schemes().await;
@@ -6335,6 +6366,149 @@ async fn inactive_custody_duplicate_registration_rejects_and_settles_rejected_ch
         .unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn protected_content_decrypt_startup_rejects_invalid_status_and_settles_child() {
+    let issuer = runtime_operation_issuer_for_seed(0x41);
+    let mut cases = Vec::new();
+    let mut wrong_identity = protected_content_decrypt_provider_status();
+    wrong_identity["data"]["provider"] = json!("decrypt");
+    cases.push(("identity", wrong_identity));
+    let mut wrong_request_schema = protected_content_decrypt_provider_status();
+    wrong_request_schema["data"]["request_schema"] = json!("wrong-request-schema");
+    cases.push(("request-schema", wrong_request_schema));
+    let mut wrong_response_schema = protected_content_decrypt_provider_status();
+    wrong_response_schema["data"]["response_schema"] = json!("wrong-response-schema");
+    cases.push(("response-schema", wrong_response_schema));
+    let mut wrong_version = protected_content_decrypt_provider_status();
+    wrong_version["data"]["version"] = json!("wrong-version");
+    cases.push(("version", wrong_version));
+    let mut unconfigured = protected_content_decrypt_provider_status();
+    unconfigured["data"]["configured"] = json!(false);
+    cases.push(("configured", unconfigured));
+    let mut wrong_operations = protected_content_decrypt_provider_status();
+    wrong_operations["data"]["supported_operations"] = json!(["status", "shutdown"]);
+    cases.push(("operations", wrong_operations));
+    let mut extra_data = protected_content_decrypt_provider_status();
+    extra_data["data"]["route"] = json!("private");
+    cases.push(("extra-data", extra_data));
+    let mut extra_top = protected_content_decrypt_provider_status();
+    extra_top["route"] = json!("private");
+    cases.push(("extra-top", extra_top));
+
+    for (name, status) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let case_root = temp.path().join(name);
+        fs::create_dir_all(&case_root).unwrap();
+        let (binary, pid_file, request_log) =
+            write_mock_protected_content_decrypt_provider(&case_root, issuer, &status);
+        let registry = Arc::new(ProviderRegistry::new());
+
+        register_protected_content_decrypt_provider(&registry, &binary, issuer)
+            .await
+            .expect_err("invalid protected-content decrypt status must fail closed");
+
+        assert!(!process_is_running(read_pid(&pid_file)), "case {name}");
+        let requests = fs::read_to_string(&request_log).unwrap();
+        assert!(requests.contains(r#""op":"status""#), "case {name}");
+        assert!(requests.contains(r#""op":"shutdown""#), "case {name}");
+        assert!(matches!(
+            registry
+                .invoke_provider(ProviderInvocation {
+                    source: RUNTIME_PROVIDER_ID.to_string(),
+                    target: PROTECTED_CONTENT_DECRYPT_PROVIDER_ID.to_string(),
+                    op: "status".to_string(),
+                    request: json!({"op":"status"}),
+                    transfer: ProviderTransfer::Json,
+                    range: None,
+                    progress: None,
+                    transport: ProviderInvocationTransport::Local,
+                })
+                .await,
+            Err(ProviderError::NoProvider(target))
+                if target == PROTECTED_CONTENT_DECRYPT_PROVIDER_ID
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn protected_content_decrypt_startup_rejects_wrong_issuer_and_settles_child() {
+    let temp = tempfile::tempdir().unwrap();
+    let expected_issuer = runtime_operation_issuer_for_seed(0x41);
+    let supplied_issuer = runtime_operation_issuer_for_seed(0x42);
+    let (binary, pid_file, request_log) = write_mock_protected_content_decrypt_provider(
+        temp.path(),
+        expected_issuer,
+        &protected_content_decrypt_provider_status(),
+    );
+    let registry = Arc::new(ProviderRegistry::new());
+
+    register_protected_content_decrypt_provider(&registry, &binary, supplied_issuer)
+        .await
+        .expect_err("a provider that rejects the Runtime issuer must fail closed");
+
+    assert!(!process_is_running(read_pid(&pid_file)));
+    let requests = fs::read_to_string(&request_log).unwrap();
+    assert!(requests.contains(&format!(
+        r#""trusted_runtime_issuer":"0x{}""#,
+        hex::encode(supplied_issuer.as_bytes())
+    )));
+    assert!(requests.contains(r#""op":"shutdown""#));
+    assert!(!requests.contains(r#""op":"status""#));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn protected_content_decrypt_duplicate_and_restart_settle_exact_processes() {
+    let temp = tempfile::tempdir().unwrap();
+    let issuer = runtime_operation_issuer_for_seed(0x41);
+    let (binary, pid_file, request_log) = write_mock_protected_content_decrypt_provider(
+        temp.path(),
+        issuer,
+        &protected_content_decrypt_provider_status(),
+    );
+    let registry = Arc::new(ProviderRegistry::new());
+
+    register_protected_content_decrypt_provider(&registry, &binary, issuer)
+        .await
+        .unwrap();
+    let first_pid = read_pid(&pid_file);
+    assert!(process_is_running(first_pid));
+
+    let duplicate = register_protected_content_decrypt_provider(&registry, &binary, issuer)
+        .await
+        .unwrap_err();
+    assert!(duplicate.to_string().contains("already registered"));
+    let duplicate_pids = read_pids(&pid_file);
+    assert_eq!(duplicate_pids.len(), 2);
+    let rejected_pid = duplicate_pids[1];
+    assert!(process_is_running(first_pid));
+    assert!(!process_is_running(rejected_pid));
+
+    registry
+        .unregister_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID)
+        .await
+        .unwrap();
+    assert!(!process_is_running(first_pid));
+
+    register_protected_content_decrypt_provider(&registry, &binary, issuer)
+        .await
+        .unwrap();
+    let replacement_pid = read_pid(&pid_file);
+    assert_ne!(replacement_pid, first_pid);
+    assert_ne!(replacement_pid, rejected_pid);
+    assert!(process_is_running(replacement_pid));
+    registry
+        .unregister_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID)
+        .await
+        .unwrap();
+    assert!(!process_is_running(replacement_pid));
+
+    let requests = fs::read_to_string(&request_log).unwrap();
+    assert_eq!(requests.matches(r#""op":"shutdown""#).count(), 3);
+}
+
 #[tokio::test]
 async fn runtime_rights_adapter_fails_closed_without_chain_and_does_not_call_rights() {
     let registry = Arc::new(ProviderRegistry::new());
@@ -6384,7 +6558,7 @@ async fn decrypt_registry_adapter_dispatches_prepare_recipient_exactly_once() {
     );
     let drm = RecordingProvider::new("drm", json!({"status": "ok", "data": {"echo": "drm"}}));
     registry
-        .register_sub_provider("decrypt", decrypt.clone())
+        .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt.clone())
         .await
         .unwrap();
     registry
@@ -6427,7 +6601,7 @@ async fn decrypt_registry_adapter_dispatches_open_viewer_session_exactly_once() 
     );
     let key = RecordingProvider::new("key", json!({"status": "ok", "data": {"echo": "key"}}));
     registry
-        .register_sub_provider("decrypt", decrypt.clone())
+        .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt.clone())
         .await
         .unwrap();
     registry
@@ -6485,7 +6659,10 @@ async fn decrypt_registry_adapter_dispatches_read_cancel_and_close_exactly_once(
         ),
     );
     registry
-        .register_sub_provider("decrypt", read_provider.clone())
+        .register_runtime_provider_target(
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+            read_provider.clone(),
+        )
         .await
         .unwrap();
     let read_expected = serde_json::to_value(&read_request).unwrap();
@@ -6502,7 +6679,10 @@ async fn decrypt_registry_adapter_dispatches_read_cancel_and_close_exactly_once(
         "read_viewer_media_part",
         &read_expected,
     );
-    registry.unregister_sub_provider("decrypt").await.unwrap();
+    registry
+        .unregister_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID)
+        .await
+        .unwrap();
 
     let cancel_provider = RecordingProvider::new(
         "decrypt",
@@ -6515,7 +6695,10 @@ async fn decrypt_registry_adapter_dispatches_read_cancel_and_close_exactly_once(
         ),
     );
     registry
-        .register_sub_provider("decrypt", cancel_provider.clone())
+        .register_runtime_provider_target(
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+            cancel_provider.clone(),
+        )
         .await
         .unwrap();
     let cancel_expected = serde_json::to_value(&cancel_request).unwrap();
@@ -6532,7 +6715,10 @@ async fn decrypt_registry_adapter_dispatches_read_cancel_and_close_exactly_once(
         "cancel_prepared_recipient",
         &cancel_expected,
     );
-    registry.unregister_sub_provider("decrypt").await.unwrap();
+    registry
+        .unregister_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID)
+        .await
+        .unwrap();
 
     let close_provider = RecordingProvider::new(
         "decrypt",
@@ -6544,7 +6730,10 @@ async fn decrypt_registry_adapter_dispatches_read_cancel_and_close_exactly_once(
         ),
     );
     registry
-        .register_sub_provider("decrypt", close_provider.clone())
+        .register_runtime_provider_target(
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+            close_provider.clone(),
+        )
         .await
         .unwrap();
     let close_expected = serde_json::to_value(&close_request).unwrap();
@@ -6575,7 +6764,7 @@ async fn decrypt_registry_adapter_fails_closed_on_provider_status_and_data_error
         let registry = Arc::new(ProviderRegistry::new());
         let decrypt = RecordingProvider::new("decrypt", response);
         registry
-            .register_sub_provider("decrypt", decrypt)
+            .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt)
             .await
             .unwrap();
         let adapter = RuntimeDecryptRegistryAdapter::new(registry);
@@ -8494,7 +8683,10 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
         ),
     );
     registry
-        .register_sub_provider("decrypt", read_provider.clone())
+        .register_runtime_provider_target(
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+            read_provider.clone(),
+        )
         .await
         .unwrap();
     let early_segment = super::read_runtime_custody_viewer(
@@ -8562,7 +8754,10 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
     );
     assert_eq!(read_provider.requests().await.len(), 1);
 
-    registry.unregister_sub_provider("decrypt").await.unwrap();
+    registry
+        .unregister_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID)
+        .await
+        .unwrap();
     let close_provider = RecordingProvider::new(
         "decrypt",
         ok_provider_response(
@@ -8577,7 +8772,10 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
         ),
     );
     registry
-        .register_sub_provider("decrypt", close_provider.clone())
+        .register_runtime_provider_target(
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+            close_provider.clone(),
+        )
         .await
         .unwrap();
     let close = super::close_runtime_custody_viewer(
@@ -8611,7 +8809,10 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
         mint.draft().mint_id(),
     ))
     .unwrap();
-    registry.unregister_sub_provider("decrypt").await.unwrap();
+    registry
+        .unregister_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID)
+        .await
+        .unwrap();
 
     let replay = super::close_runtime_custody_viewer(
         &harness.data_dir,
@@ -8692,7 +8893,10 @@ async fn runtime_custody_viewer_close_rejects_wrong_principal_without_provider_e
         ok_provider_response(serde_json::json!({"schema":"unused"})),
     );
     registry
-        .register_sub_provider("decrypt", decrypt_provider.clone())
+        .register_runtime_provider_target(
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+            decrypt_provider.clone(),
+        )
         .await
         .unwrap();
 
@@ -8754,7 +8958,10 @@ async fn runtime_custody_viewer_close_retains_cleanup_pending_until_exact_settle
         vec![Err(ProviderError::Provider("timeout".to_string()))],
     );
     registry
-        .register_sub_provider("decrypt", pending_provider.clone())
+        .register_runtime_provider_target(
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+            pending_provider.clone(),
+        )
         .await
         .unwrap();
     let err = super::close_runtime_custody_viewer(
@@ -8785,7 +8992,10 @@ async fn runtime_custody_viewer_close_retains_cleanup_pending_until_exact_settle
         super::RuntimeCustodyViewerLifecycleStatus::CleanupPending
     );
 
-    registry.unregister_sub_provider("decrypt").await.unwrap();
+    registry
+        .unregister_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID)
+        .await
+        .unwrap();
     let absent_provider = RecordingProvider::new(
         "decrypt",
         ok_provider_response(
@@ -8800,7 +9010,7 @@ async fn runtime_custody_viewer_close_retains_cleanup_pending_until_exact_settle
         ),
     );
     registry
-        .register_sub_provider("decrypt", absent_provider)
+        .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, absent_provider)
         .await
         .unwrap();
     let closed = super::close_runtime_custody_viewer(
@@ -8899,7 +9109,7 @@ async fn runtime_custody_open_pending_reconciliation_settles_no_dispatch_with_ex
         ],
     );
     registry
-        .register_sub_provider("decrypt", decrypt.clone())
+        .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt.clone())
         .await
         .unwrap();
 
@@ -9012,7 +9222,7 @@ async fn runtime_custody_open_pending_reconciliation_settles_response_loss_with_
         ],
     );
     registry
-        .register_sub_provider("decrypt", decrypt.clone())
+        .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt.clone())
         .await
         .unwrap();
 
@@ -9140,7 +9350,7 @@ async fn runtime_custody_open_pending_survives_active_write_failure_and_failed_c
         vec![Err(ProviderError::Provider("timeout".to_string()))],
     );
     registry
-        .register_sub_provider("decrypt", decrypt)
+        .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt)
         .await
         .unwrap();
     let cleanup_error = super::settle_runtime_custody_viewer_cleanup(
@@ -9220,7 +9430,10 @@ async fn runtime_custody_viewer_expiry_reconciles_exact_cleanup_before_read() {
         ),
     );
     registry
-        .register_sub_provider("decrypt", close_provider.clone())
+        .register_runtime_provider_target(
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+            close_provider.clone(),
+        )
         .await
         .unwrap();
     let err = super::read_runtime_custody_viewer(
@@ -9312,7 +9525,10 @@ async fn runtime_custody_viewer_restart_reconciliation_settles_old_active_record
         ),
     );
     registry
-        .register_sub_provider("decrypt", close_provider.clone())
+        .register_runtime_provider_target(
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+            close_provider.clone(),
+        )
         .await
         .unwrap();
 
@@ -9384,7 +9600,10 @@ async fn runtime_custody_viewer_read_and_close_reject_substituted_session_withou
         ok_provider_response(serde_json::json!({"schema":"unused"})),
     );
     registry
-        .register_sub_provider("decrypt", decrypt_provider.clone())
+        .register_runtime_provider_target(
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+            decrypt_provider.clone(),
+        )
         .await
         .unwrap();
 
@@ -9467,7 +9686,10 @@ async fn runtime_custody_viewer_read_and_close_reject_malformed_binding_without_
         ok_provider_response(serde_json::json!({"schema":"unused"})),
     );
     registry
-        .register_sub_provider("decrypt", decrypt_provider.clone())
+        .register_runtime_provider_target(
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+            decrypt_provider.clone(),
+        )
         .await
         .unwrap();
 
@@ -9580,7 +9802,7 @@ async fn runtime_custody_viewer_restart_reconciliation_settles_open_pending_reco
         ],
     );
     registry
-        .register_sub_provider("decrypt", decrypt.clone())
+        .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt.clone())
         .await
         .unwrap();
 
@@ -9683,7 +9905,10 @@ async fn runtime_custody_viewer_restart_reconciliation_settles_cleanup_pending_r
         ),
     );
     registry
-        .register_sub_provider("decrypt", close_provider.clone())
+        .register_runtime_provider_target(
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+            close_provider.clone(),
+        )
         .await
         .unwrap();
 
@@ -9765,7 +9990,10 @@ async fn runtime_custody_viewer_expired_old_binding_allows_cleanup_before_fresh_
         ),
     );
     registry
-        .register_sub_provider("decrypt", close_provider.clone())
+        .register_runtime_provider_target(
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+            close_provider.clone(),
+        )
         .await
         .unwrap();
 
@@ -9908,7 +10136,7 @@ async fn runtime_custody_viewer_reconciliation_ignores_terminal_histories_beyond
         ],
     );
     registry
-        .register_sub_provider("decrypt", decrypt)
+        .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt)
         .await
         .unwrap();
 
@@ -10249,27 +10477,18 @@ fn process_custody_play_routes(
 }
 
 #[cfg(unix)]
-async fn register_test_decrypt_provider(registry: &Arc<ProviderRegistry>, issuer_hex: &str) {
+async fn register_test_decrypt_provider(
+    registry: &Arc<ProviderRegistry>,
+    runtime_operation_issuer: RuntimeOperationIssuerKeyV1,
+) {
     let decrypt_binary = required_test_binary_path(TEST_DECRYPT_PROVIDER_BIN_ENV);
-    let decrypt_bridge = ProviderBridge::spawn(
+    register_protected_content_decrypt_provider(
+        registry,
         &decrypt_binary,
-        ProviderConfig {
-            extra: json!({
-                "trusted_runtime_issuer": issuer_hex,
-            }),
-            ..Default::default()
-        },
+        runtime_operation_issuer,
     )
     .await
     .unwrap();
-    let decrypt_provider: Arc<dyn Provider> = Arc::new(CapsuleProvider::with_scheme(
-        Arc::new(decrypt_bridge),
-        "decrypt",
-    ));
-    registry
-        .register_sub_provider("decrypt", decrypt_provider)
-        .await
-        .unwrap();
 }
 
 #[cfg(unix)]
@@ -10427,11 +10646,7 @@ pub(crate) async fn register_runtime_custody_process_providers_for_test_registry
             registry: Arc::downgrade(registry),
         }))
         .await;
-    register_test_decrypt_provider(
-        registry,
-        &format!("0x{}", hex::encode(runtime_issuer.as_bytes())),
-    )
-    .await;
+    register_test_decrypt_provider(registry, runtime_issuer).await;
     RuntimeCustodyProcessProviderFixture {
         _nodes_temp: nodes_temp,
     }
@@ -10484,7 +10699,7 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_launch_toke
     let decrypt = PrepareOnlyCleanupDecryptProvider::new();
     harness
         .registry
-        .register_sub_provider("decrypt", decrypt.clone())
+        .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt.clone())
         .await
         .unwrap();
     let profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
@@ -10549,7 +10764,7 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wal
     let decrypt = PrepareOnlyCleanupDecryptProvider::new();
     harness
         .registry
-        .register_sub_provider("decrypt", decrypt.clone())
+        .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt.clone())
         .await
         .unwrap();
     let profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);

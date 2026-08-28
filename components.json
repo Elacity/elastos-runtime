@@ -786,6 +786,14 @@
     "protected-content-decrypt-provider": {
       "install_path": "bin/protected-content-decrypt-provider",
       "description": "Host protected-content decrypt provider binary for inactive Runtime-selected scoped viewer sessions",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "protected-content-decrypt",
+        "runtime_only": true
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",

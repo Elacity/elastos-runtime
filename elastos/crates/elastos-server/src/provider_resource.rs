@@ -737,6 +737,7 @@ mod tests {
             ("object", "raw_storage_path"),
             ("operator-drive-adapter", "resolver_credentials"),
             ("tunnel", "raw_cloudflared_admin"),
+            ("protected-content-decrypt", "status"),
         ] {
             assert!(
                 build_capability_resource(scheme, op, &request).is_err(),

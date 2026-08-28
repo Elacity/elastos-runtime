@@ -16,12 +16,12 @@ SCHEMA = "elastos.source-home-provider-inventory-smoke/v1"
 PROTECTED_CONTENT_HELPERS = (
     "custody-provider",
     "protected-content-protect-provider",
-    "protected-content-decrypt-provider",
 )
 REQUIRED_PROVIDER_RUNTIMES = (
     "localhost-provider",
     "media-provider",
     "model-provider",
+    "protected-content-decrypt-provider",
 )
 
 
@@ -39,6 +39,10 @@ def assert_provider_names_and_loops(setup_text: str) -> None:
         needle = f"        {name}"
         if needle not in helper_fn:
             raise AssertionError(f"source_home_helper_binary_names() missing {name}")
+    if "        protected-content-decrypt-provider" in helper_fn:
+        raise AssertionError(
+            "source_home_helper_binary_names() must not duplicate the Runtime provider inventory"
+        )
 
     build_loop = 'source_home_binary_names | while IFS= read -r provider; do'
     if setup_text.count(build_loop) < 2:
@@ -80,6 +84,7 @@ def assert_external_metadata(components: dict) -> None:
     for name, provides in (
         ("media-provider", "elastos://media/*"),
         ("model-provider", "elastos://model/*"),
+        ("protected-content-decrypt-provider", "protected-content-decrypt"),
     ):
         runtime = external[name].get("provider_runtime") or {}
         expected_runtime = {
@@ -89,6 +94,8 @@ def assert_external_metadata(components: dict) -> None:
             "execution": "native-provider",
             "provides": provides,
         }
+        if name == "protected-content-decrypt-provider":
+            expected_runtime["runtime_only"] = True
         if runtime != expected_runtime:
             raise AssertionError(f"{name} runtime contract mismatch")
 

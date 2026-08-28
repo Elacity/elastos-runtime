@@ -1373,6 +1373,40 @@ async fn setup_server_infrastructure_impl(
         }
     }
 
+    if let Some(path) = crate::find_installed_provider_binary("protected-content-decrypt-provider")
+    {
+        if let Err(e) = verify_provider_binary("protected-content-decrypt-provider", &path) {
+            tracing::warn!(
+                "Skipping protected-content-decrypt-provider due to verification failure: {}",
+                e
+            );
+        } else {
+            let (runtime_signing_key, _) = elastos_identity::derive_did(&device_key);
+            let runtime_operation_issuer =
+                elastos_protected_content_contracts::RuntimeOperationIssuerKeyV1::new(
+                    runtime_signing_key.verifying_key().to_bytes(),
+                )
+                .map_err(|_| anyhow::anyhow!("active Runtime operation issuer is invalid"))?;
+            if let Err(e) =
+                elastos_server::protected_content_runtime::register_protected_content_decrypt_provider(
+                    &provider_registry,
+                    &path,
+                    runtime_operation_issuer,
+                )
+                .await
+            {
+                tracing::warn!(
+                    "Failed to register Runtime-only protected-content decrypt provider: {}",
+                    e
+                );
+            } else {
+                tracing::info!(
+                    "protected-content-decrypt-provider registered on Runtime-only target protected-content-decrypt; provisional decrypt-provider remains on elastos://decrypt"
+                );
+            }
+        }
+    }
+
     if let Some(path) = crate::find_installed_provider_binary("protected-content-protect-provider")
     {
         if let Err(e) = verify_provider_binary("protected-content-protect-provider", &path) {

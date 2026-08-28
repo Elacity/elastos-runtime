@@ -60,6 +60,8 @@ pub struct ProviderRuntime {
     pub runtime_abi: ProviderRuntimeAbi,
     pub execution: ProviderRuntimeExecution,
     pub provides: String,
+    #[serde(default)]
+    pub runtime_only: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -145,7 +147,19 @@ pub fn validate_provider_runtime<'a>(
             name
         );
     }
-    if !(provides.starts_with("elastos://") || provides.starts_with("localhost://")) {
+    if runtime.runtime_only {
+        if provides.starts_with('-')
+            || provides.ends_with('-')
+            || !provides
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            anyhow::bail!(
+                "component '{}' Runtime-only provider target is invalid",
+                name
+            );
+        }
+    } else if !(provides.starts_with("elastos://") || provides.starts_with("localhost://")) {
         anyhow::bail!(
             "component '{}' provider runtime provides must use elastos:// or localhost://",
             name
@@ -2310,6 +2324,10 @@ mod tests {
                 "elastos://object/*".to_string(),
             ),
             (
+                "protected-content-decrypt-provider".to_string(),
+                "protected-content-decrypt".to_string(),
+            ),
+            (
                 "wallet-provider".to_string(),
                 "elastos://wallet/meta/status".to_string(),
             ),
@@ -2350,6 +2368,14 @@ mod tests {
                 Some(expected_install_path.as_str())
             );
             assert_eq!(runtime.provides, provides);
+            assert_eq!(
+                runtime.runtime_only,
+                name == "protected-content-decrypt-provider"
+            );
+            if runtime.runtime_only {
+                assert!(first_party_provider_manifest_path(&root, &name).is_none());
+                continue;
+            }
             let path = first_party_provider_manifest_path(&root, &name).unwrap();
             let manifest: CapsuleManifest =
                 serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();

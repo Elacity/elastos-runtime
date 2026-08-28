@@ -547,6 +547,15 @@ for name, component in manifest.get("external", {}).items():
     provides = runtime.get("provides")
     if not isinstance(provides, str) or not provides:
         raise SystemExit(f"{name} provider_runtime.provides must be a non-empty string")
+    runtime_only = runtime.get("runtime_only", False)
+    if not isinstance(runtime_only, bool):
+        raise SystemExit(f"{name} provider_runtime.runtime_only must be a boolean")
+    if runtime_only and (
+        provides.startswith("-")
+        or provides.endswith("-")
+        or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789-" for ch in provides)
+    ):
+        raise SystemExit(f"{name} provider_runtime.provides must be a lowercase Runtime target")
     print(name)
 PY
 }
@@ -561,8 +570,7 @@ source_home_helper_binary_names() {
     fi
     printf '%s\n' \
         custody-provider \
-        protected-content-protect-provider \
-        protected-content-decrypt-provider
+        protected-content-protect-provider
 }
 
 source_home_binary_names() {

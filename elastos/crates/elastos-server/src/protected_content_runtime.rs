@@ -37,6 +37,7 @@ use elastos_protected_content_provider_contracts::{
     ProtectProviderResponseV1, ProtectionSessionNodeV1, RightsProviderRequestV1,
     RightsProviderResponseV1, ValidatedCencFmp4MediaSessionLayoutV1,
     ValidatedClearFmp4MediaSessionLayoutV1, ViewerMediaPartSelectorV1,
+    DECRYPT_PROVIDER_REQUEST_SCHEMA_V1, DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1,
     MAX_PROTECT_MEDIA_SEGMENTS_V1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
 };
 use elastos_protected_content_rights::{
@@ -76,6 +77,7 @@ pub(crate) const CUSTODY_PROVIDER_ID: &str = "custody";
 pub(crate) const PROTECT_PROVIDER_ID: &str = "protect";
 pub(crate) const MEDIA_PROVIDER_ID: &str = "media";
 pub(crate) const RUNTIME_PROVIDER_ID: &str = "runtime";
+pub(crate) const PROTECTED_CONTENT_DECRYPT_PROVIDER_ID: &str = "protected-content-decrypt";
 const ELACITY_PLAYER_CAPSULE_ID: &str = "elacity-player";
 const CONTENT_PROVIDER_ID: &str = "content";
 const PROTECTED_CONTENT_REPLICATION_POLICY: &str = "protected-content-replication/v1";
@@ -138,7 +140,22 @@ const CONTENT_AVAILABILITY_RECEIPT_DOMAIN: &str = "elastos.content.availability.
 const MAX_RUNTIME_VIEWER_RECONCILE_MINT_DIRS: usize = 256;
 const MAX_RUNTIME_VIEWER_RECONCILE_RECORDS: usize = 1024;
 const MAX_RUNTIME_VIEWER_RECORD_BYTES: u64 = 64 * 1024;
-const DECRYPT_PROVIDER_ID: &str = "decrypt";
+const PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION: &str =
+    match option_env!("ELASTOS_RELEASE_VERSION") {
+        Some(version) => version,
+        None => "0.1.0-dev",
+    };
+const PROTECTED_CONTENT_DECRYPT_PROVIDER_STATUS_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+const PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS: &[&str] = &[
+    "status",
+    "prepare_recipient",
+    "open_viewer_session",
+    "read_viewer_media_part",
+    "cancel_prepared_recipient",
+    "close_viewer_session",
+    "shutdown",
+];
 const WALLET_PROVIDER_ID: &str = "wallet";
 const INACTIVE_CUSTODY_ROOT: &str = "protected-content/custody-provider/inactive";
 const PROVIDER_INVOCATION_SCHEMA_V1: &str = "elastos.provider.invocation/v1";
@@ -801,7 +818,7 @@ async fn invoke_decrypt_provider(
         .map_err(|_| RuntimeProviderCallError::NoExactResult)?;
     let response_value = invoke_json_provider(
         registry,
-        DECRYPT_PROVIDER_ID,
+        PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
         decrypt_provider_op(request),
         request_value,
     )
@@ -1003,6 +1020,133 @@ pub async fn register_protect_provider(
             PROTECT_PROVIDER_ID,
         ));
     registry.register(provider).await;
+    Ok(())
+}
+
+pub async fn register_protected_content_decrypt_provider(
+    registry: &Arc<ProviderRegistry>,
+    binary_path: &Path,
+    runtime_operation_issuer: RuntimeOperationIssuerKeyV1,
+) -> anyhow::Result<()> {
+    let bridge = Arc::new(
+        ProviderBridge::spawn(
+            binary_path,
+            ProviderConfig {
+                extra: json!({
+                    "trusted_runtime_issuer": format!(
+                        "0x{}",
+                        hex::encode(runtime_operation_issuer.as_bytes())
+                    ),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("failed to spawn protected-content decrypt provider: {error}")
+        })?,
+    );
+    let startup = async {
+        let status = tokio::time::timeout(
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_STATUS_TIMEOUT,
+            bridge.send_raw(&json!({"op":"status"})),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("protected-content decrypt provider status timed out"))?
+        .map_err(|error| {
+            anyhow::anyhow!("protected-content decrypt provider status failed: {error}")
+        })?;
+        require_protected_content_decrypt_provider_status(&status)?;
+        let provider: Arc<dyn Provider> =
+            Arc::new(elastos_runtime::provider::CapsuleProvider::with_scheme(
+                bridge.clone(),
+                PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+            ));
+        registry
+            .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, provider)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("failed to register protected-content decrypt provider: {error}")
+            })
+    }
+    .await;
+    if let Err(startup_error) = startup {
+        if let Err(shutdown_error) = bridge.shutdown().await {
+            return Err(anyhow::anyhow!(
+                "{startup_error}; protected-content decrypt provider shutdown/reap also failed: {shutdown_error}"
+            ));
+        }
+        return Err(startup_error);
+    }
+    Ok(())
+}
+
+fn require_protected_content_decrypt_provider_status(status: &Value) -> anyhow::Result<()> {
+    let status_object = status
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("protected-content decrypt provider status is invalid"))?;
+    if status_object.len() != 2
+        || !status_object.contains_key("status")
+        || !status_object.contains_key("data")
+        || status.get("status").and_then(Value::as_str) != Some("ok")
+    {
+        anyhow::bail!("protected-content decrypt provider status did not succeed");
+    }
+    let data = status
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            anyhow::anyhow!("protected-content decrypt provider status is missing data")
+        })?;
+    let expected_fields = [
+        "provider",
+        "version",
+        "configured",
+        "supported_operations",
+        "request_schema",
+        "response_schema",
+    ];
+    if data.len() != expected_fields.len()
+        || expected_fields
+            .iter()
+            .any(|field| !data.contains_key(*field))
+    {
+        anyhow::bail!("protected-content decrypt provider status has an unsupported shape");
+    }
+    if data.get("provider").and_then(Value::as_str) != Some(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID) {
+        anyhow::bail!("protected-content decrypt provider status has an unsupported identity");
+    }
+    if data.get("configured").and_then(Value::as_bool) != Some(true) {
+        anyhow::bail!("protected-content decrypt provider is not configured");
+    }
+    if data.get("version").and_then(Value::as_str)
+        != Some(PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION)
+    {
+        anyhow::bail!("protected-content decrypt provider status has an unsupported version");
+    }
+    if data.get("request_schema").and_then(Value::as_str)
+        != Some(DECRYPT_PROVIDER_REQUEST_SCHEMA_V1)
+        || data.get("response_schema").and_then(Value::as_str)
+            != Some(DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1)
+    {
+        anyhow::bail!("protected-content decrypt provider status has unsupported schemas");
+    }
+    let supported_operations = data
+        .get("supported_operations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "protected-content decrypt provider status is missing supported operations"
+            )
+        })?;
+    if supported_operations.len() != PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS.len()
+        || supported_operations
+            .iter()
+            .zip(PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS)
+            .any(|(actual, expected)| actual.as_str() != Some(*expected))
+    {
+        anyhow::bail!("protected-content decrypt provider status has unsupported operations");
+    }
     Ok(())
 }
 

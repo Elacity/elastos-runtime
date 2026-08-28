@@ -24,6 +24,7 @@ use sha2::{Digest as _, Sha256};
 #[path = "../tests/support.rs"]
 mod support;
 
+pub const PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET: &str = "protected-content-decrypt";
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
@@ -182,7 +183,10 @@ impl DecryptProvider {
             Ok(value) => value,
             Err(_) => return (invalid_request(), false),
         };
-        let envelope = match strip_runtime_invocation_envelope(&mut value, "decrypt") {
+        let envelope = match strip_runtime_invocation_envelope(
+            &mut value,
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
+        ) {
             Ok(state) => state,
             Err(()) => return (invalid_request(), false),
         };
@@ -243,7 +247,7 @@ impl DecryptProvider {
 
     fn status(&self) -> ProviderResponse {
         ProviderResponse::ok(json!({
-            "provider": "protected-content-decrypt",
+            "provider": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
             "version": PROVIDER_VERSION,
             "configured": self.state.is_some(),
             "supported_operations": [
@@ -1055,9 +1059,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": op,
-                "capability": format!("provider:runtime->decrypt:{op}"),
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:{op}"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": null,
                 "transfer": "json",
@@ -1606,7 +1612,7 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
                 "transport": "runtime-local-provider-plane",
                 "carrier": null
@@ -1621,9 +1627,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
-                "capability": "provider:runtime->decrypt:prepare_recipient",
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:prepare_recipient"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": null,
                 "transfer": "json",
@@ -1642,9 +1650,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
-                "capability": "provider:runtime->decrypt:open_viewer_session",
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:open_viewer_session"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": null,
                 "transfer": "json",
@@ -1662,9 +1672,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
-                "capability": "provider:runtime->decrypt:prepare_recipient",
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:prepare_recipient"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": null,
                 "transfer": "bytes",
@@ -1682,9 +1694,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
-                "capability": "provider:runtime->decrypt:prepare_recipient",
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:prepare_recipient"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": {},
                 "transfer": "json",
@@ -1702,9 +1716,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
-                "capability": "provider:runtime->decrypt:prepare_recipient",
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:prepare_recipient"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": null,
                 "transfer": "json",
@@ -1722,9 +1738,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
-                "capability": "provider:runtime->decrypt:prepare_recipient",
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:prepare_recipient"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": null,
                 "transfer": "json",
@@ -1742,9 +1760,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
-                "capability": "provider:runtime->decrypt:prepare_recipient",
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:prepare_recipient"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": null,
                 "transfer": "json",
