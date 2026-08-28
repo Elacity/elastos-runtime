@@ -285,7 +285,7 @@ fn process_prepare_open_read_close_replay_and_restart_absence_flow() {
                 .to_bytes(),
         )
         .unwrap(),
-        &envelope,
+        envelope.manifest().content_key_commitment(),
         &media_identity,
         &protected_init_segment,
         &contributions,

@@ -3274,7 +3274,7 @@ mod tests {
                 prepared_recipient: &prepared,
                 signed_runtime_release_operation: &allowed,
                 expected_terminal_issuer: terminal.statement().issuer(),
-                custody_envelope: &envelope,
+                content_key_commitment: envelope.manifest().content_key_commitment(),
                 media_identity: available.draft().media_identity(),
                 protected_init_segment: &protected_init,
                 signed_node_contributions: &contributions,

@@ -3223,7 +3223,7 @@ fn decrypt_open_fixture() -> (
         handle,
         &operation,
         terminal.statement().issuer(),
-        &envelope,
+        envelope.manifest().content_key_commitment(),
         &media,
         &init_segment,
         &contributions,
@@ -7223,7 +7223,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
             prepared_recipient: &prepared_b,
             signed_runtime_release_operation: &operation,
             expected_terminal_issuer: terminal_receipt.statement().issuer(),
-            custody_envelope: &envelope,
+            content_key_commitment: envelope.manifest().content_key_commitment(),
             media_identity: &protected_media_identity,
             protected_init_segment: &protected_init_segment,
             signed_node_contributions: &signed_node_contributions,
@@ -7247,7 +7247,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
             prepared_recipient: &prepared_a,
             signed_runtime_release_operation: &operation,
             expected_terminal_issuer: terminal_receipt.statement().issuer(),
-            custody_envelope: &envelope,
+            content_key_commitment: envelope.manifest().content_key_commitment(),
             media_identity: &wrong_media_identity,
             protected_init_segment: &protected_init_segment,
             signed_node_contributions: &signed_node_contributions,
@@ -7265,7 +7265,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
             prepared_recipient: &prepared_a,
             signed_runtime_release_operation: &operation,
             expected_terminal_issuer: terminal_receipt.statement().issuer(),
-            custody_envelope: &envelope,
+            content_key_commitment: envelope.manifest().content_key_commitment(),
             media_identity: &protected_media_identity,
             protected_init_segment: &protected_init_segment,
             signed_node_contributions: &signed_node_contributions,
@@ -9776,19 +9776,13 @@ async fn runtime_custody_viewer_open_rejects_missing_live_availability_before_ne
     .await;
     let principal_id = "person:local:runtime-custody-viewer-missing-live-availability";
     write_device_key(&harness.data_dir, 0x21);
-    let (epoch, _composition_now) = write_library_publish_test_composition(&harness.data_dir);
+    let (_epoch, _composition_now) = write_library_publish_test_composition(&harness.data_dir);
     let (proof_binding_id, _) =
         install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
     let profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
     let mint = runtime_mint_journal(&harness.data_dir)
         .load(harness.mint_id)
         .unwrap();
-    super::persist_runtime_open_envelope(
-        &harness.data_dir,
-        mint.draft().mint_id(),
-        &custody_envelope_for_media_with_epoch(0x41, &epoch),
-    )
-    .unwrap();
     persist_runtime_custody_purchase_for_mint(
         &harness.data_dir,
         &mint,
@@ -11619,18 +11613,12 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_decrypt() {
     .await;
     let principal_id = "person:local:runtime-custody-open-no-decrypt";
     write_device_key(&harness.data_dir, 0x21);
-    let (epoch, _composition_now) = write_library_publish_test_composition(&harness.data_dir);
+    let (_epoch, _composition_now) = write_library_publish_test_composition(&harness.data_dir);
     let (proof_binding_id, _) =
         install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
     let mint = runtime_mint_journal(&harness.data_dir)
         .load(harness.mint_id)
         .unwrap();
-    super::persist_runtime_open_envelope(
-        &harness.data_dir,
-        mint.draft().mint_id(),
-        &custody_envelope_for_media_with_epoch(0x41, &epoch),
-    )
-    .unwrap();
     let profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
     persist_runtime_custody_purchase_for_mint(
         &harness.data_dir,
@@ -11904,18 +11892,12 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_launch_toke
     .await;
     let principal_id = "person:local:runtime-custody-open-no-launch-token";
     write_device_key(&harness.data_dir, 0x21);
-    let (epoch, _composition_now) = write_library_publish_test_composition(&harness.data_dir);
+    let (_epoch, _composition_now) = write_library_publish_test_composition(&harness.data_dir);
     let (_proof_binding_id, _) =
         install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
     let mint = runtime_mint_journal(&harness.data_dir)
         .load(harness.mint_id)
         .unwrap();
-    super::persist_runtime_open_envelope(
-        &harness.data_dir,
-        mint.draft().mint_id(),
-        &custody_envelope_for_media_with_epoch(0x41, &epoch),
-    )
-    .unwrap();
     let decrypt = PrepareOnlyCleanupDecryptProvider::new();
     harness
         .registry
@@ -11969,18 +11951,12 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wal
     .await;
     let principal_id = "person:local:runtime-custody-open-no-release-wallet";
     write_device_key(&harness.data_dir, 0x21);
-    let (epoch, _composition_now) = write_library_publish_test_composition(&harness.data_dir);
+    let (_epoch, _composition_now) = write_library_publish_test_composition(&harness.data_dir);
     let (proof_binding_id, _) =
         install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
     let mint = runtime_mint_journal(&harness.data_dir)
         .load(harness.mint_id)
         .unwrap();
-    super::persist_runtime_open_envelope(
-        &harness.data_dir,
-        mint.draft().mint_id(),
-        &custody_envelope_for_media_with_epoch(0x41, &epoch),
-    )
-    .unwrap();
     let decrypt = PrepareOnlyCleanupDecryptProvider::new();
     harness
         .registry

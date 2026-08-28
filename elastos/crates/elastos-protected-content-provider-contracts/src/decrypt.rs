@@ -1,5 +1,5 @@
 use elastos_protected_content_contracts::{
-    AuthenticatedRuntimeReleaseOperationV1, CanonicalContract, ContractError, CustodyEnvelopeV1,
+    AuthenticatedRuntimeReleaseOperationV1, CanonicalContract, ContractError, Digest32,
     KeyReleaseOutcomeV1, ProtectedContentBindingV1, RecipientKeyIdentityV1,
     RecipientPublicKeyBytesV1, RightsActionV1, RuntimeOperationIssuerKeyV1,
     RuntimeReleaseAuditIdV1, SignedNodeContributionV1, SignedRuntimeReleaseOperationV1,
@@ -15,10 +15,10 @@ use crate::media::{
 use crate::wire::{
     contract_decode_error, decode_json, encode_json, validate_schema, validate_time_window,
     CanonicalBlob, CanonicalBlobList, OpaqueHandleV1, ProviderFailureCodeV1,
-    MAX_CUSTODY_ENVELOPE_BYTES_V1, MAX_PROVIDER_BINDING_BYTES_V1,
-    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1, MAX_RECIPIENT_IDENTITY_BYTES_V1,
-    MAX_SIGNED_NODE_CONTRIBUTIONS_COUNT_V1, MAX_SIGNED_NODE_CONTRIBUTION_BYTES_V1,
-    MAX_SIGNED_RUNTIME_RELEASE_OPERATION_BYTES_V1, MAX_SIGNED_TERMINAL_RECEIPT_BYTES_V1,
+    MAX_PROVIDER_BINDING_BYTES_V1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
+    MAX_RECIPIENT_IDENTITY_BYTES_V1, MAX_SIGNED_NODE_CONTRIBUTIONS_COUNT_V1,
+    MAX_SIGNED_NODE_CONTRIBUTION_BYTES_V1, MAX_SIGNED_RUNTIME_RELEASE_OPERATION_BYTES_V1,
+    MAX_SIGNED_TERMINAL_RECEIPT_BYTES_V1,
 };
 
 pub const DECRYPT_PROVIDER_REQUEST_SCHEMA_V1: &str =
@@ -31,7 +31,6 @@ type BindingBlobV1 = CanonicalBlob<MAX_PROVIDER_BINDING_BYTES_V1>;
 type RecipientIdentityBlobV1 = CanonicalBlob<MAX_RECIPIENT_IDENTITY_BYTES_V1>;
 type SignedRuntimeReleaseOperationBlobV1 =
     CanonicalBlob<MAX_SIGNED_RUNTIME_RELEASE_OPERATION_BYTES_V1>;
-type CustodyEnvelopeBlobV1 = CanonicalBlob<MAX_CUSTODY_ENVELOPE_BYTES_V1>;
 type MediaIdentityBlobV1 = CanonicalBlob<MAX_CENC_FMP4_MEDIA_IDENTITY_BYTES_V1>;
 type MediaPartBlobV1 = CanonicalBlob<MAX_VIEWER_MEDIA_PART_BYTES_V1>;
 type SignedNodeContributionBlobV1 = CanonicalBlob<MAX_SIGNED_NODE_CONTRIBUTION_BYTES_V1>;
@@ -161,7 +160,7 @@ enum DecryptProviderRequestKindV1 {
         prepared_recipient_handle: OpaqueHandleV1,
         signed_runtime_release_operation: SignedRuntimeReleaseOperationBlobV1,
         expected_terminal_issuer: [u8; 32],
-        custody_envelope: CustodyEnvelopeBlobV1,
+        content_key_commitment: [u8; 32],
         media_identity: MediaIdentityBlobV1,
         protected_init_segment: MediaPartBlobV1,
         signed_node_contributions: SignedNodeContributionBlobListV1,
@@ -235,7 +234,7 @@ impl DecryptProviderRequestV1 {
         prepared_recipient_handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
         signed_runtime_release_operation: &SignedRuntimeReleaseOperationV1,
         expected_terminal_issuer: TerminalReceiptIssuerKey,
-        custody_envelope: &CustodyEnvelopeV1,
+        content_key_commitment: Digest32,
         media_identity: &CencFmp4MediaIdentityV1,
         protected_init_segment: &[u8],
         signed_node_contributions: &[SignedNodeContributionV1],
@@ -252,7 +251,7 @@ impl DecryptProviderRequestV1 {
                 signed_runtime_release_operation,
             )?,
             expected_terminal_issuer: *expected_terminal_issuer.as_bytes(),
-            custody_envelope: CanonicalBlob::from_contract(custody_envelope)?,
+            content_key_commitment: *content_key_commitment.as_bytes(),
             media_identity: CanonicalBlob::from_contract(media_identity)?,
             protected_init_segment: MediaPartBlobV1::new(protected_init_segment.to_vec())?,
             signed_node_contributions: CanonicalBlobList::new(contributions)?,
@@ -417,12 +416,13 @@ impl DecryptProviderRequestV1 {
         }
     }
 
-    fn custody_envelope(&self) -> Result<CustodyEnvelopeV1, ContractError> {
+    fn content_key_commitment(&self) -> Result<Digest32, ContractError> {
         match &self.0 {
             DecryptProviderRequestKindV1::OpenViewerSession {
-                custody_envelope, ..
-            } => custody_envelope.decode(),
-            _ => Err(ContractError::InvalidField("custody_envelope")),
+                content_key_commitment,
+                ..
+            } => Ok(Digest32::new(*content_key_commitment)),
+            _ => Err(ContractError::InvalidField("content_key_commitment")),
         }
     }
 
@@ -522,7 +522,7 @@ impl DecryptProviderRequestV1 {
                 self.prepared_recipient_handle()?;
                 let _ = self.signed_runtime_release_operation()?;
                 let _ = self.expected_terminal_issuer()?;
-                let _ = self.custody_envelope()?;
+                let _ = self.content_key_commitment()?;
                 let _ = self.media_identity()?;
                 let _ = self.protected_init_segment()?;
                 let _ = self.signed_node_contributions()?;
@@ -610,7 +610,7 @@ impl DecryptProviderRequestV1 {
                 prepared_recipient_handle,
                 signed_runtime_release_operation,
                 expected_terminal_issuer,
-                custody_envelope,
+                content_key_commitment,
                 media_identity,
                 protected_init_segment,
                 signed_node_contributions,
@@ -623,13 +623,8 @@ impl DecryptProviderRequestV1 {
                     .map_err(|_| ContractError::InvalidField("signed_runtime_release_operation"))?;
                 let expected_terminal_issuer =
                     TerminalReceiptIssuerKey::new(expected_terminal_issuer)?;
-                let custody_envelope: CustodyEnvelopeV1 = custody_envelope.decode()?;
+                let content_key_commitment = Digest32::new(content_key_commitment);
                 let media_identity: CencFmp4MediaIdentityV1 = media_identity.decode()?;
-                if media_identity.encrypted_content()
-                    != custody_envelope.manifest().encrypted_content()
-                {
-                    return Err(ContractError::InvalidField("media_identity"));
-                }
                 if media_identity.encrypted_content()
                     != authenticated_runtime_release_operation
                         .statement()
@@ -663,13 +658,6 @@ impl DecryptProviderRequestV1 {
                     let verified = authenticated_runtime_release_operation
                         .verify_node_contribution(contribution, &node_set, now_unix_seconds)
                         .map_err(|_| ContractError::InvalidField("signed_node_contributions"))?;
-                    authenticated_runtime_release_operation
-                        .validate_node_release_claim_context(
-                            &custody_envelope,
-                            verified.node_public_key(),
-                            now_unix_seconds,
-                        )
-                        .map_err(|_| ContractError::InvalidField("custody_envelope"))?;
                     verified_contributions.push(verified);
                 }
                 if signed_terminal_receipt.statement().outcome() != KeyReleaseOutcomeV1::Released {
@@ -690,7 +678,7 @@ impl DecryptProviderRequestV1 {
                             authenticated_runtime_release_operation,
                         ),
                         expected_terminal_issuer,
-                        custody_envelope,
+                        content_key_commitment,
                         media_session_layout: Box::new(media_session_layout),
                         protected_init_segment,
                         signed_node_contributions,
@@ -763,7 +751,7 @@ enum ValidatedDecryptProviderRequestKindV1 {
         prepared_recipient_handle: OpaqueHandleV1,
         authenticated_runtime_release_operation: Box<AuthenticatedRuntimeReleaseOperationV1>,
         expected_terminal_issuer: TerminalReceiptIssuerKey,
-        custody_envelope: CustodyEnvelopeV1,
+        content_key_commitment: Digest32,
         media_session_layout: Box<ValidatedCencFmp4MediaSessionLayoutV1>,
         protected_init_segment: MediaPartBlobV1,
         signed_node_contributions: Vec<SignedNodeContributionV1>,
@@ -935,12 +923,13 @@ impl ValidatedDecryptProviderRequestV1 {
         }
     }
 
-    pub fn custody_envelope(&self) -> Result<&CustodyEnvelopeV1, ContractError> {
+    pub fn content_key_commitment(&self) -> Result<Digest32, ContractError> {
         match &self.0 {
             ValidatedDecryptProviderRequestKindV1::OpenViewerSession {
-                custody_envelope, ..
-            } => Ok(custody_envelope),
-            _ => Err(ContractError::InvalidField("custody_envelope")),
+                content_key_commitment,
+                ..
+            } => Ok(*content_key_commitment),
+            _ => Err(ContractError::InvalidField("content_key_commitment")),
         }
     }
 
@@ -1459,7 +1448,7 @@ mod tests {
         MAX_VIEWER_MEDIA_PART_BYTES_V1,
     };
     use elastos_protected_content_contracts::{
-        RuntimeReleaseAuditIdV1, SignedRuntimeReleaseOperationV1,
+        CanonicalContract, RuntimeReleaseAuditIdV1, SignedRuntimeReleaseOperationV1,
     };
 
     fn handle(seed: u8) -> [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1] {
@@ -1556,7 +1545,7 @@ mod tests {
     }
 
     #[test]
-    fn decrypt_open_request_round_trips_and_rejects_wrong_envelope() {
+    fn decrypt_open_request_round_trips_without_envelope_and_rejects_wrong_bindings() {
         let (media_identity, init_segment, _, custody_envelope, operation) = open_fixture(0x11);
         let contributions = vec![
             make_signed_node_contribution(&operation, 1),
@@ -1567,21 +1556,36 @@ mod tests {
             handle(0x21),
             &operation,
             terminal.statement().issuer(),
-            &custody_envelope,
+            custody_envelope.manifest().content_key_commitment(),
             &media_identity,
             &init_segment,
             &contributions,
             &terminal,
         )
         .unwrap();
-        let decoded =
-            DecryptProviderRequestV1::decode_wire(&request.to_json_vec().unwrap()).unwrap();
+        let request_json = request.to_json_vec().unwrap();
+        let request_text = String::from_utf8(request_json.clone()).unwrap();
+        assert!(!request_text.contains("custody_envelope"));
+        assert!(!request_text.contains("stored_share"));
+        assert!(!request_text.contains("sealed_share"));
+        let stored_share_json = serde_json::to_string(
+            &custody_envelope.stored_shares()[0]
+                .canonical_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!request_text.contains(&stored_share_json));
+        let decoded = DecryptProviderRequestV1::decode_wire(&request_json).unwrap();
         assert_eq!(decoded, request);
         let validated = decode_request(&request.to_json_vec().unwrap()).unwrap();
         assert_eq!(validated.op(), request.op());
         assert_eq!(
             validated.audit_request_id(),
             operation.statement().audit_request_id()
+        );
+        assert_eq!(
+            validated.content_key_commitment().unwrap(),
+            custody_envelope.manifest().content_key_commitment()
         );
         assert!(ValidatedDecryptProviderRequestV1::decode_and_validate_at(
             &request.to_json_vec().unwrap(),
@@ -1604,7 +1608,7 @@ mod tests {
             handle(0x21),
             &operation,
             terminal.statement().issuer(),
-            &custody_envelope,
+            custody_envelope.manifest().content_key_commitment(),
             &media_identity,
             &init_segment,
             &[
@@ -1633,7 +1637,7 @@ mod tests {
             handle(0x21),
             &operation,
             terminal.statement().issuer(),
-            &custody_envelope,
+            custody_envelope.manifest().content_key_commitment(),
             &wrong_media_identity,
             &init_segment,
             &contributions,
@@ -1653,7 +1657,7 @@ mod tests {
             handle(0x21),
             &operation,
             terminal.statement().issuer(),
-            &custody_envelope,
+            custody_envelope.manifest().content_key_commitment(),
             &media_identity,
             &wrong_init,
             &contributions,
@@ -1680,7 +1684,7 @@ mod tests {
             handle(0x21),
             &operation,
             terminal.statement().issuer(),
-            &custody_envelope,
+            custody_envelope.manifest().content_key_commitment(),
             &media_identity,
             &init_segment,
             &[
@@ -1702,7 +1706,7 @@ mod tests {
             handle(0x21),
             &operation,
             terminal.statement().issuer(),
-            &custody_envelope,
+            custody_envelope.manifest().content_key_commitment(),
             &media_identity,
             &init_segment,
             &[contributions[0].clone(), contributions[0].clone()],
@@ -1764,7 +1768,7 @@ mod tests {
             handle(0x21),
             &operation,
             terminal.statement().issuer(),
-            &custody_envelope,
+            custody_envelope.manifest().content_key_commitment(),
             &media_identity,
             &init_segment,
             &contributions,
@@ -1918,7 +1922,7 @@ mod tests {
                 prepared,
                 &operation,
                 terminal.statement().issuer(),
-                &custody_envelope,
+                custody_envelope.manifest().content_key_commitment(),
                 &media_identity,
                 &init_segment,
                 &contributions,

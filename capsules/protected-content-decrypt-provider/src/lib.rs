@@ -482,7 +482,9 @@ impl DecryptProvider {
                 let wrapped_content_key = match reconstruct_content_key_into_decrypt_session(
                     &DecryptSessionReconstructionInputsV1 {
                         operation,
-                        envelope: request.custody_envelope().expect("validated envelope"),
+                        content_key_commitment: request
+                            .content_key_commitment()
+                            .expect("validated content key commitment"),
                         contributions: request
                             .signed_node_contributions()
                             .expect("validated contributions"),
@@ -1019,7 +1021,7 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use elastos_protected_content_contracts::{
-        CustodyEnvelopeV1, ProtectedContentBindingV1, RightsActionV1, RuntimeReleaseAuditIdV1,
+        Digest32, ProtectedContentBindingV1, RightsActionV1, RuntimeReleaseAuditIdV1,
         SignedNodeContributionV1, SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1,
         TerminalReceiptIssuerKey,
     };
@@ -1118,7 +1120,7 @@ mod tests {
     struct OpenRequestInputs<'a> {
         prepared_handle: HandleBytes,
         operation: &'a SignedRuntimeReleaseOperationV1,
-        envelope: &'a CustodyEnvelopeV1,
+        content_key_commitment: Digest32,
         media_identity: &'a CencFmp4MediaIdentityV1,
         init_segment: &'a [u8],
         contributions: &'a [SignedNodeContributionV1],
@@ -1136,7 +1138,7 @@ mod tests {
                     .to_bytes(),
             )
             .unwrap(),
-            inputs.envelope,
+            inputs.content_key_commitment,
             inputs.media_identity,
             inputs.init_segment,
             inputs.contributions,
@@ -1216,10 +1218,27 @@ mod tests {
             make_signed_node_contribution(&operation, &envelope, runtime_seed, 2, NOW),
         ];
         let terminal = make_signed_terminal_receipt(&operation, &contributions, 0x61, NOW);
+        let wrong_commitment_open = open_request(OpenRequestInputs {
+            prepared_handle: *prepared.prepared_recipient_handle().unwrap(),
+            operation: &operation,
+            content_key_commitment: Digest32::new([0xee; 32]),
+            media_identity: &media_identity,
+            init_segment: &init_segment,
+            contributions: &contributions,
+            terminal_receipt: &terminal,
+            issuer_seed: 0x61,
+        });
+        let wrong_commitment = typed_response(
+            provider.handle_line_at(&wrap_request(request_json(&wrong_commitment_open)), NOW + 7),
+        );
+        assert_eq!(
+            wrong_commitment.failure_code().unwrap(),
+            ProviderFailureCodeV1::BindingMismatch
+        );
         let open = open_request(OpenRequestInputs {
             prepared_handle: *prepared.prepared_recipient_handle().unwrap(),
             operation: &operation,
-            envelope: &envelope,
+            content_key_commitment: envelope.manifest().content_key_commitment(),
             media_identity: &media_identity,
             init_segment: &init_segment,
             contributions: &contributions,
@@ -1394,7 +1413,7 @@ mod tests {
         let open = open_request(OpenRequestInputs {
             prepared_handle: *prepared_a.prepared_recipient_handle().unwrap(),
             operation: &operation,
-            envelope: &envelope,
+            content_key_commitment: envelope.manifest().content_key_commitment(),
             media_identity: &media_identity,
             init_segment: &init_segment,
             contributions: &contributions,
@@ -1413,7 +1432,7 @@ mod tests {
         let conflicting_open = open_request(OpenRequestInputs {
             prepared_handle: [0x11; 32],
             operation: &operation,
-            envelope: &envelope,
+            content_key_commitment: envelope.manifest().content_key_commitment(),
             media_identity: &media_identity,
             init_segment: &init_segment,
             contributions: &contributions,
@@ -1497,7 +1516,7 @@ mod tests {
             &wrap_request(request_json(&open_request(OpenRequestInputs {
                 prepared_handle: *prepared.prepared_recipient_handle().unwrap(),
                 operation: &operation,
-                envelope: &envelope,
+                content_key_commitment: envelope.manifest().content_key_commitment(),
                 media_identity: &media_identity,
                 init_segment: &init_segment,
                 contributions: &contributions,
@@ -1578,7 +1597,7 @@ mod tests {
         let mut tampered_json = request_json(&open_request(OpenRequestInputs {
             prepared_handle: *prepared.prepared_recipient_handle().unwrap(),
             operation: &operation,
-            envelope: &envelope,
+            content_key_commitment: envelope.manifest().content_key_commitment(),
             media_identity: &media_identity,
             init_segment: &init_segment,
             contributions: &contributions,

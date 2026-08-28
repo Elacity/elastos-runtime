@@ -9,12 +9,11 @@
 use std::fmt;
 
 use elastos_protected_content_contracts::{
-    ContractError, CustodyEnvelopeV1, Digest32, EncryptedContentIdentityV1, KeyEnvelopeIdentityV1,
-    ProfileIdentityV1, ProtectedContentBindingV1, RecipientKeyIdentityV1,
-    RecipientPublicKeyBytesV1, RightsActionV1, RightsPolicyIdentityV1, RuntimeOperationIssuerKeyV1,
-    RuntimeReleaseAuditIdV1, RuntimeSessionBindingV1, SignedNodeContributionV1,
-    SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
-    WalletAddress,
+    ContractError, Digest32, EncryptedContentIdentityV1, KeyEnvelopeIdentityV1, ProfileIdentityV1,
+    ProtectedContentBindingV1, RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, RightsActionV1,
+    RightsPolicyIdentityV1, RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1,
+    RuntimeSessionBindingV1, SignedNodeContributionV1, SignedRuntimeReleaseOperationV1,
+    SignedTerminalReceiptV1, TerminalReceiptIssuerKey, WalletAddress,
 };
 use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, DecryptProviderRequestV1, DecryptProviderResponseStatusV1,
@@ -93,7 +92,7 @@ pub struct RuntimeOpenViewerSessionInput<'a> {
     pub prepared_recipient: &'a RuntimePreparedRecipient,
     pub signed_runtime_release_operation: &'a SignedRuntimeReleaseOperationV1,
     pub expected_terminal_issuer: TerminalReceiptIssuerKey,
-    pub custody_envelope: &'a CustodyEnvelopeV1,
+    pub content_key_commitment: Digest32,
     pub media_identity: &'a CencFmp4MediaIdentityV1,
     pub protected_init_segment: &'a [u8],
     pub signed_node_contributions: &'a [SignedNodeContributionV1],
@@ -770,7 +769,7 @@ pub async fn open_viewer_session(
         *input.prepared_recipient.prepared_recipient_handle(),
         input.signed_runtime_release_operation,
         input.expected_terminal_issuer,
-        input.custody_envelope,
+        input.content_key_commitment,
         input.media_identity,
         input.protected_init_segment,
         input.signed_node_contributions,

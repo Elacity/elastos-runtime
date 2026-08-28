@@ -176,7 +176,7 @@ pub struct DecryptedPayloadMetadataV1 {
 pub struct AuthenticatedPayloadDecryptInputsV1<'a> {
     pub expected_encrypted_content_identity: &'a EncryptedContentIdentityV1,
     pub operation: &'a AuthenticatedRuntimeReleaseOperationV1,
-    pub envelope: &'a CustodyEnvelopeV1,
+    pub content_key_commitment: Digest32,
     pub contributions: &'a [SignedNodeContributionV1],
     pub terminal_receipt: &'a SignedTerminalReceiptV1,
     pub expected_terminal_issuer: TerminalReceiptIssuerKey,
@@ -254,7 +254,7 @@ pub fn decrypt_payload_to_staging_writer_from_authenticated_operation_v1<
     }
     let content_key = crate::reconstruct_content_key_from_authenticated_operation(
         inputs.operation,
-        inputs.envelope,
+        inputs.content_key_commitment,
         inputs.contributions,
         inputs.terminal_receipt,
         inputs.expected_terminal_issuer,
@@ -1483,7 +1483,11 @@ mod tests {
             AuthenticatedPayloadDecryptInputsV1 {
                 expected_encrypted_content_identity: fixture.sealed.encrypted_content_identity(),
                 operation: &fixture.operation,
-                envelope: fixture.sealed.custody_envelope(),
+                content_key_commitment: fixture
+                    .sealed
+                    .custody_envelope()
+                    .manifest()
+                    .content_key_commitment(),
                 contributions: &fixture.contributions,
                 terminal_receipt: &fixture.terminal,
                 expected_terminal_issuer: fixture.terminal_issuer,
@@ -1516,7 +1520,11 @@ mod tests {
             AuthenticatedPayloadDecryptInputsV1 {
                 expected_encrypted_content_identity: fixture.sealed.encrypted_content_identity(),
                 operation: &fixture.operation,
-                envelope: fixture.sealed.custody_envelope(),
+                content_key_commitment: fixture
+                    .sealed
+                    .custody_envelope()
+                    .manifest()
+                    .content_key_commitment(),
                 contributions: &fixture.contributions,
                 terminal_receipt: &fixture.terminal,
                 expected_terminal_issuer: fixture.terminal_issuer,
@@ -1548,7 +1556,11 @@ mod tests {
                         .sealed
                         .encrypted_content_identity(),
                     operation: &wrong_operation,
-                    envelope: fixture.sealed.custody_envelope(),
+                    content_key_commitment: fixture
+                        .sealed
+                        .custody_envelope()
+                        .manifest()
+                        .content_key_commitment(),
                     contributions: &fixture.contributions,
                     terminal_receipt: &fixture.terminal,
                     expected_terminal_issuer: fixture.terminal_issuer,
@@ -1571,7 +1583,11 @@ mod tests {
                         .sealed
                         .encrypted_content_identity(),
                     operation: &fixture.operation,
-                    envelope: fixture.sealed.custody_envelope(),
+                    content_key_commitment: fixture
+                        .sealed
+                        .custody_envelope()
+                        .manifest()
+                        .content_key_commitment(),
                     contributions: &fixture.contributions[..1],
                     terminal_receipt: &fixture.terminal,
                     expected_terminal_issuer: fixture.terminal_issuer,
@@ -1598,7 +1614,11 @@ mod tests {
                         .sealed
                         .encrypted_content_identity(),
                     operation: &fixture.operation,
-                    envelope: fixture.sealed.custody_envelope(),
+                    content_key_commitment: fixture
+                        .sealed
+                        .custody_envelope()
+                        .manifest()
+                        .content_key_commitment(),
                     contributions: &duplicate_contributions,
                     terminal_receipt: &fixture.terminal,
                     expected_terminal_issuer: fixture.terminal_issuer,
@@ -1637,7 +1657,11 @@ mod tests {
                         .sealed
                         .encrypted_content_identity(),
                     operation: &fixture.operation,
-                    envelope: fixture.sealed.custody_envelope(),
+                    content_key_commitment: fixture
+                        .sealed
+                        .custody_envelope()
+                        .manifest()
+                        .content_key_commitment(),
                     contributions: &mixed_contributions,
                     terminal_receipt: &fixture.terminal,
                     expected_terminal_issuer: fixture.terminal_issuer,

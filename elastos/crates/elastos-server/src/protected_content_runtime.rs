@@ -145,8 +145,6 @@ pub(crate) const RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE: &str =
     "Runtime custody open is denied before purchase";
 pub(crate) const RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody decrypt provider is unavailable";
-pub(crate) const RUNTIME_CUSTODY_VIEWER_ENVELOPE_UNAVAILABLE_MESSAGE: &str =
-    "Runtime custody viewer envelope is unavailable";
 pub(crate) const RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody viewer release approval is unavailable";
 pub(crate) const RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE: &str =
@@ -3902,7 +3900,6 @@ pub(crate) async fn publish_runtime_custody_library_object(
             if mint_id == mint_draft.mint_id() => {}
         _ => anyhow::bail!("Runtime custody availability record failed"),
     }
-    persist_runtime_open_envelope(data_dir, mint_draft.mint_id(), &protected.envelope)?;
     let facts = runtime_custody_library_publish_facts(&input, &mint_draft, &content_id, &evidence);
     mint_journal
         .mark_intent_completed(mint_intent.request_id(), mint_draft.mint_id())
@@ -5207,8 +5204,6 @@ pub(crate) async fn open_runtime_custody_viewer(
             .ok_or_else(|| anyhow::anyhow!("local Runtime device signing key is missing"))?;
     let runtime_issuer = RuntimeOperationIssuerKeyV1::new(device_key.verifying_key().to_bytes())
         .map_err(|_| anyhow::anyhow!("local Runtime device signing key is invalid"))?;
-    let envelope = load_runtime_open_envelope(data_dir, mint_id)?
-        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_VIEWER_ENVELOPE_UNAVAILABLE_MESSAGE))?;
     let (media_identity, protected_init) = fetch_runtime_custody_open_media(
         registry.as_ref(),
         &purchase.cid,
@@ -5490,7 +5485,7 @@ pub(crate) async fn open_runtime_custody_viewer(
             prepared_recipient: &prepared,
             signed_runtime_release_operation: &operation,
             expected_terminal_issuer,
-            custody_envelope: &envelope,
+            content_key_commitment: mint.draft().content_key_commitment(),
             media_identity: &media_identity,
             protected_init_segment: &protected_init,
             signed_node_contributions: &contributions,
@@ -5771,36 +5766,6 @@ pub(crate) async fn close_runtime_custody_viewer(
             RuntimeViewerSessionCloseResult::AlreadyAbsent => "already_absent",
         },
     }))
-}
-
-fn persist_runtime_open_envelope(
-    data_dir: &Path,
-    mint_id: Digest32,
-    envelope: &CustodyEnvelopeV1,
-) -> anyhow::Result<()> {
-    // Owner-only Runtime open material, not a mint journal or Library record.
-    // Reconstruct still needs the exact envelope identity until custody-node
-    // reassembly exists. Never return these bytes to capsules.
-    let bytes = envelope
-        .canonical_bytes()
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_VIEWER_ENVELOPE_UNAVAILABLE_MESSAGE))?;
-    write_owner_only_bytes(&runtime_open_envelope_path(data_dir, mint_id), &bytes)
-}
-
-fn load_runtime_open_envelope(
-    data_dir: &Path,
-    mint_id: Digest32,
-) -> anyhow::Result<Option<CustodyEnvelopeV1>> {
-    let path = runtime_open_envelope_path(data_dir, mint_id);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = fs::read(&path)
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_VIEWER_ENVELOPE_UNAVAILABLE_MESSAGE))?;
-    Ok(Some(
-        CustodyEnvelopeV1::from_canonical_bytes(&bytes)
-            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_VIEWER_ENVELOPE_UNAVAILABLE_MESSAGE))?,
-    ))
 }
 
 pub(crate) fn persist_runtime_custody_listing(
@@ -6623,13 +6588,6 @@ fn audit_nonce_bytes(audit_request_id: RuntimeReleaseAuditIdV1) -> [u8; 16] {
     let mut nonce = [0u8; 16];
     nonce.copy_from_slice(&audit_request_id.digest().as_bytes()[..16]);
     nonce
-}
-
-fn runtime_open_envelope_path(data_dir: &Path, mint_id: Digest32) -> PathBuf {
-    data_dir
-        .join(RUNTIME_OPEN_MATERIAL_ROOT)
-        .join(hex::encode(mint_id.as_bytes()))
-        .join("envelope.bin")
 }
 
 fn runtime_listing_path(data_dir: &Path, mint_id: Digest32) -> PathBuf {

@@ -150,7 +150,7 @@ mod tests {
             handle(0x21),
             &operation,
             terminal.statement().issuer(),
-            &custody_envelope,
+            custody_envelope.manifest().content_key_commitment(),
             &media_identity,
             &init_segment,
             &[
@@ -304,7 +304,7 @@ mod tests {
                 handle(0x21),
                 &operation,
                 terminal.statement().issuer(),
-                &custody_envelope,
+                custody_envelope.manifest().content_key_commitment(),
                 &media_identity,
                 &init_segment,
                 &[
