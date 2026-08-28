@@ -57,21 +57,23 @@ use x_wing::TryKeyInit as _;
 use super::{
     invoke_json_provider, list_unresolved_runtime_releases, load_or_persist_runtime_mint_intent,
     load_runtime_custody_composition, load_runtime_custody_composition_config,
-    prepare_runtime_custody_library_source, publish_runtime_custody_library_object,
-    publish_runtime_custody_library_source, register_inactive_custody_provider,
-    register_inactive_custody_runtime_provider_target, register_protect_provider,
-    register_protected_content_decrypt_provider, resolve_runtime_rights_policy,
-    runtime_mint_journal, runtime_protected_content_id, runtime_purchase_path, source_media_digest,
-    unresolved_release_audit_records, write_owner_only_bytes, InactiveCustodyProvider,
-    RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile,
-    RuntimeCustodyLibraryPublishInput, RuntimeCustodyLibrarySourceInput,
-    RuntimeCustodyPurchaseAccessEvidenceRecord, RuntimeCustodyPurchaseProgress,
-    RuntimeCustodyPurchaseRecord, RuntimeCustodyPurchaseStageRecord, RuntimeCustodyRegistryAdapter,
+    load_runtime_protected_content_chain_provider_config, prepare_runtime_custody_library_source,
+    publish_runtime_custody_library_object, publish_runtime_custody_library_source,
+    register_inactive_custody_provider, register_inactive_custody_runtime_provider_target,
+    register_protect_provider, register_protected_content_decrypt_provider,
+    resolve_runtime_rights_policy, runtime_mint_journal, runtime_protected_content_id,
+    runtime_purchase_path, source_media_digest, unresolved_release_audit_records,
+    write_owner_only_bytes, InactiveCustodyProvider, RuntimeCustodyComposition,
+    RuntimeCustodyCompositionConfigFile, RuntimeCustodyLibraryPublishInput,
+    RuntimeCustodyLibrarySourceInput, RuntimeCustodyPurchaseAccessEvidenceRecord,
+    RuntimeCustodyPurchaseProgress, RuntimeCustodyPurchaseRecord,
+    RuntimeCustodyPurchaseStageRecord, RuntimeCustodyRegistryAdapter,
     RuntimeCustodyRouteBindingConfig, RuntimeCustodyRouteTransportConfig,
     RuntimeCustodyTerminalPurchaseRecord, RuntimeDecryptRegistryAdapter,
     RuntimeLibraryMediaPreparation, CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1,
     CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID, CUSTODY_PROVIDER_OPERATIONS,
-    CUSTODY_PROVIDER_VERSION, MEDIA_PROVIDER_ID, PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
+    CUSTODY_PROVIDER_VERSION, MAX_CHAIN_PROVIDER_CONFIG_BYTES, MEDIA_PROVIDER_ID,
+    PROTECTED_CONTENT_CHAIN_PROVIDER_CONFIG_SCHEMA_V1, PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
     PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS, PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION,
     PROTECTED_CONTENT_PROVIDER_STATUS_TIMEOUT, PROTECT_PROVIDER_ID, PROTECT_PROVIDER_OPERATIONS,
     PROTECT_PROVIDER_PROCESS_ID, PROTECT_PROVIDER_VERSION,
@@ -3634,6 +3636,37 @@ fn custody_composition_config_path(data_dir: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
+fn chain_provider_config_path(data_dir: &Path) -> PathBuf {
+    protected_content_root(data_dir).join("chain-provider.json")
+}
+
+#[cfg(unix)]
+fn write_chain_provider_config(data_dir: &Path, config: &Value) {
+    owner_only_dir(&protected_content_root(data_dir));
+    fs::write(
+        chain_provider_config_path(data_dir),
+        serde_json::to_vec(config).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(
+        chain_provider_config_path(data_dir),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+fn test_chain_provider_config() -> Value {
+    json!({
+        "schema": PROTECTED_CONTENT_CHAIN_PROVIDER_CONFIG_SCHEMA_V1,
+        "protected_content_network": {
+            "id": "esc-mainnet",
+            "rpc_url": "https://private-primary.example.invalid"
+        }
+    })
+}
+
+#[cfg(unix)]
 fn canonical_b64<T: CanonicalContract>(value: &T) -> String {
     base64::engine::general_purpose::STANDARD.encode(value.canonical_bytes().unwrap())
 }
@@ -4714,6 +4747,147 @@ fn runtime_custody_composition_rejects_noncanonical_json_and_base64_and_bad_peer
         .expect("expected noncanonical did:key rejection")
         .to_string()
         .contains("did:key"));
+}
+
+#[cfg(unix)]
+#[test]
+fn protected_content_chain_config_loads_owner_only_file_and_accepts_missing_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing_data_dir = temp.path().join("missing");
+    owner_only_dir(&missing_data_dir);
+    assert!(
+        load_runtime_protected_content_chain_provider_config(&missing_data_dir)
+            .unwrap()
+            .is_none()
+    );
+
+    let data_dir = temp.path().join("configured");
+    owner_only_dir(&data_dir);
+    let config = test_chain_provider_config();
+    write_chain_provider_config(&data_dir, &config);
+
+    let loaded = load_runtime_protected_content_chain_provider_config(&data_dir)
+        .unwrap()
+        .expect("owner-only Chain config");
+    assert_eq!(
+        loaded.protected_content_network(),
+        &config["protected_content_network"]
+    );
+    assert!(config.get("protected_content_runtime_issuer").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn protected_content_chain_config_rejects_unknown_empty_oversized_or_invalid_content() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+
+    let mut unknown = test_chain_provider_config();
+    unknown["protected_content_runtime_issuer"] = json!("0xoperator-cannot-set-this");
+    write_chain_provider_config(&data_dir, &unknown);
+    assert!(load_runtime_protected_content_chain_provider_config(&data_dir).is_err());
+
+    for invalid in [
+        Vec::new(),
+        b"{".to_vec(),
+        serde_json::to_vec(&json!({
+            "schema": "wrong-schema",
+            "protected_content_network": {}
+        }))
+        .unwrap(),
+        serde_json::to_vec(&json!({
+            "schema": PROTECTED_CONTENT_CHAIN_PROVIDER_CONFIG_SCHEMA_V1,
+            "protected_content_network": []
+        }))
+        .unwrap(),
+        vec![b'x'; MAX_CHAIN_PROVIDER_CONFIG_BYTES + 1],
+    ] {
+        fs::write(chain_provider_config_path(&data_dir), invalid).unwrap();
+        fs::set_permissions(
+            chain_provider_config_path(&data_dir),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(load_runtime_protected_content_chain_provider_config(&data_dir).is_err());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn protected_content_chain_config_rejects_unsafe_or_nonregular_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = test_chain_provider_config();
+
+    let mode_data_dir = temp.path().join("mode");
+    owner_only_dir(&mode_data_dir);
+    write_chain_provider_config(&mode_data_dir, &config);
+    fs::set_permissions(
+        chain_provider_config_path(&mode_data_dir),
+        fs::Permissions::from_mode(0o640),
+    )
+    .unwrap();
+    assert!(load_runtime_protected_content_chain_provider_config(&mode_data_dir).is_err());
+
+    fs::set_permissions(
+        chain_provider_config_path(&mode_data_dir),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::set_permissions(
+        protected_content_root(&mode_data_dir),
+        fs::Permissions::from_mode(0o750),
+    )
+    .unwrap();
+    assert!(load_runtime_protected_content_chain_provider_config(&mode_data_dir).is_err());
+
+    let directory_data_dir = temp.path().join("directory");
+    owner_only_dir(&directory_data_dir);
+    owner_only_dir(&protected_content_root(&directory_data_dir));
+    owner_only_dir(&chain_provider_config_path(&directory_data_dir));
+    assert!(load_runtime_protected_content_chain_provider_config(&directory_data_dir).is_err());
+
+    let symlink_data_dir = temp.path().join("symlink");
+    owner_only_dir(&symlink_data_dir);
+    owner_only_dir(&protected_content_root(&symlink_data_dir));
+    let symlink_target = temp.path().join("chain-provider-target.json");
+    fs::write(&symlink_target, serde_json::to_vec(&config).unwrap()).unwrap();
+    fs::set_permissions(&symlink_target, fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(
+        &symlink_target,
+        chain_provider_config_path(&symlink_data_dir),
+    )
+    .unwrap();
+    assert!(load_runtime_protected_content_chain_provider_config(&symlink_data_dir).is_err());
+
+    let symlink_parent_data_dir = temp.path().join("symlink-parent");
+    owner_only_dir(&symlink_parent_data_dir);
+    let symlink_parent_target = temp.path().join("protected-content-target");
+    owner_only_dir(&symlink_parent_target);
+    let symlink_parent_config = symlink_parent_target.join("chain-provider.json");
+    fs::write(&symlink_parent_config, serde_json::to_vec(&config).unwrap()).unwrap();
+    fs::set_permissions(&symlink_parent_config, fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(
+        &symlink_parent_target,
+        protected_content_root(&symlink_parent_data_dir),
+    )
+    .unwrap();
+    assert!(
+        load_runtime_protected_content_chain_provider_config(&symlink_parent_data_dir).is_err()
+    );
+
+    let hard_link_data_dir = temp.path().join("hard-link");
+    owner_only_dir(&hard_link_data_dir);
+    owner_only_dir(&protected_content_root(&hard_link_data_dir));
+    let hard_link_source = temp.path().join("chain-provider-source.json");
+    fs::write(&hard_link_source, serde_json::to_vec(&config).unwrap()).unwrap();
+    fs::set_permissions(&hard_link_source, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::hard_link(
+        &hard_link_source,
+        chain_provider_config_path(&hard_link_data_dir),
+    )
+    .unwrap();
+    assert!(load_runtime_protected_content_chain_provider_config(&hard_link_data_dir).is_err());
 }
 
 #[cfg(unix)]

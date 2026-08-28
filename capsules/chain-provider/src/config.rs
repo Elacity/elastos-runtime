@@ -103,6 +103,36 @@ pub(super) fn validate_networks(networks: &[ChainNetwork]) -> Result<(), String>
     Ok(())
 }
 
+pub(super) fn validate_protected_content_network(network: &ChainNetwork) -> Result<(), String> {
+    validate_networks(std::slice::from_ref(network))?;
+    if network.kind != ChainKind::EvmJsonRpc {
+        return Err("protected-content network must use EVM JSON-RPC".to_string());
+    }
+    if network.rights_methods.len() != 1
+        || network.rights_methods[0]
+            .protected_content_policies
+            .is_empty()
+    {
+        return Err("protected-content network requires one configured rights method".to_string());
+    }
+    if network.protected_content_creator_mint.is_none() {
+        return Err("protected-content network requires creator mint configuration".to_string());
+    }
+    if network.protected_content_market.is_none() {
+        return Err("protected-content network requires market configuration".to_string());
+    }
+    Ok(())
+}
+
+pub(super) fn network_has_protected_content_source(network: &ChainNetwork) -> bool {
+    network.protected_content_creator_mint.is_some()
+        || network.protected_content_market.is_some()
+        || network
+            .rights_methods
+            .iter()
+            .any(|method| !method.protected_content_policies.is_empty())
+}
+
 pub(super) fn validate_rights_methods(network: &ChainNetwork) -> Result<(), String> {
     let mut seen_actions = std::collections::BTreeSet::new();
     for method in &network.rights_methods {
@@ -182,11 +212,13 @@ fn validate_protected_content_policy_sources(
         ));
     }
     let mut unique_urls = std::collections::BTreeSet::new();
+    let mut unique_origins = std::collections::BTreeSet::new();
     for url in &policy.evidence_rpc_urls {
-        let canonical = canonicalize_protected_content_evidence_rpc_url(&network.id, url)?;
-        if !unique_urls.insert(canonical) {
+        let (canonical_url, canonical_origin) =
+            canonicalize_protected_content_evidence_rpc_url(&network.id, url)?;
+        if !unique_urls.insert(canonical_url) || !unique_origins.insert(canonical_origin) {
             return Err(format!(
-                "network {} action {:?} configures duplicate protected-content evidence RPC URLs",
+                "network {} action {:?} configures duplicate or shared-origin protected-content evidence RPC URLs",
                 network.id, policy.action
             ));
         }
@@ -197,10 +229,15 @@ fn validate_protected_content_policy_sources(
 fn canonicalize_protected_content_evidence_rpc_url(
     network_id: &str,
     url: &str,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let trimmed = url.trim();
     validate_rpc_url_value(network_id, trimmed, false)?;
-    Ok(trimmed.trim_end_matches('/').to_string())
+    let parsed =
+        reqwest::Url::parse(trimmed).map_err(|_| format!("invalid RPC URL for {network_id}"))?;
+    Ok((
+        parsed.as_str().trim_end_matches('/').to_string(),
+        parsed.origin().ascii_serialization(),
+    ))
 }
 
 fn validate_rpc_url_value(

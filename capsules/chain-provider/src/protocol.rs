@@ -69,6 +69,7 @@ impl ChainNetwork {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RightsMethod {
     pub(super) id: String,
     pub(super) contract: String,

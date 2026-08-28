@@ -57,6 +57,7 @@ const PROTECTED_CONTENT_UNBOUND_CONTENT_ID_SELECTOR: [u8; 4] = [0xca, 0xd8, 0x82
 
 struct ChainProvider {
     networks: Vec<ChainNetwork>,
+    protected_content_network_id: Option<String>,
     client: reqwest::blocking::Client,
     node_lifecycle_state_path: PathBuf,
     node_lifecycle_state: NodeLifecycleStateFile,
@@ -84,6 +85,7 @@ impl ChainProvider {
             };
         Self {
             networks: default_networks(),
+            protected_content_network_id: None,
             client,
             node_lifecycle_state_path,
             node_lifecycle_state,
@@ -250,23 +252,17 @@ impl ChainProvider {
 
     fn init(&mut self, config: Value) -> Response {
         let extra = config.get("extra").unwrap_or(&config);
-        let next_networks = if let Some(networks) = config
+        let configured_networks = config
             .get("extra")
             .and_then(|extra| extra.get("networks"))
-            .or_else(|| config.get("networks"))
-        {
-            match serde_json::from_value::<Vec<ChainNetwork>>(networks.clone()) {
-                Ok(networks) => {
-                    if let Err(err) = validate_networks(&networks) {
-                        return Response::error("invalid_config", &err);
-                    }
-                    Some(networks)
-                }
-                Err(err) => return Response::error("invalid_config", &err.to_string()),
-            }
-        } else {
-            None
-        };
+            .or_else(|| config.get("networks"));
+        let configured_protected_content_network = extra.get("protected_content_network");
+        if configured_networks.is_some() && configured_protected_content_network.is_some() {
+            return Response::error(
+                "invalid_config",
+                "full networks and protected-content network configuration are ambiguous",
+            );
+        }
         let next_supervisor = if let Some(supervisor) = extra.get("node_supervisor") {
             match serde_json::from_value::<NodeSupervisorConfig>(supervisor.clone()) {
                 Ok(supervisor) => {
@@ -291,9 +287,80 @@ impl ChainProvider {
         } else {
             None
         };
+        let (next_networks, next_protected_content_network_id) =
+            if let Some(networks) = configured_networks {
+                if self.protected_content_network_id.is_some() {
+                    return Response::error(
+                        "invalid_config",
+                        "protected-content network configuration is already active",
+                    );
+                }
+                let networks = match serde_json::from_value::<Vec<ChainNetwork>>(networks.clone()) {
+                    Ok(networks) => networks,
+                    Err(err) => return Response::error("invalid_config", &err.to_string()),
+                };
+                if let Err(err) = validate_networks(&networks) {
+                    return Response::error("invalid_config", &err);
+                }
+                if networks.iter().any(network_has_protected_content_source) {
+                    return Response::error(
+                        "invalid_config",
+                        "protected-content sources require protected_content_network",
+                    );
+                }
+                (Some(networks), None)
+            } else if let Some(network) = configured_protected_content_network {
+                if next_runtime_issuer.is_none() {
+                    return Response::error(
+                        "invalid_config",
+                        "protected-content network requires a Runtime operation issuer",
+                    );
+                }
+                if self.protected_content_network_id.is_some()
+                    || self
+                        .networks
+                        .iter()
+                        .any(network_has_protected_content_source)
+                {
+                    return Response::error(
+                        "invalid_config",
+                        "a protected-content network source is already configured",
+                    );
+                }
+                let network = match serde_json::from_value::<ChainNetwork>(network.clone()) {
+                    Ok(network) => network,
+                    Err(err) => return Response::error("invalid_config", &err.to_string()),
+                };
+                if let Err(err) = validate_protected_content_network(&network) {
+                    return Response::error("invalid_config", &err);
+                }
+                let matching_indices = self
+                    .networks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, current)| (current.id == network.id).then_some(index))
+                    .collect::<Vec<_>>();
+                if matching_indices.len() > 1 {
+                    return Response::error(
+                        "invalid_config",
+                        "protected-content network matches more than one configured network",
+                    );
+                }
+                let network_id = network.id.clone();
+                let mut networks = self.networks.clone();
+                if let Some(index) = matching_indices.first().copied() {
+                    networks[index] = network;
+                } else {
+                    networks.push(network);
+                }
+                (Some(networks), Some(network_id))
+            } else {
+                (None, self.protected_content_network_id.clone())
+            };
         if let Some(networks) = next_networks {
             self.networks = networks;
         }
+        self.protected_content_network_id = next_protected_content_network_id;
         if let Some(supervisor) = next_supervisor {
             self.node_supervisor = supervisor;
         }

@@ -133,6 +133,63 @@ fn model_provider_bridge_config(data_dir: &Path) -> anyhow::Result<provider::Bri
     })
 }
 
+fn derive_protected_content_runtime_issuer(
+    device_key: &[u8; 32],
+) -> anyhow::Result<elastos_protected_content_contracts::RuntimeOperationIssuerKeyV1> {
+    let (runtime_signing_key, _) = elastos_identity::derive_did(device_key);
+    elastos_protected_content_contracts::RuntimeOperationIssuerKeyV1::new(
+        runtime_signing_key.verifying_key().to_bytes(),
+    )
+    .map_err(|_| anyhow::anyhow!("active Runtime operation issuer is invalid"))
+}
+
+fn chain_provider_bridge_config_without_protected_network(
+    runtime_operation_issuer: &elastos_protected_content_contracts::RuntimeOperationIssuerKeyV1,
+) -> provider::BridgeProviderConfig {
+    provider::BridgeProviderConfig {
+        extra: serde_json::json!({
+            "protected_content_runtime_issuer": format!(
+                "0x{}",
+                hex::encode(runtime_operation_issuer.as_bytes())
+            )
+        }),
+        ..Default::default()
+    }
+}
+
+fn chain_provider_bridge_config(
+    data_dir: &Path,
+    runtime_operation_issuer: &elastos_protected_content_contracts::RuntimeOperationIssuerKeyV1,
+) -> anyhow::Result<provider::BridgeProviderConfig> {
+    let protected_content_config =
+        elastos_server::protected_content_runtime::load_runtime_protected_content_chain_provider_config(
+            data_dir,
+        )?;
+    let mut config =
+        chain_provider_bridge_config_without_protected_network(runtime_operation_issuer);
+    if let Some(protected_content_config) = protected_content_config {
+        config.extra["protected_content_network"] =
+            protected_content_config.protected_content_network().clone();
+    }
+    Ok(config)
+}
+
+fn chain_provider_protected_startup_config(
+    data_dir: &Path,
+    runtime_operation_issuer: &elastos_protected_content_contracts::RuntimeOperationIssuerKeyV1,
+) -> Option<provider::BridgeProviderConfig> {
+    match chain_provider_bridge_config(data_dir, runtime_operation_issuer) {
+        Ok(config) if config.extra.get("protected_content_network").is_some() => Some(config),
+        Ok(_) => None,
+        Err(_) => {
+            tracing::warn!(
+                "Protected-content Chain configuration is invalid; protected operations remain unavailable"
+            );
+            None
+        }
+    }
+}
+
 fn load_model_provider_operator_offers(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
     let config_path = model_provider_config_path(data_dir);
     let metadata = match fs::symlink_metadata(&config_path) {
@@ -729,6 +786,7 @@ async fn setup_server_infrastructure_impl(
     }
     let device_key = elastos_identity::load_or_create_device_key(&data_dir)?;
     let device_key_hex = hex::encode(device_key.as_ref());
+    let protected_content_runtime_issuer = derive_protected_content_runtime_issuer(&device_key)?;
     let mut provider_cid = "sha256:unavailable".to_string();
     let verify_provider_binary = |name: &str, path: &std::path::Path| -> anyhow::Result<()> {
         let checksum = crate::setup::verify_installed_component_binary(&data_dir, name, path)?;
@@ -1078,21 +1136,56 @@ async fn setup_server_infrastructure_impl(
     }
 
     match binaries::resolve_verified_native_provider_binary("chain-provider") {
-        Ok(Some(path)) => match provider::ProviderBridge::spawn(&path, Default::default()).await {
-            Ok(bridge) => {
-                let chain_provider: Arc<dyn provider::Provider> = Arc::new(
-                    provider::CapsuleProvider::with_scheme(Arc::new(bridge), "chain"),
-                );
-                if let Err(e) = provider_registry
-                    .register_sub_provider("chain", chain_provider)
-                    .await
-                {
-                    tracing::warn!("Failed to register elastos://chain sub-provider: {}", e);
+        Ok(Some(path)) => {
+            let protected_chain_config = chain_provider_protected_startup_config(
+                &data_dir,
+                &protected_content_runtime_issuer,
+            );
+            let generic_chain_config = chain_provider_bridge_config_without_protected_network(
+                &protected_content_runtime_issuer,
+            );
+            match provider::ProviderBridge::spawn(&path, generic_chain_config).await {
+                Ok(bridge) => {
+                    let bridge = Arc::new(bridge);
+                    let mut transport_ready = true;
+                    if let Some(config) = protected_chain_config {
+                        match bridge
+                            .request(provider::bridge::ProviderRequest::Init { config })
+                            .await
+                        {
+                            Ok(provider::bridge::ProviderResponse::Ok { .. }) => {}
+                            Ok(provider::bridge::ProviderResponse::Error { .. }) => {
+                                tracing::warn!(
+                                    "Protected-content Chain configuration was rejected; protected operations remain unavailable"
+                                );
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "Chain provider transport failed while applying protected-content configuration"
+                                );
+                                let _ = bridge.shutdown().await;
+                                transport_ready = false;
+                            }
+                        }
+                    }
+                    if transport_ready {
+                        let chain_provider: Arc<dyn provider::Provider> =
+                            Arc::new(provider::CapsuleProvider::with_scheme(bridge, "chain"));
+                        if let Err(e) = provider_registry
+                            .register_sub_provider("chain", chain_provider)
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to register elastos://chain sub-provider: {}",
+                                e
+                            );
+                        }
+                        tracing::info!("chain-provider capsule from {}", path.display());
+                    }
                 }
-                tracing::info!("chain-provider capsule from {}", path.display());
+                Err(e) => tracing::warn!("Failed to spawn chain-provider: {}", e),
             }
-            Err(e) => tracing::warn!("Failed to spawn chain-provider: {}", e),
-        },
+        }
         Ok(None) => {}
         Err(e) => tracing::warn!("Skipping chain-provider due to verification failure: {}", e),
     }
@@ -1342,30 +1435,22 @@ async fn setup_server_infrastructure_impl(
                 "Skipping protected-content-decrypt-provider due to verification failure: {}",
                 e
             );
+        } else if let Err(e) =
+            elastos_server::protected_content_runtime::register_protected_content_decrypt_provider(
+                &provider_registry,
+                &path,
+                protected_content_runtime_issuer,
+            )
+            .await
+        {
+            tracing::warn!(
+                "Failed to register Runtime-only protected-content decrypt provider: {}",
+                e
+            );
         } else {
-            let (runtime_signing_key, _) = elastos_identity::derive_did(&device_key);
-            let runtime_operation_issuer =
-                elastos_protected_content_contracts::RuntimeOperationIssuerKeyV1::new(
-                    runtime_signing_key.verifying_key().to_bytes(),
-                )
-                .map_err(|_| anyhow::anyhow!("active Runtime operation issuer is invalid"))?;
-            if let Err(e) =
-                elastos_server::protected_content_runtime::register_protected_content_decrypt_provider(
-                    &provider_registry,
-                    &path,
-                    runtime_operation_issuer,
-                )
-                .await
-            {
-                tracing::warn!(
-                    "Failed to register Runtime-only protected-content decrypt provider: {}",
-                    e
-                );
-            } else {
-                tracing::info!(
-                    "protected-content-decrypt-provider registered on Runtime-only target protected-content-decrypt; provisional decrypt-provider remains on elastos://decrypt"
-                );
-            }
+            tracing::info!(
+                "protected-content-decrypt-provider registered on Runtime-only target protected-content-decrypt; provisional decrypt-provider remains on elastos://decrypt"
+            );
         }
     }
 
@@ -2095,6 +2180,62 @@ mod tests {
         #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    fn write_protected_content_chain_config(tempdir: &TempDir) -> serde_json::Value {
+        let protected_content_dir = tempdir.path().join("protected-content");
+        fs::create_dir(&protected_content_dir).unwrap();
+        fs::set_permissions(&protected_content_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let network = serde_json::json!({
+            "id": "esc-mainnet",
+            "display_name": "Protected ESC",
+            "kind": "evm_json_rpc",
+            "chain_id": 20,
+            "native_symbol": "ELA",
+            "provider": "operator",
+            "mainnet": true,
+            "explorer_url": null,
+            "rpc_url": "https://private-primary.example.invalid",
+            "rights_methods": [{
+                "id": "has_access_by_content_id",
+                "contract": "0x0000000000000000000000000000000000000001",
+                "abi": "has_access_by_content_id_address_bytes16",
+                "selector": "0x12345678",
+                "protected_content_policies": [{
+                    "action": "view",
+                    "evidence_rpc_urls": [
+                        "https://private-rights-a.example.invalid",
+                        "https://private-rights-b.example.invalid"
+                    ]
+                }]
+            }],
+            "protected_content_creator_mint": {
+                "ledger": "0x0000000000000000000000000000000000000022",
+                "pay_token": "0x0000000000000000000000000000000000000033",
+                "asset_created_emitter": "0x0000000000000000000000000000000000000044",
+                "abi": "elacity_mint_v1"
+            },
+            "protected_content_market": {
+                "authority_gateway_contract": "0x00000000000000000000000000000000000000aa",
+                "evidence_rpc_urls": [
+                    "https://private-market-a.example.invalid",
+                    "https://private-market-b.example.invalid"
+                ]
+            }
+        });
+        let path = protected_content_dir.join("chain-provider.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": elastos_server::protected_content_runtime::PROTECTED_CONTENT_CHAIN_PROVIDER_CONFIG_SCHEMA_V1,
+                "protected_content_network": network
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        network
     }
 
     #[cfg(unix)]
@@ -2941,6 +3082,78 @@ mod tests {
         );
         assert_eq!(config.extra["offers"], serde_json::json!([]));
         assert!(!model_provider_config_path(tempdir.path()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chain_provider_bridge_config_uses_derived_issuer_and_private_network() {
+        let tempdir = TempDir::new().unwrap();
+        let network = write_protected_content_chain_config(&tempdir);
+        let device_key = [0x5a; 32];
+        let issuer = derive_protected_content_runtime_issuer(&device_key).unwrap();
+        let (expected_signing_key, _) = elastos_identity::derive_did(&device_key);
+
+        let config = chain_provider_bridge_config(tempdir.path(), &issuer).unwrap();
+
+        assert_eq!(
+            issuer.as_bytes(),
+            &expected_signing_key.verifying_key().to_bytes()
+        );
+        assert_eq!(
+            config.extra["protected_content_runtime_issuer"],
+            format!("0x{}", hex::encode(issuer.as_bytes()))
+        );
+        assert_eq!(config.extra["protected_content_network"], network);
+        let private_file =
+            fs::read_to_string(tempdir.path().join("protected-content/chain-provider.json"))
+                .unwrap();
+        assert!(!private_file.contains("protected_content_runtime_issuer"));
+        assert!(!private_file.contains(&hex::encode(issuer.as_bytes())));
+    }
+
+    #[test]
+    fn chain_provider_bridge_config_accepts_missing_private_network() {
+        let tempdir = TempDir::new().unwrap();
+        let issuer = derive_protected_content_runtime_issuer(&[0x5b; 32]).unwrap();
+
+        let config = chain_provider_bridge_config(tempdir.path(), &issuer).unwrap();
+
+        assert!(config.extra.get("protected_content_network").is_none());
+        assert_eq!(
+            config.extra["protected_content_runtime_issuer"],
+            format!("0x{}", hex::encode(issuer.as_bytes()))
+        );
+        assert!(!tempdir.path().join("protected-content").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_private_chain_config_keeps_only_generic_chain_init_and_redacts_values() {
+        let tempdir = TempDir::new().unwrap();
+        let network = write_protected_content_chain_config(&tempdir);
+        let path = tempdir.path().join("protected-content/chain-provider.json");
+        let mut invalid: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        invalid["unexpected"] = serde_json::json!("private-secret.example.invalid");
+        fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let issuer = derive_protected_content_runtime_issuer(&[0x5c; 32]).unwrap();
+
+        let error = chain_provider_bridge_config(tempdir.path(), &issuer).unwrap_err();
+        let protected = chain_provider_protected_startup_config(tempdir.path(), &issuer);
+        let generic = chain_provider_bridge_config_without_protected_network(&issuer);
+
+        assert!(!error.to_string().contains("private-secret.example.invalid"));
+        assert!(!error
+            .to_string()
+            .contains(network["rpc_url"].as_str().unwrap()));
+        assert!(protected.is_none());
+        assert!(generic.extra.get("protected_content_network").is_none());
+        assert!(generic.extra.get("networks").is_none());
+        assert_eq!(
+            generic.extra["protected_content_runtime_issuer"],
+            format!("0x{}", hex::encode(issuer.as_bytes()))
+        );
     }
 
     #[test]

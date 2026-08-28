@@ -108,6 +108,10 @@ pub(crate) const RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE: &str =
 pub(crate) const RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE: &str =
     "Runtime custody mint was settled before draft persistence";
 const PROTECTED_CONTENT_ROOT: &str = "protected-content";
+const CHAIN_PROVIDER_CONFIG_FILE: &str = "protected-content/chain-provider.json";
+pub const PROTECTED_CONTENT_CHAIN_PROVIDER_CONFIG_SCHEMA_V1: &str =
+    "elastos.protected-content.chain-provider-config/v1";
+const MAX_CHAIN_PROVIDER_CONFIG_BYTES: usize = 64 * 1024;
 const CUSTODY_COMPOSITION_CONFIG_FILE: &str = "protected-content/custody-composition.json";
 const RUNTIME_MINT_JOURNAL_ROOT: &str = "protected-content/runtime-mint";
 const RUNTIME_OPEN_MATERIAL_ROOT: &str = "protected-content/runtime-open";
@@ -230,6 +234,24 @@ impl ResolvedRuntimeRightsPolicy {
 struct ChainProtectedContentPolicyResponse {
     schema: String,
     policy_body: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeProtectedContentChainProviderConfigFile {
+    schema: String,
+    protected_content_network: Value,
+}
+
+#[derive(Clone)]
+pub struct RuntimeProtectedContentChainProviderConfig {
+    protected_content_network: Value,
+}
+
+impl RuntimeProtectedContentChainProviderConfig {
+    pub fn protected_content_network(&self) -> &Value {
+        &self.protected_content_network
+    }
 }
 
 #[derive(Deserialize)]
@@ -1437,59 +1459,114 @@ fn invalid_custody_composition_config(reason: impl std::fmt::Display) -> anyhow:
     anyhow::anyhow!("protected-content custody composition config is missing or unsafe: {reason}")
 }
 
+fn invalid_chain_provider_config(reason: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("protected-content Chain provider config is missing or unsafe: {reason}")
+}
+
 fn validate_owner_only_protected_content_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    validate_owner_only_protected_content_dir_with_error(
+        data_dir,
+        invalid_custody_composition_config,
+    )
+}
+
+fn validate_owner_only_protected_content_dir_with_error(
+    data_dir: &Path,
+    error_fn: fn(String) -> anyhow::Error,
+) -> anyhow::Result<PathBuf> {
     let root = protected_content_root(data_dir);
-    let metadata = fs::symlink_metadata(&root).map_err(|_| {
-        invalid_custody_composition_config("protected-content parent is unavailable")
-    })?;
+    let metadata = fs::symlink_metadata(&root)
+        .map_err(|_| error_fn("protected-content parent is unavailable".to_string()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         anyhow::bail!(
             "{}",
-            invalid_custody_composition_config(
-                "protected-content parent must be an owner-only directory"
-            )
+            error_fn("protected-content parent must be an owner-only directory".to_string())
         );
     }
     validate_owner_only_metadata_with_error(
         "protected-content parent",
         &metadata,
         false,
-        invalid_custody_composition_config,
+        error_fn,
     )?;
     Ok(root)
 }
 
-#[cfg(unix)]
-fn read_owner_only_config_bytes(path: &Path, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
-    let mut file = options.open(path).map_err(|_| {
-        invalid_custody_composition_config("custody-composition file is unavailable")
-    })?;
-    let metadata = file.metadata().map_err(|_| {
-        invalid_custody_composition_config("custody-composition file metadata is unavailable")
-    })?;
-    if !metadata.is_file() {
+fn runtime_chain_provider_config_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(CHAIN_PROVIDER_CONFIG_FILE)
+}
+
+pub fn load_runtime_protected_content_chain_provider_config(
+    data_dir: &Path,
+) -> anyhow::Result<Option<RuntimeProtectedContentChainProviderConfig>> {
+    let config_path = runtime_chain_provider_config_path(data_dir);
+    match fs::symlink_metadata(&config_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            anyhow::bail!(
+                "{}",
+                invalid_chain_provider_config("config file is unavailable")
+            )
+        }
+    }
+    validate_owner_only_protected_content_dir_with_error(data_dir, invalid_chain_provider_config)?;
+    let bytes = read_owner_only_protected_content_config_bytes(
+        &config_path,
+        MAX_CHAIN_PROVIDER_CONFIG_BYTES,
+        "Chain provider config file",
+        invalid_chain_provider_config,
+    )?;
+    let config: RuntimeProtectedContentChainProviderConfigFile = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid_chain_provider_config("config JSON is invalid"))?;
+    if config.schema != PROTECTED_CONTENT_CHAIN_PROVIDER_CONFIG_SCHEMA_V1
+        || !config.protected_content_network.is_object()
+    {
         anyhow::bail!(
             "{}",
-            invalid_custody_composition_config("custody-composition file must be a regular file")
+            invalid_chain_provider_config("config fields are invalid")
         );
     }
-    validate_owner_only_metadata_with_error(
+    Ok(Some(RuntimeProtectedContentChainProviderConfig {
+        protected_content_network: config.protected_content_network,
+    }))
+}
+
+#[cfg(unix)]
+fn read_owner_only_config_bytes(path: &Path, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+    read_owner_only_protected_content_config_bytes(
+        path,
+        max_bytes,
         "custody-composition file",
-        &metadata,
-        true,
         invalid_custody_composition_config,
-    )?;
+    )
+}
+
+#[cfg(unix)]
+fn read_owner_only_protected_content_config_bytes(
+    path: &Path,
+    max_bytes: usize,
+    label: &str,
+    error_fn: fn(String) -> anyhow::Error,
+) -> anyhow::Result<Vec<u8>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options
+        .open(path)
+        .map_err(|_| error_fn(format!("{label} is unavailable")))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| error_fn(format!("{label} metadata is unavailable")))?;
+    if !metadata.is_file() {
+        anyhow::bail!("{}", error_fn(format!("{label} must be a regular file")));
+    }
+    validate_owner_only_metadata_with_error(label, &metadata, true, error_fn)?;
     let mut bytes = Vec::with_capacity(max_bytes.min(4096));
     std::io::Read::by_ref(&mut file)
         .take((max_bytes + 1) as u64)
         .read_to_end(&mut bytes)?;
     if bytes.is_empty() || bytes.len() > max_bytes {
-        anyhow::bail!(
-            "{}",
-            invalid_custody_composition_config("custody-composition file exceeds bounds")
-        );
+        anyhow::bail!("{}", error_fn(format!("{label} exceeds bounds")));
     }
     Ok(bytes)
 }
@@ -1497,6 +1574,17 @@ fn read_owner_only_config_bytes(path: &Path, max_bytes: usize) -> anyhow::Result
 #[cfg(not(unix))]
 fn read_owner_only_config_bytes(path: &Path, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
     let _ = (path, max_bytes);
+    anyhow::bail!("owner-only protected-content config validation is unsupported on this platform")
+}
+
+#[cfg(not(unix))]
+fn read_owner_only_protected_content_config_bytes(
+    path: &Path,
+    max_bytes: usize,
+    label: &str,
+    error_fn: fn(String) -> anyhow::Error,
+) -> anyhow::Result<Vec<u8>> {
+    let _ = (path, max_bytes, label, error_fn);
     anyhow::bail!("owner-only protected-content config validation is unsupported on this platform")
 }
 
