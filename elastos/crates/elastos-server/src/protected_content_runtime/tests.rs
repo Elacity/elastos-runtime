@@ -21,13 +21,14 @@ use elastos_protected_content_runtime::{
     bind_buy, cancel_prepared_recipient, close_viewer_session, open_viewer_session,
     prepare_recipient, read_viewer_media_part, resolve_runtime_mint_selected_nodes,
     PersistedRuntimeMint, RuntimeContentAvailabilityRequirement, RuntimeCustodyProvider,
-    RuntimeDecryptProvider, RuntimeMintCoordinator, RuntimeMintCoordinatorOutcome,
-    RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal, RuntimeMintNodeBinding,
-    RuntimeMintNodeReceipt, RuntimeMintSelectedNode, RuntimeOpenError,
-    RuntimeOpenViewerSessionInput, RuntimeProtectedContentPurchaseIntent, RuntimeProviderCallError,
-    RuntimePurchaseEffectAuthority, RuntimeReleaseCoordinator, RuntimeReleaseCoordinatorOutcome,
-    RuntimeReleaseJournal, RuntimeReleaseTerminalResult, RuntimeRightsProvider,
-    RuntimeSelectedProvider, RuntimeVerifiedPurchaseEffect, RuntimeViewerSession,
+    RuntimeDecryptProvider, RuntimeMediaPreparationRecord, RuntimeMediaPreparationState,
+    RuntimeMintCoordinator, RuntimeMintCoordinatorOutcome, RuntimeMintDraft, RuntimeMintIntent,
+    RuntimeMintJournal, RuntimeMintNodeBinding, RuntimeMintNodeReceipt, RuntimeMintSelectedNode,
+    RuntimeOpenError, RuntimeOpenViewerSessionInput, RuntimeProtectedContentPurchaseIntent,
+    RuntimeProviderCallError, RuntimePurchaseEffectAuthority, RuntimeReleaseCoordinator,
+    RuntimeReleaseCoordinatorOutcome, RuntimeReleaseJournal, RuntimeReleaseTerminalResult,
+    RuntimeRightsProvider, RuntimeSelectedProvider, RuntimeVerifiedPurchaseEffect,
+    RuntimeViewerSession,
 };
 use elastos_runtime::provider::{
     bridge::ProviderConfig, CapsuleProvider, Provider, ProviderBridge, ProviderCarrierInvoker,
@@ -50,19 +51,21 @@ use x_wing::TryKeyInit as _;
 use super::{
     invoke_json_provider, list_unresolved_runtime_releases, load_or_persist_runtime_mint_intent,
     load_runtime_custody_composition, load_runtime_custody_composition_config,
-    publish_runtime_custody_library_object, register_inactive_custody_provider,
+    prepare_runtime_custody_library_source, publish_runtime_custody_library_object,
+    publish_runtime_custody_library_source, register_inactive_custody_provider,
     register_inactive_custody_sub_provider, register_protect_provider,
     resolve_runtime_rights_policy, runtime_mint_journal, runtime_protected_content_id,
-    runtime_purchase_path, unresolved_release_audit_records, write_owner_only_bytes,
-    InactiveCustodyProvider, RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile,
-    RuntimeCustodyLibraryPublishInput, RuntimeCustodyPurchaseAccessEvidenceRecord,
+    runtime_purchase_path, source_media_digest, unresolved_release_audit_records,
+    write_owner_only_bytes, InactiveCustodyProvider, RuntimeCustodyComposition,
+    RuntimeCustodyCompositionConfigFile, RuntimeCustodyLibraryPublishInput,
+    RuntimeCustodyLibrarySourceInput, RuntimeCustodyPurchaseAccessEvidenceRecord,
     RuntimeCustodyPurchaseProgress, RuntimeCustodyPurchaseRecord,
     RuntimeCustodyPurchaseStageRecord, RuntimeCustodyRegistryAdapter,
     RuntimeCustodyRouteBindingConfig, RuntimeCustodyRouteTransportConfig,
     RuntimeCustodyTerminalPurchaseRecord, RuntimeDecryptRegistryAdapter,
-    CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1, CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID,
-    PROTECT_PROVIDER_ID, RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE,
-    RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE,
+    RuntimeLibraryMediaPreparation, CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1,
+    CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID, MEDIA_PROVIDER_ID, PROTECT_PROVIDER_ID,
+    RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE, RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE,
     RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE,
     RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE, RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE,
     RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE, RUNTIME_PROVIDER_ID,
@@ -124,6 +127,21 @@ struct ProcessChainEvidenceProvider {
     expected_request: RightsProviderRequestV1,
     requests: Mutex<Vec<Value>>,
     has_access: bool,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum TestMediaPreparationResponse {
+    Prepared,
+    SettledFailure,
+    UnknownSettlement,
+}
+
+#[cfg(unix)]
+struct TestMediaPreparationProvider {
+    staging_root: PathBuf,
+    requests: Mutex<Vec<String>>,
+    response: TestMediaPreparationResponse,
 }
 
 #[cfg(unix)]
@@ -3172,6 +3190,79 @@ impl Provider for ProcessChainEvidenceProvider {
             evidence_now,
             self.has_access,
         )))
+    }
+}
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl Provider for TestMediaPreparationProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "test media provider is invoke-only".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec![MEDIA_PROVIDER_ID]
+    }
+
+    fn name(&self) -> &'static str {
+        MEDIA_PROVIDER_ID
+    }
+
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        let operation_id = request
+            .get("operation_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::Provider("missing operation id".to_string()))?
+            .to_string();
+        if request["op"] != "prepare"
+            || request["_runtime_invocation"]["source"] != RUNTIME_PROVIDER_ID
+            || request["_runtime_invocation"]["target"] != MEDIA_PROVIDER_ID
+            || request["_runtime_invocation"]["op"] != "prepare"
+            || request["_runtime_invocation"]["transport"] != "runtime-local-provider-plane"
+            || request["_runtime_invocation"]["carrier"] != Value::Null
+        {
+            return Err(ProviderError::Provider(
+                "media preparation invocation authority is invalid".to_string(),
+            ));
+        }
+        self.requests.lock().await.push(operation_id.clone());
+        match self.response {
+            TestMediaPreparationResponse::Prepared => {
+                let prepared_root = self.staging_root.join(operation_id).join("prepared");
+                owner_only_dir(&prepared_root);
+                owner_only_dir(&prepared_root.join("segments"));
+                let (init, segments) = clear_media_components(0x61);
+                fs::write(prepared_root.join("init.mp4"), init).unwrap();
+                fs::set_permissions(
+                    prepared_root.join("init.mp4"),
+                    fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+                for (index, segment) in segments.iter().enumerate() {
+                    let path = prepared_root
+                        .join("segments")
+                        .join(format!("{index:08}.m4s"));
+                    fs::write(&path, segment).unwrap();
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                Ok(ok_provider_response(json!({
+                    "schema": "elastos.media-provider.prepared-media/v1",
+                    "mime_type": "video/mp4",
+                    "codecs": "avc1.640028",
+                })))
+            }
+            TestMediaPreparationResponse::SettledFailure => Ok(json!({
+                "status": "error",
+                "code": "internal_error",
+                "message": "media preparation failed",
+                "data": {"operation_settled": true},
+            })),
+            TestMediaPreparationResponse::UnknownSettlement => Err(ProviderError::Provider(
+                "media preparation transport failed".to_string(),
+            )),
+        }
     }
 }
 
@@ -6412,6 +6503,170 @@ async fn runtime_resolve_rights_policy_recomputes_identity_and_rejects_mismatch(
     }
 }
 
+#[cfg(unix)]
+fn media_preparation_source_input(
+    root: &Path,
+    principal_id: &str,
+) -> RuntimeCustodyLibrarySourceInput {
+    RuntimeCustodyLibrarySourceInput {
+        object_uri: "localhost://Users/test/Documents/source.mp4".to_string(),
+        principal_id: principal_id.to_string(),
+        source_file_path: root.join("source.mp4"),
+        wallet_account_id: "wallet-account-1".to_string(),
+        copies: "0x1".to_string(),
+        price: "0x5".to_string(),
+        source_storage: "protected_principal_root".to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn setup_media_preparation_root(temp: &Path) -> (PathBuf, PathBuf) {
+    let data_dir = temp.join("data");
+    owner_only_dir(&data_dir);
+    let protected_root = data_dir.join("protected-content");
+    owner_only_dir(&protected_root);
+    let provider_root = protected_root.join("media-provider");
+    owner_only_dir(&provider_root);
+    let staging_root = provider_root.join("staging");
+    owner_only_dir(&staging_root);
+    let source_path = temp.join("source.mp4");
+    fs::write(&source_path, b"bounded source media").unwrap();
+    fs::set_permissions(&source_path, fs::Permissions::from_mode(0o600)).unwrap();
+    (data_dir, staging_root)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_media_preparation_reuses_exact_settled_output_and_rejects_source_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let (data_dir, staging_root) = setup_media_preparation_root(temp.path());
+    let input = media_preparation_source_input(temp.path(), "person:local:media-retry");
+    let provider = Arc::new(TestMediaPreparationProvider {
+        staging_root: staging_root.clone(),
+        requests: Mutex::new(Vec::new()),
+        response: TestMediaPreparationResponse::Prepared,
+    });
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider(MEDIA_PROVIDER_ID, provider.clone())
+        .await
+        .unwrap();
+
+    let first = prepare_runtime_custody_library_source(&data_dir, registry.as_ref(), &input)
+        .await
+        .expect("first preparation must settle");
+    assert!(matches!(first, RuntimeLibraryMediaPreparation::Prepared(_)));
+    let second = prepare_runtime_custody_library_source(&data_dir, registry.as_ref(), &input)
+        .await
+        .expect("exact retry must reuse prepared output");
+    assert!(matches!(
+        second,
+        RuntimeLibraryMediaPreparation::Prepared(_)
+    ));
+    assert_eq!(provider.requests.lock().await.len(), 1);
+
+    let operation_id = provider.requests.lock().await[0].clone();
+    fs::remove_file(
+        staging_root
+            .join(operation_id)
+            .join("prepared/segments/00000001.m4s"),
+    )
+    .unwrap();
+    let corrupt = prepare_runtime_custody_library_source(&data_dir, registry.as_ref(), &input)
+        .await
+        .expect_err("corrupt settled output must fail closed without redispatch");
+    assert!(corrupt.to_string().contains("output is invalid"));
+    assert_eq!(provider.requests.lock().await.len(), 1);
+
+    fs::write(&input.source_file_path, b"changed source media").unwrap();
+    let error = prepare_runtime_custody_library_source(&data_dir, registry.as_ref(), &input)
+        .await
+        .expect_err("changed source must conflict with durable authority");
+    assert!(error
+        .to_string()
+        .contains("conflicts with existing authority"));
+    assert_eq!(provider.requests.lock().await.len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_media_preparation_unknown_settlement_never_redispatches() {
+    let temp = tempfile::tempdir().unwrap();
+    let (data_dir, staging_root) = setup_media_preparation_root(temp.path());
+    let input = media_preparation_source_input(temp.path(), "person:local:media-unknown");
+    let request_id = RuntimeMintIntent::request_id_for_source(
+        &input.principal_id,
+        &input.object_uri,
+        &input.source_storage,
+    )
+    .unwrap();
+    let provider = Arc::new(TestMediaPreparationProvider {
+        staging_root,
+        requests: Mutex::new(Vec::new()),
+        response: TestMediaPreparationResponse::UnknownSettlement,
+    });
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider(MEDIA_PROVIDER_ID, provider.clone())
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let error = prepare_runtime_custody_library_source(&data_dir, registry.as_ref(), &input)
+            .await
+            .expect_err("unknown settlement must require reconciliation");
+        assert!(error.to_string().contains("settlement reconciliation"));
+    }
+    assert_eq!(provider.requests.lock().await.len(), 1);
+    assert_eq!(
+        runtime_mint_journal(&data_dir)
+            .load_media_preparation(request_id)
+            .unwrap()
+            .state(),
+        RuntimeMediaPreparationState::EffectPending
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_media_preparation_settled_failure_is_terminal_and_cleans_staging() {
+    let temp = tempfile::tempdir().unwrap();
+    let (data_dir, staging_root) = setup_media_preparation_root(temp.path());
+    let input = media_preparation_source_input(temp.path(), "person:local:media-failed");
+    let request_id = RuntimeMintIntent::request_id_for_source(
+        &input.principal_id,
+        &input.object_uri,
+        &input.source_storage,
+    )
+    .unwrap();
+    let provider = Arc::new(TestMediaPreparationProvider {
+        staging_root: staging_root.clone(),
+        requests: Mutex::new(Vec::new()),
+        response: TestMediaPreparationResponse::SettledFailure,
+    });
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider(MEDIA_PROVIDER_ID, provider.clone())
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let error = prepare_runtime_custody_library_source(&data_dir, registry.as_ref(), &input)
+            .await
+            .expect_err("settled provider failure must remain terminal");
+        assert!(error.to_string().contains("media preparation failed"));
+    }
+    assert_eq!(provider.requests.lock().await.len(), 1);
+    assert_eq!(
+        runtime_mint_journal(&data_dir)
+            .load_media_preparation(request_id)
+            .unwrap()
+            .state(),
+        RuntimeMediaPreparationState::Failed
+    );
+    assert!(fs::read_dir(staging_root).unwrap().next().is_none());
+}
+
 #[tokio::test]
 async fn runtime_custody_library_publish_fails_closed_without_composition() {
     let temp = tempfile::tempdir().unwrap();
@@ -6723,6 +6978,53 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
         .await
         .unwrap();
     registry.unregister_sub_provider("content").await.unwrap();
+
+    let media_provider_root = data_dir.join("protected-content/media-provider");
+    owner_only_dir(&media_provider_root);
+    owner_only_dir(&media_provider_root.join("staging"));
+    let source_file_path = temp.path().join("completed-source.mp4");
+    fs::write(&source_file_path, b"completed source media").unwrap();
+    fs::set_permissions(&source_file_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let source = RuntimeCustodyLibrarySourceInput {
+        object_uri: "localhost://Users/test/Documents/media".to_string(),
+        principal_id: "person:local:runtime-custody-pre-dispatch-retry".to_string(),
+        source_file_path: source_file_path.clone(),
+        wallet_account_id: "wallet-account-1".to_string(),
+        copies: "0x1".to_string(),
+        price: "0x5".to_string(),
+        source_storage: "plain_localhost_root".to_string(),
+    };
+    let preparation = RuntimeMediaPreparationRecord::new(
+        &source.principal_id,
+        &source.object_uri,
+        &source.source_storage,
+        source_media_digest(&source_file_path).unwrap(),
+        MEDIA_PROVIDER_ID,
+    )
+    .unwrap();
+    let preparation_receipt = digest(0xd1);
+    let journal = runtime_mint_journal(&data_dir);
+    journal.persist_media_preparation(&preparation).unwrap();
+    journal
+        .mark_media_preparation_effect_started(preparation.request_id())
+        .unwrap();
+    journal
+        .mark_media_preparation_prepared(preparation.request_id(), preparation_receipt)
+        .unwrap();
+    journal
+        .mark_media_preparation_consumed(
+            preparation.request_id(),
+            preparation_receipt,
+            published.mint_id,
+        )
+        .unwrap();
+    let (source_replay, source_replay_input) =
+        publish_runtime_custody_library_source(&data_dir, registry.clone(), source)
+            .await
+            .expect("consumed media preparation must replay without provider dispatch");
+    assert_eq!(source_replay.mint_id, published.mint_id);
+    assert!(source_replay_input.clear_init_segment.is_empty());
+    assert!(source_replay_input.clear_segments.is_empty());
 
     let replay = publish_runtime_custody_library_object(
         &data_dir,

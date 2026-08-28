@@ -2604,15 +2604,23 @@ pub(crate) async fn runtime_custody_publish_via_gateway(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
     registry: Arc<ProviderRegistry>,
-    input: crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput,
+    input: crate::protected_content_runtime::RuntimeCustodyLibrarySourceInput,
 ) -> anyhow::Result<crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts> {
-    let facts = crate::protected_content_runtime::publish_runtime_custody_library_object(
-        &state.data_dir,
-        Arc::clone(&registry),
-        input.clone(),
+    let (facts, prepared_input) =
+        crate::protected_content_runtime::publish_runtime_custody_library_source(
+            &state.data_dir,
+            Arc::clone(&registry),
+            input,
+        )
+        .await?;
+    runtime_custody_publish_creator_tail_from_facts(
+        state,
+        authority,
+        registry,
+        prepared_input,
+        facts,
     )
-    .await?;
-    runtime_custody_publish_creator_tail_from_facts(state, authority, registry, input, facts).await
+    .await
 }
 
 pub(crate) async fn runtime_custody_buy_via_gateway(

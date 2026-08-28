@@ -32,6 +32,11 @@ const STORE_MAGIC: &[u8; 8] = b"epc-mj05";
 const STORE_DIGEST_DOMAIN: &[u8] = b"elastos/protected-content/runtime-mint-journal/v5";
 const INTENT_MAGIC: &[u8; 8] = b"epc-mi01";
 const INTENT_DIGEST_DOMAIN: &[u8] = b"elastos/protected-content/runtime-mint-intent/v1";
+const MEDIA_PREPARATION_MAGIC: &[u8; 8] = b"epc-mp01";
+const MEDIA_PREPARATION_DIGEST_DOMAIN: &[u8] =
+    b"elastos/protected-content/runtime-media-preparation/v1";
+const MEDIA_PREPARATION_OPERATION_ID_DOMAIN: &[u8] =
+    b"elastos.protected-content.runtime-media-preparation-operation-id/v1";
 const STORE_LOCK_FILE: &str = "runtime-mint-journal.lock";
 const MINT_ID_DOMAIN: &[u8] = b"elastos.protected-content.runtime-mint-id/v4";
 const MINT_INTENT_REQUEST_ID_DOMAIN: &[u8] =
@@ -380,6 +385,149 @@ pub struct RuntimeMintIntent {
     custody_epoch: CustodyEpochIdentityV1,
     custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
     nodes: Vec<RuntimeMintNodeBinding>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeMediaPreparationState {
+    Ready,
+    EffectPending,
+    Prepared,
+    Failed,
+    Consumed,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeMediaPreparationRecord {
+    request_id: Digest32,
+    source_binding_digest: Digest32,
+    source_object_digest: Digest32,
+    operation_id: Digest32,
+    provider_id: String,
+    state: RuntimeMediaPreparationState,
+    output_receipt_digest: Option<Digest32>,
+    consumed_mint_id: Option<Digest32>,
+}
+
+impl fmt::Debug for RuntimeMediaPreparationRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeMediaPreparationRecord")
+            .field("request_id", &self.request_id)
+            .field("source_binding_digest", &self.source_binding_digest)
+            .field("source_object_digest", &self.source_object_digest)
+            .field("operation_id", &self.operation_id)
+            .field("provider_id", &self.provider_id)
+            .field("state", &self.state)
+            .field("output_receipt_digest", &self.output_receipt_digest)
+            .field("consumed_mint_id", &self.consumed_mint_id)
+            .finish()
+    }
+}
+
+impl RuntimeMediaPreparationRecord {
+    pub fn new(
+        principal_id: &str,
+        object_uri: &str,
+        source_storage: &str,
+        source_object_digest: Digest32,
+        provider_id: impl Into<String>,
+    ) -> Result<Self, RuntimeMintJournalError> {
+        validate_intent_text(principal_id)?;
+        let provider_id = provider_id.into();
+        validate_intent_text(&provider_id)?;
+        if source_object_digest == Digest32::new([0; 32]) {
+            return Err(RuntimeMintJournalError::InvalidSelection);
+        }
+        let source_binding_digest = compute_source_binding_digest(object_uri, source_storage);
+        let request_id = compute_mint_intent_request_id(principal_id, source_binding_digest);
+        let operation_id =
+            compute_media_preparation_operation_id(request_id, source_object_digest, &provider_id);
+        let value = Self {
+            request_id,
+            source_binding_digest,
+            source_object_digest,
+            operation_id,
+            provider_id,
+            state: RuntimeMediaPreparationState::Ready,
+            output_receipt_digest: None,
+            consumed_mint_id: None,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), RuntimeMintJournalError> {
+        validate_intent_text(&self.provider_id)?;
+        if self.request_id == Digest32::new([0; 32])
+            || self.source_binding_digest == Digest32::new([0; 32])
+            || self.source_object_digest == Digest32::new([0; 32])
+            || self.operation_id == Digest32::new([0; 32])
+            || self.operation_id
+                != compute_media_preparation_operation_id(
+                    self.request_id,
+                    self.source_object_digest,
+                    &self.provider_id,
+                )
+        {
+            return Err(RuntimeMintJournalError::InvalidSelection);
+        }
+        match self.state {
+            RuntimeMediaPreparationState::Ready
+            | RuntimeMediaPreparationState::EffectPending
+            | RuntimeMediaPreparationState::Failed
+                if self.output_receipt_digest.is_some() || self.consumed_mint_id.is_some() =>
+            {
+                Err(RuntimeMintJournalError::InvalidSelection)
+            }
+            RuntimeMediaPreparationState::Prepared
+                if self.output_receipt_digest.is_none() || self.consumed_mint_id.is_some() =>
+            {
+                Err(RuntimeMintJournalError::InvalidSelection)
+            }
+            RuntimeMediaPreparationState::Consumed
+                if self.output_receipt_digest.is_none() || self.consumed_mint_id.is_none() =>
+            {
+                Err(RuntimeMintJournalError::InvalidSelection)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub const fn request_id(&self) -> Digest32 {
+        self.request_id
+    }
+
+    pub const fn source_object_digest(&self) -> Digest32 {
+        self.source_object_digest
+    }
+
+    pub const fn operation_id(&self) -> Digest32 {
+        self.operation_id
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub const fn state(&self) -> RuntimeMediaPreparationState {
+        self.state
+    }
+
+    pub const fn output_receipt_digest(&self) -> Option<Digest32> {
+        self.output_receipt_digest
+    }
+
+    pub const fn consumed_mint_id(&self) -> Option<Digest32> {
+        self.consumed_mint_id
+    }
+
+    pub fn same_authority_as(&self, other: &Self) -> bool {
+        self.request_id == other.request_id
+            && self.source_binding_digest == other.source_binding_digest
+            && self.source_object_digest == other.source_object_digest
+            && self.operation_id == other.operation_id
+            && self.provider_id == other.provider_id
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1427,6 +1575,117 @@ impl RuntimeMintJournal {
         self.read_intent(request_id)
     }
 
+    pub fn persist_media_preparation(
+        &self,
+        preparation: &RuntimeMediaPreparationRecord,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        self.write_or_replay_media_preparation(preparation)
+    }
+
+    pub fn load_media_preparation(
+        &self,
+        request_id: Digest32,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        self.read_media_preparation(request_id)
+    }
+
+    pub fn mark_media_preparation_effect_started(
+        &self,
+        request_id: Digest32,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut preparation = self.read_media_preparation(request_id)?;
+        match preparation.state {
+            RuntimeMediaPreparationState::Ready => {
+                preparation.state = RuntimeMediaPreparationState::EffectPending;
+                self.write_replace_media_preparation(&preparation)?;
+                Ok(preparation)
+            }
+            _ => Err(RuntimeMintJournalError::Conflict),
+        }
+    }
+
+    pub fn mark_media_preparation_prepared(
+        &self,
+        request_id: Digest32,
+        output_receipt_digest: Digest32,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        if output_receipt_digest == Digest32::new([0; 32]) {
+            return Err(RuntimeMintJournalError::InvalidSelection);
+        }
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut preparation = self.read_media_preparation(request_id)?;
+        match preparation.state {
+            RuntimeMediaPreparationState::EffectPending => {
+                preparation.state = RuntimeMediaPreparationState::Prepared;
+                preparation.output_receipt_digest = Some(output_receipt_digest);
+                self.write_replace_media_preparation(&preparation)?;
+                Ok(preparation)
+            }
+            RuntimeMediaPreparationState::Prepared
+                if preparation.output_receipt_digest == Some(output_receipt_digest) =>
+            {
+                Ok(preparation)
+            }
+            _ => Err(RuntimeMintJournalError::Conflict),
+        }
+    }
+
+    pub fn mark_media_preparation_failed(
+        &self,
+        request_id: Digest32,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut preparation = self.read_media_preparation(request_id)?;
+        match preparation.state {
+            RuntimeMediaPreparationState::EffectPending => {
+                preparation.state = RuntimeMediaPreparationState::Failed;
+                self.write_replace_media_preparation(&preparation)?;
+                Ok(preparation)
+            }
+            RuntimeMediaPreparationState::Failed => Ok(preparation),
+            _ => Err(RuntimeMintJournalError::Conflict),
+        }
+    }
+
+    pub fn mark_media_preparation_consumed(
+        &self,
+        request_id: Digest32,
+        output_receipt_digest: Digest32,
+        mint_id: Digest32,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        if output_receipt_digest == Digest32::new([0; 32]) || mint_id == Digest32::new([0; 32]) {
+            return Err(RuntimeMintJournalError::InvalidSelection);
+        }
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut preparation = self.read_media_preparation(request_id)?;
+        match preparation.state {
+            RuntimeMediaPreparationState::Prepared
+                if preparation.output_receipt_digest == Some(output_receipt_digest) =>
+            {
+                preparation.state = RuntimeMediaPreparationState::Consumed;
+                preparation.consumed_mint_id = Some(mint_id);
+                self.write_replace_media_preparation(&preparation)?;
+                Ok(preparation)
+            }
+            RuntimeMediaPreparationState::Consumed
+                if preparation.output_receipt_digest == Some(output_receipt_digest)
+                    && preparation.consumed_mint_id == Some(mint_id) =>
+            {
+                Ok(preparation)
+            }
+            _ => Err(RuntimeMintJournalError::Conflict),
+        }
+    }
+
     pub fn mark_intent_protect_effect_started(
         &self,
         request_id: Digest32,
@@ -1775,6 +2034,18 @@ impl RuntimeMintJournal {
             .join(format!("intent-{}.tmp", hex::encode(request_id.as_bytes())))
     }
 
+    fn media_preparation_path(&self, request_id: Digest32) -> PathBuf {
+        self.root_dir
+            .join(format!("prepare-{}", hex::encode(request_id.as_bytes())))
+    }
+
+    fn media_preparation_temp_path(&self, request_id: Digest32) -> PathBuf {
+        self.root_dir.join(format!(
+            "prepare-{}.tmp",
+            hex::encode(request_id.as_bytes())
+        ))
+    }
+
     fn write_or_replay(
         &self,
         record: &PersistedRuntimeMint,
@@ -1842,6 +2113,45 @@ impl RuntimeMintJournal {
         sync_directory(&self.root_dir)
     }
 
+    fn write_or_replay_media_preparation(
+        &self,
+        preparation: &RuntimeMediaPreparationRecord,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        let path = self.media_preparation_path(preparation.request_id);
+        if path.exists() {
+            let existing = self.read_media_preparation(preparation.request_id)?;
+            if existing != *preparation {
+                return Err(RuntimeMintJournalError::Conflict);
+            }
+            return Ok(existing);
+        }
+        self.write_replace_media_preparation(preparation)?;
+        Ok(preparation.clone())
+    }
+
+    fn write_replace_media_preparation(
+        &self,
+        preparation: &RuntimeMediaPreparationRecord,
+    ) -> Result<(), RuntimeMintJournalError> {
+        preparation.validate()?;
+        let bytes = encode_media_preparation(preparation)?;
+        let temp_path = self.media_preparation_temp_path(preparation.request_id);
+        let _ = fs::remove_file(&temp_path);
+        let mut temp_file = open_owner_only_temp_file_for_write(&temp_path)?;
+        temp_file
+            .write_all(&bytes)
+            .map_err(|_| RuntimeMintJournalError::Unavailable)?;
+        temp_file
+            .sync_all()
+            .map_err(|_| RuntimeMintJournalError::Unavailable)?;
+        fs::rename(
+            &temp_path,
+            self.media_preparation_path(preparation.request_id),
+        )
+        .map_err(|_| RuntimeMintJournalError::Unavailable)?;
+        sync_directory(&self.root_dir)
+    }
+
     fn read_record(
         &self,
         mint_id: Digest32,
@@ -1890,6 +2200,31 @@ impl RuntimeMintJournal {
             return Err(RuntimeMintJournalError::Corrupt);
         }
         Ok(intent)
+    }
+
+    fn read_media_preparation(
+        &self,
+        request_id: Digest32,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        let path = self.media_preparation_path(request_id);
+        let mut file = open_owner_only_file_for_read(&path).map_err(|error| {
+            if !path.exists() {
+                RuntimeMintJournalError::NotFound
+            } else {
+                error
+            }
+        })?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|_| RuntimeMintJournalError::Unavailable)?;
+        if bytes.len() > MAX_STORE_FILE_BYTES {
+            return Err(RuntimeMintJournalError::Corrupt);
+        }
+        let preparation = decode_media_preparation(&bytes)?;
+        if preparation.request_id != request_id {
+            return Err(RuntimeMintJournalError::Corrupt);
+        }
+        Ok(preparation)
     }
 }
 
@@ -2316,6 +2651,99 @@ fn decode_intent(bytes: &[u8]) -> Result<RuntimeMintIntent, RuntimeMintJournalEr
     Ok(intent)
 }
 
+fn encode_media_preparation(
+    preparation: &RuntimeMediaPreparationRecord,
+) -> Result<Vec<u8>, RuntimeMintJournalError> {
+    preparation.validate()?;
+    let mut payload = Vec::new();
+    push_digest(&mut payload, preparation.request_id);
+    push_digest(&mut payload, preparation.source_binding_digest);
+    push_digest(&mut payload, preparation.source_object_digest);
+    push_digest(&mut payload, preparation.operation_id);
+    push_availability_text(&mut payload, &preparation.provider_id)?;
+    payload.push(match preparation.state {
+        RuntimeMediaPreparationState::Ready => 0,
+        RuntimeMediaPreparationState::EffectPending => 1,
+        RuntimeMediaPreparationState::Prepared => 2,
+        RuntimeMediaPreparationState::Failed => 3,
+        RuntimeMediaPreparationState::Consumed => 4,
+    });
+    if let Some(digest) = preparation.output_receipt_digest {
+        push_digest(&mut payload, digest);
+    }
+    if let Some(mint_id) = preparation.consumed_mint_id {
+        push_digest(&mut payload, mint_id);
+    }
+    let digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(MEDIA_PREPARATION_DIGEST_DOMAIN);
+        hasher.update(&payload);
+        hasher.finalize()
+    };
+    let mut out = Vec::with_capacity(8 + 32 + payload.len());
+    out.extend_from_slice(MEDIA_PREPARATION_MAGIC);
+    out.extend_from_slice(&digest);
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+fn decode_media_preparation(
+    bytes: &[u8],
+) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+    if bytes.len() < 8 + 32 || &bytes[..8] != MEDIA_PREPARATION_MAGIC {
+        return Err(RuntimeMintJournalError::Corrupt);
+    }
+    let expected = &bytes[8..40];
+    let payload = &bytes[40..];
+    let mut hasher = Sha256::new();
+    hasher.update(MEDIA_PREPARATION_DIGEST_DOMAIN);
+    hasher.update(payload);
+    if hasher.finalize().as_slice() != expected {
+        return Err(RuntimeMintJournalError::Corrupt);
+    }
+    let mut off = 0;
+    let request_id = read_digest(payload, &mut off)?;
+    let source_binding_digest = read_digest(payload, &mut off)?;
+    let source_object_digest = read_digest(payload, &mut off)?;
+    let operation_id = read_digest(payload, &mut off)?;
+    let provider_id = read_availability_text(payload, &mut off)?;
+    let state = match read_u8(payload, &mut off)? {
+        0 => RuntimeMediaPreparationState::Ready,
+        1 => RuntimeMediaPreparationState::EffectPending,
+        2 => RuntimeMediaPreparationState::Prepared,
+        3 => RuntimeMediaPreparationState::Failed,
+        4 => RuntimeMediaPreparationState::Consumed,
+        _ => return Err(RuntimeMintJournalError::Corrupt),
+    };
+    let output_receipt_digest = match state {
+        RuntimeMediaPreparationState::Prepared | RuntimeMediaPreparationState::Consumed => {
+            Some(read_digest(payload, &mut off)?)
+        }
+        _ => None,
+    };
+    let consumed_mint_id = match state {
+        RuntimeMediaPreparationState::Consumed => Some(read_digest(payload, &mut off)?),
+        _ => None,
+    };
+    if off != payload.len() {
+        return Err(RuntimeMintJournalError::Corrupt);
+    }
+    let preparation = RuntimeMediaPreparationRecord {
+        request_id,
+        source_binding_digest,
+        source_object_digest,
+        operation_id,
+        provider_id,
+        state,
+        output_receipt_digest,
+        consumed_mint_id,
+    };
+    preparation
+        .validate()
+        .map_err(|_| RuntimeMintJournalError::Corrupt)?;
+    Ok(preparation)
+}
+
 fn read_handle(
     bytes: &[u8],
     off: &mut usize,
@@ -2493,6 +2921,19 @@ fn compute_mint_intent_request_id(principal_id: &str, source_binding_digest: Dig
     hasher.update(principal_id.as_bytes());
     hasher.update([0u8]);
     hasher.update(source_binding_digest.as_bytes());
+    Digest32::new(hasher.finalize().into())
+}
+
+fn compute_media_preparation_operation_id(
+    request_id: Digest32,
+    source_object_digest: Digest32,
+    provider_id: &str,
+) -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(MEDIA_PREPARATION_OPERATION_ID_DOMAIN);
+    hasher.update(request_id.as_bytes());
+    hasher.update(source_object_digest.as_bytes());
+    hasher.update(provider_id.as_bytes());
     Digest32::new(hasher.finalize().into())
 }
 
@@ -3426,6 +3867,72 @@ mod tests {
                 &availability_requirement(),
                 wrong_publisher,
             ),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+    }
+
+    #[test]
+    fn media_preparation_journal_binds_source_provider_and_exact_settlement() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let preparation = RuntimeMediaPreparationRecord::new(
+            "person:local:media-preparation",
+            "localhost://Users/test/Documents/video.mp4",
+            "protected_principal_root",
+            digest(0x81),
+            "media",
+        )
+        .unwrap();
+        let persisted = journal.persist_media_preparation(&preparation).unwrap();
+        assert_eq!(persisted.state(), RuntimeMediaPreparationState::Ready);
+        assert_eq!(persisted.provider_id(), "media");
+
+        let pending = journal
+            .mark_media_preparation_effect_started(preparation.request_id())
+            .unwrap();
+        assert_eq!(pending.state(), RuntimeMediaPreparationState::EffectPending);
+        assert_eq!(
+            journal.mark_media_preparation_effect_started(preparation.request_id()),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+        let receipt = digest(0x82);
+        let prepared = journal
+            .mark_media_preparation_prepared(preparation.request_id(), receipt)
+            .unwrap();
+        assert_eq!(prepared.state(), RuntimeMediaPreparationState::Prepared);
+        assert_eq!(prepared.output_receipt_digest(), Some(receipt));
+        let consumed = journal
+            .mark_media_preparation_consumed(preparation.request_id(), receipt, digest(0x83))
+            .unwrap();
+        assert_eq!(consumed.state(), RuntimeMediaPreparationState::Consumed);
+        assert_eq!(consumed.consumed_mint_id(), Some(digest(0x83)));
+
+        let changed_source = RuntimeMediaPreparationRecord::new(
+            "person:local:media-preparation",
+            "localhost://Users/test/Documents/video.mp4",
+            "protected_principal_root",
+            digest(0x84),
+            "media",
+        )
+        .unwrap();
+        assert_eq!(changed_source.request_id(), preparation.request_id());
+        assert!(!changed_source.same_authority_as(&preparation));
+        assert_eq!(
+            journal.persist_media_preparation(&changed_source),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+        let changed_provider = RuntimeMediaPreparationRecord::new(
+            "person:local:media-preparation",
+            "localhost://Users/test/Documents/video.mp4",
+            "protected_principal_root",
+            digest(0x81),
+            "other-media",
+        )
+        .unwrap();
+        assert_eq!(changed_provider.request_id(), preparation.request_id());
+        assert!(!changed_provider.same_authority_as(&preparation));
+        assert_eq!(
+            journal.persist_media_preparation(&changed_provider),
             Err(RuntimeMintJournalError::Conflict)
         );
     }

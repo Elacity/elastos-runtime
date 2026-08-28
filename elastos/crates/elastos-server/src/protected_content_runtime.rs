@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read as _, Write as _};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
@@ -35,8 +35,9 @@ use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, DecryptProviderRequestOpV1, DecryptProviderRequestV1,
     DecryptProviderResponseV1, ProtectProviderRequestV1, ProtectProviderResponseStatusV1,
     ProtectProviderResponseV1, ProtectionSessionNodeV1, RightsProviderRequestV1,
-    RightsProviderResponseV1, ValidatedCencFmp4MediaSessionLayoutV1, ViewerMediaPartSelectorV1,
-    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
+    RightsProviderResponseV1, ValidatedCencFmp4MediaSessionLayoutV1,
+    ValidatedClearFmp4MediaSessionLayoutV1, ViewerMediaPartSelectorV1,
+    MAX_PROTECT_MEDIA_SEGMENTS_V1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
 };
 use elastos_protected_content_rights::{
     PrivateCustodyRightsRequestV1, CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP,
@@ -47,9 +48,10 @@ use elastos_protected_content_runtime::{
     close_viewer_session_with_result, open_viewer_session, prepare_recipient,
     read_viewer_media_part, resolve_runtime_mint_selected_nodes, PersistedRuntimeMint,
     PersistedRuntimeReleaseOperation, RuntimeContentAvailabilityRequirement,
-    RuntimeDecryptProvider, RuntimeMintConfiguredCustodyProvider, RuntimeMintCoordinator,
-    RuntimeMintCoordinatorError, RuntimeMintCoordinatorOutcome, RuntimeMintCreatorTerminalEvidence,
-    RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal, RuntimeOpenViewerSessionInput,
+    RuntimeDecryptProvider, RuntimeMediaPreparationRecord, RuntimeMediaPreparationState,
+    RuntimeMintConfiguredCustodyProvider, RuntimeMintCoordinator, RuntimeMintCoordinatorError,
+    RuntimeMintCoordinatorOutcome, RuntimeMintCreatorTerminalEvidence, RuntimeMintDraft,
+    RuntimeMintIntent, RuntimeMintJournal, RuntimeOpenViewerSessionInput,
     RuntimePreparedRecipientCancelResult, RuntimeProtectedContentPurchaseIntent,
     RuntimePurchaseEffectAuthority, RuntimeReleaseAuditRecord, RuntimeReleaseCoordinator,
     RuntimeReleaseCoordinatorOutcome, RuntimeReleaseJournal, RuntimeReleaseJournalError,
@@ -72,6 +74,7 @@ use sha2::Digest as _;
 
 pub(crate) const CUSTODY_PROVIDER_ID: &str = "custody";
 pub(crate) const PROTECT_PROVIDER_ID: &str = "protect";
+pub(crate) const MEDIA_PROVIDER_ID: &str = "media";
 pub(crate) const RUNTIME_PROVIDER_ID: &str = "runtime";
 const CONTENT_PROVIDER_ID: &str = "content";
 const PROTECTED_CONTENT_REPLICATION_POLICY: &str = "protected-content-replication/v1";
@@ -131,6 +134,20 @@ const INACTIVE_CUSTODY_ROOT: &str = "protected-content/custody-provider/inactive
 const PROVIDER_INVOCATION_SCHEMA_V1: &str = "elastos.provider.invocation/v1";
 const CHAIN_PROTECTED_CONTENT_POLICY_OP: &str = "resolve_protected_content_policy";
 const CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1: &str = "elastos.chain.protected-content-policy/v1";
+const MEDIA_PROVIDER_PREPARED_MEDIA_SCHEMA_V1: &str = "elastos.media-provider.prepared-media/v1";
+const MEDIA_PROVIDER_OUTPUT_MIME_TYPE_V1: &str = "video/mp4";
+const MEDIA_PROVIDER_OUTPUT_CODECS_V1: &str = "avc1.640028";
+const MEDIA_PROVIDER_INPUT_FILE_NAME: &str = "input.bin";
+const MEDIA_PROVIDER_PREPARED_DIR_NAME: &str = "prepared";
+const MEDIA_PROVIDER_SEGMENTS_DIR_NAME: &str = "segments";
+const MEDIA_PROVIDER_MAX_INPUT_BYTES: u64 = 1024 * 1024 * 1024;
+const MEDIA_PROVIDER_MAX_OUTPUT_PART_BYTES: u64 = 64 * 1024 * 1024;
+const MEDIA_PROVIDER_MAX_SEGMENT_COUNT: usize = 512;
+const MEDIA_PROVIDER_MAX_TOTAL_OUTPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const RUNTIME_MEDIA_PREPARATION_RECEIPT_DOMAIN: &[u8] =
+    b"elastos.protected-content.runtime-media-preparation-receipt/v1";
+const RUNTIME_MEDIA_PREPARATION_RECONCILIATION_MESSAGE: &str =
+    "Runtime custody media preparation requires settlement reconciliation";
 
 pub(crate) struct ResolvedRuntimeRightsPolicy {
     body: RightsPolicyBodyV1,
@@ -152,6 +169,14 @@ impl ResolvedRuntimeRightsPolicy {
 struct ChainProtectedContentPolicyResponse {
     schema: String,
     policy_body: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimePreparedMediaProviderOutput {
+    schema: String,
+    mime_type: String,
+    codecs: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1945,6 +1970,420 @@ fn verify_protected_content_receipt(
     .map_err(|_| anyhow::anyhow!("protected content availability evidence is invalid"))
 }
 
+#[derive(Debug)]
+struct RuntimePreparedLibraryPublish {
+    input: RuntimeCustodyLibraryPublishInput,
+    request_id: Digest32,
+    output_receipt_digest: Digest32,
+    operation_root: PathBuf,
+}
+
+#[derive(Debug)]
+enum RuntimeLibraryMediaPreparation {
+    Prepared(RuntimePreparedLibraryPublish),
+    Consumed {
+        record: RuntimeMediaPreparationRecord,
+        operation_root: PathBuf,
+    },
+}
+
+enum RuntimeMediaProviderPrepareError {
+    Settled,
+    Unknown,
+}
+
+fn runtime_media_staging_root(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join(PROTECTED_CONTENT_ROOT)
+        .join("media-provider")
+        .join("staging")
+}
+
+fn runtime_media_private_state_error(_reason: String) -> anyhow::Error {
+    anyhow::anyhow!("Runtime custody media preparation private state is invalid")
+}
+
+fn validate_runtime_media_staging_root(staging_root: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(staging_root)
+        .map_err(|_| runtime_media_private_state_error(String::new()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("Runtime custody media preparation private state is invalid");
+    }
+    validate_owner_only_metadata_with_error(
+        "media-provider staging root",
+        &metadata,
+        false,
+        runtime_media_private_state_error,
+    )
+}
+
+fn source_media_digest(path: &Path) -> anyhow::Result<Digest32> {
+    let file = open_runtime_media_source_file(path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
+    if metadata.len() == 0 || metadata.len() > MEDIA_PROVIDER_MAX_INPUT_BYTES {
+        anyhow::bail!("Runtime custody media preparation input is invalid");
+    }
+    let mut source = std::io::Read::take(file, MEDIA_PROVIDER_MAX_INPUT_BYTES + 1);
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|_| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
+        if total > MEDIA_PROVIDER_MAX_INPUT_BYTES {
+            anyhow::bail!("Runtime custody media preparation input is invalid");
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if total != metadata.len() {
+        anyhow::bail!("Runtime custody media preparation input is invalid");
+    }
+    Ok(Digest32::new(hasher.finalize().into()))
+}
+
+fn reset_runtime_media_operation_root(operation_root: &Path) -> anyhow::Result<()> {
+    if operation_root.exists() {
+        let metadata = fs::symlink_metadata(operation_root)
+            .map_err(|_| runtime_media_private_state_error(String::new()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!("Runtime custody media preparation private state is invalid");
+        }
+        fs::remove_dir_all(operation_root)
+            .map_err(|_| runtime_media_private_state_error(String::new()))?;
+    }
+    fs::create_dir(operation_root).map_err(|_| runtime_media_private_state_error(String::new()))?;
+    #[cfg(unix)]
+    fs::set_permissions(operation_root, fs::Permissions::from_mode(0o700))
+        .map_err(|_| runtime_media_private_state_error(String::new()))?;
+    Ok(())
+}
+
+fn copy_runtime_media_provider_input_file(
+    source_file_path: &Path,
+    destination_path: &Path,
+    expected_digest: Digest32,
+) -> anyhow::Result<()> {
+    let source = open_runtime_media_source_file(source_file_path)?;
+    let metadata = source
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
+    if metadata.len() == 0 || metadata.len() > MEDIA_PROVIDER_MAX_INPUT_BYTES {
+        anyhow::bail!("Runtime custody media preparation input is invalid");
+    }
+    let mut destination = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination_path)
+        .map_err(|_| runtime_media_private_state_error(String::new()))?;
+    #[cfg(unix)]
+    fs::set_permissions(destination_path, fs::Permissions::from_mode(0o600))
+        .map_err(|_| runtime_media_private_state_error(String::new()))?;
+    let mut source = std::io::Read::take(source, MEDIA_PROVIDER_MAX_INPUT_BYTES + 1);
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|_| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
+        if total > MEDIA_PROVIDER_MAX_INPUT_BYTES {
+            anyhow::bail!("Runtime custody media preparation input is invalid");
+        }
+        destination
+            .write_all(&buffer[..read])
+            .map_err(|_| runtime_media_private_state_error(String::new()))?;
+        hasher.update(&buffer[..read]);
+    }
+    destination
+        .sync_all()
+        .map_err(|_| runtime_media_private_state_error(String::new()))?;
+    if total != metadata.len() || Digest32::new(hasher.finalize().into()) != expected_digest {
+        anyhow::bail!("Runtime custody media preparation input is invalid");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_runtime_media_source_file(path: &Path) -> anyhow::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        anyhow::bail!("Runtime custody media preparation input is invalid");
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_runtime_media_source_file(path: &Path) -> anyhow::Result<fs::File> {
+    let file = fs::File::open(path)
+        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
+    if !metadata.is_file() {
+        anyhow::bail!("Runtime custody media preparation input is invalid");
+    }
+    Ok(file)
+}
+
+fn load_validated_runtime_prepared_media(
+    operation_root: &Path,
+    prepared_output: &RuntimePreparedMediaProviderOutput,
+) -> anyhow::Result<(RuntimeCustodyLibraryPublishInputMedia, Digest32)> {
+    if prepared_output.schema != MEDIA_PROVIDER_PREPARED_MEDIA_SCHEMA_V1
+        || prepared_output.mime_type != MEDIA_PROVIDER_OUTPUT_MIME_TYPE_V1
+        || prepared_output.codecs != MEDIA_PROVIDER_OUTPUT_CODECS_V1
+    {
+        anyhow::bail!("Runtime custody media preparation output is invalid");
+    }
+    let prepared_root = operation_root.join(MEDIA_PROVIDER_PREPARED_DIR_NAME);
+    let prepared_metadata = fs::symlink_metadata(&prepared_root)
+        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?;
+    if prepared_metadata.file_type().is_symlink() || !prepared_metadata.is_dir() {
+        anyhow::bail!("Runtime custody media preparation output is invalid");
+    }
+    validate_owner_only_metadata_with_error(
+        "media-provider prepared output root",
+        &prepared_metadata,
+        false,
+        runtime_media_private_state_error,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?;
+    let segments_root = prepared_root.join(MEDIA_PROVIDER_SEGMENTS_DIR_NAME);
+    let mut saw_init = false;
+    let mut saw_segments = false;
+    for entry in fs::read_dir(&prepared_root)
+        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?
+    {
+        let entry = entry
+            .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("Runtime custody media preparation output is invalid");
+        }
+        match name.as_str() {
+            "init.mp4" if metadata.is_file() => saw_init = true,
+            MEDIA_PROVIDER_SEGMENTS_DIR_NAME if metadata.is_dir() => saw_segments = true,
+            _ => anyhow::bail!("Runtime custody media preparation output is invalid"),
+        }
+    }
+    if !saw_init || !saw_segments {
+        anyhow::bail!("Runtime custody media preparation output is invalid");
+    }
+    let clear_init_segment = read_runtime_media_prepared_part(
+        &prepared_root.join("init.mp4"),
+        false,
+        MEDIA_PROVIDER_MAX_OUTPUT_PART_BYTES,
+    )?;
+    let mut total_output_bytes = clear_init_segment.len() as u64;
+    let session = ValidatedClearFmp4MediaSessionLayoutV1::new(&clear_init_segment)
+        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?;
+    let segments_metadata = fs::symlink_metadata(&segments_root)
+        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?;
+    if segments_metadata.file_type().is_symlink() || !segments_metadata.is_dir() {
+        anyhow::bail!("Runtime custody media preparation output is invalid");
+    }
+    validate_owner_only_metadata_with_error(
+        "media-provider prepared segments root",
+        &segments_metadata,
+        false,
+        runtime_media_private_state_error,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?;
+    let mut segments = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(&segments_root)
+        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?
+    {
+        let entry = entry
+            .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?;
+        let index = parse_runtime_media_segment_name(&name)?;
+        let bytes = read_runtime_media_prepared_part(
+            &entry.path(),
+            true,
+            MEDIA_PROVIDER_MAX_OUTPUT_PART_BYTES,
+        )?;
+        total_output_bytes = total_output_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Runtime custody media preparation output is invalid")
+            })?;
+        session
+            .validate_segment(&bytes)
+            .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?;
+        if segments.insert(index, bytes).is_some() {
+            anyhow::bail!("Runtime custody media preparation output is invalid");
+        }
+    }
+    if segments.is_empty()
+        || segments.len() > MEDIA_PROVIDER_MAX_SEGMENT_COUNT
+        || segments.len() > MAX_PROTECT_MEDIA_SEGMENTS_V1 as usize
+        || total_output_bytes > MEDIA_PROVIDER_MAX_TOTAL_OUTPUT_BYTES
+    {
+        anyhow::bail!("Runtime custody media preparation output is invalid");
+    }
+    let mut clear_segments = Vec::with_capacity(segments.len());
+    for (expected_index, (actual_index, bytes)) in segments.into_iter().enumerate() {
+        if actual_index != expected_index as u32 {
+            anyhow::bail!("Runtime custody media preparation output is invalid");
+        }
+        clear_segments.push(bytes);
+    }
+    let media = RuntimeCustodyLibraryPublishInputMedia {
+        mime_type: prepared_output.mime_type.clone(),
+        codecs: prepared_output.codecs.clone(),
+        clear_init_segment,
+        clear_segments,
+    };
+    let receipt = runtime_media_preparation_receipt(&media);
+    Ok((media, receipt))
+}
+
+struct RuntimeCustodyLibraryPublishInputMedia {
+    mime_type: String,
+    codecs: String,
+    clear_init_segment: Vec<u8>,
+    clear_segments: Vec<Vec<u8>>,
+}
+
+fn runtime_media_preparation_receipt(media: &RuntimeCustodyLibraryPublishInputMedia) -> Digest32 {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(RUNTIME_MEDIA_PREPARATION_RECEIPT_DOMAIN);
+    hasher.update(media.mime_type.as_bytes());
+    hasher.update([0]);
+    hasher.update(media.codecs.as_bytes());
+    hasher.update([0]);
+    hasher.update((media.clear_init_segment.len() as u64).to_be_bytes());
+    hasher.update(sha2::Sha256::digest(&media.clear_init_segment));
+    for (index, segment) in media.clear_segments.iter().enumerate() {
+        hasher.update((index as u64).to_be_bytes());
+        hasher.update((segment.len() as u64).to_be_bytes());
+        hasher.update(sha2::Sha256::digest(segment));
+    }
+    Digest32::new(hasher.finalize().into())
+}
+
+fn read_runtime_media_prepared_part(
+    path: &Path,
+    require_non_empty: bool,
+    max_output_part_bytes: u64,
+) -> anyhow::Result<Vec<u8>> {
+    #[cfg(unix)]
+    let file = {
+        let mut options = fs::OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        options
+            .open(path)
+            .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?
+    };
+    #[cfg(not(unix))]
+    let file = fs::File::open(path)
+        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?;
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        anyhow::bail!("Runtime custody media preparation output is invalid");
+    }
+    if !metadata.is_file()
+        || metadata.len() > max_output_part_bytes
+        || (require_non_empty && metadata.len() == 0)
+    {
+        anyhow::bail!("Runtime custody media preparation output is invalid");
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    std::io::Read::take(file, max_output_part_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))?;
+    if bytes.len() as u64 > max_output_part_bytes || (require_non_empty && bytes.is_empty()) {
+        anyhow::bail!("Runtime custody media preparation output is invalid");
+    }
+    Ok(bytes)
+}
+
+fn parse_runtime_media_segment_name(name: &str) -> anyhow::Result<u32> {
+    let Some(index) = name.strip_suffix(".m4s") else {
+        anyhow::bail!("Runtime custody media preparation output is invalid");
+    };
+    if index.len() != 8 || !index.as_bytes().iter().all(u8::is_ascii_digit) {
+        anyhow::bail!("Runtime custody media preparation output is invalid");
+    }
+    index
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation output is invalid"))
+}
+
+async fn invoke_runtime_media_provider_prepare(
+    registry: &ProviderRegistry,
+    operation_id: Digest32,
+) -> Result<RuntimePreparedMediaProviderOutput, RuntimeMediaProviderPrepareError> {
+    let response = registry
+        .invoke_provider(ProviderInvocation {
+            source: RUNTIME_PROVIDER_ID.to_string(),
+            target: MEDIA_PROVIDER_ID.to_string(),
+            op: "prepare".to_string(),
+            request: json!({
+                "op": "prepare",
+                "operation_id": hex::encode(operation_id.as_bytes()),
+            }),
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Local,
+        })
+        .await
+        .map_err(|_| RuntimeMediaProviderPrepareError::Unknown)?;
+    match response.get("status").and_then(Value::as_str) {
+        Some("ok") => response
+            .get("data")
+            .cloned()
+            .ok_or(RuntimeMediaProviderPrepareError::Settled)
+            .and_then(|data| {
+                serde_json::from_value(data).map_err(|_| RuntimeMediaProviderPrepareError::Settled)
+            }),
+        Some("error")
+            if response
+                .get("data")
+                .and_then(|data| data.get("operation_settled"))
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            Err(RuntimeMediaProviderPrepareError::Settled)
+        }
+        _ => Err(RuntimeMediaProviderPrepareError::Unknown),
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RuntimeCustodyLibraryPublishInput {
     pub object_uri: String,
@@ -1957,6 +2396,32 @@ pub(crate) struct RuntimeCustodyLibraryPublishInput {
     pub clear_init_segment: Vec<u8>,
     pub clear_segments: Vec<Vec<u8>>,
     pub source_storage: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeCustodyLibrarySourceInput {
+    pub object_uri: String,
+    pub principal_id: String,
+    pub source_file_path: PathBuf,
+    pub wallet_account_id: String,
+    pub copies: String,
+    pub price: String,
+    pub source_storage: String,
+}
+
+impl std::fmt::Debug for RuntimeCustodyLibrarySourceInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeCustodyLibrarySourceInput")
+            .field("object_uri", &self.object_uri)
+            .field("principal_id", &self.principal_id)
+            .field("source_file_path", &"[private]")
+            .field("wallet_account_id", &self.wallet_account_id)
+            .field("copies", &self.copies)
+            .field("price", &self.price)
+            .field("source_storage", &self.source_storage)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for RuntimeCustodyLibraryPublishInput {
@@ -1985,6 +2450,257 @@ pub(crate) struct RuntimeCustodyLibraryPublishFacts {
     pub availability: Value,
     pub receipt: Value,
     pub content_security: Value,
+}
+
+async fn prepare_runtime_custody_library_source(
+    data_dir: &Path,
+    registry: &ProviderRegistry,
+    source: &RuntimeCustodyLibrarySourceInput,
+) -> anyhow::Result<RuntimeLibraryMediaPreparation> {
+    let staging_root = runtime_media_staging_root(data_dir);
+    let source_object_digest = source_media_digest(&source.source_file_path)?;
+    let expected = RuntimeMediaPreparationRecord::new(
+        &source.principal_id,
+        &source.object_uri,
+        &source.source_storage,
+        source_object_digest,
+        MEDIA_PROVIDER_ID,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody media preparation intent is invalid"))?;
+    let journal = runtime_mint_journal(data_dir);
+    if !runtime_media_provider_is_registered(registry).await
+        && !data_dir.join(RUNTIME_MINT_JOURNAL_ROOT).exists()
+    {
+        anyhow::bail!("Runtime custody media preparation provider is unavailable");
+    }
+    let record = match journal.load_media_preparation(expected.request_id()) {
+        Ok(existing) => {
+            if !existing.same_authority_as(&expected) {
+                anyhow::bail!(
+                    "Runtime custody media preparation conflicts with existing authority"
+                );
+            }
+            existing
+        }
+        Err(elastos_protected_content_runtime::RuntimeMintJournalError::NotFound) => {
+            if !runtime_media_provider_is_registered(registry).await {
+                anyhow::bail!("Runtime custody media preparation provider is unavailable");
+            }
+            validate_runtime_media_staging_root(&staging_root)?;
+            let operation_root = staging_root.join(hex::encode(expected.operation_id().as_bytes()));
+            reset_runtime_media_operation_root(&operation_root)?;
+            if let Err(error) = copy_runtime_media_provider_input_file(
+                &source.source_file_path,
+                &operation_root.join(MEDIA_PROVIDER_INPUT_FILE_NAME),
+                source_object_digest,
+            ) {
+                let _ = fs::remove_dir_all(&operation_root);
+                return Err(error);
+            }
+            journal.persist_media_preparation(&expected).map_err(|_| {
+                let _ = fs::remove_dir_all(&operation_root);
+                anyhow::anyhow!("Runtime custody media preparation intent is unavailable")
+            })?
+        }
+        Err(_) => {
+            anyhow::bail!("Runtime custody media preparation intent is unavailable");
+        }
+    };
+    let operation_root = staging_root.join(hex::encode(record.operation_id().as_bytes()));
+    match record.state() {
+        RuntimeMediaPreparationState::Consumed => {
+            if operation_root.exists() {
+                validate_runtime_media_staging_root(&staging_root)?;
+                reset_runtime_media_operation_root(&operation_root)?;
+                fs::remove_dir(&operation_root)
+                    .map_err(|_| runtime_media_private_state_error(String::new()))?;
+            }
+            return Ok(RuntimeLibraryMediaPreparation::Consumed {
+                record,
+                operation_root,
+            });
+        }
+        RuntimeMediaPreparationState::EffectPending => {
+            anyhow::bail!(RUNTIME_MEDIA_PREPARATION_RECONCILIATION_MESSAGE);
+        }
+        RuntimeMediaPreparationState::Failed => {
+            anyhow::bail!("Runtime custody media preparation failed");
+        }
+        RuntimeMediaPreparationState::Prepared => {
+            validate_runtime_media_staging_root(&staging_root)?;
+            let output = RuntimePreparedMediaProviderOutput {
+                schema: MEDIA_PROVIDER_PREPARED_MEDIA_SCHEMA_V1.to_string(),
+                mime_type: MEDIA_PROVIDER_OUTPUT_MIME_TYPE_V1.to_string(),
+                codecs: MEDIA_PROVIDER_OUTPUT_CODECS_V1.to_string(),
+            };
+            let (media, output_receipt_digest) =
+                load_validated_runtime_prepared_media(&operation_root, &output)?;
+            if record.output_receipt_digest() != Some(output_receipt_digest) {
+                anyhow::bail!("Runtime custody media preparation output is invalid");
+            }
+            return Ok(RuntimeLibraryMediaPreparation::Prepared(
+                RuntimePreparedLibraryPublish {
+                    input: RuntimeCustodyLibraryPublishInput {
+                        object_uri: source.object_uri.clone(),
+                        principal_id: source.principal_id.clone(),
+                        mime_type: media.mime_type,
+                        codecs: media.codecs,
+                        wallet_account_id: source.wallet_account_id.clone(),
+                        copies: source.copies.clone(),
+                        price: source.price.clone(),
+                        clear_init_segment: media.clear_init_segment,
+                        clear_segments: media.clear_segments,
+                        source_storage: source.source_storage.clone(),
+                    },
+                    request_id: record.request_id(),
+                    output_receipt_digest,
+                    operation_root,
+                },
+            ));
+        }
+        RuntimeMediaPreparationState::Ready => {}
+    }
+
+    if !runtime_media_provider_is_registered(registry).await {
+        anyhow::bail!("Runtime custody media preparation provider is unavailable");
+    }
+    validate_runtime_media_staging_root(&staging_root)?;
+    reset_runtime_media_operation_root(&operation_root)?;
+    if let Err(error) = copy_runtime_media_provider_input_file(
+        &source.source_file_path,
+        &operation_root.join(MEDIA_PROVIDER_INPUT_FILE_NAME),
+        source_object_digest,
+    ) {
+        let _ = fs::remove_dir_all(&operation_root);
+        return Err(error);
+    }
+    journal
+        .mark_media_preparation_effect_started(record.request_id())
+        .map_err(|_| anyhow::anyhow!(RUNTIME_MEDIA_PREPARATION_RECONCILIATION_MESSAGE))?;
+    let output = match invoke_runtime_media_provider_prepare(registry, record.operation_id()).await
+    {
+        Ok(output) => output,
+        Err(RuntimeMediaProviderPrepareError::Settled) => {
+            journal
+                .mark_media_preparation_failed(record.request_id())
+                .map_err(|_| anyhow::anyhow!(RUNTIME_MEDIA_PREPARATION_RECONCILIATION_MESSAGE))?;
+            let _ = fs::remove_dir_all(&operation_root);
+            anyhow::bail!("Runtime custody media preparation failed");
+        }
+        Err(RuntimeMediaProviderPrepareError::Unknown) => {
+            anyhow::bail!(RUNTIME_MEDIA_PREPARATION_RECONCILIATION_MESSAGE);
+        }
+    };
+    let (media, output_receipt_digest) =
+        match load_validated_runtime_prepared_media(&operation_root, &output) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                journal
+                    .mark_media_preparation_failed(record.request_id())
+                    .map_err(|_| {
+                        anyhow::anyhow!(RUNTIME_MEDIA_PREPARATION_RECONCILIATION_MESSAGE)
+                    })?;
+                let _ = fs::remove_dir_all(&operation_root);
+                return Err(error);
+            }
+        };
+    journal
+        .mark_media_preparation_prepared(record.request_id(), output_receipt_digest)
+        .map_err(|_| anyhow::anyhow!(RUNTIME_MEDIA_PREPARATION_RECONCILIATION_MESSAGE))?;
+    Ok(RuntimeLibraryMediaPreparation::Prepared(
+        RuntimePreparedLibraryPublish {
+            input: RuntimeCustodyLibraryPublishInput {
+                object_uri: source.object_uri.clone(),
+                principal_id: source.principal_id.clone(),
+                mime_type: media.mime_type,
+                codecs: media.codecs,
+                wallet_account_id: source.wallet_account_id.clone(),
+                copies: source.copies.clone(),
+                price: source.price.clone(),
+                clear_init_segment: media.clear_init_segment,
+                clear_segments: media.clear_segments,
+                source_storage: source.source_storage.clone(),
+            },
+            request_id: record.request_id(),
+            output_receipt_digest,
+            operation_root,
+        },
+    ))
+}
+
+async fn runtime_media_provider_is_registered(registry: &ProviderRegistry) -> bool {
+    registry
+        .sub_provider_schemes()
+        .await
+        .iter()
+        .any(|scheme| scheme == MEDIA_PROVIDER_ID)
+}
+
+pub(crate) async fn publish_runtime_custody_library_source(
+    data_dir: &Path,
+    registry: Arc<ProviderRegistry>,
+    source: RuntimeCustodyLibrarySourceInput,
+) -> anyhow::Result<(
+    RuntimeCustodyLibraryPublishFacts,
+    RuntimeCustodyLibraryPublishInput,
+)> {
+    match prepare_runtime_custody_library_source(data_dir, registry.as_ref(), &source).await? {
+        RuntimeLibraryMediaPreparation::Prepared(prepared) => {
+            let input = prepared.input;
+            let facts = publish_runtime_custody_library_object(
+                data_dir,
+                Arc::clone(&registry),
+                input.clone(),
+            )
+            .await?;
+            runtime_mint_journal(data_dir)
+                .mark_media_preparation_consumed(
+                    prepared.request_id,
+                    prepared.output_receipt_digest,
+                    facts.mint_id,
+                )
+                .map_err(|_| anyhow::anyhow!(RUNTIME_MEDIA_PREPARATION_RECONCILIATION_MESSAGE))?;
+            fs::remove_dir_all(&prepared.operation_root)
+                .map_err(|_| runtime_media_private_state_error(String::new()))?;
+            Ok((facts, input))
+        }
+        RuntimeLibraryMediaPreparation::Consumed {
+            record,
+            operation_root,
+        } => {
+            let mint_id = record.consumed_mint_id().ok_or_else(|| {
+                anyhow::anyhow!("Runtime custody media preparation intent is unavailable")
+            })?;
+            let journal = runtime_mint_journal(data_dir);
+            let intent = journal
+                .load_intent(record.request_id())
+                .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+            if intent.completed_mint_id() != Some(mint_id) {
+                anyhow::bail!("Runtime custody media preparation conflicts with mint settlement");
+            }
+            let persisted = journal
+                .load(mint_id)
+                .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+            let input = RuntimeCustodyLibraryPublishInput {
+                object_uri: source.object_uri,
+                principal_id: source.principal_id,
+                mime_type: persisted.draft().media_identity().mime_type().to_string(),
+                codecs: persisted.draft().media_identity().codecs().to_string(),
+                wallet_account_id: source.wallet_account_id,
+                copies: source.copies,
+                price: source.price,
+                clear_init_segment: Vec::new(),
+                clear_segments: Vec::new(),
+                source_storage: source.source_storage,
+            };
+            let facts = load_completed_runtime_mint_facts(&journal, &input, mint_id)?;
+            if operation_root.exists() {
+                fs::remove_dir_all(&operation_root)
+                    .map_err(|_| runtime_media_private_state_error(String::new()))?;
+            }
+            Ok((facts, input))
+        }
+    }
 }
 
 pub(crate) async fn publish_runtime_custody_library_object(

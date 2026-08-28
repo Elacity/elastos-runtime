@@ -556,8 +556,6 @@ async fn publish_runtime_custody(
             "uri": uri,
             "protection": {
                 "mode": "runtime_custody",
-                "mime_type": "video/mp4",
-                "codecs": "avc1.64001f,mp4a.40.2",
                 "wallet_account_id": "wallet-account-1",
                 "copies": "0x1",
                 "price": "0xde0b6b3a7640000"
@@ -571,7 +569,7 @@ async fn publish_runtime_custody(
     clippy::too_many_arguments,
     reason = "test helper binds every fixture fact explicitly"
 )]
-async fn assert_invalid_runtime_custody_media_declaration(
+async fn assert_rejected_runtime_custody_protection_field(
     data_dir: &std::path::Path,
     app: &axum::Router,
     token: &str,
@@ -585,14 +583,6 @@ async fn assert_invalid_runtime_custody_media_declaration(
     protection.insert(
         "mode".into(),
         serde_json::Value::String("runtime_custody".into()),
-    );
-    protection.insert(
-        "mime_type".into(),
-        serde_json::Value::String("video/mp4".into()),
-    );
-    protection.insert(
-        "codecs".into(),
-        serde_json::Value::String("avc1.64001f,mp4a.40.2".into()),
     );
     protection.insert(
         "wallet_account_id".into(),
@@ -6020,9 +6010,7 @@ async fn test_library_provider_publish_rejects_removed_fixture_and_unknown_prote
             json!({
                 "uri": uri,
                 "protection": {
-                    "mode": "fixture",
-                    "mime_type": "video/mp4",
-                    "codecs": "avc1.64001f,mp4a.40.2"
+                    "mode": "fixture"
                 }
             }),
             "unknown variant `fixture`",
@@ -6032,8 +6020,9 @@ async fn test_library_provider_publish_rejects_removed_fixture_and_unknown_prote
                 "uri": uri,
                 "protection": {
                     "mode": "runtime_custody",
-                    "mime_type": "video/mp4",
-                    "codecs": "avc1.64001f,mp4a.40.2",
+                    "wallet_account_id": "wallet-account-1",
+                    "copies": "0x1",
+                    "price": "0xde0b6b3a7640000",
                     "extra": true
                 }
             }),
@@ -6052,32 +6041,29 @@ async fn test_library_provider_publish_rejects_removed_fixture_and_unknown_prote
         assert_no_publish_records(dir.path(), &authority.principal_id);
     }
 
-    let overlong = "x".repeat(256);
     for (field, value, expected_message) in [
-        ("mime_type", "", "invalid protected publish mime_type"),
         (
             "mime_type",
-            "video/mp4 ",
-            "invalid protected publish mime_type",
+            "",
+            "unknown field `mime_type`, expected one of `wallet_account_id`, `copies`, `price`",
         ),
         (
             "mime_type",
-            overlong.as_str(),
-            "invalid protected publish mime_type",
-        ),
-        ("codecs", "", "invalid protected publish codecs"),
-        (
-            "codecs",
-            "avc1.64001f, mp4a.40.2",
-            "invalid protected publish codecs",
+            "video/mp4",
+            "unknown field `mime_type`, expected one of `wallet_account_id`, `copies`, `price`",
         ),
         (
             "codecs",
-            overlong.as_str(),
-            "invalid protected publish codecs",
+            "",
+            "unknown field `codecs`, expected one of `wallet_account_id`, `copies`, `price`",
+        ),
+        (
+            "codecs",
+            "avc1.64001f,mp4a.40.2",
+            "unknown field `codecs`, expected one of `wallet_account_id`, `copies`, `price`",
         ),
     ] {
-        assert_invalid_runtime_custody_media_declaration(
+        assert_rejected_runtime_custody_protection_field(
             dir.path(),
             &app,
             &token,
@@ -7478,8 +7464,8 @@ async fn test_library_provider_runtime_custody_publish_rejects_invalid_input_lay
     let root = crate::auth::principal_localhost_root(&authority.principal_id);
     let invalid_message = "Runtime custody publish input invalid";
 
-    let file_uri = format!("{root}/Documents/protected-file-target.mp4");
-    write_library_bytes(&app, &token, &file_uri, b"not a directory").await;
+    let file_uri = format!("{root}/Documents/protected-directory-target");
+    std::fs::create_dir_all(library_object_path(dir.path(), &file_uri)).unwrap();
     assert_runtime_custody_publish_error(
         dir.path(),
         &app,
@@ -7755,6 +7741,32 @@ async fn test_library_provider_runtime_custody_publish_rejects_invalid_input_lay
         invalid_message,
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_library_provider_runtime_custody_publish_passes_one_file_to_runtime_media_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/source-video.mp4");
+    write_library_bytes(&app, &token, &uri, b"source media bytes").await;
+
+    let payload = assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &uri,
+        "Runtime custody media preparation provider is unavailable",
+    )
+    .await;
+    let text = payload.to_string();
+    assert!(!text.contains("source-video.mp4"));
+    assert!(!text.contains("input.bin"));
+    assert!(!text.contains("staging"));
 }
 
 #[tokio::test]

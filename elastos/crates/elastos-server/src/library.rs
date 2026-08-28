@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Cursor, Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
@@ -12,10 +12,6 @@ use elastos_common::protected_content::{
     DecryptSessionRequestV1, KeyReleaseRequestV1, ReleaseReceiptV1, RightsDecisionReceiptV1,
     SealedObjectV1, DECRYPT_SESSION_REQUEST_SCHEMA, DECRYPT_SESSION_SCHEMA,
     KEY_RELEASE_REQUEST_SCHEMA, RELEASE_RECEIPT_SCHEMA, RIGHTS_DECISION_RECEIPT_SCHEMA,
-};
-use elastos_protected_content_provider_contracts::{
-    ValidatedClearFmp4MediaSessionLayoutV1, MAX_PROTECT_MEDIA_PART_BYTES_V1,
-    MAX_PROTECT_MEDIA_SEGMENTS_V1,
 };
 use elastos_runtime::provider::{
     Provider, ProviderError, ProviderInvocation, ProviderInvocationTransport, ProviderRegistry,
@@ -38,7 +34,6 @@ const LIBRARY_TRASH_RECORD_SCHEMA: &str = "elastos.library.trash-record/v1";
 const MAX_LIBRARY_EVENTS: usize = 256;
 const MAX_ARCHIVE_LIST_ENTRIES: usize = 512;
 const MAX_ARCHIVE_PREVIEW_BYTES: usize = 64 * 1024;
-const MAX_LIBRARY_PROTECTED_MEDIA_DECLARATION_BYTES: usize = 255;
 const RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE: &str = "Runtime custody publish input invalid";
 const RUNTIME_CUSTODY_SHARE_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody sharing is not available yet";
@@ -362,8 +357,6 @@ enum ObjectProviderRequest {
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 enum LibraryPublishProtectionRequest {
     RuntimeCustody {
-        mime_type: String,
-        codecs: String,
         wallet_account_id: String,
         copies: String,
         price: String,
@@ -371,13 +364,9 @@ enum LibraryPublishProtectionRequest {
 }
 
 struct LoadedRuntimeCustodyPublishInput {
-    mime_type: String,
-    codecs: String,
     wallet_account_id: String,
     copies: String,
     price: String,
-    clear_init_segment: Vec<u8>,
-    clear_segments: Vec<Vec<u8>>,
 }
 
 pub struct ObjectProvider {
@@ -1958,16 +1947,13 @@ async fn library_publish(
     if let Some(protection) = protection {
         let loaded =
             validate_runtime_custody_publish_input(data_dir, principal_id, &target, protection)?;
-        let runtime_input = crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput {
+        let runtime_input = crate::protected_content_runtime::RuntimeCustodyLibrarySourceInput {
             object_uri: target.uri.clone(),
             principal_id: principal_id.to_string(),
-            mime_type: loaded.mime_type,
-            codecs: loaded.codecs,
+            source_file_path: target.path.clone(),
             wallet_account_id: loaded.wallet_account_id,
             copies: loaded.copies,
             price: loaded.price,
-            clear_init_segment: loaded.clear_init_segment,
-            clear_segments: loaded.clear_segments,
             source_storage: published_source_storage(data_dir, principal_id, &target)?.to_string(),
         };
         let Some((state, authority)) = gateway_authority else {
@@ -5945,162 +5931,21 @@ fn validate_runtime_custody_publish_input(
     protection: LibraryPublishProtectionRequest,
 ) -> anyhow::Result<LoadedRuntimeCustodyPublishInput> {
     let LibraryPublishProtectionRequest::RuntimeCustody {
-        mime_type,
-        codecs,
         wallet_account_id,
         copies,
         price,
     } = protection;
-    validate_runtime_custody_media_declaration(&mime_type, "mime_type")?;
-    validate_runtime_custody_media_declaration(&codecs, "codecs")?;
-
     let target_metadata = fs::symlink_metadata(&target.path)
         .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-    if target_metadata.file_type().is_symlink() || !target_metadata.is_dir() {
+    if target_metadata.file_type().is_symlink() || !target_metadata.is_file() {
         bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
     }
-
-    let mut saw_init = false;
-    let mut saw_segments = false;
-    for entry in fs::read_dir(&target.path)
-        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?
-    {
-        let entry = entry.map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-        let metadata = fs::symlink_metadata(entry.path())
-            .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-        if metadata.file_type().is_symlink() {
-            bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-        }
-        match name.as_str() {
-            "init.mp4" if metadata.is_file() => saw_init = true,
-            "segments" if metadata.is_dir() => saw_segments = true,
-            _ => bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE),
-        }
-    }
-    if !saw_init || !saw_segments {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-
-    let init_target = library_target(data_dir, principal_id, &format!("{}/init.mp4", target.uri))?;
-    let clear_init =
-        read_runtime_custody_publish_part(data_dir, principal_id, &init_target, false)?;
-    let session = ValidatedClearFmp4MediaSessionLayoutV1::new(&clear_init)
-        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-
-    let segments_target =
-        library_target(data_dir, principal_id, &format!("{}/segments", target.uri))?;
-    let segments_metadata = fs::symlink_metadata(&segments_target.path)
-        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-    if segments_metadata.file_type().is_symlink() || !segments_metadata.is_dir() {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-
-    let mut segment_bytes = BTreeMap::new();
-    for entry in fs::read_dir(&segments_target.path)
-        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?
-    {
-        let entry = entry.map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-        let metadata = fs::symlink_metadata(entry.path())
-            .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-        }
-        let index = parse_runtime_custody_segment_name(&name)?;
-        let segment_target = library_target(
-            data_dir,
-            principal_id,
-            &format!("{}/segments/{name}", target.uri),
-        )?;
-        let clear_segment =
-            read_runtime_custody_publish_part(data_dir, principal_id, &segment_target, true)?;
-        session
-            .validate_segment(&clear_segment)
-            .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-        if segment_bytes.insert(index, clear_segment).is_some() {
-            bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-        }
-    }
-    if segment_bytes.is_empty() || segment_bytes.len() > MAX_PROTECT_MEDIA_SEGMENTS_V1 as usize {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-    let mut clear_segments = Vec::with_capacity(segment_bytes.len());
-    for (expected, (actual, bytes)) in segment_bytes.into_iter().enumerate() {
-        if actual != expected as u32 {
-            bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-        }
-        clear_segments.push(bytes);
-    }
+    let _ = (data_dir, principal_id);
     Ok(LoadedRuntimeCustodyPublishInput {
-        mime_type,
-        codecs,
         wallet_account_id,
         copies,
         price,
-        clear_init_segment: clear_init,
-        clear_segments,
     })
-}
-
-fn validate_runtime_custody_media_declaration(
-    value: &str,
-    field: &'static str,
-) -> anyhow::Result<()> {
-    let valid = !value.is_empty()
-        && value.len() <= MAX_LIBRARY_PROTECTED_MEDIA_DECLARATION_BYTES
-        && value
-            .as_bytes()
-            .iter()
-            .all(|byte| matches!(*byte, 0x21..=0x7e));
-    if !valid {
-        bail!("invalid protected publish {field}");
-    }
-    Ok(())
-}
-
-fn read_runtime_custody_publish_part(
-    data_dir: &Path,
-    principal_id: &str,
-    target: &LibraryTarget,
-    require_non_empty: bool,
-) -> anyhow::Result<Vec<u8>> {
-    let metadata = fs::metadata(&target.path)
-        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-    if metadata.len() > MAX_PROTECT_MEDIA_PART_BYTES_V1 as u64
-        || (require_non_empty && metadata.len() == 0)
-    {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-    let bytes = read_library_file_bytes(data_dir, principal_id, target)
-        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-    if bytes.len() > MAX_PROTECT_MEDIA_PART_BYTES_V1 || (require_non_empty && bytes.is_empty()) {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-    Ok(bytes)
-}
-
-fn parse_runtime_custody_segment_name(name: &str) -> anyhow::Result<u32> {
-    if name.len() != "00000000.m4s".len() || !name.ends_with(".m4s") {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-    let digits = &name[..8];
-    if !digits.as_bytes().iter().all(u8::is_ascii_digit) {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-    let index = digits
-        .parse::<u32>()
-        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-    if index >= MAX_PROTECT_MEDIA_SEGMENTS_V1 {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-    Ok(index)
 }
 
 fn protected_content_sealed_object_from_security(
