@@ -98,7 +98,8 @@ verify:
     cd elastos && cargo fmt --all -- --check
     cd elastos && cargo clippy --workspace --all-targets -- -D warnings
     just test
-    # browser-local-exit carries its own workspace, so --workspace above misses it
+    # browser-local-exit has its own workspace under elastos/tools, so neither
+    # the elastos workspace test nor test-capsules reaches it
     cd elastos/tools/browser-local-exit && cargo fmt -- --check
     cd elastos/tools/browser-local-exit && cargo clippy --all-targets -- -D warnings
     cd elastos/tools/browser-local-exit && cargo test

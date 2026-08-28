@@ -10,7 +10,7 @@ of truth. Historical branches and PRs are evidence only.
 |---|---|---|
 | `origin/feat/protected-content-runtime-lifecycle` | `854d9dc945b6ecd53731af7edb382847d92cbb76` | Published inactive lifecycle source. |
 | `origin/feat/0.7-uiux-candidate` | `8b547590335e25126aca726135976d415433cea6` | Published reviewed UIUX donor. |
-| Unpublished integrated source prefix | `b817e0fe0a2dccf47466f17f25f751c82ba19416` | Reconstructed source through protected-content product, private-provider, stable installation, static audit, and exact platform restart slices. |
+| Unpublished implementation prefix | `3ece9042df1193ec6873145971557103fdd4f45a` | Reconstructed source through cross-Runtime release admission and playback envelope removal; tree `a17c799d4ffd837a4c65888ec9601ee6216c52fa`. |
 
 The integrated prefix remains unpublished source evidence. It is not installed
 or live product proof. The active installed path still selects the provisional
@@ -78,11 +78,19 @@ Verified Base read behavior is:
 - Unknown KIDs revert with `UnboundContentId(bytes16)`; a bound KID without
   access returns `false`.
 
-The exact CentralStorage binding write and authorization remain open.
-`AuthorityGateway.buyAccess` needs exact deployed ABI, transaction receipt,
-and event proof. The deployed meaning of `View` and `Download` also remains
-open. Signed Runtime policy owns those action distinctions until contract
-evidence defines them.
+Verified Base 8453 evidence from `origin/upstream/0.7-dev@90bbe15b` records:
+
+- `CentralStorage.bindIP(bytes16,address,uint256)` is acknowledged-contracts
+  only and is called by `AssetFactory.registerNewAsset`;
+- native `AuthorityGateway.buyAccess` selector `0xf7580ad9`;
+- ERC20 `AuthorityGateway.buyAccess` selector `0x0ede2294`, with prior approval
+  to each operative `paymentProcessor()`;
+- EventHub as the mint emitter; and
+- bound-KID allowed, denied, and unbound results.
+
+The exact funded transaction receipt and event remain installed proof. Chain
+access is one boolean per holder and KID. Signed Runtime policy owns the View
+and Download action distinction.
 
 Each custody node reads rights through its node-host Chain provider. The
 owner-only protected-content Chain config supplies 2-5 explicit private RPC
@@ -111,15 +119,11 @@ The current source covers:
 
 This proof uses focused source and fixture tests. It does not establish real
 operator custody, deployed Chain acceptance, live replication, or an active
-cutover. It also does not establish a two-Runtime protected-content path:
-
-- a buyer Runtime needs a typed import or resolution operation for the
-  creator's immutable listing, which is currently a local Runtime record, bound
-  to its content and Chain identity; and
-- custody release needs to authenticate a buyer Runtime issuer distinct from
-  the provisioning Runtime while preserving the Profile-signed recipient-key
-  binding, node-local rights decision, signed operation, exact replay, and
-  provisioning issuer authority.
+cutover. Custody release now authenticates the buyer Runtime issuer declared by
+the signed operation and bound by the buyer Profile, while provisioning stays
+pinned to the creator Runtime. A buyer Runtime still needs typed import and
+verified projection for the creator's immutable listing, which remains a local
+Runtime record bound to its content and Chain identity.
 
 A shared listing link is sufficient for 0.7. Global listing discovery and
 public custody governance remain later work. The public protected-content
@@ -178,20 +182,24 @@ fixture checks cover the `/proc` identity model. Active Linux
 
 Complete the sequence in [TASKS.md](../TASKS.md):
 
-1. add the bounded cross-Runtime listing and custody-issuer source slice;
-2. review the integrated source and prepare the review branch;
-3. install the exact same tree on localhost and the seed with matching stable
+1. repair the stale private-custody gateway fixture and restore the combined
+   one-Runtime proof;
+2. add portable listing export, import, and projection;
+3. prove the full two-Runtime source journey;
+4. review the integrated source and prepare the review branch;
+5. install the exact same tree on localhost, the seed, and the third custody
+   node with matching stable
    receipts;
-4. supply a real signed owner-only 2-of-3 custody composition across distinct
+6. supply a real signed owner-only 2-of-3 custody composition across distinct
    operators;
-5. supply the private multi-source Chain config and prove deployed Base reads;
-6. prove one bound KID, allowed and denied Wallet accounts, CentralStorage
+7. supply the private multi-source Chain config and prove deployed Base reads;
+8. prove one bound KID, allowed and denied Wallet accounts, CentralStorage
    binding, and the exact `AuthorityGateway.buyAccess` effect;
-7. prove three replicas and repair after one loss;
-8. run the two-Runtime, two-principal mint-list-deny-buy-open-play-close path
+9. prove three replicas and repair after one loss;
+10. run the two-Runtime, two-principal mint-list-deny-buy-open-play-close path
    with restart, replay, tamper, settlement, and cleanup evidence;
-9. complete the named manual UIUX journeys; and
-10. make one atomic cutover that removes every provisional authority surface.
+11. complete the named manual UIUX matrix in `TASKS.md`; and
+12. make one atomic cutover that removes every provisional authority surface.
 
 The atomic cutover updates startup, registration, resources, packaging, tests,
 and docs together. It leaves one Runtime coordinator, one ProviderRegistry,

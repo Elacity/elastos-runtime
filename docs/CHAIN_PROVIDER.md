@@ -103,7 +103,7 @@ Current supported ABI:
   "id": "has_access_by_content_id",
   "contract": "0x0000000000000000000000000000000000000001",
   "abi": "has_access_by_content_id_address_bytes16",
-  "selector": "0x12345678"
+  "selector": "0x54d42821"
 }
 ```
 
@@ -112,6 +112,12 @@ The provider encodes:
 ```text
 hasAccessByContentId(address subject, bytes16 contentId) -> bool
 ```
+
+`0x54d42821` is the canonical selector of
+`hasAccessByContentId(address,bytes16)` — the value deployed on the Base 8453
+`AuthorityGateway` (verified in ELACITY-2296). The provider validates only the
+shape of the configured selector, so operators must supply this exact value
+for that deployment.
 
 The selector is configured explicitly so the provider does not need arbitrary ABI
 loading or contract SDKs. Missing config, mismatched contracts, malformed

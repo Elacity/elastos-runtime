@@ -45,12 +45,14 @@ const MAX_PROTECTED_CONTENT_RUNTIME_OPERATION_BYTES: usize = 16384;
 // - BUY_ONCE op type 1
 // - ACCESS_TOKEN role 1
 // - ROYALTY_SHARE role 2
-// - creator royalty 950 tenths of a percent (95%), matching the public PC2
-//   default where the protocol retains 5%
+// - creator royalty 950 ERC-1155 ROYALTY_SHARE units (tokenId 2). 1000 units
+//   exist per asset: the creator's 950 (95%) plus the protocol owner's share
+//   minted by the contracts from `CentralStorage.protocolShares()` — 50 (5%)
+//   on the deployed Base 8453 config (verified on-chain, ELACITY-2296).
 const PROTECTED_CONTENT_CREATOR_BUY_ONCE_OP_TYPE: u16 = 1;
 const PROTECTED_CONTENT_CREATOR_ACCESS_TOKEN_ROLE: u64 = 1;
 const PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_ROLE: u64 = 2;
-const PROTECTED_CONTENT_CREATOR_ROYALTY_TENTHS_PERCENT: &str = "0x3b6";
+const PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_UNITS: &str = "0x3b6";
 const PROTECTED_CONTENT_PURCHASE_ACCESS_MAX_FINALIZED_AGE_SECS: u64 = 30 * 60;
 const PROTECTED_CONTENT_PURCHASE_ACCESS_MAX_FUTURE_SKEW_SECS: u64 = 30;
 const PROTECTED_CONTENT_UNBOUND_CONTENT_ID_SELECTOR: [u8; 4] = [0xca, 0xd8, 0x82, 0x23];
@@ -1183,7 +1185,7 @@ impl ChainProvider {
             ],
             &[
                 copies.clone(),
-                PROTECTED_CONTENT_CREATOR_ROYALTY_TENTHS_PERCENT.to_string(),
+                PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_UNITS.to_string(),
             ],
             None,
         ) {

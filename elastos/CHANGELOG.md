@@ -25,6 +25,10 @@ All notable changes to the public ElastOS Runtime repository.
   hiding protection or Recovery changes behind a profile save.
 
 ### Fixed
+- Bound `browser-local-exit` to its launching Runtime through a held-open stdin
+  pipe. Cleanup now checks the relay socket inode, and Runtime refuses to
+  replace a socket still owned by a live helper. Runtime abort, exit, rebuild,
+  and supersession paths no longer leave the helper orphaned.
 - Renaming yourself no longer looks like becoming someone else. A person's
   identity is their Profile DID and a rename only advances the revision, but
   the context check compared whole signed Profile documents, so editing your

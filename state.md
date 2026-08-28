@@ -28,14 +28,16 @@ volatile proof logs remain outside the repository.
   candidate tips.
 - Relative to `origin/upstream/0.7-dev@90bbe15b`, the `3ece9042` implementation
   prefix has 15 unique commits behind and 98 unique commits ahead. Its merge
-  base is `854d9dc9`. The current upstream tip is not integrated. Its changes
-  overlap 27 files also changed locally, including Chain provider source and
-  tests and protected-content documents.
+  base is `854d9dc9`. At that prefix, the upstream tip was not integrated. This
+  merge makes `90bbe15b` an ancestor of the active branch. Its changes overlap
+  27 files also changed locally, including Chain provider source and tests and
+  protected-content documents.
 - Upstream `90bbe15b` records Irzhy's verified Base 8453 evidence and changes
   `TASKS.md`, Chain provider source and tests, `docs/CHAIN_PROVIDER.md`,
   `docs/PROTECTED_CONTENT.md`, and
-  `docs/PROTECTED_CONTENT_EXTRACTION.md`. Upstream reconciliation must preserve
-  the published protected-content repairs and integrate this evidence once.
+  `docs/PROTECTED_CONTENT_EXTRACTION.md`. This merge preserves the published
+  protected-content repairs and integrates that evidence once. It also retains
+  upstream collaboration and Browser local-exit orphan cleanup.
 - The protected-content source path remains inactive. Installed proof and one
   atomic cutover remain open.
 - The inactive combined proof uses one Runtime and two principals. Commit
@@ -143,7 +145,7 @@ The active local branch preserves the verified deployed read behavior:
   access returns `false`.
 
 `origin/upstream/0.7-dev@90bbe15b` adds verified deployed Base 8453 evidence
-that is pending integration into this local branch:
+that this merge integrates into the local branch:
 
 - `CentralStorage.bindIP(bytes16,address,uint256)` accepts acknowledged
   contracts only and is called by `AssetFactory.registerNewAsset`.
@@ -153,7 +155,6 @@ that is pending integration into this local branch:
 - EventHub emits mint events.
 - Upstream records bound-KID allow, deny, and unbound evidence.
 
-These upstream facts do not make `90bbe15b` part of the active local source.
 The exact funded buy receipt and event remain installed proof items. Deployed
 `View` and `Download` still map to one boolean Chain access result, so signed
 Runtime policy owns the action distinction until contract evidence defines it.

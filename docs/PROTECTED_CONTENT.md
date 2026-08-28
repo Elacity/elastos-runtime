@@ -44,14 +44,12 @@ The source path has one operation sequence:
     viewer session and settles open, read, and close ownership.
 
 Current source runs this sequence inside one Runtime, and the creator listing is
-a local Runtime record. The localhost-to-seed journey needs two additional
-typed source behaviors: the buyer Runtime must import or resolve that immutable
-listing from its content and Chain identity, and custody nodes must authenticate
-a buyer Runtime issuer that differs from the provisioning Runtime. That custody
-change preserves the
-Profile-signed recipient-key binding, node-local rights decision, signed
-operation, exact replay, and provisioning issuer authority. A shared listing
-link is sufficient for 0.7. Global listing discovery remains later work.
+a local Runtime record. The localhost-to-seed journey still needs one portable
+immutable listing package and typed buyer Runtime import/projection. Custody
+release already authenticates the buyer Runtime issuer declared by the signed
+operation and bound by the buyer Profile, while the creator Runtime remains the
+provisioning authority. A shared listing link is sufficient for 0.7. Global
+listing discovery remains later work.
 
 Runtime journals identities, state, receipts, and settlement. Providers keep
 clear media, ciphertext staging, CEKs, shares, process details, and private
@@ -94,12 +92,19 @@ Verified deployed read behavior is:
 - Unknown KIDs revert with `UnboundContentId(bytes16)`; a bound KID without
   access returns `false`.
 
-The CentralStorage KID-binding write and its authorization still need deployed
-proof. `AuthorityGateway.buyAccess` remains the purchase operation to prove
-with its exact deployed ABI, transaction receipt, and event. Deployed
-`View`/`Download` contract semantics also remain open. Signed Runtime policy
-owns the View and Download action distinction until that contract truth is
-verified.
+Verified Base 8453 contract facts from `origin/upstream/0.7-dev@90bbe15b` are:
+
+- `CentralStorage.bindIP(bytes16,address,uint256)` accepts acknowledged
+  contracts only and is called by `AssetFactory.registerNewAsset`.
+- Native `AuthorityGateway.buyAccess` uses selector `0xf7580ad9`.
+- ERC20 `AuthorityGateway.buyAccess` uses selector `0x0ede2294`; Wallet first
+  approves the operative `paymentProcessor()`.
+- EventHub is the mint event emitter.
+- A deployed bound KID has recorded allowed, denied, and unbound results.
+
+The exact funded buy receipt and event remain installed proof. Deployed access
+is one boolean per holder and KID, so signed Runtime policy owns the View and
+Download action distinction.
 
 The operator supplies one owner-only
 `protected-content/chain-provider.json` with one versioned
@@ -124,10 +129,11 @@ and signatures.
 
 The decrypt provider generates each operation-scoped recipient key and keeps
 the secret behind an opaque handle. The authenticated Profile authorizes the
-exact public key. Reconstruction requires exact threshold settlement and
-holder proof, verifies the CEK commitment, and keeps the live CEK inside the
-decrypt process. Close expires the launch authority and settles Runtime,
-decrypt, viewer, and staging ownership.
+exact public key. Reconstruction uses the authenticated release operation,
+verified signed epoch, released contributions and terminal receipt, recipient
+possession, and public CEK commitment. Runtime stores no playback custody
+envelope or sealed-share bytes. Close expires the launch authority and settles
+Runtime, decrypt, viewer, and staging ownership.
 
 The current confidentiality suite is
 `elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1` for new protected content.
@@ -176,20 +182,23 @@ owner-only restart receipt.
 The ordered release proof is in [TASKS.md](../TASKS.md). The protected-content
 part requires:
 
-1. the bounded cross-Runtime listing and custody-issuer source slice described
-   above, without changing the frozen public contracts;
-2. final source review and a review branch;
-3. exact same-tree localhost and seed installation receipts;
-4. one real signed owner-only 2-of-3 custody composition across distinct
+1. repair the stale private-custody gateway fixture and restore the combined
+   one-Runtime proof;
+2. add the portable listing export, import, and projection without changing the
+   frozen public contracts;
+3. prove the full two-Runtime source journey;
+4. run the final source review and prepare one review branch;
+5. exact same-tree localhost, seed, and third-node installation receipts;
+6. one real signed owner-only 2-of-3 custody composition across distinct
    operators;
-5. private multi-source Chain configuration and deployed Base evidence;
-6. one bound KID with allowed and denied Wallet evidence, the CentralStorage
+7. private multi-source Chain configuration and deployed Base evidence;
+8. one bound KID with allowed and denied Wallet evidence, the CentralStorage
    binding proof, and the exact `AuthorityGateway.buyAccess` receipt/event;
-7. three replicas plus repair after one replica is lost;
-8. the two-Runtime, two-principal mint-list-deny-buy-open-play-close journey,
+9. three replicas plus repair after one replica is lost;
+10. the two-Runtime, two-principal mint-list-deny-buy-open-play-close journey,
    including restart, replay, tamper, settlement, and cleanup;
-9. the named manual UIUX journeys; and
-10. one atomic cutover that removes the provisional authority surfaces.
+11. the named manual UIUX matrix in `TASKS.md`; and
+12. one atomic cutover that removes the provisional authority surfaces.
 
 The cutover activates the Runtime-owned path and removes provisional startup,
 registration, resources, packaging, tests, and docs in the same reviewable
