@@ -404,6 +404,37 @@ active provider-registry cutover, installed product flow, or production
 confidentiality claim. The provisional `key-provider` and `rights-provider`
 remain the active registered product path until the atomic cutover.
 
+### dKMS placement and transport
+
+The typed key-release contract does not change with placement. Runtime selects
+the route after authorization; the caller does not name a peer, host path,
+backend, or transport. The selected provider may use an internal compatibility
+backend, but that backend does not become part of the capsule contract:
+
+- same-node key or dKMS implementations use a private Runtime-owned adapter;
+- a first-party production dKMS hop that crosses an ElastOS machine boundary
+  uses Carrier as the canonical off-box transport;
+- vendor or compatibility transports remain provider-internal and must not
+  create a second capsule contract;
+- Carrier endpoint authentication identifies the transport peer but does not
+  authorize key release, so the dKMS protocol still verifies node authority,
+  rights binding, encryption, signatures, freshness, replay, and threshold
+  policy end to end;
+- raw CEKs never enter Runtime, Carrier, an ordinary app, or a viewer. Prefer
+  direct sealing to a one-time decrypt-session key; and
+- an all-on-one-machine quorum is a development or contract-test topology, not
+  proof of independent operators, failure domains, or distributed custody.
+
+Current EVM/BTC/ELA wallet proofs and dDRM chain state are still classical. They
+are useful authorization inputs today, but they should not be the only permanent
+identity or access root for long-lived encrypted assets.
+
+References: [NIST PQC standards announcement](https://www.nist.gov/news-events/news/2024/08/nist-releases-first-3-finalized-post-quantum-encryption-standards),
+[FIPS 203 ML-KEM](https://csrc.nist.gov/pubs/fips/203/final),
+[FIPS 204 ML-DSA](https://csrc.nist.gov/pubs/fips/204/final),
+[FIPS 205 SLH-DSA](https://csrc.nist.gov/pubs/fips/205/final),
+and [RFC 9591 FROST](https://www.rfc-editor.org/rfc/rfc9591).
+
 ## Capsule boundary
 
 Normal capsules must not see:

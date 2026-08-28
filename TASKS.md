@@ -25,6 +25,12 @@ Active priority index:
 
 ### Collaboration candidate closeout
 
+Review status (2026-08-28): the stacked review chain #27-#36 covering this
+work is fully reviewed, CI-green at every checkpoint tip, and integrated with
+the base reconciliation on the local `temp/0.7-merge` line (see state.md).
+The remaining open work below is product proof, not source review; merging
+the chain into `main` is the chain owner's operation.
+
 This is the remaining collaboration closeout for
 `codex/post-0.6-consolidation`. It is based on released `main` at `d358dedb`
 and is a candidate for the next 0.7 development line. Do not resume work from
@@ -74,6 +80,19 @@ the remaining Home redesign, and Browser setup are later work. They must not
 enter this candidate to satisfy the five gates above.
 
 ## Later
+
+### Consequence-aware effects
+
+- [ ] Before shipping a physical or retry-sensitive provider, define its typed
+  observation or actuation contract and provider operation classification.
+  Runtime must enforce or strengthen that classification. Also define the
+  effect-ID and reconciliation policy, deadlines, settlement evidence, and
+  local safety owner. Prove that capsule metadata cannot downgrade the policy,
+  remote authority cannot bypass a destination interlock, and reconnect or
+  timeout cannot repeat an uncertain effect. Keep field buses, controller
+  protocols, peers, host paths, backends, and credentials below the provider
+  boundary. Do not add a separate OT authority stack or claim Runtime is a hard
+  real-time controller.
 
 ### Collaboration identity and Carrier boundary
 

@@ -86,6 +86,8 @@ verify:
     ./scripts/vendor-ui-tokens.sh --check
     node scripts/home-entropy-check.mjs
     node scripts/carrier-dependency-generation-check.mjs
+    node scripts/system-map-check.mjs
+    python3 scripts/source-home-provider-inventory-smoke.py
     just product-ui-source
     node scripts/home-clipboard-source-gate.mjs
     node scripts/browser-entropy-check.mjs
@@ -93,10 +95,16 @@ verify:
     node --test scripts/home-two-runtime-acceptance.test.mjs
     python3 scripts/source-home-capsule-inventory-smoke.py
     ./scripts/command-smoke.sh
+    ./scripts/browser-local-exit-orphan-cleanup-smoke.sh
     just candidate-command-audit
     cd elastos && cargo fmt --all -- --check
     cd elastos && cargo clippy --workspace --all-targets -- -D warnings
     just test
+    # browser-local-exit carries its own workspace under elastos/tools, so
+    # neither the elastos workspace test nor test-capsules reaches it
+    cd elastos/tools/browser-local-exit && cargo fmt -- --check
+    cd elastos/tools/browser-local-exit && cargo clippy --all-targets -- -D warnings
+    cd elastos/tools/browser-local-exit && cargo test
 
 product-ui-source:
     node scripts/home-shell-regression-smoke.mjs

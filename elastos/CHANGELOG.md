@@ -5,12 +5,27 @@ All notable changes to the public ElastOS Runtime repository.
 ## [Unreleased]
 
 ### Added
+- Protected-content source-only foundation across the stacked review chain:
+  canonical contracts (identities, wallet-signed rights, custody envelopes,
+  epochs, pool policy), threshold custody with durable replay stores, the
+  custody/protect/decrypt provider processes and wire contracts, the Runtime
+  release coordinator and mint journal, chain rights evidence, and the runtime
+  lifecycle (mint, buy, play, purchase closeout). Source-only: the provisional
+  drm/rights/key/decrypt capsules remain the registered product path until the
+  atomic cutover.
 - People now reports Profile readiness explicitly. Passkey registration and
   Profile setup are separate: a valid passkey remains valid when Profile setup
   is not ready, and People directs the person to System Recovery rather than
   hiding protection or Recovery changes behind a profile save.
 
 ### Fixed
+- Bound `browser-local-exit` to the lifetime of the Runtime that launched it via
+  a held-open stdin pipe, so it no longer survives as an orphan when the Runtime
+  is SIGKILLed, aborts on panic, or leaves through `std::process::exit` (the
+  installed-binary supersession watch takes that path on every rebuild). Helper
+  teardown is now scoped by inode identity to the relay socket it bound, and the
+  Runtime refuses to replace a relay socket a live helper is still serving
+  instead of stranding it on an unlinked socket.
 - Renaming yourself no longer looks like becoming someone else. A person's
   identity is their Profile DID and a rename only advances the revision, but
   the context check compared whole signed Profile documents, so editing your
