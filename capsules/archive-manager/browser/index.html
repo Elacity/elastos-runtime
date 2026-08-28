@@ -880,7 +880,10 @@
       for (const [key, value] of Object.entries(query)) {
         if (value) url.searchParams.set(key, value);
       }
-      window.location.assign(url.pathname + url.search);
+      if (homeToken) {
+        url.hash = new URLSearchParams({ home_token: homeToken }).toString();
+      }
+      window.location.assign(url.pathname + url.search + url.hash);
     }
 
     async function openLibraryObject(object) {
