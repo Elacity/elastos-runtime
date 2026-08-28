@@ -1834,6 +1834,11 @@ install_browser_runtime_helpers
 start_browser_runtime_turn
 install_browser_source_home_config
 install_collaboration_startup_config
+python3 "${ROOT}/scripts/install-source-home-runtime.py" \
+    --source-root "${ROOT}" \
+    --data-dir "${DATA_DIR}" \
+    --built-runtime "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)" \
+    --platform "${PLATFORM}"
 
 cat <<EOF
 [setup-source-home] artifacts installed; offline principal-root upgrade and restart are required before readiness
