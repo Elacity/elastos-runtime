@@ -719,7 +719,7 @@ fn custody_provider_provision_command_is_idempotent_for_public_identities() {
 }
 
 #[test]
-fn custody_provider_process_provisions_releases_replays_after_restart_and_shuts_down() {
+fn custody_provider_process_keeps_provisioning_issuer_while_buyer_runtime_releases_and_replays() {
     let temp = tempfile::tempdir().unwrap();
     let init_request = prepare_config(temp.path());
     let base_path = Path::new(init_request["config"]["base_path"].as_str().unwrap());
@@ -750,7 +750,11 @@ fn custody_provider_process_provisions_releases_replays_after_restart_and_shuts_
     let duplicate = provider.request(request_value(&provision_request));
     assert_eq!(duplicate["data"], provisioned["data"]);
 
-    let release_operation = signed_release_operation_with_provider(&record, &provider_node);
+    let release_operation = signed_release_operation_with_runtime_seed_and_epoch(
+        &record,
+        0x43,
+        signed_epoch_with_provider(&provider_node),
+    );
     let decision = signed_decision_with_provider(
         &release_operation,
         &provider_node,
@@ -890,27 +894,6 @@ fn custody_provider_process_rejects_wrong_issuer_node_conflict_and_redacts_diagn
     assert!(!wrong_issuer.contains("0x43"));
 
     let wrong_runtime_operation = signed_release_operation_with_provider(&record, &provider_node);
-    let wrong_release_issuer_operation = signed_release_operation_with_runtime_seed_and_epoch(
-        &record,
-        0x43,
-        signed_epoch_with_provider(&provider_node),
-    );
-    let wrong_release_issuer_decision = signed_decision_with_provider(
-        &wrong_release_issuer_operation,
-        &provider_node,
-        RightsDecisionV1::Allowed,
-    );
-    let wrong_release_issuer_request = CustodyProviderRequestV1::new_release_contribution(
-        &wrong_release_issuer_operation,
-        &wrong_release_issuer_decision,
-    )
-    .unwrap();
-    let wrong_release_issuer =
-        serde_json::to_string(&provider.request(request_value(&wrong_release_issuer_request)))
-            .unwrap();
-    assert!(wrong_release_issuer.contains("invalid_request"));
-    assert!(!wrong_release_issuer.contains("issuer"));
-
     let wrong_node_decision =
         signed_decision_with(&wrong_runtime_operation, 2, RightsDecisionV1::Allowed);
     let wrong_node_request = CustodyProviderRequestV1::new_release_contribution(
