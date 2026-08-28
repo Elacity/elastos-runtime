@@ -17,8 +17,7 @@ section if a higher section is incoherent, unverified, or too large to review.
 
 Active priority index:
 
-- current source work: close the two exact cross-Runtime protected-content
-  boundaries under
+- current source work: reconcile `origin/upstream/0.7-dev@90bbe15b` under
   [Trusted content and access rights](#trusted-content-and-access-rights)
 - integrated UIUX source evidence: published
   `origin/feat/0.7-uiux-candidate` at `8b547590`; this ref is donor evidence,
@@ -27,45 +26,51 @@ Active priority index:
 
 ### Integrated UIUX and protected-content proof
 
-The integrated source proves the inactive protected-content journey with one
-Runtime and two principals. Runtime owns authority, provider selection,
-lifecycle, Wallet and Chain effects, and audit. The reviewed UIUX groups own
-presentation and app behavior. Source presence does not prove installed
-artifacts or a cross-Runtime product journey.
+Verified integrated source truth is in [state.md](state.md). The following
+gates are the remaining path to review, installation, and cutover.
 
 Open gates, in order:
 
-1. [ ] Add one bounded cross-Runtime source slice before installation. A buyer
-   Runtime needs a typed way to import or resolve the creator's immutable
-   listing from its content and Chain identity. A shared listing link is
-   sufficient for 0.7; global market discovery remains later work. Custody
-   release must authenticate a buyer Runtime issuer that differs from the
-   provisioning Runtime while preserving the Profile-signed recipient-key
-   binding, node-local rights decision, signed operation, exact replay, and
-   provisioning issuer authority. Keep the public contracts frozen and do not
-   design public custody governance in this slice.
-2. [ ] Complete the final source review after that slice and prepare the 0.7
-   review branch.
-3. [ ] Install the exact same reviewed tree on localhost and the seed with
-   matching stable Runtime, component, capsule metadata, provider, static audit,
-   installation, and platform restart receipts.
-4. [ ] Provision one real signed owner-only 2-of-3 custody composition across
+1. [ ] Reconcile `origin/upstream/0.7-dev@90bbe15b` semantically. Preserve all
+   current local behavior and every published protected-content tip while
+   integrating the verified Base 8453 contract facts once. Upstream overlaps
+   27 locally changed files, including Chain provider source, tests, and
+   protected-content docs, so this gate precedes new listing code.
+2. [ ] Repair the stale combined gateway fixture so it registers private
+   custody through the Runtime-only target path. Restore the combined
+   one-Runtime protected-content proof at the reconciled tip. The current
+   failure is `sub-provider 'custody' is not a reserved name`; it is a fixture
+   boundary, not a product authority change.
+3. [ ] Publish the creator's bounded immutable listing package through
+   `elastos://content`. Add typed buyer Runtime import and verified projection
+   through the existing content, Chain, availability, listing, and provider
+   seams. Refactor buy and open to use that projection instead of creator-only
+   mint-journal state. A shared listing link is sufficient for 0.7; global
+   market discovery remains later work.
+4. [ ] Prove the full two-Runtime source journey with the exact exported and
+   imported listing.
+5. [ ] Run the final source, entropy, and UIUX gates. Review the complete source
+   and prepare one 0.7 review branch.
+6. [ ] Install the exact reviewed tree on localhost, the seed, and the third
+   custody node with matching stable Runtime, component, capsule metadata,
+   provider, static audit, installation, and platform restart receipts.
+7. [ ] Provision one real signed owner-only 2-of-3 custody composition across
    three distinct operators and failure domains.
-5. [ ] Install the private multi-source Chain configuration and prove the
-   deployed Base reads.
-6. [ ] Prove one bound KID with one allowed and one denied Wallet account,
-   CentralStorage binding evidence, and the exact
-   `AuthorityGateway.buyAccess` receipt and event.
-7. [ ] Prove three protected-content replicas and repair after one replica is
-   lost.
-8. [ ] Run the installed two-Runtime journey: mint and list on localhost, then
-   resolve, deny, buy, open, play, and close on the seed. Prove exact restart,
-   replay, tamper rejection, provider settlement, and cleanup.
-9. [ ] Complete the manual UIUX matrix for Home windows, focus, fullscreen, and
-   launcher; People, Chat, Inbox, and Clipboard; Wallet and connectors; Library,
-   Marketplace, and `elacity-player`; Assistant model-offer states; GBA; and
-   Browser.
-10. [ ] Make one atomic cutover that selects the Runtime-owned protected-content
+8. [ ] Install the private multi-RPC Chain configuration and verify the exact
+   deployed Base network, contract, token, emitter, and finality authority.
+9. [ ] Prove exactly three protected-content replicas and repair after one
+   replica is lost.
+10. [ ] Fund the creator and buyer Base accounts, then run the Brave two-Runtime
+   journey: mint, list, and share on localhost; import, deny, buy, open, play,
+   and close on the seed. Prove one bound KID with allowed, denied, and unbound
+   reads, the CentralStorage binding, the exact `AuthorityGateway.buyAccess`
+   receipt and event, restart, replay, tamper rejection, settlement, cleanup,
+   and zero unresolved state.
+11. [ ] Complete the installed manual UIUX matrix for Home windows, focus,
+    fullscreen, and launcher; People, Chat, Inbox, and Clipboard; Wallet and
+    connectors; Library, Marketplace, and `elacity-player`; Assistant
+    model-offer states; GBA; and Browser.
+12. [ ] Make one atomic cutover that selects the Runtime-owned protected-content
     path and removes the provisional `drm`, `rights`, `key`, and `decrypt`
     authority surfaces from startup, registration, resources, packaging, tests,
     and docs.
@@ -601,60 +606,52 @@ evidence, while installed and live truth requires separate target evidence.
 
 Current protected-content source status lives in [state.md](state.md) and
 [Protected-content integration plan](docs/PROTECTED_CONTENT_EXTRACTION.md).
-The current inactive source proof uses one Runtime and two principals for mint,
-availability, listing, deny, buy, open, 2-of-3 release, decrypt, and close. It
-does not prove the requested localhost-to-seed protected-content journey.
+The following tasks repeat the strict `Now` order for this product boundary:
 
-- [ ] Close the cross-Runtime source boundary before final source review:
-  - A buyer Runtime needs a typed import or resolution operation for the
-    creator's immutable listing, bound to its content and Chain identity. A
-    shared listing link is sufficient for 0.7. Global listing discovery remains
-    later work.
-  - Each custody node must authenticate a buyer Runtime issuer that differs from
-    the provisioning Runtime while preserving the Profile-signed recipient-key
-    binding, node-local rights decision, signed operation, exact replay, and
-    provisioning issuer authority.
-  - Keep the frozen public protected-content contracts unchanged. This task
-    defines the missing ownership boundary; implementation and review must
-    choose the narrow typed operation.
+1. [ ] Reconcile `origin/upstream/0.7-dev@90bbe15b` semantically. Preserve all
+   current local behavior and published protected-content tips while
+   integrating its verified Base 8453 evidence: `CentralStorage.bindIP`, native
+   and ERC20 `AuthorityGateway.buyAccess`, operative payment processors,
+   EventHub mint emission, and bound-KID allow, deny, and unbound results.
+   Upstream overlaps 27 locally changed files, including Chain provider source,
+   tests, and protected-content docs, so this gate precedes listing work.
+2. [ ] Repair the combined protected-content gateway fixture so private custody
+   uses the Runtime-only target path. Restore the combined one-Runtime proof at
+   the reconciled tip. The current failure is
+   `sub-provider 'custody' is not a reserved name`.
+3. [ ] Add one portable immutable listing package through `elastos://content`.
+   Bind the creator's exact content, Chain, availability, and listing
+   identities. Add typed buyer Runtime import and verified projection, then
+   make buy and open use that projection instead of creator-only mint-journal
+   state. Keep the frozen public contracts unchanged.
+4. [ ] Prove the full two-Runtime source journey with the exact exported and
+   imported listing.
+5. [ ] Run the final source, entropy, and UIUX gates. Review the complete source
+   and prepare one 0.7 review branch.
+6. [ ] Install the exact reviewed tree on localhost, the seed, and the third
+   custody node with matching stable artifact and restart receipts.
+7. [ ] Provision one signed owner-only three-node 2-of-3 custody composition
+   across distinct operators and failure domains.
+8. [ ] Install the private multi-RPC Chain configuration and verify the exact
+   deployed Base network, contract, token, emitter, and finality authority.
+9. [ ] Prove exactly three replicas and repair after one replica is lost.
+10. [ ] Fund the creator and buyer Base accounts, then run the Brave journey.
+    The creator mints, lists, and shares on localhost. The buyer Runtime imports
+    on the seed, proves deny before purchase, buys, opens, plays, and closes.
+    Prove one bound KID with allowed, denied, and unbound reads, the
+    CentralStorage binding, the exact `AuthorityGateway.buyAccess` receipt and
+    event, restart, replay, tamper rejection, settlement, provider cleanup, and
+    zero unresolved state.
+11. [ ] Complete the installed manual UIUX matrix for Home windows, focus,
+    fullscreen, and launcher; People, Chat, Inbox, and Clipboard; Wallet and
+    connectors; Library, Marketplace, and `elacity-player`; Assistant
+    model-offer states; GBA; and Browser.
+12. [ ] Make the atomic cutover one authority change. Activate the Runtime-owned
+    protected-content path and remove the provisional `drm`, `rights`, `key`,
+    and old `decrypt` startup, DTO, provider-resource, catalog, build, install,
+    component, WCI, test, and documentation surfaces together.
 
-- [ ] Keep deployed-contract and installed prerequisites exact:
-  - AuthorityGateway access reads use
-    `hasAccessByContentId(address holder, bytes16 contentId) -> bool`.
-  - The bytes16 KID remains separate from `EncryptedContentIdentityV1`.
-  - `UnboundContentId(bytes16)` means unknown or unbound, while a bound KID
-    without access returns `false`.
-  - AuthorityGateway read resolution uses
-    `CentralStorage.ipReference(bytes16)`.
-  - The exact KID-binding write and authorization remain unverified.
-  - Deployed `View` and `Download` contract semantics remain open. Signed
-    Runtime policy owns those action distinctions until contract evidence
-    defines them.
-  - The exact `AuthorityGateway.buyAccess` ABI, receipt, and event remain open.
-  - Deployed proof needs one known bound KID with one allowed and one denied
-    Wallet account.
-  - Installed proof needs one signed owner-only three-node 2-of-3 custody
-    composition, private multi-source Chain configuration, three replicas,
-    repair after one loss, and exact stable installation receipts.
-  - External cryptographic review remains open.
-
-- [ ] Preserve the installed proof order in `Now`: final source review after
-  the cross-Runtime slice, same-tree installation, signed custody composition,
-  private Chain and deployed proof, bound-KID allow/deny and exact buy receipt,
-  replicas and repair, the installed two-Runtime journey, the manual UIUX
-  matrix, then atomic cutover.
-
-- [ ] Make the atomic cutover one authority change. Activate the Runtime-owned
-  protected-content path and remove the provisional `drm`, `rights`, `key`,
-  and old `decrypt` startup, DTO, provider-resource, catalog, build, install,
-  component, WCI, test, and documentation surfaces together.
-
-- [ ] Installed acceptance uses two Runtimes and two principals. The creator
-  mints and lists on localhost. The buyer Runtime on the seed imports or
-  resolves that exact immutable listing, proves deny before purchase, uses the
-  real Wallet and Chain paths, opens through a buyer-issued custody release,
-  reads and closes the player, and proves restart, replay, tamper rejection,
-  provider cleanup, and zero unresolved state.
+External cryptographic review remains open.
 
 PR #15 is source evidence, not a merge target. The retained extraction ledger
 covers threshold crypto, recipient-sealed contributions, CEK commitment,

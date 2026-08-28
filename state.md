@@ -8,28 +8,68 @@ volatile proof logs remain outside the repository.
 
 ## Release Posture
 
-- `main` at `d358dedb` is the released 0.6.0 source line.
-- `origin/feat/protected-content-runtime-lifecycle` at `854d9dc9` is the
-  published protected-content lifecycle source. It proves the inactive
-  Runtime-owned lifecycle through mint, availability, listing, purchase, open,
-  read, and close.
-- `origin/feat/0.7-uiux-candidate` at `8b547590` is the published UIUX donor
-  for reviewed collaboration, Home/platform, Wallet, capsule/GBA,
-  model-provider, and Assistant groups.
-- The unpublished integrated source prefix through `b817e0fe` reconstructs
-  those two published lines and adds the reviewed protected-content product,
-  private-provider, installation, audit, and restart slices. This commit is
-  source evidence. It is not a published review ref, installed target, or live
-  deployment.
-- The active protected-content product path remains provisional. The canonical
-  source path is inactive while exact installed proof and one atomic cutover
-  remain open.
-- The inactive protected-content source proof uses one Runtime with two
-  principals. The requested localhost-to-seed journey remains open because a
-  creator listing is a local Runtime record with no typed buyer Runtime import
-  or resolution from its content and Chain identity, and custody release still
-  pins the provisioning Runtime issuer instead of authenticating a distinct
-  buyer Runtime issuer.
+- A fresh fetch records `main` at `d358dedb` as the released 0.6 source and
+  `origin/upstream/0.7-dev` at `90bbe15b` as the current 0.7 integration line.
+- Published feature evidence is
+  `origin/feat/protected-content-runtime-lifecycle@854d9dc9`,
+  `origin/feat/0.7-uiux-candidate@8b547590`,
+  `origin/feat/dkms-esp-port@27d85c6f`, and
+  `origin/feat/0.7-product-documentation@74cd4e42`.
+- The published protected-content stack is contracts `0c56c56a`, custody
+  `2f844cef`, key reconstruction `467a6c03`, custody provider `1b7fa732`, Wallet
+  rights `c9e82e75`, Runtime `a8ac6dc8`, and rights `3627da01`. Every tip is an
+  ancestor of the published lifecycle and is already present in the active
+  integration. The latest published protected-branch repairs need no new
+  extraction.
+- The active unpublished branch contains the implementation prefix through
+  `3ece9042`, tree `a17c799d4ffd837a4c65888ec9601ee6216c52fa`. The source
+  worktree was clean at that implementation prefix before this document update.
+  The branch has no upstream and contains both the published lifecycle and UIUX
+  candidate tips.
+- Relative to `origin/upstream/0.7-dev@90bbe15b`, the `3ece9042` implementation
+  prefix has 15 unique commits behind and 98 unique commits ahead. Its merge
+  base is `854d9dc9`. The current upstream tip is not integrated. Its changes
+  overlap 27 files also changed locally, including Chain provider source and
+  tests and protected-content documents.
+- Upstream `90bbe15b` records Irzhy's verified Base 8453 evidence and changes
+  `TASKS.md`, Chain provider source and tests, `docs/CHAIN_PROVIDER.md`,
+  `docs/PROTECTED_CONTENT.md`, and
+  `docs/PROTECTED_CONTENT_EXTRACTION.md`. Upstream reconciliation must preserve
+  the published protected-content repairs and integrate this evidence once.
+- The protected-content source path remains inactive. Installed proof and one
+  atomic cutover remain open.
+- The inactive combined proof uses one Runtime and two principals. Commit
+  `f657242c` completed cross-Runtime custody release issuer admission: creator
+  Runtime authority still controls provisioning, while release authenticates
+  the buyer Runtime issuer declared by the signed operation and bound by the
+  buyer Profile. The remaining cross-Runtime source boundary is a portable
+  immutable listing package and typed buyer import/projection.
+- Commit `3ece9042` removed Runtime `runtime-open/envelope.bin` state. Playback
+  reconstructs from the authenticated release operation, verified signed
+  epoch, released contributions and terminal receipt, recipient possession,
+  and public CEK commitment. Provisioning still uses `CustodyEnvelopeV1`.
+- The broad combined protected-content gateway proof currently stops at a stale
+  fixture that registers private custody through the public sub-provider path:
+  `sub-provider 'custody' is not a reserved name`. This is the next test
+  boundary, not a product authority change.
+
+## Branch Hygiene
+
+- Local UIUX subgroup branches are extraction scaffolding already contained in
+  the published UIUX candidate and active integration. They need no separate
+  publication.
+- Local accepted protected-content labels whose tips are ancestors of the
+  published lifecycle or upstream need no separate publication.
+- Keep the unique local donor
+  `feat/protected-content-runtime-lifecycle@e06837d4` and old parallel drafts
+  until the active integration is reviewed or published and retained behavior
+  is confirmed. These drafts are evidence, not publication candidates.
+- `feat/0.7-product-documentation` has a published prefix at `74cd4e42` and a
+  separate dirty local tail owned by another task. Keep that work separate.
+- `feat/home-urux-on-freeze` has a published remote tip at `5e546ef4` and a
+  dirty local donor that is behind that tip. Keep it separate for owner review.
+- `pc-review` is a clean local label and worktree at `main@d358dedb`. It is an
+  exact cleanup candidate after explicit user approval.
 
 ## Integrated Source Truth
 
@@ -94,7 +134,7 @@ KID and `EncryptedContentIdentityV1` are separate identities. The bytes16 CENC
 KID is the deployed AuthorityGateway access key. The full encrypted-content
 identity binds the protected object and media contract.
 
-Verified deployed read behavior is:
+The active local branch preserves the verified deployed read behavior:
 
 - `AuthorityGateway.hasAccessByContentId(address,bytes16) -> bool` owns the
   access read.
@@ -102,11 +142,21 @@ Verified deployed read behavior is:
 - An unknown KID reverts with `UnboundContentId(bytes16)`; a bound KID without
   access returns `false`.
 
-The exact CentralStorage binding write and authorization remain open.
-`AuthorityGateway.buyAccess` is the intended purchase operation, and its exact
-deployed ABI, receipt, and event still need target proof. Deployed
-`View`/`Download` contract semantics are also open, so signed Runtime policy
-continues to own those action distinctions.
+`origin/upstream/0.7-dev@90bbe15b` adds verified deployed Base 8453 evidence
+that is pending integration into this local branch:
+
+- `CentralStorage.bindIP(bytes16,address,uint256)` accepts acknowledged
+  contracts only and is called by `AssetFactory.registerNewAsset`.
+- Native `AuthorityGateway.buyAccess` uses selector `0xf7580ad9`.
+- ERC20 `AuthorityGateway.buyAccess` uses selector `0x0ede2294`; Wallet approval
+  targets each operative `paymentProcessor()`.
+- EventHub emits mint events.
+- Upstream records bound-KID allow, deny, and unbound evidence.
+
+These upstream facts do not make `90bbe15b` part of the active local source.
+The exact funded buy receipt and event remain installed proof items. Deployed
+`View` and `Download` still map to one boolean Chain access result, so signed
+Runtime policy owns the action distinction until contract evidence defines it.
 
 The canonical source path keeps Runtime journals limited to identities, state,
 receipts, and settlement. Protect, custody, and decrypt providers keep clear
@@ -133,8 +183,9 @@ integrated source adapted these useful parts to the typed Runtime path:
 Current video opens in `elacity-player`. Document and 3D viewers remain later
 typed-viewer scope. External cryptographic review remains open before public
 dKMS or production confidentiality claims. Global listing discovery and public
-custody governance remain later work; a shared listing link and bounded buyer
-Runtime issuer admission are the open 0.7 source boundary.
+custody governance remain later work. Buyer Runtime issuer admission is
+complete. A shared listing link, portable immutable listing package, and typed
+buyer import/projection are the remaining 0.7 source boundary.
 
 ## Capsule Execution Truth
 
@@ -583,8 +634,8 @@ Runtime issuer admission are the open 0.7 source boundary.
   artifacts.
 - Set `ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1` only when the publisher relay
   path itself is under review.
-- Final public installed-path proof waits for publishing the 0.6.0
-  binary/artifact set.
+- Integrated 0.7 installed-path proof waits for one reviewed source tree and
+  matching stable installation receipts on each target role.
 
 ## Open Blockers
 
