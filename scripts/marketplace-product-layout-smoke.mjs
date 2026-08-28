@@ -14,6 +14,50 @@ const { chromium } = require("playwright");
 
 const normalToken = "marketplace-layout-token";
 const errorToken = "marketplace-error-token";
+const mediaErrorToken = "marketplace-media-error-token";
+const mediaMalformedToken = "marketplace-media-malformed-token";
+const mediaEmptyToken = "marketplace-media-empty-token";
+const mediaCreatorMint = "a".repeat(64);
+const mediaPurchasedMint = "b".repeat(64);
+const mediaAvailableMint = "c".repeat(64);
+const mediaPayToken = "0x1111111111111111111111111111111111111111";
+const mediaSellerAddress = "0x2222222222222222222222222222222222222222";
+const mediaTokenId = "0x7";
+const mediaAvailability = {
+  schema: "elastos.library.runtime-custody-availability-summary/v1",
+  status: "last_verified_receipt",
+  checked_at: 1_756_295_696,
+  required_replicas: 3,
+  observed_replicas: 3,
+  recheck_before_buy: true,
+  recheck_before_open: true,
+};
+
+function mediaListing({ mintId, displayName, accessState, quantity, price, codecs = "avc1.640028" }) {
+  return {
+    schema: "elastos.library.runtime-custody-listing/v1",
+    mint_id: mintId,
+    display_name: displayName,
+    mime_type: "video/mp4",
+    codecs,
+    quantity,
+    price,
+    pay_token: mediaPayToken,
+    seller_address: mediaSellerAddress,
+    token_id: mediaTokenId,
+    published_at: 1_756_293_600,
+    availability: mediaAvailability,
+    access_state: accessState,
+  };
+}
+
+function mediaListResponse(listings, truncated = false) {
+  return {
+    schema: "elastos.library.runtime-custody-listings/v1",
+    truncated,
+    listings,
+  };
+}
 
 const catalogCapsules = [
   {
@@ -162,6 +206,15 @@ function createBarrier() {
   return { promise, release };
 }
 
+async function readJsonBody(request) {
+  const chunks = [];
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const body = Buffer.concat(chunks).toString("utf8");
+  return body ? JSON.parse(body) : null;
+}
+
 function json(response, value, status = 200, headers = {}) {
   const body = Buffer.from(JSON.stringify(value));
   response.writeHead(status, {
@@ -257,9 +310,37 @@ function startServer() {
       catalogFailuresRemaining: 0,
       initialCatalogBarrier: createBarrier(),
       initialInterfacesBarrier: createBarrier(),
+      initialMediaBarrier: createBarrier(),
       initialCatalogHeld: false,
       initialInterfacesHeld: false,
+      initialMediaHeld: false,
+      mediaListings: [
+        mediaListing({
+          mintId: mediaCreatorMint,
+          displayName: "Creator Video",
+          accessState: "creator",
+          quantity: "0x2",
+          price: "0x5",
+        }),
+        mediaListing({
+          mintId: mediaPurchasedMint,
+          displayName: "Owned Video",
+          accessState: "purchased",
+          quantity: "0x3",
+          price: "0x6",
+        }),
+        mediaListing({
+          mintId: mediaAvailableMint,
+          displayName: "Store Video",
+          accessState: "available",
+          quantity: "0x4",
+          price: "0x8",
+        }),
+      ],
     },
+    [mediaErrorToken]: { catalogFailuresRemaining: 0 },
+    [mediaMalformedToken]: { catalogFailuresRemaining: 0 },
+    [mediaEmptyToken]: { catalogFailuresRemaining: 0 },
   };
   const server = createServer(async (request, response) => {
     try {
@@ -288,6 +369,33 @@ function startServer() {
       if (url.pathname === "/fixture-error") {
         const topOrigin = `http://${request.headers.host}`;
         const appSrc = `/apps/marketplace/?home_origin=${encodeURIComponent(topOrigin)}#home_token=${encodeURIComponent(errorToken)}`;
+        const shellSrc = `/fixture-shell?app_src=${encodeURIComponent(appSrc)}`;
+        const body = Buffer.from(buildFixtureHtml(shellSrc));
+        response.writeHead(200, { "content-length": body.length, "content-type": "text/html; charset=utf-8" });
+        response.end(body);
+        return;
+      }
+      if (url.pathname === "/fixture-media-error") {
+        const topOrigin = `http://${request.headers.host}`;
+        const appSrc = `/apps/marketplace/?home_origin=${encodeURIComponent(topOrigin)}#home_token=${encodeURIComponent(mediaErrorToken)}`;
+        const shellSrc = `/fixture-shell?app_src=${encodeURIComponent(appSrc)}`;
+        const body = Buffer.from(buildFixtureHtml(shellSrc));
+        response.writeHead(200, { "content-length": body.length, "content-type": "text/html; charset=utf-8" });
+        response.end(body);
+        return;
+      }
+      if (url.pathname === "/fixture-media-malformed") {
+        const topOrigin = `http://${request.headers.host}`;
+        const appSrc = `/apps/marketplace/?home_origin=${encodeURIComponent(topOrigin)}#home_token=${encodeURIComponent(mediaMalformedToken)}`;
+        const shellSrc = `/fixture-shell?app_src=${encodeURIComponent(appSrc)}`;
+        const body = Buffer.from(buildFixtureHtml(shellSrc));
+        response.writeHead(200, { "content-length": body.length, "content-type": "text/html; charset=utf-8" });
+        response.end(body);
+        return;
+      }
+      if (url.pathname === "/fixture-media-empty") {
+        const topOrigin = `http://${request.headers.host}`;
+        const appSrc = `/apps/marketplace/?home_origin=${encodeURIComponent(topOrigin)}#home_token=${encodeURIComponent(mediaEmptyToken)}`;
         const shellSrc = `/fixture-shell?app_src=${encodeURIComponent(appSrc)}`;
         const body = Buffer.from(buildFixtureHtml(shellSrc));
         response.writeHead(200, { "content-length": body.length, "content-type": "text/html; charset=utf-8" });
@@ -334,6 +442,59 @@ function startServer() {
         json(response, { interfaces: interfaceEntries });
         return;
       }
+      if (url.pathname === "/api/provider/object/list_runtime_custody") {
+        const token = String(request.headers["x-elastos-home-token"] || "");
+        const body = await readJsonBody(request);
+        requestLog.push({ path: url.pathname, token, method: request.method, body });
+        if (token === normalToken && !state[normalToken].initialMediaHeld) {
+          state[normalToken].initialMediaHeld = true;
+          await state[normalToken].initialMediaBarrier.promise;
+        }
+        if (token === mediaErrorToken) {
+          json(response, { message: "runtime service unavailable" }, 500);
+          return;
+        }
+        if (token === mediaMalformedToken) {
+          json(response, {
+            status: "ok",
+            data: mediaListResponse([
+              {
+                ...mediaListing({
+                  mintId: mediaCreatorMint,
+                  displayName: "Broken Video",
+                  accessState: "creator",
+                  quantity: "0x1",
+                  price: "0x2",
+                }),
+                access_state: "unknown",
+              },
+            ]),
+          });
+          return;
+        }
+        if (token === mediaEmptyToken) {
+          json(response, { status: "ok", data: mediaListResponse([]) });
+          return;
+        }
+        json(response, { status: "ok", data: mediaListResponse(state[token]?.mediaListings || []) });
+        return;
+      }
+      if (url.pathname === "/api/provider/object/buy") {
+        const token = String(request.headers["x-elastos-home-token"] || "");
+        const body = await readJsonBody(request);
+        requestLog.push({ path: url.pathname, token, method: request.method, body });
+        if (token === normalToken && body?.mint_id === mediaAvailableMint) {
+          state[normalToken].mediaListings = state[normalToken].mediaListings.map((listing) =>
+            listing.mint_id === mediaAvailableMint
+              ? { ...listing, access_state: "purchased" }
+              : listing,
+          );
+          json(response, { status: "ok", data: { status: "accepted" } });
+          return;
+        }
+        json(response, { message: "runtime purchase unavailable" }, 500);
+        return;
+      }
       notFoundPaths.push(url.pathname);
       response.writeHead(404).end("not found");
     } catch (error) {
@@ -361,8 +522,10 @@ async function readHomeMessages(page) {
       origin: entry.origin,
       type: entry.message?.type || "",
       target: entry.message?.target || "",
+      query: entry.message?.query || null,
       menus: entry.message?.menus || null,
       homeToken: entry.message?.homeToken || "",
+      keys: Object.keys(entry.message || {}).sort(),
     })),
   );
 }
@@ -452,9 +615,24 @@ async function run() {
     await frame.locator(".store-row-skeleton").first().waitFor();
     await waitForRequestCount(requestLog, normalToken, "/api/capsules/catalog", 1);
     await waitForRequestCount(requestLog, normalToken, "/api/capsules/interfaces", 1);
+    await waitForRequestCount(requestLog, normalToken, "/api/provider/object/list_runtime_custody", 1);
     state[normalToken].initialCatalogBarrier.release();
     state[normalToken].initialInterfacesBarrier.release();
     await frame.locator(".store-row").filter({ hasText: "People" }).first().waitFor();
+    const discoverTextWhileMediaPending = await frame.locator("#store-main").textContent();
+    assert(
+      /People/.test(discoverTextWhileMediaPending || ""),
+      "Marketplace must render Discover when catalog requests finish even while Media is still pending",
+      { discoverTextWhileMediaPending },
+    );
+    await frame.locator('[data-destination="media"]').click();
+    await frame.locator(".store-row-skeleton").first().waitFor();
+    const mediaRowsWhilePending = await frame.locator(".store-row-media").count();
+    assert(mediaRowsWhilePending === 0, "Marketplace Media must keep its own loading state while listings are pending", { mediaRowsWhilePending });
+    state[normalToken].initialMediaBarrier.release();
+    await frame.locator('.store-row-media').first().waitFor();
+    await frame.locator('[data-destination="discover"]').click();
+    await frame.locator('.store-row[data-app="people"]').first().waitFor();
 
     const initialMessages = await readHomeMessages(page);
     assert(initialMessages[0]?.type === "home:app-ready", "Marketplace must announce Home readiness first", initialMessages);
@@ -464,7 +642,17 @@ async function run() {
 
     const normalCatalogRequests = requestLog.filter((entry) => entry.token === normalToken && entry.path === "/api/capsules/catalog").length;
     const normalInterfaceRequests = requestLog.filter((entry) => entry.token === normalToken && entry.path === "/api/capsules/interfaces").length;
-    assert(normalCatalogRequests === 1 && normalInterfaceRequests === 1, "Marketplace must read the canonical catalog routes once on first load", requestLog);
+    const initialMediaRequest = requestLog.find((entry) => entry.token === normalToken && entry.path === "/api/provider/object/list_runtime_custody");
+    assert(
+      normalCatalogRequests === 1 && normalInterfaceRequests === 1,
+      "Marketplace must read the canonical catalog routes once on first load",
+      requestLog,
+    );
+    assert(
+      initialMediaRequest?.method === "POST" && JSON.stringify(initialMediaRequest.body) === "{}",
+      "Marketplace must load protected media through the typed list_runtime_custody request",
+      initialMediaRequest,
+    );
 
     const peopleIconVisible = await frame.locator('.store-row[data-app="people"] .app-icon-img').first().getAttribute("src");
     assert(peopleIconVisible === "/apps/people/icons/icon-128.png", "Marketplace must prefer the declared 128px icon route", { peopleIconVisible });
@@ -504,6 +692,107 @@ async function run() {
       visibleRows,
     );
     await frame.locator("#search-input").fill("");
+
+    await frame.locator('[data-destination="media"]').click();
+    await frame.locator('.store-row-media').first().waitFor();
+    const mediaTitle = await frame.locator("#store-title").textContent();
+    assert(mediaTitle?.trim() === "Media", "Marketplace must expose the Media destination", { mediaTitle });
+    const mediaRows = await frame.locator(".store-row-media").evaluateAll((nodes) =>
+      nodes.map((node) => node.textContent?.trim() || ""),
+    );
+    assert(
+      mediaRows.some((row) => /Creator Video/.test(row) && /Quantity 2/.test(row) && /Price 5 base units/.test(row))
+        && mediaRows.every((row) => !/Quantity 0x|Price 0x/.test(row)),
+      "Marketplace media rows must present canonical uint256 listing values in decimal",
+      mediaRows,
+    );
+    await frame.locator("#search-input").fill("price 5");
+    const decimalSearchRows = await frame.locator(".store-row-media").evaluateAll((nodes) =>
+      nodes.map((node) => node.textContent?.trim() || ""),
+    );
+    assert(
+      decimalSearchRows.length === 1 && /Creator Video/.test(decimalSearchRows[0]),
+      "Marketplace media search must include the visible decimal price",
+      decimalSearchRows,
+    );
+    await frame.locator("#search-input").fill("");
+    const mediaPageText = await frame.locator("#store-main").textContent();
+    assert(
+      !mediaPageText?.includes(mediaCreatorMint)
+        && !mediaPageText?.includes(mediaPurchasedMint)
+        && !mediaPageText?.includes(mediaAvailableMint),
+      "Marketplace must keep mint IDs internal to media actions",
+      { mediaPageText },
+    );
+
+    const mediaOpenCountBefore = (await readHomeMessages(page)).filter((entry) => entry.type === "home:open-target").length;
+    await frame.locator(`.store-row-media[data-mint="${mediaCreatorMint}"] [data-action="open-media"]`).click();
+    const mediaOpenMessagesAfterCreator = await readHomeMessages(page);
+    const creatorOpen = mediaOpenMessagesAfterCreator.filter((entry) => entry.type === "home:open-target").at(-1);
+    assert(
+      mediaOpenMessagesAfterCreator.filter((entry) => entry.type === "home:open-target").length === mediaOpenCountBefore + 1,
+      "Marketplace creator media rows must open through Home exactly once",
+      mediaOpenMessagesAfterCreator,
+    );
+    assert(
+      creatorOpen?.target === "elacity-player"
+        && creatorOpen.homeToken === normalToken
+        && JSON.stringify(creatorOpen.query) === JSON.stringify({ mint_id: mediaCreatorMint })
+        && JSON.stringify(creatorOpen.keys) === JSON.stringify(["homeToken", "query", "target", "type"]),
+      "Marketplace creator media rows must send the exact authorized elacity-player launch command",
+      creatorOpen,
+    );
+
+    const listCountBeforeBuy = requestLog.filter((entry) => entry.token === normalToken && entry.path === "/api/provider/object/list_runtime_custody").length;
+    const pendingBuyState = await frame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"] [data-action="buy-media"]`).evaluate((button) => {
+      button.click();
+      button.click();
+      const activeButton = document.querySelector(`.store-row-media[data-mint="${button.dataset.mint}"] [data-action="buy-media"]`);
+      return {
+        disabled: activeButton?.disabled === true,
+        label: activeButton?.textContent?.trim() || "",
+      };
+    });
+    assert(
+      pendingBuyState.disabled && pendingBuyState.label === "Buying...",
+      "Marketplace must mark an in-memory media buy as pending before the request settles",
+      pendingBuyState,
+    );
+    await waitForRequestCount(requestLog, normalToken, "/api/provider/object/buy", 1);
+    await waitForRequestCount(requestLog, normalToken, "/api/provider/object/list_runtime_custody", listCountBeforeBuy + 1);
+    const buyRequests = requestLog.filter((entry) => entry.token === normalToken && entry.path === "/api/provider/object/buy");
+    const buyRequest = buyRequests[0];
+    assert(
+      buyRequests.length === 1
+        && buyRequest?.method === "POST"
+        && JSON.stringify(buyRequest.body) === JSON.stringify({ mint_id: mediaAvailableMint }),
+      "Marketplace rapid media Buy activation must submit one exact typed request",
+      buyRequests,
+    );
+    await frame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"] [data-action="open-media"]`).waitFor();
+    const boughtRowText = await frame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"]`).textContent();
+    assert(/Owned/.test(boughtRowText || ""), "Marketplace must reload the media list after buy", { boughtRowText });
+
+    const purchasedOpenCountBefore = (await readHomeMessages(page)).filter((entry) => entry.type === "home:open-target").length;
+    await frame.locator(`.store-row-media[data-mint="${mediaPurchasedMint}"] [data-action="open-media"]`).click();
+    const mediaOpenMessagesAfterPurchased = await readHomeMessages(page);
+    const purchasedOpen = mediaOpenMessagesAfterPurchased.filter((entry) => entry.type === "home:open-target").at(-1);
+    assert(
+      mediaOpenMessagesAfterPurchased.filter((entry) => entry.type === "home:open-target").length === purchasedOpenCountBefore + 1,
+      "Marketplace purchased media rows must open through Home exactly once",
+      mediaOpenMessagesAfterPurchased,
+    );
+    assert(
+      purchasedOpen?.target === "elacity-player"
+        && purchasedOpen.homeToken === normalToken
+        && JSON.stringify(purchasedOpen.query) === JSON.stringify({ mint_id: mediaPurchasedMint })
+        && JSON.stringify(purchasedOpen.keys) === JSON.stringify(["homeToken", "query", "target", "type"]),
+      "Marketplace purchased media rows must send the exact authorized elacity-player launch command",
+      purchasedOpen,
+    );
+
+    await frame.locator('[data-destination="discover"]').click();
+    await frame.locator('.store-row[data-app="documents"]').first().waitFor();
 
     await frame.locator('.store-row[data-app="documents"]').first().focus();
     await frame.locator('.store-row[data-app="documents"]').first().click();
@@ -584,11 +873,38 @@ async function run() {
 
     await page.setViewportSize({ width: 1280, height: 900 });
     await waitForFrameWidth(frame, 1280);
+    await frame.locator('[data-destination="media"]').click();
+    await frame.locator('.store-row-media').first().waitFor();
     await assertNoHorizontalOverflow(frame, "wide Marketplace layout");
 
     await page.setViewportSize({ width: 640, height: 900 });
     await waitForFrameWidth(frame, 640);
     await assertNoHorizontalOverflow(frame, "narrow Marketplace layout");
+
+    await page.goto(`http://127.0.0.1:${port}/fixture-media-error`);
+    const mediaErrorFrame = await waitForMarketplaceFrame(page);
+    await mediaErrorFrame.locator('.store-row[data-app="people"]').first().waitFor();
+    await mediaErrorFrame.locator('[data-destination="media"]').click();
+    await mediaErrorFrame.locator(".store-error-card").waitFor();
+    const mediaErrorText = await mediaErrorFrame.locator("#load-error").textContent();
+    assert(/Couldn’t load media/.test(mediaErrorText || ""), "Marketplace must show a bounded public media error", { mediaErrorText });
+    assert(!/runtime service unavailable/.test(mediaErrorText || ""), "Marketplace must keep raw Runtime errors out of visible media text", { mediaErrorText });
+    await mediaErrorFrame.locator('[data-destination="discover"]').click();
+    await mediaErrorFrame.locator('.store-row[data-app="people"]').first().waitFor();
+
+    await page.goto(`http://127.0.0.1:${port}/fixture-media-empty`);
+    const mediaEmptyFrame = await waitForMarketplaceFrame(page);
+    await mediaEmptyFrame.locator('[data-destination="media"]').click();
+    await mediaEmptyFrame.locator(".empty-state").waitFor();
+    const mediaEmptyText = await mediaEmptyFrame.locator("#store-main").textContent();
+    assert(/No protected media available/.test(mediaEmptyText || ""), "Marketplace must keep a clear empty media state", { mediaEmptyText });
+
+    await page.goto(`http://127.0.0.1:${port}/fixture-media-malformed`);
+    const mediaMalformedFrame = await waitForMarketplaceFrame(page);
+    await mediaMalformedFrame.locator('[data-destination="media"]').click();
+    await mediaMalformedFrame.locator(".store-error-card").waitFor();
+    const mediaMalformedText = await mediaMalformedFrame.locator("#load-error").textContent();
+    assert(/Couldn’t load media/.test(mediaMalformedText || ""), "Marketplace must fail closed on malformed media listings", { mediaMalformedText });
 
     await page.goto(`http://127.0.0.1:${port}/fixture-error`);
     const errorFrame = await waitForMarketplaceFrame(page);
@@ -604,20 +920,28 @@ async function run() {
 
     assert(notFoundPaths.length === 0, "Marketplace layout smoke hit unexpected fixture paths", notFoundPaths);
     assert(
-      nonOkResponses.length === 1
-        && nonOkResponses[0].url === `http://127.0.0.1:${port}/api/capsules/catalog`
-        && nonOkResponses[0].status === 500
-        && nonOkResponses[0].token === errorToken
-        && nonOkResponses[0].method === "GET",
-      "Marketplace layout smoke must see exactly one expected catalog 500 from the deliberate error fixture",
+      nonOkResponses.length === 2
+        && nonOkResponses.some((entry) =>
+          entry.url === `http://127.0.0.1:${port}/api/capsules/catalog`
+            && entry.status === 500
+            && entry.token === errorToken
+            && entry.method === "GET",
+        )
+        && nonOkResponses.some((entry) =>
+          entry.url === `http://127.0.0.1:${port}/api/provider/object/list_runtime_custody`
+            && entry.status === 500
+            && entry.token === mediaErrorToken
+            && entry.method === "POST",
+        ),
+      "Marketplace layout smoke must see only the deliberate catalog and media fixture failures",
       nonOkResponses,
     );
     assert(pageErrors.length === 0, "Marketplace layout smoke saw page errors", pageErrors);
     const expectedConsoleError = "Failed to load resource: the server responded with a status of 500 (Internal Server Error)";
     const unexpectedConsoleErrors = consoleErrors.filter((entry) => entry !== expectedConsoleError);
     assert(
-      consoleErrors.length <= 1,
-      "Marketplace layout smoke saw too many console errors",
+      consoleErrors.length === 2,
+      "Marketplace layout smoke must see only the deliberate catalog and media fixture console errors",
       consoleErrors,
     );
     assert(unexpectedConsoleErrors.length === 0, "Marketplace layout smoke saw console errors", unexpectedConsoleErrors);

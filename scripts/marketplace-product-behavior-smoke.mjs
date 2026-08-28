@@ -20,8 +20,9 @@ assert(
   html.includes("<title>Apps · ElastOS</title>")
     && html.includes('<script src="./elastos-theme.js"></script>')
     && html.includes('<link rel="stylesheet" href="./elastos-ui.css">')
-    && html.includes('<div class="store-product-name">Apps</div>'),
-  "Marketplace must expose the Apps surface and load the canonical shared theme assets.",
+    && html.includes('<div class="store-product-name">Apps</div>')
+    && html.includes('data-destination="media"'),
+  "Marketplace must expose the Apps and Media surfaces and load the canonical shared theme assets.",
 );
 assert(
   vendorScript.includes("marketplace/browser"),
@@ -64,9 +65,54 @@ assert(
 assert(
   js.includes('fetch("/api/capsules/catalog", { headers: { "x-elastos-home-token": homeToken } })')
     && js.includes('fetch("/api/capsules/interfaces", { headers: { "x-elastos-home-token": homeToken } })')
+    && js.includes('postObjectProvider("list_runtime_custody", {})')
+    && js.includes('`/api/provider/object/${operation}`')
+    && js.includes('postObjectProvider("buy", { mint_id: mintId })')
     && !js.includes("/api/apps/marketplace/catalog")
-    && js.includes('type: "home:open-target"'),
-  "Marketplace must keep the canonical catalog/interface reads and Home launch target path.",
+    && js.includes('type: "home:open-target"')
+    && js.includes('target: "elacity-player"'),
+  "Marketplace must keep the canonical catalog/interface reads, typed media routes, and Home launch target path.",
+);
+assert(
+  js.includes('const RUNTIME_CUSTODY_LISTINGS_RESPONSE_SCHEMA_V1 = "elastos.library.runtime-custody-listings/v1";')
+    && js.includes('const RUNTIME_CUSTODY_LISTING_SCHEMA_V1 = "elastos.library.runtime-custody-listing/v1";')
+    && js.includes('const RUNTIME_CUSTODY_AVAILABILITY_SCHEMA_V1 = "elastos.library.runtime-custody-availability-summary/v1";')
+    && js.includes("const MAX_RUNTIME_CUSTODY_LISTINGS = 128;")
+    && js.includes("const MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES = 256;")
+    && js.includes("const MAX_U32 = 0xffffffff;")
+    && js.includes("const UINT256_HEX = /^0x(?:0|[1-9a-f][0-9a-f]{0,63})$/;")
+    && js.includes("const ADDRESS_HEX = /^0x[0-9a-f]{40}$/;")
+    && js.includes('const pendingMediaBuys = new Set();')
+    && js.includes('if (pendingMediaBuys.has(mintId)) {')
+    && js.includes('pendingMediaBuys.add(mintId);')
+    && js.includes('pendingMediaBuys.delete(mintId);')
+    && js.includes('disabled aria-busy="true">Buying...</button>')
+    && js.includes("function boundedTimestamp(value) {")
+    && js.includes("Number.isSafeInteger(value)")
+    && js.includes('typeof value !== "string"')
+    && js.includes("new TextEncoder().encode(value).length > maxBytes")
+    && js.includes("observedReplicas < requiredReplicas")
+    && js.includes("function uint256Decimal(value) {")
+    && js.includes("if (!UINT256_HEX.test(value)) {")
+    && js.includes("return BigInt(value).toString(10);")
+    && js.includes("`quantity ${uint256Decimal(listing.quantity)}`")
+    && js.includes("`price ${uint256Decimal(listing.price)} base units`")
+    && js.includes('postObjectProvider("buy", { mint_id: mintId })')
+    && !js.includes("MAX_PUBLISHED_AT_LENGTH"),
+  "Marketplace must retain canonical media values while presenting validated uint256 values in decimal.",
+);
+assert(
+  js.includes("loadCatalogData().then(render)")
+    && js.includes("loadMediaData().then(render)")
+    && !js.includes("await Promise.all([loadCatalogData(), loadMediaData()]);"),
+  "Marketplace must let catalog and media surfaces finish independently.",
+);
+assert(
+  !js.includes("/api/viewers/")
+    && !js.includes("publisher_principal_id")
+    && !js.includes("window.open")
+    && !js.includes("target=_blank"),
+  "Marketplace must keep protected media actions on the typed Runtime path only.",
 );
 assert(
   js.includes("function isValidCapsuleIconVariant(capsuleName, entry)")
@@ -99,8 +145,9 @@ assert(
     && !js.includes("sessionStorage")
     && !js.includes("navigator.clipboard")
     && !js.includes("indexedDB")
-    && !js.includes("carrier"),
-  "Marketplace must not add browser storage, clipboard fallback, or direct Carrier authority.",
+    && !js.includes("carrier")
+    && js.includes("\\b(schema|projection|provider|adapter|capability|affordance|runtime|runtime-owned|launch token|hostcall|request failed|failed to fetch|unauthorized|forbidden|[45]\\d\\d)\\b"),
+  "Marketplace must keep browser authority local and redact internal Runtime errors.",
 );
 
 console.log("marketplace-product-behavior-smoke: OK");

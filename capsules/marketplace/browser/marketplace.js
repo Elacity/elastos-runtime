@@ -2,15 +2,30 @@
   const params = new URLSearchParams(window.location.search);
   const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
   const homeParentOrigin = params.get("home_origin") || "";
+  const RUNTIME_CUSTODY_LISTINGS_RESPONSE_SCHEMA_V1 = "elastos.library.runtime-custody-listings/v1";
+  const RUNTIME_CUSTODY_LISTING_SCHEMA_V1 = "elastos.library.runtime-custody-listing/v1";
+  const RUNTIME_CUSTODY_AVAILABILITY_SCHEMA_V1 = "elastos.library.runtime-custody-availability-summary/v1";
+  const MAX_RUNTIME_CUSTODY_LISTINGS = 128;
+  const MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES = 256;
+  const MAX_U32 = 0xffffffff;
+  const MAX_SAFE_TIMESTAMP = Number.MAX_SAFE_INTEGER;
+  const RUNTIME_CUSTODY_MINT_ID = /^[0-9a-f]{64}$/;
+  const UINT256_HEX = /^0x(?:0|[1-9a-f][0-9a-f]{0,63})$/;
+  const ADDRESS_HEX = /^0x[0-9a-f]{40}$/;
 
   const state = {
     apps: [],
+    mediaListings: [],
     destination: "discover",
     search: "",
-    loading: true,
-    loadError: null,
+    appLoading: true,
+    mediaLoading: true,
+    appLoadError: null,
+    mediaLoadError: null,
+    mediaTruncated: false,
   };
 
+  const pendingMediaBuys = new Set();
   let detailPreviousFocus = null;
   let homeChromeReady = false;
   let lastHomeMenuManifestSignature = "";
@@ -45,6 +60,7 @@
     search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path></svg>',
     close: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>',
     check: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>',
+    media: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m10 9 5 3-5 3V9Z" fill="currentColor" stroke="none"></path></svg>',
   };
 
   const CAPSULE_ICON_ROUTE = /^\/apps\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+\.png$/;
@@ -194,9 +210,19 @@
   }
 
   async function loadData() {
-    state.loading = true;
-    state.loadError = null;
-    setLoading(true);
+    state.appLoading = true;
+    state.mediaLoading = true;
+    state.appLoadError = null;
+    state.mediaLoadError = null;
+    renderSurfaceState();
+    await Promise.all([
+      loadCatalogData().then(render),
+      loadMediaData().then(render),
+    ]);
+  }
+
+  async function loadCatalogData() {
+    state.appLoadError = null;
     try {
       const [catalogResponse, interfacesResponse] = await Promise.all([
         fetch("/api/capsules/catalog", { headers: { "x-elastos-home-token": homeToken } }),
@@ -231,22 +257,26 @@
         .sort((left, right) => appSortKey(left).localeCompare(appSortKey(right)));
     } catch (error) {
       state.apps = [];
-      state.loadError = publicError(error.message, "Couldn’t load apps.");
+      state.appLoadError = publicError(error.message, "Couldn’t load apps.");
     } finally {
-      state.loading = false;
-      setLoading(false);
+      state.appLoading = false;
     }
   }
 
-  function setLoading(loading) {
-    els.loadingState.classList.toggle("hidden", !loading);
-    if (loading) {
-      els.loadingState.innerHTML = skeletonRows(6);
-      els.storeSections.classList.add("hidden");
-      els.loadError.classList.add("hidden");
-      return;
+  async function loadMediaData() {
+    state.mediaLoadError = null;
+    try {
+      const payload = await postObjectProvider("list_runtime_custody", {});
+      const parsed = parseRuntimeCustodyListings(payload);
+      state.mediaListings = parsed.listings;
+      state.mediaTruncated = parsed.truncated;
+    } catch (error) {
+      state.mediaListings = [];
+      state.mediaTruncated = false;
+      state.mediaLoadError = publicError(error.message, "Couldn’t load media.");
+    } finally {
+      state.mediaLoading = false;
     }
-    els.storeSections.classList.toggle("hidden", Boolean(state.loadError));
   }
 
   function skeletonRows(count) {
@@ -413,20 +443,22 @@
   function render() {
     selectDestination(state.destination, { silent: true });
     updateInstalledBadge();
-    renderLoadError();
-    if (!state.loadError) {
+    const surfaceBlocked = renderSurfaceState();
+    if (!surfaceBlocked) {
       renderSections();
     }
     syncHomeMenuManifest();
   }
 
   function normalizeDestination(id) {
+    if (id === "media") return "media";
     if (id === "installed") return "installed";
     if (categories.some((category) => category.id === id)) return id;
     return "discover";
   }
 
   function destinationTitle(id) {
+    if (id === "media") return "Media";
     if (id === "installed") return "Installed";
     const category = categories.find((entry) => entry.id === id);
     if (category) return category.label;
@@ -443,8 +475,8 @@
     });
     els.storeTitle.textContent = destinationTitle(state.destination);
     if (!options.silent) {
-      renderLoadError();
-      if (!state.loadError) {
+      const surfaceBlocked = renderSurfaceState();
+      if (!surfaceBlocked) {
         renderSections();
       }
     }
@@ -466,29 +498,64 @@
     });
   }
 
-  function renderLoadError() {
-    if (!state.loadError) {
+  function renderSurfaceState() {
+    const surface = surfaceState();
+    els.loadingState.classList.toggle("hidden", !surface.loading);
+    if (surface.loading) {
+      els.loadingState.innerHTML = skeletonRows(surface.destination === "media" ? 3 : 6);
+      els.storeSections.classList.add("hidden");
       els.loadError.classList.add("hidden");
       els.loadError.innerHTML = "";
-      return;
+      return true;
+    }
+    els.loadingState.innerHTML = "";
+    els.loadingState.classList.add("hidden");
+    if (!surface.error) {
+      els.loadError.classList.add("hidden");
+      els.loadError.innerHTML = "";
+      return false;
     }
     els.storeSections.classList.add("hidden");
     els.loadError.classList.remove("hidden");
     els.loadError.innerHTML = `
       <div class="store-error-card">
-        <div class="store-error-title">Couldn’t load apps</div>
-        <div class="store-error-body">${escapeHtml(state.loadError)}</div>
-        <button type="button" class="store-pill" data-action="retry">Retry</button>
+        <div class="store-error-title">${escapeHtml(surface.title)}</div>
+        <div class="store-error-body">${escapeHtml(surface.error)}</div>
+        <button type="button" class="store-pill" data-action="${surface.retryAction}">Retry</button>
       </div>
     `;
     bindAppActions(els.loadError);
+    return true;
+  }
+
+  function surfaceState() {
+    if (state.destination === "media") {
+      return {
+        destination: "media",
+        loading: state.mediaLoading,
+        error: state.mediaLoadError,
+        retryAction: "retry-media",
+        title: "Couldn’t load media",
+      };
+    }
+    return {
+      destination: "apps",
+      loading: state.appLoading,
+      error: state.appLoadError,
+      retryAction: "retry",
+      title: "Couldn’t load apps",
+    };
   }
 
   function renderSections() {
-    if (state.loading || state.loadError) {
+    if (surfaceState().loading || surfaceState().error) {
       return;
     }
     els.storeSections.classList.remove("hidden");
+    if (state.destination === "media") {
+      renderMediaSections();
+      return;
+    }
     if (state.destination === "installed") {
       renderInstalledSections();
       return;
@@ -557,6 +624,51 @@
     bindAppActions(els.storeSections);
   }
 
+  function renderMediaSections() {
+    const listings = filteredMediaListings();
+    if (!listings.length) {
+      els.storeSections.innerHTML = emptyState(
+        state.search ? "No results" : "No protected media available",
+        state.search ? "Try a different search." : "Protected listings on this Home will appear here.",
+        icons.media,
+      );
+      return;
+    }
+    const notice = state.mediaTruncated
+      ? `<p class="store-inline-note">Showing the first ${MAX_RUNTIME_CUSTODY_LISTINGS} protected items.</p>`
+      : "";
+    els.storeSections.innerHTML = `
+      ${notice}
+      <section class="store-section">
+        <div class="store-section-head">
+          <h2 class="store-section-title">Protected media</h2>
+        </div>
+        <div class="store-row-grid">
+          ${listings.map(renderMediaRow).join("")}
+        </div>
+      </section>
+    `;
+    bindAppActions(els.storeSections);
+  }
+
+  function filteredMediaListings() {
+    return state.mediaListings.filter((listing) => {
+      if (!state.search) {
+        return true;
+      }
+      const haystack = [
+        listing.displayName,
+        listing.mimeType,
+        listing.codecs,
+        `quantity ${uint256Decimal(listing.quantity)}`,
+        `price ${uint256Decimal(listing.price)} base units`,
+        listing.payToken,
+        listing.accessState,
+      ].join(" ").toLowerCase();
+      return haystack.includes(state.search);
+    });
+  }
+
   function renderSection(title, apps, { seeAllDestination } = {}) {
     const seeAll = seeAllDestination && apps.length
       ? `<button type="button" class="store-see-all" data-action="see-all" data-destination="${escapeAttr(seeAllDestination)}">See All</button>`
@@ -617,6 +729,69 @@
         ${actionButton(app)}
       </article>
     `;
+  }
+
+  function renderMediaRow(listing) {
+    return `
+      <article class="store-row store-row-static store-row-media" data-mint="${escapeAttr(listing.mintId)}">
+        <span class="app-icon gradient-blue store-row-icon" aria-hidden="true">${icons.media}</span>
+        <div class="store-row-text">
+          <div class="store-row-title">${escapeHtml(listing.displayName)}</div>
+          <div class="store-row-sub">${escapeHtml(mediaSubtitle(listing))}</div>
+          <div class="store-row-facts">
+            <span class="store-row-fact">Quantity ${escapeHtml(uint256Decimal(listing.quantity))}</span>
+            <span class="store-row-fact">Price ${escapeHtml(uint256Decimal(listing.price))} base units</span>
+            <span class="store-row-fact">Token ${escapeHtml(abbreviateAddress(listing.payToken))}</span>
+            <span class="store-row-fact">${escapeHtml(availabilitySummary(listing.availability))}</span>
+            <span class="store-row-fact">${escapeHtml(accessStateLabel(listing.accessState))}</span>
+          </div>
+        </div>
+        ${mediaActionButton(listing)}
+      </article>
+    `;
+  }
+
+  function mediaSubtitle(listing) {
+    return listing.codecs
+      ? `${listing.mimeType} • ${listing.codecs}`
+      : listing.mimeType;
+  }
+
+  function mediaActionButton(listing) {
+    if (listing.accessState === "available" && pendingMediaBuys.has(listing.mintId)) {
+      return `<button class="store-pill" type="button" data-action="buy-media" data-mint="${escapeAttr(listing.mintId)}" disabled aria-busy="true">Buying...</button>`;
+    }
+    const action = listing.accessState === "available" ? "buy-media" : "open-media";
+    const label = listing.accessState === "available" ? "Buy" : "Open";
+    return `<button class="store-pill" type="button" data-action="${escapeAttr(action)}" data-mint="${escapeAttr(listing.mintId)}">${label}</button>`;
+  }
+
+  function availabilitySummary(availability) {
+    return `${availability.observedReplicas}/${availability.requiredReplicas} replicas checked`;
+  }
+
+  function accessStateLabel(accessState) {
+    if (accessState === "creator") {
+      return "You listed this";
+    }
+    if (accessState === "purchased") {
+      return "Owned";
+    }
+    return "Available";
+  }
+
+  function abbreviateAddress(value) {
+    if (value.length <= 14) {
+      return value;
+    }
+    return `${value.slice(0, 8)}...${value.slice(-6)}`;
+  }
+
+  function uint256Decimal(value) {
+    if (!UINT256_HEX.test(value)) {
+      throw new Error("invalid protected media quantity");
+    }
+    return BigInt(value).toString(10);
   }
 
   function actionButton(app) {
@@ -831,6 +1006,43 @@
     }, homeParentOrigin);
   }
 
+  function openMedia(mintId) {
+    if (!RUNTIME_CUSTODY_MINT_ID.test(mintId)) {
+      return;
+    }
+    if (window.top === window || !homeParentOrigin) {
+      showToast("Open Apps from Home to launch apps.", true);
+      return;
+    }
+    window.top.postMessage({
+      type: "home:open-target",
+      target: "elacity-player",
+      query: { mint_id: mintId },
+      homeToken,
+    }, homeParentOrigin);
+  }
+
+  async function buyMedia(mintId) {
+    if (!RUNTIME_CUSTODY_MINT_ID.test(mintId)) {
+      showToast("Media action could not be completed.", true);
+      return;
+    }
+    if (pendingMediaBuys.has(mintId)) {
+      return;
+    }
+    pendingMediaBuys.add(mintId);
+    render();
+    try {
+      await postObjectProvider("buy", { mint_id: mintId });
+      await loadMediaData();
+    } catch (error) {
+      showToast(publicError(error.message, "Media action could not be completed."), true);
+    } finally {
+      pendingMediaBuys.delete(mintId);
+      render();
+    }
+  }
+
   function bindAppActions(root) {
     bindRasterIconFallbacks(root);
     root.querySelectorAll("[data-action]").forEach((node) => {
@@ -856,14 +1068,33 @@
           openApp(appId);
         }
         if (action === "retry") {
-          loadData()
+          state.appLoading = true;
+          state.appLoadError = null;
+          renderSurfaceState();
+          loadCatalogData()
             .then(render)
             .catch((error) => {
               showToast(publicError(error.message, "Couldn’t load apps."), true);
             });
         }
+        if (action === "retry-media") {
+          state.mediaLoading = true;
+          state.mediaLoadError = null;
+          renderSurfaceState();
+          loadMediaData()
+            .then(render)
+            .catch((error) => {
+              showToast(publicError(error.message, "Couldn’t load media."), true);
+            });
+        }
         if (action === "see-all") {
           selectDestination(target.dataset.destination);
+        }
+        if (action === "buy-media") {
+          buyMedia(target.dataset.mint);
+        }
+        if (action === "open-media") {
+          openMedia(target.dataset.mint);
         }
         if (action === "close-detail") {
           closeDetail();
@@ -914,6 +1145,32 @@
     return publicError(payload.error || payload.message, "Apps and services could not be loaded.");
   }
 
+  async function postObjectProvider(operation, payload) {
+    const response = await fetch(`/api/provider/object/${operation}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-elastos-home-token": homeToken,
+      },
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(providerErrorMessage(response, data));
+    }
+    if (data && typeof data === "object" && data.status === "error") {
+      throw new Error(providerErrorMessage(response, data.error || data));
+    }
+    return data && typeof data === "object" && "data" in data ? data.data : data;
+  }
+
+  function providerErrorMessage(response, payload) {
+    if (response.status === 404) {
+      return "Protected media is unavailable. Update ElastOS and try again.";
+    }
+    return publicError(payload.error || payload.message, "Protected media could not be loaded.");
+  }
+
   function publicDescription(capsule) {
     const description = String(capsule.description || "").trim();
     const role = String(capsule.role || "app").toLowerCase();
@@ -943,10 +1200,154 @@
 
   function publicError(value, fallback) {
     const message = String(value || "").trim();
-    if (!message || /\b(schema|projection|provider|adapter|capability|affordance|runtime-owned|launch token|hostcall|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(message)) {
+    if (!message || /\b(schema|projection|provider|adapter|capability|affordance|runtime|runtime-owned|launch token|hostcall|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(message)) {
       return fallback;
     }
     return message;
+  }
+
+  function parseRuntimeCustodyListings(payload) {
+    assertExactKeys(payload, ["schema", "listings", "truncated"]);
+    if (payload.schema !== RUNTIME_CUSTODY_LISTINGS_RESPONSE_SCHEMA_V1) {
+      throw new Error("invalid protected media schema");
+    }
+    if (!Array.isArray(payload.listings) || payload.listings.length > MAX_RUNTIME_CUSTODY_LISTINGS) {
+      throw new Error("invalid protected media list");
+    }
+    if (typeof payload.truncated !== "boolean") {
+      throw new Error("invalid protected media truncation state");
+    }
+    return {
+      truncated: payload.truncated,
+      listings: payload.listings.map(parseRuntimeCustodyListing),
+    };
+  }
+
+  function parseRuntimeCustodyListing(value) {
+    assertExactKeys(value, [
+      "access_state",
+      "availability",
+      "codecs",
+      "display_name",
+      "mime_type",
+      "mint_id",
+      "pay_token",
+      "price",
+      "published_at",
+      "quantity",
+      "schema",
+      "seller_address",
+      "token_id",
+    ]);
+    if (value.schema !== RUNTIME_CUSTODY_LISTING_SCHEMA_V1) {
+      throw new Error("invalid protected media entry");
+    }
+    const accessState = boundedString(value.access_state, 16);
+    if (!["available", "creator", "purchased"].includes(accessState)) {
+      throw new Error("invalid protected media access state");
+    }
+    const mintId = boundedString(value.mint_id, 64);
+    const displayName = boundedString(value.display_name, MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES);
+    const mimeType = boundedString(value.mime_type, MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES);
+    const codecs = boundedString(value.codecs, MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES);
+    const quantity = boundedString(value.quantity, 66);
+    const price = boundedString(value.price, 66);
+    const payToken = boundedString(value.pay_token, 42);
+    const publishedAt = boundedTimestamp(value.published_at);
+    const sellerAddress = boundedString(value.seller_address, 42);
+    const tokenId = boundedString(value.token_id, 66);
+    if (!RUNTIME_CUSTODY_MINT_ID.test(mintId)) {
+      throw new Error("invalid protected media mint");
+    }
+    if (!UINT256_HEX.test(quantity) || !UINT256_HEX.test(price)) {
+      throw new Error("invalid protected media quantity");
+    }
+    if (!ADDRESS_HEX.test(payToken) || !ADDRESS_HEX.test(sellerAddress)) {
+      throw new Error("invalid protected media address");
+    }
+    if (!UINT256_HEX.test(tokenId)) {
+      throw new Error("invalid protected media token");
+    }
+    return {
+      accessState,
+      availability: parseAvailabilitySummary(value.availability),
+      codecs,
+      displayName,
+      mimeType,
+      mintId,
+      payToken,
+      price,
+      publishedAt,
+      quantity,
+    };
+  }
+
+  function parseAvailabilitySummary(value) {
+    assertExactKeys(value, [
+      "checked_at",
+      "observed_replicas",
+      "recheck_before_buy",
+      "recheck_before_open",
+      "required_replicas",
+      "schema",
+      "status",
+    ]);
+    if (value.schema !== RUNTIME_CUSTODY_AVAILABILITY_SCHEMA_V1 || value.status !== "last_verified_receipt") {
+      throw new Error("invalid protected media availability");
+    }
+    const checkedAt = boundedTimestamp(value.checked_at);
+    const requiredReplicas = boundedCount(value.required_replicas);
+    const observedReplicas = boundedCount(value.observed_replicas);
+    if (
+      requiredReplicas === 0
+      || observedReplicas < requiredReplicas
+      || value.recheck_before_buy !== true
+      || value.recheck_before_open !== true
+    ) {
+      throw new Error("invalid protected media availability state");
+    }
+    return {
+      checkedAt,
+      observedReplicas,
+      requiredReplicas,
+    };
+  }
+
+  function boundedString(value, maxBytes) {
+    if (
+      typeof value !== "string"
+      || !value
+      || new TextEncoder().encode(value).length > maxBytes
+      || /[\u0000-\u001f\u007f]/.test(value)
+    ) {
+      throw new Error("invalid protected media field");
+    }
+    return value;
+  }
+
+  function boundedCount(value) {
+    if (!Number.isInteger(value) || value < 0 || value > MAX_U32) {
+      throw new Error("invalid protected media count");
+    }
+    return value;
+  }
+
+  function boundedTimestamp(value) {
+    if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_SAFE_TIMESTAMP) {
+      throw new Error("invalid protected media timestamp");
+    }
+    return value;
+  }
+
+  function assertExactKeys(value, keys) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("invalid protected media object");
+    }
+    const actual = Object.keys(value).sort().join("\n");
+    const expected = [...keys].sort().join("\n");
+    if (actual !== expected) {
+      throw new Error("invalid protected media shape");
+    }
   }
 
   function badgeLabel(badge) {
