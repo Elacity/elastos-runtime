@@ -2979,7 +2979,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                 buy_step,
             )?;
             let fresh_availability =
-                crate::protected_content_runtime::verify_fresh_runtime_custody_buy_availability(
+                crate::protected_content_runtime::verify_fresh_runtime_custody_availability(
                     &state.data_dir,
                     registry.as_ref(),
                     mint_id,
@@ -3066,7 +3066,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
     }
 
     let fresh_availability =
-        crate::protected_content_runtime::verify_fresh_runtime_custody_buy_availability(
+        crate::protected_content_runtime::verify_fresh_runtime_custody_availability(
             &state.data_dir,
             registry.as_ref(),
             mint_id,

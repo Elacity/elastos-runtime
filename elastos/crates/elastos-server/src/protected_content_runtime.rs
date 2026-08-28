@@ -84,6 +84,7 @@ const ELACITY_PLAYER_CAPSULE_ID: &str = "elacity-player";
 const CONTENT_PROVIDER_ID: &str = "content";
 const PROTECTED_CONTENT_REPLICATION_POLICY: &str = "protected-content-replication/v1";
 const PROTECTED_CONTENT_MIN_REPLICAS: u32 = 3;
+const PROTECTED_CONTENT_REQUIRE_LIVE_MULTI_PEER_PROOF: bool = true;
 const PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS: u64 = 60;
 const PROTECTED_CONTENT_AVAILABILITY_MAX_FUTURE_SKEW_SECS: u64 = 5;
 pub(crate) const RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE: &str =
@@ -1981,13 +1982,19 @@ pub async fn publish_and_verify_protected_content_availability(
     requirement: &RuntimeContentAvailabilityRequirement,
     now_unix_seconds: u64,
 ) -> anyhow::Result<RuntimeVerifiedContentAvailability> {
+    validate_protected_content_availability_requirement(requirement)?;
     verify_protected_content_directory(protected_content_dir, media_identity)?;
-    let content_cid = crate::content::publish_directory_via_provider_with_kind(
+    let publish_requirements = crate::content::ContentPublishRequirements::new(
+        requirement.minimum_replicas(),
+        PROTECTED_CONTENT_REQUIRE_LIVE_MULTI_PEER_PROOF,
+    )?;
+    let content_cid = crate::content::publish_directory_via_provider_with_kind_and_requirements(
         registry,
         protected_content_dir,
         PROTECTED_CONTENT_OBJECT_KIND,
         Some(requirement.expected_object_identity()),
         Some(requirement.expected_publisher_did()),
+        publish_requirements,
     )
     .await?;
     let receipt = fetch_content_availability_receipt(registry, &content_cid).await?;
@@ -2002,6 +2009,17 @@ pub async fn publish_and_verify_protected_content_availability(
         requirement,
         now_unix_seconds,
     )
+}
+
+fn validate_protected_content_availability_requirement(
+    requirement: &RuntimeContentAvailabilityRequirement,
+) -> anyhow::Result<()> {
+    if requirement.policy() != PROTECTED_CONTENT_REPLICATION_POLICY
+        || requirement.minimum_replicas() != PROTECTED_CONTENT_MIN_REPLICAS
+    {
+        anyhow::bail!("protected content availability requirement is invalid");
+    }
+    Ok(())
 }
 
 async fn fetch_content_availability_receipt(
@@ -2276,6 +2294,7 @@ fn verify_protected_content_receipt(
     requirement: &RuntimeContentAvailabilityRequirement,
     now_unix_seconds: u64,
 ) -> anyhow::Result<RuntimeVerifiedContentAvailability> {
+    validate_protected_content_availability_requirement(requirement)?;
     cid::Cid::try_from(content_cid)
         .map_err(|_| anyhow::anyhow!("protected content availability CID is invalid"))?;
     let receipt: crate::content::SignedAvailabilityReceipt =
@@ -2292,6 +2311,13 @@ fn verify_protected_content_receipt(
         || receipt.payload.policy != requirement.policy()
         || receipt.payload.status != PROTECTED_CONTENT_AVAILABLE_STATUS
         || receipt.payload.replicas < requirement.minimum_replicas()
+        || (PROTECTED_CONTENT_REQUIRE_LIVE_MULTI_PEER_PROOF
+            && receipt
+                .payload
+                .peer_selection
+                .get("live_multi_peer_proof")
+                .and_then(Value::as_bool)
+                != Some(true))
         || manifest.object_did.as_deref() != Some(requirement.expected_object_identity())
         || manifest.publisher_did.as_deref() != Some(requirement.expected_publisher_did())
     {
@@ -4321,7 +4347,7 @@ fn validate_runtime_custody_evm_address(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) async fn verify_fresh_runtime_custody_buy_availability(
+pub(crate) async fn verify_fresh_runtime_custody_availability(
     data_dir: &Path,
     registry: &ProviderRegistry,
     mint_id: Digest32,
@@ -4485,6 +4511,16 @@ pub(crate) async fn open_runtime_custody_viewer(
             RuntimeCustodyViewerLifecycleStatus::Closed
             | RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent => {}
         }
+    }
+    let fresh_availability = verify_fresh_runtime_custody_availability(
+        data_dir,
+        registry.as_ref(),
+        mint_id,
+        crate::auth::now_ts(),
+    )
+    .await?;
+    if fresh_availability.content_cid() != purchase.cid {
+        anyhow::bail!("Runtime custody content availability is unavailable");
     }
     let composition = load_runtime_custody_composition(data_dir, registry.clone())?
         .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE))?;

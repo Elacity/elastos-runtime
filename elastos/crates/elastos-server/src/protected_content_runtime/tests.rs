@@ -172,10 +172,12 @@ struct ContentAvailabilityTestConfig {
     policy: String,
     status: String,
     replicas: u32,
+    live_multi_peer_proof: Option<bool>,
     checked_at: u64,
     receipt_cid: Option<String>,
     receipt_object_identity: Option<String>,
     receipt_publisher_did: Option<String>,
+    malformed_receipt: bool,
     mutate_fetch_path: Option<String>,
     mutate_manifest_extra_file: bool,
 }
@@ -186,12 +188,21 @@ impl ContentAvailabilityTestConfig {
             policy: "protected-content-replication/v1".to_string(),
             status: "network_available".to_string(),
             replicas: 3,
+            live_multi_peer_proof: Some(true),
             checked_at: NOW,
             receipt_cid: None,
             receipt_object_identity: None,
             receipt_publisher_did: None,
+            malformed_receipt: false,
             mutate_fetch_path: None,
             mutate_manifest_extra_file: false,
+        }
+    }
+
+    fn accepted_now() -> Self {
+        Self {
+            checked_at: crate::auth::now_ts(),
+            ..Self::accepted()
         }
     }
 }
@@ -295,6 +306,13 @@ impl ContentAvailabilityTestProvider {
     }
 
     async fn status(&self) -> Result<Value, ProviderError> {
+        if self.config.malformed_receipt {
+            return Ok(ok_provider_response(json!({
+                "receipt": {
+                    "payload": "malformed",
+                },
+            })));
+        }
         let manifest = self
             .manifest
             .lock()
@@ -324,7 +342,15 @@ impl ContentAvailabilityTestProvider {
             policy: self.config.policy.clone(),
             status: self.config.status.clone(),
             replicas: self.config.replicas,
-            peer_selection: json!({}),
+            peer_selection: self
+                .config
+                .live_multi_peer_proof
+                .map(|live_multi_peer_proof| {
+                    json!({
+                        "live_multi_peer_proof": live_multi_peer_proof,
+                    })
+                })
+                .unwrap_or_else(|| json!({})),
             quota: json!({}),
             repair_worker: json!({}),
             storage_market: json!({}),
@@ -1462,6 +1488,82 @@ async fn protected_content_availability_publishes_status_refetches_and_verifies_
 }
 
 #[tokio::test]
+async fn protected_content_publish_sends_exact_three_replica_live_requirement() {
+    let (directory, media) = protected_content_directory(0x41);
+    let provider =
+        ContentAvailabilityTestProvider::new(0x61, ContentAvailabilityTestConfig::accepted());
+    let requirement = availability_requirement(provider.signer_did());
+    let registry = ProviderRegistry::new();
+    registry
+        .register_sub_provider("content", provider.clone())
+        .await
+        .unwrap();
+
+    super::publish_and_verify_protected_content_availability(
+        &registry,
+        directory.path(),
+        &media,
+        &requirement,
+        NOW,
+    )
+    .await
+    .unwrap();
+
+    let requests = provider.requests().await;
+    let publish = requests
+        .iter()
+        .find(|request| request.get("op").and_then(Value::as_str) == Some("publish"))
+        .unwrap();
+    assert_eq!(
+        publish.get("availability_requirements"),
+        Some(&json!({
+            "min_replicas": 3,
+            "require_live_multi_peer_proof": true,
+        }))
+    );
+    assert!(publish["availability_requirements"]
+        .get("max_replicas")
+        .is_none());
+}
+
+#[tokio::test]
+async fn protected_content_publish_rejects_mismatched_policy_or_count_before_provider_use() {
+    for (policy, minimum_replicas) in [("wrong-policy", 3), ("protected-content-replication/v1", 2)]
+    {
+        let (directory, media) = protected_content_directory(0x41);
+        let provider =
+            ContentAvailabilityTestProvider::new(0x61, ContentAvailabilityTestConfig::accepted());
+        let requirement = RuntimeContentAvailabilityRequirement::new(
+            provider.signer_did(),
+            "did:key:z6Mkhq7f4c4QAEgwRByrEsmGu3RJRYvpP5UGcWvqBjGW4YRe#content",
+            "did:key:z6Mkhq7f4c4QAEgwRByrEsmGu3RJRYvpP5UGcWvqBjGW4YRe#publisher",
+            policy,
+            minimum_replicas,
+            60,
+            5,
+        )
+        .unwrap();
+        let registry = ProviderRegistry::new();
+        registry
+            .register_sub_provider("content", provider.clone())
+            .await
+            .unwrap();
+
+        super::publish_and_verify_protected_content_availability(
+            &registry,
+            directory.path(),
+            &media,
+            &requirement,
+            NOW,
+        )
+        .await
+        .expect_err("mismatched protected availability requirement must fail closed");
+
+        assert!(provider.requests().await.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn protected_content_availability_rejects_wrong_signed_receipt_or_refetched_object() {
     let wrong_signer =
         ContentAvailabilityTestProvider::new(0x62, ContentAvailabilityTestConfig::accepted())
@@ -1492,6 +1594,18 @@ async fn protected_content_availability_rejects_wrong_signed_receipt_or_refetche
         },
         ContentAvailabilityTestConfig {
             replicas: 2,
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+        ContentAvailabilityTestConfig {
+            live_multi_peer_proof: None,
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+        ContentAvailabilityTestConfig {
+            live_multi_peer_proof: Some(false),
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+        ContentAvailabilityTestConfig {
+            malformed_receipt: true,
             ..ContentAvailabilityTestConfig::accepted()
         },
         ContentAvailabilityTestConfig {
@@ -1533,7 +1647,7 @@ async fn runtime_custody_prebuy_availability_refetches_fresh_exact_receipt_witho
         },
     )
     .await;
-    let verified = super::verify_fresh_runtime_custody_buy_availability(
+    let verified = super::verify_fresh_runtime_custody_availability(
         &harness.data_dir,
         harness.registry.as_ref(),
         harness.mint_id,
@@ -1571,7 +1685,7 @@ async fn runtime_custody_prebuy_availability_rejects_stale_receipt() {
         },
     )
     .await;
-    assert!(super::verify_fresh_runtime_custody_buy_availability(
+    assert!(super::verify_fresh_runtime_custody_availability(
         &harness.data_dir,
         harness.registry.as_ref(),
         harness.mint_id,
@@ -1601,13 +1715,25 @@ async fn runtime_custody_prebuy_availability_rejects_wrong_receipt_binding_or_ma
             ..ContentAvailabilityTestConfig::accepted()
         },
         ContentAvailabilityTestConfig {
+            live_multi_peer_proof: None,
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+        ContentAvailabilityTestConfig {
+            live_multi_peer_proof: Some(false),
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+        ContentAvailabilityTestConfig {
+            malformed_receipt: true,
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+        ContentAvailabilityTestConfig {
             mutate_manifest_extra_file: true,
             ..ContentAvailabilityTestConfig::accepted()
         },
     ];
     for config in cases {
         let harness = runtime_custody_prebuy_availability_harness(0x61, config).await;
-        assert!(super::verify_fresh_runtime_custody_buy_availability(
+        assert!(super::verify_fresh_runtime_custody_availability(
             &harness.data_dir,
             harness.registry.as_ref(),
             harness.mint_id,
@@ -1622,7 +1748,7 @@ async fn runtime_custody_prebuy_availability_rejects_wrong_receipt_binding_or_ma
         ContentAvailabilityTestConfig::accepted(),
     )
     .await;
-    assert!(super::verify_fresh_runtime_custody_buy_availability(
+    assert!(super::verify_fresh_runtime_custody_availability(
         &wrong_signer.data_dir,
         wrong_signer.registry.as_ref(),
         wrong_signer.mint_id,
@@ -1645,7 +1771,7 @@ async fn runtime_custody_prebuy_availability_requires_existing_mint_and_listing_
         missing_listing.mint_id,
     ))
     .unwrap();
-    assert!(super::verify_fresh_runtime_custody_buy_availability(
+    assert!(super::verify_fresh_runtime_custody_availability(
         &missing_listing.data_dir,
         missing_listing.registry.as_ref(),
         missing_listing.mint_id,
@@ -1660,7 +1786,7 @@ async fn runtime_custody_prebuy_availability_requires_existing_mint_and_listing_
         ContentAvailabilityTestConfig::accepted(),
     )
     .await;
-    assert!(super::verify_fresh_runtime_custody_buy_availability(
+    assert!(super::verify_fresh_runtime_custody_availability(
         &wrong_mint.data_dir,
         wrong_mint.registry.as_ref(),
         digest(0x33),
@@ -9191,6 +9317,87 @@ async fn runtime_custody_viewer_open_rejects_substituted_session_without_provide
 
 #[cfg(unix)]
 #[tokio::test]
+async fn runtime_custody_viewer_open_rejects_missing_live_availability_before_new_effects() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig {
+            live_multi_peer_proof: None,
+            ..ContentAvailabilityTestConfig::accepted_now()
+        },
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-missing-live-availability";
+    write_device_key(&harness.data_dir, 0x21);
+    let (epoch, _composition_now) = write_library_publish_test_composition(&harness.data_dir);
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    super::persist_runtime_open_envelope(
+        &harness.data_dir,
+        mint.draft().mint_id(),
+        &custody_envelope_for_media_with_epoch(0x41, &epoch),
+    )
+    .unwrap();
+    persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &profile_did,
+        crate::auth::now_ts(),
+    );
+    let decrypt = PrepareOnlyCleanupDecryptProvider::new();
+    harness
+        .registry
+        .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt.clone())
+        .await
+        .unwrap();
+    let wallet = RecordingProvider::new("wallet", ok_provider_response(json!({})));
+    harness
+        .registry
+        .register_sub_provider("wallet", wallet.clone())
+        .await
+        .unwrap();
+
+    let error = super::open_runtime_custody_viewer(
+        &harness.data_dir,
+        harness.registry.clone(),
+        super::RuntimeCustodyViewerOpenInput {
+            principal_id: principal_id.to_string(),
+            mint_id: hex::encode(harness.mint_id.as_bytes()),
+            launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
+            proof_binding_id: Some(proof_binding_id),
+            session_id: Some("runtime-session:alpha".to_string()),
+            grant_id: Some("grant:alpha".to_string()),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("Runtime custody content availability is unavailable"));
+    assert!(super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .is_none());
+    assert!(decrypt.requests().await.is_empty());
+    assert!(wallet.requests().await.is_empty());
+    assert!(harness
+        .content_provider
+        .requests()
+        .await
+        .iter()
+        .any(|request| request.get("op").and_then(Value::as_str) == Some("status")));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
     let harness = runtime_custody_prebuy_availability_harness(
         0x61,
@@ -10504,7 +10711,7 @@ async fn runtime_custody_viewer_restart_reconciliation_settles_cleanup_pending_r
 async fn runtime_custody_viewer_expired_old_binding_allows_cleanup_before_fresh_open() {
     let harness = runtime_custody_prebuy_availability_harness(
         0x61,
-        ContentAvailabilityTestConfig::accepted(),
+        ContentAvailabilityTestConfig::accepted_now(),
     )
     .await;
     let principal_id = "person:local:runtime-custody-viewer-expired-old-binding";
@@ -10555,6 +10762,10 @@ async fn runtime_custody_viewer_expired_old_binding_allows_cleanup_before_fresh_
             PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
             close_provider.clone(),
         )
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider("content", harness.content_provider.clone())
         .await
         .unwrap();
 
@@ -10955,7 +11166,7 @@ async fn runtime_custody_library_open_after_purchase_rejects_mismatched_purchase
 async fn runtime_custody_library_open_after_buy_fails_closed_without_decrypt() {
     let harness = runtime_custody_prebuy_availability_harness(
         0x61,
-        ContentAvailabilityTestConfig::accepted(),
+        ContentAvailabilityTestConfig::accepted_now(),
     )
     .await;
     let principal_id = "person:local:runtime-custody-open-no-decrypt";
@@ -11305,7 +11516,7 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_launch_toke
 async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wallet() {
     let harness = runtime_custody_prebuy_availability_harness(
         0x61,
-        ContentAvailabilityTestConfig::accepted(),
+        ContentAvailabilityTestConfig::accepted_now(),
     )
     .await;
     let principal_id = "person:local:runtime-custody-open-no-release-wallet";

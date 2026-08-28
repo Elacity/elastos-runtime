@@ -138,7 +138,9 @@ fn store_mock_published_protected_content(
         policy: "protected-content-replication/v1".to_string(),
         status: "network_available".to_string(),
         replicas: 3,
-        peer_selection: json!({}),
+        peer_selection: json!({
+            "live_multi_peer_proof": true,
+        }),
         quota: json!({}),
         repair_worker: json!({}),
         storage_market: json!({}),
