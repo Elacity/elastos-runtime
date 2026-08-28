@@ -246,6 +246,33 @@ def assert_setup_order():
 
 def run_smoke():
     stamper = load_stamper()
+    player_manifest = json.loads(
+        (ROOT / "capsules" / "elacity-player" / "capsule.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    if player_manifest.get("name") != "elacity-player":
+        raise AssertionError("Elacity Player manifest name drifted")
+    if player_manifest.get("icon") != "browser/icons":
+        raise AssertionError("Elacity Player must keep capsule-owned icons")
+    for icon_file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"]:
+        if not (
+            ROOT / "capsules" / "elacity-player" / "browser" / "icons" / icon_file
+        ).is_file():
+            raise AssertionError(f"missing Elacity Player icon asset {icon_file}")
+
+    source_components = json.loads((ROOT / "components.json").read_text(encoding="utf-8"))
+    if (
+        source_components["external"]["elacity-player"]["install_path"]
+        != "capsules/elacity-player"
+    ):
+        raise AssertionError(
+            "components.json must install Elacity Player from its capsule tree"
+        )
+    for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"]:
+        if "elacity-player" not in source_components["profiles"][profile]["components"]:
+            raise AssertionError(f"profile {profile} must include Elacity Player")
+
     with tempfile.TemporaryDirectory() as temp:
         temp_root = Path(temp)
         root = temp_root / "repo"

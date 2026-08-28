@@ -47,6 +47,9 @@ export function createLibraryActions({
   writeResourceIdentifier,
   writeResourceUri,
 }) {
+  const RUNTIME_CUSTODY_METADATA_SCHEMA = "elastos.library.protected-content-identity/v1";
+  const MINT_ID_HEX_RE = /^[0-9a-f]{64}$/;
+
   async function openObject(object) {
     if (!object) return;
     if (isDirectory(object)) {
@@ -66,6 +69,13 @@ export function createLibraryActions({
       deliverArchiveObject(object);
       return;
     }
+    if (isRuntimeCustodyProtectedVideo(object)) {
+      if (openProtectedVideo(object)) {
+        return;
+      }
+      setStatus("Protected video is unavailable.");
+      return;
+    }
     if (isArchiveObject(object) && openWithViewer(object, "archive-manager")) {
       return;
     }
@@ -79,6 +89,21 @@ export function createLibraryActions({
     }
     setStatus("No installed app can open this item.");
     showProperties(object);
+  }
+
+  function isRuntimeCustodyProtectedVideo(object) {
+    return (
+      String(object?.mime || "").startsWith("video/") &&
+      object?.metadata?.protected_content?.schema === RUNTIME_CUSTODY_METADATA_SCHEMA
+    );
+  }
+
+  function openProtectedVideo(object) {
+    const mintId = String(object?.metadata?.protected_content?.mint_id || "").trim();
+    if (!MINT_ID_HEX_RE.test(mintId)) {
+      return false;
+    }
+    return openTarget("elacity-player", { mint_id: mintId });
   }
 
   function openWithViewer(object, viewer) {

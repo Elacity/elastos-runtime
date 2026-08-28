@@ -582,6 +582,7 @@ APP_CAPSULES=(
     browser
     documents
     library
+    elacity-player
     marketplace
     archive-manager
     inbox

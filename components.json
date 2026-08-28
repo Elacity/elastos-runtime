@@ -1188,6 +1188,20 @@
         }
       }
     },
+    "elacity-player": {
+      "install_path": "capsules/elacity-player",
+      "description": "Protected video viewer capsule through Runtime-scoped object-provider access.",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "elacity-player.tar.gz",
+          "extract_path": "elacity-player",
+          "install_path": "capsules/elacity-player"
+        }
+      }
+    },
     "marketplace": {
       "install_path": "capsules/marketplace",
       "description": "Marketplace for browsing installed apps, viewers, providers, and content",
@@ -1444,6 +1458,7 @@
         "browser",
         "documents",
         "library",
+        "elacity-player",
         "marketplace",
         "archive-manager",
         "inbox",
@@ -1490,6 +1505,7 @@
         "ipfs-provider",
         "documents",
         "library",
+        "elacity-player",
         "marketplace",
         "archive-manager",
         "inbox",
@@ -1551,6 +1567,7 @@
         "ipfs-provider",
         "documents",
         "library",
+        "elacity-player",
         "marketplace",
         "archive-manager",
         "inbox",
@@ -1596,6 +1613,7 @@
         "tunnel-provider",
         "documents",
         "library",
+        "elacity-player",
         "marketplace",
         "archive-manager",
         "inbox",
@@ -1646,6 +1664,7 @@
         "tunnel-provider",
         "documents",
         "library",
+        "elacity-player",
         "marketplace",
         "archive-manager",
         "inbox",

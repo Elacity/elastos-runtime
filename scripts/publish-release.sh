@@ -75,6 +75,7 @@ DEFAULT_CAPSULES=(
     archive-manager
     inbox
     assistant
+    elacity-player
 )
 CAPSULES=("${DEFAULT_CAPSULES[@]}")
 REQUIRED_SUPPORTED_CAPSULES=(
@@ -106,6 +107,7 @@ REQUIRED_SUPPORTED_CAPSULES=(
     archive-manager
     inbox
     assistant
+    elacity-player
 )
 SUPPORT_BINARY_ASSETS=(
     shell

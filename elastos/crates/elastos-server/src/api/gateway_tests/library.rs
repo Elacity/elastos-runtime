@@ -9,6 +9,8 @@ fn protected_content_gateway_mock_test_guard() -> &'static tokio::sync::Mutex<()
     GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+const ELACITY_PLAYER_CAPSULE_ID_FOR_TEST: &str = "elacity-player";
+
 async fn post_library(
     app: axum::Router,
     token: &str,
@@ -36,7 +38,7 @@ async fn post_library(
     } else {
         serde_json::from_slice(&bytes).unwrap_or_else(|err| {
             panic!(
-                "invalid json response (status={status}): {err}; body={}",
+                "invalid json response for {op} (status={status}): {err}; body={}",
                 String::from_utf8_lossy(&bytes)
             )
         })
@@ -7144,6 +7146,11 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
         &registry,
     )
     .await;
+    crate::protected_content_runtime::tests::register_runtime_custody_mock_media_provider_for_test_registry(
+        dir.path(),
+        &registry,
+    )
+    .await;
     let creator = passkey_authority_with_profile_role_credential(
         dir.path(),
         "creator",
@@ -7158,6 +7165,11 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
     );
     let creator_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &creator);
     let buyer_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &buyer);
+    let player_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        ELACITY_PLAYER_CAPSULE_ID_FOR_TEST,
+        &buyer,
+    );
     let creator_account_id = wallet_provider
         .provider
         .seed_managed_evm_account_for_principal_with_index(&creator.principal_id, 1)
@@ -7169,30 +7181,14 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
     let app = gateway_router(state.clone());
 
     let creator_root = crate::auth::principal_localhost_root(&creator.principal_id);
-    let uri = format!("{creator_root}/Documents/protected-runtime-proof");
-    let (clear_init, clear_segments) = clear_runtime_custody_media(0xa1);
-    write_library_bytes(
-        &app,
-        &creator_token,
-        &format!("{uri}/init.mp4"),
-        &clear_init,
-    )
-    .await;
-    for (index, segment) in clear_segments.iter().enumerate() {
-        write_library_bytes(
-            &app,
-            &creator_token,
-            &format!("{uri}/segments/{index:08}.m4s"),
-            segment,
-        )
-        .await;
-    }
+    let uri = format!("{creator_root}/Documents/protected-runtime-proof.mp4");
+    let (clear_init, clear_segments) =
+        crate::protected_content_runtime::tests::runtime_custody_gateway_media_output_for_test();
+    write_library_bytes(&app, &creator_token, &uri, b"media").await;
     let publish_body = json!({
         "uri": uri,
         "protection": {
             "mode": "runtime_custody",
-            "mime_type": "video/mp4",
-            "codecs": "avc1.64001f,mp4a.40.2",
             "wallet_account_id": creator_account_id,
             "copies": "0x2",
             "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
@@ -7346,10 +7342,15 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
     wallet_provider.clear_requests().await;
     let (open_status, open_payload) = post_library(
         app.clone(),
-        &buyer_token,
+        &player_token,
         "open_viewer",
         json!({
             "mint_id": hex::encode(mint_id.as_bytes()),
+            "principal_id": "person:substituted",
+            "launch_id": "launch:ffffffffffffffffffffffffffffffff",
+            "proof_binding_id": "proof:substituted",
+            "session_id": "runtime-session:substituted",
+            "grant_id": "grant:substituted",
         }),
     )
     .await;
@@ -7367,14 +7368,63 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
         .as_str()
         .unwrap()
         .to_string();
+    let open_keys = open_payload["data"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        open_keys,
+        std::collections::BTreeSet::from([
+            "codecs",
+            "expires_at",
+            "has_init_segment",
+            "mime_type",
+            "mint_id",
+            "schema",
+            "segment_count",
+            "viewer_session_handle",
+        ])
+    );
+    assert_eq!(
+        open_payload["data"]["segment_count"].as_u64(),
+        Some(clear_segments.len() as u64)
+    );
+
+    let substituted_player_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        ELACITY_PLAYER_CAPSULE_ID_FOR_TEST,
+        &buyer,
+    );
+    let (substituted_launch_status, substituted_launch_payload) = post_library(
+        app.clone(),
+        &substituted_player_token,
+        "read_viewer",
+        json!({
+            "mint_id": hex::encode(mint_id.as_bytes()),
+            "viewer_session_handle": viewer_handle.clone(),
+        }),
+    )
+    .await;
+    assert_eq!(substituted_launch_status, StatusCode::OK);
+    assert_eq!(substituted_launch_payload["status"], "error");
+    assert_eq!(
+        substituted_launch_payload["message"],
+        "Runtime custody viewer session is unavailable"
+    );
 
     let (init_status, init_payload) = post_library(
         app.clone(),
-        &buyer_token,
+        &player_token,
         "read_viewer",
         json!({
             "mint_id": hex::encode(mint_id.as_bytes()),
             "viewer_session_handle": viewer_handle,
+            "principal_id": "person:substituted",
+            "proof_binding_id": "proof:substituted",
+            "session_id": "runtime-session:substituted",
+            "grant_id": "grant:substituted",
         }),
     )
     .await;
@@ -7387,11 +7437,15 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
 
     let (segment_status, segment_payload) = post_library(
         app.clone(),
-        &buyer_token,
+        &player_token,
         "read_viewer",
         json!({
             "mint_id": hex::encode(mint_id.as_bytes()),
             "viewer_session_handle": open_payload["data"]["viewer_session_handle"],
+            "principal_id": "person:substituted",
+            "proof_binding_id": "proof:substituted",
+            "session_id": "runtime-session:substituted",
+            "grant_id": "grant:substituted",
             "segment_index": 0,
         }),
     )
@@ -7405,11 +7459,15 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
 
     let (close_status, close_payload) = post_library(
         app,
-        &buyer_token,
+        &player_token,
         "close_viewer",
         json!({
             "mint_id": hex::encode(mint_id.as_bytes()),
             "viewer_session_handle": open_payload["data"]["viewer_session_handle"],
+            "principal_id": "person:substituted",
+            "proof_binding_id": "proof:substituted",
+            "session_id": "runtime-session:substituted",
+            "grant_id": "grant:substituted",
         }),
     )
     .await;
@@ -7431,7 +7489,7 @@ async fn test_library_provider_runtime_custody_open_is_denied_before_purchase() 
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(library_test_state_without_content(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
-    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let token = app_token_for_authority(dir.path(), ELACITY_PLAYER_CAPSULE_ID_FOR_TEST, &authority);
     let (status, payload) = post_library(
         app,
         &token,
@@ -7452,6 +7510,130 @@ async fn test_library_provider_runtime_custody_open_is_denied_before_purchase() 
         payload["message"],
         crate::protected_content_runtime::RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE
     );
+}
+
+#[tokio::test]
+async fn test_library_provider_runtime_custody_viewer_ops_require_player_launch_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let library_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let denied_message = "home launch token is not authorized for this provider";
+
+    for (op, request) in [
+        (
+            "open_viewer",
+            json!({
+                "mint_id": "00".repeat(32),
+            }),
+        ),
+        (
+            "read_viewer",
+            json!({
+                "mint_id": "00".repeat(32),
+                "viewer_session_handle": "00".repeat(32),
+            }),
+        ),
+        (
+            "close_viewer",
+            json!({
+                "mint_id": "00".repeat(32),
+                "viewer_session_handle": "00".repeat(32),
+            }),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri(format!("/api/provider/object/{op}"))
+                    .header("x-elastos-home-token", library_token.clone())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(provider_body(request))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(status, StatusCode::FORBIDDEN, "{op} body={body}");
+        assert_eq!(body, denied_message, "{op} body={body}");
+    }
+
+    let wrong_resource_token = issue_home_projection_launch_token_with_context(
+        dir.path(),
+        LIBRARY_CAPSULE_ID,
+        ELACITY_PLAYER_CAPSULE_ID_FOR_TEST,
+        &HomeLaunchTokenContext {
+            principal_id: authority.principal_id.clone(),
+            session_id: authority.session_id.clone(),
+            proof_binding_id: Some(authority.proof_binding_id.clone()),
+            grant_id: authority.grant_id.clone(),
+        },
+    )
+    .unwrap();
+    let wrong_resource = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/provider/object/open_viewer")
+                .header("x-elastos-home-token", wrong_resource_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(provider_body(json!({ "mint_id": "00".repeat(32) })))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_resource.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        String::from_utf8(
+            axum::body::to_bytes(wrong_resource.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec()
+        )
+        .unwrap(),
+        "home launch token is not authorized for this viewer"
+    );
+
+    let player_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        ELACITY_PLAYER_CAPSULE_ID_FOR_TEST,
+        &authority,
+    );
+    let malformed_token = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/provider/object/open_viewer")
+                .header("x-elastos-home-token", "not-an-opaque-launch-token")
+                .header(CONTENT_TYPE, "application/json")
+                .body(provider_body(json!({ "mint_id": "00".repeat(32) })))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(malformed_token.status(), StatusCode::FORBIDDEN);
+
+    let wrong_origin = app
+        .oneshot(
+            test_browser_request("localhost:61180", "https://example.invalid")
+                .method("POST")
+                .uri("/api/provider/object/open_viewer")
+                .header("x-elastos-home-token", player_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(provider_body(json!({ "mint_id": "00".repeat(32) })))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_origin.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

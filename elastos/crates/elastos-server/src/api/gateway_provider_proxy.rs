@@ -22,6 +22,7 @@ const MODEL_TEXT_OUTPUT_SCHEMA: &str = "elastos.model.output.text/v1";
 const MODEL_OBJECT_OUTPUT_SCHEMA: &str = "elastos.model.output.object/v1";
 const MODEL_CONTENT_OUTPUT_SCHEMA: &str = "elastos.model.output.content/v1";
 const MODEL_OUTPUT_URI_MAX_BYTES: usize = 4 * 1024;
+const ELACITY_PLAYER_CAPSULE_ID: &str = "elacity-player";
 static LIBRARY_UPLOAD_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Deserialize)]
@@ -1476,10 +1477,8 @@ pub(super) async fn gateway_provider_proxy(
             | "repair"
             | "share"
             | "shared_access"
-            | "events"
-            | "open_viewer"
-            | "read_viewer"
-            | "close_viewer" => &[LIBRARY_CAPSULE_ID],
+            | "events" => &[LIBRARY_CAPSULE_ID],
+            "open_viewer" | "read_viewer" | "close_viewer" => &[ELACITY_PLAYER_CAPSULE_ID],
             "list_runtime_custody" | "buy" => &[LIBRARY_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
             _ => {
                 return (
@@ -1541,6 +1540,18 @@ pub(super) async fn gateway_provider_proxy(
         Ok(required) => required,
         Err(err) => return gateway_provider_error_response(&scheme, err),
     };
+    let is_protected_viewer_op =
+        scheme == "object" && matches!(op.as_str(), "open_viewer" | "read_viewer" | "close_viewer");
+    if is_protected_viewer_op
+        && (required.launch_context.selected_resource != ELACITY_PLAYER_CAPSULE_ID
+            || required.launch_context.executable_actor != ELACITY_PLAYER_CAPSULE_ID)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "home launch token is not authorized for this viewer",
+        )
+            .into_response();
+    }
     let context = required.context.clone();
     let principal_id = context.principal_id.clone();
     let session_id = context.session_id.clone();
@@ -1586,8 +1597,9 @@ pub(super) async fn gateway_provider_proxy(
     if scheme == "documents" || scheme == "object" || scheme == "net" {
         request["principal_id"] = serde_json::Value::String(principal_id.clone());
     }
-    if scheme == "object" && op == "open_viewer" {
+    if is_protected_viewer_op {
         if let Some(object) = request.as_object_mut() {
+            object.remove("launch_id");
             object.remove("proof_binding_id");
             object.remove("session_id");
             object.remove("grant_id");
@@ -1616,6 +1628,10 @@ pub(super) async fn gateway_provider_proxy(
                     serde_json::Value::String(context.grant_id.clone()),
                 );
             }
+            object.insert(
+                "launch_id".to_string(),
+                serde_json::Value::String(required.launch_id.clone()),
+            );
         }
     }
     if scheme == "object" && op == "shared_access" {

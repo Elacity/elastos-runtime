@@ -107,6 +107,9 @@ use elastos_protected_content_provider_contracts::{
     MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
 };
 
+const TEST_VIEWER_LAUNCH_ID: &str = "launch:11111111111111111111111111111111";
+const TEST_VIEWER_LAUNCH_ID_B: &str = "launch:22222222222222222222222222222222";
+
 struct RecordingProvider {
     name: &'static str,
     requests: Mutex<Vec<Value>>,
@@ -2025,6 +2028,7 @@ fn persist_runtime_custody_active_viewer_for_purchase(
     let binding = super::derive_runtime_custody_session_binding(
         &purchase.principal_id,
         &purchase.profile_did,
+        TEST_VIEWER_LAUNCH_ID,
         proof_binding_id,
         session_id,
         grant_id,
@@ -2077,6 +2081,7 @@ fn persist_runtime_custody_open_pending_viewer_for_purchase(
     let binding = super::derive_runtime_custody_session_binding(
         &purchase.principal_id,
         &purchase.profile_did,
+        TEST_VIEWER_LAUNCH_ID,
         proof_binding_id,
         session_id,
         grant_id,
@@ -7891,6 +7896,7 @@ async fn runtime_custody_release_wallet_uses_fresh_binding_per_session() {
     let session_a = super::derive_runtime_custody_session_binding(
         principal_id,
         &current_profile_did,
+        TEST_VIEWER_LAUNCH_ID,
         "proof:alpha",
         "runtime-session:alpha",
         "grant:alpha",
@@ -7900,13 +7906,25 @@ async fn runtime_custody_release_wallet_uses_fresh_binding_per_session() {
     let session_b = super::derive_runtime_custody_session_binding(
         principal_id,
         &current_profile_did,
+        TEST_VIEWER_LAUNCH_ID,
         "proof:alpha",
         "runtime-session:beta",
         "grant:alpha",
         mint.draft().mint_id(),
     )
     .unwrap();
+    let launch_b = super::derive_runtime_custody_session_binding(
+        principal_id,
+        &current_profile_did,
+        TEST_VIEWER_LAUNCH_ID_B,
+        "proof:alpha",
+        "runtime-session:alpha",
+        "grant:alpha",
+        mint.draft().mint_id(),
+    )
+    .unwrap();
     assert_ne!(session_a, session_b);
+    assert_ne!(session_a, launch_b);
     let now = crate::auth::now_ts();
     let (request_a, response_a, signed_a) = super::invoke_runtime_release_wallet(
         registry.as_ref(),
@@ -8011,6 +8029,7 @@ async fn runtime_custody_viewer_open_replays_exact_active_session_without_provid
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some(proof_binding_id),
             session_id: Some("runtime-session:alpha".to_string()),
             grant_id: Some("grant:alpha".to_string()),
@@ -8023,6 +8042,32 @@ async fn runtime_custody_viewer_open_replays_exact_active_session_without_provid
         hex::encode(session.viewer_session_handle())
     );
     assert_eq!(open["expires_at"].as_u64(), Some(session.expires_at()));
+    assert_eq!(open["mime_type"], MEDIA_MIME_TYPE_V1);
+    assert_eq!(open["codecs"], MEDIA_CODECS_V1);
+    assert_eq!(open["has_init_segment"], true);
+    assert_eq!(
+        open["segment_count"].as_u64(),
+        Some(u64::try_from(mint.draft().media_identity().encrypted_segments().len()).unwrap())
+    );
+    let open_keys = open
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        open_keys,
+        std::collections::BTreeSet::from([
+            "codecs",
+            "expires_at",
+            "has_init_segment",
+            "mime_type",
+            "mint_id",
+            "schema",
+            "segment_count",
+            "viewer_session_handle",
+        ])
+    );
     assert!(harness.content_provider.requests().await.is_empty());
 }
 
@@ -8064,6 +8109,7 @@ async fn runtime_custody_viewer_open_rejects_substituted_session_without_provide
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some(proof_binding_id),
             session_id: Some("runtime-session:beta".to_string()),
             grant_id: Some("grant:alpha".to_string()),
@@ -8135,12 +8181,35 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
         .register_sub_provider("decrypt", read_provider.clone())
         .await
         .unwrap();
+    let early_segment = super::read_runtime_custody_viewer(
+        &harness.data_dir,
+        registry.clone(),
+        principal_id,
+        &hex::encode(harness.mint_id.as_bytes()),
+        &hex::encode(session.viewer_session_handle()),
+        Some(TEST_VIEWER_LAUNCH_ID),
+        Some(&proof_binding_id),
+        Some("runtime-session:alpha"),
+        Some("grant:alpha"),
+        Some(0),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        early_segment.to_string(),
+        "Runtime custody viewer media part is invalid"
+    );
+    assert!(read_provider.requests().await.is_empty());
     let read = super::read_runtime_custody_viewer(
         &harness.data_dir,
         registry.clone(),
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        Some(TEST_VIEWER_LAUNCH_ID),
+        Some(&proof_binding_id),
+        Some("runtime-session:alpha"),
+        Some("grant:alpha"),
         None,
     )
     .await
@@ -8157,6 +8226,25 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
         "read_viewer_media_part",
         &serde_json::to_value(&read_request).unwrap(),
     );
+    let repeated_init = super::read_runtime_custody_viewer(
+        &harness.data_dir,
+        registry.clone(),
+        principal_id,
+        &hex::encode(harness.mint_id.as_bytes()),
+        &hex::encode(session.viewer_session_handle()),
+        Some(TEST_VIEWER_LAUNCH_ID),
+        Some(&proof_binding_id),
+        Some("runtime-session:alpha"),
+        Some("grant:alpha"),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        repeated_init.to_string(),
+        "Runtime custody viewer media part is invalid"
+    );
+    assert_eq!(read_provider.requests().await.len(), 1);
 
     registry.unregister_sub_provider("decrypt").await.unwrap();
     let close_provider = RecordingProvider::new(
@@ -8182,6 +8270,10 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        Some(TEST_VIEWER_LAUNCH_ID),
+        Some(&proof_binding_id),
+        Some("runtime-session:alpha"),
+        Some("grant:alpha"),
     )
     .await
     .unwrap();
@@ -8211,6 +8303,10 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        Some(TEST_VIEWER_LAUNCH_ID),
+        Some(&proof_binding_id),
+        Some("runtime-session:alpha"),
+        Some("grant:alpha"),
     )
     .await
     .unwrap();
@@ -8290,6 +8386,10 @@ async fn runtime_custody_viewer_close_rejects_wrong_principal_without_provider_e
         wrong_principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        Some(TEST_VIEWER_LAUNCH_ID),
+        Some(&proof_binding_id),
+        Some("runtime-session:alpha"),
+        Some("grant:alpha"),
     )
     .await
     .expect_err("expected wrong-principal close rejection");
@@ -8347,6 +8447,10 @@ async fn runtime_custody_viewer_close_retains_cleanup_pending_until_exact_settle
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        Some(TEST_VIEWER_LAUNCH_ID),
+        Some(&proof_binding_id),
+        Some("runtime-session:alpha"),
+        Some("grant:alpha"),
     )
     .await
     .unwrap_err();
@@ -8389,6 +8493,10 @@ async fn runtime_custody_viewer_close_retains_cleanup_pending_until_exact_settle
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        Some(TEST_VIEWER_LAUNCH_ID),
+        Some(&proof_binding_id),
+        Some("runtime-session:alpha"),
+        Some("grant:alpha"),
     )
     .await
     .unwrap();
@@ -8678,6 +8786,7 @@ async fn runtime_custody_open_pending_survives_active_write_failure_and_failed_c
         super::derive_runtime_custody_session_binding(
             principal_id,
             &current_profile_did,
+            TEST_VIEWER_LAUNCH_ID,
             &proof_binding_id,
             "runtime-session:alpha",
             "grant:alpha",
@@ -8804,6 +8913,10 @@ async fn runtime_custody_viewer_expiry_reconciles_exact_cleanup_before_read() {
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        Some(TEST_VIEWER_LAUNCH_ID),
+        Some(&proof_binding_id),
+        Some("runtime-session:alpha"),
+        Some("grant:alpha"),
         None,
     )
     .await
@@ -8911,6 +9024,176 @@ async fn runtime_custody_viewer_restart_reconciliation_settles_old_active_record
         record.lifecycle_status,
         super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_read_and_close_reject_substituted_session_without_provider_effects()
+{
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-substituted-binding";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    let session = persist_runtime_custody_active_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x2a),
+        crate::auth::now_ts() + 60,
+    );
+    let record_path =
+        super::runtime_viewer_path(&harness.data_dir, principal_id, mint.draft().mint_id());
+    let before = fs::read(&record_path).unwrap();
+    let registry = Arc::new(ProviderRegistry::new());
+    let decrypt_provider = RecordingProvider::new(
+        "decrypt",
+        ok_provider_response(serde_json::json!({"schema":"unused"})),
+    );
+    registry
+        .register_sub_provider("decrypt", decrypt_provider.clone())
+        .await
+        .unwrap();
+
+    let read_error = super::read_runtime_custody_viewer(
+        &harness.data_dir,
+        registry.clone(),
+        principal_id,
+        &hex::encode(harness.mint_id.as_bytes()),
+        &hex::encode(session.viewer_session_handle()),
+        Some(TEST_VIEWER_LAUNCH_ID),
+        Some(&proof_binding_id),
+        Some("runtime-session:beta"),
+        Some("grant:alpha"),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(read_error
+        .to_string()
+        .contains("Runtime custody viewer session is unavailable"));
+
+    let close_error = super::close_runtime_custody_viewer(
+        &harness.data_dir,
+        registry,
+        principal_id,
+        &hex::encode(harness.mint_id.as_bytes()),
+        &hex::encode(session.viewer_session_handle()),
+        Some(TEST_VIEWER_LAUNCH_ID),
+        Some(&proof_binding_id),
+        Some("runtime-session:beta"),
+        Some("grant:alpha"),
+    )
+    .await
+    .unwrap_err();
+    assert!(close_error
+        .to_string()
+        .contains("Runtime custody viewer session is unavailable"));
+    assert!(decrypt_provider.requests().await.is_empty());
+    assert_eq!(fs::read(&record_path).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_read_and_close_reject_malformed_binding_without_provider_effects() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-malformed-binding";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    let session = persist_runtime_custody_active_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x2b),
+        crate::auth::now_ts() + 60,
+    );
+    let record_path =
+        super::runtime_viewer_path(&harness.data_dir, principal_id, mint.draft().mint_id());
+    let before = fs::read(&record_path).unwrap();
+    let registry = Arc::new(ProviderRegistry::new());
+    let decrypt_provider = RecordingProvider::new(
+        "decrypt",
+        ok_provider_response(serde_json::json!({"schema":"unused"})),
+    );
+    registry
+        .register_sub_provider("decrypt", decrypt_provider.clone())
+        .await
+        .unwrap();
+
+    let read_error = super::read_runtime_custody_viewer(
+        &harness.data_dir,
+        registry.clone(),
+        principal_id,
+        &hex::encode(harness.mint_id.as_bytes()),
+        &hex::encode(session.viewer_session_handle()),
+        Some(TEST_VIEWER_LAUNCH_ID),
+        Some(&proof_binding_id),
+        Some(""),
+        Some("grant:alpha"),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        read_error.to_string(),
+        "Runtime custody viewer session is unavailable"
+    );
+
+    let close_error = super::close_runtime_custody_viewer(
+        &harness.data_dir,
+        registry.clone(),
+        principal_id,
+        &hex::encode(harness.mint_id.as_bytes()),
+        &hex::encode(session.viewer_session_handle()),
+        Some(TEST_VIEWER_LAUNCH_ID),
+        Some(&proof_binding_id),
+        Some("runtime-session:alpha"),
+        Some(""),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        close_error.to_string(),
+        "Runtime custody viewer session is unavailable"
+    );
+
+    assert!(decrypt_provider.requests().await.is_empty());
+    assert_eq!(fs::read(&record_path).unwrap(), before);
 }
 
 #[cfg(unix)]
@@ -9176,6 +9459,7 @@ async fn runtime_custody_viewer_expired_old_binding_allows_cleanup_before_fresh_
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some(proof_binding_id),
             session_id: Some("runtime-session:beta".to_string()),
             grant_id: Some("grant:alpha".to_string()),
@@ -9484,6 +9768,7 @@ async fn runtime_custody_library_open_after_purchase_fails_closed_without_profil
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some("proof:alpha".to_string()),
             session_id: Some("runtime-session:alpha".to_string()),
             grant_id: Some("grant:alpha".to_string()),
@@ -9537,6 +9822,7 @@ async fn runtime_custody_library_open_after_purchase_rejects_mismatched_purchase
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some(proof_binding_id),
             session_id: Some("runtime-session:alpha".to_string()),
             grant_id: Some("grant:alpha".to_string()),
@@ -9595,6 +9881,7 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_decrypt() {
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some(proof_binding_id),
             session_id: Some("runtime-session:alpha".to_string()),
             grant_id: Some("grant:alpha".to_string()),
@@ -9672,6 +9959,11 @@ async fn register_test_decrypt_provider(registry: &Arc<ProviderRegistry>, issuer
 #[cfg(unix)]
 pub(crate) struct RuntimeCustodyProcessProviderFixture {
     _nodes_temp: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+pub(crate) fn runtime_custody_gateway_media_output_for_test() -> (Vec<u8>, Vec<Vec<u8>>) {
+    clear_media_components(0x61)
 }
 
 #[cfg(unix)]
@@ -9830,6 +10122,28 @@ pub(crate) async fn register_runtime_custody_process_providers_for_test_registry
 }
 
 #[cfg(unix)]
+pub(crate) async fn register_runtime_custody_mock_media_provider_for_test_registry(
+    data_dir: &Path,
+    registry: &Arc<ProviderRegistry>,
+) {
+    let provider_root = data_dir.join("protected-content/media-provider");
+    owner_only_dir(&provider_root);
+    let staging_root = provider_root.join("staging");
+    owner_only_dir(&staging_root);
+    registry
+        .register_sub_provider(
+            MEDIA_PROVIDER_ID,
+            Arc::new(TestMediaPreparationProvider {
+                staging_root,
+                requests: Mutex::new(Vec::new()),
+                response: TestMediaPreparationResponse::Prepared,
+            }),
+        )
+        .await
+        .unwrap();
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn runtime_custody_library_open_after_buy_fails_closed_without_launch_token() {
     let harness = runtime_custody_prebuy_availability_harness(
@@ -9871,6 +10185,7 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_launch_toke
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: None,
             session_id: None,
             grant_id: None,
@@ -9935,6 +10250,7 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wal
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some(proof_binding_id),
             session_id: Some("runtime-session:alpha".to_string()),
             grant_id: Some("grant:alpha".to_string()),

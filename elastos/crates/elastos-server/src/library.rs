@@ -333,6 +333,8 @@ enum ObjectProviderRequest {
         principal_id: String,
         mint_id: String,
         #[serde(default)]
+        launch_id: Option<String>,
+        #[serde(default)]
         proof_binding_id: Option<String>,
         #[serde(default)]
         session_id: Option<String>,
@@ -344,12 +346,28 @@ enum ObjectProviderRequest {
         mint_id: String,
         viewer_session_handle: String,
         #[serde(default)]
+        launch_id: Option<String>,
+        #[serde(default)]
+        proof_binding_id: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        grant_id: Option<String>,
+        #[serde(default)]
         segment_index: Option<u32>,
     },
     CloseViewer {
         principal_id: String,
         mint_id: String,
         viewer_session_handle: String,
+        #[serde(default)]
+        launch_id: Option<String>,
+        #[serde(default)]
+        proof_binding_id: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        grant_id: Option<String>,
     },
 }
 
@@ -1879,6 +1897,7 @@ async fn handle_runtime_custody_library_request(
         ObjectProviderRequest::OpenViewer {
             principal_id,
             mint_id,
+            launch_id,
             proof_binding_id,
             session_id,
             grant_id,
@@ -1889,6 +1908,7 @@ async fn handle_runtime_custody_library_request(
                 crate::protected_content_runtime::RuntimeCustodyViewerOpenInput {
                     principal_id,
                     mint_id,
+                    launch_id,
                     proof_binding_id,
                     session_id,
                     grant_id,
@@ -1900,6 +1920,10 @@ async fn handle_runtime_custody_library_request(
             principal_id,
             mint_id,
             viewer_session_handle,
+            launch_id,
+            proof_binding_id,
+            session_id,
+            grant_id,
             segment_index,
         } => {
             crate::protected_content_runtime::read_runtime_custody_viewer(
@@ -1908,6 +1932,10 @@ async fn handle_runtime_custody_library_request(
                 &principal_id,
                 &mint_id,
                 &viewer_session_handle,
+                launch_id.as_deref(),
+                proof_binding_id.as_deref(),
+                session_id.as_deref(),
+                grant_id.as_deref(),
                 segment_index,
             )
             .await
@@ -1916,6 +1944,10 @@ async fn handle_runtime_custody_library_request(
             principal_id,
             mint_id,
             viewer_session_handle,
+            launch_id,
+            proof_binding_id,
+            session_id,
+            grant_id,
         } => {
             crate::protected_content_runtime::close_runtime_custody_viewer(
                 &data_dir,
@@ -1923,6 +1955,10 @@ async fn handle_runtime_custody_library_request(
                 &principal_id,
                 &mint_id,
                 &viewer_session_handle,
+                launch_id.as_deref(),
+                proof_binding_id.as_deref(),
+                session_id.as_deref(),
+                grant_id.as_deref(),
             )
             .await
         }

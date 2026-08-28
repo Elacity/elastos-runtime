@@ -682,6 +682,7 @@ ordinary_capsules_with_privileged_authority_ui = {"home", "system", "wallet-meta
 system_only_elastos_backends = {
     "elacity",
     "elacity-sdk",
+    "elacity_sdk",
     "gateway",
     "chain",
     "wallet",
@@ -859,7 +860,7 @@ for path in manifest_paths:
             "/api/provider/wallet": "direct wallet provider route",
             "ipfs-cluster": "raw IPFS Cluster backend",
             "elacity-sdk": "raw Elacity SDK backend",
-            "elacity": "raw Elacity backend",
+            "elacity_sdk": "raw Elacity SDK backend",
             "/api/provider/ipfs": "direct IPFS provider route",
             "WalletConnect": "direct browser wallet adapter authority",
             "walletconnect": "direct browser wallet adapter authority",
