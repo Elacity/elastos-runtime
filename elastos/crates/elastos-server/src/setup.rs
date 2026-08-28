@@ -2300,6 +2300,10 @@ mod tests {
                 "model-provider".to_string(),
                 "elastos://model/*".to_string(),
             ),
+            (
+                "media-provider".to_string(),
+                "elastos://media/*".to_string(),
+            ),
             ("net-provider".to_string(), "elastos://net/*".to_string()),
             (
                 "object-provider".to_string(),

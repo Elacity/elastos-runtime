@@ -749,6 +749,40 @@
         }
       }
     },
+    "media-provider": {
+      "install_path": "bin/media-provider",
+      "description": "Host protected-content media preparation provider binary for Runtime-selected clear fragmented MP4 preparation",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://media/*"
+      },
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "media-provider-linux-amd64",
+          "install_path": "bin/media-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "media-provider-linux-arm64",
+          "install_path": "bin/media-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "media-provider-darwin-arm64",
+          "install_path": "bin/media-provider"
+        }
+      }
+    },
     "protected-content-decrypt-provider": {
       "install_path": "bin/protected-content-decrypt-provider",
       "description": "Host protected-content decrypt provider binary for inactive Runtime-selected scoped viewer sessions",

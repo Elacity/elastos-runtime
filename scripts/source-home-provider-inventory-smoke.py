@@ -18,7 +18,11 @@ PROTECTED_CONTENT_HELPERS = (
     "protected-content-protect-provider",
     "protected-content-decrypt-provider",
 )
-REQUIRED_PROVIDER_RUNTIMES = ("localhost-provider", "model-provider")
+REQUIRED_PROVIDER_RUNTIMES = (
+    "localhost-provider",
+    "media-provider",
+    "model-provider",
+)
 
 
 def assert_provider_names_and_loops(setup_text: str) -> None:
@@ -73,16 +77,20 @@ def assert_external_metadata(components: dict) -> None:
             if info.get("release_path") != f"{name}-{platform}":
                 raise AssertionError(f"{name} {platform} release_path mismatch")
 
-    model_runtime = external["model-provider"].get("provider_runtime") or {}
-    expected_runtime = {
-        "role": "provider",
-        "substrate": "native",
-        "runtime_abi": "elastos.provider-stdio/v1",
-        "execution": "native-provider",
-        "provides": "elastos://model/*",
-    }
-    if model_runtime != expected_runtime:
-        raise AssertionError("model-provider runtime contract mismatch")
+    for name, provides in (
+        ("media-provider", "elastos://media/*"),
+        ("model-provider", "elastos://model/*"),
+    ):
+        runtime = external[name].get("provider_runtime") or {}
+        expected_runtime = {
+            "role": "provider",
+            "substrate": "native",
+            "runtime_abi": "elastos.provider-stdio/v1",
+            "execution": "native-provider",
+            "provides": provides,
+        }
+        if runtime != expected_runtime:
+            raise AssertionError(f"{name} runtime contract mismatch")
 
 
 def run_integrity_smoke(components: dict) -> None:

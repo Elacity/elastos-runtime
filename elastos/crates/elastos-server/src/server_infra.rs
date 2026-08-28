@@ -59,12 +59,53 @@ const MODEL_PROVIDER_PROTOCOL_VERSION: &str = "elastos.model-provider/v1";
 const MODEL_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const MODEL_PROVIDER_CONFIG_FILE_NAME: &str = "config.json";
 const MODEL_PROVIDER_CONFIG_MAX_BYTES: usize = 256 * 1024;
+const MEDIA_PROVIDER_ID: &str = "media-provider";
+const MEDIA_PROVIDER_ROUTE: &str = "media";
+const MEDIA_PROVIDER_PROTOCOL_VERSION: &str = "elastos.media-provider/v1";
+const MEDIA_PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
+    Some(version) => version,
+    None => "0.1.0-dev",
+};
+const MEDIA_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const MEDIA_PROVIDER_CONFIG_MAX_BYTES: usize = 8 * 1024;
+const MEDIA_PROVIDER_CONFIG_SCHEMA: &str = "elastos.protected-content.media-provider-config/v1";
+const MEDIA_PROVIDER_OUTPUT_PROFILE: &str = "browser_fmp4_h264_v1";
+const MEDIA_PROVIDER_MAX_TIMEOUT_MS: u64 = 3_600_000;
+const MEDIA_PROVIDER_MAX_STDIO_BYTES: usize = 1024 * 1024;
+const MEDIA_PROVIDER_MAX_INPUT_BYTES: u64 = 1024 * 1024 * 1024;
+const MEDIA_PROVIDER_MAX_OUTPUT_PART_BYTES: u64 = 64 * 1024 * 1024;
+const MEDIA_PROVIDER_MAX_DURATION_SECS: u64 = 1_800;
+const MEDIA_PROVIDER_MAX_SOURCE_WIDTH: u32 = 3_840;
+const MEDIA_PROVIDER_MAX_SOURCE_HEIGHT: u32 = 2_160;
+const MEDIA_PROVIDER_MAX_SOURCE_FPS: u32 = 60;
+const MEDIA_PROVIDER_MAX_SEGMENT_COUNT: usize = 512;
+const MEDIA_PROVIDER_MAX_TOTAL_OUTPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const WALLET_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelProviderOperatorConfigFile {
     offers: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MediaProviderOperatorConfigFile {
+    schema: String,
+    ffmpeg_path: String,
+    ffprobe_path: String,
+    staging_root: String,
+    output_profile: String,
+    timeout_ms: u64,
+    max_stdio_bytes: usize,
+    max_input_bytes: u64,
+    max_output_part_bytes: u64,
+    max_duration_secs: u64,
+    max_source_width: u32,
+    max_source_height: u32,
+    max_source_fps: u32,
+    max_segment_count: usize,
+    max_total_output_bytes: u64,
 }
 
 fn model_provider_root_dir(data_dir: &Path) -> PathBuf {
@@ -194,6 +235,125 @@ fn read_model_provider_private_file(
         anyhow::bail!("{label} exceeds its byte limit");
     }
     Ok(bytes)
+}
+
+fn media_provider_root_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("protected-content").join(MEDIA_PROVIDER_ID)
+}
+
+fn media_provider_config_path(data_dir: &Path) -> PathBuf {
+    media_provider_root_dir(data_dir).join("config.json")
+}
+
+fn media_provider_bridge_config(
+    data_dir: &Path,
+) -> anyhow::Result<Option<provider::BridgeProviderConfig>> {
+    let config_path = media_provider_config_path(data_dir);
+    let metadata = match fs::symlink_metadata(&config_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => anyhow::bail!("media-provider private config is unavailable"),
+    };
+    let protected_content_root = data_dir.join("protected-content");
+    let provider_root = media_provider_root_dir(data_dir);
+    let tools_root = provider_root.join("tools");
+    let expected_staging_root = provider_root.join("staging");
+    validate_model_provider_private_directory(
+        &protected_content_root,
+        "media-provider private parent",
+    )
+    .map_err(|_| anyhow::anyhow!("media-provider private config is unsafe"))?;
+    validate_model_provider_private_directory(&provider_root, "media-provider private root")
+        .map_err(|_| anyhow::anyhow!("media-provider private config is unsafe"))?;
+    validate_model_provider_private_directory(&tools_root, "media-provider private tools")
+        .map_err(|_| anyhow::anyhow!("media-provider private config is unsafe"))?;
+    validate_model_provider_private_directory(
+        &expected_staging_root,
+        "media-provider private staging",
+    )
+    .map_err(|_| anyhow::anyhow!("media-provider private config is unsafe"))?;
+    let bytes = read_model_provider_private_file(
+        &config_path,
+        &metadata,
+        MEDIA_PROVIDER_CONFIG_MAX_BYTES,
+        "media-provider private config",
+    )
+    .map_err(|_| anyhow::anyhow!("media-provider private config is unsafe"))?;
+    let raw: MediaProviderOperatorConfigFile = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("media-provider private config is invalid"))?;
+    let ffmpeg_path = PathBuf::from(&raw.ffmpeg_path);
+    let ffprobe_path = PathBuf::from(&raw.ffprobe_path);
+    if raw.schema != MEDIA_PROVIDER_CONFIG_SCHEMA
+        || raw.output_profile != MEDIA_PROVIDER_OUTPUT_PROFILE
+        || PathBuf::from(&raw.staging_root) != expected_staging_root
+        || ffmpeg_path != tools_root.join("ffmpeg")
+        || ffprobe_path != tools_root.join("ffprobe")
+        || raw.timeout_ms == 0
+        || raw.timeout_ms > MEDIA_PROVIDER_MAX_TIMEOUT_MS
+        || raw.max_stdio_bytes == 0
+        || raw.max_stdio_bytes > MEDIA_PROVIDER_MAX_STDIO_BYTES
+        || raw.max_input_bytes == 0
+        || raw.max_input_bytes > MEDIA_PROVIDER_MAX_INPUT_BYTES
+        || raw.max_output_part_bytes == 0
+        || raw.max_output_part_bytes > MEDIA_PROVIDER_MAX_OUTPUT_PART_BYTES
+        || raw.max_duration_secs == 0
+        || raw.max_duration_secs > MEDIA_PROVIDER_MAX_DURATION_SECS
+        || raw.max_source_width == 0
+        || raw.max_source_width > MEDIA_PROVIDER_MAX_SOURCE_WIDTH
+        || raw.max_source_height == 0
+        || raw.max_source_height > MEDIA_PROVIDER_MAX_SOURCE_HEIGHT
+        || raw.max_source_fps == 0
+        || raw.max_source_fps > MEDIA_PROVIDER_MAX_SOURCE_FPS
+        || raw.max_segment_count == 0
+        || raw.max_segment_count > MEDIA_PROVIDER_MAX_SEGMENT_COUNT
+        || raw.max_total_output_bytes == 0
+        || raw.max_total_output_bytes > MEDIA_PROVIDER_MAX_TOTAL_OUTPUT_BYTES
+        || raw.max_total_output_bytes < raw.max_output_part_bytes
+    {
+        anyhow::bail!("media-provider private config is invalid");
+    }
+    validate_media_provider_tool(&ffmpeg_path)?;
+    validate_media_provider_tool(&ffprobe_path)?;
+    Ok(Some(provider::BridgeProviderConfig {
+        extra: serde_json::json!({
+            "provider_id": MEDIA_PROVIDER_ID,
+            "staging_root": raw.staging_root,
+            "ffmpeg_path": raw.ffmpeg_path,
+            "ffprobe_path": raw.ffprobe_path,
+            "output_profile": raw.output_profile,
+            "timeout_ms": raw.timeout_ms,
+            "max_stdio_bytes": raw.max_stdio_bytes,
+            "max_input_bytes": raw.max_input_bytes,
+            "max_output_part_bytes": raw.max_output_part_bytes,
+            "max_duration_secs": raw.max_duration_secs,
+            "max_source_width": raw.max_source_width,
+            "max_source_height": raw.max_source_height,
+            "max_source_fps": raw.max_source_fps,
+            "max_segment_count": raw.max_segment_count,
+            "max_total_output_bytes": raw.max_total_output_bytes,
+        }),
+        ..Default::default()
+    }))
+}
+
+fn validate_media_provider_tool(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| anyhow::anyhow!("media-provider private tool is unavailable"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("media-provider private tool is unsafe");
+    }
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode() & 0o777;
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || mode & 0o077 != 0
+            || mode & 0o100 == 0
+        {
+            anyhow::bail!("media-provider private tool is unsafe");
+        }
+    }
+    Ok(())
 }
 
 async fn request_browser_engine_provider_status(
@@ -349,6 +509,44 @@ async fn start_model_provider(
     Ok(())
 }
 
+async fn request_media_provider_status(
+    bridge: &provider::ProviderBridge,
+    status_timeout: Duration,
+) -> anyhow::Result<serde_json::Value> {
+    tokio::time::timeout(
+        status_timeout,
+        bridge.send_raw(&serde_json::json!({"op": "status"})),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("media-provider status request timed out"))?
+    .map_err(|_| anyhow::anyhow!("media-provider status request failed"))
+}
+
+async fn start_media_provider(
+    registry: &provider::ProviderRegistry,
+    bridge: Arc<provider::ProviderBridge>,
+    status_timeout: Duration,
+) -> anyhow::Result<()> {
+    let startup = async {
+        let status = request_media_provider_status(&bridge, status_timeout).await?;
+        require_media_provider_status(&status)?;
+        let media_provider: Arc<dyn provider::Provider> = Arc::new(
+            provider::CapsuleProvider::with_scheme(bridge.clone(), MEDIA_PROVIDER_ROUTE),
+        );
+        register_media_provider(registry, media_provider).await
+    }
+    .await;
+    if let Err(startup_error) = startup {
+        if let Err(shutdown_error) = bridge.shutdown().await {
+            return Err(anyhow::anyhow!(
+                "{startup_error}; media-provider shutdown/reap also failed: {shutdown_error}"
+            ));
+        }
+        return Err(startup_error);
+    }
+    Ok(())
+}
+
 fn require_wallet_provider_v2_status(status: &serde_json::Value) -> anyhow::Result<()> {
     if status.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
         anyhow::bail!("wallet-provider status request did not succeed");
@@ -391,6 +589,43 @@ fn require_model_provider_status(status: &serde_json::Value) -> anyhow::Result<(
     Ok(())
 }
 
+fn require_media_provider_status(status: &serde_json::Value) -> anyhow::Result<()> {
+    if status.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+        anyhow::bail!("media-provider status request did not succeed");
+    }
+    let data = status
+        .get("data")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("media-provider status is missing data"))?;
+    if data.get("provider").and_then(serde_json::Value::as_str) != Some(MEDIA_PROVIDER_ID) {
+        anyhow::bail!("media-provider status has an unsupported provider identity");
+    }
+    if data
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_str)
+        != Some(MEDIA_PROVIDER_PROTOCOL_VERSION)
+    {
+        anyhow::bail!("media-provider status has an unsupported protocol version");
+    }
+    if data.get("version").and_then(serde_json::Value::as_str) != Some(MEDIA_PROVIDER_VERSION) {
+        anyhow::bail!("media-provider status has an unsupported version");
+    }
+    if data.get("configured").and_then(serde_json::Value::as_bool) != Some(true) {
+        anyhow::bail!("media-provider is not configured");
+    }
+    let operations = data
+        .get("supported_operations")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("media-provider status is missing operations"))?;
+    if operations.len() != 2
+        || operations[0].as_str() != Some("status")
+        || operations[1].as_str() != Some("prepare")
+    {
+        anyhow::bail!("media-provider status has unsupported operations");
+    }
+    Ok(())
+}
+
 async fn register_wallet_provider_v2(
     registry: &provider::ProviderRegistry,
     wallet_provider: Arc<dyn provider::Provider>,
@@ -416,6 +651,23 @@ async fn register_model_provider(
         .register_sub_provider("model", model_provider)
         .await
         .map_err(|err| anyhow::anyhow!("failed to register model provider: {err}"))
+}
+
+async fn register_media_provider(
+    registry: &provider::ProviderRegistry,
+    media_provider: Arc<dyn provider::Provider>,
+) -> anyhow::Result<()> {
+    if registry
+        .registration_for_uri("elastos://media/status")
+        .await
+        .is_some()
+    {
+        anyhow::bail!("failed to register media provider: route already registered");
+    }
+    registry
+        .register_sub_provider(MEDIA_PROVIDER_ROUTE, media_provider)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to register media provider: {err}"))
 }
 
 pub(crate) async fn setup_server_infrastructure() -> anyhow::Result<ServerInfrastructure> {
@@ -776,6 +1028,37 @@ async fn setup_server_infrastructure_impl(
         },
         Ok(None) => {}
         Err(e) => tracing::warn!("Skipping model-provider due to verification failure: {}", e),
+    }
+
+    match binaries::resolve_verified_native_provider_binary(MEDIA_PROVIDER_ID) {
+        Ok(Some(path)) => match media_provider_bridge_config(&data_dir) {
+            Ok(Some(media_config)) => {
+                match provider::ProviderBridge::spawn(&path, media_config).await {
+                    Ok(bridge) => {
+                        let bridge = Arc::new(bridge);
+                        match start_media_provider(
+                            &provider_registry,
+                            bridge,
+                            MEDIA_PROVIDER_STATUS_TIMEOUT,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                tracing::info!("media-provider capsule from verified install")
+                            }
+                            Err(_) => {
+                                tracing::warn!("Skipping media-provider because startup failed")
+                            }
+                        }
+                    }
+                    Err(_) => tracing::warn!("Skipping media-provider because startup failed"),
+                }
+            }
+            Ok(None) => tracing::info!("media-provider is installed but unconfigured"),
+            Err(_) => tracing::warn!("Skipping media-provider due to invalid private config"),
+        },
+        Ok(None) => {}
+        Err(_) => tracing::warn!("Skipping media-provider due to verification failure"),
     }
 
     if let Some(path) = crate::find_installed_provider_binary("operator-drive-adapter") {
@@ -1777,6 +2060,19 @@ mod tests {
         })
     }
 
+    fn media_provider_status() -> serde_json::Value {
+        serde_json::json!({
+            "status": "ok",
+            "data": {
+                "provider": MEDIA_PROVIDER_ID,
+                "protocol_version": MEDIA_PROVIDER_PROTOCOL_VERSION,
+                "version": MEDIA_PROVIDER_VERSION,
+                "configured": true,
+                "supported_operations": ["status", "prepare"],
+            }
+        })
+    }
+
     fn setup_model_provider_operator_root(tempdir: &TempDir) -> PathBuf {
         let root = model_provider_root_dir(tempdir.path());
         fs::create_dir_all(&root).unwrap();
@@ -1799,6 +2095,55 @@ mod tests {
         #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    fn write_media_provider_operator_config(
+        tempdir: &TempDir,
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) -> PathBuf {
+        let protected_content_root = tempdir.path().join("protected-content");
+        let provider_root = media_provider_root_dir(tempdir.path());
+        let tools_root = provider_root.join("tools");
+        let staging_root = provider_root.join("staging");
+        fs::create_dir_all(&tools_root).unwrap();
+        fs::create_dir(&staging_root).unwrap();
+        for path in [
+            &protected_content_root,
+            &provider_root,
+            &tools_root,
+            &staging_root,
+        ] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let ffmpeg_path = tools_root.join("ffmpeg");
+        let ffprobe_path = tools_root.join("ffprobe");
+        fs::write(&ffmpeg_path, b"ffmpeg-test").unwrap();
+        fs::write(&ffprobe_path, b"ffprobe-test").unwrap();
+        fs::set_permissions(&ffmpeg_path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&ffprobe_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut value = serde_json::json!({
+            "schema": MEDIA_PROVIDER_CONFIG_SCHEMA,
+            "ffmpeg_path": ffmpeg_path,
+            "ffprobe_path": ffprobe_path,
+            "staging_root": staging_root,
+            "output_profile": MEDIA_PROVIDER_OUTPUT_PROFILE,
+            "timeout_ms": 5_000,
+            "max_stdio_bytes": 4096,
+            "max_input_bytes": 1 << 20,
+            "max_output_part_bytes": 1 << 20,
+            "max_duration_secs": 60,
+            "max_source_width": 1920,
+            "max_source_height": 1080,
+            "max_source_fps": 60,
+            "max_segment_count": 32,
+            "max_total_output_bytes": 1 << 24,
+        });
+        mutate(&mut value);
+        let config_path = media_provider_config_path(tempdir.path());
+        fs::write(&config_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        config_path
     }
 
     #[cfg(unix)]
@@ -2192,6 +2537,161 @@ mod tests {
         assert_eq!(requests[0]["op"], "status");
         assert_eq!(requests[1]["op"], "shutdown");
         first_provider.abort();
+    }
+
+    #[tokio::test]
+    async fn media_provider_startup_registers_only_the_runtime_media_route() {
+        let registry = provider::ProviderRegistry::new();
+        let (bridge, provider) = test_provider_bridge(media_provider_status(), Duration::ZERO);
+
+        start_media_provider(&registry, bridge, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let registration = registry
+            .registration_for_uri("elastos://media/status")
+            .await
+            .unwrap();
+        assert_eq!(registration.route, MEDIA_PROVIDER_ROUTE);
+        assert_eq!(registration.provider, "capsule-provider");
+        provider.abort();
+    }
+
+    #[tokio::test]
+    async fn media_provider_startup_reaps_mismatched_or_unconfigured_processes() {
+        let mut cases = Vec::new();
+        let mut wrong_identity = media_provider_status();
+        wrong_identity["data"]["provider"] = serde_json::json!("other-provider");
+        cases.push(wrong_identity);
+        let mut wrong_protocol = media_provider_status();
+        wrong_protocol["data"]["protocol_version"] = serde_json::json!("old");
+        cases.push(wrong_protocol);
+        let mut wrong_version = media_provider_status();
+        wrong_version["data"]["version"] = serde_json::json!("old");
+        cases.push(wrong_version);
+        let mut unconfigured = media_provider_status();
+        unconfigured["data"]["configured"] = serde_json::json!(false);
+        cases.push(unconfigured);
+        let mut wrong_operations = media_provider_status();
+        wrong_operations["data"]["supported_operations"] =
+            serde_json::json!(["status", "prepare", "publish"]);
+        cases.push(wrong_operations);
+
+        for status in cases {
+            let registry = provider::ProviderRegistry::new();
+            let (bridge, provider) = test_provider_bridge(status, Duration::ZERO);
+
+            start_media_provider(&registry, bridge, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+
+            assert!(registry
+                .registration_for_uri("elastos://media/status")
+                .await
+                .is_none());
+            let requests = provider.await.unwrap();
+            assert_eq!(requests[0]["op"], "status");
+            assert_eq!(requests[1]["op"], "shutdown");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn media_provider_status_and_failed_startup_are_bounded_and_settled() {
+        let registry = provider::ProviderRegistry::new();
+        let (bridge, provider) =
+            test_provider_bridge(media_provider_status(), Duration::from_millis(20));
+        let started = tokio::time::Instant::now();
+
+        let error = start_media_provider(&registry, bridge, Duration::from_millis(5))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(started.elapsed(), Duration::from_millis(20));
+        assert!(registry
+            .registration_for_uri("elastos://media/status")
+            .await
+            .is_none());
+        let requests = provider.await.unwrap();
+        assert_eq!(requests[0]["op"], "status");
+        assert_eq!(requests[1]["op"], "shutdown");
+    }
+
+    #[tokio::test]
+    async fn media_provider_duplicate_registration_reaps_the_rejected_process() {
+        let registry = provider::ProviderRegistry::new();
+        let (first_bridge, first_provider) =
+            test_provider_bridge(media_provider_status(), Duration::ZERO);
+        start_media_provider(&registry, first_bridge, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let (second_bridge, second_provider) =
+            test_provider_bridge(media_provider_status(), Duration::ZERO);
+
+        let error = start_media_provider(&registry, second_bridge, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("failed to register"));
+        let requests = second_provider.await.unwrap();
+        assert_eq!(requests[0]["op"], "status");
+        assert_eq!(requests[1]["op"], "shutdown");
+        first_provider.abort();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn media_provider_config_is_private_bounded_and_path_fixed() {
+        let absent = TempDir::new().unwrap();
+        assert!(media_provider_bridge_config(absent.path())
+            .unwrap()
+            .is_none());
+
+        let valid = TempDir::new().unwrap();
+        let path = write_media_provider_operator_config(&valid, |_| {});
+        let original = fs::read(&path).unwrap();
+        let config = media_provider_bridge_config(valid.path()).unwrap().unwrap();
+        assert_eq!(config.extra["provider_id"], MEDIA_PROVIDER_ID);
+        let expected_staging = media_provider_root_dir(valid.path()).join("staging");
+        assert_eq!(
+            config.extra["staging_root"].as_str(),
+            expected_staging.to_str()
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+
+        let invalid_cases: [fn(&mut serde_json::Value); 3] = [
+            |value: &mut serde_json::Value| {
+                value["timeout_ms"] = serde_json::json!(MEDIA_PROVIDER_MAX_TIMEOUT_MS + 1)
+            },
+            |value: &mut serde_json::Value| {
+                value["max_input_bytes"] = serde_json::json!(MEDIA_PROVIDER_MAX_INPUT_BYTES + 1)
+            },
+            |value: &mut serde_json::Value| {
+                value["staging_root"] = serde_json::json!("/private/tmp/escaped")
+            },
+        ];
+        for mutate in invalid_cases {
+            let tempdir = TempDir::new().unwrap();
+            write_media_provider_operator_config(&tempdir, mutate);
+            assert!(media_provider_bridge_config(tempdir.path()).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn media_provider_config_rejects_links_and_redacts_private_values() {
+        let tempdir = TempDir::new().unwrap();
+        let config_path = write_media_provider_operator_config(&tempdir, |value| {
+            value["secret"] = serde_json::json!("super-secret-private-path")
+        });
+        let error = media_provider_bridge_config(tempdir.path()).unwrap_err();
+        assert!(!error.to_string().contains("super-secret-private-path"));
+        fs::remove_file(&config_path).unwrap();
+
+        let target = tempdir.path().join("linked-config");
+        fs::write(&target, b"{}").unwrap();
+        std::os::unix::fs::symlink(&target, &config_path).unwrap();
+        assert!(media_provider_bridge_config(tempdir.path()).is_err());
     }
 
     #[test]

@@ -1,0 +1,46 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "media-provider",
+  "version": "0.1.0",
+  "description": "Bounded media preparation behind Runtime authorization",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://media/*",
+  "authority": {
+    "reason": "Runtime selects authorized object and content resources while media-provider owns bounded probing and preparation semantics.",
+    "capabilities": [
+      {
+        "resource": "elastos://media/*",
+        "actions": ["execute"],
+        "operations": ["prepare"]
+      }
+    ],
+    "audit_events": ["media.prepare"]
+  },
+  "interfaces": [
+    {
+      "id": "elastos.provider.media",
+      "version": "0.1.0",
+      "description": "Runtime provider affordance descriptors for bounded media preparation; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "prepare",
+          "description": "Prepare an authorized Runtime staging operation through the media-provider boundary.",
+          "risk": "privileged",
+          "approval": "runtime_policy",
+          "audit": "full",
+          "resource": "elastos://media/*",
+          "operation": "prepare"
+        }
+      ]
+    }
+  ],
+  "capabilities": [],
+  "resources": {
+    "memory_mb": 512,
+    "gpu": false
+  },
+  "permissions": {}
+}
