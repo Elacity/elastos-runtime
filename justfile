@@ -33,16 +33,16 @@ check crate="elastos-server":
 # environment sets a global CARGO_TARGET_DIR.
 # Build the provider process binaries the protected-content process tests spawn
 prepare-providers:
-    cd capsules/protected-content-protect-provider && cargo build --target-dir target
-    cd capsules/protected-content-decrypt-provider && cargo build --target-dir target
-    cd capsules/custody-provider && cargo build --target-dir target
+    cd capsules/protected-content-protect-provider && cargo build --release --target-dir target
+    cd capsules/protected-content-decrypt-provider && cargo build --release --target-dir target
+    cd capsules/custody-provider && cargo build --release --target-dir target
 
 # Run workspace tests (provider process tests need the capsule binaries)
 test-elastos *args: prepare-providers
     cd elastos && \
-      ELASTOS_TEST_PROTECT_PROVIDER_BIN="$(pwd)/../capsules/protected-content-protect-provider/target/debug/protected-content-protect-provider" \
-      ELASTOS_TEST_DECRYPT_PROVIDER_BIN="$(pwd)/../capsules/protected-content-decrypt-provider/target/debug/protected-content-decrypt-provider" \
-      ELASTOS_TEST_CUSTODY_PROVIDER_BIN="$(pwd)/../capsules/custody-provider/target/debug/custody-provider" \
+      ELASTOS_TEST_PROTECT_PROVIDER_BIN="$(pwd)/../capsules/protected-content-protect-provider/target/release/protected-content-protect-provider" \
+      ELASTOS_TEST_DECRYPT_PROVIDER_BIN="$(pwd)/../capsules/protected-content-decrypt-provider/target/release/protected-content-decrypt-provider" \
+      ELASTOS_TEST_CUSTODY_PROVIDER_BIN="$(pwd)/../capsules/custody-provider/target/release/custody-provider" \
       cargo test --workspace {{args}}
 
 # The elastos workspace suite (and CI's `cargo test --workspace`) never
