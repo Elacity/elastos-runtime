@@ -196,6 +196,20 @@ impl ProviderBridge {
         }
     }
 
+    async fn terminate_child_for_init_failure(child_mutex: &Mutex<Option<Child>>) {
+        let mut child_guard = child_mutex.lock().await;
+        let Some(mut child) = child_guard.take() else {
+            return;
+        };
+
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let _ = Self::force_child_reap(&mut child).await;
+            }
+        }
+    }
+
     /// Spawn a provider capsule as a child process.
     ///
     /// Starts the binary, sends Init with the given config, and waits
@@ -209,12 +223,26 @@ impl ProviderBridge {
             .spawn()
             .map_err(BridgeError::Spawn)?;
 
-        let stdin = child.stdin.take().ok_or_else(|| {
-            BridgeError::InitFailed("spawned provider missing piped stdin".to_string())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            BridgeError::InitFailed("spawned provider missing piped stdout".to_string())
-        })?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let child = Mutex::new(Some(child));
+                Self::terminate_child_for_init_failure(&child).await;
+                return Err(BridgeError::InitFailed(
+                    "spawned provider missing piped stdin".to_string(),
+                ));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let child = Mutex::new(Some(child));
+                Self::terminate_child_for_init_failure(&child).await;
+                return Err(BridgeError::InitFailed(
+                    "spawned provider missing piped stdout".to_string(),
+                ));
+            }
+        };
 
         let bridge = Self {
             io: Arc::new(Mutex::new(ProviderIo {
@@ -648,9 +676,55 @@ impl Provider for CapsuleProvider {
 mod tests {
     use super::*;
     #[cfg(unix)]
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn write_provider_script(tempdir: &TempDir, name: &str, script: &str) -> std::path::PathBuf {
+        let path = tempdir.path().join(name);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn wait_for_file(path: &std::path::Path) {
+        for _ in 0..50 {
+            if path.is_file() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("expected test provider marker {} to exist", path.display());
+    }
+
+    #[cfg(unix)]
+    fn assert_process_absent(pid: &str) {
+        if !process_exists(pid) {
+            return;
+        }
+        for _ in 0..5 {
+            if !process_exists(pid) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("expected provider process {pid} to be terminated and reaped");
+    }
 
     #[test]
     fn test_provider_request_serialization() {
@@ -1030,6 +1104,87 @@ mod tests {
         assert!(matches!(error, BridgeError::InitFailed(_)));
         let pid = read_pid(&pid_file);
         assert!(!process_is_running(pid));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_reaps_provider_that_rejects_init_and_stays_alive() {
+        let tempdir = TempDir::new().unwrap();
+        let pid_path = tempdir.path().join("reject.pid");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' $$ > '{}'\nIFS= read -r _line || exit 0\nprintf '{{\"status\":\"error\",\"code\":\"invalid_config\",\"message\":\"reject\"}}\\n'\nwhile :; do :; done\n",
+            pid_path.display()
+        );
+        let script_path = write_provider_script(&tempdir, "reject-provider.sh", &script);
+
+        let error = match ProviderBridge::spawn(&script_path, ProviderConfig::default()).await {
+            Ok(_) => panic!("init rejection should not return a usable bridge"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, BridgeError::InitFailed(_)));
+        let pid = std::fs::read_to_string(&pid_path).unwrap();
+        assert_process_absent(pid.trim());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn test_spawn_reaps_provider_that_never_answers_init() {
+        let tempdir = TempDir::new().unwrap();
+        let pid_path = tempdir.path().join("hang.pid");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' $$ > '{}'\nIFS= read -r _line || exit 0\nwhile :; do :; done\n",
+            pid_path.display()
+        );
+        let script_path = write_provider_script(&tempdir, "hung-provider.sh", &script);
+
+        let task = tokio::spawn(async move {
+            ProviderBridge::spawn(&script_path, ProviderConfig::default()).await
+        });
+        tokio::task::yield_now().await;
+        wait_for_file(&pid_path);
+        tokio::time::advance(INIT_TIMEOUT).await;
+        let error = match task.await.unwrap() {
+            Ok(_) => panic!("init timeout should not return a usable bridge"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            BridgeError::InitFailed(ref detail)
+                if detail.starts_with(
+                    "provider init timed out; failed to settle provider child:"
+                )
+        ));
+        let pid = std::fs::read_to_string(&pid_path).unwrap();
+        assert_process_absent(pid.trim());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_success_returns_usable_bridge() {
+        let tempdir = TempDir::new().unwrap();
+        let pid_path = tempdir.path().join("ok.pid");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' $$ > '{}'\nwhile IFS= read -r line; do\ncase \"$line\" in\n  *'\"op\":\"init\"'*) printf '{{\"status\":\"ok\"}}\\n' ;;\n  *'\"op\":\"exists\"'*) printf '{{\"status\":\"ok\",\"data\":{{\"exists\":true}}}}\\n' ;;\n  *'\"op\":\"shutdown\"'*) printf '{{\"status\":\"ok\"}}\\n'; exit 0 ;;\n  *) printf '{{\"status\":\"error\",\"code\":\"unexpected\",\"message\":\"unexpected\"}}\\n'; exit 0 ;;\nesac\ndone\n",
+            pid_path.display()
+        );
+        let script_path = write_provider_script(&tempdir, "ok-provider.sh", &script);
+
+        let bridge = ProviderBridge::spawn(&script_path, ProviderConfig::default())
+            .await
+            .unwrap();
+        let response = bridge
+            .request(ProviderRequest::Exists {
+                path: "test".into(),
+                token: String::new(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(response, ProviderResponse::Ok { .. }));
+        bridge.shutdown().await.unwrap();
+
+        let pid = std::fs::read_to_string(&pid_path).unwrap();
+        assert_process_absent(pid.trim());
     }
 
     #[test]

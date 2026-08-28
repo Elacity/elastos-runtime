@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Assistant - ElastOS</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main id="assistant-app" class="assistant-app" aria-labelledby="assistant-title">
+      <aside class="assistant-rail" aria-label="Sessions">
+        <div class="assistant-rail-head">
+          <img
+            class="assistant-brand-icon"
+            src="./icons/icon-128.png"
+            alt=""
+            width="32"
+            height="32"
+          />
+          <div class="assistant-brand-copy">
+            <h1 id="assistant-title">Assistant</h1>
+            <p>Chat, Build, and Studio</p>
+          </div>
+        </div>
+
+        <button id="assistant-new-session" type="button" class="assistant-button">
+          New session
+        </button>
+
+        <label class="assistant-search">
+          <span class="assistant-search-label">Search</span>
+          <input
+            id="assistant-session-search"
+            type="search"
+            placeholder="Search sessions"
+            autocomplete="off"
+          />
+        </label>
+
+        <p id="assistant-status" class="assistant-banner" role="status" aria-live="polite">
+          Loading model offers...
+        </p>
+        <p
+          id="assistant-conflict"
+          class="assistant-banner assistant-banner-warning"
+          role="status"
+          aria-live="polite"
+          hidden
+        ></p>
+
+        <div id="assistant-session-list" class="assistant-session-list"></div>
+      </aside>
+
+      <section class="assistant-main" aria-label="Conversation">
+        <header class="assistant-main-head">
+          <div class="assistant-mode-switch" role="tablist" aria-label="Assistant mode">
+            <button
+              id="assistant-mode-chat"
+              type="button"
+              class="assistant-segment"
+              data-mode="chat"
+              role="tab"
+            >
+              Chat
+            </button>
+            <button
+              id="assistant-mode-build"
+              type="button"
+              class="assistant-segment"
+              data-mode="build"
+              role="tab"
+            >
+              Build
+            </button>
+            <button
+              id="assistant-mode-studio"
+              type="button"
+              class="assistant-segment"
+              data-mode="studio"
+              role="tab"
+            >
+              Studio
+            </button>
+          </div>
+
+          <div class="assistant-main-tools">
+            <label class="assistant-offer-picker">
+              <span>Model</span>
+              <select id="assistant-offer-select" aria-label="Model offer"></select>
+            </label>
+            <div class="assistant-copy-tools">
+              <button
+                id="assistant-copy-transcript"
+                type="button"
+                class="assistant-icon-button"
+                aria-label="Copy transcript"
+                title="Copy this conversation as Markdown."
+              >
+                <svg
+                  aria-hidden="true"
+                  viewBox="0 0 16 16"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  width="16"
+                  height="16"
+                >
+                  <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
+                  <path
+                    d="M10.5 3.5v-.8A1.7 1.7 0 0 0 8.8 1H3.7A1.7 1.7 0 0 0 2 2.7v5.1a1.7 1.7 0 0 0 1.7 1.7h.8"
+                  />
+                </svg>
+                <span class="assistant-visually-hidden">Copy transcript</span>
+              </button>
+              <span
+                id="assistant-copy-status"
+                class="assistant-copy-status"
+                role="status"
+                aria-live="polite"
+              ></span>
+            </div>
+          </div>
+        </header>
+
+        <section id="assistant-empty-state" class="assistant-empty-state" aria-live="polite">
+          <p id="assistant-empty-title" class="assistant-empty-title">Start a new session</p>
+          <p id="assistant-empty-copy" class="assistant-empty-copy">
+            Choose a starter prompt or write your own.
+          </p>
+          <div id="assistant-starters" class="assistant-starters"></div>
+        </section>
+
+        <section
+          id="assistant-studio-panel"
+          class="assistant-studio-panel"
+          aria-live="polite"
+          hidden
+        >
+          <p id="assistant-studio-title" class="assistant-empty-title">Start a studio run</p>
+          <p id="assistant-studio-copy" class="assistant-empty-copy">
+            Choose an offer and write a prompt.
+          </p>
+          <p id="assistant-studio-progress" class="assistant-studio-progress" hidden></p>
+          <div id="assistant-studio-result" class="assistant-studio-result" hidden>
+            <span class="assistant-studio-result-label">Result URI</span>
+            <code id="assistant-studio-result-uri" class="assistant-studio-result-uri"></code>
+          </div>
+        </section>
+
+        <section
+          id="assistant-message-list"
+          class="assistant-message-list"
+          aria-live="polite"
+        ></section>
+
+        <form id="assistant-composer-form" class="assistant-composer">
+          <label class="assistant-composer-label" for="assistant-composer-input">Message</label>
+          <textarea
+            id="assistant-composer-input"
+            class="assistant-composer-input"
+            rows="4"
+            maxlength="8192"
+            placeholder="Ask Assistant"
+          ></textarea>
+          <div class="assistant-composer-actions">
+            <span id="assistant-composer-meta" class="assistant-composer-meta"></span>
+            <div class="assistant-composer-buttons">
+              <button
+                id="assistant-stop"
+                type="button"
+                class="assistant-button assistant-button-secondary"
+                hidden
+              >
+                Stop
+              </button>
+              <button id="assistant-send" type="submit" class="assistant-button">Send</button>
+            </div>
+          </div>
+        </form>
+      </section>
+    </main>
+    <script type="module" src="./assistant.js"></script>
+  </body>
+</html>

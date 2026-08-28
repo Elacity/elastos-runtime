@@ -113,7 +113,7 @@ Carrier is not identical to `elastos://`:
 
 - Carrier gives decentralized peer/content semantics to the relevant parts of `elastos://`
 - the runtime routes and authorizes `elastos://` operations
-- providers define the meaning of subspaces such as `elastos://peer/`, `elastos://did/`, `elastos://chain/`, and `elastos://ai/`
+- providers define the meaning of subspaces such as `elastos://peer/`, `elastos://did/`, `elastos://chain/`, and `elastos://model/`
 
 `elastos://` is the namespace and contract surface. Carrier is one substrate
 behind selected peer and content operations. Runtime hosts the authority,

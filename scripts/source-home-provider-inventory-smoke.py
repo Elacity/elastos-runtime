@@ -13,23 +13,34 @@ COMPONENTS = ROOT / "components.json"
 INTEGRITY = ROOT / "scripts" / "components-release-integrity-check.py"
 SCHEMA = "elastos.source-home-provider-inventory-smoke/v1"
 
-NEW_PROVIDERS = (
+PROTECTED_CONTENT_HELPERS = (
     "custody-provider",
     "protected-content-protect-provider",
     "protected-content-decrypt-provider",
 )
+REQUIRED_PROVIDER_RUNTIMES = ("localhost-provider", "model-provider")
 
 
 def assert_provider_names_and_loops(setup_text: str) -> None:
-    provider_fn = setup_text.split("provider_names() {", 1)[1].split("}\n\nPROVIDER_NAMES_JSON", 1)[0]
-    for name in NEW_PROVIDERS:
-        needle = f"        {name}"
-        if needle not in provider_fn:
-            raise AssertionError(f"provider_names() missing {name}")
+    provider_fn = setup_text.split("provider_runtime_names() {", 1)[1].split(
+        "}\n\nsource_home_helper_binary_names", 1
+    )[0]
+    if 'runtime = component.get("provider_runtime")' not in provider_fn:
+        raise AssertionError("provider runtime inventory must derive from components.json")
 
-    build_loop = 'provider_names | while IFS= read -r provider; do'
+    helper_fn = setup_text.split("source_home_helper_binary_names() {", 1)[1].split(
+        "}\n\nsource_home_binary_names", 1
+    )[0]
+    for name in PROTECTED_CONTENT_HELPERS:
+        needle = f"        {name}"
+        if needle not in helper_fn:
+            raise AssertionError(f"source_home_helper_binary_names() missing {name}")
+
+    build_loop = 'source_home_binary_names | while IFS= read -r provider; do'
     if setup_text.count(build_loop) < 2:
-        raise AssertionError("setup-source-home must build and install providers through provider_names()")
+        raise AssertionError(
+            "setup-source-home must build and install its derived binary inventory"
+        )
 
     main = setup_text.split('echo "[setup-source-home] repo:', 1)[1]
     build_index = main.index('echo "[setup-source-home] build native provider binaries"')
@@ -37,15 +48,15 @@ def assert_provider_names_and_loops(setup_text: str) -> None:
     if build_index >= install_index:
         raise AssertionError("provider build must precede provider install/stamp")
 
-    if 'PROVIDER_NAMES_JSON="${PROVIDER_NAMES_JSON}"' not in setup_text:
-        raise AssertionError("source-home stamp must receive PROVIDER_NAMES_JSON")
+    if 'SOURCE_HOME_BINARY_NAMES_JSON="${SOURCE_HOME_BINARY_NAMES_JSON}"' not in setup_text:
+        raise AssertionError("source-home stamp must receive SOURCE_HOME_BINARY_NAMES_JSON")
 
 
 def assert_external_metadata(components: dict) -> None:
     capsules = components["capsules"]
     external = components["external"]
-    for name in NEW_PROVIDERS:
-        if name in capsules:
+    for name in (*PROTECTED_CONTENT_HELPERS, *REQUIRED_PROVIDER_RUNTIMES):
+        if name in PROTECTED_CONTENT_HELPERS and name in capsules:
             raise AssertionError(f"components.json must not list {name} under capsules")
         entry = external.get(name)
         if not isinstance(entry, dict):
@@ -62,6 +73,17 @@ def assert_external_metadata(components: dict) -> None:
             if info.get("release_path") != f"{name}-{platform}":
                 raise AssertionError(f"{name} {platform} release_path mismatch")
 
+    model_runtime = external["model-provider"].get("provider_runtime") or {}
+    expected_runtime = {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://model/*",
+    }
+    if model_runtime != expected_runtime:
+        raise AssertionError("model-provider runtime contract mismatch")
+
 
 def run_integrity_smoke(components: dict) -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -71,7 +93,11 @@ def run_integrity_smoke(components: dict) -> None:
         bin_dir = data_dir / "bin"
         bin_dir.mkdir(parents=True)
 
-        host_names = ["shell", "localhost-provider", *NEW_PROVIDERS]
+        host_names = [
+            "shell",
+            *REQUIRED_PROVIDER_RUNTIMES,
+            *PROTECTED_CONTENT_HELPERS,
+        ]
         manifest = {
             "schema": components["schema"],
             "capsules": {},
@@ -128,7 +154,10 @@ def main() -> None:
             {
                 "schema": SCHEMA,
                 "ok": True,
-                "providers": list(NEW_PROVIDERS),
+                "providers": [
+                    *REQUIRED_PROVIDER_RUNTIMES,
+                    *PROTECTED_CONTENT_HELPERS,
+                ],
             }
         )
     )

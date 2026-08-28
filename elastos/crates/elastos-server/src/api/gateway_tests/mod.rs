@@ -822,6 +822,7 @@ mod home_system;
 mod inspect;
 mod library;
 mod marketplace;
+mod model;
 mod recovery;
 mod room;
 mod site_publication;

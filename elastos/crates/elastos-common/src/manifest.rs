@@ -1847,11 +1847,11 @@ mod tests {
     fn test_v1_with_gpu() {
         let json = r#"{
             "schema": "elastos.capsule/v1",
-            "name": "llama-provider",
+            "name": "gpu-provider",
             "version": "0.1.0",
             "role": "provider",
             "type": "microvm",
-            "entrypoint": "llama-provider",
+            "entrypoint": "gpu-provider",
             "resources": { "memory_mb": 4096, "gpu": true }
         }"#;
 

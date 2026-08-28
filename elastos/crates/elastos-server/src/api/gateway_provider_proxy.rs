@@ -5,6 +5,10 @@ use elastos_protected_content_contracts::Digest32;
 use sha2::Digest as _;
 
 use super::*;
+use elastos_model_contract::{
+    model_input_hash, RuntimeAccessBinding, RuntimeCreateBinding, RUNTIME_ACCESS_BINDING_SCHEMA,
+    RUNTIME_CREATE_BINDING_SCHEMA,
+};
 
 const LIBRARY_EVENTS_STREAM_KEEPALIVE_SECS: u64 = 15;
 const LIBRARY_TRANSFER_RECEIPT_SCHEMA: &str = "elastos.object.transfer.receipt/v1";
@@ -13,7 +17,47 @@ const LIBRARY_TRANSFER_RECEIPT_HEADER: &str = "x-elastos-transfer-receipt";
 const LIBRARY_DOWNLOAD_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const LIBRARY_UPLOAD_SESSION_SCHEMA: &str = "elastos.object.upload-session/v1";
 const LIBRARY_UPLOAD_SESSION_TTL_SECS: u64 = 24 * 60 * 60;
+const ASSISTANT_CAPSULE_ID: &str = "assistant";
+const MODEL_TEXT_OUTPUT_SCHEMA: &str = "elastos.model.output.text/v1";
+const MODEL_OBJECT_OUTPUT_SCHEMA: &str = "elastos.model.output.object/v1";
+const MODEL_CONTENT_OUTPUT_SCHEMA: &str = "elastos.model.output.content/v1";
+const MODEL_OUTPUT_URI_MAX_BYTES: usize = 4 * 1024;
 static LIBRARY_UPLOAD_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelRunsCreateGatewayRequest {
+    offer_id: String,
+    operation: String,
+    input: serde_json::Value,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelRunAccessGatewayRequest {
+    run_id: String,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelRunEventsGatewayRequest {
+    run_id: String,
+    request_id: String,
+    #[serde(default)]
+    after_sequence: Option<u64>,
+}
+
+struct ModelProviderEffectAudit<'a> {
+    request_id: &'a str,
+    requested_event: &'static str,
+    completed_event: &'static str,
+    failed_event: &'static str,
+    requested_reason: &'static str,
+    completed_reason: &'static str,
+    failed_reason: &'static str,
+}
 
 #[derive(Debug, Deserialize)]
 pub(super) struct LibraryUploadQuery {
@@ -1478,6 +1522,18 @@ pub(super) async fn gateway_provider_proxy(
                     .into_response()
             }
         },
+        "model" => match op.as_str() {
+            "offers_list" | "runs_create" | "runs_get" | "runs_events" | "runs_cancel" => {
+                &[ASSISTANT_CAPSULE_ID]
+            }
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    "Gateway provider operation not found",
+                )
+                    .into_response()
+            }
+        },
         _ => return (StatusCode::NOT_FOUND, "Gateway provider not found").into_response(),
     };
     let required = match require_home_launch_token_binding(&state.data_dir, &headers, allowed_apps)
@@ -1519,7 +1575,14 @@ pub(super) async fn gateway_provider_proxy(
         )
             .into_response();
     }
-    request["op"] = serde_json::Value::String(op.clone());
+    if scheme == "model" {
+        request = match normalize_model_provider_request(&op, &request, &context) {
+            Ok(value) => value,
+            Err((status, message)) => return (status, message).into_response(),
+        };
+    } else {
+        request["op"] = serde_json::Value::String(op.clone());
+    }
     if scheme == "documents" || scheme == "object" || scheme == "net" {
         request["principal_id"] = serde_json::Value::String(principal_id.clone());
     }
@@ -1596,6 +1659,7 @@ pub(super) async fn gateway_provider_proxy(
 
     let chain_lifecycle_audit = chain_lifecycle_effect_audit(&scheme, &op, &request);
     let library_audit = (scheme == "object").then(|| format!("object:{op}:{}", now_ts()));
+    let model_audit = model_provider_effect_audit(&scheme, &op, &request);
     if let Some(audit) = &chain_lifecycle_audit {
         if let Err(err) = append_provider_effect_audit(
             &state.data_dir,
@@ -1637,8 +1701,27 @@ pub(super) async fn gateway_provider_proxy(
             );
         }
     }
+    if let Some(audit) = &model_audit {
+        if let Err(err) = append_provider_effect_audit(
+            &state.data_dir,
+            ProviderEffectAuditInput {
+                capsule_id: ASSISTANT_CAPSULE_ID,
+                event_type: audit.requested_event,
+                principal_id: &principal_id,
+                session_id: &session_id,
+                request_id: audit.request_id,
+                result: "requested",
+                reason: audit.requested_reason,
+            },
+        ) {
+            return gateway_provider_error_response(
+                &scheme,
+                anyhow::anyhow!("model provider audit failed: {}", err),
+            );
+        }
+    }
 
-    let response = if scheme == "object"
+    let mut response = if scheme == "object"
         && (library_operation_needs_runtime_coordinator(&op)
             || library_request_targets_webspace(&request))
     {
@@ -1689,6 +1772,14 @@ pub(super) async fn gateway_provider_proxy(
             }),
         }
     };
+    if scheme == "model" {
+        if let Err(err) = project_model_provider_response(&op, &mut response) {
+            return gateway_provider_error_response(
+                &scheme,
+                anyhow::anyhow!("model provider returned an invalid typed response: {err}"),
+            );
+        }
+    }
 
     if let Some(audit) = &chain_lifecycle_audit {
         let completed = response.get("status").and_then(|value| value.as_str()) == Some("ok");
@@ -1746,6 +1837,34 @@ pub(super) async fn gateway_provider_proxy(
             return gateway_provider_error_response(
                 &scheme,
                 anyhow::anyhow!("object provider audit failed: {}", err),
+            );
+        }
+    }
+    if let Some(audit) = &model_audit {
+        let completed = response.get("status").and_then(|value| value.as_str()) == Some("ok");
+        if let Err(err) = append_provider_effect_audit(
+            &state.data_dir,
+            ProviderEffectAuditInput {
+                capsule_id: ASSISTANT_CAPSULE_ID,
+                event_type: if completed {
+                    audit.completed_event
+                } else {
+                    audit.failed_event
+                },
+                principal_id: &principal_id,
+                session_id: &session_id,
+                request_id: audit.request_id,
+                result: if completed { "completed" } else { "failed" },
+                reason: if completed {
+                    audit.completed_reason
+                } else {
+                    audit.failed_reason
+                },
+            },
+        ) {
+            return gateway_provider_error_response(
+                &scheme,
+                anyhow::anyhow!("model provider audit failed: {}", err),
             );
         }
     }
@@ -2994,6 +3113,224 @@ pub(super) fn provider_proxy_runtime_metadata_field(request: &serde_json::Value)
                 || matches!(key.as_str(), "connect_ticket" | "carrier_route" | "carrier")
         })
         .map(String::as_str)
+}
+
+fn normalize_model_provider_request(
+    op: &str,
+    request: &serde_json::Value,
+    context: &HomeLaunchTokenContext,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    match op {
+        "offers_list" => {
+            if request.as_object().is_some_and(|value| value.is_empty()) {
+                Ok(serde_json::json!({ "op": "offers_list" }))
+            } else {
+                Err((
+                    StatusCode::BAD_REQUEST,
+                    "model offers_list request must be an empty JSON object".to_string(),
+                ))
+            }
+        }
+        "runs_create" => {
+            let parsed = serde_json::from_value::<ModelRunsCreateGatewayRequest>(request.clone())
+                .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+            let runtime_binding = RuntimeCreateBinding {
+                schema: RUNTIME_CREATE_BINDING_SCHEMA.to_string(),
+                principal_id: context.principal_id.clone(),
+                session_id: context.session_id.clone(),
+                capsule_id: ASSISTANT_CAPSULE_ID.to_string(),
+                grant_id: context.grant_id.clone(),
+                request_id: parsed.request_id,
+                offer_id: parsed.offer_id.clone(),
+                operation: parsed.operation.clone(),
+                input_hash: model_input_hash(&parsed.input).map_err(|err| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid model input: {err}"),
+                    )
+                })?,
+            };
+            runtime_binding
+                .validate(&parsed.offer_id, &parsed.operation, &parsed.input)
+                .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+            Ok(serde_json::json!({
+                "op": "runs_create",
+                "offer_id": parsed.offer_id,
+                "operation": parsed.operation,
+                "input": parsed.input,
+                "runtime_binding": runtime_binding,
+            }))
+        }
+        "runs_get" | "runs_cancel" => {
+            let parsed = serde_json::from_value::<ModelRunAccessGatewayRequest>(request.clone())
+                .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+            let runtime_binding = RuntimeAccessBinding {
+                schema: RUNTIME_ACCESS_BINDING_SCHEMA.to_string(),
+                principal_id: context.principal_id.clone(),
+                session_id: context.session_id.clone(),
+                capsule_id: ASSISTANT_CAPSULE_ID.to_string(),
+                grant_id: context.grant_id.clone(),
+                request_id: parsed.request_id,
+                run_id: parsed.run_id.clone(),
+            };
+            runtime_binding
+                .validate(&parsed.run_id)
+                .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+            Ok(serde_json::json!({
+                "op": op,
+                "run_id": parsed.run_id,
+                "runtime_binding": runtime_binding,
+            }))
+        }
+        "runs_events" => {
+            let parsed = serde_json::from_value::<ModelRunEventsGatewayRequest>(request.clone())
+                .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+            let runtime_binding = RuntimeAccessBinding {
+                schema: RUNTIME_ACCESS_BINDING_SCHEMA.to_string(),
+                principal_id: context.principal_id.clone(),
+                session_id: context.session_id.clone(),
+                capsule_id: ASSISTANT_CAPSULE_ID.to_string(),
+                grant_id: context.grant_id.clone(),
+                request_id: parsed.request_id,
+                run_id: parsed.run_id.clone(),
+            };
+            runtime_binding
+                .validate(&parsed.run_id)
+                .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+            Ok(serde_json::json!({
+                "op": "runs_events",
+                "run_id": parsed.run_id,
+                "after_sequence": parsed.after_sequence,
+                "runtime_binding": runtime_binding,
+            }))
+        }
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            "Gateway provider operation not found".to_string(),
+        )),
+    }
+}
+
+fn model_provider_effect_audit<'a>(
+    scheme: &str,
+    op: &str,
+    request: &'a serde_json::Value,
+) -> Option<ModelProviderEffectAudit<'a>> {
+    if scheme != "model" {
+        return None;
+    }
+    let request_id = request.pointer("/runtime_binding/request_id")?.as_str()?;
+    match op {
+        "runs_create" => Some(ModelProviderEffectAudit {
+            request_id,
+            requested_event: "model.run_create.requested",
+            completed_event: "model.run_create.completed",
+            failed_event: "model.run_create.failed",
+            requested_reason: "Assistant requested model run creation",
+            completed_reason: "Assistant completed model run creation",
+            failed_reason: "Assistant failed model run creation",
+        }),
+        "runs_cancel" => Some(ModelProviderEffectAudit {
+            request_id,
+            requested_event: "model.run_cancel.requested",
+            completed_event: "model.run_cancel.completed",
+            failed_event: "model.run_cancel.failed",
+            requested_reason: "Assistant requested model run cancellation",
+            completed_reason: "Assistant completed model run cancellation",
+            failed_reason: "Assistant failed model run cancellation",
+        }),
+        _ => None,
+    }
+}
+
+pub(super) fn project_model_provider_response(
+    op: &str,
+    response: &mut serde_json::Value,
+) -> anyhow::Result<()> {
+    if response.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+        return Ok(());
+    }
+    match op {
+        "runs_get" => {
+            if let Some(output) = response.pointer_mut("/data/terminal/output") {
+                project_model_run_output(output)?;
+            }
+        }
+        "runs_events" => {
+            let events = response
+                .pointer_mut("/data/events")
+                .and_then(serde_json::Value::as_array_mut)
+                .ok_or_else(|| anyhow::anyhow!("model run events response is missing events"))?;
+            for event in events {
+                if event.get("kind").and_then(serde_json::Value::as_str) == Some("output") {
+                    project_model_run_output(event.get_mut("data").ok_or_else(|| {
+                        anyhow::anyhow!("model output event is missing typed data")
+                    })?)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn project_model_run_output(output: &mut serde_json::Value) -> anyhow::Result<()> {
+    let object = output
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("model run output must be an object"))?;
+    let schema = object
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("model run output is missing schema"))?
+        .to_string();
+    match schema.as_str() {
+        MODEL_TEXT_OUTPUT_SCHEMA => {
+            if object.len() != 2
+                || object
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+            {
+                anyhow::bail!("model text output must contain only schema and text");
+            }
+        }
+        MODEL_OBJECT_OUTPUT_SCHEMA => {
+            project_model_output_resource(object, "elastos://object/")?;
+        }
+        MODEL_CONTENT_OUTPUT_SCHEMA => {
+            project_model_output_resource(object, "elastos://content/")?;
+        }
+        _ => anyhow::bail!("model run output uses an unsupported schema"),
+    }
+    Ok(())
+}
+
+fn project_model_output_resource(
+    output: &mut serde_json::Map<String, serde_json::Value>,
+    prefix: &str,
+) -> anyhow::Result<()> {
+    if output.len() != 2 {
+        anyhow::bail!("model resource output must contain only schema and uri");
+    }
+    let uri = output
+        .get("uri")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("model resource output is missing uri"))?;
+    if uri.trim() != uri
+        || uri.len() <= prefix.len()
+        || uri.len() > MODEL_OUTPUT_URI_MAX_BYTES
+        || !uri.starts_with(prefix)
+        || uri.bytes().any(|byte| byte.is_ascii_control())
+    {
+        anyhow::bail!("model resource output has an invalid Runtime resource uri");
+    }
+    let resource_id = uri[prefix.len()..].to_string();
+    output.remove("uri");
+    output.insert(
+        "resource_id".to_string(),
+        serde_json::Value::String(resource_id),
+    );
+    Ok(())
 }
 
 fn library_operation_emits_events(op: &str) -> bool {

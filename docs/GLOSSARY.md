@@ -124,9 +124,10 @@ protocol, expansion, authority layer, or capsule ABI.
 
 A capsule or Runtime-owned service that implements a typed contract. Examples
 include `localhost-provider` for rooted local storage, `did-provider` for
-identity, `chain-provider` for typed chain reads and proofs, `wallet-provider`
-for Wallet proof and approval authority, `rights-provider` for protected-content
-rights evidence, `decrypt-provider` for scoped decrypt/render sessions,
+identity, `model-provider` for typed model offers and durable runs,
+`chain-provider` for typed chain reads and proofs, `wallet-provider` for Wallet
+proof and approval authority, `rights-provider` for protected-content rights
+evidence, `decrypt-provider` for scoped decrypt/render sessions,
 `availability-provider` for configured replication, and `ipfs-provider` for
 low-level local IPFS through Kubo. Runtime selects providers. Application
 capsules use typed Runtime resources instead of choosing providers or network

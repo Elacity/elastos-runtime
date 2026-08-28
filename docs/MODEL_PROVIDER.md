@@ -4,11 +4,8 @@ Agent Hosts and Apps request inference through a typed Runtime resource. They do
 not receive hosted-model credentials, provider endpoints, local model process
 access, or authority to choose a hidden alternate backend.
 
-This document defines the target contract needed by a durable Agent Host. The
-repository already includes `ai-provider` and `llama-provider`, but their
-presence does not prove the complete streaming, cancellation, recovery, and
-provider-selection behavior described here. Current implementation truth stays
-in [`state.md`](../state.md).
+This document defines the target contract needed by a durable Agent Host.
+Current implementation truth stays in [`state.md`](../state.md).
 
 ## Authority boundary
 

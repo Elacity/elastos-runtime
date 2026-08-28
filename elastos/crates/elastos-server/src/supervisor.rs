@@ -1721,10 +1721,6 @@ mod tests {
             Some(ProviderRoute::SubProvider("did".to_string()))
         );
         assert_eq!(
-            Supervisor::parse_provider_route_from_provides("elastos://ai/chat"),
-            Some(ProviderRoute::SubProvider("ai".to_string()))
-        );
-        assert_eq!(
             Supervisor::parse_provider_route_from_provides("localhost://Users/*"),
             Some(ProviderRoute::Scheme("localhost".to_string()))
         );
@@ -1875,6 +1871,7 @@ mod tests {
             repository: None,
             size_mb: None,
             description: None,
+            provider_runtime: None,
             platforms,
         }
     }

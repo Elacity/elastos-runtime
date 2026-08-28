@@ -14,6 +14,7 @@ import {
 test("target and purpose lookup accepts own policy entries only", () => {
   assert.equal(homeClipboardTargetSupported("browser"), true);
   assert.equal(homeClipboardTargetSupported("chat-room"), true);
+  assert.equal(homeClipboardTargetSupported("assistant"), true);
   assert.equal(
     homeClipboardOperationAllowed(
       "chat-room",
@@ -37,6 +38,22 @@ test("target and purpose lookup accepts own policy entries only", () => {
   assert.equal(
     homeClipboardOperationAllowed("library", "resource.uri", "write"),
     true,
+  );
+  assert.equal(
+    homeClipboardOperationAllowed(
+      "assistant",
+      "transcript.markdown",
+      "write",
+    ),
+    true,
+  );
+  assert.equal(
+    homeClipboardOperationAllowed(
+      "assistant",
+      "transcript.markdown",
+      "read",
+    ),
+    false,
   );
 
   for (const inheritedName of ["__proto__", "constructor", "toString"]) {
@@ -84,6 +101,15 @@ test("code-unit bounds reject before UTF-8 encoding while byte bounds stay exact
     ),
     false,
   );
+  assert.equal(
+    homeClipboardValidWriteText(
+      "assistant",
+      "transcript.markdown",
+      "a".repeat(MAX_HOME_CLIPBOARD_TEXT_UTF8_BYTES + 1),
+      MustNotEncode,
+    ),
+    false,
+  );
 
   const exactUtf8Text = "é".repeat(MAX_HOME_CLIPBOARD_TEXT_UTF8_BYTES / 2);
   assert.equal(
@@ -97,6 +123,14 @@ test("code-unit bounds reject before UTF-8 encoding while byte bounds stay exact
       `${exactUtf8Text}a`,
     ),
     false,
+  );
+  assert.equal(
+    homeClipboardValidWriteText(
+      "assistant",
+      "transcript.markdown",
+      exactUtf8Text,
+    ),
+    true,
   );
 });
 

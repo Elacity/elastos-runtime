@@ -47,7 +47,43 @@ pub struct Component {
     pub size_mb: Option<u64>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_runtime: Option<ProviderRuntime>,
     pub platforms: HashMap<String, PlatformInfo>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRuntime {
+    pub role: ProviderRuntimeRole,
+    pub substrate: ProviderRuntimeSubstrate,
+    pub runtime_abi: ProviderRuntimeAbi,
+    pub execution: ProviderRuntimeExecution,
+    pub provides: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderRuntimeRole {
+    Provider,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderRuntimeSubstrate {
+    Native,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub enum ProviderRuntimeAbi {
+    #[serde(rename = "elastos.provider-stdio/v1")]
+    ProviderStdioV1,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderRuntimeExecution {
+    NativeProvider,
 }
 
 /// A capsule registry entry (CID-based, resolved via IPFS gateways).
@@ -87,6 +123,35 @@ pub struct PlatformInfo {
 pub struct Profile {
     pub description: Option<String>,
     pub components: Vec<String>,
+}
+
+pub fn validate_provider_runtime<'a>(
+    name: &str,
+    component: &'a Component,
+) -> anyhow::Result<&'a ProviderRuntime> {
+    let runtime = component.provider_runtime.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("component '{}' is missing provider runtime metadata", name)
+    })?;
+    let provides = runtime.provides.trim();
+    if provides.is_empty() {
+        anyhow::bail!(
+            "component '{}' provider runtime provides must not be empty",
+            name
+        );
+    }
+    if provides != runtime.provides {
+        anyhow::bail!(
+            "component '{}' provider runtime provides must not contain surrounding whitespace",
+            name
+        );
+    }
+    if !(provides.starts_with("elastos://") || provides.starts_with("localhost://")) {
+        anyhow::bail!(
+            "component '{}' provider runtime provides must use elastos:// or localhost://",
+            name
+        );
+    }
+    Ok(runtime)
 }
 
 // ── Entry point ─────────────────────────────────────────────────────
@@ -2073,6 +2138,8 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
+    use elastos_common::{CapsuleManifest, CapsuleRole};
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -2190,6 +2257,166 @@ mod tests {
 
         assert!(!manifest.external.contains_key("kubo"));
         assert!(manifest.external.contains_key("archive-manager"));
+    }
+
+    fn first_party_provider_manifest_path(root: &Path, name: &str) -> Option<PathBuf> {
+        [
+            root.join("capsules").join(name).join("capsule.json"),
+            root.join("elastos")
+                .join("capsules")
+                .join(name)
+                .join("capsule.json"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+    }
+
+    #[test]
+    fn provider_runtime_contract_covers_exact_active_provider_set() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
+        let components: ComponentsManifest =
+            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
+        let expected = BTreeMap::from([
+            (
+                "browser-engine-adapter".to_string(),
+                "elastos://browser-engine/*".to_string(),
+            ),
+            (
+                "chain-provider".to_string(),
+                "elastos://chain/*".to_string(),
+            ),
+            (
+                "content-block-graph-provider".to_string(),
+                "elastos://block-graph/*".to_string(),
+            ),
+            ("did-provider".to_string(), "elastos://did/*".to_string()),
+            ("exit-provider".to_string(), "elastos://exit/*".to_string()),
+            ("ipfs-provider".to_string(), "elastos://ipfs/*".to_string()),
+            (
+                "localhost-provider".to_string(),
+                "localhost://*".to_string(),
+            ),
+            (
+                "model-provider".to_string(),
+                "elastos://model/*".to_string(),
+            ),
+            ("net-provider".to_string(), "elastos://net/*".to_string()),
+            (
+                "object-provider".to_string(),
+                "elastos://object/*".to_string(),
+            ),
+            (
+                "wallet-provider".to_string(),
+                "elastos://wallet/meta/status".to_string(),
+            ),
+            (
+                "webspace-provider".to_string(),
+                "localhost://WebSpaces/*".to_string(),
+            ),
+        ]);
+        let actual = components
+            .external
+            .iter()
+            .filter_map(|(name, component)| {
+                component
+                    .provider_runtime
+                    .as_ref()
+                    .map(|runtime| (name.clone(), runtime.provides.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(actual, expected);
+
+        for helper in [
+            "browser-engine-supervisor",
+            "browser-local-exit",
+            "browser-native-proxy-engine",
+            "browser-stream-bridge",
+        ] {
+            let component = components.external.get(helper).unwrap();
+            assert!(component.provider_runtime.is_none(), "{helper}");
+        }
+
+        for (name, provides) in expected {
+            let component = components.external.get(&name).unwrap();
+            let runtime = validate_provider_runtime(&name, component).unwrap();
+            let expected_install_path = format!("bin/{name}");
+            assert_eq!(
+                component.install_path.as_deref(),
+                Some(expected_install_path.as_str())
+            );
+            assert_eq!(runtime.provides, provides);
+            let path = first_party_provider_manifest_path(&root, &name).unwrap();
+            let manifest: CapsuleManifest =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(manifest.role, CapsuleRole::Provider);
+            assert_eq!(
+                manifest.provides.as_deref(),
+                Some(runtime.provides.as_str())
+            );
+        }
+
+        for profile in ["agent-local-ai", "full"] {
+            assert!(
+                components
+                    .profiles
+                    .get(profile)
+                    .unwrap()
+                    .components
+                    .iter()
+                    .any(|value| value == "model-provider"),
+                "profile {profile} must install model-provider"
+            );
+        }
+        assert!(
+            !components
+                .profiles
+                .get("public-gateway")
+                .unwrap()
+                .components
+                .iter()
+                .any(|value| value == "model-provider"),
+            "public-gateway must not install model-provider"
+        );
+    }
+
+    #[test]
+    fn assistant_capsule_is_packaged_with_a_capsule_owned_icon() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("capsules/assistant/capsule.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["schema"], "elastos.capsule/v1");
+        assert_eq!(manifest["name"], "assistant");
+        assert_eq!(manifest["icon"], "browser/icons");
+        assert_eq!(manifest["entrypoint"], "browser/index.html");
+
+        for file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"] {
+            assert!(
+                root.join("capsules/assistant/browser/icons")
+                    .join(file)
+                    .is_file(),
+                "missing Assistant icon asset {file}"
+            );
+        }
+
+        let components: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
+        assert_eq!(
+            components["external"]["assistant"]["install_path"],
+            "capsules/assistant"
+        );
+        for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
+            assert!(
+                components["profiles"][profile]["components"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == "assistant"),
+                "profile {profile} must include the Assistant capsule"
+            );
+        }
     }
 
     #[test]
@@ -2328,6 +2555,7 @@ mod tests {
             repository: None,
             size_mb: None,
             description: None,
+            provider_runtime: None,
             platforms: HashMap::new(),
         };
 
@@ -2378,6 +2606,7 @@ mod tests {
             repository: None,
             size_mb: None,
             description: None,
+            provider_runtime: None,
             platforms,
         };
 
@@ -2424,6 +2653,7 @@ mod tests {
             repository: None,
             size_mb: None,
             description: None,
+            provider_runtime: None,
             platforms,
         };
         let manifest: ComponentsManifest = serde_json::from_value(serde_json::json!({
@@ -2667,6 +2897,7 @@ mod tests {
             repository: None,
             size_mb: None,
             description: None,
+            provider_runtime: None,
             platforms,
         };
         let manifest = ComponentsManifest {
@@ -3011,6 +3242,7 @@ mod tests {
             repository: None,
             size_mb: None,
             description: None,
+            provider_runtime: None,
             platforms,
         };
 
