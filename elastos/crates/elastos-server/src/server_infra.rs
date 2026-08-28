@@ -1146,12 +1146,19 @@ fn spawn_browser_local_exit(path: &Path, config: &serde_json::Value) -> anyhow::
     {
         remove_existing_browser_local_exit_socket(&relay_path)?;
     }
+    // `stdin` is the helper's parent-liveness channel, not a data channel: we
+    // hold the write end open for as long as this process lives, so the helper
+    // reads EOF and reaps itself however we exit. `HostHelperProcess::drop` only
+    // covers graceful shutdown — SIGKILL, an abort on panic, and the installed
+    // binary supersession watch's `process::exit` all skip it, and each of those
+    // used to strand a helper holding the relay socket.
     let mut child = Command::new(path)
         .env(
             "ELASTOS_BROWSER_LOCAL_EXIT_CONFIG",
             serde_json::to_string(config)?,
         )
-        .stdin(Stdio::null())
+        .env("ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF", "1")
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1261,13 +1268,53 @@ fn remove_existing_browser_local_exit_socket(path: &Path) -> anyhow::Result<()> 
         );
     }
 
-    std::fs::remove_file(path).map_err(|err| {
-        anyhow::anyhow!(
+    // Unlinking a socket a live helper is still listening on does not stop that
+    // helper — it keeps serving an unreachable, unlinked socket forever. Doing it
+    // blindly on every launch is how helpers piled up one per launch, all bound to
+    // the same path. Give an incumbent a moment to reap itself (the parent-EOF
+    // watch makes that prompt) before deciding the path is genuinely abandoned.
+    #[cfg(unix)]
+    {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while browser_local_exit_socket_has_listener(path) {
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "browser-local-exit relay socket {} is still served by a live helper; \
+                     stop the ElastOS host that owns it before starting another",
+                    path.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        // The incumbent reaped itself and removed its own socket.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(anyhow::anyhow!(
             "failed to remove existing browser-local-exit relay socket {}: {}",
             path.display(),
             err
-        )
-    })
+        )),
+    }
+}
+
+/// Whether anything is still accepting on `path`, distinguishing a live helper
+/// from a socket file left behind by one that is already gone.
+#[cfg(unix)]
+fn browser_local_exit_socket_has_listener(path: &Path) -> bool {
+    use std::os::unix::net::UnixStream;
+
+    match UnixStream::connect(path) {
+        Ok(stream) => {
+            // Connected without sending a relay-open handshake; drop it immediately.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            true
+        }
+        // ECONNREFUSED means the socket file outlived its listener.
+        Err(_) => false,
+    }
 }
 
 fn availability_provider_config_from_env() -> Option<serde_json::Value> {
@@ -2086,6 +2133,48 @@ mod tests {
                     .contains("replace_existing_socket is only supported")
         );
         assert!(relay_path.exists());
+    }
+
+    /// Bindable socket paths must stay under `SUN_LEN`, which `tempfile::tempdir`
+    /// paths can overrun on macOS.
+    #[cfg(unix)]
+    fn bindable_relay_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ele-srv-{}-{tag}.sock", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_local_exit_replace_existing_socket_removes_a_socket_with_no_listener() {
+        let relay_path = bindable_relay_path("stale");
+        let _ = std::fs::remove_file(&relay_path);
+        let listener = std::os::unix::net::UnixListener::bind(&relay_path).unwrap();
+        // Rust does not unlink the path on drop, so this leaves the exact shape a
+        // hard-killed helper leaves behind: a socket file with nothing serving it.
+        drop(listener);
+        assert!(relay_path.exists());
+
+        remove_existing_browser_local_exit_socket(&relay_path).unwrap();
+        assert!(!relay_path.exists(), "stale relay socket must be reclaimed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_local_exit_replace_existing_socket_refuses_a_live_listener() {
+        let relay_path = bindable_relay_path("live");
+        let _ = std::fs::remove_file(&relay_path);
+        let listener = std::os::unix::net::UnixListener::bind(&relay_path).unwrap();
+
+        // Silently unlinking here is what stranded helpers one per launch: the
+        // incumbent keeps serving an unlinked socket that nothing can reach again.
+        let err = remove_existing_browser_local_exit_socket(&relay_path).unwrap_err();
+        assert!(
+            err.to_string().contains("still served by a live helper"),
+            "unexpected error: {err}"
+        );
+        assert!(relay_path.exists(), "a live helper's socket must survive");
+
+        drop(listener);
+        let _ = std::fs::remove_file(&relay_path);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-08-27 UTC
+Last updated: 2026-08-28 UTC
 
 This file records public-safe current truth for released 0.6.0 and active
 unpublished work. Historical
@@ -258,6 +258,10 @@ repository.
   routes, frames, cookies, and placement are not the capsule ABI or authority,
   and the repo must not claim that every visible first-party app is already a
   self-contained executable Component.
+- Verified on `b07160cf` on 2026-08-16: the generic
+  `POST /api/provider/:scheme/:op` route remains a live host adapter used by
+  current web projections and control surfaces. It is not the Component ABI or
+  a capsule contract, and new capsule code must not treat it as one.
 - Runtime auth audit history is currently SHA-256-linked and Ed25519-signed with
   retained-chain anchoring. BLAKE3 is not the canonical audit hash in this
   branch; any future algorithm change requires an explicit schema version,
@@ -281,6 +285,24 @@ repository.
 - Browser account access is an explicit Wallet approval. The injected provider
   can request accounts, but the page receives no selected address until the
   Runtime-mediated request is approved through the trusted review path.
+
+## Consequence-aware effect truth
+
+- The manifest schema includes `AffordanceRisk::Actuator`, and Runtime maps it
+  to the `execute` capability action. The generic catalog invocation path still
+  rejects actuator, payment, rights, and privileged affordances because its
+  explicit user-approval dispatch is not enabled.
+- No shipped capsule manifest declares `actuator`. This branch has no general
+  sensor-observation envelope, installed physical-actuator provider proof, or
+  hard real-time safety claim.
+- Wallet transactions have durable effect IDs and uncertain-outcome
+  reconciliation. Browser launch has bounded `DidNotAct` reconciliation, and
+  remote service contracts forbid blind retry after uncertain dispatch. These
+  are provider-specific proofs, not a shipped universal effect state machine.
+- [Consequence-aware effects](docs/CONSEQUENCE_AWARE_EFFECTS.md) defines the
+  shared target contract. Physical effects still require an operation-specific
+  provider, destination admission, local interlock proof, truthful settlement,
+  and installed-target evidence before any readiness claim.
 
 ## Proof Path Ledger
 
@@ -330,9 +352,17 @@ repository.
 
 - Browser architecture is coherent enough to preserve, but the objective still
   fails product audio proof and hash-bound manual UX evidence.
+- Verified on `b07160cf` on 2026-08-16: Browser projection code still selects
+  `display_mode`, preferring `webrtc_remote_display` when the selected engine
+  advertises it. This is an open authority-placement gap. The target contract
+  has Browser request a display capability while Runtime selects the display
+  path and engine adapter.
 - Docker/Selkies is only `managed_baseline_not_final_product`; the hosted Selkies/GStreamer service is a managed baseline, not accepted as the final Browser.
 - The hosted baseline is single-session; active pages are a serialization blocker.
 - This server is not a product native-browser proof target because it lacks a real host compositor/display, host audio service, and working network namespace support.
+- Verified on the public seed on 2026-08-16: `test -e /dev/kvm` returned 1. The
+  seed is a bootstrap and gateway host and may consume a remote Browser Engine;
+  it is not a person's Home or a local crosvm/KVM Browser target.
 - Kasm Workspaces, BrowserBox, or KasmVNC cannot replace Selkies until the
   operator_control_socket not provisioned blocker and their operator evidence
   requirements are cleared.
@@ -508,10 +538,11 @@ repository.
 
 ## Collaboration Truth
 
-- A person is a signed Profile DID. The Profile separately authorizes Carrier
-  endpoint DIDs for routing and scoped signer DIDs for application authorship.
-  Neither role is a person, display name, contact key, or browser-visible
-  selector.
+- Collaboration represents a person through a signed Profile DID. The human
+  actor, local principal, signed Profile, and Device DID remain separate. The
+  Profile authorizes Carrier endpoint DIDs for routing and scoped signer DIDs
+  for application authorship. Neither role is a display name, contact key, or
+  browser-visible selector.
 - Runtime owns identity derivation, protected state, and Carrier/provider
   mediation. Capsules receive bounded read models and opaque selectors only.
 - `chat-room` is the sole Chat product in manifests, demos, build, and
@@ -537,6 +568,11 @@ repository.
   endpoint. The resolved endpoint identity must match the requested DID, and a
   route with no verified peer reports the peer as unavailable before any
   provider effect.
+- Verified on `b07160cf` on 2026-08-16: a same-endpoint Peer DID stays on the
+  Carrier provider plane and enters authenticated admission through the local
+  registry without a network dial. Direct messages settle the same signed
+  envelope and signed acceptance receipt used by the remote contract. This was
+  implemented by `8dd54706`; it was not an open gap in that snapshot.
 - Discovery is explicit, opt-in, bounded, and temporary. Accepted contacts are
   derived from signed request and decision chains, and Inbox is the only
   Accept/Decline authority surface.
@@ -550,14 +586,14 @@ repository.
   (`durable_pending_restarts_with_the_exact_envelope_and_settles_once`). The
   recipient does not need to be online at send time; it needs to become
   reachable within the TTL while the sender's Runtime is running. The real gap
-  is a sender that goes offline before the recipient returns — there is no
+  is a sender that goes offline before the recipient returns: there is no
   third-party store-and-forward, and an expired envelope is abandoned and
   reads `expired`, never `pending`. The seed never sees message plaintext.
   The shared room has the matching reach limit: gossip topic buffers are
   in-memory on whichever peer holds them, so a peer offline past that
   buffer's retention, or across a restart of the holding peer, misses that
   interval; whatever arrives is ingested durably. Profile update catch-up is
-  bounded by the 8-revision announcement ring — a contact further behind
+  bounded by the 8-revision announcement ring. A contact further behind
   fails closed with an explicit refusal and needs a fresh approval.
 - A Profile authorizes exactly one device today. The signed document supports
   several, but the product path always writes the current local device, so
@@ -591,7 +627,7 @@ repository.
   bounded signed chain over the dedicated `collaboration-profile` provider,
   apply under strict next-revision and chain-hash rules, and re-announce
   idempotently after restart. The two-runtime proof surfaced and fixed a real
-  wire gap — the Carrier peer provider plane had never admitted the profile
+  wire gap: the Carrier peer provider plane had never admitted the profile
   provider. Design and boundaries live in
   [docs/COLLABORATION_HANDOFF.md](docs/COLLABORATION_HANDOFF.md); the
   strict fixture-owned installed two-runtime acceptance now passes: Recovery,

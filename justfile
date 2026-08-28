@@ -93,10 +93,15 @@ verify:
     node --test scripts/home-two-runtime-acceptance.test.mjs
     python3 scripts/source-home-capsule-inventory-smoke.py
     ./scripts/command-smoke.sh
+    ./scripts/browser-local-exit-orphan-cleanup-smoke.sh
     just candidate-command-audit
     cd elastos && cargo fmt --all -- --check
     cd elastos && cargo clippy --workspace --all-targets -- -D warnings
     just test
+    # browser-local-exit carries its own workspace, so --workspace above misses it
+    cd elastos/tools/browser-local-exit && cargo fmt -- --check
+    cd elastos/tools/browser-local-exit && cargo clippy --all-targets -- -D warnings
+    cd elastos/tools/browser-local-exit && cargo test
 
 product-ui-source:
     node scripts/home-shell-regression-smoke.mjs

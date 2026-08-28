@@ -331,6 +331,13 @@ continuation. These changes are not part of the 0.5.0 release history.
   and one `eth_requestAccounts` call creating one pending account-access request.
 
 ### Fixed
+- Bound `browser-local-exit` to the lifetime of the Runtime that launched it via
+  a held-open stdin pipe, so it no longer survives as an orphan when the Runtime
+  is SIGKILLed, aborts on panic, or leaves through `std::process::exit` (the
+  installed-binary supersession watch takes that path on every rebuild). Helper
+  teardown is now scoped by inode identity to the relay socket it bound, and the
+  Runtime refuses to replace a relay socket a live helper is still serving
+  instead of stranding it on an unlinked socket.
 - Fixed Home launch classification so browser projections are attached as
   authorized web surfaces instead of being sent to a WASM compute provider.
 - Bound fresh passkey authority to one app, operation, and request payload;
