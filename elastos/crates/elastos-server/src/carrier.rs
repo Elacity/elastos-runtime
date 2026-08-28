@@ -616,7 +616,11 @@ fn relay_only_ticket_endpoints(source: &TrustedSource) -> Vec<iroh::EndpointAddr
 }
 
 fn carrier_mdns_enabled() -> bool {
-    std::env::var("ELASTOS_CARRIER_MDNS")
+    mdns_enabled_from(std::env::var("ELASTOS_CARRIER_MDNS").ok().as_deref())
+}
+
+fn mdns_enabled_from(value: Option<&str>) -> bool {
+    value
         .map(|value| {
             !matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -6832,7 +6836,7 @@ pub async fn try_p2p_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex as StdMutex, OnceLock};
+    use std::sync::Mutex as StdMutex;
 
     const NONCANONICAL_ALIAS_DID: &str = "did:key:z2DQYePVrytqCLfdq5VSDGtksAZC9NAt75iCed5WwSKKVXt";
 
@@ -6887,11 +6891,6 @@ mod tests {
         message.content = "x".repeat(encoded_len - empty_len);
         assert_eq!(gossip_message_encoded_len(&message), encoded_len);
         message
-    }
-
-    fn env_lock() -> &'static StdMutex<()> {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| StdMutex::new(()))
     }
 
     async fn shutdown_test_carrier_node(node: CarrierNode) {
@@ -10817,16 +10816,16 @@ mod tests {
 
     #[test]
     fn test_carrier_mdns_env_can_disable_lan_discovery() {
-        let _guard = env_lock().lock().unwrap();
-        std::env::remove_var("ELASTOS_CARRIER_MDNS");
-        assert!(carrier_mdns_enabled());
-        std::env::set_var("ELASTOS_CARRIER_MDNS", "0");
-        assert!(!carrier_mdns_enabled());
-        std::env::set_var("ELASTOS_CARRIER_MDNS", "false");
-        assert!(!carrier_mdns_enabled());
-        std::env::set_var("ELASTOS_CARRIER_MDNS", "1");
-        assert!(carrier_mdns_enabled());
-        std::env::remove_var("ELASTOS_CARRIER_MDNS");
+        // Pure parsing helper: never mutate the process-global environment —
+        // concurrently starting carrier nodes read ELASTOS_CARRIER_MDNS
+        // without a lock and would silently lose mDNS for their lifetime.
+        assert!(mdns_enabled_from(None));
+        assert!(!mdns_enabled_from(Some("0")));
+        assert!(!mdns_enabled_from(Some("false")));
+        assert!(!mdns_enabled_from(Some("no")));
+        assert!(!mdns_enabled_from(Some(" FALSE ")));
+        assert!(mdns_enabled_from(Some("1")));
+        assert!(mdns_enabled_from(Some("yes")));
     }
 
     #[tokio::test]

@@ -180,6 +180,10 @@ struct ProviderIo {
 pub struct ProviderBridge {
     io: Arc<Mutex<ProviderIo>>,
     child: Mutex<Option<Child>>,
+    /// True once a shutdown attempt has completed (child reaped, or the
+    /// protocol shutdown was delivered on a childless bridge). Later
+    /// shutdown() calls are idempotent no-ops.
+    shutdown_completed: std::sync::atomic::AtomicBool,
 }
 
 impl ProviderBridge {
@@ -218,6 +222,7 @@ impl ProviderBridge {
                 reader: Box::new(tokio::io::BufReader::new(stdout)),
             })),
             child: Mutex::new(Some(child)),
+            shutdown_completed: std::sync::atomic::AtomicBool::new(false),
         };
 
         // Send Init request
@@ -275,6 +280,7 @@ impl ProviderBridge {
                 reader: Box::new(reader),
             })),
             child: Mutex::new(None),
+            shutdown_completed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -346,7 +352,33 @@ impl ProviderBridge {
     pub async fn shutdown(&self) -> Result<(), BridgeError> {
         let mut child_guard = self.child.lock().await;
         let Some(child) = child_guard.as_mut() else {
-            return Ok(());
+            if self
+                .shutdown_completed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                // The child was already reaped (or the protocol shutdown was
+                // already delivered): shutdown is idempotent.
+                return Ok(());
+            }
+            // Never had a child process: the transport is the only handle on
+            // the provider, so the protocol shutdown must still be delivered
+            // for an attached provider to stop cleanly.
+            let result = tokio::time::timeout(
+                SHUTDOWN_TIMEOUT,
+                self.request_raw(ProviderRequest::Shutdown),
+            )
+            .await
+            .map_err(|_| BridgeError::Timeout)
+            .and_then(|result| result)
+            .and_then(|response| match response {
+                ProviderResponse::Ok { .. } => Ok(()),
+                ProviderResponse::Error { code, message } => {
+                    Err(BridgeError::Provider { code, message })
+                }
+            });
+            self.shutdown_completed
+                .store(true, std::sync::atomic::Ordering::Release);
+            return result;
         };
 
         let shutdown_result = tokio::time::timeout(
@@ -367,6 +399,8 @@ impl ProviderBridge {
         match tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
             Ok(Ok(status)) => {
                 child_guard.take();
+                self.shutdown_completed
+                    .store(true, std::sync::atomic::Ordering::Release);
                 if let Some(error) = protocol_error {
                     Err(error)
                 } else if status.success() {
@@ -378,6 +412,8 @@ impl ProviderBridge {
             Ok(Err(error)) => match Self::force_child_reap(child).await {
                 Ok(()) => {
                     child_guard.take();
+                    self.shutdown_completed
+                        .store(true, std::sync::atomic::Ordering::Release);
                     Err(protocol_error.unwrap_or(BridgeError::Io(error)))
                 }
                 Err(reap_error) => Err(reap_error),
@@ -385,6 +421,8 @@ impl ProviderBridge {
             Err(_) => match Self::force_child_reap(child).await {
                 Ok(()) => {
                     child_guard.take();
+                    self.shutdown_completed
+                        .store(true, std::sync::atomic::Ordering::Release);
                     Err(protocol_error.unwrap_or(BridgeError::Timeout))
                 }
                 Err(reap_error) => Err(reap_error),
@@ -844,6 +882,32 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Spawn a just-written mock provider script, tolerating Linux ETXTBSY:
+    /// a concurrently forking test can briefly hold the script's write fd
+    /// (fork duplicates open descriptors before exec closes them), and exec
+    /// then fails with ExecutableFileBusy until that window closes.
+    #[cfg(unix)]
+    async fn spawn_test_bridge(
+        binary: &std::path::Path,
+        config: ProviderConfig,
+    ) -> Result<ProviderBridge, BridgeError> {
+        let mut attempts = 0u32;
+        loop {
+            match ProviderBridge::spawn(binary, config.clone()).await {
+                Err(BridgeError::Spawn(error))
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                {
+                    attempts += 1;
+                    if attempts >= 40 {
+                        return Err(BridgeError::Spawn(error));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn test_bridge_shutdown_requires_typed_ok_response() {
@@ -854,7 +918,7 @@ mod tests {
             Some(r#"{"status":"error","code":"denied","message":"no"}"#),
             0,
         );
-        let bridge = ProviderBridge::spawn(&binary, ProviderConfig::default())
+        let bridge = spawn_test_bridge(&binary, ProviderConfig::default())
             .await
             .unwrap();
         let pid = read_pid(&pid_file);
@@ -874,7 +938,7 @@ mod tests {
             Some(r#"{"status":"ok"}"#),
             7,
         );
-        let bridge = ProviderBridge::spawn(&binary, ProviderConfig::default())
+        let bridge = spawn_test_bridge(&binary, ProviderConfig::default())
             .await
             .unwrap();
         let pid = read_pid(&pid_file);
@@ -889,7 +953,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (binary, pid_file) =
             write_mock_provider_script(temp.path(), r#"{"status":"ok"}"#, None, 0);
-        let bridge = ProviderBridge::spawn(&binary, ProviderConfig::default())
+        let bridge = spawn_test_bridge(&binary, ProviderConfig::default())
             .await
             .unwrap();
         let pid = read_pid(&pid_file);
@@ -920,7 +984,7 @@ mod tests {
         std::fs::write(&binary, script).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        let bridge = ProviderBridge::spawn(&binary, ProviderConfig::default())
+        let bridge = spawn_test_bridge(&binary, ProviderConfig::default())
             .await
             .unwrap();
         let pid = read_pid(&pid_file);
@@ -940,7 +1004,7 @@ mod tests {
             Some(r#"{"status":"ok"}"#),
             0,
         );
-        let bridge = ProviderBridge::spawn(&binary, ProviderConfig::default())
+        let bridge = spawn_test_bridge(&binary, ProviderConfig::default())
             .await
             .unwrap();
         let pid = read_pid(&pid_file);
@@ -959,7 +1023,7 @@ mod tests {
             None,
             0,
         );
-        let error = match ProviderBridge::spawn(&binary, ProviderConfig::default()).await {
+        let error = match spawn_test_bridge(&binary, ProviderConfig::default()).await {
             Ok(_) => panic!("expected init failure"),
             Err(error) => error,
         };

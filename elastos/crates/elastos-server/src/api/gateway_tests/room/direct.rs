@@ -112,17 +112,27 @@ async fn json_response(response: Response) -> serde_json::Value {
 
 async fn wait_for_direct_peer_ready(
     peer: &crate::collaboration_discovery_runtime::tests::DirectGatewayPeerFixture,
+    remote_node: &crate::carrier::CarrierNode,
 ) {
-    let remote_did = crate::crypto::encode_signing_key_did(&peer.remote_key);
-    let endpoint_id = crate::carrier::did_to_public_key(&remote_did).unwrap();
+    // Probe over the same plane the delivery path uses: the fixture's local
+    // node endpoint plus an explicitly seeded remote address. Dialing a bare
+    // endpoint id from a fresh anonymous endpoint would depend on live
+    // mDNS/DNS discovery, which is a different resolution plane than the
+    // code under test.
+    use iroh::Watcher as _;
+    let remote_addr = remote_node.endpoint.watch_addr().get();
+    peer._local_node
+        .memory_lookup
+        .add_endpoint_info(remote_addr.clone());
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let provider_ready = peer.remote_registry.schemes().await.iter().any(|scheme| {
                 scheme == crate::collaboration_direct_messages::DIRECT_MESSAGE_PROVIDER_SCHEME
             });
             if provider_ready
-                && crate::carrier::CarrierClient::connect_endpoint_addr(
-                    iroh::EndpointAddr::from(endpoint_id),
+                && crate::carrier::CarrierClient::connect_known_endpoint(
+                    &peer._local_node.endpoint,
+                    remote_addr.clone(),
                     1,
                 )
                 .await
@@ -327,7 +337,7 @@ async fn direct_api_auth_list_and_message_projection_are_bounded_and_redacted() 
 #[tokio::test]
 async fn direct_api_send_is_strict_idempotent_and_contact_gated() {
     let fixture = direct_api_route_fixture().await;
-    wait_for_direct_peer_ready(&fixture.peer).await;
+    wait_for_direct_peer_ready(&fixture.peer, &fixture.peer._remote_node).await;
     let direct = fixture.peer.service.direct_message_service();
     let local_profile_did = fixture.peer.store.local_profile_did().to_string();
     let conversation_id = fixture.peer.conversation_id.clone();
@@ -499,7 +509,7 @@ async fn direct_api_send_is_strict_idempotent_and_contact_gated() {
 #[tokio::test]
 async fn direct_api_pending_retry_settles_the_same_durable_envelope() {
     let fixture = direct_api_route_fixture().await;
-    wait_for_direct_peer_ready(&fixture.peer).await;
+    wait_for_direct_peer_ready(&fixture.peer, &fixture.peer._remote_node).await;
     fixture.peer._remote_node.endpoint.close().await;
     let direct = fixture.peer.service.direct_message_service();
     let local_profile_did = fixture.peer.store.local_profile_did().to_string();
@@ -519,7 +529,7 @@ async fn direct_api_pending_retry_settles_the_same_durable_envelope() {
     let exact_envelope = pending[0].envelope_bytes.clone();
 
     let remote_did = crate::crypto::encode_signing_key_did(&fixture.peer.remote_key);
-    let _restarted = crate::carrier::start_carrier_node_with_registry(
+    let restarted = crate::carrier::start_carrier_node_with_registry(
         &fixture.peer.remote_key,
         &remote_did,
         fixture.dir.path().join("direct-api-remote-restarted"),
@@ -527,7 +537,7 @@ async fn direct_api_pending_retry_settles_the_same_durable_envelope() {
     )
     .await
     .unwrap();
-    wait_for_direct_peer_ready(&fixture.peer).await;
+    wait_for_direct_peer_ready(&fixture.peer, &restarted).await;
     direct
         .retry_pending(&local_profile_did, crate::auth::now_ts())
         .await

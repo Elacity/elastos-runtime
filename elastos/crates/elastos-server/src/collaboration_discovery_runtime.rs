@@ -2937,6 +2937,7 @@ pub(crate) mod tests {
     use super::*;
 
     use async_trait::async_trait;
+    use iroh::Watcher as _;
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -3474,6 +3475,13 @@ pub(crate) mod tests {
             .direct_messages
             .register_verified_context_for_test(store_b.clone(), profile_b.clone())
             .unwrap();
+        // Seed each node's address book with the other's endpoint address so
+        // peer resolution is deterministic instead of depending on live
+        // mDNS/DNS discovery latency.
+        let mut watch_a = node_a.endpoint.watch_addr();
+        let mut watch_b = node_b.endpoint.watch_addr();
+        node_a.memory_lookup.add_endpoint_info(watch_b.get());
+        node_b.memory_lookup.add_endpoint_info(watch_a.get());
         DirectPeerPair {
             key_a,
             key_b,
@@ -4037,6 +4045,17 @@ pub(crate) mod tests {
         assert!(remote_registry.schemes().await.iter().any(|scheme| {
             scheme == crate::collaboration_direct_messages::DIRECT_MESSAGE_PROVIDER_SCHEME
         }));
+        // Seed both address books so delivery and readiness probes resolve
+        // deterministically over the explicit-address plane instead of
+        // depending on live mDNS/DNS discovery.
+        let mut local_watch = local_node.endpoint.watch_addr();
+        let mut remote_watch = remote_node.endpoint.watch_addr();
+        local_node
+            .memory_lookup
+            .add_endpoint_info(remote_watch.get());
+        remote_node
+            .memory_lookup
+            .add_endpoint_info(local_watch.get());
         DirectGatewayPeerFixture {
             service,
             store,
@@ -7118,7 +7137,6 @@ pub(crate) mod tests {
     async fn independent_direct_schedule_actual_worker_updates_each_result_separately() {
         let temp = tempfile::tempdir().unwrap();
         let pair = direct_peer_pair(temp.path()).await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
         let now = current_timestamp();
         let key = DiscoverySyncContextKey {
             principal_id: pair.store_a.principal_id().to_string(),

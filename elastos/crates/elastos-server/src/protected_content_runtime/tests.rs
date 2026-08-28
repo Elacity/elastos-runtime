@@ -1738,7 +1738,7 @@ fn validated_custody_committee_for_epoch(
     epoch: &SignedCustodyEpochV1,
     now: u64,
 ) -> ValidatedCustodyCommitteeV1 {
-    let pool = signed_custody_pool_for_epoch(epoch, (now.saturating_sub(10), now + 10));
+    let pool = signed_custody_pool_for_epoch(epoch, (now.saturating_sub(60), now + 3600));
     let authorization =
         signed_committee_authorization_for_epoch(pool.pool_identity().unwrap(), epoch);
     elastos_protected_content_contracts::validate_custody_epoch_against_pool_at(
@@ -2453,7 +2453,7 @@ fn make_signed_runtime_release_operation_for_envelope_and_epoch_and_recipient_at
         RightsActionV1::View,
         rights_request.request().recipient().clone(),
         now.saturating_sub(4),
-        now + 45,
+        now + 56,
         ReplayNonce16::new([0x66; 16]),
     )
     .unwrap();
@@ -2465,7 +2465,7 @@ fn make_signed_runtime_release_operation_for_envelope_and_epoch_and_recipient_at
         rights_request.request().recipient().clone(),
         RuntimeOperationIssuerKeyV1::new(runtime_key.verifying_key().to_bytes()).unwrap(),
         now.saturating_sub(5),
-        now + 50,
+        now + 120,
     )
     .unwrap();
     let authorization = SignedRecipientKeyAuthorizationV1::new(
@@ -2494,7 +2494,7 @@ fn make_signed_runtime_release_operation_for_envelope_and_epoch_and_recipient_at
         custody_epoch,
         audit_request_id,
         now.saturating_sub(3),
-        now + 40,
+        now + 55,
     )
     .unwrap();
     SignedRuntimeReleaseOperationV1::new(
@@ -3212,7 +3212,7 @@ fn custody_composition_config(
     routes: Vec<RuntimeCustodyRouteBindingConfig>,
 ) -> RuntimeCustodyCompositionConfigFile {
     let epoch = signed_custody_epoch();
-    let pool = signed_custody_pool_for_epoch(&epoch, (now.saturating_sub(10), now + 10));
+    let pool = signed_custody_pool_for_epoch(&epoch, (now.saturating_sub(60), now + 3600));
     let authorization =
         signed_committee_authorization_for_epoch(pool.pool_identity().unwrap(), &epoch);
     RuntimeCustodyCompositionConfigFile {
@@ -5573,7 +5573,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     let audit_b = RuntimeReleaseAuditIdV1::new(digest(0xa2)).unwrap();
     let flow_now = crate::auth::now_ts();
     let prepare_issued_at = flow_now.saturating_sub(5);
-    let prepare_expires_at = flow_now + 60;
+    let prepare_expires_at = flow_now + 240;
     let prepared_a = prepare_recipient(
         &decrypt,
         &preliminary_buy,
@@ -6543,14 +6543,18 @@ fn library_publish_request_id(input: &RuntimeCustodyLibraryPublishInput) -> Dige
 }
 
 #[cfg(unix)]
-fn write_library_publish_test_composition(data_dir: &Path) -> SignedCustodyEpochV1 {
+fn write_library_publish_test_composition(data_dir: &Path) -> (SignedCustodyEpochV1, u64) {
     let now = crate::auth::now_ts();
     let epoch = signed_custody_epoch();
     write_owner_only_custody_composition_config(
         data_dir,
         &custody_composition_config(now, library_publish_test_routes(&epoch)),
     );
-    epoch
+    // Return the clock read used to derive the composition identities: the
+    // custody-pool identity is content-addressed over clock-derived windows,
+    // so any fixture that must produce the identical pool/committee identity
+    // has to reuse this exact value instead of reading the clock again.
+    (epoch, now)
 }
 
 #[cfg(unix)]
@@ -6560,7 +6564,7 @@ async fn runtime_custody_library_publish_fails_closed_without_protect_provider()
     let data_dir = temp.path().join("data");
     owner_only_dir(&data_dir);
     write_device_key(&data_dir, 0x21);
-    write_library_publish_test_composition(&data_dir);
+    let _ = write_library_publish_test_composition(&data_dir);
     let input = library_publish_test_input("person:local:runtime-custody-missing-protect");
     let request_id = library_publish_request_id(&input);
     let error =
@@ -6588,7 +6592,7 @@ async fn runtime_custody_library_publish_fails_closed_without_chain_policy() {
     let data_dir = temp.path().join("data");
     owner_only_dir(&data_dir);
     write_device_key(&data_dir, 0x21);
-    write_library_publish_test_composition(&data_dir);
+    let _ = write_library_publish_test_composition(&data_dir);
     let registry = Arc::new(ProviderRegistry::new());
     register_protect_provider(&registry, &protect_binary)
         .await
@@ -6634,7 +6638,7 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
     let data_dir = temp.path().join("data");
     owner_only_dir(&data_dir);
     write_device_key(&data_dir, 0x21);
-    let epoch = write_library_publish_test_composition(&data_dir);
+    let (epoch, _composition_now) = write_library_publish_test_composition(&data_dir);
     let registry = Arc::new(ProviderRegistry::new());
     let input = library_publish_test_input("person:local:runtime-custody-pre-dispatch-retry");
     let request_id = library_publish_request_id(&input);
@@ -6739,7 +6743,7 @@ async fn runtime_custody_library_publish_blocks_exact_retry_after_ambiguous_prot
     let data_dir = temp.path().join("data");
     owner_only_dir(&data_dir);
     write_device_key(&data_dir, 0x21);
-    write_library_publish_test_composition(&data_dir);
+    let _ = write_library_publish_test_composition(&data_dir);
     let protect = SequencedProvider::new(
         PROTECT_PROVIDER_ID,
         vec![
@@ -6815,7 +6819,7 @@ async fn runtime_custody_library_publish_settles_cancelled_session_before_failin
     let data_dir = temp.path().join("data");
     owner_only_dir(&data_dir);
     write_device_key(&data_dir, 0x21);
-    write_library_publish_test_composition(&data_dir);
+    let _ = write_library_publish_test_composition(&data_dir);
     let handle = [0x31; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1];
     let protect = SequencedProvider::new(
         PROTECT_PROVIDER_ID,
@@ -6880,7 +6884,7 @@ async fn runtime_custody_library_publish_recovers_open_handle_by_cancelling_befo
     let data_dir = temp.path().join("data");
     owner_only_dir(&data_dir);
     write_device_key(&data_dir, 0x21);
-    write_library_publish_test_composition(&data_dir);
+    let _ = write_library_publish_test_composition(&data_dir);
     let registry = Arc::new(ProviderRegistry::new());
     let input = library_publish_test_input("person:local:runtime-custody-open-handle-recovery");
     let request_id = library_publish_request_id(&input);
@@ -6947,7 +6951,7 @@ async fn runtime_custody_library_publish_retains_cleanup_obligation_when_close_f
     let data_dir = temp.path().join("data");
     owner_only_dir(&data_dir);
     write_device_key(&data_dir, 0x21);
-    let epoch = write_library_publish_test_composition(&data_dir);
+    let (epoch, composition_now) = write_library_publish_test_composition(&data_dir);
     let registry = Arc::new(ProviderRegistry::new());
     let input = library_publish_test_input("person:local:runtime-custody-close-failure");
     let request_id = library_publish_request_id(&input);
@@ -6992,7 +6996,7 @@ async fn runtime_custody_library_publish_retains_cleanup_obligation_when_close_f
         MEDIA_CODECS_V1,
     )
     .unwrap();
-    let committee = validated_custody_committee_for_epoch(&epoch, crate::auth::now_ts());
+    let committee = validated_custody_committee_for_epoch(&epoch, composition_now);
     let content_key =
         elastos_protected_content_custody::ContentEncryptionKeyV1::generate().unwrap();
     let envelope = provision_custody_envelope(
@@ -7043,6 +7047,13 @@ async fn runtime_custody_library_publish_retains_cleanup_obligation_when_close_f
     let pending = runtime_mint_journal(&data_dir)
         .load_intent(request_id)
         .unwrap();
+    assert_eq!(
+        pending.protect_state_label(),
+        "open_handle_pending_close",
+        "the close-failure scenario must reach the pending-close obligation; a \
+         different label means the fixture was steered into another failure \
+         mode: {pending:?}"
+    );
     assert_eq!(
         pending.protect_pending_close_handle(),
         Some(handle),
@@ -9256,7 +9267,7 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_decrypt() {
     .await;
     let principal_id = "person:local:runtime-custody-open-no-decrypt";
     write_device_key(&harness.data_dir, 0x21);
-    let epoch = write_library_publish_test_composition(&harness.data_dir);
+    let (epoch, _composition_now) = write_library_publish_test_composition(&harness.data_dir);
     let (proof_binding_id, _) =
         install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
     let mint = runtime_mint_journal(&harness.data_dir)
@@ -9526,7 +9537,7 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_launch_toke
     .await;
     let principal_id = "person:local:runtime-custody-open-no-launch-token";
     write_device_key(&harness.data_dir, 0x21);
-    let epoch = write_library_publish_test_composition(&harness.data_dir);
+    let (epoch, _composition_now) = write_library_publish_test_composition(&harness.data_dir);
     let (_proof_binding_id, _) =
         install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
     let mint = runtime_mint_journal(&harness.data_dir)
@@ -9590,7 +9601,7 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wal
     .await;
     let principal_id = "person:local:runtime-custody-open-no-release-wallet";
     write_device_key(&harness.data_dir, 0x21);
-    let epoch = write_library_publish_test_composition(&harness.data_dir);
+    let (epoch, _composition_now) = write_library_publish_test_composition(&harness.data_dir);
     let (proof_binding_id, _) =
         install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
     let mint = runtime_mint_journal(&harness.data_dir)
