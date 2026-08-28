@@ -175,6 +175,7 @@ pub async fn run(
     with: Vec<String>,
     without: Vec<String>,
     list: bool,
+    prerequisites_only: bool,
 ) -> anyhow::Result<()> {
     let manifest = load_manifest()?;
     let data_dir = data_dir()?;
@@ -240,6 +241,12 @@ pub async fn run(
     if components.is_empty() {
         println!("No components selected.");
         println!("Use --with <component> to add components, or --list to see available profiles/components.");
+        return Ok(());
+    }
+
+    prepare_selected_component_prerequisites(&data_dir, &components)?;
+    if prerequisites_only {
+        println!("Selected component prerequisites are ready.");
         return Ok(());
     }
 
@@ -1489,6 +1496,16 @@ fn normalize_profile_name(name: &str) -> &str {
     name
 }
 
+fn prepare_selected_component_prerequisites(
+    data_dir: &Path,
+    components: &[String],
+) -> anyhow::Result<()> {
+    if components.iter().any(|name| name == "media-provider") {
+        crate::protected_content_runtime::prepare_runtime_media_provider_prerequisite(data_dir)?;
+    }
+    Ok(())
+}
+
 // ── Elastos fetch-path resolution ──────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2171,6 +2188,89 @@ mod tests {
             "Platform should contain arch: {}",
             p
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_non_media_selection_has_no_media_prerequisite_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        prepare_selected_component_prerequisites(temp.path(), &["shell".to_string()]).unwrap();
+        assert!(!temp
+            .path()
+            .join("protected-content/media-provider/config.json")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_missing_media_prerequisite_fails_before_first_component_install_effect() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let xdg_data_home = temp.path().join("xdg-data");
+        let data_dir = xdg_data_home.join("elastos");
+        let manifest_path = temp.path().join("components.json");
+        let source = temp.path().join("effect-source");
+        fs::write(&source, b"install-effect").unwrap();
+        let platform = detect_platform();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&serde_json::json!({
+                "external": {
+                    "effect": {
+                        "install_path": "bin/effect",
+                        "platforms": {
+                            platform.clone(): {
+                                "strategy": "local-copy",
+                                "source": source,
+                                "install_path": "bin/effect"
+                            }
+                        }
+                    },
+                    "media-provider": {
+                        "install_path": "bin/media-provider",
+                        "platforms": {}
+                    }
+                },
+                "profiles": {
+                    "media-preflight": {
+                        "components": ["effect", "media-provider"]
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let original_manifest = std::env::var_os(COMPONENTS_MANIFEST_ENV);
+        let original_xdg = std::env::var_os("XDG_DATA_HOME");
+        let original_path = std::env::var_os("PATH");
+        std::env::set_var(COMPONENTS_MANIFEST_ENV, &manifest_path);
+        std::env::set_var("XDG_DATA_HOME", &xdg_data_home);
+        std::env::set_var("PATH", "");
+
+        let result = run(
+            Some("media-preflight".to_string()),
+            vec![],
+            vec![],
+            false,
+            false,
+        )
+        .await;
+
+        match original_manifest {
+            Some(value) => std::env::set_var(COMPONENTS_MANIFEST_ENV, value),
+            None => std::env::remove_var(COMPONENTS_MANIFEST_ENV),
+        }
+        match original_xdg {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        match original_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert!(result.unwrap_err().to_string().contains("ffmpeg"));
+        assert!(!data_dir.join("bin/effect").exists());
     }
 
     #[test]

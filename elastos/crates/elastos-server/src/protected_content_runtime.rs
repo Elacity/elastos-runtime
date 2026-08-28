@@ -10,8 +10,9 @@
 pub(crate) mod tests;
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsStr;
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -80,6 +81,21 @@ pub(crate) const PROTECT_PROVIDER_ID: &str = "protect";
 pub(crate) const MEDIA_PROVIDER_ID: &str = "media";
 pub(crate) const RUNTIME_PROVIDER_ID: &str = "runtime";
 pub(crate) const PROTECTED_CONTENT_DECRYPT_PROVIDER_ID: &str = "protected-content-decrypt";
+const MEDIA_PROVIDER_CONFIG_FILE: &str = "protected-content/media-provider/config.json";
+const MEDIA_PROVIDER_CONFIG_SCHEMA_V1: &str = "elastos.protected-content.media-provider-config/v1";
+const MEDIA_PROVIDER_OUTPUT_PROFILE_V1: &str = "browser_fmp4_h264_v1";
+const MAX_MEDIA_PROVIDER_CONFIG_BYTES: usize = 8 * 1024;
+const MAX_MEDIA_PROVIDER_IMPORTED_TOOL_BYTES: u64 = 512 * 1024 * 1024;
+const MEDIA_PROVIDER_TIMEOUT_MS_V1: u64 = 3_600_000;
+const MEDIA_PROVIDER_MAX_STDIO_BYTES_V1: usize = 1 << 20;
+const MEDIA_PROVIDER_MAX_INPUT_BYTES_V1: u64 = 1 << 30;
+const MEDIA_PROVIDER_MAX_OUTPUT_PART_BYTES_V1: u64 = 64 << 20;
+const MEDIA_PROVIDER_MAX_DURATION_SECS_V1: u64 = 1_800;
+const MEDIA_PROVIDER_MAX_SOURCE_WIDTH_V1: u32 = 3_840;
+const MEDIA_PROVIDER_MAX_SOURCE_HEIGHT_V1: u32 = 2_160;
+const MEDIA_PROVIDER_MAX_SOURCE_FPS_V1: u32 = 60;
+const MEDIA_PROVIDER_MAX_SEGMENT_COUNT_V1: usize = MAX_PROTECT_MEDIA_SEGMENTS_V1 as usize;
+const MEDIA_PROVIDER_MAX_TOTAL_OUTPUT_BYTES_V1: u64 = 2 << 30;
 const ELACITY_PLAYER_CAPSULE_ID: &str = "elacity-player";
 const CONTENT_PROVIDER_ID: &str = "content";
 const PROTECTED_CONTENT_REPLICATION_POLICY: &str = "protected-content-replication/v1";
@@ -87,6 +103,36 @@ const PROTECTED_CONTENT_MIN_REPLICAS: u32 = 3;
 const PROTECTED_CONTENT_REQUIRE_LIVE_MULTI_PEER_PROOF: bool = true;
 const PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS: u64 = 60;
 const PROTECTED_CONTENT_AVAILABILITY_MAX_FUTURE_SKEW_SECS: u64 = 5;
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeMediaProviderConfigFile {
+    schema: String,
+    ffmpeg_path: String,
+    ffprobe_path: String,
+    staging_root: String,
+    output_profile: String,
+    timeout_ms: u64,
+    max_stdio_bytes: usize,
+    max_input_bytes: u64,
+    max_output_part_bytes: u64,
+    max_duration_secs: u64,
+    max_source_width: u32,
+    max_source_height: u32,
+    max_source_fps: u32,
+    max_segment_count: usize,
+    max_total_output_bytes: u64,
+}
+
+struct RuntimeMediaToolSource {
+    file: fs::File,
+    size: u64,
+}
+
+struct RuntimeMediaToolImport {
+    path: PathBuf,
+    created: bool,
+}
 pub(crate) const RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE: &str =
     "Runtime custody composition is not configured";
 pub(crate) const RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE: &str =
@@ -1416,6 +1462,19 @@ fn validate_owner_only_directory(path: &Path, label: &str) -> anyhow::Result<()>
     )
 }
 
+fn validate_owner_only_directory_with_error(
+    path: &Path,
+    label: &str,
+    error_fn: fn(String) -> anyhow::Error,
+) -> anyhow::Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| error_fn(format!("{label} is unavailable")))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(error_fn(format!("{label} must be an owner-only directory")));
+    }
+    validate_owner_only_metadata_with_error(label, &metadata, false, error_fn)
+}
+
 #[cfg(unix)]
 fn validate_owner_only_metadata_with_error(
     label: &str,
@@ -1530,6 +1589,537 @@ pub fn load_runtime_protected_content_chain_provider_config(
     Ok(Some(RuntimeProtectedContentChainProviderConfig {
         protected_content_network: config.protected_content_network,
     }))
+}
+
+fn invalid_media_provider_config(reason: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("media-provider private config is missing or unsafe: {reason}")
+}
+
+fn runtime_media_provider_config_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(MEDIA_PROVIDER_CONFIG_FILE)
+}
+
+fn runtime_media_provider_root(data_dir: &Path) -> PathBuf {
+    runtime_media_provider_config_path(data_dir)
+        .parent()
+        .expect("media-provider config has a parent")
+        .to_path_buf()
+}
+
+fn runtime_media_provider_tools_root(data_dir: &Path) -> PathBuf {
+    runtime_media_provider_root(data_dir).join("tools")
+}
+
+fn runtime_media_provider_staging_root(data_dir: &Path) -> PathBuf {
+    runtime_media_provider_root(data_dir).join("staging")
+}
+
+pub fn load_runtime_media_provider_bridge_config(
+    data_dir: &Path,
+) -> anyhow::Result<Option<ProviderConfig>> {
+    let config_path = runtime_media_provider_config_path(data_dir);
+    match fs::symlink_metadata(&config_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(invalid_media_provider_config("config file is unavailable")),
+    }
+    validate_owner_only_protected_content_dir_with_error(data_dir, invalid_media_provider_config)?;
+    validate_owner_only_directory_with_error(
+        &runtime_media_provider_root(data_dir),
+        "media-provider root",
+        invalid_media_provider_config,
+    )?;
+    validate_owner_only_directory_with_error(
+        &runtime_media_provider_tools_root(data_dir),
+        "media-provider tools root",
+        invalid_media_provider_config,
+    )?;
+    validate_owner_only_directory_with_error(
+        &runtime_media_provider_staging_root(data_dir),
+        "media-provider staging root",
+        invalid_media_provider_config,
+    )?;
+    let bytes = read_owner_only_protected_content_config_bytes(
+        &config_path,
+        MAX_MEDIA_PROVIDER_CONFIG_BYTES,
+        "media-provider config file",
+        invalid_media_provider_config,
+    )?;
+    let raw: RuntimeMediaProviderConfigFile = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid_media_provider_config("config JSON is invalid"))?;
+    let canonical_root = fs::canonicalize(runtime_media_provider_root(data_dir))
+        .map_err(|_| invalid_media_provider_config("provider root is unavailable"))?;
+    let expected_tools = canonical_root.join("tools");
+    let expected_staging = canonical_root.join("staging");
+    let expected_ffmpeg = expected_tools.join("ffmpeg");
+    let expected_ffprobe = expected_tools.join("ffprobe");
+    if raw.schema != MEDIA_PROVIDER_CONFIG_SCHEMA_V1
+        || raw.output_profile != MEDIA_PROVIDER_OUTPUT_PROFILE_V1
+        || Path::new(&raw.staging_root) != expected_staging
+        || Path::new(&raw.ffmpeg_path) != expected_ffmpeg
+        || Path::new(&raw.ffprobe_path) != expected_ffprobe
+        || raw.timeout_ms == 0
+        || raw.timeout_ms > MEDIA_PROVIDER_TIMEOUT_MS_V1
+        || raw.max_stdio_bytes == 0
+        || raw.max_stdio_bytes > MEDIA_PROVIDER_MAX_STDIO_BYTES_V1
+        || raw.max_input_bytes == 0
+        || raw.max_input_bytes > MEDIA_PROVIDER_MAX_INPUT_BYTES_V1
+        || raw.max_output_part_bytes == 0
+        || raw.max_output_part_bytes > MEDIA_PROVIDER_MAX_OUTPUT_PART_BYTES_V1
+        || raw.max_duration_secs == 0
+        || raw.max_duration_secs > MEDIA_PROVIDER_MAX_DURATION_SECS_V1
+        || raw.max_source_width == 0
+        || raw.max_source_width > MEDIA_PROVIDER_MAX_SOURCE_WIDTH_V1
+        || raw.max_source_height == 0
+        || raw.max_source_height > MEDIA_PROVIDER_MAX_SOURCE_HEIGHT_V1
+        || raw.max_source_fps == 0
+        || raw.max_source_fps > MEDIA_PROVIDER_MAX_SOURCE_FPS_V1
+        || raw.max_segment_count == 0
+        || raw.max_segment_count > MEDIA_PROVIDER_MAX_SEGMENT_COUNT_V1
+        || raw.max_total_output_bytes == 0
+        || raw.max_total_output_bytes > MEDIA_PROVIDER_MAX_TOTAL_OUTPUT_BYTES_V1
+        || raw.max_total_output_bytes < raw.max_output_part_bytes
+    {
+        return Err(invalid_media_provider_config("config fields are invalid"));
+    }
+    validate_runtime_media_import(&expected_ffmpeg, &expected_tools, "ffmpeg")?;
+    validate_runtime_media_import(&expected_ffprobe, &expected_tools, "ffprobe")?;
+    Ok(Some(ProviderConfig {
+        extra: json!({
+            "provider_id": MEDIA_PROVIDER_PROCESS_ID,
+            "staging_root": raw.staging_root,
+            "ffmpeg_path": raw.ffmpeg_path,
+            "ffprobe_path": raw.ffprobe_path,
+            "output_profile": raw.output_profile,
+            "timeout_ms": raw.timeout_ms,
+            "max_stdio_bytes": raw.max_stdio_bytes,
+            "max_input_bytes": raw.max_input_bytes,
+            "max_output_part_bytes": raw.max_output_part_bytes,
+            "max_duration_secs": raw.max_duration_secs,
+            "max_source_width": raw.max_source_width,
+            "max_source_height": raw.max_source_height,
+            "max_source_fps": raw.max_source_fps,
+            "max_segment_count": raw.max_segment_count,
+            "max_total_output_bytes": raw.max_total_output_bytes,
+        }),
+        ..Default::default()
+    }))
+}
+
+pub(crate) fn prepare_runtime_media_provider_prerequisite(data_dir: &Path) -> anyhow::Result<()> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    prepare_runtime_media_provider_prerequisite_with_path(data_dir, &path)
+}
+
+fn prepare_runtime_media_provider_prerequisite_with_path(
+    data_dir: &Path,
+    path: &OsStr,
+) -> anyhow::Result<()> {
+    match fs::symlink_metadata(runtime_media_provider_config_path(data_dir)) {
+        Ok(_) => {
+            load_runtime_media_provider_bridge_config(data_dir)?.ok_or_else(|| {
+                invalid_media_provider_config("config file disappeared during validation")
+            })?;
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(invalid_media_provider_config("config file is unavailable")),
+    }
+
+    let mut ffmpeg = open_runtime_media_tool_from_path(path, "ffmpeg")?;
+    let mut ffprobe = open_runtime_media_tool_from_path(path, "ffprobe")?;
+    #[cfg(unix)]
+    {
+        ensure_media_provider_directory(data_dir, "Runtime data root")?;
+        ensure_media_provider_directory(
+            &protected_content_root(data_dir),
+            "protected-content parent",
+        )?;
+        ensure_media_provider_directory(
+            &runtime_media_provider_root(data_dir),
+            "media-provider root",
+        )?;
+        let tools_root = runtime_media_provider_tools_root(data_dir);
+        ensure_media_provider_directory(&tools_root, "media-provider tools root")?;
+        let staging_root = runtime_media_provider_staging_root(data_dir);
+        ensure_media_provider_directory(&staging_root, "media-provider staging root")?;
+
+        let canonical_root = fs::canonicalize(runtime_media_provider_root(data_dir))
+            .map_err(|_| invalid_media_provider_config("provider root is unavailable"))?;
+        let canonical_tools = fs::canonicalize(&tools_root)
+            .map_err(|_| invalid_media_provider_config("tools root is unavailable"))?;
+        let canonical_staging = fs::canonicalize(&staging_root)
+            .map_err(|_| invalid_media_provider_config("staging root is unavailable"))?;
+        if canonical_tools != canonical_root.join("tools")
+            || canonical_staging != canonical_root.join("staging")
+        {
+            return Err(invalid_media_provider_config(
+                "private paths escape the provider root",
+            ));
+        }
+
+        let config_path = runtime_media_provider_config_path(data_dir);
+        let mut created_tools = Vec::new();
+        let mut config_created = false;
+        let result = (|| -> anyhow::Result<()> {
+            let ffmpeg_import = import_runtime_media_tool(&canonical_tools, "ffmpeg", &mut ffmpeg)?;
+            if ffmpeg_import.created {
+                created_tools.push(ffmpeg_import.path.clone());
+            }
+            let ffprobe_import =
+                import_runtime_media_tool(&canonical_tools, "ffprobe", &mut ffprobe)?;
+            if ffprobe_import.created {
+                created_tools.push(ffprobe_import.path.clone());
+            }
+            let config = RuntimeMediaProviderConfigFile {
+                schema: MEDIA_PROVIDER_CONFIG_SCHEMA_V1.to_string(),
+                ffmpeg_path: media_path_string(&ffmpeg_import.path, "ffmpeg")?,
+                ffprobe_path: media_path_string(&ffprobe_import.path, "ffprobe")?,
+                staging_root: media_path_string(&canonical_staging, "staging")?,
+                output_profile: MEDIA_PROVIDER_OUTPUT_PROFILE_V1.to_string(),
+                timeout_ms: MEDIA_PROVIDER_TIMEOUT_MS_V1,
+                max_stdio_bytes: MEDIA_PROVIDER_MAX_STDIO_BYTES_V1,
+                max_input_bytes: MEDIA_PROVIDER_MAX_INPUT_BYTES_V1,
+                max_output_part_bytes: MEDIA_PROVIDER_MAX_OUTPUT_PART_BYTES_V1,
+                max_duration_secs: MEDIA_PROVIDER_MAX_DURATION_SECS_V1,
+                max_source_width: MEDIA_PROVIDER_MAX_SOURCE_WIDTH_V1,
+                max_source_height: MEDIA_PROVIDER_MAX_SOURCE_HEIGHT_V1,
+                max_source_fps: MEDIA_PROVIDER_MAX_SOURCE_FPS_V1,
+                max_segment_count: MEDIA_PROVIDER_MAX_SEGMENT_COUNT_V1,
+                max_total_output_bytes: MEDIA_PROVIDER_MAX_TOTAL_OUTPUT_BYTES_V1,
+            };
+            let mut bytes = serde_json::to_vec_pretty(&config)?;
+            bytes.push(b'\n');
+            create_private_file_atomically(&config_path, &bytes, 0o600, "config")?;
+            config_created = true;
+            load_runtime_media_provider_bridge_config(data_dir)?.ok_or_else(|| {
+                invalid_media_provider_config("config file disappeared after setup")
+            })?;
+            Ok(())
+        })();
+        if result.is_err() {
+            if config_created {
+                let _ = fs::remove_file(&config_path);
+            }
+            for path in created_tools {
+                let _ = fs::remove_file(path);
+            }
+            let _ = sync_runtime_storage_parent(&canonical_tools);
+            let _ = sync_runtime_storage_parent(&canonical_root);
+        }
+        result
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (data_dir, ffmpeg, ffprobe);
+        anyhow::bail!(
+            "owner-only media-provider prerequisite setup is unsupported on this platform"
+        )
+    }
+}
+
+fn media_path_string(path: &Path, label: &str) -> anyhow::Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| invalid_media_provider_config(format!("{label} path is not valid UTF-8")))
+}
+
+#[cfg(unix)]
+fn ensure_media_provider_directory(path: &Path, label: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            validate_owner_only_directory_with_error(path, label, invalid_media_provider_config)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                if !parent.exists() {
+                    fs::create_dir_all(parent).map_err(|_| {
+                        invalid_media_provider_config(format!(
+                            "{label} parent could not be created"
+                        ))
+                    })?;
+                }
+            }
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700).create(path).map_err(|_| {
+                invalid_media_provider_config(format!("{label} could not be created"))
+            })?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            validate_owner_only_directory_with_error(path, label, invalid_media_provider_config)
+        }
+        Err(_) => Err(invalid_media_provider_config(format!(
+            "{label} is unavailable"
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn open_runtime_media_tool_from_path(
+    path: &OsStr,
+    name: &str,
+) -> anyhow::Result<RuntimeMediaToolSource> {
+    for directory in std::env::split_paths(path) {
+        let candidate = directory.join(name);
+        let canonical = match fs::canonicalize(&candidate) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(invalid_media_provider_config(format!(
+                    "{name} prerequisite is unavailable"
+                )))
+            }
+        };
+        validate_safe_media_source_parent_chain(&canonical, name)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(&canonical).map_err(|_| {
+            invalid_media_provider_config(format!("{name} prerequisite is unavailable"))
+        })?;
+        let metadata = file.metadata().map_err(|_| {
+            invalid_media_provider_config(format!("{name} prerequisite metadata is unavailable"))
+        })?;
+        let mode = metadata.permissions().mode() & 0o777;
+        let uid = unsafe { libc::geteuid() };
+        if !metadata.is_file()
+            || (metadata.uid() != 0 && metadata.uid() != uid)
+            || mode & 0o022 != 0
+            || mode & 0o111 == 0
+            || metadata.nlink() != 1
+            || metadata.len() == 0
+            || metadata.len() > MAX_MEDIA_PROVIDER_IMPORTED_TOOL_BYTES
+        {
+            return Err(invalid_media_provider_config(format!(
+                "{name} prerequisite is unsafe or exceeds bounds"
+            )));
+        }
+        return Ok(RuntimeMediaToolSource {
+            file,
+            size: metadata.len(),
+        });
+    }
+    Err(invalid_media_provider_config(format!(
+        "media-provider prerequisite '{name}' was not found in the setup process PATH"
+    )))
+}
+
+#[cfg(not(unix))]
+fn open_runtime_media_tool_from_path(
+    _path: &OsStr,
+    _name: &str,
+) -> anyhow::Result<RuntimeMediaToolSource> {
+    anyhow::bail!("owner-only media-provider prerequisite setup is unsupported on this platform")
+}
+
+#[cfg(unix)]
+fn validate_safe_media_source_parent_chain(path: &Path, name: &str) -> anyhow::Result<()> {
+    let uid = unsafe { libc::geteuid() };
+    for parent in path.ancestors().skip(1) {
+        let metadata = fs::symlink_metadata(parent).map_err(|_| {
+            invalid_media_provider_config(format!("{name} prerequisite parent is unavailable"))
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || (metadata.uid() != 0 && metadata.uid() != uid)
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(invalid_media_provider_config(format!(
+                "{name} prerequisite parent is unsafe"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_runtime_media_import(path: &Path, tools_root: &Path, name: &str) -> anyhow::Result<()> {
+    let canonical = fs::canonicalize(path)
+        .map_err(|_| invalid_media_provider_config(format!("{name} import is unavailable")))?;
+    if canonical != path || canonical.parent() != Some(tools_root) {
+        return Err(invalid_media_provider_config(format!(
+            "{name} import escapes the tools root"
+        )));
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| invalid_media_provider_config(format!("{name} import is unavailable")))?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || mode != 0o500
+        || metadata.len() == 0
+        || metadata.len() > MAX_MEDIA_PROVIDER_IMPORTED_TOOL_BYTES
+    {
+        return Err(invalid_media_provider_config(format!(
+            "{name} import is unsafe"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_runtime_media_import(
+    _path: &Path,
+    _tools_root: &Path,
+    _name: &str,
+) -> anyhow::Result<()> {
+    anyhow::bail!("owner-only media-provider config validation is unsupported on this platform")
+}
+
+#[cfg(unix)]
+fn import_runtime_media_tool(
+    tools_root: &Path,
+    name: &str,
+    source: &mut RuntimeMediaToolSource,
+) -> anyhow::Result<RuntimeMediaToolImport> {
+    let destination = tools_root.join(name);
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => {
+            validate_runtime_media_import(&destination, tools_root, name)?;
+            if !runtime_media_tool_matches(source, &destination, name)? {
+                return Err(invalid_media_provider_config(format!(
+                    "{name} import conflicts with the discovered prerequisite"
+                )));
+            }
+            return Ok(RuntimeMediaToolImport {
+                path: destination,
+                created: false,
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(invalid_media_provider_config(format!(
+                "{name} import is unavailable"
+            )))
+        }
+    }
+
+    let mut nonce = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let temp_path = tools_root.join(format!(".{name}.tmp-{}", hex::encode(nonce)));
+    let mut options = fs::OpenOptions::new();
+    options
+        .create_new(true)
+        .write(true)
+        .mode(0o500)
+        .custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(&temp_path).map_err(|_| {
+        invalid_media_provider_config(format!("{name} temporary import could not be created"))
+    })?;
+    let mut published = false;
+    let result = (|| -> anyhow::Result<()> {
+        source.file.seek(SeekFrom::Start(0))?;
+        let copied = std::io::copy(
+            &mut std::io::Read::by_ref(&mut source.file)
+                .take(MAX_MEDIA_PROVIDER_IMPORTED_TOOL_BYTES + 1),
+            &mut file,
+        )?;
+        if copied != source.size {
+            return Err(invalid_media_provider_config(format!(
+                "{name} prerequisite changed during import"
+            )));
+        }
+        file.sync_all()?;
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o500))?;
+        drop(file);
+        fs::hard_link(&temp_path, &destination).map_err(|_| {
+            invalid_media_provider_config(format!(
+                "{name} import could not be installed atomically"
+            ))
+        })?;
+        published = true;
+        fs::remove_file(&temp_path)?;
+        sync_runtime_storage_parent(tools_root)?;
+        validate_runtime_media_import(&destination, tools_root, name)
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp_path);
+        if published {
+            let _ = fs::remove_file(&destination);
+        }
+        return Err(error);
+    }
+    Ok(RuntimeMediaToolImport {
+        path: destination,
+        created: true,
+    })
+}
+
+#[cfg(unix)]
+fn runtime_media_tool_matches(
+    source: &mut RuntimeMediaToolSource,
+    destination: &Path,
+    name: &str,
+) -> anyhow::Result<bool> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let mut imported = options
+        .open(destination)
+        .map_err(|_| invalid_media_provider_config(format!("{name} import is unavailable")))?;
+    if imported.metadata()?.len() != source.size {
+        return Ok(false);
+    }
+    source.file.seek(SeekFrom::Start(0))?;
+    let mut source_reader = std::io::Read::by_ref(&mut source.file).take(source.size + 1);
+    let mut imported_reader = std::io::Read::by_ref(&mut imported).take(source.size + 1);
+    let mut source_buffer = [0u8; 64 * 1024];
+    let mut imported_buffer = [0u8; 64 * 1024];
+    loop {
+        let source_read = source_reader.read(&mut source_buffer)?;
+        let imported_read = imported_reader.read(&mut imported_buffer)?;
+        if source_read != imported_read
+            || source_buffer[..source_read] != imported_buffer[..imported_read]
+        {
+            return Ok(false);
+        }
+        if source_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn create_private_file_atomically(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    label: &str,
+) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_media_provider_config(format!("{label} parent is unavailable")))?;
+    let mut nonce = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let temp_path = parent.join(format!(".{label}.tmp-{}", hex::encode(nonce)));
+    let mut options = fs::OpenOptions::new();
+    options
+        .create_new(true)
+        .write(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(&temp_path).map_err(|_| {
+        invalid_media_provider_config(format!("{label} temporary file could not be created"))
+    })?;
+    let mut published = false;
+    let result = (|| -> anyhow::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::hard_link(&temp_path, path)
+            .map_err(|_| invalid_media_provider_config(format!("{label} appeared during setup")))?;
+        published = true;
+        fs::remove_file(&temp_path)?;
+        sync_runtime_storage_parent(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+        if published {
+            let _ = fs::remove_file(path);
+        }
+    }
+    result
 }
 
 #[cfg(unix)]

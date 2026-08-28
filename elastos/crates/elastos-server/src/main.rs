@@ -439,6 +439,10 @@ enum Commands {
         /// List available components and profiles
         #[arg(long)]
         list: bool,
+
+        /// Prepare selected component prerequisites without installing components
+        #[arg(long, hide = true)]
+        prerequisites_only: bool,
     },
 
     /// Manage trusted release sources
@@ -1411,8 +1415,9 @@ async fn main() -> anyhow::Result<()> {
             with,
             without,
             list,
+            prerequisites_only,
         } => {
-            setup::run(profile, with, without, list).await?;
+            setup::run(profile, with, without, list, prerequisites_only).await?;
         }
 
         Commands::Source(cmd) => {

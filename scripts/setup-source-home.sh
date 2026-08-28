@@ -1685,6 +1685,14 @@ stamp_source_home_capsule_artifacts_manifest() {
         "${args[@]}"
 }
 
+prepare_media_provider_prerequisite() {
+    echo "[setup-source-home] prepare media-provider prerequisite"
+    HOME="${HOME}" \
+    ELASTOS_COMPONENTS_MANIFEST="${ROOT}/components.json" \
+        "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)" \
+        setup --with media-provider --prerequisites-only
+}
+
 install_content_publish_backend() {
     local mode="${SETUP_SOURCE_HOME_INSTALL_KUBO:-auto}"
 
@@ -1792,6 +1800,8 @@ for capsule in "${APP_CAPSULES[@]}"; do
         exit 1
     fi
 done
+
+prepare_media_provider_prerequisite
 
 echo "[setup-source-home] install native providers and stamp manifest"
 mkdir -p "${DATA_DIR}/bin"

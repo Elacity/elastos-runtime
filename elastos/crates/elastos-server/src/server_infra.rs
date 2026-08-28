@@ -61,51 +61,20 @@ const MODEL_PROVIDER_CONFIG_FILE_NAME: &str = "config.json";
 const MODEL_PROVIDER_CONFIG_MAX_BYTES: usize = 256 * 1024;
 const MEDIA_PROVIDER_ID: &str = "media-provider";
 const MEDIA_PROVIDER_ROUTE: &str = "media";
+#[cfg(test)]
 const MEDIA_PROVIDER_PROTOCOL_VERSION: &str = "elastos.media-provider/v1";
+#[cfg(test)]
 const MEDIA_PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
     None => "0.1.0-dev",
 };
 const MEDIA_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
-const MEDIA_PROVIDER_CONFIG_MAX_BYTES: usize = 8 * 1024;
-const MEDIA_PROVIDER_CONFIG_SCHEMA: &str = "elastos.protected-content.media-provider-config/v1";
-const MEDIA_PROVIDER_OUTPUT_PROFILE: &str = "browser_fmp4_h264_v1";
-const MEDIA_PROVIDER_MAX_TIMEOUT_MS: u64 = 3_600_000;
-const MEDIA_PROVIDER_MAX_STDIO_BYTES: usize = 1024 * 1024;
-const MEDIA_PROVIDER_MAX_INPUT_BYTES: u64 = 1024 * 1024 * 1024;
-const MEDIA_PROVIDER_MAX_OUTPUT_PART_BYTES: u64 = 64 * 1024 * 1024;
-const MEDIA_PROVIDER_MAX_DURATION_SECS: u64 = 1_800;
-const MEDIA_PROVIDER_MAX_SOURCE_WIDTH: u32 = 3_840;
-const MEDIA_PROVIDER_MAX_SOURCE_HEIGHT: u32 = 2_160;
-const MEDIA_PROVIDER_MAX_SOURCE_FPS: u32 = 60;
-const MEDIA_PROVIDER_MAX_SEGMENT_COUNT: usize = 512;
-const MEDIA_PROVIDER_MAX_TOTAL_OUTPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const WALLET_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelProviderOperatorConfigFile {
     offers: Vec<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MediaProviderOperatorConfigFile {
-    schema: String,
-    ffmpeg_path: String,
-    ffprobe_path: String,
-    staging_root: String,
-    output_profile: String,
-    timeout_ms: u64,
-    max_stdio_bytes: usize,
-    max_input_bytes: u64,
-    max_output_part_bytes: u64,
-    max_duration_secs: u64,
-    max_source_width: u32,
-    max_source_height: u32,
-    max_source_fps: u32,
-    max_segment_count: usize,
-    max_total_output_bytes: u64,
 }
 
 fn model_provider_root_dir(data_dir: &Path) -> PathBuf {
@@ -294,10 +263,12 @@ fn read_model_provider_private_file(
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn media_provider_root_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("protected-content").join(MEDIA_PROVIDER_ID)
 }
 
+#[cfg(test)]
 fn media_provider_config_path(data_dir: &Path) -> PathBuf {
     media_provider_root_dir(data_dir).join("config.json")
 }
@@ -305,112 +276,7 @@ fn media_provider_config_path(data_dir: &Path) -> PathBuf {
 fn media_provider_bridge_config(
     data_dir: &Path,
 ) -> anyhow::Result<Option<provider::BridgeProviderConfig>> {
-    let config_path = media_provider_config_path(data_dir);
-    let metadata = match fs::symlink_metadata(&config_path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(_) => anyhow::bail!("media-provider private config is unavailable"),
-    };
-    let protected_content_root = data_dir.join("protected-content");
-    let provider_root = media_provider_root_dir(data_dir);
-    let tools_root = provider_root.join("tools");
-    let expected_staging_root = provider_root.join("staging");
-    validate_model_provider_private_directory(
-        &protected_content_root,
-        "media-provider private parent",
-    )
-    .map_err(|_| anyhow::anyhow!("media-provider private config is unsafe"))?;
-    validate_model_provider_private_directory(&provider_root, "media-provider private root")
-        .map_err(|_| anyhow::anyhow!("media-provider private config is unsafe"))?;
-    validate_model_provider_private_directory(&tools_root, "media-provider private tools")
-        .map_err(|_| anyhow::anyhow!("media-provider private config is unsafe"))?;
-    validate_model_provider_private_directory(
-        &expected_staging_root,
-        "media-provider private staging",
-    )
-    .map_err(|_| anyhow::anyhow!("media-provider private config is unsafe"))?;
-    let bytes = read_model_provider_private_file(
-        &config_path,
-        &metadata,
-        MEDIA_PROVIDER_CONFIG_MAX_BYTES,
-        "media-provider private config",
-    )
-    .map_err(|_| anyhow::anyhow!("media-provider private config is unsafe"))?;
-    let raw: MediaProviderOperatorConfigFile = serde_json::from_slice(&bytes)
-        .map_err(|_| anyhow::anyhow!("media-provider private config is invalid"))?;
-    let ffmpeg_path = PathBuf::from(&raw.ffmpeg_path);
-    let ffprobe_path = PathBuf::from(&raw.ffprobe_path);
-    if raw.schema != MEDIA_PROVIDER_CONFIG_SCHEMA
-        || raw.output_profile != MEDIA_PROVIDER_OUTPUT_PROFILE
-        || PathBuf::from(&raw.staging_root) != expected_staging_root
-        || ffmpeg_path != tools_root.join("ffmpeg")
-        || ffprobe_path != tools_root.join("ffprobe")
-        || raw.timeout_ms == 0
-        || raw.timeout_ms > MEDIA_PROVIDER_MAX_TIMEOUT_MS
-        || raw.max_stdio_bytes == 0
-        || raw.max_stdio_bytes > MEDIA_PROVIDER_MAX_STDIO_BYTES
-        || raw.max_input_bytes == 0
-        || raw.max_input_bytes > MEDIA_PROVIDER_MAX_INPUT_BYTES
-        || raw.max_output_part_bytes == 0
-        || raw.max_output_part_bytes > MEDIA_PROVIDER_MAX_OUTPUT_PART_BYTES
-        || raw.max_duration_secs == 0
-        || raw.max_duration_secs > MEDIA_PROVIDER_MAX_DURATION_SECS
-        || raw.max_source_width == 0
-        || raw.max_source_width > MEDIA_PROVIDER_MAX_SOURCE_WIDTH
-        || raw.max_source_height == 0
-        || raw.max_source_height > MEDIA_PROVIDER_MAX_SOURCE_HEIGHT
-        || raw.max_source_fps == 0
-        || raw.max_source_fps > MEDIA_PROVIDER_MAX_SOURCE_FPS
-        || raw.max_segment_count == 0
-        || raw.max_segment_count > MEDIA_PROVIDER_MAX_SEGMENT_COUNT
-        || raw.max_total_output_bytes == 0
-        || raw.max_total_output_bytes > MEDIA_PROVIDER_MAX_TOTAL_OUTPUT_BYTES
-        || raw.max_total_output_bytes < raw.max_output_part_bytes
-    {
-        anyhow::bail!("media-provider private config is invalid");
-    }
-    validate_media_provider_tool(&ffmpeg_path)?;
-    validate_media_provider_tool(&ffprobe_path)?;
-    Ok(Some(provider::BridgeProviderConfig {
-        extra: serde_json::json!({
-            "provider_id": MEDIA_PROVIDER_ID,
-            "staging_root": raw.staging_root,
-            "ffmpeg_path": raw.ffmpeg_path,
-            "ffprobe_path": raw.ffprobe_path,
-            "output_profile": raw.output_profile,
-            "timeout_ms": raw.timeout_ms,
-            "max_stdio_bytes": raw.max_stdio_bytes,
-            "max_input_bytes": raw.max_input_bytes,
-            "max_output_part_bytes": raw.max_output_part_bytes,
-            "max_duration_secs": raw.max_duration_secs,
-            "max_source_width": raw.max_source_width,
-            "max_source_height": raw.max_source_height,
-            "max_source_fps": raw.max_source_fps,
-            "max_segment_count": raw.max_segment_count,
-            "max_total_output_bytes": raw.max_total_output_bytes,
-        }),
-        ..Default::default()
-    }))
-}
-
-fn validate_media_provider_tool(path: &Path) -> anyhow::Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|_| anyhow::anyhow!("media-provider private tool is unavailable"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        anyhow::bail!("media-provider private tool is unsafe");
-    }
-    #[cfg(unix)]
-    {
-        let mode = metadata.permissions().mode() & 0o777;
-        if metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.nlink() != 1
-            || mode & 0o077 != 0
-            || mode & 0o100 == 0
-        {
-            anyhow::bail!("media-provider private tool is unsafe");
-        }
-    }
-    Ok(())
+    elastos_server::protected_content_runtime::load_runtime_media_provider_bridge_config(data_dir)
 }
 
 async fn request_browser_engine_provider_status(
@@ -2261,24 +2127,27 @@ mod tests {
         let ffprobe_path = tools_root.join("ffprobe");
         fs::write(&ffmpeg_path, b"ffmpeg-test").unwrap();
         fs::write(&ffprobe_path, b"ffprobe-test").unwrap();
-        fs::set_permissions(&ffmpeg_path, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::set_permissions(&ffprobe_path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&ffmpeg_path, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&ffprobe_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let ffmpeg_path = fs::canonicalize(ffmpeg_path).unwrap();
+        let ffprobe_path = fs::canonicalize(ffprobe_path).unwrap();
+        let staging_root = fs::canonicalize(staging_root).unwrap();
         let mut value = serde_json::json!({
-            "schema": MEDIA_PROVIDER_CONFIG_SCHEMA,
+            "schema": "elastos.protected-content.media-provider-config/v1",
             "ffmpeg_path": ffmpeg_path,
             "ffprobe_path": ffprobe_path,
             "staging_root": staging_root,
-            "output_profile": MEDIA_PROVIDER_OUTPUT_PROFILE,
-            "timeout_ms": 5_000,
-            "max_stdio_bytes": 4096,
-            "max_input_bytes": 1 << 20,
-            "max_output_part_bytes": 1 << 20,
-            "max_duration_secs": 60,
-            "max_source_width": 1920,
-            "max_source_height": 1080,
+            "output_profile": "browser_fmp4_h264_v1",
+            "timeout_ms": 3_600_000u64,
+            "max_stdio_bytes": 1usize << 20,
+            "max_input_bytes": 1u64 << 30,
+            "max_output_part_bytes": 64u64 << 20,
+            "max_duration_secs": 1_800u64,
+            "max_source_width": 3840,
+            "max_source_height": 2160,
             "max_source_fps": 60,
-            "max_segment_count": 32,
-            "max_total_output_bytes": 1 << 24,
+            "max_segment_count": 512,
+            "max_total_output_bytes": 2u64 << 30,
         });
         mutate(&mut value);
         let config_path = media_provider_config_path(tempdir.path());
@@ -3024,7 +2893,8 @@ mod tests {
         let original = fs::read(&path).unwrap();
         let config = media_provider_bridge_config(valid.path()).unwrap().unwrap();
         assert_eq!(config.extra["provider_id"], MEDIA_PROVIDER_ID);
-        let expected_staging = media_provider_root_dir(valid.path()).join("staging");
+        let expected_staging =
+            fs::canonicalize(media_provider_root_dir(valid.path()).join("staging")).unwrap();
         assert_eq!(
             config.extra["staging_root"].as_str(),
             expected_staging.to_str()
@@ -3032,11 +2902,9 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), original);
 
         let invalid_cases: [fn(&mut serde_json::Value); 3] = [
+            |value: &mut serde_json::Value| value["timeout_ms"] = serde_json::json!(3_600_001u64),
             |value: &mut serde_json::Value| {
-                value["timeout_ms"] = serde_json::json!(MEDIA_PROVIDER_MAX_TIMEOUT_MS + 1)
-            },
-            |value: &mut serde_json::Value| {
-                value["max_input_bytes"] = serde_json::json!(MEDIA_PROVIDER_MAX_INPUT_BYTES + 1)
+                value["max_input_bytes"] = serde_json::json!((1u64 << 30) + 1)
             },
             |value: &mut serde_json::Value| {
                 value["staging_root"] = serde_json::json!("/private/tmp/escaped")
