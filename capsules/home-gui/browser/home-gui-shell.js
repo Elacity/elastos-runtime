@@ -101,6 +101,22 @@ function settleRequest(message) {
   return true;
 }
 
+window.addEventListener("elastos:ui-preference-changed", (event) => {
+  const detail = event?.detail || {};
+  const key = typeof detail.key === "string" ? detail.key.trim() : "";
+  const value = typeof detail.value === "string" ? detail.value.trim() : "";
+  if (!key || !value) {
+    return;
+  }
+  requestHome("home:ui-preference", {
+    action: "write",
+    key,
+    value,
+  }).catch((error) => {
+    console.error("home-gui appearance preference update failed", error);
+  });
+});
+
 async function applySummary(summary, options = {}) {
   projectHomeGuiAuthority(document.body, summary);
   const previous = currentSummary;

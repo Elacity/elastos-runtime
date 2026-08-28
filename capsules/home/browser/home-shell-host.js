@@ -186,8 +186,190 @@ function enterHostAuthGate() {
   stopHomeEventChannel();
 }
 
+function currentSignedProfileDisplayName() {
+  if (shellState.currentSummary?.authority?.signed_in !== true) {
+    return "";
+  }
+  const displayName = shellState.currentSummary?.identity?.profile?.display_name;
+  return typeof displayName === "string" ? displayName.trim() : "";
+}
+
+const HOME_UI_PREFERENCE_KEYS = Object.freeze({
+  theme: new Set(["auto", "light", "dark"]),
+  accent: new Set(["blue", "purple", "pink", "red", "orange", "yellow", "green", "graphite", "custom"]),
+  dockAutoHide: new Set(["on", "off"]),
+  sounds: new Set(["on", "off"]),
+  focusMode: new Set(["on", "off"]),
+});
+const HOME_UI_PREFERENCE_DEFAULTS = Object.freeze({
+  revision: 0,
+  theme: "dark",
+  accent: "blue",
+  accentCustom: "#4f7fff",
+  dockAutoHide: "off",
+  sounds: "off",
+  focusMode: "off",
+});
+
+function normalizeHomeUiAccentCustom(value) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (!/^#[0-9a-f]{6}$/i.test(trimmed)) {
+    return "";
+  }
+  return trimmed.toLowerCase();
+}
+
+function canonicalHomeUiPreferences(summary) {
+  if (summary?.authority?.signed_in !== true) {
+    return { ...HOME_UI_PREFERENCE_DEFAULTS };
+  }
+  const appearance = summary?.appearance;
+  const revision = appearance?.revision;
+  const theme = typeof appearance?.theme === "string" ? appearance.theme.trim() : "";
+  const accent = typeof appearance?.accent === "string" ? appearance.accent.trim() : "";
+  const accentCustom = normalizeHomeUiAccentCustom(appearance?.accent_custom);
+  if (
+    appearance?.schema !== "elastos.home.appearance/v1" ||
+    !Number.isSafeInteger(revision) ||
+    revision < 0 ||
+    !HOME_UI_PREFERENCE_KEYS.theme.has(theme) ||
+    !HOME_UI_PREFERENCE_KEYS.accent.has(accent) ||
+    !accentCustom ||
+    typeof appearance?.dock_auto_hide !== "boolean" ||
+    typeof appearance?.sounds !== "boolean" ||
+    typeof appearance?.focus_mode !== "boolean"
+  ) {
+    throw new Error("Home rejected the appearance summary");
+  }
+  return {
+    revision,
+    theme,
+    accent,
+    accentCustom,
+    dockAutoHide: appearance?.dock_auto_hide === true ? "on" : "off",
+    sounds: appearance?.sounds === true ? "on" : "off",
+    focusMode: appearance?.focus_mode === true ? "on" : "off",
+  };
+}
+
+function currentHomeUiPreferences() {
+  return canonicalHomeUiPreferences(shellState.currentSummary);
+}
+
+function syncHomeUiPreferencesToActiveShell() {
+  if (!shellState.currentSummary || activeShellRoot?.dataset?.target !== HOME_GUI_SHELL_ID) {
+    return false;
+  }
+  return postToActiveShell({
+    type: "home:shell-summary",
+    summary: shellState.currentSummary,
+  });
+}
+
+async function writeHomeUiPreference(key, value) {
+  if (shellState.currentSummary?.authority?.signed_in !== true) {
+    throw new Error("Home denied the appearance preference");
+  }
+  let payload = null;
+  if (key === "theme" && HOME_UI_PREFERENCE_KEYS.theme.has(value)) {
+    payload = { theme: value };
+  } else if (key === "accent" && HOME_UI_PREFERENCE_KEYS.accent.has(value)) {
+    payload = { accent: value };
+  } else if (key === "accentCustom") {
+    const accentCustom = normalizeHomeUiAccentCustom(value);
+    if (accentCustom) {
+      payload = { accent_custom: accentCustom };
+    }
+  } else if (key === "dockAutoHide" && HOME_UI_PREFERENCE_KEYS.dockAutoHide.has(value)) {
+    payload = { dock_auto_hide: value === "on" };
+  } else if (key === "sounds" && HOME_UI_PREFERENCE_KEYS.sounds.has(value)) {
+    payload = { sounds: value === "on" };
+  } else if (key === "focusMode" && HOME_UI_PREFERENCE_KEYS.focusMode.has(value)) {
+    payload = { focus_mode: value === "on" };
+  }
+  if (!payload) {
+    throw new Error("Home rejected the appearance preference");
+  }
+  const appearance = await fetchJson("/api/apps/home/appearance/preferences", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  const currentPreferences = currentHomeUiPreferences();
+  const nextPreferences = canonicalHomeUiPreferences({
+    ...shellState.currentSummary,
+    appearance,
+  });
+  if (shellState.currentSummary) {
+    if (nextPreferences.revision >= currentPreferences.revision) {
+      shellState.currentSummary = {
+        ...shellState.currentSummary,
+        appearance,
+      };
+      syncHomeUiPreferencesToActiveShell();
+      return nextPreferences;
+    }
+    syncHomeUiPreferencesToActiveShell();
+    return currentPreferences;
+  }
+  return nextPreferences;
+}
+
+function handleHomeUiPreferenceMessage(event, context, data) {
+  const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
+  const action = typeof data.action === "string" ? data.action.trim() : "";
+  if (
+    context.kind !== "shell-frame" ||
+    context.targetId !== HOME_GUI_SHELL_ID ||
+    !requestId ||
+    requestId.length > 128
+  ) {
+    replyToShellRequest(
+      event,
+      requestId,
+      null,
+      new Error("Home denied the appearance preference"),
+    );
+    return;
+  }
+  if (action === "read") {
+    if (!hasExactMessageKeys(data, ["type", "requestId", "homeToken", "action"])) {
+      replyToShellRequest(
+        event,
+        requestId,
+        null,
+        new Error("Home rejected the appearance preference"),
+      );
+      return;
+    }
+    try {
+      replyToShellRequest(event, requestId, currentHomeUiPreferences());
+    } catch (error) {
+      replyToShellRequest(event, requestId, null, error);
+    }
+    return;
+  }
+  if (
+    action !== "write" ||
+    !hasExactMessageKeys(data, ["type", "requestId", "homeToken", "action", "key", "value"])
+  ) {
+    replyToShellRequest(
+      event,
+      requestId,
+      null,
+      new Error("Home rejected the appearance preference"),
+    );
+    return;
+  }
+  const key = typeof data.key === "string" ? data.key.trim() : "";
+  const value = typeof data.value === "string" ? data.value.trim() : "";
+  writeHomeUiPreference(key, value)
+    .then((preferences) => replyToShellRequest(event, requestId, preferences))
+    .catch((error) => replyToShellRequest(event, requestId, null, error));
+}
+
 async function showHostAuthGate(options = {}) {
   enterHostAuthGate();
+  const personName = options?.preserveSignedProfileLabel ? currentSignedProfileDisplayName() : "";
   const unlockReady = showHomeUnlock(async (response) => {
     await boot();
     const profileActionTarget = profileReadinessActionTarget(response);
@@ -197,7 +379,7 @@ async function showHostAuthGate(options = {}) {
     }
   }, {
     ...options,
-    surface: "neutral",
+    personName,
   });
   hideHostBootMask();
   await unlockReady;
@@ -1126,13 +1308,20 @@ window.addEventListener("message", (event) => {
       return;
     }
     replyToShellRequest(event, requestId, true);
-    showHostAuthGate({ presentation: "prompt", surface: "neutral" }).catch((error) => {
+    showHostAuthGate({
+      presentation: "prompt",
+      preserveSignedProfileLabel: true,
+    }).catch((error) => {
       console.error("home unlock failed", error);
     });
     return;
   }
   if (data.type === "home:refresh-summary") {
     requestShellSummaryRefresh({ reason: "child-message" });
+    return;
+  }
+  if (data.type === "home:ui-preference") {
+    handleHomeUiPreferenceMessage(event, context, data);
     return;
   }
   if (data.type === "home:menu-manifest") {

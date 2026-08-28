@@ -8,6 +8,7 @@ let nextIntervalId = 1;
 let signedSummary = false;
 let resolvePresenceHeartbeat = null;
 let presenceResponseMode = "pending";
+let credentialGetCount = 0;
 
 class FakeClassList {
   constructor() {
@@ -97,6 +98,12 @@ class FakeElement {
 
   cloneNode() {
     return new FakeElement(`${this.selector}:clone`);
+  }
+
+  click() {
+    for (const callback of this.listeners.get("click") || []) {
+      callback({ currentTarget: this, preventDefault() {}, stopPropagation() {} });
+    }
   }
 
   closest() {
@@ -192,13 +199,23 @@ globalThis.document = {
 };
 Object.defineProperty(globalThis, "navigator", {
   configurable: true,
-  value: {},
+  value: {
+    credentials: {
+      async get() {
+        credentialGetCount += 1;
+        return null;
+      },
+    },
+  },
 });
 globalThis.window = {
   PublicKeyCredential: function PublicKeyCredential() {},
+  atob: (value) => Buffer.from(String(value), "base64").toString("binary"),
+  btoa: (value) => Buffer.from(String(value), "binary").toString("base64"),
   crypto: { randomUUID: () => "home-shell-auth-gate-smoke" },
   location: { href: "http://localhost:61180/apps/home/", origin: "http://localhost:61180" },
   localStorage: { getItem: () => null, removeItem() {}, setItem() {} },
+  matchMedia: () => ({ matches: false }),
   performance: { now: () => Date.now() },
   innerWidth: 1280,
   addEventListener(type, callback) {
@@ -225,6 +242,7 @@ globalThis.window = {
     return 0;
   },
 };
+globalThis.window.navigator = globalThis.navigator;
 
 elementForSelector("#home-unlock").hidden = true;
 elementForSelector("#launcher").hidden = true;
@@ -246,6 +264,13 @@ globalThis.fetch = async (url, init = {}) => {
       authority: signedSummary
         ? { signed_in: true, proof_binding_id: "proof:passkey:host" }
         : { signed_in: false },
+      identity: signedSummary
+        ? {
+            profile: {
+              display_name: "Verified Person",
+            },
+          }
+        : undefined,
       active_shell: {
         schema: "elastos.home.active-shell/v1",
         active: "home-gui",
@@ -256,6 +281,20 @@ globalThis.fetch = async (url, init = {}) => {
   }
   if (url === "/api/auth/passkey/status") {
     return jsonResponse({ registered: true, guest_registration_enabled: false });
+  }
+  if (url === "/api/auth/passkey/authenticate/begin") {
+    return jsonResponse({
+      ceremony_id: "auth-gate-passkey",
+      options: {
+        publicKey: {
+          challenge: "AQ",
+          timeout: 60000,
+          rpId: "localhost",
+          allowCredentials: [],
+          userVerification: "preferred",
+        },
+      },
+    });
   }
   if (url === "/api/auth/sessions/refresh") {
     return jsonResponse({ home_token: "trusted-home-host-token" });
@@ -300,10 +339,28 @@ for (let attempt = 0; attempt < 20 && elementForSelector("#home-unlock").hidden;
 
 const unlock = elementForSelector("#home-unlock");
 assert(unlock.hidden === false, "auth gate did not show the passkey prompt");
-assert(unlock.dataset.surface === "neutral", "auth gate did not use a neutral non-GUI unlock surface", unlock.dataset);
+assert(unlock.dataset.surface === "lock-face", "auth gate did not show the lock face", unlock.dataset);
 assert(
   elementForSelector("#home-shell-boot-mask").hidden === true,
   "auth gate left the neutral host mask over the passkey prompt",
+);
+assert(
+  elementForSelector(".home-unlock-face").hidden === false,
+  "auth gate did not show the lock face content",
+);
+assert(
+  elementForSelector(".home-unlock-card").hidden === true,
+  "auth gate left the neutral card visible for a registered lock face",
+);
+assert(
+  elementForSelector("#home-unlock-person-name").textContent === "",
+  "unsigned Home leaked a profile name into the lock face",
+  elementForSelector("#home-unlock-person-name").textContent,
+);
+assert(
+  requests.filter((request) => request.url === "/api/auth/passkey/authenticate/begin").length === 0,
+  "auth gate started passkey sign-in without an explicit click",
+  requests,
 );
 assert(document.body.dataset.homeStatus === "ready", "auth gate prompt did not leave Home ready for passkey input", document.body.dataset);
 assert(document.body.dataset.homeShell === "resolving", "auth gate left a root shell visible", document.body.dataset);
@@ -315,6 +372,24 @@ assert(!activeShellFrame.dataset.route, "auth gate kept a stale active shell rou
 assert(!activeShellFrame.getAttribute("src"), "auth gate kept a stale shell iframe src", activeShellFrame.getAttribute("src"));
 assert(!requests.some((request) => request.url === "/api/apps/home/active-shell"), "auth gate tried to switch shells without a token", requests);
 assert(!requests.some((request) => request.url === "/api/apps/home/launch"), "auth gate tried to launch a shell while locked", requests);
+
+elementForSelector("#home-unlock-person").click();
+for (
+  let attempt = 0;
+  attempt < 20 && credentialGetCount < 1;
+  attempt += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  requests.filter((request) => request.url === "/api/auth/passkey/authenticate/begin").length === 1,
+  "auth gate did not start passkey sign-in after the explicit lock-face click",
+  requests,
+);
+assert(
+  credentialGetCount === 1,
+  "auth gate did not reach navigator.credentials.get after the explicit lock-face click",
+);
 
 for (const listener of windowListeners.get("message") || []) {
   listener({
@@ -362,6 +437,11 @@ const heartbeatRequests = () => requests.filter(
   (request) => request.url === "/api/apps/home/collaboration/presence",
 );
 assert(heartbeatRequests().length === 1, "proof-bound Home did not emit one presence heartbeat", requests);
+assert(
+  elementForSelector("#home-unlock-person-name").textContent === "",
+  "summary refresh leaked a signed profile name into an unsigned lock gate",
+  elementForSelector("#home-unlock-person-name").textContent,
+);
 assert(
   JSON.stringify(heartbeatRequests()[0].body) === "{}",
   "Home presence heartbeat forwarded authority fields",
@@ -440,6 +520,18 @@ assert(heartbeatRequests().length === 3, "unsigned Home emitted from a stale pre
 
 const { profileReadinessActionTarget } = await import(
   `../capsules/home/browser/shell-auth.js?v=${moduleVersion}`
+);
+const { showHomeUnlock } = await import(
+  `../capsules/home/browser/shell-auth.js?v=${moduleVersion}`
+);
+await showHomeUnlock(() => {}, {
+  presentation: "prompt",
+  personName: "Verified Person",
+});
+assert(
+  elementForSelector("#home-unlock-person-name").textContent === "Verified Person",
+  "lock face did not render an explicit signed-session profile label",
+  elementForSelector("#home-unlock-person-name").textContent,
 );
 assert(profileReadinessActionTarget({
   profile_readiness: {

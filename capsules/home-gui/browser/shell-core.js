@@ -492,11 +492,14 @@ export function initializeShellLayout(summary) {
   syncHomeBrowserState(summary);
   const stored = shellState.homeBrowserState.layout;
   const normalizedDesktopHidden = normalizeDesktopHiddenTargets(
-    stored ? stored.desktopHidden : null,
+    stored ? stored.desktopHidden : defaultHiddenDesktopTargets(summary),
     summary,
   );
   shellState.shellLayoutState = {
-    taskbar: normalizeTaskbarLayout(stored ? stored.taskbar : null, summary),
+    taskbar: normalizeTaskbarLayout(
+      stored ? stored.taskbar : defaultTaskbarPins(summary),
+      summary,
+    ),
     desktop: {},
     desktopLabels: normalizeDesktopLabels(stored ? stored.desktopLabels : null, summary),
     desktopHidden: normalizedDesktopHidden,
@@ -652,6 +655,13 @@ function normalizeTaskbarLayout(taskbar, summary) {
   return normalized;
 }
 
+const DEFAULT_TASKBAR_PINS = ["browser", "library", "wallet", "documents", "chat-room", "system"];
+
+function defaultTaskbarPins(summary) {
+  const knownTargets = new Set(allVisibleTargets(summary).map((target) => target.target));
+  return DEFAULT_TASKBAR_PINS.filter((targetId) => knownTargets.has(targetId));
+}
+
 function normalizeDesktopLabels(labels, summary) {
   const knownTargets = new Set(allVisibleTargets(summary).map((target) => target.target));
   const normalized = {};
@@ -666,6 +676,12 @@ function normalizeDesktopLabels(labels, summary) {
     normalized[targetId] = nextLabel;
   }
   return normalized;
+}
+
+function defaultHiddenDesktopTargets(summary) {
+  return allVisibleTargets(summary)
+    .filter((target) => target.target_kind !== "object")
+    .map((target) => target.target);
 }
 
 function normalizeDesktopHiddenTargets(targetIds, summary) {

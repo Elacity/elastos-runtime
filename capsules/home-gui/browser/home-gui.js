@@ -88,6 +88,11 @@ import {
   recordNotifications,
 } from "./shell-notifications.js?v=home-20260813a";
 import {
+  bindSetupSheet,
+  holdHomeSetupAct,
+  syncSetupSheet,
+} from "./shell-setup-sheet.js?v=home-20260813a";
+import {
   bindMenubar,
   closeMenus,
   setMenuManifest,
@@ -102,7 +107,6 @@ import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-
 import {
   bindSpaceEdgePeek,
   bindSpacePager,
-  toggleActiveFullscreenStage,
 } from "./shell-stages.js?v=home-20260813a";
 import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20260813a";
 import {
@@ -129,6 +133,7 @@ import {
   inboxRailSessionMounted,
 } from "./shell-inbox-rail.js?v=home-20260813a";
 import {
+  attachAuthorizedConnectorSheet,
   bindConnectorSheet,
   connectorSheetFrame,
   connectorSheetTarget,
@@ -146,6 +151,7 @@ bindIdentityMenu();
 bindShellSurfaceDom();
 bindSpotlight();
 bindNotificationCenter();
+bindSetupSheet();
 bindQuickLook();
 bindExpose();
 bindSpacePager();
@@ -156,14 +162,6 @@ bindControlCentre();
 bindWalletRail();
 bindInboxRail();
 bindConnectorSheet();
-window.addEventListener("elastos:ui-preference-changed", (event) => {
-  const detail = event?.detail;
-  const key = typeof detail?.key === "string" ? detail.key.trim() : "";
-  if (!key) {
-    return;
-  }
-  applyHomeGuiUiPreferences({ [key]: detail.value });
-});
 
 const HOME_GUI_HOST_SELECTORS = Object.freeze([
   ".desktop-backdrop",
@@ -177,6 +175,7 @@ const HOME_GUI_HOST_SELECTORS = Object.freeze([
   "#control-centre",
   "#wallet-rail",
   "#inbox-rail",
+  "#setup-sheet",
   "#connector-sheet",
   "#spotlight",
   "#window-switcher",
@@ -194,6 +193,7 @@ export const homeGuiWindowHooks = Object.freeze({
   renderDesktop,
   renderTaskbar,
   updateTaskbarState,
+  holdHomeSetupAct,
 });
 
 const homeGuiHostActions = {
@@ -211,6 +211,7 @@ configureWindowHooks({
   renderTaskbar,
   syncMenubar,
   updateTaskbarState,
+  holdHomeSetupAct,
   // Host-mediated launches: GUI never fetch-launches; shell-windows and the
   // wallet rail call this hook after bindHomeGuiInteractions binds it.
   launchTarget: (...args) => homeGuiHostActions.launchTarget?.(...args),
@@ -361,19 +362,16 @@ export function closeHomeGuiWindowsForTarget(targetId) {
 
 export function openHomeGuiTarget(target, options = {}) {
   const query = options.query && typeof options.query === "object" ? options.query : {};
-  // Wallet connectors open as an in-rail ceremony sheet — not a second
-  // desktop product window — when the wallet asks for sheet presentation
-  // or the wallet rail is already open.
   if (
     isConnectorSheetTarget(target) &&
     (query.presentation === "sheet" || walletRailOpen())
   ) {
-    showConnectorSheet(target, { ...options, query: { ...query, presentation: "sheet" } }).catch(
-      (error) => {
-        console.error("connector sheet open failed", error);
-        openTarget(target, options);
-      },
-    );
+    void showConnectorSheet(target, {
+      ...options,
+      query: { ...query, presentation: "sheet" },
+    }).catch((error) => {
+      console.error("connector sheet open failed", error);
+    });
     return;
   }
   openTarget(target, options);
@@ -703,6 +701,9 @@ export function relaunchHomeGuiWindowForToken(homeToken) {
 }
 
 export function attachAuthorizedHomeGuiTarget(launched) {
+  if (walletRailOpen() && isConnectorSheetTarget(launched?.target)) {
+    return attachAuthorizedConnectorSheet(launched);
+  }
   return attachAuthorizedTarget(launched);
 }
 
@@ -737,6 +738,7 @@ export function homeGuiLauncherIsOpen() {
 export function syncHomeGuiProjection(previous, summary, options = {}) {
   shellState.currentSummary = summary;
   shellState.requestSummaryRefresh = homeGuiHostActions.requestSummaryRefresh;
+  applyHomeGuiUiPreferences(homeGuiUiPreferencesFromSummary(summary));
   if (options.initialize === true || options.principalChanged === true) {
     initializeShellLayout(summary);
     initializeRecentTargets(summary);
@@ -770,7 +772,61 @@ export function syncHomeGuiChrome(previous, summary) {
   syncWalletRailAvailability(summary);
   maybeShowWalletApprovalToast(previous, summary);
   recordNotifications(summary);
+  syncSetupSheet(previous, summary);
   syncControlCentre(summary);
+}
+
+function homeGuiUiPreferencesFromSummary(summary) {
+  if (summary?.authority?.signed_in !== true) {
+    return {
+      revision: 0,
+      theme: "dark",
+      accent: "blue",
+      accentCustom: "#4f7fff",
+      dockAutoHide: "off",
+      sounds: "off",
+      focusMode: "off",
+    };
+  }
+  const appearance = summary?.appearance;
+  const revision = appearance?.revision;
+  const accentCustom =
+    typeof appearance?.accent_custom === "string" &&
+    /^#[0-9a-f]{6}$/i.test(appearance.accent_custom.trim())
+      ? appearance.accent_custom.trim().toLowerCase()
+      : "";
+  if (
+    appearance?.schema !== "elastos.home.appearance/v1" ||
+    !Number.isSafeInteger(revision) ||
+    revision < 0 ||
+    !["dark", "light", "auto"].includes(appearance?.theme) ||
+    ![
+      "blue",
+      "purple",
+      "pink",
+      "red",
+      "orange",
+      "yellow",
+      "green",
+      "graphite",
+      "custom",
+    ].includes(appearance?.accent) ||
+    !accentCustom ||
+    typeof appearance?.dock_auto_hide !== "boolean" ||
+    typeof appearance?.sounds !== "boolean" ||
+    typeof appearance?.focus_mode !== "boolean"
+  ) {
+    throw new Error("Home GUI rejected the appearance summary");
+  }
+  return {
+    revision,
+    theme: appearance.theme,
+    accent: appearance.accent,
+    accentCustom,
+    dockAutoHide: appearance.dock_auto_hide === true ? "on" : "off",
+    sounds: appearance.sounds === true ? "on" : "off",
+    focusMode: appearance.focus_mode === true ? "on" : "off",
+  };
 }
 
 /* Menus are self-declared UI, not authority: the host verifies the sender's
@@ -863,6 +919,7 @@ function fullscreenApi() {
 /* About ElastOS: window-chrome close, verified runtime version, and an
    honest update path (System About owns check/install — no fake badges). */
 let aboutOverlayBound = false;
+let homeGuiFullscreenControlBound = false;
 
 function aboutOverlayNode() {
   return document.querySelector("#about-overlay");
@@ -1008,10 +1065,7 @@ function syncFullscreenButton() {
   if (!toolbarFullscreenButton) {
     return;
   }
-  // Window fullscreen stage (dedicated Space) — not the browser Fullscreen API.
-  const id = shellState.activeWindowId;
-  const entry = id ? shellState.windows.get(id) : null;
-  const active = entry?.fullscreenStage === true;
+  const active = Boolean(fullscreenElement());
   const text = active ? "Exit Fullscreen" : "Enter Fullscreen";
   const label = toolbarFullscreenButton.querySelector(".control-centre-row-label");
   if (label) {
@@ -1021,10 +1075,23 @@ function syncFullscreenButton() {
   toolbarFullscreenButton.title = text;
 }
 
-function toggleHomeGuiFullscreen() {
+async function toggleHomeGuiFullscreen() {
   hideControlCentre({ restoreFocus: false });
-  toggleActiveFullscreenStage();
-  syncFullscreenButton();
+  const { root, request, exit } = fullscreenApi();
+  try {
+    if (fullscreenElement()) {
+      if (typeof exit === "function") {
+        await exit.call(document);
+      }
+    } else if (typeof request === "function") {
+      await request.call(root);
+    }
+  } catch {
+    // Browser Fullscreen API owns state. Fail closed and resync from the
+    // actual document fullscreen state so the control stays retryable.
+  } finally {
+    syncFullscreenButton();
+  }
 }
 
 function trackPointerDown(event) {
@@ -1050,11 +1117,16 @@ function trackPointerMove(event) {
 }
 
 function bindHomeGuiFullscreenControl() {
-  if (!toolbarFullscreenButton) {
+  if (!toolbarFullscreenButton || homeGuiFullscreenControlBound) {
     return;
   }
+  homeGuiFullscreenControlBound = true;
   toolbarFullscreenButton.hidden = false;
-  toolbarFullscreenButton.addEventListener("click", toggleHomeGuiFullscreen);
+  document.addEventListener("fullscreenchange", syncFullscreenButton);
+  document.addEventListener("webkitfullscreenchange", syncFullscreenButton);
+  toolbarFullscreenButton.addEventListener("click", () => {
+    void toggleHomeGuiFullscreen();
+  });
   syncFullscreenButton();
 }
 
@@ -1140,7 +1212,7 @@ export function bindHomeGuiInteractions(options = {}) {
   });
 
   document.querySelector("#identity-menu-lock")?.addEventListener("click", () => {
-    window.dispatchEvent(new CustomEvent("elastos:request-lock"));
+    homeGuiHostActions.requestHomeUnlock?.();
   });
 
   bindAboutOverlay();

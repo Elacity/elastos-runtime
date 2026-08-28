@@ -894,25 +894,30 @@ pub(in crate::api) fn principal_root_recovery_status_for_context(
     context: &super::gateway::HomeLaunchTokenContext,
 ) -> anyhow::Result<PrincipalRootRecoveryStatusV1> {
     let principal = require_active_passkey_principal_for_context(state, context)?;
-    principal_root_recovery_status_for_principal(state, &principal)
-}
-
-fn principal_root_recovery_status_for_principal(
-    state: &GatewayState,
-    principal: &crate::auth::PrincipalRecord,
-) -> anyhow::Result<PrincipalRootRecoveryStatusV1> {
-    let protected_object_inventory =
-        principal_root_protected_object_inventory(&state.data_dir, &principal.localhost_root);
-    let inspection = crate::auth::inspect_declarative_principal_root_protection(
+    principal_root_recovery_status_for_verified_principal(
         &state.data_dir,
         &principal.principal_id,
         &principal.localhost_root,
+    )
+}
+
+pub(in crate::api) fn principal_root_recovery_status_for_verified_principal(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    localhost_root: &str,
+) -> anyhow::Result<PrincipalRootRecoveryStatusV1> {
+    let protected_object_inventory =
+        principal_root_protected_object_inventory(data_dir, localhost_root);
+    let inspection = crate::auth::inspect_declarative_principal_root_protection(
+        data_dir,
+        principal_id,
+        localhost_root,
         &protected_object_inventory,
     )?;
     let Some(protection) = inspection.protection else {
         let mut status = PrincipalRootRecoveryStatusV1::unprotected(
-            principal.principal_id.clone(),
-            principal.localhost_root.clone(),
+            principal_id.to_string(),
+            localhost_root.to_string(),
         );
         if inspection.plaintext_object_count > 0 {
             status
@@ -938,8 +943,8 @@ fn principal_root_recovery_status_for_principal(
     }
     Ok(PrincipalRootRecoveryStatusV1 {
         schema: elastos_runtime::auth::PRINCIPAL_ROOT_RECOVERY_STATUS_SCHEMA.to_string(),
-        principal_id: principal.principal_id.clone(),
-        localhost_root: principal.localhost_root.clone(),
+        principal_id: principal_id.to_string(),
+        localhost_root: localhost_root.to_string(),
         root_encrypted,
         recovery_configured,
         recovery_download_available,
@@ -947,6 +952,12 @@ fn principal_root_recovery_status_for_principal(
         required_actions,
         crypto: protection.crypto,
     })
+}
+
+pub(in crate::api) fn principal_root_recovery_is_ready(
+    recovery: &PrincipalRootRecoveryStatusV1,
+) -> bool {
+    recovery.root_encrypted && recovery.recovery_configured
 }
 
 pub fn verify_configured_principal_roots_ready(data_dir: &std::path::Path) -> anyhow::Result<()> {

@@ -681,6 +681,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route("/artifacts/*path", get(serve_artifact_file))
         .route("/api/apps/system/summary", get(system_summary))
         .route(
+            "/api/apps/system/appearance/preferences",
+            post(system_appearance_preferences_update),
+        )
+        .route(
             "/api/apps/system/appearance/background-image",
             post(system_background_image_update)
                 .delete(system_background_image_reset)
@@ -878,6 +882,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/:wallet_connector/wallet/approvals/:request_id/complete",
             post(wallet_connector_approval_complete),
+        )
+        .route(
+            "/api/apps/home/appearance/preferences",
+            post(home_appearance_preferences_update),
         )
         .route("/api/apps/home/summary", get(home_summary))
         .route("/api/apps/home/events", get(home_events))
@@ -1354,7 +1362,10 @@ fn inbox_error_response(err: anyhow::Error) -> Response {
 }
 
 fn system_error_response(err: anyhow::Error) -> Response {
-    let text = err.to_string();
+    let appearance_request = gateway_home_system::home_appearance_preference_request_message(&err);
+    let text = appearance_request
+        .map(str::to_string)
+        .unwrap_or_else(|| err.to_string());
     let status = if text.contains("home launch token")
         || text.contains("admin passkey required")
         || text.contains("proof-bound passkey session required")
@@ -1362,6 +1373,8 @@ fn system_error_response(err: anyhow::Error) -> Response {
         || text.contains("passkey step-up")
     {
         StatusCode::FORBIDDEN
+    } else if appearance_request.is_some() {
+        StatusCode::BAD_REQUEST
     } else if text.contains("nickname must")
         || text.contains("missing")
         || text.contains("background image")
@@ -1379,13 +1392,17 @@ fn system_error_response(err: anyhow::Error) -> Response {
 
 fn home_error_response(err: anyhow::Error) -> Response {
     let profile_required = gateway_home_system::profile_required_message(&err);
+    let appearance_request = gateway_home_system::home_appearance_preference_request_message(&err);
     let text = profile_required
         .map(str::to_string)
+        .or_else(|| appearance_request.map(str::to_string))
         .unwrap_or_else(|| err.to_string());
     let status = if text.contains("home launch token") || text.contains("gateway identity") {
         StatusCode::FORBIDDEN
     } else if profile_required.is_some() {
         StatusCode::CONFLICT
+    } else if appearance_request.is_some() {
+        StatusCode::BAD_REQUEST
     } else if text.contains("service access request delivery failed: service offer")
         || text.contains("service access request delivery failed: only Browser Exit")
     {

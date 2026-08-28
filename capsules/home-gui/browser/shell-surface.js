@@ -1553,9 +1553,14 @@ export function hideLauncher() {
 }
 
 function syncLauncherVisibility(isVisible) {
+  const taskbar = document.querySelector(".taskbar");
   if (isVisible) {
     closeOtherShellPopovers("launcher");
   }
+  if (isVisible) {
+    prepareSurfaceOpen(launcher);
+  }
+  taskbar?.classList.toggle("is-launcher-face", isVisible);
   setOverlayOpen(launcher, isVisible, {
     invoker: launcherToggleButton,
     focusEl: isVisible && shouldFocusLauncherSearch() ? launcherSearch : undefined,
@@ -2691,7 +2696,7 @@ export function setDockAutoHide(on) {
 export function syncDockAutoHide() {
   const on = dockAutoHideEnabled();
   document.body.classList.toggle("dock-autohide", on);
-  if (!on) {
+  if (!on || !launcher.hidden) {
     document.body.classList.remove("dock-revealed");
   }
 }
@@ -2700,6 +2705,10 @@ function bindDockAutoHideReveal() {
   const revealBand = 28;
   window.addEventListener("pointermove", (event) => {
     if (!document.body.classList.contains("dock-autohide")) {
+      return;
+    }
+    if (!launcher.hidden) {
+      document.body.classList.add("dock-revealed");
       return;
     }
     const nearBottom = event.clientY >= window.innerHeight - revealBand;
