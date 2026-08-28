@@ -2545,16 +2545,17 @@ fn resolve_protected_content_policy_rejects_missing_or_ambiguous_sources() {
 
 #[test]
 fn protected_content_creator_royalty_share_value_is_pinned() {
-    // 0x3b6 = 950. The constant is named tenths-of-percent (which would read
-    // as 95%); the deployed Base 8453 AuthorityGateway's actual royalty-share
-    // unit is still unproven and tracked by the deployed-facts verification
-    // task. This pin exists so any change to the mint's money constant is a
-    // reviewed decision instead of silent drift — the exact-call test below
-    // re-derives its expectation from the same constant and cannot catch it.
-    assert_eq!(PROTECTED_CONTENT_CREATOR_ROYALTY_TENTHS_PERCENT, "0x3b6");
+    // 0x3b6 = 950 ERC-1155 ROYALTY_SHARE units (tokenId 2) out of the 1000
+    // issued per asset — creator 950 (95%), protocol owner 50 (5%) minted by
+    // the contracts from `CentralStorage.protocolShares()`. Verified against
+    // the deployed Base 8453 contracts (ELACITY-2296). This pin exists so any
+    // change to the mint's money constant is a reviewed decision instead of
+    // silent drift — the exact-call test below re-derives its expectation from
+    // the same constant and cannot catch it.
+    assert_eq!(PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_UNITS, "0x3b6");
     assert_eq!(
         u64::from_str_radix(
-            PROTECTED_CONTENT_CREATOR_ROYALTY_TENTHS_PERCENT.trim_start_matches("0x"),
+            PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_UNITS.trim_start_matches("0x"),
             16,
         )
         .unwrap(),
@@ -2610,7 +2611,7 @@ fn resolve_protected_content_creator_mint_returns_exact_call_and_content_access_
                 ],
                 &[
                     "0x7".to_string(),
-                    PROTECTED_CONTENT_CREATOR_ROYALTY_TENTHS_PERCENT.to_string(),
+                    PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_UNITS.to_string(),
                 ],
                 None,
             )

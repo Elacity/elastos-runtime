@@ -197,16 +197,26 @@ Latest confirmed PR #15 comment truth for the Base read path:
   `UnboundContentId(bytes16)` / selector `0xcad88223`; bound KIDs without
   access return `false`.
 
-Still open from that same review:
+The questions that review left open are closed by the ELACITY-2296 on-chain
+verification (2026-08-28; details and evidence in
+`PROTECTED_CONTENT_EXTRACTION.md` "Confirmed deployed-contract facts"):
 
-- the exact KID-binding write operation and authorization path; do not treat
-  `bindIP` as verified truth;
-- whether canonical deployed purchase state requires Runtime to call
-  `buyAccess`, plus the exact ABI/receipt/event proof for that path;
-- whether `View` / `Download` remain only signed Runtime policy actions for
-  the deployed Elacity flow; and
-- one known bound KID plus one allowed and one denied wallet against the
-  reviewed deployed proxy.
+- KID binding is `CentralStorage.bindIP(bytes16, address, uint256)`,
+  restricted to acknowledged protocol contracts and called only by
+  `AssetFactory.registerNewAsset` in the mint flow — `bindIP` is now verified
+  truth for the deployed v3 contracts.
+- Canonical deployed purchase state DOES require Runtime to call
+  `buyAccess` (`0xf7580ad9` native / `0x0ede2294` ERC-20 with a prior
+  `approve` to the per-operative `paymentProcessor()`); no off-chain purchase
+  can grant chain-visible access.
+- Deployed access state is one boolean per `(holder, contentId)`.
+  `ACCESS_TOKEN` (id 1) carries playback/read (and by extension download);
+  `DISTRIBUTION_RIGHT` (id 3) is the right to sell the access token, not a
+  consumption right. `View` / `Download` remain signed Runtime policy actions
+  only.
+- Bound-KID allow/deny/unbound proof recorded against the deployed proxy
+  (KID `0x2c27d859924f93f14aa8071f7ba8192e`, allowed minter, denied random
+  wallet, `0xcad88223` unbound revert).
 
 ## Source-only sealed decrypt handoff
 

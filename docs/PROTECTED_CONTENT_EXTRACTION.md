@@ -182,17 +182,53 @@ Latest confirmed PR #15 review facts for the Base read path:
   `UnboundContentId(bytes16)` / selector `0xcad88223`.
 - Bound KIDs without access return `false`.
 
-Still open:
+All previously open questions are closed by the ELACITY-2296 on-chain
+verification (2026-08-28, read-only probes against the deployed Base 8453
+proxies; `v3-drm-protocol` is the authoritative contracts repo — the older
+`drm-contracts` deployment is deprecated and must not be used for ABI or
+authorization conclusions):
 
-- the exact KID-binding write operation and authorization path; do not treat
-  `bindIP` as proven;
-- whether canonical deployed purchase state requires Runtime to call
-  `AuthorityGateway.buyAccess`, and the exact ABI/receipt/event proof for that
-  path;
-- whether `View` / `Download` remain the deployed signed Runtime policy
-  actions; and
-- one known bound KID plus one allowed and one denied wallet against the
-  reviewed deployed proxy.
+- KID binding is `CentralStorage.bindIP(bytes16 contentId, address channel,
+  uint256 tokenId)`, callable only by acknowledged protocol contracts
+  (`whitelistOnly`; unauthorized callers revert
+  `UnrecognizedContractError(address)` / `0x552b3ecd`). Its sole caller is
+  `AssetFactory.registerNewAsset` inside the mint flow; each binding emits
+  `IPBound(bytes16 indexed, address indexed, uint256 indexed)` (topic0
+  `0x69eafb02…`). Verified live: `acknowledged(AssetFactory) == true`,
+  `acknowledged(<random EOA>) == false`, simulated EOA `bindIP` reverts, and
+  97 `IPBound` events exist on the deployed `CentralStorage`.
+- Canonical purchase state DOES require Runtime to issue
+  `AuthorityGateway.buyAccess`: access resolves only through ERC-1155
+  `ACCESS_TOKEN` (id 1) / `DISTRIBUTION_RIGHT` (id 3) balances on the
+  per-asset operative — moved only by the buyAccess trade path — or an active
+  channel subscription. ABIs confirmed: native
+  `buyAccess(address seller, address ledger, uint256 tokenId, uint256
+  _quantity, uint256 _pricePerToken)` payable = `0xf7580ad9`; ERC-20 adds
+  `address _payToken` (non-payable, rejects the zero sentinel) =
+  `0x0ede2294`, and requires a prior `approve` to the per-operative
+  `paymentProcessor()` (`0xf1c6bdf8`), never to the gateway. The pinned
+  `AssetCreated` topic0 `0xc0a995e4…dba46` is the EventHub shape (3 indexed
+  topics); `mint.asset_created_emitter` must be the EventHub proxy, not the
+  channel.
+- Deployed contracts store a single boolean per `(holder, contentId)` — no
+  per-right state exists on-chain. The two token ids `checkAccess` reads are
+  not consumption rights: `ACCESS_TOKEN` (id 1) carries playback/read access
+  (and by extension download); `DISTRIBUTION_RIGHT` (id 3) is the right to
+  sell/distribute the access token. `View` / `Download` (and any per-right
+  granularity) live exclusively in the signed Runtime rights policy.
+- Bound-KID proof (Base 8453, gateway
+  `0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D`): KID
+  `0x2c27d859924f93f14aa8071f7ba8192e` → allowed wallet (minter)
+  `0x34DAF31B99B5A59cEB18E424Dbc112FA6e5f3Dc3` returns `true`; random wallet
+  `0x1111…1111` returns `false`; an unbound KID reverts with
+  `0xcad88223` + KID payload. Note: access can also be satisfied by channel
+  token-ownership gates (`TokenAccessRegistered`), so an "open" channel can
+  legitimately return `true` for arbitrary wallets — deny proofs must use a
+  gated channel.
+- Creator royalty: `0x3b6` = 950 ERC-1155 `ROYALTY_SHARE` (id 2) units.
+  1000 units exist per asset — creator 950 (95%) plus the protocol owner's
+  `CentralStorage.protocolShares()` = `(50, 0xdB0E70C1…)` (5%), both
+  observed live on a deployed operative's balances.
 
 ## Installed prerequisites
 

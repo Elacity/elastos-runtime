@@ -753,13 +753,17 @@ installed, not cut over, and not installed-product truth.
   - `UnboundContentId(bytes16)` means unknown/unbound object, not deny.
   - AuthorityGateway read resolution goes through
     `CentralStorage.ipReference(bytes16)`.
-  - The exact KID-binding write operation and its authorization remain
-    unverified; do not claim `bindIP` or any binding write path is proven.
-  - Deployed `View` / `Download` contract semantics remain open.
-  - The exact `buyAccess` ABI/receipt/event and whether Runtime must issue it
-    for canonical purchase state remain open.
-  - Deployed proof still needs one known bound KID with one allowed and one
-    denied wallet against the reviewed proxy.
+  - KID binding is verified (ELACITY-2296): `CentralStorage.bindIP(bytes16,
+    address, uint256)`, acknowledged-contracts-only, called by
+    `AssetFactory.registerNewAsset` in the mint flow.
+  - Deployed `View` / `Download` semantics are verified boolean-only on-chain;
+    per-right policy lives exclusively in the signed Runtime rights policy.
+  - `buyAccess` ABIs are verified (`0xf7580ad9` native, `0x0ede2294` ERC-20
+    with prior `approve` to the per-operative `paymentProcessor()`), and
+    Runtime MUST issue `buyAccess` for canonical purchase state.
+  - Bound-KID proof recorded (ELACITY-2296): allowed minter and denied random
+    wallet on KID `0x2c27d859924f93f14aa8071f7ba8192e`, plus the `0xcad88223`
+    unbound revert, against the deployed Base 8453 proxy.
   - Installed prerequisites still need one signed owner-only three-node 2-of-3
     custody composition, private multi-source Chain config, packaged protect +
     custody + decrypt provider registration, and an installed three-replica
