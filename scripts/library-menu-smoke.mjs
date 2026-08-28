@@ -209,6 +209,18 @@ const viewerFile = object(`${documentsUri}/Viewer.md`, "Viewer.md", "file", [
 ], {
   viewers: [{ id: "documents", label: "Documents" }],
 });
+const localVideoFile = object(`${documentsUri}/Clip.mp4`, "Clip.mp4", "file", [
+  "download",
+  "compress_archive",
+  "rename",
+  "move",
+  "copy",
+  "publish",
+  "trash",
+  "properties",
+], {
+  mime: "video/mp4",
+});
 const gbaFile = object(`${documentsUri}/Game.gba`, "Game.gba", "file", [
   "download",
   "rename",
@@ -504,7 +516,7 @@ const webspaceMutable = createWebspaceFolderObject(webspaceMutableUri, "Mutable"
 const folders = new Map([
   [principalRoot, []],
   [desktopUri, []],
-  [documentsUri, [folder, file, viewerFile, gbaFile, publishedFile, archiveFile, tarArchiveFile, zipArchiveFile, looseZipFile, policyGatedArchiveFile, blockedFile, hiddenFile]],
+  [documentsUri, [folder, file, viewerFile, localVideoFile, gbaFile, publishedFile, archiveFile, tarArchiveFile, zipArchiveFile, looseZipFile, policyGatedArchiveFile, blockedFile, hiddenFile]],
   [picturesUri, []],
   [videosUri, []],
   [downloadsUri, []],
@@ -844,6 +856,12 @@ function handleProvider(op, payload, res) {
   if (op === "publish") {
     const found = findObject(payload.uri);
     if (!found) return sendJson(res, 404, JSON.stringify({ status: "error", message: "not found" }));
+    if (payload.protection?.mode === "runtime_custody") {
+      return sendJson(res, 200, JSON.stringify({
+        status: "error",
+        message: "Runtime custody creator mint is pending exact Wallet or Chain settlement",
+      }));
+    }
     found.published_cid = SMOKE_PUBLISHED_CID;
     found.published = true;
     found.availability = "local_pinned";
@@ -1157,7 +1175,7 @@ function createServer() {
   </style>
 </head>
 <body>
-  <iframe id="library-frame" src="/apps/library/#home_token=${encodeURIComponent(token)}"></iframe>
+  <iframe id="library-frame" src="/apps/library/?home_origin=${encodeURIComponent("http://" + req.headers.host)}#home_token=${encodeURIComponent(token)}"></iframe>
   <script>
     window.__shellMessages = [];
     window.addEventListener("message", (event) => {
@@ -1777,14 +1795,14 @@ async function run() {
       "Sidebar place drag must animate reorder instead of hard-redrawing",
     );
     assert(
-      await page.evaluate(() => JSON.parse(localStorage.getItem("library.sidebarOrder") || "[]").slice(0, 3).join("|")) === "home|public|desktop",
-      "Sidebar place drag must persist root order by root id",
+      await page.evaluate(() => localStorage.getItem("library.sidebarOrder")) === null,
+      "Sidebar place drag must keep view preferences out of durable browser storage",
     );
     await page.reload();
     await page.locator(".item").filter({ hasText: "Readme.md" }).first().waitFor();
     assert(
-      (await sidebarLabels(page)).slice(0, 3).join("|") === "Home|Public|Desktop",
-      "Sidebar root order must survive reload",
+      (await sidebarLabels(page)).slice(0, 3).join("|") === "Home|Desktop|Documents",
+      "Sidebar root order must return to the Runtime projection after reload",
     );
     await page.locator(".place").filter({ hasText: "Desktop" }).first().click();
     await assertOnlyActivePlace(page, "Desktop");
@@ -1824,7 +1842,7 @@ async function run() {
     includesAll(await submenuRows(page, "View"), ["Icons", "Details"], "View submenu");
     includesAll(await submenuRows(page, "New"), ["Folder", "Text Document"], "New submenu");
 
-    assert(await page.locator("#content").getAttribute("data-view") === "grid", "Library should boot in grid view");
+    assert(await page.locator("#content").getAttribute("data-view") === "list", "Library should boot in details view");
     await page.locator("#list-button").click();
     assert(await page.locator("#content").getAttribute("data-view") === "list", "List view button must switch to list view");
     assert(await page.locator(".explore-table-headers").count() === 1, "List view must render details headers");
@@ -1896,10 +1914,10 @@ async function run() {
     assert(await page.locator("#sort-select").inputValue() === "size", "Sort By Size menu action must update sort state");
     await openBackgroundMenu(page);
     await clickSubmenu(page, "Sort By", "Descending");
-    assert(await page.evaluate(() => localStorage.getItem("library.sortOrder")) === "desc", "Descending menu action must persist sort order");
+    assert(await page.evaluate(() => localStorage.getItem("library.sortOrder")) === null, "Descending menu action must keep sort state out of durable browser storage");
     await openBackgroundMenu(page);
     await clickSubmenu(page, "Sort By", "Ascending");
-    assert(await page.evaluate(() => localStorage.getItem("library.sortOrder")) === "asc", "Ascending menu action must persist sort order");
+    assert(await page.evaluate(() => localStorage.getItem("library.sortOrder")) === null, "Ascending menu action must keep sort state out of durable browser storage");
 
     includesAll(await openItemMenu(page, "Readme.md"), [
       "Open",
@@ -1914,6 +1932,39 @@ async function run() {
       "Properties",
     ], "file menu");
     excludesAll(await openItemMenu(page, "Readme.md"), ["Open With", "Copy Published Link"], "file menu without installed viewer or published link");
+    includesAll(await openItemMenu(page, "Clip.mp4"), [
+      "Open",
+      "Download",
+      "Compress to ZIP",
+      "Publish",
+      "Protect and List...",
+      "Properties",
+    ], "protected publish video menu");
+    await clickMenu(page, "Protect and List...");
+    await page.locator(".dialog-card").filter({ hasText: "Protect and List" }).first().waitFor();
+    await page.locator('input[name="copies"]').fill("2");
+    await page.locator('input[name="price"]').fill("1000000000000000000");
+    await page.locator("[data-protect-and-list-summary]").filter({
+      hasText: "Protect Clip.mp4 and request a listing for 2 copies at 1000000000000000000 base units each.",
+    }).waitFor();
+    await page.locator(".dialog-card button").filter({ hasText: "Protect and List" }).first().click();
+    await page.waitForFunction(
+      () => document.querySelector("#status-text")?.textContent?.includes("Protection for Clip.mp4 is pending approval or confirmation."),
+    );
+    assert(
+      !(await page.locator("body").textContent()).includes("Runtime custody creator mint is pending exact Wallet or Chain settlement"),
+      "Library must redact the internal Runtime pending message",
+    );
+    assert(
+      ops.some((entry) =>
+        entry.op === "publish" &&
+        entry.payload.uri.endsWith("/Clip.mp4") &&
+        entry.payload.if_revision === "rev:Clip.mp4" &&
+        entry.payload.protection?.mode === "runtime_custody" &&
+        entry.payload.protection?.copies === "0x2" &&
+        entry.payload.protection?.price === "0xde0b6b3a7640000"),
+      "Protect and List must call publish with the exact runtime custody payload",
+    );
     await openItemMenu(page, "Readme.md");
     await clickMenu(page, "Properties");
     await page.locator(".window-item-properties").filter({ hasText: "Readme.md properties" }).first().waitFor();
@@ -2511,13 +2562,14 @@ async function run() {
       window.__shellMessages = [];
     });
     await libraryFrame.goto(
-      `http://127.0.0.1:${port}/apps/library/?mode=attach&returnTarget=browser#home_token=${encodeURIComponent(token)}`,
+      `http://127.0.0.1:${port}/apps/library/?mode=attach&returnTarget=browser&home_origin=${encodeURIComponent("http://127.0.0.1:" + port)}#home_token=${encodeURIComponent(token)}`,
     );
     await libraryFrame.locator("#picker-action-button").filter({ hasText: "Select for Browser" }).first().waitFor();
     await libraryFrame.locator("#status-text").filter({ hasText: "Choose an item for Browser." }).first().waitFor();
     const browserAttachRows = await openItemMenu(libraryFrame, "Viewer.md");
     includesAll(browserAttachRows, ["Select for Browser", "Download", "Properties"], "Browser attach file menu");
     excludesAll(browserAttachRows, ["Open With"], "Browser attach file menu");
+    await libraryFrame.page().keyboard.press("Escape");
     await libraryFrame.locator(".item").filter({ hasText: "Viewer.md" }).first().click();
     await libraryFrame.locator("#picker-action-button").filter({ hasText: "Select for Browser" }).first().click();
     await page.waitForFunction(() =>
@@ -2533,7 +2585,7 @@ async function run() {
       window.__shellMessages = [];
     });
     await libraryFrame.goto(
-      `http://127.0.0.1:${port}/apps/library/?mode=archive-open&returnTarget=archive-manager#home_token=${encodeURIComponent(token)}`,
+      `http://127.0.0.1:${port}/apps/library/?mode=archive-open&returnTarget=archive-manager&home_origin=${encodeURIComponent("http://127.0.0.1:" + port)}#home_token=${encodeURIComponent(token)}`,
     );
     await libraryFrame.locator("#picker-action-button").filter({ hasText: "Open in Archive" }).first().waitFor();
     await libraryFrame.waitForFunction(() => document.querySelector("#status-text")?.classList.contains("hidden"));
@@ -2596,14 +2648,18 @@ async function run() {
       `http://127.0.0.1:${port}/apps/archive-manager/#home_token=${encodeURIComponent(token)}`,
     );
     await archiveMessagePage.evaluate((uri) => {
-      window.postMessage({
-        type: "archive:open-library-object",
-        object: {
-          uri,
-          name: "Portable.zip",
-          mime: "application/zip",
+      window.dispatchEvent(new MessageEvent("message", {
+        data: {
+          type: "archive:open-library-object",
+          object: {
+            uri,
+            name: "Portable.zip",
+            mime: "application/zip",
+          },
         },
-      }, window.location.origin);
+        origin: "null",
+        source: window.parent,
+      }));
     }, `${documentsUri}/Portable.zip`);
     await archiveMessagePage.locator("#entry-list").filter({ hasText: "Nested/deep.txt" }).first().waitFor();
     await archiveMessagePage.close();

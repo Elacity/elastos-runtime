@@ -7,6 +7,7 @@ import {
   inTrash,
   isBlockedObject,
   isDirectory,
+  isRuntimeCustodyProtectableVideo,
   isTrashRootUri,
   isTrashUri,
   isWebSpaceUri,
@@ -134,6 +135,7 @@ import {
     let openObject = async () => {};
     let openWithViewer = () => false;
     let pasteClipboardTo = async () => {};
+    let protectAndListObject = async () => {};
     let publishObject = async () => {};
     let publishSelectedObjects = async () => {};
     let repairObject = async () => {};
@@ -206,6 +208,7 @@ import {
       confirmDestructive,
       hideDialog,
       showObjectStatus,
+      showProtectAndListDialog,
       showProperties,
       showShareDialog,
       showShareReceipt,
@@ -284,6 +287,7 @@ import {
       openObject,
       openWithViewer,
       pasteClipboardTo,
+      protectAndListObject,
       publishObject,
       publishSelectedObjects,
       repairObject,
@@ -317,6 +321,7 @@ import {
       setUploadProgress,
       showMenuForObject,
       showObjectStatus,
+      showProtectAndListDialog,
       showProperties,
       showShareDialog,
       showShareReceipt,
@@ -363,7 +368,10 @@ import {
 
     function publicLibraryText(value) {
       const message = String(value || "").trim();
-      if (!message || !/\b(schema|projection|provider|adapter|capability|affordance|runtime-owned|launch token|hostcall|objects?|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(message)) {
+      if (
+        !message ||
+        !/\b(schema|projection|provider|adapter|capability|affordance|runtime|runtime-owned|launch token|hostcall|objects?|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(message)
+      ) {
         return message;
       }
       return "Library action could not be completed.";
@@ -1001,6 +1009,9 @@ import {
               if (hasCapability(object, "unpublish")) actions.push(menuAction("Unpublish", () => unpublishObject(object)));
           } else if (hasCapability(object, "publish")) {
             actions.push(menuAction("Publish", () => publishObject(object)));
+            if (isRuntimeCustodyProtectableVideo(object)) {
+              actions.push(menuAction("Protect and List...", () => protectAndListObject(object)));
+            }
           }
         }
         actions.push("-");

@@ -4,11 +4,13 @@ import {
   canPreviewObject,
   childUri,
   contentCid,
+  decimalIntegerToHexQuantity,
   hasCapability,
   inTrash,
   isArchiveObject,
   isBlockedObject,
   isDirectory,
+  isRuntimeCustodyProtectableVideo,
   isTrashRootUri,
   isTrashUri,
   isWebSpaceUri,
@@ -37,6 +39,7 @@ export function createLibraryActions({
   setUploadProgress,
   showMenuForObject,
   showObjectStatus,
+  showProtectAndListDialog,
   showProperties,
   showShareDialog,
   showShareReceipt,
@@ -49,6 +52,7 @@ export function createLibraryActions({
 }) {
   const RUNTIME_CUSTODY_METADATA_SCHEMA = "elastos.library.protected-content-identity/v1";
   const MINT_ID_HEX_RE = /^[0-9a-f]{64}$/;
+  const protectAndListInFlight = new Map();
 
   async function openObject(object) {
     if (!object) return;
@@ -337,6 +341,63 @@ export function createLibraryActions({
     await providerApi("publish", { uri: object.uri, if_revision: object.revision });
     setStatus(`Published ${object.name}.`);
     await loadCurrentFolder();
+  }
+
+  async function protectAndListObject(object) {
+    if (!isRuntimeCustodyProtectableVideo(object)) return;
+    const operationKey = String(object.uri || "");
+    const existing = protectAndListInFlight.get(operationKey);
+    if (existing) {
+      setStatus(`Protection for ${object.name} is already in progress.`);
+      return existing;
+    }
+    const operation = (async () => {
+      const decision = await showProtectAndListDialog(object);
+      if (!decision) return;
+      const copies = decimalIntegerToHexQuantity(decision.copies);
+      const price = decimalIntegerToHexQuantity(decision.price);
+      setStatus(
+        `Protecting ${object.name} as ${decision.copies} ${decision.copies === "1" ? "copy" : "copies"} at ${decision.price} base units...`,
+      );
+      try {
+        await providerApi("publish", {
+          uri: object.uri,
+          if_revision: object.revision,
+          protection: {
+            mode: "runtime_custody",
+            copies,
+            price,
+          },
+        });
+      } catch (error) {
+        setStatus(protectAndListFailureStatus(object, error));
+        return;
+      }
+      setStatus(`Protected and listed ${object.name}.`);
+      await loadCurrentFolder();
+    })();
+    protectAndListInFlight.set(operationKey, operation);
+    try {
+      return await operation;
+    } finally {
+      if (protectAndListInFlight.get(operationKey) === operation) {
+        protectAndListInFlight.delete(operationKey);
+      }
+    }
+  }
+
+  function protectAndListFailureStatus(object, error) {
+    const message = String(error?.message || error || "");
+    if (/pending/i.test(message)) {
+      return `Protection for ${object.name} is pending approval or confirmation.`;
+    }
+    if (/denied|forbidden|unauthorized|requires verified/i.test(message)) {
+      return `Protection for ${object.name} was denied.`;
+    }
+    if (/unavailable|not configured|missing/i.test(message)) {
+      return `Protection for ${object.name} is unavailable.`;
+    }
+    return `Protection for ${object.name} failed.`;
   }
 
   async function unpublishObject(object) {
@@ -648,6 +709,7 @@ export function createLibraryActions({
     openObject,
     openWithViewer,
     pasteClipboardTo,
+    protectAndListObject,
     publishObject,
     publishSelectedObjects,
     repairObject,

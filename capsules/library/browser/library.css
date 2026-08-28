@@ -1445,9 +1445,10 @@
       font-size: 0.82rem;
     }
 
-    .dialog-field textarea {
+    .dialog-field textarea,
+    .dialog-field input {
       width: 100%;
-      resize: vertical;
+      min-width: 0;
       border: 1px solid var(--line);
       border-radius: var(--radius-md);
       background: rgba(255, 255, 255, 0.84);
@@ -1457,7 +1458,12 @@
       outline: none;
     }
 
-    .dialog-field textarea:focus {
+    .dialog-field textarea {
+      resize: vertical;
+    }
+
+    .dialog-field textarea:focus,
+    .dialog-field input:focus {
       border-color: rgba(0, 122, 255, 0.45);
       box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
     }
@@ -1465,6 +1471,13 @@
     .dialog-error {
       color: var(--danger);
       font-weight: 700;
+    }
+
+    .protect-and-list-summary {
+      margin: 0;
+      color: var(--ink);
+      font-weight: 600;
+      overflow-wrap: anywhere;
     }
 
     .preview-frame {

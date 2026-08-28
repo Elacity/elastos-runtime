@@ -4,6 +4,7 @@ import {
   formatBytes,
   formatTime,
   hasCapability,
+  decimalIntegerToHexQuantity,
   isDirectory,
   parentUri,
   publishedCid,
@@ -833,6 +834,56 @@ export function createLibraryDialog({
     });
   }
 
+  function showProtectAndListDialog(object) {
+    hideMenu();
+    hideDialog();
+    return new Promise((resolve) => {
+      pendingDialogResolve = resolve;
+      dialog.innerHTML = `
+        <div class="dialog-card" role="dialog" aria-modal="true" aria-labelledby="protect-and-list-title">
+          <form data-protect-and-list-form aria-describedby="protect-and-list-summary protect-and-list-hint">
+            <div>
+              <p class="eyebrow">Protect and List</p>
+              <h2 id="protect-and-list-title" data-protect-and-list-object>${escapeHtml(object.name || "Video")}</h2>
+              <p class="subtitle">Review the listing terms before you submit them.</p>
+            </div>
+            <label class="dialog-field">
+              <span>Copies</span>
+              <input name="copies" type="text" inputmode="numeric" autocomplete="off" value="1" maxlength="78" required>
+            </label>
+            <label class="dialog-field">
+              <span>Price (base units)</span>
+              <input name="price" type="text" inputmode="numeric" autocomplete="off" placeholder="1000000000000000000" maxlength="78" required>
+            </label>
+            <p class="dialog-hint protect-and-list-summary" id="protect-and-list-summary" data-protect-and-list-summary></p>
+            <p class="dialog-hint" id="protect-and-list-hint">Price and copies use positive whole-number base units.</p>
+            <p class="dialog-error hidden" role="alert" data-protect-and-list-error></p>
+            <div class="button-row">
+              <button class="btn" type="button" data-dialog-close>Cancel</button>
+              <button class="btn btn-primary" type="submit">Protect and List</button>
+            </div>
+          </form>
+        </div>
+      `;
+      dialog.classList.remove("hidden");
+      const form = dialog.querySelector("[data-protect-and-list-form]");
+      updateProtectAndListSummary(form);
+      form?.querySelector('input[name="copies"]')?.focus();
+    });
+  }
+
+  function updateProtectAndListSummary(form) {
+    if (!form) return;
+    const objectName = form.querySelector("[data-protect-and-list-object]")?.textContent || "video";
+    const copies = String(form.elements?.copies?.value || "").trim();
+    const price = String(form.elements?.price?.value || "").trim();
+    const summary = form.querySelector("[data-protect-and-list-summary]");
+    if (!summary) return;
+    summary.textContent = copies && price
+      ? `Protect ${objectName} and request a listing for ${copies} ${copies === "1" ? "copy" : "copies"} at ${price} base units each.`
+      : `Protect ${objectName}, then create one listing with the copies and price shown here.`;
+  }
+
   function confirmDestructive({ title, message, confirmLabel }) {
     hideMenu();
     hideDialog();
@@ -871,25 +922,58 @@ export function createLibraryDialog({
   }
 
   function bindDialogEvents() {
+    dialog.addEventListener("input", (event) => {
+      const form = event.target.closest("[data-protect-and-list-form]");
+      if (form) updateProtectAndListSummary(form);
+    });
     dialog.addEventListener("submit", (event) => {
       const form = event.target.closest("[data-share-form]");
-      if (!form) return;
+      if (form) {
+        event.preventDefault();
+        const formData = new FormData(form);
+        const policy = String(formData.get("sharePolicy") || "public_link");
+        const recipients = String(formData.get("shareRecipients") || "")
+          .split(/[\n,]+/)
+          .map((recipient) => recipient.trim())
+          .filter(Boolean);
+        const error = form.querySelector("[data-share-error]");
+        if (policy === "recipient_scoped" && !recipients.length) {
+          if (error) {
+            error.textContent = "Recipient-scoped sharing requires at least one recipient.";
+            error.classList.remove("hidden");
+          }
+          return;
+        }
+        resolveDialogDecision({ policy, recipients });
+        hideDialog();
+        return;
+      }
+      const protectForm = event.target.closest("[data-protect-and-list-form]");
+      if (!protectForm) return;
       event.preventDefault();
-      const formData = new FormData(form);
-      const policy = String(formData.get("sharePolicy") || "public_link");
-      const recipients = String(formData.get("shareRecipients") || "")
-        .split(/[\n,]+/)
-        .map((recipient) => recipient.trim())
-        .filter(Boolean);
-      const error = form.querySelector("[data-share-error]");
-      if (policy === "recipient_scoped" && !recipients.length) {
+      const formData = new FormData(protectForm);
+      const copies = String(formData.get("copies") || "").trim();
+      const price = String(formData.get("price") || "").trim();
+      const error = protectForm.querySelector("[data-protect-and-list-error]");
+      try {
+        decimalIntegerToHexQuantity(copies);
+      } catch (validationError) {
         if (error) {
-          error.textContent = "Recipient-scoped sharing requires at least one recipient.";
+          error.textContent = validationError?.message || "Copies must be a valid quantity.";
           error.classList.remove("hidden");
         }
         return;
       }
-      resolveDialogDecision({ policy, recipients });
+      try {
+        decimalIntegerToHexQuantity(price);
+      } catch (validationError) {
+        if (error) {
+          error.textContent = validationError?.message || "Price must be a valid quantity.";
+          error.classList.remove("hidden");
+        }
+        return;
+      }
+      resolveDialogDecision({ copies, price });
       hideDialog();
     });
 
@@ -949,6 +1033,7 @@ export function createLibraryDialog({
     bindDialogEvents,
     confirmDestructive,
     hideDialog,
+    showProtectAndListDialog,
     showObjectStatus,
     showProperties,
     showShareDialog,

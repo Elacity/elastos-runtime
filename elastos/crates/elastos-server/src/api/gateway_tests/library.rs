@@ -6117,29 +6117,58 @@ async fn test_library_provider_publish_rejects_removed_fixture_and_unknown_prote
 }
 
 #[tokio::test]
-async fn test_library_provider_runtime_custody_publish_fails_closed_without_composition_or_record()
-{
+async fn test_library_provider_runtime_custody_publish_fails_closed_without_composition_or_mint_record(
+) {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let protected_content_root = dir.path().join("protected-content");
+    std::fs::create_dir_all(&protected_content_root).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &protected_content_root,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider(
+            "object",
+            std::sync::Arc::new(crate::library::ObjectProvider::new(
+                dir.path().to_path_buf(),
+                std::sync::Arc::downgrade(&registry),
+            )),
+        )
+        .await
+        .unwrap();
+    let _media_fixture = crate::protected_content_runtime::tests::register_runtime_custody_mock_media_provider_for_test_registry(
+        dir.path(),
+        &registry,
+    )
+    .await;
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &wallet_account_id,
+        10,
+    )
+    .await;
+    let app = gateway_router(state);
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
     crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
     let root = crate::auth::principal_localhost_root(&authority.principal_id);
-    let uri = format!("{root}/Documents/protected-clear-media");
-    let directory_path = library_object_path(dir.path(), &uri);
-    std::fs::create_dir_all(directory_path.join("segments")).unwrap();
-
-    let (init, segments) = clear_runtime_custody_media(0x41);
-    write_library_bytes(&app, &token, &format!("{uri}/init.mp4"), &init).await;
-    for index in (0..segments.len()).rev() {
-        write_library_bytes(
-            &app,
-            &token,
-            &format!("{uri}/segments/{index:08}.m4s"),
-            &segments[index],
-        )
-        .await;
-    }
+    let uri = format!("{root}/Documents/protected-clear-media.mp4");
+    write_library_bytes(&app, &token, &uri, b"media").await;
 
     assert_runtime_custody_publish_error(
         dir.path(),
@@ -6150,7 +6179,18 @@ async fn test_library_provider_runtime_custody_publish_fails_closed_without_comp
         crate::protected_content_runtime::RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE,
     )
     .await;
-    assert!(!dir.path().join("protected-content/runtime-mint").exists());
+    let mint_root = dir.path().join("protected-content/runtime-mint");
+    let journal_entries = std::fs::read_dir(mint_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(journal_entries.len(), 2, "{journal_entries:?}");
+    assert!(journal_entries
+        .iter()
+        .any(|name| name == "runtime-mint-journal.lock"));
+    assert!(journal_entries
+        .iter()
+        .any(|name| name.starts_with("prepare-")));
 }
 
 #[tokio::test]
