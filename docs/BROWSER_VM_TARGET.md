@@ -375,6 +375,12 @@ artifact paths for crosvm and VZ target maintenance.
 and `browser-local-exit`. It does not currently own the source-home Browser VM
 helper script wrappers or VM guest artifacts.
 
+Full source-home setup installs the Runtime at the stable platform data-root
+path `bin/elastos` and writes
+`receipts/source-home-installation.json`. Platform restart helpers validate
+that receipt, current source identity, and installed artifact parity before
+they stop or start a Runtime.
+
 For source-home runtimes, `scripts/setup-source-home.sh` is the canonical
 generator/stager for:
 
@@ -439,9 +445,11 @@ XDG_DATA_HOME=<target-xdg-data-home> \
 scripts/linux-source-home-restart.sh \
   --home <target-home> \
   --xdg-data-home <target-xdg-data-home> \
-  --addr <target-loopback-addr> \
-  --json-out <target-elastos-data-dir>/logs/gateway-restart.json
+  --addr <target-loopback-addr>
 ```
+
+The Linux helper writes its receipt to
+`<target-elastos-data-dir>/receipts/linux-source-home-restart.json`.
 
 After the target refresh, prove the target from the reconciliation host:
 

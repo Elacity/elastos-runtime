@@ -8,7 +8,9 @@ automatically a stable end-user command.
 
 - `build.sh` builds Runtime and capsules.
 - `install.sh` runs the signed installer.
-- `setup-source-home.sh` builds and provisions a source Home.
+- `setup-source-home.sh` builds and provisions a source Home. Full mode
+  installs one stable Runtime under the platform data root and writes the
+  versioned source-home installation receipt.
 - `home-demo-local.sh` and `chat-demo-local.sh` start disposable local demos.
 - `share-demo.sh` runs the focused sharing demo.
 - `setup-crosvm.sh` installs VM prerequisites.
@@ -79,6 +81,9 @@ Common branch gates include:
 - `capsule-inspector-act-check.sh` for Inspector scope and Inbox approval
 - `installed-provider-verify.sh` for an installed provider manifest and binary
 - `source-home-capsule-inventory-smoke.py` for source-home capsule finalization
+- `protected-content-installed-static-audit.py` for a bounded read-only audit
+  of source identity, installed artifacts, private provider declarations, and
+  operator prerequisites; `ready_for_active_proof` is not product readiness
 
 `public-copy-entropy-check.mjs` checks selected public manifests, static HTML,
 accessibility labels, and Home CLI command copy for Home, People, Spaces,
@@ -112,9 +117,12 @@ ports, and data roots belong in local operator notes.
 
 ## Live and recovery helpers
 
-`linux-source-home-restart.sh` restarts a Linux source-home gateway after setup
-has installed the new binary. It checks the Home and Services artifacts before
-reporting success.
+`mac-source-home-restart.sh` and `linux-source-home-restart.sh` restart only the
+stable source-home Runtime after they validate the installation receipt,
+current clean source identity, exact prior process, bounded rollback, and
+served artifact parity. Linux writes
+`receipts/linux-source-home-restart.json` under the stable data root and has no
+receipt-output argument.
 
 `recovery-kit-live-smoke.sh` requires a signed Home or System session through
 `ELASTOS_HOME_TOKEN`, a Cookie header, or a cookie jar. Export also requires a

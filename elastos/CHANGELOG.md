@@ -5,6 +5,20 @@ All notable changes to the public ElastOS Runtime repository.
 ## [Unreleased]
 
 ### Added
+- The unpublished 0.7 source integrates the reviewed protected-content
+  lifecycle with collaboration, Home/platform, Wallet, GBA, model-provider,
+  Assistant, Library, Marketplace, and player UIUX. The Runtime-owned
+  protected-content path remains inactive until installed proof and cutover.
+- A bounded read-only protected-content audit verifies source and installed
+  artifact parity, private provider declarations, profile and role facts, and
+  operator prerequisites. Its redacted receipt reports readiness for active
+  proof separately from product readiness.
+- Full source-home setup installs one stable Runtime under the platform data
+  root and writes an owner-only receipt that binds source identity, Runtime,
+  components, capsule metadata, platform, and installation time.
+- macOS and Linux source-home restart helpers validate the stable installation
+  receipt and exact prior process before replacement. They own one PID file,
+  one bounded principal-root rollback, and one atomic restart receipt.
 - People now reports Profile readiness explicitly. Passkey registration and
   Profile setup are separate: a valid passkey remains valid when Profile setup
   is not ready, and People directs the person to System Recovery rather than

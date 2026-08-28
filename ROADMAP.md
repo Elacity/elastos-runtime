@@ -185,29 +185,19 @@ E. PQ-hybrid share wrap, recipient possession, decrypt-session wrap, and the
    now uses production rights wiring, three independently addressed
    custody-provider processes, one protect-provider process, and the
    decrypt-provider process, and already covers the combined wrong-object/media
-   binding and durable replay cases. The remaining ordered product gates are:
-   A. package and provision the new protect provider, three custody instances,
-      and decrypt provider through the existing component/install/supervisor
-      model, internal and inactive only;
-   B. make protect and decrypt production-callable through the existing
-      `ProviderRegistry`, and add one Runtime-owned protected-content product
-      service for mint/buy/open/read/close orchestration and journals, still
-      inactive;
-   C. wire the existing Library creator import/mint/list flow to
-      protect -> custody -> content availability with identity-only Runtime
-      state;
-   D. wire the existing Marketplace buy flow and Library open/viewer flow to
-      the existing Wallet/transaction/Chain and release/decrypt path;
-   E. land one atomic cutover commit that activates the new route and removes
-      the provisional `drm` / `rights` / `key` / old `decrypt` startup, DTO,
-      provider-resource/catalog, build/install/component/WCI/test/doc surface,
-      with no fallback or dual path; and
-   F. prove the minimum installed one-Runtime/two-principal product acceptance.
+   binding and durable replay cases. This inactive source proof runs on one
+   Runtime with two principals. The requested localhost-to-seed journey first
+   needs a typed buyer Runtime import or resolution operation for the creator's
+   immutable listing, which is currently a local Runtime record, plus custody
+   release that authenticates a buyer Runtime
+   issuer distinct from the provisioning Runtime. A shared listing link is
+   sufficient for 0.7. Global listing discovery and public custody governance
+   remain later work.
 
-The first honest product proof is one installed Runtime with two human
-principals. Current source pins one local Runtime device issuer; multi-Runtime
-issuer admission and cross-Runtime protected-content exchange are later
-explicit pre-public-network gates.
+After that source slice, the ordered gates are final source review, same-tree
+installation, signed 2-of-3 custody, private Chain and deployed proof, bound-KID
+allow/deny and exact buy proof, replicas and repair, the installed two-Runtime
+journey, the manual UIUX matrix, and one atomic cutover.
 
 Share wrap on this current review tree is PQ-hybrid. It is still not a product
 mint path. First minted objects must stay PQ-hybrid; do not add a classical
@@ -217,18 +207,15 @@ scenarios, CENC/play, and UX shape. Its public `shares[]` metadata, PQ-off
 decrypt defaults, raw-CEK/reference operations, old DRM orchestration, direct
 TCP/IP topology, and standalone harness must not become the product path.
 
-The published protected-content lifecycle prefix currently reaches
-`origin/feat/protected-content-runtime-lifecycle` at `34465959`. The earlier
+The published protected-content lifecycle source reaches
+`origin/feat/protected-content-runtime-lifecycle` at `854d9dc9`. The earlier
 published `origin/feat/protected-content-custody-provider` branch remains
 historical source-only evidence for the custody-provider introduction. Local
-`feat/protected-content-runtime-lifecycle` adds the inactive Runtime-owned
-mint/list/buy/open/release/decrypt/close source path without changing
-installed product behavior. It also adds Wallet-rights, a private Runtime
-coordinator, typed Chain evidence, and a typed rights evaluator on that source
-line. Do not continue `feat/protected-content-runtime-coordinator-v1`. Rights
-evaluation invokes existing `chain` evidence through the Runtime registry. The
-remaining-work plan is the
-[Protected-content integration plan](docs/PROTECTED_CONTENT_EXTRACTION.md).
+integrated source through `b817e0fe` adds the inactive Runtime-owned
+mint/list/buy/open/release/decrypt/close path, stable installation receipts,
+the static installed audit, and exact platform restart ownership. It does not
+change the active installed protected-content path. The remaining-work plan is
+the [Protected-content integration plan](docs/PROTECTED_CONTENT_EXTRACTION.md).
 
 Carrier remains transport only throughout that sequence. It carries
 Runtime-selected traffic, but it does not define rights authority, custody

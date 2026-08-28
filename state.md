@@ -3,224 +3,138 @@
 Last updated: 2026-08-28 UTC
 
 This file records public-safe current truth for released 0.6.0 and active
-unpublished work. Historical
-local proof logs, private SSH aliases, tunnel ports, operator usernames, key
-paths, and target backup paths are intentionally not tracked in the public
-repository.
+unpublished work. Private operator paths, credentials, target identities, and
+volatile proof logs remain outside the repository.
 
 ## Release Posture
 
-- `main` at `d358dedb` is the released 0.6.0 line.
-- `origin/feat/0.7-uiux-candidate` at `8b547590` is published source evidence
-  for the reviewed collaboration, Home/platform, Wallet, GBA, model-provider,
-  and Assistant UIUX groups. It is not installed, live, release, or manual
-  acceptance evidence.
-- `feat/protected-content-contracts` is a published source-only contract
-  branch, stacked for review on
-  `origin/review/collaboration-product-integration`. It adds the
-  canonical `elastos-protected-content-contracts` crate, the related
-  documentation, and the shared strict DID/Carrier codec correction required by
-  that contract surface. It does not integrate Runtime orchestration, provider
-  replacement, custody, threshold reconstruction, recipient encryption proof,
-  decryption, playback, installation, or deployment.
-- `origin/feat/protected-content-custody` is the published source-only child
-  branch
-  stacked on `origin/feat/protected-content-contracts`. It adds the
-  `elastos-protected-content-custody` crate plus custody-envelope
-  provisioning and recipient-sealed node release. It also includes the typed
-  EVM rights-policy and evidence contracts, Profile-signed recipient-key
-  authorization, signed custody epochs, the Runtime-to-release-node operation
-  envelope, and one owner-only node-local durable dual-key replay store. That
-  store privately gates release, persists the exact encrypted node
-  contribution, and replays only that result after restart.
-- `origin/feat/protected-content-key-reconstruction` is the published
-  source-only child branch stacked on
-  `origin/feat/protected-content-custody`. It adds authenticated release
-  reconstruction inside the decrypt boundary for new content. Its current
-  reviewed behavior rejects invalid X25519 contract key bytes before HPKE use,
-  requires exactly the bound released threshold, and checks a manifest-bound
-  CEK commitment after reconstruction to detect a wrong reconstructed key. A
-  durable local claim without a stored result fails closed and currently
-  requires a fresh Runtime release operation; there is no operation-resume
-  journal for that state.
-- `origin/feat/protected-content-custody-provider` is the historical published
-  source-only protected-content branch at `f7cd6c3d`. Its ancestry includes
-  provider protocol, authenticated payload sealing, local decrypt-output,
-  object-bound custody-pool policy, one-node provisioning authority, expected
-  Runtime issuer pinning, owner-only durable node-share storage, and the
-  unregistered `capsules/custody-provider` process. It proves exact
-  object/pool/epoch/committee binding, one selected node and one sealed-share
-  provisioning record, local-node validation, exact duplicate/conflict/restart
-  behavior, signed-rights-gated release, exact encrypted contribution replay,
-  bounded provider frames, redacted diagnostics, and clean shutdown. It exposes
-  no CEK, raw share, topology, Carrier authority, route, host, IP address,
-  port, path, or credential. It is not registered, installed, deployed, or
-  product-current. The old provisional `key-provider` remains the only active
-  registered product key/custody path until a later atomic Runtime cutover.
-- `origin/feat/protected-content-wallet-rights` at `2c69d0c2` is the published
-  source-only child branch that adds a dedicated Wallet operation for
-  protected-content rights. It signs the exact canonical `RightsRequestV1`
-  bytes for the selected active EVM account through the existing verified
-  Wallet invocation context. It does not add Runtime, Library, provider
-  registration, Carrier, or product UI behavior.
-- `origin/feat/protected-content-runtime` at `b00bfeeb` is the published
-  source-only child branch that adds private durable Runtime release state
-  and typed internal coordination over the Wallet-rights, rights-provider, and
-  custody-provider contract types. It persists before provider effects, records
-  effect-started state, treats ambiguous post-dispatch outcomes as durable
-  nonterminal state, replays only exact stored terminal results, and prevents
-  caller-selected provider or topology input. It is not wired into
-  `elastos-server` product routes, Library, viewer output, or the installed
-  provisional path.
-- `origin/feat/protected-content-rights` at `43a83e5b` is the published
-  source-only child branch that adds typed chain-rights evidence and the
-  typed rights evaluator. Evidence acquisition is bound to the exact Runtime
-  release operation, verifies live chain id, uses an exact canonical block
-  hash/number binding, binds contract/method selector, has bounded freshness,
-  redacts upstream failures, and does not accept caller-supplied rights facts.
-  It remains source-only and unregistered.
-- Published `origin/feat/protected-content-runtime-lifecycle` at `854d9dc9`
-  is stacked on published
-  `origin/feat/protected-content-rights` at `43a83e5b`. The inactive
-  Runtime-owned mint -> availability -> creator mint/list -> buy -> open ->
-  play -> close path is complete on that published source line:
-  Runtime-owned mint durability, fresh pre-buy availability, verified creator
-  mint/list binding, Runtime-owned buy with finalized access corroboration,
-  durable viewer lifecycle, and the inactive combined mint -> buy -> open ->
-  play -> close proof. Later closeout commits keep Base read-path truth and
-  docs current without changing installed-product scope. The atomic cutover
-  has not started.
-- `CustodyEnvelopeV1` is current source-only inactive Runtime
-  open/provisioning material stored owner-only at
-  `protected-content/runtime-open/{mint}/envelope.bin`, not public asset
-  metadata. It is separate from the identity-only mint journal and from public
-  metadata, capsules cannot read it, and Runtime cannot open the node-sealed
-  shares inside it. Each selected custody provider persists only its own raw
-  share. Public metadata contains no shares; it contains bounded identities,
-  threshold/epoch/pool facts, CEK commitment, and signatures only.
-- Raw CEK and private-key JSON vectors in historical protected-content work are
-  deterministic test fixtures only. Product operations, responses, logs, public
-  metadata, and durable product state must not contain raw CEKs.
-- PR #15 / `feat/dkms-esp-port` remains public, unmerged source evidence only:
-  keep its threshold crypto, node-local custody, recipient-sealed
-  contributions, CEK commitment, lifecycle scenarios, and fail-closed negative
-  tests as research; reimplement per-node durable shard storage,
-  DKG/rotation/re-share/revocation, pool/governance policy, provider roles, and
-  Runtime-open scenarios at the canonical boundary; reject its public
-  aggregated `shares[]` metadata, capsule-owned authority, raw CEK operations,
-  `rail_shim`/reference fallbacks, old `drm-provider` orchestration, direct
-  topology in capsules or contracts, static authorization fallbacks, and
-  standalone harness as a product route. Its generated producer-smoke
-  `escrow.json` is historical dev evidence only because it aggregates wrapped
-  shares. The producer smoke writes and reloads `cek_commitment_b64`; the older
-  Creator path carried the missing-commitment writer/reloader inconsistency.
-- Published protected-content lifecycle source proof is complete for the inactive
-  Runtime-owned mint -> availability -> creator mint/list -> buy -> open ->
-  play -> close path through `854d9dc9`, but it is
-  still not installed or product-complete.
-  Runtime tests prove durable 2-of-3 custody provisioning, exact pre-buy
-  signed availability rechecks, Runtime-owned creator mint/list settlement,
-  immutable listing bind, Runtime-owned buy with finalized multi-source access
-  corroboration, and durable viewer lifecycle/cleanup. The typed combined proof
-  now drives the existing gateway Runtime seams with two distinct principals and
-  accounts, one shared ProviderRegistry, real protect/custody/decrypt provider
-  processes, typed Wallet approval/effect replay, creator mint -> listing ->
-  buyer purchase -> finalized access corroboration -> open -> 2-of-3 release ->
-  decrypt init/segment read -> exact close, with zero unresolved Runtime or
-  provider state. The proof still uses deterministic test Wallet/Chain/content
-  fixtures for non-installed authority surfaces, so it is source proof rather
-  than installed/live product evidence. Lower-level Runtime lifecycle and
-  decrypt-provider process tests still separately prove PQ-hybrid contribution
-  reconstruction, exact CENC media reads, close replay, process restart, and
-  old-handle absence. Separate Runtime restart/replay tests prove persisted
-  terminal replay and retained nonterminal state after effect start. The
-  decrypt provider generates each operation-scoped recipient key and retains
-  its secret behind an opaque handle; Runtime receives only the public
-  key/identity, and a Profile signature authorizes that exact key. No Profile
-  seed enters Runtime, custody, or decrypt-provider contracts. The combined
-  inactive proof and its supporting lower-layer tests cover wrong-recipient and
-  wrong-object/media-binding rejection, exact durable release replay from the
-  same Runtime journal, explicit provider unregister/absence cleanup, and zero
-  unresolved release state. Restart/crash/cleanup remain owned by the
-  lower-layer process and journal tests:
-  `capsules/custody-provider/tests/process.rs::custody_provider_process_provisions_releases_replays_after_restart_and_shuts_down`,
-  `capsules/protected-content-decrypt-provider/tests/process.rs::process_prepare_open_read_close_replay_and_restart_absence_flow`,
-  `elastos/crates/elastos-protected-content-runtime/src/journal.rs::durable_state_replays_only_persisted_terminal_result`,
-  `elastos/crates/elastos-protected-content-runtime/src/coordinator.rs::runtime_coordination_replays_terminal_without_dispatch`,
-  `elastos/crates/elastos-protected-content-runtime/src/mint.rs::restart_after_effect_started_stays_nonterminal`,
-  and `elastos/crates/elastos-protected-content-runtime/src/mint.rs::custody_provisioned_replays_without_redispatch`.
-  Focused Profile-signing, Wallet binding, Chain evidence, and the integrated
-  deterministic process path already cover the source seams they own. Current
-  source still pins one local Runtime device issuer; multi-Runtime issuer
-  admission is not yet present. The new protected-content path remains
-  inactive, not installed, not cut over, and not product-ready.
-- Released 0.6 and the published collaboration review stack retain the older
-  provisional `elastos_common::protected_content` DTOs plus fail-closed
-  `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
-  capsules. That old DRM/provider surface remains installed and source-visible
-  only until an atomic Runtime cutover replaces it. It does not consume or
-  prove the new v1 contract, and the new protected-content product path is not
-  yet connected or usable. Installed-target truth requires separate target
-  evidence.
-- An independent branch-local source/contract review of the published
-  `origin/feat/protected-content-contracts` branch completed with no code
-  findings after the strict DID codec and Carrier codec consolidation. This is
-  not an external cryptographic audit or production security approval.
-- An independent AI/model review found the invalid-X25519 acceptance,
-  released-threshold mismatch, and missing reconstructed-key commitment check
-  now corrected on the custody branch. That review is useful source
-  review evidence, not a professional external cryptographic audit.
-- The collaboration source adds Runtime-backed People/Chat collaboration
-  and selected shell UI work. The source boundary is complete for review:
-  Profile authority, Runtime lifecycle, Carrier routing, People/Chat
-  projections, and the strict fixture-owned two-Runtime acceptance all pass.
-  Normal localhost and public seed installation remain separate product gates.
-- The integrated source uses one coordinated Carrier generation: Iroh 1.0.2,
-  iroh-gossip 0.101.0, mDNS 0.4.0, and distributed-topic-tracker 0.3.5.
-  Localhost, public-seed, and manual Browser proof require fresh evidence for
-  the exact integrated commit.
-- The integrated source keeps the Runtime-owned protected-content,
-  collaboration, Carrier, Wallet, Chain, provider lifecycle, and audit
-  boundaries while adding the reviewed UIUX presentation groups. Source
-  presence does not establish installation or product acceptance.
-- Source-home CI defines Linux x86_64, Linux aarch64, and macOS matrix jobs with
-  a 10 percent free-space gate and job-shared Cargo targets. The workflow
-  definition is source configuration; its execution result is separate CI
-  evidence.
-- The Runtime implements the WASM Component Model path through
-  `elastos.component/v1` and the Runtime-mediated `elastos:bus@v1` authority
-  contract. The conformance fixture and authoring template exercise it; all 18
-  shipped first-party UI Apps still use `elastos.runtime-projection/v1` web
-  projections. WASI Preview 1 is rejected at product capsule admission.
-- Source/review proof must cite concrete reusable commands: `git diff --check`,
-  `node scripts/home-entropy-check.mjs`, `node scripts/browser-entropy-check.mjs`,
-  `bash scripts/check-wci-alignment.sh`, `just candidate-command-audit`, and the
-  touched-surface Rust/capsule tests.
-- Component ABI proof also includes
-  `node scripts/check-first-party-wasi-gate.mjs`, which reports every
-  first-party WASI Preview 1 capsule finding and fails on unclassified product
-  WASI usage.
-- ElastOS Bus v1 deliberately omits streams because no shared
-  capability/audit/lifecycle implementation exists yet. Its checked-in WIT hash
-  is `7a026e0a641c8c04214576dc85a677e0b52c9f02866d231119f9a3ba609d49e2`;
-  the conformance fixture and Component authoring template are bound to that
-  hash. No shipped first-party product Component proves adoption end to end.
-- [docs/CAPSULE_AUTHORING.md](docs/CAPSULE_AUTHORING.md),
-  [templates/capsules](templates/capsules), and `elastos init` are the canonical
-  capsule authoring paths. Their manifests are validated by repository gates;
-  generated product capsules have no WASI, ambient environment, preopen,
-  socket, FIFO, or direct provider authority.
-- People is a standalone first-party web-projection capsule under
-  `capsules/people`. Home launches `/apps/people/` with a People-scoped token;
-  People owns its UI and calls only its Runtime-mediated app routes.
-- Release publishing validates every discovered capsule manifest and rejects
-  missing descriptions, missing authors, and scaffold placeholder authors.
-- Target proof is operator-supplied. It must name target roles and exact command
-  lines without committing private host aliases, SSH keys, tunnel ports, local
-  data roots, or other private operator paths.
-- Private proof logs stay outside this repo. Public release notes should claim
-  only proof that can be reproduced from the reviewed source or from
-  explicitly supplied target evidence.
+- `main` at `d358dedb` is the released 0.6.0 source line.
+- `origin/feat/protected-content-runtime-lifecycle` at `854d9dc9` is the
+  published protected-content lifecycle source. It proves the inactive
+  Runtime-owned lifecycle through mint, availability, listing, purchase, open,
+  read, and close.
+- `origin/feat/0.7-uiux-candidate` at `8b547590` is the published UIUX donor
+  for reviewed collaboration, Home/platform, Wallet, capsule/GBA,
+  model-provider, and Assistant groups.
+- The unpublished integrated source prefix through `b817e0fe` reconstructs
+  those two published lines and adds the reviewed protected-content product,
+  private-provider, installation, audit, and restart slices. This commit is
+  source evidence. It is not a published review ref, installed target, or live
+  deployment.
+- The active protected-content product path remains provisional. The canonical
+  source path is inactive while exact installed proof and one atomic cutover
+  remain open.
+- The inactive protected-content source proof uses one Runtime with two
+  principals. The requested localhost-to-seed journey remains open because a
+  creator listing is a local Runtime record with no typed buyer Runtime import
+  or resolution from its content and Chain identity, and custody release still
+  pins the provisioning Runtime issuer instead of authenticating a distinct
+  buyer Runtime issuer.
+
+## Integrated Source Truth
+
+Runtime owns authenticated principal and session authority, capability
+admission, provider selection, lifecycle, durable operation identity, Wallet
+and Chain coordination, audit, and settlement. Providers own their typed
+operation semantics. Carrier transports only Runtime-selected endpoint traffic.
+Capsules own presentation and app behavior and receive bounded read models and
+opaque selectors only.
+
+The integrated source includes these durable facts:
+
+- Collaboration identifies people by Profile DID and uses endpoint DIDs for
+  private Runtime routing. People and Chat consume typed Runtime projections.
+- Home owns shell chrome, launch framing, focus, fullscreen, clipboard
+  mediation, notifications, and sign-out. Capsules own their content and icons.
+- Wallet owns accounts, approvals, signatures, and transaction effects. Runtime
+  binds protected-content creator and buyer operations to the verified Wallet
+  account and configured Chain authority.
+- Assistant is a capsule. Runtime selects one model offer through
+  `ProviderRegistry`, and `model-provider` owns model execution. Assistant
+  renders bounded, sanitized markdown and math from typed output.
+- Library prepares, protects, lists, and opens video through typed Runtime
+  operations. Marketplace reads immutable listing projections and submits only
+  the mint identity for buy or open. `elacity-player` owns video presentation.
+- Runtime keeps the canonical protect, media, custody, and protected-content
+  decrypt providers on reserved private targets. Public capsule lookup,
+  interface projection, and provider routes exclude these targets.
+- Protected publication requests exactly three replicas. The repair task keeps
+  the same requirement. Purchase and open both require fresh signed
+  availability bound to the exact protected object.
+- Protected Chain configuration is an owner-only
+  `protected-content/chain-provider.json` file. It contains one versioned
+  `protected_content_network`; Runtime supplies its operation issuer
+  separately. Node-local rights evaluation uses 2-5 explicit private RPC
+  sources and requires two exact agreeing finalized results.
+- `scripts/protected-content-installed-static-audit.py` reads installed
+  artifacts and emits
+  `elastos.protected-content.installed-static-audit/v1`. It reports source and
+  static artifact failures, operator configuration prerequisites, and active
+  installed proof prerequisites separately. `ready_for_active_proof` is a
+  static admission result, not product readiness.
+- Full `scripts/setup-source-home.sh` installs one stable Runtime at the
+  platform data root under `bin/elastos`. It writes the owner-only
+  `receipts/source-home-installation.json` receipt after components, native
+  providers, capsule trees, and source-home capsule metadata are final. The
+  receipt binds source commit/tree/clean state and exact artifact hashes.
+- `scripts/mac-source-home-restart.sh` and
+  `scripts/linux-source-home-restart.sh` select only that stable Runtime.
+  Each validates current clean source identity and installation receipt before
+  stop or migration, owns one exact PID file, stops only the identity-bound
+  prior Runtime, retains at most one bounded principal-root rollback, and writes
+  one owner-only restart receipt. Runtime owns provider shutdown.
+- The macOS replacement-restart path is proven in its fixture on this host,
+  including a live prior Runtime after atomic binary replacement. Linux dry-run
+  and fixture proof is source evidence; active `/proc`, listener, and binary
+  replacement behavior still requires Linux target evidence.
+
+## Protected-content Contract Truth
+
+KID and `EncryptedContentIdentityV1` are separate identities. The bytes16 CENC
+KID is the deployed AuthorityGateway access key. The full encrypted-content
+identity binds the protected object and media contract.
+
+Verified deployed read behavior is:
+
+- `AuthorityGateway.hasAccessByContentId(address,bytes16) -> bool` owns the
+  access read.
+- `CentralStorage.ipReference(bytes16)` resolves the KID for that read.
+- An unknown KID reverts with `UnboundContentId(bytes16)`; a bound KID without
+  access returns `false`.
+
+The exact CentralStorage binding write and authorization remain open.
+`AuthorityGateway.buyAccess` is the intended purchase operation, and its exact
+deployed ABI, receipt, and event still need target proof. Deployed
+`View`/`Download` contract semantics are also open, so signed Runtime policy
+continues to own those action distinctions.
+
+The canonical source path keeps Runtime journals limited to identities, state,
+receipts, and settlement. Protect, custody, and decrypt providers keep clear
+media, ciphertext staging, CEKs, and shares inside their private process
+boundaries. Each custody node owns one independent share and its node-local
+rights check. Runtime and capsules do not receive private provider, storage,
+Chain, RPC, or Carrier topology.
+
+## PR15 Extraction Ledger
+
+PR #15 / `feat/dkms-esp-port` is source evidence, not a merge target. The
+integrated source adapted these useful parts to the typed Runtime path:
+
+- `6d2e9083`: player/viewer behavior and Library-open UX now use typed Runtime
+  launch, read, and close operations.
+- `c5aed9db`: Creator UX now appears as the Library protect-and-list flow.
+- `57974479`: the grant journey maps to current Profile, session, Wallet, and
+  Runtime authority.
+- `ffea5998`: useful Create, mint, and open failure cases are covered by the
+  current typed paths.
+- `e148218b`: applicable CI lessons remain in the focused source and platform
+  gates.
+
+Current video opens in `elacity-player`. Document and 3D viewers remain later
+typed-viewer scope. External cryptographic review remains open before public
+dKMS or production confidentiality claims. Global listing discovery and public
+custody governance remain later work; a shared listing link and bounded buyer
+Runtime issuer admission are the open 0.7 source boundary.
 
 ## Capsule Execution Truth
 

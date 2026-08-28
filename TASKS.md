@@ -17,39 +17,61 @@ section if a higher section is incoherent, unverified, or too large to review.
 
 Active priority index:
 
-- current source work: protected-content review correction under
+- current source work: close the two exact cross-Runtime protected-content
+  boundaries under
   [Trusted content and access rights](#trusted-content-and-access-rights)
 - integrated UIUX source evidence: published
   `origin/feat/0.7-uiux-candidate` at `8b547590`; this ref is donor evidence,
   not installed, live, or release truth
-- separate remaining product proof: collaboration and UIUX installed localhost,
-  manual interaction, and public-seed gates, with no scope expansion
 - all other work remains queued below
 
-### Integrated UIUX product proof
+### Integrated UIUX and protected-content proof
 
-The integrated source retains Runtime-owned collaboration, protected-content,
-provider, Wallet, Chain, and Carrier authority while adding the reviewed UIUX
-surfaces from the published source evidence above. Source presence does not
-prove installed artifacts or human product behavior.
+The integrated source proves the inactive protected-content journey with one
+Runtime and two principals. Runtime owns authority, provider selection,
+lifecycle, Wallet and Chain effects, and audit. The reviewed UIUX groups own
+presentation and app behavior. Source presence does not prove installed
+artifacts or a cross-Runtime product journey.
 
 Open gates, in order:
 
-1. [ ] Finish the protected-content tail and durable documentation
-   reconciliation before installation or publication review.
-2. [ ] Install the exact reviewed integrated commit on localhost and collect the
-   remaining product evidence that source tests cannot prove: manual Browser
-   visible video/input usability, Home shell acceptance, Assistant visible
-   Chat/Build/Studio behavior, and GBA theme/layout acceptance on the installed
-   artifacts.
-3. [ ] Install that same reviewed commit on the public seed and rerun the
-   real two-Runtime collaboration journey with exact source/installed artifact
-   parity.
-4. [ ] Review the install evidence and update release truth before any named
-   publication, merge, tag, or deployment action.
-5. [ ] Add the private operator-owned model-provider config on the Runtime line
-   only when real model offers are ready for install proof. Missing config is an
-   honest zero-offer Assistant state and is not itself a source defect.
+1. [ ] Add one bounded cross-Runtime source slice before installation. A buyer
+   Runtime needs a typed way to import or resolve the creator's immutable
+   listing from its content and Chain identity. A shared listing link is
+   sufficient for 0.7; global market discovery remains later work. Custody
+   release must authenticate a buyer Runtime issuer that differs from the
+   provisioning Runtime while preserving the Profile-signed recipient-key
+   binding, node-local rights decision, signed operation, exact replay, and
+   provisioning issuer authority. Keep the public contracts frozen and do not
+   design public custody governance in this slice.
+2. [ ] Complete the final source review after that slice and prepare the 0.7
+   review branch.
+3. [ ] Install the exact same reviewed tree on localhost and the seed with
+   matching stable Runtime, component, capsule metadata, provider, static audit,
+   installation, and platform restart receipts.
+4. [ ] Provision one real signed owner-only 2-of-3 custody composition across
+   three distinct operators and failure domains.
+5. [ ] Install the private multi-source Chain configuration and prove the
+   deployed Base reads.
+6. [ ] Prove one bound KID with one allowed and one denied Wallet account,
+   CentralStorage binding evidence, and the exact
+   `AuthorityGateway.buyAccess` receipt and event.
+7. [ ] Prove three protected-content replicas and repair after one replica is
+   lost.
+8. [ ] Run the installed two-Runtime journey: mint and list on localhost, then
+   resolve, deny, buy, open, play, and close on the seed. Prove exact restart,
+   replay, tamper rejection, provider settlement, and cleanup.
+9. [ ] Complete the manual UIUX matrix for Home windows, focus, fullscreen, and
+   launcher; People, Chat, Inbox, and Clipboard; Wallet and connectors; Library,
+   Marketplace, and `elacity-player`; Assistant model-offer states; GBA; and
+   Browser.
+10. [ ] Make one atomic cutover that selects the Runtime-owned protected-content
+    path and removes the provisional `drm`, `rights`, `key`, and `decrypt`
+    authority surfaces from startup, registration, resources, packaging, tests,
+    and docs.
+
+The operator-owned model-provider configuration remains a separate installed
+Assistant proof item. Missing configuration is an honest zero-offer state.
 
 ## Later
 
@@ -579,71 +601,66 @@ evidence, while installed and live truth requires separate target evidence.
 
 Current protected-content source status lives in [state.md](state.md) and
 [Protected-content integration plan](docs/PROTECTED_CONTENT_EXTRACTION.md).
-The current `feat/protected-content-runtime-lifecycle` source line proves the
-inactive Runtime-owned mint -> availability -> creator mint/list -> buy ->
-open -> 2-of-3 release -> decrypt -> close path in source, but it is not
-installed, not cut over, and not installed-product truth.
+The current inactive source proof uses one Runtime and two principals for mint,
+availability, listing, deny, buy, open, 2-of-3 release, decrypt, and close. It
+does not prove the requested localhost-to-seed protected-content journey.
 
-- [ ] Installed prerequisites — deployed-contract and installed proof. Keep these
-  open facts exact:
+- [ ] Close the cross-Runtime source boundary before final source review:
+  - A buyer Runtime needs a typed import or resolution operation for the
+    creator's immutable listing, bound to its content and Chain identity. A
+    shared listing link is sufficient for 0.7. Global listing discovery remains
+    later work.
+  - Each custody node must authenticate a buyer Runtime issuer that differs from
+    the provisioning Runtime while preserving the Profile-signed recipient-key
+    binding, node-local rights decision, signed operation, exact replay, and
+    provisioning issuer authority.
+  - Keep the frozen public protected-content contracts unchanged. This task
+    defines the missing ownership boundary; implementation and review must
+    choose the narrow typed operation.
 
+- [ ] Keep deployed-contract and installed prerequisites exact:
   - AuthorityGateway access reads use
     `hasAccessByContentId(address holder, bytes16 contentId) -> bool`.
-  - The exact bytes16 KID is separate from `EncryptedContentIdentityV1`.
-  - `UnboundContentId(bytes16)` means unknown/unbound object, not deny.
-  - AuthorityGateway read resolution goes through
+  - The bytes16 KID remains separate from `EncryptedContentIdentityV1`.
+  - `UnboundContentId(bytes16)` means unknown or unbound, while a bound KID
+    without access returns `false`.
+  - AuthorityGateway read resolution uses
     `CentralStorage.ipReference(bytes16)`.
-  - The exact KID-binding write operation and its authorization remain
-    unverified; do not claim `bindIP` or any binding write path is proven.
-  - Deployed `View` / `Download` contract semantics remain open.
-  - The exact `buyAccess` ABI/receipt/event and whether Runtime must issue it
-    for canonical purchase state remain open.
-  - Deployed proof still needs one known bound KID with one allowed and one
-    denied wallet against the reviewed proxy.
-  - Installed prerequisites still need one signed owner-only three-node 2-of-3
-    custody composition, private multi-source Chain config, packaged protect +
-    custody + decrypt provider registration, and an installed three-replica
-    availability plus repair-after-one-loss proof.
+  - The exact KID-binding write and authorization remain unverified.
+  - Deployed `View` and `Download` contract semantics remain open. Signed
+    Runtime policy owns those action distinctions until contract evidence
+    defines them.
+  - The exact `AuthorityGateway.buyAccess` ABI, receipt, and event remain open.
+  - Deployed proof needs one known bound KID with one allowed and one denied
+    Wallet account.
+  - Installed proof needs one signed owner-only three-node 2-of-3 custody
+    composition, private multi-source Chain configuration, three replicas,
+    repair after one loss, and exact stable installation receipts.
   - External cryptographic review remains open.
 
-- [ ] Atomic cutover — Entry: the installed prerequisites are green while the
-  current path remains inactive. Exit: activate the Runtime-owned
-  protected-content path and remove the provisional `drm` / `rights` / `key` /
-  old `decrypt` startup, DTO, provider-resource, catalog, build, install,
-  component, WCI, test, and doc surfaces in the same commit. No fallback, no
-  dual route, no compatibility decoder, no dual write, no dual authority, and
-  no second registry/supervisor/coordinator/journal.
+- [ ] Preserve the installed proof order in `Now`: final source review after
+  the cross-Runtime slice, same-tree installation, signed custody composition,
+  private Chain and deployed proof, bound-KID allow/deny and exact buy receipt,
+  replicas and repair, the installed two-Runtime journey, the manual UIUX
+  matrix, then atomic cutover.
 
-- [ ] Installed acceptance — one Runtime, two principals. After atomic
-  cutover, prove installed creator mint/list, buyer deny-before-purchase, real
-  Wallet approval, real Chain result, fresh availability before purchase,
-  buyer open -> 2-of-3 release -> init/segment read -> close, wrong-object
-  rejection, tampered-segment rejection, exact replay, restart/cleanup, zero
-  unresolved state, immutable creator listing bytes, and no CEK/share/
-  ciphertext/clear-media/topology/credential/bearer-URL leakage.
+- [ ] Make the atomic cutover one authority change. Activate the Runtime-owned
+  protected-content path and remove the provisional `drm`, `rights`, `key`,
+  and old `decrypt` startup, DTO, provider-resource, catalog, build, install,
+  component, WCI, test, and documentation surfaces together.
 
-- [ ] Hard stop if any remaining step requires:
-  1. clear media being published before protection or sent to the content
-     provider on the protected path;
-  2. fixture fields or fixture authority in the production path;
-  3. a fake 2-of-3 made from one node or one route;
-  4. test keys or deterministic signed fixtures in production code;
-  5. changing a frozen public protected-content contract merely for routing;
-  6. exposing Carrier/topology in a capsule or public contract;
-  7. migration, fallback, dual authority, or dual write to keep the old path
-     alive;
-  8. a second provider registry, supervisor, coordinator, or journal;
-  9. route/path/host/port/credential, CEK, share, ciphertext, or clear-media
-     bytes entering Runtime or Library journals; or
-  10. proceeding without the signed custody profile or Chain contract config,
-      starting atomic cutover early, or running below 10% free disk.
+- [ ] Installed acceptance uses two Runtimes and two principals. The creator
+  mints and lists on localhost. The buyer Runtime on the seed imports or
+  resolves that exact immutable listing, proves deny before purchase, uses the
+  real Wallet and Chain paths, opens through a buyer-issued custody release,
+  reads and closes the player, and proves restart, replay, tamper rejection,
+  provider cleanup, and zero unresolved state.
 
-PR #15 keep/reject note: keep its threshold crypto, recipient-sealed
-contributions, CEK commitment, node-local custody direction, and negative-test
-research; reject public aggregated `shares[]` metadata, capsule-owned
-authority, raw CEK operations, `rail_shim`/reference fallbacks, old DRM
-orchestration, and any claim that `bindIP` or other KID-binding writes are
-already proven.
+PR #15 is source evidence, not a merge target. The retained extraction ledger
+covers threshold crypto, recipient-sealed contributions, CEK commitment,
+node-local custody, typed player and Creator UX, grant authority, failure cases,
+and applicable CI lessons. Current video uses `elacity-player`; document and
+3D viewers remain later typed-viewer work.
 
 ### Operator and audit hardening
 - [ ] Keep the existing SHA-256 audit chain canonical for 0.6 unless an explicit
