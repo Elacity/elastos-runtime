@@ -44,6 +44,8 @@ selects it, not the capsule API or a required local envelope.
 - local loopback, HTTP, WebSocket, `postMessage`, stdio, or in-process calls are host adapters below the capsule contract
 - Carrier remains the endpoint-authenticated off-box transport, discovery, replication, and content-delivery plane behind those resources
 - Carrier endpoint authentication proves the transport peer, not the author of an application message; message authorship requires its own verified signature or authority binding
+- private-network membership and service discovery are routing inputs, not capabilities; the destination Runtime independently authorizes the requested service and operation
+- legacy IP, TUN, Exit, and LAN Gateway adapters must stay behind explicit Runtime policy and must not become ambient capsule networking
 - content publication should go through a content/availability provider contract, not raw IPFS/Kubo/gateway calls from app capsules
 - ordinary public-web substitutes are a bug unless explicitly approved as edge adapters
 - bootstrap exceptions must stay narrow, visible, and fail-closed
@@ -103,6 +105,7 @@ The repo should not hide competing behaviors behind undocumented fallbacks.
 
 - one runtime expectation per command
 - one canonical install/update/publication path
+- explicit model-provider selection and fallback policy for inference
 - explicit failure when the intended path is not ready
 
 ## 11. Fail closed, then explain
@@ -158,8 +161,14 @@ access policy.
   synchronization
 - encrypted content must use the normal content path
 - decryption and license policy should be mediated by an explicit provider, not reimplemented inside every app
-- a capability-checked access/decryption plane may use local storage, Carrier,
-  or another substrate without changing the capsule contract
+- Runtime may route a capability-checked access/decryption request through a
+  private local adapter, Carrier, or a provider-internal compatibility
+  substrate without changing the capsule contract; the calling capsule does
+  not select the peer, backend, or transport
+- when a first-party production dKMS service crosses an ElastOS machine
+  boundary, Carrier is its canonical off-box transport; dKMS authorization and
+  end-to-end cryptography remain above Carrier, and compatibility transports
+  stay provider-internal
 
 ## 16. UI surfaces must not be authority
 
@@ -195,6 +204,23 @@ launch applications with ambient host authority.
 - mutable state is separate from the immutable capsule artifact and is mounted through rooted objects and WebSpaces
 - portability means independently verifiable and re-instantiable on compatible ElastOS nodes under current trust policy, not an immortal process or a bypass of revocation
 - shells, browser frames, routes, and app stores may project or distribute capsules, but they never become capsule identity or authority
+
+## 19. Consequences govern effects, not transports
+
+ElastOS uses one typed Runtime effect path for digital, economic, rights, and
+physical operations. The operation's consequences determine its authority,
+approval, retry, settlement, and safety requirements. HTTP, Carrier, a webhook,
+a field bus, or an in-process call does not.
+
+- Runtime policy sets and enforces the minimum classification from the admitted provider operation contract; capsule-declared risk may tighten that policy but cannot weaken it
+- observations used for authority or safety decisions must bind their source, subject, schema, time, freshness, integrity, and replay boundary
+- retry-sensitive effects require an idempotent contract or a durable effect identifier that can be reconciled before retry
+- transport acceptance, provider acceptance, execution, and observed outcome are separate claims; uncertainty after dispatch must remain explicit
+- a destination Runtime independently authorizes a remote operation, and a physical controller retains the final local safety decision
+- a DID, ownership record, right, or payment proof may inform policy but does not become control authority by itself
+- Runtime authorizes, routes, reconciles, and audits; hard real-time control, interlocks, emergency stops, and safe-state behavior remain local to the device provider or controller
+
+The detailed contract is [Consequence-aware effects](docs/CONSEQUENCE_AWARE_EFFECTS.md).
 
 ## Decision rule
 

@@ -307,6 +307,10 @@ enum Commands {
     #[command(subcommand)]
     Config(ConfigCommand),
 
+    /// Offline signed collaboration-network configuration authority
+    #[command(subcommand)]
+    CollaborationConfig(elastos_server::collaboration_config::CollaborationConfigCommand),
+
     /// Show and manage the local DID-backed profile
     #[command(subcommand)]
     Identity(IdentityCommand),
@@ -1037,69 +1041,6 @@ pub(crate) enum RoomCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Seed the local ElastOS identity as the Chat manager
-    Seed {
-        /// Room title to store in control state
-        #[arg(long, default_value = "Chat")]
-        title: String,
-        /// Emit machine-readable JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Create an ElastOS user invite for another DID
-    Invite {
-        /// DID to invite into Chat
-        did: String,
-        /// Access role to grant to the invited ElastOS identity
-        #[arg(long, value_enum, default_value_t = room_cmd::RoomInviteRoleArg::Member)]
-        role: room_cmd::RoomInviteRoleArg,
-        /// Emit machine-readable JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Create and sign a deliverable ElastOS user invite envelope
-    InviteExport {
-        /// DID to invite into Chat
-        did: String,
-        /// Access role to grant to the invited ElastOS identity
-        #[arg(long, value_enum, default_value_t = room_cmd::RoomInviteRoleArg::Member)]
-        role: room_cmd::RoomInviteRoleArg,
-        /// Emit machine-readable JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Import a signed ElastOS user invite envelope from another runtime
-    InviteImport {
-        /// Path to invite envelope JSON, or omit/read '-' for stdin
-        path: Option<PathBuf>,
-        /// Emit machine-readable JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Accept a pending ElastOS user invite on this runtime
-    Accept {
-        /// Pending invite ID
-        invite_id: String,
-        /// Emit machine-readable JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Export a signed Chat acceptance envelope after local invite acceptance
-    AcceptExport {
-        /// Accepted invite ID
-        invite_id: String,
-        /// Emit machine-readable JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Import a signed Chat acceptance envelope on the managing runtime
-    AcceptImport {
-        /// Path to acceptance envelope JSON, or omit/read '-' for stdin
-        path: Option<PathBuf>,
-        /// Emit machine-readable JSON
-        #[arg(long)]
-        json: bool,
-    },
     /// Approve a pending Chat web guest request
     Approve {
         /// Pending request ID. Omit to approve the oldest pending request.
@@ -1350,6 +1291,10 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Config(cmd) => {
             config_cmd::run_config(cmd)?;
+        }
+
+        Commands::CollaborationConfig(cmd) => {
+            elastos_server::collaboration_config::run_collaboration_config_command(cmd).await?;
         }
 
         Commands::Identity(cmd) => {
@@ -1698,6 +1643,8 @@ async fn serve_web_capsule(
     };
 
     let infra = setup_server_infrastructure().await?;
+    let mut collaboration_service = infra.collaboration_service;
+    let mut carrier_service = infra.carrier_service;
     let runtime = Arc::new(runtime);
     let docs_dir = std::env::current_dir().ok().and_then(|d| {
         let docs = d.join("..");
@@ -1854,8 +1801,18 @@ async fn serve_web_capsule(
     if let Some(tunnel) = public_tunnel {
         let _ = tunnel.shutdown().await;
     }
-
+    let collaboration_shutdown = async {
+        if let Some(service) = collaboration_service.as_mut() {
+            service.shutdown().await?;
+        }
+        if let Some(service) = carrier_service.as_mut() {
+            service.shutdown().await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
     server_result?;
+    collaboration_shutdown?;
 
     Ok(())
 }
@@ -2177,6 +2134,7 @@ pub(crate) async fn create_runtime(
 #[cfg(test)]
 mod tests {
     use super::verify_component_binary_with_data_dir;
+    use clap::Parser;
     use sha2::Digest;
     use std::fs;
 
@@ -2228,5 +2186,20 @@ mod tests {
         .unwrap();
 
         verify_component_binary_with_data_dir(data_dir.path(), "agent", &install_path).unwrap();
+    }
+
+    #[test]
+    fn room_cli_rejects_removed_authority_bearing_membership_subcommands() {
+        for argv in [
+            ["elastos", "room", "seed"],
+            ["elastos", "room", "invite"],
+            ["elastos", "room", "invite-export"],
+            ["elastos", "room", "invite-import"],
+            ["elastos", "room", "accept"],
+            ["elastos", "room", "accept-export"],
+            ["elastos", "room", "accept-import"],
+        ] {
+            assert!(super::Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
     }
 }

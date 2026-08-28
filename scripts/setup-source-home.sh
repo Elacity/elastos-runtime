@@ -15,6 +15,8 @@ Configure tool paths with:
   ELASTOS_CARGO_BIN
   ELASTOS_NODE_BIN
   ELASTOS_DEBUGFS_BIN
+  ELASTOS_COLLABORATION_STARTUP_MODE (configured|isolated)
+  ELASTOS_COLLABORATION_STARTUP_CONFIG_INPUT
   ELASTOS_BROWSER_NATIVE_PROXY_BIN
   ELASTOS_BROWSER_VM_RUNTIME_RELAY_BIN
   ELASTOS_BROWSER_VM_GUEST_CONTROL_BRIDGE_BIN
@@ -60,6 +62,30 @@ default_data_dir() {
     esac
 }
 
+cargo_target_root_for_manifest() {
+    local manifest_path="$1"
+    local manifest_dir
+    manifest_dir="$(cd "$(dirname "${manifest_path}")" && pwd)"
+    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        if [[ "${CARGO_TARGET_DIR}" = /* ]]; then
+            printf '%s\n' "${CARGO_TARGET_DIR}"
+        else
+            printf '%s\n' "${ROOT}/${CARGO_TARGET_DIR}"
+        fi
+    elif [[ "${manifest_dir}" == "${ROOT}/elastos"* ]]; then
+        printf '%s\n' "${ROOT}/elastos/target"
+    else
+        printf '%s\n' "${manifest_dir}/target"
+    fi
+}
+
+cargo_built_binary_path() {
+    local manifest_path="$1"
+    local profile="$2"
+    local binary="$3"
+    printf '%s\n' "$(cargo_target_root_for_manifest "${manifest_path}")/${profile}/${binary}"
+}
+
 find_cargo() {
     if [[ -n "${ELASTOS_CARGO_BIN:-}" && -x "${ELASTOS_CARGO_BIN}" ]]; then
         printf '%s\n' "${ELASTOS_CARGO_BIN}"
@@ -81,6 +107,27 @@ find_cargo() {
     fi
     echo "cargo not found. Install Rust or add cargo to PATH." >&2
     exit 1
+}
+
+require_supported_rust() {
+    local rustc_bin="$1"
+    local output
+    local version
+    local major
+    local minor
+
+    output="$(cd "$ROOT" && "$rustc_bin" --version)"
+    version="$(printf '%s\n' "$output" | awk '{print $2}')"
+    if [[ ! "$version" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?([+-].*)?$ ]]; then
+        echo "Could not parse Rust version from: $output" >&2
+        exit 1
+    fi
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    if (( major < 1 || (major == 1 && minor < 91) )); then
+        echo "Rust 1.91 or newer is required; found ${version}." >&2
+        exit 1
+    fi
 }
 
 find_node() {
@@ -321,6 +368,7 @@ resolve_browser_vm_guest_helper_source() {
     local explicit="${!env_name:-}"
     local rust_target
     local candidate
+    local manifest
 
     if [[ -n "$explicit" ]]; then
         if [[ ! -x "$explicit" ]]; then
@@ -335,7 +383,8 @@ resolve_browser_vm_guest_helper_source() {
     if [[ -z "$rust_target" ]]; then
         return 1
     fi
-    candidate="${ROOT}/elastos/tools/${crate_name}/target/${rust_target}/release/${binary_name}"
+    manifest="${ROOT}/elastos/tools/${crate_name}/Cargo.toml"
+    candidate="$(cargo_target_root_for_manifest "$manifest")/${rust_target}/release/${binary_name}"
     if [[ ! -x "$candidate" ]]; then
         echo "$label source build is missing: $candidate" >&2
         return 1
@@ -473,6 +522,7 @@ NODE_BIN="$(find_node)"
 BROWSER_VM_ROOTFS_BACKUP=""
 configure_rust_toolchain_env "$CARGO_BIN"
 export PATH="$(dirname "$CARGO_BIN"):$(dirname "$NODE_BIN"):${PATH}"
+require_supported_rust "$(command -v rustc)"
 
 provider_names() {
     printf '%s\n' \
@@ -493,7 +543,10 @@ provider_names() {
         webspace-provider \
         object-provider \
         content-block-graph-provider \
-        ipfs-provider
+        ipfs-provider \
+        custody-provider \
+        protected-content-protect-provider \
+        protected-content-decrypt-provider
 }
 
 PROVIDER_NAMES_JSON="$(provider_names | python3 -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))')"
@@ -532,6 +585,110 @@ RETIRED_SOURCE_HOME_CAPSULES=(
 RETIRED_SOURCE_HOME_PROVIDER_BINARIES=(
     gba-engine-provider
 )
+
+collaboration_startup_config_destination() {
+    printf '%s\n' "${DATA_DIR}/collaboration-network-v1.json"
+}
+
+collaboration_startup_mode() {
+    case "${ELASTOS_COLLABORATION_STARTUP_MODE:-}" in
+        configured|isolated) printf '%s\n' "${ELASTOS_COLLABORATION_STARTUP_MODE}" ;;
+        "")
+            echo "ELASTOS_COLLABORATION_STARTUP_MODE must be set to configured or isolated." >&2
+            exit 1
+            ;;
+        *)
+            echo "unsupported ELASTOS_COLLABORATION_STARTUP_MODE: ${ELASTOS_COLLABORATION_STARTUP_MODE}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+validate_collaboration_startup_mode() {
+    local mode
+    mode="$(collaboration_startup_mode)"
+    local input_path="${ELASTOS_COLLABORATION_STARTUP_CONFIG_INPUT:-}"
+    local destination
+    destination="$(collaboration_startup_config_destination)"
+    case "$mode" in
+        configured)
+            if [[ -z "$input_path" ]]; then
+                echo "configured collaboration setup requires ELASTOS_COLLABORATION_STARTUP_CONFIG_INPUT." >&2
+                exit 1
+            fi
+            ;;
+        isolated)
+            if [[ -n "$input_path" ]]; then
+                echo "isolated collaboration setup rejects ELASTOS_COLLABORATION_STARTUP_CONFIG_INPUT." >&2
+                exit 1
+            fi
+            if [[ -e "$destination" || -L "$destination" ]]; then
+                echo "isolated collaboration setup refuses an existing startup config: ${destination}" >&2
+                exit 1
+            fi
+            ;;
+    esac
+}
+
+verify_collaboration_startup_config_input() {
+    local mode
+    mode="$(collaboration_startup_mode)"
+    if [[ "$mode" != "configured" ]]; then
+        return 0
+    fi
+    local input_path="${ELASTOS_COLLABORATION_STARTUP_CONFIG_INPUT:-}"
+    if [[ ! -f "$input_path" ]]; then
+        echo "collaboration startup config input is unavailable: ${input_path}" >&2
+        exit 1
+    fi
+    local elastos_bin
+    elastos_bin="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)"
+    "$elastos_bin" collaboration-config verify --input "$input_path" >/dev/null
+}
+
+install_collaboration_startup_config() {
+    local mode
+    mode="$(collaboration_startup_mode)"
+    if [[ "$mode" != "configured" ]]; then
+        return 0
+    fi
+    local input_path="${ELASTOS_COLLABORATION_STARTUP_CONFIG_INPUT:-}"
+    local destination
+    destination="$(collaboration_startup_config_destination)"
+    mkdir -p "${DATA_DIR}"
+    if [[ -e "$destination" || -L "$destination" ]]; then
+        if [[ -f "$destination" && ! -L "$destination" ]] && cmp -s "$input_path" "$destination"; then
+            chmod 600 "$destination"
+            echo "[setup-source-home] preserve identical collaboration startup config: ${destination}"
+            return 0
+        fi
+        echo "refusing to replace collaboration startup config with different bytes: ${destination}" >&2
+        exit 1
+    fi
+    local temp_path
+    temp_path="$(mktemp "${DATA_DIR}/.collaboration-network-v1.XXXXXX.tmp")"
+    chmod 600 "$temp_path"
+    cat "$input_path" >"$temp_path"
+    chmod 600 "$temp_path"
+    if ! cmp -s "$input_path" "$temp_path"; then
+        rm -f "$temp_path"
+        echo "collaboration startup config install changed bytes unexpectedly" >&2
+        exit 1
+    fi
+    if ! ln "$temp_path" "$destination"; then
+        rm -f "$temp_path"
+        echo "failed to install collaboration startup config: ${destination}" >&2
+        exit 1
+    fi
+    rm -f "$temp_path"
+    chmod 600 "$destination"
+    echo "[setup-source-home] installed collaboration startup config: ${destination}"
+}
+
+ensure_owner_only_data_dir() {
+    mkdir -p "${DATA_DIR}"
+    chmod 700 "${DATA_DIR}"
+}
 
 capsule_entrypoint() {
     local manifest="$1"
@@ -1217,11 +1374,15 @@ EOF
 
     if [[ "$(uname -s)" == "Darwin" ]]; then
         local vz_supervisor="${DATA_DIR}/bin/browser-vz-engine-supervisor"
-        if [[ -x "${ROOT}/elastos/target/release/browser-vz-engine-supervisor" ]]; then
-            install -m 755 "${ROOT}/elastos/target/release/browser-vz-engine-supervisor" \
+        local vz_release_bin
+        local vz_debug_bin
+        vz_release_bin="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release browser-vz-engine-supervisor)"
+        vz_debug_bin="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" debug browser-vz-engine-supervisor)"
+        if [[ -x "${vz_release_bin}" ]]; then
+            install -m 755 "${vz_release_bin}" \
                 "${vz_supervisor}"
-        elif [[ -x "${ROOT}/elastos/target/debug/browser-vz-engine-supervisor" ]]; then
-            install -m 755 "${ROOT}/elastos/target/debug/browser-vz-engine-supervisor" \
+        elif [[ -x "${vz_debug_bin}" ]]; then
+            install -m 755 "${vz_debug_bin}" \
                 "${vz_supervisor}"
         fi
         if [[ -x "${vz_supervisor}" ]]; then
@@ -1501,7 +1662,7 @@ install_content_publish_backend() {
     echo "[setup-source-home] install Kubo for Library/Documents publish"
     HOME="${HOME}" \
     ELASTOS_COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
-        "${ROOT}/elastos/target/release/elastos" setup --with kubo
+        "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)" setup --with kubo
 }
 
 echo "[setup-source-home] repo: ${ROOT}"
@@ -1512,8 +1673,13 @@ echo "[setup-source-home] node: ${NODE_BIN}"
 echo "[setup-source-home] cargo home: ${CARGO_HOME:-<default>}"
 echo "[setup-source-home] rustup home: ${RUSTUP_HOME:-<default>}"
 
-mkdir -p "${DATA_DIR}"
+ensure_owner_only_data_dir
+validate_collaboration_startup_mode
 if [[ "${SETUP_SOURCE_HOME_CONFIG_ONLY:-0}" == "1" ]]; then
+    if [[ "$(collaboration_startup_mode)" == "configured" ]]; then
+        echo "configured collaboration setup requires full setup-source-home mode." >&2
+        exit 1
+    fi
     install_browser_source_home_config
     echo "[setup-source-home] config-only artifacts installed"
     exit 0
@@ -1530,6 +1696,7 @@ fi
 
 echo "[setup-source-home] build runtime server"
 "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-server
+verify_collaboration_startup_config_input
 if [[ "$PLATFORM" == "darwin-arm64" ]]; then
     echo "[setup-source-home] build Browser VZ engine supervisor"
     "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-vz --bin browser-vz-engine-supervisor
@@ -1574,14 +1741,14 @@ done
 
 echo "[setup-source-home] install native providers and stamp manifest"
 mkdir -p "${DATA_DIR}/bin"
-install -m 755 "${ROOT}/elastos/target/release/shell" "${DATA_DIR}/bin/shell"
-install -m 755 "${ROOT}/elastos/target/release/localhost-provider" "${DATA_DIR}/bin/localhost-provider"
-install -m 755 "${ROOT}/capsules/home-cli/target/release/home-cli" "${DATA_DIR}/bin/home-cli"
+install -m 755 "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release shell)" "${DATA_DIR}/bin/shell"
+install -m 755 "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release localhost-provider)" "${DATA_DIR}/bin/localhost-provider"
+install -m 755 "$(cargo_built_binary_path "${ROOT}/capsules/home-cli/Cargo.toml" release home-cli)" "${DATA_DIR}/bin/home-cli"
 provider_names | while IFS= read -r provider; do
-    if [[ -x "${ROOT}/capsules/${provider}/target/release/${provider}" ]]; then
-        install -m 755 "${ROOT}/capsules/${provider}/target/release/${provider}" "${DATA_DIR}/bin/${provider}"
+    if [[ -f "${ROOT}/capsules/${provider}/Cargo.toml" ]]; then
+        install -m 755 "$(cargo_built_binary_path "${ROOT}/capsules/${provider}/Cargo.toml" release "${provider}")" "${DATA_DIR}/bin/${provider}"
     else
-        install -m 755 "${ROOT}/elastos/tools/${provider}/target/release/${provider}" "${DATA_DIR}/bin/${provider}"
+        install -m 755 "$(cargo_built_binary_path "${ROOT}/elastos/tools/${provider}/Cargo.toml" release "${provider}")" "${DATA_DIR}/bin/${provider}"
     fi
 done
 stamp_source_home_components_manifest
@@ -1604,6 +1771,7 @@ python3 "${ROOT}/scripts/components-release-integrity-check.py" \
 install_browser_runtime_helpers
 start_browser_runtime_turn
 install_browser_source_home_config
+install_collaboration_startup_config
 
 cat <<EOF
 [setup-source-home] artifacts installed; offline principal-root upgrade and restart are required before readiness

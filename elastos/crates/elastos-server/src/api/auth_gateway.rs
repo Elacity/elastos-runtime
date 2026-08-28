@@ -42,6 +42,7 @@ use super::gateway::{
 const AUTH_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 const RECOVERY_DESCRIPTOR_SCHEMA: &str = "elastos.principal.root-descriptor/v1";
 const FULL_RECOVERY_BUNDLE_SCHEMA: &str = "elastos.full-recovery-bundle/v1";
+const FULL_RECOVERY_PEOPLE_IDENTITY_SCHEMA: &str = "elastos.people.recovery-identity/v1";
 const FULL_RECOVERY_BUNDLE_EXPORT_REQUEST_SCHEMA: &str =
     "elastos.full-recovery-bundle.export.request/v1";
 const FULL_RECOVERY_BUNDLE_IMPORT_REQUEST_SCHEMA: &str =
@@ -289,7 +290,27 @@ struct FullRecoveryBundleImportResponseV2 {
     #[serde(skip_serializing_if = "Option::is_none")]
     system_token: Option<String>,
     wallet_restore: FullRecoveryWalletRestoreOutcomeV2,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    people_identity_restore: Option<FullRecoveryPeopleIdentityOutcomeV1>,
     runtime_audit: FullRecoveryRuntimeAuditOutcomeV2,
+}
+
+/// What happened to the People identity carried by a Full Recovery Bundle.
+/// `restored`: the Profile signing seed (and any contact store) is back and
+/// the current device is authorized by the recovered chain — accepted
+/// contacts survive. `absent`: the bundle predates identity recovery or the
+/// account never saved a Profile. `incomplete`: the root recovered but the
+/// identity did not; the response says so instead of claiming a complete
+/// restore.
+#[derive(Debug, Clone, Serialize)]
+struct FullRecoveryPeopleIdentityOutcomeV1 {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_did: Option<String>,
+    rebound_device: bool,
+    contact_store_restored: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -324,6 +345,7 @@ pub struct PasskeyVerifyResponse {
     pub expires_at: u64,
     pub home_token: String,
     pub system_token: String,
+    pub profile_readiness: super::gateway::ProfileReadinessSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -864,7 +886,21 @@ async fn recovery_status_inner(
     headers: &HeaderMap,
 ) -> anyhow::Result<PrincipalRootRecoveryStatusV1> {
     let context = require_auth_home_or_system_context(state, headers)?;
-    let principal = require_active_passkey_principal_for_context(state, &context)?;
+    principal_root_recovery_status_for_context(state, &context)
+}
+
+pub(in crate::api) fn principal_root_recovery_status_for_context(
+    state: &GatewayState,
+    context: &super::gateway::HomeLaunchTokenContext,
+) -> anyhow::Result<PrincipalRootRecoveryStatusV1> {
+    let principal = require_active_passkey_principal_for_context(state, context)?;
+    principal_root_recovery_status_for_principal(state, &principal)
+}
+
+fn principal_root_recovery_status_for_principal(
+    state: &GatewayState,
+    principal: &crate::auth::PrincipalRecord,
+) -> anyhow::Result<PrincipalRootRecoveryStatusV1> {
     let protected_object_inventory =
         principal_root_protected_object_inventory(&state.data_dir, &principal.localhost_root);
     let inspection = crate::auth::inspect_declarative_principal_root_protection(
@@ -875,8 +911,8 @@ async fn recovery_status_inner(
     )?;
     let Some(protection) = inspection.protection else {
         let mut status = PrincipalRootRecoveryStatusV1::unprotected(
-            principal.principal_id,
-            principal.localhost_root,
+            principal.principal_id.clone(),
+            principal.localhost_root.clone(),
         );
         if inspection.plaintext_object_count > 0 {
             status
@@ -902,8 +938,8 @@ async fn recovery_status_inner(
     }
     Ok(PrincipalRootRecoveryStatusV1 {
         schema: elastos_runtime::auth::PRINCIPAL_ROOT_RECOVERY_STATUS_SCHEMA.to_string(),
-        principal_id: principal.principal_id,
-        localhost_root: principal.localhost_root,
+        principal_id: principal.principal_id.clone(),
+        localhost_root: principal.localhost_root.clone(),
         root_encrypted,
         recovery_configured,
         recovery_download_available,
@@ -971,6 +1007,84 @@ pub(crate) fn principal_root_protected_object_inventory(
     inventory
 }
 
+/// Synchronous so the activation guard (a mutex guard) never enters the
+/// export handler's async state machine. Consumes the step-up, creates or
+/// loads the kit, and migrates any first-run plaintext under the same guard.
+fn full_recovery_bundle_establish_kit(
+    state: &GatewayState,
+    launch: &super::gateway::RequiredHomeLaunchToken,
+    context: &super::gateway::HomeLaunchTokenContext,
+    principal: &crate::auth::PrincipalRecord,
+    input: &FullRecoveryBundleExportRequest,
+    now: u64,
+) -> anyhow::Result<RecoveryKitV1> {
+    let protected_object_inventory =
+        principal_root_protected_object_inventory(&state.data_dir, &principal.localhost_root);
+    let protection_activation =
+        crate::auth::begin_declarative_principal_root_protection_activation_migrating_plaintext(
+            &state.data_dir,
+            &principal.principal_id,
+            &principal.localhost_root,
+            &protected_object_inventory,
+        )?;
+    // Same refusal, ahead of the same first write: a Recovery Kit export
+    // must not be the thing that leaves a root protected with plaintext
+    // beside it. Checked before the step-up is consumed so a refusal costs
+    // the person nothing but a message.
+    crate::auth::ensure_online_plaintext_migration_is_possible(
+        &protection_activation.plaintext_objects,
+    )?;
+    consume_passkey_step_up_token(
+        &state.data_dir,
+        &input.step_up_token,
+        launch,
+        180,
+        "auth.full-recovery-bundle.export",
+        &serde_json::json!({
+            "principal_id": input.principal_id,
+            "localhost_root": input.localhost_root,
+            "label": input.label,
+            "download_password": input.download_password,
+        }),
+    )?;
+    let kit = recovery_kit_get_or_create_for_principal(
+        state,
+        context,
+        principal,
+        input.label.as_deref(),
+        RecoveryKitDelivery::RetainedUnseen,
+        now,
+    )?;
+    if !protection_activation.plaintext_objects.is_empty() {
+        let migrated = crate::auth::migrate_principal_root_plaintext_objects_under_activation(
+            &protection_activation.guard,
+            &state.data_dir,
+            &principal.principal_id,
+            &principal.localhost_root,
+            protection_activation.plaintext_objects.clone(),
+        )?;
+        let _ = crate::auth::append_audit_event(
+            &state.data_dir,
+            audit_event(AuditEventInput {
+                event_type: "auth.principal_root.plaintext_migrated",
+                principal_id: Some(principal.principal_id.clone()),
+                proof_binding_id: Some(principal.proof_binding_id.clone()),
+                session_id: Some(context.session_id.clone()),
+                result: "ok",
+                reason: "declared plaintext objects migrated during recovery-kit activation",
+                occurred_at: now,
+                ..AuditEventInput::default()
+            }),
+        );
+        tracing::info!(
+            principal_id = %principal.principal_id,
+            object_count = migrated.object_count,
+            "migrated declared plaintext principal-root objects during recovery activation"
+        );
+    }
+    Ok(kit)
+}
+
 async fn full_recovery_bundle_export_inner(
     state: &GatewayState,
     headers: &HeaderMap,
@@ -1003,40 +1117,18 @@ async fn full_recovery_bundle_export_inner(
     }
 
     let now = crate::auth::now_ts();
-    let protected_object_inventory =
-        principal_root_protected_object_inventory(&state.data_dir, &principal.localhost_root);
-    let protection_activation =
-        crate::auth::begin_declarative_principal_root_protection_activation(
-            &state.data_dir,
-            &principal.principal_id,
-            &principal.localhost_root,
-            &protected_object_inventory,
-        )?;
-    consume_passkey_step_up_token(
-        &state.data_dir,
-        &input.step_up_token,
-        &launch,
-        180,
-        "auth.full-recovery-bundle.export",
-        &serde_json::json!({
-            "principal_id": input.principal_id,
-            "localhost_root": input.localhost_root,
-            "label": input.label,
-            "download_password": input.download_password,
-        }),
-    )?;
-    let kit = recovery_kit_get_or_create_for_principal(
-        state,
-        &context,
-        &principal,
-        input.label.as_deref(),
-        now,
-    )?;
-    drop(protection_activation);
+    let kit =
+        full_recovery_bundle_establish_kit(state, &launch, &context, &principal, &input, now)?;
     let wallet_recovery_set = export_managed_recovery_set(state, &wallet_authority).await?;
     let wallet_recovery_keys = full_bundle_wallet_recovery_keys(wallet_recovery_set)?;
     let wallet_recovery_key_count = wallet_recovery_keys.len();
-    let bundle = json!({
+    let people_identity = people_identity_for_full_bundle(
+        &state.data_dir,
+        &principal.principal_id,
+        &principal.localhost_root,
+    )?;
+    let people_identity_included = people_identity.is_some();
+    let mut bundle = json!({
         "schema": FULL_RECOVERY_BUNDLE_SCHEMA,
         "bundle_id": format!("bundle:{}", random_hex(16)),
         "principal_id": principal.principal_id.clone(),
@@ -1045,14 +1137,21 @@ async fn full_recovery_bundle_export_inner(
         "wallet_recovery_keys": wallet_recovery_keys,
         "included": {
             "data_kit": true,
-            "wallet_recovery_key_count": wallet_recovery_key_count
+            "wallet_recovery_key_count": wallet_recovery_key_count,
+            "people_identity": people_identity_included
         },
         "created_at": now,
         "instructions": [
-            "Keep this Full Recovery Bundle offline. Anyone with it can recover this ElastOS user root and included built-in Wallet accounts.",
+            "Keep this Full Recovery Bundle offline. Anyone with it can recover this ElastOS user root, included built-in Wallet accounts, and the signed People identity with its contacts.",
             "Import it only through ElastOS System recovery on a runtime you control."
         ]
     });
+    if let Some(people_identity) = people_identity {
+        bundle
+            .as_object_mut()
+            .expect("full recovery bundle is an object")
+            .insert("people_identity".to_string(), people_identity);
+    }
     let value = match input
         .download_password
         .as_deref()
@@ -1075,6 +1174,7 @@ async fn full_recovery_bundle_export_inner(
             ..AuditEventInput::default()
         }),
     )?;
+    mark_recovery_kit_handed_to_person(state, &principal, &kit, now)?;
     Ok(value)
 }
 
@@ -1181,6 +1281,7 @@ async fn full_recovery_bundle_import_inner(
                 imported_count: expected_wallet_count,
                 reason_code: WALLET_RESTORE_REASON_NONE,
             },
+            people_identity_restore: None,
             runtime_audit,
         })?);
     }
@@ -1213,6 +1314,7 @@ async fn full_recovery_bundle_import_inner(
                     imported_count: expected_wallet_count,
                     reason_code: WALLET_RESTORE_REASON_NONE,
                 },
+                people_identity_restore: None,
                 runtime_audit: FullRecoveryRuntimeAuditOutcomeV2 {
                     status: RUNTIME_AUDIT_COMPLETE,
                     reason_code: RUNTIME_AUDIT_REASON_NONE,
@@ -1233,6 +1335,17 @@ async fn full_recovery_bundle_import_inner(
         },
     )
     .await?;
+    let restored_proof_binding_id = context
+        .proof_binding_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("missing proof-bound auth session"))?;
+    let people_identity_restore = restore_people_identity_from_full_bundle(
+        &state.data_dir,
+        &bundle,
+        &recovery_response.principal_id,
+        &recovery_response.localhost_root,
+        &restored_proof_binding_id,
+    );
     let wallet_authority = if recovery_response.status == "reassigned" {
         replacement_wallet_authority(
             &state.data_dir,
@@ -1264,7 +1377,9 @@ async fn full_recovery_bundle_import_inner(
             context.session_id.clone(),
         ),
     };
-    let (event_type, result) = if wallet_restore.status == WALLET_RESTORE_COMPLETE {
+    let (event_type, result) = if wallet_restore.status == WALLET_RESTORE_COMPLETE
+        && people_identity_restore.status != "incomplete"
+    {
         ("auth.full_recovery_bundle.imported", "ok")
     } else {
         ("auth.full_recovery_bundle.import_incomplete", "incomplete")
@@ -1337,6 +1452,7 @@ async fn full_recovery_bundle_import_inner(
         home_token: recovery_response.home_token,
         system_token: recovery_response.system_token,
         wallet_restore,
+        people_identity_restore: Some(people_identity_restore),
         runtime_audit,
     })?)
 }
@@ -1363,11 +1479,25 @@ fn full_recovery_bundle_from_import_request(
     full_recovery_bundle_from_password_package(package, password)
 }
 
+/// Did this Recovery Kit reach the person, or was it only minted so their
+/// root could be protected? A protector records `verified_at` to mean
+/// someone holds the phrase off this machine. Protecting a root on their
+/// behalf is worth doing — it is what makes a Profile possible — but it
+/// proves nothing about what they hold, and recording it as verified would
+/// tell them, and the guest-hosting gate, that recovery is handled when
+/// nobody has ever seen the phrase.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryKitDelivery {
+    HandedToPerson,
+    RetainedUnseen,
+}
+
 fn recovery_kit_get_or_create_for_principal(
     state: &GatewayState,
     context: &super::gateway::HomeLaunchTokenContext,
     principal: &crate::auth::PrincipalRecord,
     label: Option<&str>,
+    delivery: RecoveryKitDelivery,
     now: u64,
 ) -> anyhow::Result<RecoveryKitV1> {
     if let Some(protection) = crate::auth::load_principal_root_protection(
@@ -1393,7 +1523,7 @@ fn recovery_kit_get_or_create_for_principal(
         now,
     )?;
     let archive = crate::auth::recovery_archive_from_kit(&state.data_dir, &kit)?;
-    let protection = protection_from_recovery_kit(&kit, label, now, Some(archive))?;
+    let protection = protection_from_recovery_kit(&kit, label, delivery, now, Some(archive))?;
     crate::auth::store_principal_root_protection(&state.data_dir, protection)?;
     crate::auth::append_audit_event(
         &state.data_dir,
@@ -1409,6 +1539,193 @@ fn recovery_kit_get_or_create_for_principal(
         }),
     )?;
     Ok(kit)
+}
+
+fn mark_recovery_kit_handed_to_person(
+    state: &GatewayState,
+    principal: &crate::auth::PrincipalRecord,
+    kit: &RecoveryKitV1,
+    now: u64,
+) -> anyhow::Result<()> {
+    crate::auth::verify_recovery_kit_material(kit)?;
+    if kit.principal_id != principal.principal_id || kit.localhost_root != principal.localhost_root
+    {
+        anyhow::bail!("recovery kit principal binding mismatch");
+    }
+    let mut protection = crate::auth::load_principal_root_protection(
+        &state.data_dir,
+        &principal.principal_id,
+        &principal.localhost_root,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("principal root protection is missing"))?;
+    if protection.data_key_id != kit.data_key_id || protection.crypto != kit.crypto {
+        anyhow::bail!("recovery kit protection binding mismatch");
+    }
+    let protector = protection
+        .protectors
+        .iter_mut()
+        .find(|protector| protector.protector_id == kit.protector_id)
+        .ok_or_else(|| anyhow::anyhow!("recovery kit protector is missing"))?;
+    if protector.kind != PrincipalRootProtectorKind::RecoveryKit {
+        anyhow::bail!("recovery kit protector kind mismatch");
+    }
+    let archived_kit = crate::auth::recovery_kit_from_archive(
+        &state.data_dir,
+        protector
+            .archive
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("recovery kit archive is missing"))?,
+    )?;
+    crate::auth::verify_recovery_kit_material(&archived_kit)?;
+    if archived_kit != *kit {
+        anyhow::bail!("recovery kit archive binding mismatch");
+    }
+    if protector.verified_at.is_some() {
+        return Ok(());
+    }
+    protector.verified_at = Some(now);
+    protection.updated_at = now.max(protection.updated_at);
+    crate::auth::store_principal_root_protection(&state.data_dir, protection)
+}
+
+/// The People identity a Full Recovery Bundle carries: the decrypted profile
+/// authority bundle (signing seed, retained revision ring, signed head) plus
+/// the signed contact-store state when one exists. `None` when this account
+/// has no saved Profile — a contact store without its Profile would be
+/// unusable, so it never travels alone.
+fn people_identity_for_full_bundle(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    localhost_root: &str,
+) -> anyhow::Result<Option<Value>> {
+    let Some(profile_authority_bundle) =
+        crate::collaboration_profile_authority::export_profile_authority_bundle_for_recovery(
+            data_dir,
+            principal_id,
+            localhost_root,
+        )?
+    else {
+        return Ok(None);
+    };
+    let mut people_identity = json!({
+        "schema": FULL_RECOVERY_PEOPLE_IDENTITY_SCHEMA,
+        "profile_authority_bundle": profile_authority_bundle,
+    });
+    if let Some(contact_store_state) =
+        crate::collaboration_contact_store::export_contact_store_state_for_recovery(
+            data_dir,
+            principal_id,
+            localhost_root,
+        )?
+    {
+        people_identity
+            .as_object_mut()
+            .expect("people identity is an object")
+            .insert("contact_store_state".to_string(), contact_store_state);
+    }
+    Ok(Some(people_identity))
+}
+
+/// Restores the People identity after the root itself recovered: writes the
+/// profile authority bundle and contact store back under the restored
+/// protected root, then — when the recovered head does not authorize this
+/// machine's device — signs the next revision through the normal Profile
+/// authority path so the existing update-delivery chain announces the new
+/// device to every accepted contact. Failure never claims completeness: the
+/// outcome says exactly what happened.
+fn restore_people_identity_from_full_bundle(
+    data_dir: &std::path::Path,
+    bundle: &Value,
+    principal_id: &str,
+    localhost_root: &str,
+    proof_binding_id: &str,
+) -> FullRecoveryPeopleIdentityOutcomeV1 {
+    let Some(people_identity) = bundle.get("people_identity") else {
+        return FullRecoveryPeopleIdentityOutcomeV1 {
+            status: "absent",
+            profile_did: None,
+            rebound_device: false,
+            contact_store_restored: false,
+            reason: None,
+        };
+    };
+    match restore_people_identity_inner(
+        data_dir,
+        people_identity,
+        principal_id,
+        localhost_root,
+        proof_binding_id,
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => FullRecoveryPeopleIdentityOutcomeV1 {
+            status: "incomplete",
+            profile_did: None,
+            rebound_device: false,
+            contact_store_restored: false,
+            reason: Some(format!("{err:#}")),
+        },
+    }
+}
+
+fn restore_people_identity_inner(
+    data_dir: &std::path::Path,
+    people_identity: &Value,
+    principal_id: &str,
+    localhost_root: &str,
+    proof_binding_id: &str,
+) -> anyhow::Result<FullRecoveryPeopleIdentityOutcomeV1> {
+    if people_identity.get("schema").and_then(Value::as_str)
+        != Some(FULL_RECOVERY_PEOPLE_IDENTITY_SCHEMA)
+    {
+        anyhow::bail!("unsupported People identity schema in full recovery bundle");
+    }
+    let profile_bundle = people_identity
+        .get("profile_authority_bundle")
+        .ok_or_else(|| anyhow::anyhow!("People identity missing profile authority bundle"))?;
+    let restored =
+        crate::collaboration_profile_authority::restore_profile_authority_bundle_for_recovery(
+            data_dir,
+            principal_id,
+            localhost_root,
+            profile_bundle,
+        )?;
+    let profile_did = restored.document().profile_did.clone();
+    let contact_store_restored = match people_identity.get("contact_store_state") {
+        Some(state) => {
+            crate::collaboration_contact_store::restore_contact_store_state_for_recovery(
+                data_dir,
+                principal_id,
+                localhost_root,
+                state,
+                &profile_did,
+            )?;
+            true
+        }
+        None => false,
+    };
+    let (_, device_did) = elastos_identity::load_or_create_did(data_dir)?;
+    let rebound_device = if restored.authorizes_endpoint(&device_did) {
+        false
+    } else {
+        let head = restored.document();
+        crate::collaboration_profile_authority::update_profile_authority(
+            data_dir,
+            principal_id,
+            localhost_root,
+            proof_binding_id,
+            &head.display_name,
+            head.handle.as_deref(),
+            crate::auth::now_ts(),
+        )?;
+        true
+    };
+    Ok(FullRecoveryPeopleIdentityOutcomeV1 {
+        status: "restored",
+        profile_did: Some(profile_did),
+        rebound_device,
+        contact_store_restored,
+        reason: None,
+    })
 }
 
 async fn export_managed_recovery_set(
@@ -1948,8 +2265,13 @@ async fn recovery_kit_import_inner(
     }
     let now = crate::auth::now_ts();
     let candidate_data_key = crate::auth::recovery_kit_data_key(&kit)?;
-    let mut protection =
-        protection_from_recovery_kit(&kit, Some("Imported Recovery Kit"), now, None)?;
+    let mut protection = protection_from_recovery_kit(
+        &kit,
+        Some("Imported Recovery Kit"),
+        RecoveryKitDelivery::HandedToPerson,
+        now,
+        None,
+    )?;
     let previous_principal_id = principal.principal_id.clone();
     let previous_localhost_root = principal.localhost_root.clone();
     let verified_did_recovery_protector = match input.did_recovery_proof.as_ref() {
@@ -2192,6 +2514,7 @@ fn create_recovery_kit_for_principal(
 fn protection_from_recovery_kit(
     kit: &RecoveryKitV1,
     label: Option<&str>,
+    delivery: RecoveryKitDelivery,
     now: u64,
     archive: Option<PrincipalRootRecoveryArchiveV1>,
 ) -> anyhow::Result<PrincipalRootProtectionV1> {
@@ -2213,7 +2536,12 @@ fn protection_from_recovery_kit(
             label,
             subject: None,
             created_at: kit.created_at,
-            verified_at: Some(now),
+            // Verified means someone holds this off the machine. Only the
+            // export path can say that.
+            verified_at: match delivery {
+                RecoveryKitDelivery::HandedToPerson => Some(now),
+                RecoveryKitDelivery::RetainedUnseen => None,
+            },
             envelope: Some(PrincipalRootProtectorEnvelopeV1 {
                 cipher: kit.crypto.cipher.clone(),
                 kdf: kit.crypto.recovery_kdf.clone(),
@@ -3377,14 +3705,21 @@ fn issue_named_passkey_session_grant(
         super::gateway::SYSTEM_CAPSULE_ID,
         &grant,
     )?;
+    let profile_readiness = super::gateway::profile_readiness_for_principal(
+        &state.data_dir,
+        &principal.principal_id,
+        &principal.localhost_root,
+    )
+    .readiness;
     Ok(PasskeyVerifyResponse {
-        schema: "elastos.auth.passkey.verify/v1".to_string(),
+        schema: "elastos.auth.passkey.verify/v2".to_string(),
         principal_id: principal.principal_id,
         proof_binding_id: principal.proof_binding_id,
         session_id: grant.session_id,
         expires_at: grant.expires_at,
         home_token,
         system_token,
+        profile_readiness,
     })
 }
 
@@ -3431,6 +3766,7 @@ pub(in crate::api) fn auth_error_response(err: anyhow::Error) -> Response {
         || text.contains("not a passkey")
         || text.contains("not bound")
         || text.contains("required")
+        || text.contains("conflicting")
     {
         StatusCode::FORBIDDEN
     } else {
@@ -3576,6 +3912,9 @@ mod tests {
     fn test_gateway_state(data_dir: &std::path::Path) -> GatewayState {
         GatewayState {
             provider_registry: None,
+            collaboration_chat_product_port: None,
+            collaboration_presence_product_port: None,
+            collaboration_discovery_service: None,
             identity_manager: Arc::new(std::sync::OnceLock::new()),
             cache_dir: data_dir.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
@@ -3598,6 +3937,9 @@ mod tests {
             .unwrap();
         GatewayState {
             provider_registry: Some(registry),
+            collaboration_chat_product_port: None,
+            collaboration_presence_product_port: None,
+            collaboration_discovery_service: None,
             identity_manager: Arc::new(std::sync::OnceLock::new()),
             cache_dir: data_dir.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
@@ -3796,7 +4138,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(response.schema, "elastos.auth.passkey.verify/v1");
+        assert_eq!(response.schema, "elastos.auth.passkey.verify/v2");
+        assert_eq!(
+            serde_json::to_value(&response.profile_readiness).unwrap(),
+            serde_json::json!({
+                "schema": "elastos.profile.readiness/v1",
+                "status": "setup_required",
+            })
+        );
         assert!(response
             .proof_binding_id
             .starts_with("proof:passkey:elastos.elacitylabs.com:"));
@@ -4377,6 +4726,7 @@ mod tests {
         let protection = protection_from_recovery_kit(
             &kit,
             Some("Exact imported binding"),
+            RecoveryKitDelivery::HandedToPerson,
             1_800_000_000,
             Some(archive),
         )
@@ -4465,6 +4815,7 @@ mod tests {
         let protection = protection_from_recovery_kit(
             &exact_kit,
             Some("Exact retained binding"),
+            RecoveryKitDelivery::HandedToPerson,
             1_800_000_000,
             Some(archive),
         )
@@ -4790,6 +5141,7 @@ mod tests {
         let protection = protection_from_recovery_kit(
             &kit,
             Some("Orphaned exact binding"),
+            RecoveryKitDelivery::HandedToPerson,
             1_800_000_000,
             Some(archive),
         )
@@ -5312,6 +5664,217 @@ mod tests {
     }
 
     #[test]
+    fn registration_with_a_name_keeps_profile_setup_explicit() {
+        let temp = tempfile::tempdir().unwrap();
+        let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+
+        let registered = issue_named_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "test passkey registration",
+            Some("Anders"),
+        )
+        .unwrap();
+        let principal = crate::auth::load_principal_for_proof_binding(
+            temp.path(),
+            &registered.proof_binding_id,
+        )
+        .unwrap();
+        assert_eq!(principal.display_name, "Anders");
+        assert_eq!(
+            serde_json::to_value(&registered.profile_readiness).unwrap(),
+            serde_json::json!({
+                "schema": "elastos.profile.readiness/v1",
+                "status": "setup_required",
+            })
+        );
+        assert!(
+            crate::collaboration_profile_authority::load_profile_authority(
+                temp.path(),
+                &principal.principal_id,
+                &principal.localhost_root,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(crate::auth::load_principal_root_protection(
+            temp.path(),
+            &principal.principal_id,
+            &principal.localhost_root,
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            !crate::collaboration_profile_authority::profile_authority_path(
+                temp.path(),
+                &principal.localhost_root,
+            )
+            .unwrap()
+            .exists()
+        );
+        let recovery_archive_key =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), "ElastOS/System/Auth")
+                .unwrap()
+                .join("recovery-archive.key");
+        assert!(!recovery_archive_key.exists());
+        assert!(crate::auth::is_auth_session_active(
+            temp.path(),
+            &registered.session_id,
+            crate::auth::now_ts(),
+        )
+        .unwrap());
+
+        let again = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "test passkey authentication",
+        )
+        .unwrap();
+        assert_eq!(again.proof_binding_id, registered.proof_binding_id);
+        assert_eq!(
+            serde_json::to_value(&again.profile_readiness).unwrap()["status"],
+            "setup_required"
+        );
+    }
+
+    #[test]
+    fn authentication_survives_an_invalid_profile_without_reporting_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+        let first = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "initial passkey grant",
+        )
+        .unwrap();
+        let principal =
+            crate::auth::load_principal_for_proof_binding(temp.path(), &first.proof_binding_id)
+                .unwrap();
+        crate::auth::store_test_principal_root_protection(temp.path(), &principal.principal_id);
+        let object_uri = crate::collaboration_profile_authority::profile_authority_object_uri(
+            &principal.localhost_root,
+        );
+        let path = crate::collaboration_profile_authority::profile_authority_path(
+            temp.path(),
+            &principal.localhost_root,
+        )
+        .unwrap();
+        crate::auth::write_protected_principal_root_object(
+            temp.path(),
+            &principal.principal_id,
+            &principal.localhost_root,
+            &object_uri,
+            &path,
+            b"not a profile bundle",
+        )
+        .unwrap();
+
+        let authenticated = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "passkey authentication with invalid Profile",
+        )
+        .unwrap();
+
+        assert_eq!(authenticated.proof_binding_id, first.proof_binding_id);
+        assert_eq!(
+            serde_json::to_value(&authenticated.profile_readiness).unwrap(),
+            serde_json::json!({
+                "schema": "elastos.profile.readiness/v1",
+                "status": "unavailable",
+            })
+        );
+        assert!(crate::auth::is_auth_session_active(
+            temp.path(),
+            &authenticated.session_id,
+            crate::auth::now_ts(),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn authentication_reports_ready_only_after_profile_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+        let first = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "initial passkey grant",
+        )
+        .unwrap();
+        let principal =
+            crate::auth::load_principal_for_proof_binding(temp.path(), &first.proof_binding_id)
+                .unwrap();
+        elastos_identity::load_or_create_did(temp.path()).unwrap();
+        crate::auth::store_test_principal_root_protection(temp.path(), &principal.principal_id);
+        crate::collaboration_profile_authority::update_profile_authority(
+            temp.path(),
+            &principal.principal_id,
+            &principal.localhost_root,
+            &principal.proof_binding_id,
+            "Verified Profile",
+            None,
+            crate::auth::now_ts(),
+        )
+        .unwrap();
+
+        let authenticated = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "passkey authentication with verified Profile",
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&authenticated.profile_readiness).unwrap(),
+            serde_json::json!({
+                "schema": "elastos.profile.readiness/v1",
+                "status": "ready",
+            })
+        );
+        assert!(crate::auth::is_auth_session_active(
+            temp.path(),
+            &authenticated.session_id,
+            crate::auth::now_ts(),
+        )
+        .unwrap());
+    }
+
+    #[test]
     fn refresh_session_reissues_proof_bound_home_and_system_tokens() {
         let temp = tempfile::tempdir().unwrap();
         let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
@@ -5512,6 +6075,50 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!crate::auth::is_auth_session_active(
             trusted.path(),
+            &grant.session_id,
+            crate::auth::now_ts(),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn sign_out_accepts_stale_header_beside_rotated_session_cookie() {
+        let temp = tempfile::tempdir().unwrap();
+        let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+        let grant = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "test passkey grant",
+        )
+        .unwrap();
+
+        let refreshed =
+            refresh_session_inner(&state, &home_token_headers(&grant.home_token)).unwrap();
+        assert_ne!(refreshed.home_token, grant.home_token);
+
+        // The tab keeps its pre-refresh mint in the header while the browser
+        // carries the rotated session cookie — one session, two generations.
+        let mut headers = home_token_headers(&grant.home_token);
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{}={}",
+                super::super::gateway::HOME_SESSION_COOKIE,
+                refreshed.home_token
+            ))
+            .unwrap(),
+        );
+
+        let signed_out = sign_out_session_inner(&state, &headers).unwrap();
+
+        assert_eq!(signed_out.session_id, grant.session_id);
+        assert!(!crate::auth::is_auth_session_active(
+            temp.path(),
             &grant.session_id,
             crate::auth::now_ts(),
         )

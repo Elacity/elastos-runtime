@@ -1,0 +1,1397 @@
+use std::collections::HashSet;
+
+use vsss_rs::Gf256;
+use zeroize::Zeroizing;
+
+use elastos_protected_content_contracts::{
+    AuthenticatedRuntimeReleaseOperationV1, CustodyEnvelopeV1, CustodyNodeIdentityV1, Digest32,
+    KeyReleaseError, KeyReleaseOutcomeV1, NodeSetV1, ProtectedContentBindingV1,
+    RecipientKeyIdentityV1, SignedNodeContributionV1, SignedTerminalReceiptV1,
+    TerminalReceiptIssuerKey, VerifiedNodeContributionV1,
+};
+
+use hpke::rand_core::{CryptoRng, RngCore};
+
+use crate::{
+    possession::{
+        possession_transcript_v1, require_recipient_possession,
+        wrap_content_key_to_decrypt_session, DecryptSessionPublicKeyV1,
+        DecryptSessionWrappedContentKeyV1,
+    },
+    secrets::{ContentEncryptionKeyV1, RecipientSecretKeyV1},
+    share_wrap::{decode_ciphertext_bytes, open_share},
+    CustodyError, CONTENT_KEY_BYTES,
+};
+
+#[cfg(test)]
+fn reconstruct_content_key(
+    request: &elastos_protected_content_contracts::VerifiedKeyReleaseRequestV1,
+    envelope: &CustodyEnvelopeV1,
+    contributions: &[SignedNodeContributionV1],
+    terminal_receipt: &SignedTerminalReceiptV1,
+    expected_terminal_issuer: TerminalReceiptIssuerKey,
+    recipient_secret: &RecipientSecretKeyV1,
+    now: u64,
+) -> Result<ContentEncryptionKeyV1, CustodyError> {
+    let possession = require_recipient_possession(
+        recipient_secret,
+        request.binding(),
+        request.recipient(),
+        request.request_hash(),
+    )?;
+    let context = ReconstructionContext {
+        binding: request.binding(),
+        recipient: request.recipient(),
+        request_hash: request.request_hash(),
+        envelope,
+        contributions,
+        terminal_receipt,
+        expected_terminal_issuer,
+        recipient_secret: possession.secret(),
+        now,
+    };
+    reconstruct_content_key_impl(
+        &context,
+        |contribution, node_set, now| contribution.verify(request, node_set, now),
+        |terminal_receipt, verified_contributions, expected_issuer, now| {
+            terminal_receipt.verify(request, verified_contributions, expected_issuer, now)
+        },
+    )
+}
+
+pub(crate) fn reconstruct_content_key_from_authenticated_operation(
+    operation: &AuthenticatedRuntimeReleaseOperationV1,
+    envelope: &CustodyEnvelopeV1,
+    contributions: &[SignedNodeContributionV1],
+    terminal_receipt: &SignedTerminalReceiptV1,
+    expected_terminal_issuer: TerminalReceiptIssuerKey,
+    recipient_secret: &RecipientSecretKeyV1,
+    now: u64,
+) -> Result<ContentEncryptionKeyV1, CustodyError> {
+    let possession = require_recipient_possession(
+        recipient_secret,
+        operation.binding(),
+        operation.recipient(),
+        operation.release_request_hash(),
+    )?;
+    let context = ReconstructionContext {
+        binding: operation.binding(),
+        recipient: operation.recipient(),
+        request_hash: operation.release_request_hash(),
+        envelope,
+        contributions,
+        terminal_receipt,
+        expected_terminal_issuer,
+        recipient_secret: possession.secret(),
+        now,
+    };
+    reconstruct_content_key_impl(
+        &context,
+        |contribution, node_set, now| {
+            operation.verify_node_contribution(contribution, node_set, now)
+        },
+        |terminal_receipt, verified_contributions, expected_issuer, now| {
+            operation.verify_terminal_receipt(
+                terminal_receipt,
+                verified_contributions,
+                expected_issuer,
+                now,
+            )
+        },
+    )
+}
+
+pub struct DecryptSessionReconstructionInputsV1<'a> {
+    pub operation: &'a AuthenticatedRuntimeReleaseOperationV1,
+    pub envelope: &'a CustodyEnvelopeV1,
+    pub contributions: &'a [SignedNodeContributionV1],
+    pub terminal_receipt: &'a SignedTerminalReceiptV1,
+    pub expected_terminal_issuer: TerminalReceiptIssuerKey,
+    pub recipient_secret: &'a RecipientSecretKeyV1,
+    pub decrypt_session_public: &'a DecryptSessionPublicKeyV1,
+    pub now: u64,
+}
+
+pub fn reconstruct_content_key_into_decrypt_session<R: CryptoRng + RngCore>(
+    inputs: &DecryptSessionReconstructionInputsV1<'_>,
+    rng: &mut R,
+) -> Result<DecryptSessionWrappedContentKeyV1, CustodyError> {
+    let content_key = reconstruct_content_key_from_authenticated_operation(
+        inputs.operation,
+        inputs.envelope,
+        inputs.contributions,
+        inputs.terminal_receipt,
+        inputs.expected_terminal_issuer,
+        inputs.recipient_secret,
+        inputs.now,
+    )?;
+    let mut wrap_transcript = possession_transcript_v1(
+        inputs.operation.binding().profile(),
+        inputs.operation.binding().runtime_session_binding(),
+        inputs.operation.recipient(),
+        inputs.operation.release_request_hash(),
+    )?;
+    wrap_transcript.extend_from_slice(inputs.decrypt_session_public.as_bytes());
+    wrap_content_key_to_decrypt_session(
+        &content_key,
+        inputs.decrypt_session_public,
+        &wrap_transcript,
+        rng,
+    )
+}
+
+struct ReconstructionContext<'a> {
+    binding: &'a ProtectedContentBindingV1,
+    recipient: &'a RecipientKeyIdentityV1,
+    request_hash: Digest32,
+    envelope: &'a CustodyEnvelopeV1,
+    contributions: &'a [SignedNodeContributionV1],
+    terminal_receipt: &'a SignedTerminalReceiptV1,
+    expected_terminal_issuer: TerminalReceiptIssuerKey,
+    recipient_secret: &'a RecipientSecretKeyV1,
+    now: u64,
+}
+
+fn reconstruct_content_key_impl<VerifyContribution, VerifyTerminalReceipt>(
+    context: &ReconstructionContext<'_>,
+    verify_contribution: VerifyContribution,
+    verify_terminal_receipt: VerifyTerminalReceipt,
+) -> Result<ContentEncryptionKeyV1, CustodyError>
+where
+    VerifyContribution: Fn(
+        &SignedNodeContributionV1,
+        &NodeSetV1,
+        u64,
+    ) -> Result<VerifiedNodeContributionV1, KeyReleaseError>,
+    VerifyTerminalReceipt: Fn(
+        &SignedTerminalReceiptV1,
+        &[VerifiedNodeContributionV1],
+        TerminalReceiptIssuerKey,
+        u64,
+    ) -> Result<(), KeyReleaseError>,
+{
+    if !context
+        .envelope
+        .matches_key_envelope_identity(context.binding.key_envelope())?
+    {
+        return Err(CustodyError::BindingMismatch("key_envelope"));
+    }
+    if context.recipient_secret.identity()? != *context.recipient {
+        return Err(CustodyError::BindingMismatch("recipient_key_identity"));
+    }
+
+    let required = usize::from(context.binding.key_envelope().threshold().required());
+    if context.contributions.len() < required {
+        return Err(CustodyError::Release(
+            KeyReleaseError::InsufficientContributions,
+        ));
+    }
+    if context.contributions.len() != required {
+        return Err(CustodyError::BindingMismatch("release_threshold"));
+    }
+
+    let node_set = context.envelope.manifest().node_set()?;
+    let mut seen_nodes = HashSet::with_capacity(context.contributions.len());
+    let mut verified_contributions = Vec::with_capacity(context.contributions.len());
+    let mut ordered_contributions = Vec::with_capacity(context.contributions.len());
+
+    for contribution in context.contributions {
+        let verified = verify_contribution(contribution, &node_set, context.now)?;
+        if !seen_nodes.insert(verified.node_public_key()) {
+            return Err(CustodyError::BindingMismatch("duplicate_contribution_node"));
+        }
+        let node_entry = context
+            .envelope
+            .manifest()
+            .node(verified.node_public_key())
+            .ok_or(CustodyError::BindingMismatch("custody_node"))?
+            .clone();
+        verified_contributions.push(verified.clone());
+        ordered_contributions.push((
+            node_entry.share_coordinate().get(),
+            node_entry,
+            verified,
+            contribution,
+        ));
+    }
+
+    verify_terminal_receipt(
+        context.terminal_receipt,
+        &verified_contributions,
+        context.expected_terminal_issuer,
+        context.now,
+    )?;
+    if context.terminal_receipt.statement().outcome() != KeyReleaseOutcomeV1::Released {
+        return Err(CustodyError::BindingMismatch("terminal_receipt_outcome"));
+    }
+
+    ordered_contributions.sort_unstable_by_key(|(coordinate, _, _, _)| *coordinate);
+
+    let mut plaintext_shares =
+        Zeroizing::new(Vec::<Vec<u8>>::with_capacity(ordered_contributions.len()));
+    for (_, node_entry, verified, contribution) in ordered_contributions {
+        let plaintext_share = open_released_share(
+            context.request_hash,
+            context.binding,
+            context.recipient,
+            &node_entry,
+            &verified,
+            contribution,
+            context.recipient_secret,
+        )?;
+        let share_index = plaintext_shares.len();
+        plaintext_shares.push(vec![0u8; CONTENT_KEY_BYTES + 1]);
+        let share = &mut plaintext_shares[share_index];
+        share[0] = node_entry.share_coordinate().get();
+        share[1..].copy_from_slice(&plaintext_share[..]);
+    }
+
+    let reconstructed = Zeroizing::new(Gf256::combine_bytes(&*plaintext_shares)?);
+    if reconstructed.len() != CONTENT_KEY_BYTES {
+        return Err(CustodyError::MalformedShare("reconstructed_content_key"));
+    }
+
+    let mut content_key = Zeroizing::new([0u8; CONTENT_KEY_BYTES]);
+    content_key.copy_from_slice(&reconstructed[..]);
+    let content_key = ContentEncryptionKeyV1::from_guarded_bytes(content_key);
+    if !content_key.matches_commitment(context.envelope.manifest().content_key_commitment()) {
+        return Err(CustodyError::ContentKeyCommitmentMismatch);
+    }
+    Ok(content_key)
+}
+
+fn open_released_share(
+    request_hash: Digest32,
+    binding: &ProtectedContentBindingV1,
+    recipient: &RecipientKeyIdentityV1,
+    node_entry: &CustodyNodeIdentityV1,
+    verified: &elastos_protected_content_contracts::VerifiedNodeContributionV1,
+    contribution: &SignedNodeContributionV1,
+    recipient_secret: &RecipientSecretKeyV1,
+) -> Result<Zeroizing<[u8; CONTENT_KEY_BYTES]>, CustodyError> {
+    let released_aad = node_entry.released_share_aad_bytes(
+        request_hash,
+        binding,
+        verified.decision_hash(),
+        recipient,
+    )?;
+    let ciphertext = decode_ciphertext_bytes(
+        contribution
+            .statement()
+            .recipient_sealed_contribution()
+            .sealed_bytes(),
+    )?;
+    let plaintext_share = open_share(
+        &ciphertext,
+        recipient_secret.secret_bytes(),
+        elastos_protected_content_contracts::RELEASED_SHARE_HPKE_INFO_V1,
+        &released_aad,
+    )?;
+    Ok(plaintext_share)
+}
+
+#[cfg(test)]
+mod tests {
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use rand09::{rngs::StdRng, SeedableRng as _};
+    use rand10::SeedableRng as _;
+
+    use elastos_protected_content_contracts::{
+        CanonicalContract, EncryptedContentIdentityV1, KeyReleaseError, KeyReleaseOutcomeV1,
+        NodeContributionRefV1, NodeContributionStatementV1, RecipientSealedContributionV1,
+        SignedNodeContributionV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
+        TerminalReceiptStatementV1, VerifiedKeyReleaseRequestV1,
+    };
+
+    use crate::{
+        provision::provision_custody_envelope_with_rng,
+        release::produce_node_contribution_with_rng,
+        share_wrap::{open_share, seal_share},
+        test_support::{
+            authenticated_runtime_release_operation_for_envelope_and_recipient_seed,
+            claimed_runtime_release_operation_for_envelope_and_node_seed, content_key, digest,
+            node_custody_secret, node_public_key, node_signing_key, provisioned_envelope,
+            recipient_public_key, recipient_secret, signed_node_decision, verified_release_request,
+            verified_release_request_for_envelope,
+            verified_release_request_for_envelope_and_recipient_seed, NOW,
+        },
+    };
+
+    use super::*;
+
+    fn released_contribution(
+        request: &VerifiedKeyReleaseRequestV1,
+        envelope: &CustodyEnvelopeV1,
+        node_seed: u8,
+        recipient_seed: u8,
+        hpke_seed: u8,
+    ) -> SignedNodeContributionV1 {
+        produce_node_contribution_with_rng(
+            &claimed_runtime_release_operation_for_envelope_and_node_seed(
+                envelope,
+                node_seed,
+                recipient_seed,
+            ),
+            &signed_node_decision(
+                request,
+                node_seed,
+                elastos_protected_content_contracts::RightsDecisionV1::Allowed,
+            ),
+            &crate::NodeLocalStoredShareV1::extract_from_envelope(
+                envelope,
+                node_public_key(node_seed),
+            )
+            .unwrap(),
+            &node_signing_key(node_seed),
+            &node_custody_secret(node_seed),
+            &recipient_public_key(recipient_seed),
+            NOW + 5,
+            NOW + 45,
+            NOW + 6,
+            &mut StdRng::from_seed([hpke_seed; 32]),
+        )
+        .unwrap()
+    }
+
+    fn terminal_receipt(
+        request: &VerifiedKeyReleaseRequestV1,
+        envelope: &CustodyEnvelopeV1,
+        contributions: &[SignedNodeContributionV1],
+        issuer_seed: u8,
+        outcome: KeyReleaseOutcomeV1,
+    ) -> SignedTerminalReceiptV1 {
+        let verified = contributions
+            .iter()
+            .map(|contribution| {
+                contribution
+                    .verify(request, &envelope.manifest().node_set().unwrap(), NOW + 7)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let issuer_key = SigningKey::from_bytes(&[issuer_seed; 32]);
+        let issuer = TerminalReceiptIssuerKey::new(issuer_key.verifying_key().to_bytes()).unwrap();
+        let refs = match outcome {
+            KeyReleaseOutcomeV1::Denied => Vec::new(),
+            KeyReleaseOutcomeV1::Released => {
+                verified.iter().map(NodeContributionRefV1::from).collect()
+            }
+        };
+        let statement = TerminalReceiptStatementV1::new(
+            request.request_hash(),
+            request.binding().clone(),
+            issuer,
+            outcome,
+            refs,
+            NOW + 7,
+            NOW + 40,
+        )
+        .unwrap();
+        let signature = issuer_key
+            .sign(&statement.canonical_bytes().unwrap())
+            .to_bytes()
+            .to_vec();
+        SignedTerminalReceiptV1::new(statement, signature).unwrap()
+    }
+
+    fn tampered_ciphertext_contribution(
+        request: &VerifiedKeyReleaseRequestV1,
+        envelope: &CustodyEnvelopeV1,
+        node_seed: u8,
+        recipient_seed: u8,
+        hpke_seed: u8,
+    ) -> SignedNodeContributionV1 {
+        let valid = released_contribution(request, envelope, node_seed, recipient_seed, hpke_seed);
+        let mut ciphertext = decode_ciphertext_bytes(
+            valid
+                .statement()
+                .recipient_sealed_contribution()
+                .sealed_bytes(),
+        )
+        .unwrap();
+        ciphertext = ciphertext.tamper_envelope();
+        let sealed = RecipientSealedContributionV1::new(
+            request.recipient().clone(),
+            ciphertext.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        let statement = NodeContributionStatementV1::new(
+            request.request_hash(),
+            request.binding().clone(),
+            signed_node_decision(
+                request,
+                node_seed,
+                elastos_protected_content_contracts::RightsDecisionV1::Allowed,
+            ),
+            sealed,
+            NOW + 5,
+            NOW + 45,
+        )
+        .unwrap();
+        let signature = node_signing_key(node_seed)
+            .sign(&statement.canonical_bytes().unwrap())
+            .to_bytes()
+            .to_vec();
+        SignedNodeContributionV1::new(statement, signature).unwrap()
+    }
+
+    fn malicious_wrong_share_contribution(
+        request: &VerifiedKeyReleaseRequestV1,
+        envelope: &CustodyEnvelopeV1,
+        node_seed: u8,
+        recipient_seed: u8,
+        hpke_seed: u8,
+    ) -> SignedNodeContributionV1 {
+        let valid = released_contribution(request, envelope, node_seed, recipient_seed, hpke_seed);
+        let verified = valid
+            .verify(request, &envelope.manifest().node_set().unwrap(), NOW + 7)
+            .unwrap();
+        let node_entry = envelope
+            .manifest()
+            .node(verified.node_public_key())
+            .unwrap()
+            .clone();
+        let released_aad = node_entry
+            .released_share_aad_bytes(
+                request.request_hash(),
+                request.binding(),
+                verified.decision_hash(),
+                request.recipient(),
+            )
+            .unwrap();
+        let original = decode_ciphertext_bytes(
+            valid
+                .statement()
+                .recipient_sealed_contribution()
+                .sealed_bytes(),
+        )
+        .unwrap();
+        let mut plaintext = open_share(
+            &original,
+            recipient_secret(recipient_seed).secret_bytes(),
+            elastos_protected_content_contracts::RELEASED_SHARE_HPKE_INFO_V1,
+            &released_aad,
+        )
+        .unwrap();
+        plaintext[0] ^= 0x01;
+        let resealed = seal_share(
+            recipient_public_key(recipient_seed).as_bytes(),
+            elastos_protected_content_contracts::RELEASED_SHARE_HPKE_INFO_V1,
+            &released_aad,
+            &plaintext,
+            &mut StdRng::from_seed([hpke_seed.wrapping_add(0x30); 32]),
+        )
+        .unwrap();
+        let sealed = RecipientSealedContributionV1::new(
+            request.recipient().clone(),
+            resealed.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        let statement = NodeContributionStatementV1::new(
+            request.request_hash(),
+            request.binding().clone(),
+            signed_node_decision(
+                request,
+                node_seed,
+                elastos_protected_content_contracts::RightsDecisionV1::Allowed,
+            ),
+            sealed,
+            NOW + 5,
+            NOW + 45,
+        )
+        .unwrap();
+        let signature = node_signing_key(node_seed)
+            .sign(&statement.canonical_bytes().unwrap())
+            .to_bytes()
+            .to_vec();
+        SignedNodeContributionV1::new(statement, signature).unwrap()
+    }
+
+    fn alternate_envelope() -> CustodyEnvelopeV1 {
+        provision_custody_envelope_with_rng(
+            EncryptedContentIdentityV1::new(digest(0x99), 4096).unwrap(),
+            &content_key(),
+            &crate::test_support::validated_custody_committee(),
+            &mut StdRng::from_seed([0x51; 32]),
+            &mut rand10::rngs::StdRng::from_seed([0x52; 32]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reconstructs_threshold_content_key() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let recovered = reconstruct_content_key(
+            &request,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recovered.with_bytes(|bytes| *bytes),
+            content_key().with_bytes(|bytes| *bytes)
+        );
+    }
+
+    #[test]
+    fn authenticated_operation_reconstructs_threshold_content_key() {
+        let envelope = provisioned_envelope();
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        let request = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x30);
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let recovered = reconstruct_content_key_from_authenticated_operation(
+            &operation,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recovered.with_bytes(|bytes| *bytes),
+            content_key().with_bytes(|bytes| *bytes)
+        );
+    }
+
+    #[test]
+    fn authenticated_operation_wraps_reconstructed_cek_to_decrypt_session() {
+        let envelope = provisioned_envelope();
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        let request = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x30);
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+        let (session_secret, session_public) =
+            crate::mint_decrypt_session_from_seed([0x51; 32]).unwrap();
+        let inputs = DecryptSessionReconstructionInputsV1 {
+            operation: &operation,
+            envelope: &envelope,
+            contributions: &contributions,
+            terminal_receipt: &terminal,
+            expected_terminal_issuer: terminal.statement().issuer(),
+            recipient_secret: &recipient_secret(0x30),
+            decrypt_session_public: &session_public,
+            now: NOW + 8,
+        };
+        let wrapped = reconstruct_content_key_into_decrypt_session(
+            &inputs,
+            &mut StdRng::from_seed([0x71; 32]),
+        )
+        .unwrap();
+        let cek = content_key().with_bytes(|bytes| *bytes);
+        let sealed_bytes = wrapped.sealed_share().canonical_bytes().unwrap();
+        assert!(!sealed_bytes.windows(cek.len()).any(|window| window == cek));
+
+        let mut wrap_transcript = crate::possession_transcript_v1(
+            operation.binding().profile(),
+            operation.binding().runtime_session_binding(),
+            operation.recipient(),
+            operation.release_request_hash(),
+        )
+        .unwrap();
+        wrap_transcript.extend_from_slice(session_public.as_bytes());
+        let opened = crate::unwrap_content_key_in_decrypt_session(
+            &session_secret,
+            &wrapped,
+            &wrap_transcript,
+        )
+        .unwrap();
+        assert_eq!(opened.with_bytes(|bytes| *bytes), cek);
+    }
+
+    #[test]
+    fn authenticated_operation_insufficient_shares_fail_before_open() {
+        let envelope = provisioned_envelope();
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        let request = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x30);
+        let contribution = released_contribution(&request, &envelope, 1, 0x30, 0x71);
+        let terminal =
+            terminal_receipt(&request, &envelope, &[], 0x21, KeyReleaseOutcomeV1::Denied);
+
+        let err = reconstruct_content_key_from_authenticated_operation(
+            &operation,
+            &envelope,
+            &[contribution],
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::Release(KeyReleaseError::InsufficientContributions)
+        ));
+    }
+
+    #[test]
+    fn authenticated_operation_required_plus_one_shares_fail_before_open() {
+        let envelope = provisioned_envelope();
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        let request = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x30);
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+            released_contribution(&request, &envelope, 3, 0x30, 0x73),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions[..2],
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let err = reconstruct_content_key_from_authenticated_operation(
+            &operation,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::BindingMismatch("release_threshold")
+        ));
+    }
+
+    #[test]
+    fn authenticated_operation_duplicate_node_contributions_fail_before_open() {
+        let envelope = provisioned_envelope();
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        let request = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x30);
+        let contribution = released_contribution(&request, &envelope, 1, 0x30, 0x71);
+        let terminal =
+            terminal_receipt(&request, &envelope, &[], 0x21, KeyReleaseOutcomeV1::Denied);
+
+        let err = reconstruct_content_key_from_authenticated_operation(
+            &operation,
+            &envelope,
+            &[contribution.clone(), contribution],
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::BindingMismatch("duplicate_contribution_node")
+        ));
+    }
+
+    #[test]
+    fn authenticated_operation_wrong_recipient_secret_is_rejected() {
+        let envelope = provisioned_envelope();
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        let request = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x30);
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let err = reconstruct_content_key_from_authenticated_operation(
+            &operation,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x31),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::BindingMismatch("recipient_key_identity")
+        ));
+    }
+
+    #[test]
+    fn insufficient_shares_fail_before_open() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let contribution = released_contribution(&request, &envelope, 1, 0x30, 0x71);
+        let terminal =
+            terminal_receipt(&request, &envelope, &[], 0x21, KeyReleaseOutcomeV1::Denied);
+
+        let err = reconstruct_content_key(
+            &request,
+            &envelope,
+            &[contribution],
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::Release(KeyReleaseError::InsufficientContributions)
+        ));
+    }
+
+    #[test]
+    fn required_plus_one_shares_fail_before_open() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+            released_contribution(&request, &envelope, 3, 0x30, 0x73),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions[..2],
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let err = reconstruct_content_key(
+            &request,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::BindingMismatch("release_threshold")
+        ));
+    }
+
+    #[test]
+    fn duplicate_node_contributions_fail_before_open() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let contribution = released_contribution(&request, &envelope, 1, 0x30, 0x71);
+        let terminal =
+            terminal_receipt(&request, &envelope, &[], 0x21, KeyReleaseOutcomeV1::Denied);
+
+        let err = reconstruct_content_key(
+            &request,
+            &envelope,
+            &[contribution.clone(), contribution],
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::BindingMismatch("duplicate_contribution_node")
+        ));
+    }
+
+    #[test]
+    fn wrong_recipient_secret_is_rejected() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let err = reconstruct_content_key(
+            &request,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x31),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::BindingMismatch("recipient_key_identity")
+        ));
+    }
+
+    #[test]
+    fn wrong_request_contribution_is_rejected() {
+        let envelope = provisioned_envelope();
+        let request_a = verified_release_request_for_envelope(&envelope);
+        let request_b = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x31);
+        let contributions = vec![
+            released_contribution(&request_a, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request_b, &envelope, 2, 0x31, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request_a,
+            &envelope,
+            &[],
+            0x21,
+            KeyReleaseOutcomeV1::Denied,
+        );
+
+        let err = reconstruct_content_key(
+            &request_a,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::Release(KeyReleaseError::BindingMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn authenticated_operation_wrong_request_contribution_is_rejected() {
+        let envelope = provisioned_envelope();
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        let request_a = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x30);
+        let request_b = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x31);
+        let contributions = vec![
+            released_contribution(&request_a, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request_b, &envelope, 2, 0x31, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request_a,
+            &envelope,
+            &[],
+            0x21,
+            KeyReleaseOutcomeV1::Denied,
+        );
+
+        let err = reconstruct_content_key_from_authenticated_operation(
+            &operation,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::Release(KeyReleaseError::BindingMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn authenticated_operation_wrong_terminal_release_request_is_rejected() {
+        let envelope = provisioned_envelope();
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        let request_a = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x30);
+        let request_b = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x31);
+        let contributions = vec![
+            released_contribution(&request_a, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request_a, &envelope, 2, 0x30, 0x72),
+        ];
+        let verified = contributions
+            .iter()
+            .map(|contribution| {
+                contribution
+                    .verify(
+                        &request_a,
+                        &envelope.manifest().node_set().unwrap(),
+                        NOW + 7,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let issuer_key = SigningKey::from_bytes(&[0x21; 32]);
+        let issuer = TerminalReceiptIssuerKey::new(issuer_key.verifying_key().to_bytes()).unwrap();
+        let refs = verified.iter().map(NodeContributionRefV1::from).collect();
+        let statement = TerminalReceiptStatementV1::new(
+            request_b.request_hash(),
+            request_a.binding().clone(),
+            issuer,
+            KeyReleaseOutcomeV1::Released,
+            refs,
+            NOW + 6,
+            NOW + 46,
+        )
+        .unwrap();
+        let terminal = SignedTerminalReceiptV1::new(
+            statement.clone(),
+            issuer_key
+                .sign(&statement.canonical_bytes().unwrap())
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+
+        let err = reconstruct_content_key_from_authenticated_operation(
+            &operation,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::Release(KeyReleaseError::BindingMismatch("key_release_request_hash"))
+        ));
+    }
+
+    #[test]
+    fn authenticated_operation_wrong_terminal_contribution_set_is_rejected() {
+        let envelope = provisioned_envelope();
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        let request = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x30);
+        let contribution_a = released_contribution(&request, &envelope, 1, 0x30, 0x71);
+        let contribution_b = released_contribution(&request, &envelope, 2, 0x30, 0x72);
+        let contribution_c = released_contribution(&request, &envelope, 3, 0x30, 0x73);
+        let contributions = vec![contribution_a.clone(), contribution_b];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &[contribution_a, contribution_c],
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let err = reconstruct_content_key_from_authenticated_operation(
+            &operation,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::Release(KeyReleaseError::BindingMismatch("node_contribution_refs"))
+        ));
+    }
+
+    #[test]
+    fn tampered_ciphertext_is_rejected() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let contributions = vec![
+            tampered_ciphertext_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let err = reconstruct_content_key(
+            &request,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, CustodyError::PqHybrid(_)));
+    }
+
+    #[test]
+    fn malicious_signed_wrong_share_is_rejected_by_content_key_commitment() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            malicious_wrong_share_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let err = reconstruct_content_key(
+            &request,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, CustodyError::ContentKeyCommitmentMismatch));
+    }
+
+    #[test]
+    fn authenticated_operation_malicious_signed_wrong_share_is_rejected_by_content_key_commitment()
+    {
+        let envelope = provisioned_envelope();
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        let request = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x30);
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            malicious_wrong_share_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let err = reconstruct_content_key_from_authenticated_operation(
+            &operation,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, CustodyError::ContentKeyCommitmentMismatch));
+    }
+
+    #[test]
+    fn authenticated_operation_wrong_terminal_issuer_is_rejected() {
+        let envelope = provisioned_envelope();
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        let request = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x30);
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let wrong_issuer = TerminalReceiptIssuerKey::new(
+            SigningKey::from_bytes(&[0x31; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap();
+        let err = reconstruct_content_key_from_authenticated_operation(
+            &operation,
+            &envelope,
+            &contributions,
+            &terminal,
+            wrong_issuer,
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::Release(KeyReleaseError::UnexpectedTerminalIssuer)
+        ));
+    }
+
+    #[test]
+    fn expiry_is_rejected() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let err = reconstruct_content_key(
+            &request,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 40,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::Release(KeyReleaseError::Rights(
+                elastos_protected_content_contracts::RightsError::Expired
+            ))
+        ));
+    }
+
+    #[test]
+    fn authenticated_operation_expiry_is_rejected() {
+        let envelope = provisioned_envelope();
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        let request = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x30);
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let err = reconstruct_content_key_from_authenticated_operation(
+            &operation,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 40,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::Release(KeyReleaseError::Rights(
+                elastos_protected_content_contracts::RightsError::Expired
+            ))
+        ));
+    }
+
+    #[test]
+    fn contributions_are_sorted_by_manifest_coordinate() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let contributions = vec![
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let recovered = reconstruct_content_key(
+            &request,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recovered.with_bytes(|bytes| *bytes),
+            content_key().with_bytes(|bytes| *bytes)
+        );
+    }
+
+    #[test]
+    fn reconstructed_key_debug_output_is_redacted() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let key = reconstruct_content_key(
+            &request,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap();
+        let debug = format!("{key:?}");
+
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("22"));
+    }
+
+    #[test]
+    fn wrong_envelope_binding_is_rejected() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let err = reconstruct_content_key(
+            &request,
+            &alternate_envelope(),
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, CustodyError::BindingMismatch("key_envelope")));
+    }
+
+    #[test]
+    fn authenticated_operation_wrong_envelope_binding_is_rejected() {
+        let envelope = provisioned_envelope();
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        let request = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x30);
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let err = reconstruct_content_key_from_authenticated_operation(
+            &operation,
+            &alternate_envelope(),
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, CustodyError::BindingMismatch("key_envelope")));
+    }
+}

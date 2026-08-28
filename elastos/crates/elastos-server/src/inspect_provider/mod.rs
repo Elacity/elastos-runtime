@@ -1,7 +1,7 @@
 //! Runtime-owned Capsule Inspector provider (`elastos://inspect/*`).
 //!
 //! This is the live-object mirror: read-only, capability-gated by the existing
-//! provider proxy/Carrier bridge, and projected through an allow-list so it does
+//! provider proxy/resource bridge, and projected through an allow-list so it does
 //! not leak bearer tokens, raw signatures, host paths, or mutation handles.
 
 mod dispatch;
@@ -186,7 +186,7 @@ mod tests {
                 "/host/private/storage",
                 "localhost://UsersAI/Documents/*"
             ],
-            "carrier": true
+            "host_process": true
         });
         manifest["interfaces"] = json!([{
             "id": "elastos.exit.leaky",

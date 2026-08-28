@@ -126,7 +126,7 @@ pub async fn run_attest(
     };
 
     let prov_bytes = elastos_server::shares::create_provenance(&cid, &digest, &signing_key)?;
-    let did = elastos_server::crypto::encode_did_key(&signing_key.verifying_key());
+    let did = elastos_server::crypto::encode_signing_key_did(&signing_key);
     let prov_cid = elastos_server::content::publish_bytes_via_provider(
         &content_registry,
         "provenance.json",

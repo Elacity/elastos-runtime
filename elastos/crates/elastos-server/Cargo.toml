@@ -19,6 +19,10 @@ elastos-tls = { path = "../elastos-tls" }
 elastos-identity = { path = "../elastos-identity" }
 elastos-crosvm = { path = "../elastos-crosvm" }
 elastos-wallet-contract = { path = "../elastos-wallet-contract" }
+elastos-protected-content-runtime = { path = "../elastos-protected-content-runtime" }
+elastos-protected-content-rights = { path = "../elastos-protected-content-rights" }
+elastos-protected-content-provider-contracts = { path = "../elastos-protected-content-provider-contracts" }
+elastos-protected-content-contracts = { path = "../elastos-protected-content-contracts" }
 
 # HTTP server
 axum = { version = "0.7", features = ["ws"] }
@@ -81,9 +85,9 @@ base64 = "0.22"
 
 # Ed25519 signing (for provenance attestations)
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-# ed25519-dalek 3.x needed by distributed-topic-tracker for DHT record signing.
-# Cargo resolves both versions; we convert between them via raw key bytes.
-ed25519-dalek3 = { package = "ed25519-dalek", version = "=3.0.0-pre.1" }
+# ed25519-dalek 3.x is used by Iroh and distributed-topic-tracker for transport
+# and DHT signing. Runtime identity remains on 2.x; the boundary is raw key bytes.
+ed25519-dalek3 = { package = "ed25519-dalek", version = "=3.0.0-rc.0" }
 
 # Directory helpers
 dirs = "5.0"
@@ -100,13 +104,12 @@ tar = "0.4"
 zip = { version = "2.4.2", default-features = false, features = ["deflate-flate2", "flate2"] }
 libc = "0.2"
 
-# Built-in Carrier transport (P2P for updates, gossip messaging, DHT discovery)
-# distributed-topic-tracker 0.2.8 pulls iroh 0.97 while elastos-server still
-# uses iroh 0.96 directly. Keep one iroh generation in the tree until the whole
-# server can migrate together.
-iroh = { version = "0.96", features = ["address-lookup-mdns"] }
-iroh-gossip = "0.96"
-distributed-topic-tracker = "=0.2.7"
+# Built-in Carrier transport (P2P for updates, gossip messaging, DHT discovery).
+# These versions form one coordinated generation and must move together.
+iroh = "=1.0.2"
+iroh-gossip = "=0.101.0"
+iroh-mdns-address-lookup = "=0.4.0"
+distributed-topic-tracker = "=0.3.5"
 futures-lite = "2.6"
 getrandom = "0.2"
 data-encoding = "2.6"
@@ -116,6 +119,10 @@ tokio = { version = "1.0", features = ["full", "test-util"] }
 tempfile = "3.10"
 tower = { version = "0.5", features = ["util"] }
 wasm-encoder = "=0.236.1"
+elastos-auth = { path = "../elastos-auth" }
+elastos-protected-content-custody = { path = "../elastos-protected-content-custody" }
+x-wing = { version = "=0.1.0", features = ["hazmat", "zeroize"] }
+custody-provider = { path = "../../../capsules/custody-provider" }
 
 [features]
 default = []

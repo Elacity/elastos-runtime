@@ -7,29 +7,37 @@ import {
   launcher,
   launcherSearch,
   launcherToggleButton,
-  closeLauncherButton,
+  launcherViewToggle,
+  identityMenuSystemButton,
   shellState,
   taskbarTargets,
   toolbarFullscreenButton,
   toolbarHomeButton,
+  identityMenuShowDesktopButton,
   toolbarInboxButton,
   toolbarSignOutButton,
   ensureHomeGuiDom,
   initializeRecentTargets,
   initializeShellLayout,
+  rememberSharedUiPreferences,
+  setFocusModeEnabled,
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260725a";
+} from "./shell-core.js?v=home-20260813a";
 import {
+  bindIdentityMenu,
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260725a";
+} from "./shell-chrome.js?v=home-20260813a";
 import {
+  beginDesktopMarquee,
+  bindShellSurfaceDom,
   clearDesktopSelection,
   continueTargetDrag,
   filterLauncherItems,
+  finishDesktopMarquee,
   finishTargetDrag,
   handleContextAction,
   hideDesktopContextMenu,
@@ -44,9 +52,12 @@ import {
   renderDesktop,
   renderLauncher,
   renderTaskbar,
+  selectAllDesktopIcons,
+  setDockAutoHide,
   toggleLauncher,
+  updateDesktopMarquee,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260731b";
+} from "./shell-surface.js?v=home-20260813a";
 import {
   attachAuthorizedTarget,
   closeWindow,
@@ -58,12 +69,101 @@ import {
   renewBrowserWindowAuthority,
   restoreShellSession,
   showDesktopHome,
-} from "./shell-windows.js?v=home-20260731b";
+  supportsMenuNewWindow,
+} from "./shell-windows.js?v=home-20260813a";
+import {
+  bindShellKeyboard,
+  handleDesktopArrowKey,
+  retireKeyboardSurfaces,
+  toggleShortcutsOverlay,
+} from "./shell-keyboard.js?v=home-20260813a";
+import {
+  bindSpotlight,
+  hideSpotlight,
+  showSpotlight,
+} from "./shell-spotlight.js?v=home-20260813a";
+import {
+  bindNotificationCenter,
+  hideNotificationCenter,
+  recordNotifications,
+} from "./shell-notifications.js?v=home-20260813a";
+import {
+  bindMenubar,
+  closeMenus,
+  setMenuManifest,
+  syncMenubar,
+} from "./shell-menubar.js?v=home-20260813a";
+import {
+  bindQuickLook,
+  hideQuickLook,
+  toggleQuickLook,
+} from "./shell-quicklook.js?v=home-20260813a";
+import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-20260813a";
+import {
+  bindSpaceEdgePeek,
+  bindSpacePager,
+  toggleActiveFullscreenStage,
+} from "./shell-stages.js?v=home-20260813a";
+import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20260813a";
+import {
+  bindControlCentre,
+  hideControlCentre,
+  syncControlCentre,
+} from "./shell-control-centre.js?v=home-20260813a";
+import {
+  bindWalletRail,
+  retireWalletRail,
+  showWalletRail,
+  syncWalletRailAvailability,
+  walletRailFrame,
+  walletRailOpen,
+  walletRailSessionMounted,
+} from "./shell-wallet-rail.js?v=home-20260813a";
+import {
+  bindInboxRail,
+  retireInboxRail,
+  toggleInboxRail,
+  showInboxRail,
+  inboxRailFrame,
+  inboxRailOpen,
+  inboxRailSessionMounted,
+} from "./shell-inbox-rail.js?v=home-20260813a";
+import {
+  bindConnectorSheet,
+  connectorSheetFrame,
+  connectorSheetTarget,
+  isConnectorSheetTarget,
+  noteConnectorSheetSummaryRefresh,
+  retireConnectorSheet,
+  showConnectorSheet,
+} from "./shell-connector-sheet.js?v=home-20260813a";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
 
 await ensureHomeGuiDom();
+bindIdentityMenu();
+bindShellSurfaceDom();
+bindSpotlight();
+bindNotificationCenter();
+bindQuickLook();
+bindExpose();
+bindSpacePager();
+bindSpaceEdgePeek();
+bindShellKeyboard();
+bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow });
+bindControlCentre();
+bindWalletRail();
+bindInboxRail();
+bindConnectorSheet();
+window.addEventListener("elastos:ui-preference-changed", (event) => {
+  const detail = event?.detail;
+  const key = typeof detail?.key === "string" ? detail.key.trim() : "";
+  if (!key) {
+    return;
+  }
+  applyHomeGuiUiPreferences({ [key]: detail.value });
+});
 
 const HOME_GUI_HOST_SELECTORS = Object.freeze([
   ".desktop-backdrop",
@@ -73,6 +173,16 @@ const HOME_GUI_HOST_SELECTORS = Object.freeze([
   ".launcher",
   "#desktop-context-menu",
   "#home-notification-toast",
+  "#notification-center",
+  "#control-centre",
+  "#wallet-rail",
+  "#inbox-rail",
+  "#connector-sheet",
+  "#spotlight",
+  "#window-switcher",
+  "#quick-look",
+  "#shortcuts-overlay",
+  "#about-overlay",
 ]);
 let homeGuiInteractionsBound = false;
 
@@ -99,8 +209,24 @@ configureWindowHooks({
   refreshLauncherIfVisible,
   renderDesktop,
   renderTaskbar,
+  syncMenubar,
   updateTaskbarState,
+  // Host-mediated launches: GUI never fetch-launches; shell-windows and the
+  // wallet rail call this hook after bindHomeGuiInteractions binds it.
   launchTarget: (...args) => homeGuiHostActions.launchTarget?.(...args),
+  // One Wallet session: dock/desktop window launch retires the rail so we
+  // do not keep two iframes / home_tokens for the same capsule — including
+  // when the rail is hidden but the warm iframe is still mounted.
+  retireWalletRailBeforeWindow: () => {
+    if (walletRailSessionMounted() || walletRailOpen()) {
+      retireWalletRail();
+    }
+  },
+  retireInboxRailBeforeWindow: () => {
+    if (inboxRailSessionMounted() || inboxRailOpen()) {
+      retireInboxRail();
+    }
+  },
 });
 
 function homeGuiHostNodes() {
@@ -136,6 +262,17 @@ export function retireHomeGuiSurface(options = {}) {
   hideLauncher();
   hideDesktopContextMenu();
   clearDesktopSelection();
+  hideSpotlight({ restoreFocus: false });
+  hideNotificationCenter({ restoreFocus: false });
+  hideControlCentre({ restoreFocus: false });
+  retireWalletRail();
+  retireInboxRail();
+  retireConnectorSheet();
+  hideAboutOverlay({ restoreFocus: false });
+  hideQuickLook();
+  closeExpose();
+  retireKeyboardSurfaces();
+  closeMenus({ restoreFocus: false });
   if (options.closeWindows === true) {
     for (const id of [...shellState.windows.keys()]) {
       closeWindow(id);
@@ -146,6 +283,7 @@ export function retireHomeGuiSurface(options = {}) {
 }
 
 export function setHomeGuiMounted(mounted, options = {}) {
+  const wasMounted = document.body.dataset.homeGui === "mounted";
   document.body.dataset.homeGui = mounted ? "mounted" : "dormant";
   if (mounted) {
     shellState.homeGuiMounted = true;
@@ -153,6 +291,9 @@ export function setHomeGuiMounted(mounted, options = {}) {
     startHomeGuiClock();
     for (const node of homeGuiHostNodes()) {
       setHomeGuiHostNodeMounted(node, true);
+    }
+    if (!wasMounted) {
+      playHomeGuiArrival();
     }
     return;
   }
@@ -163,6 +304,27 @@ export function setHomeGuiMounted(mounted, options = {}) {
   for (const node of homeGuiHostNodes()) {
     setHomeGuiHostNodeMounted(node, false);
   }
+}
+
+// Arrival: the desktop settles in as the GUI mounts (unlock hand-off or a
+// switch back from an alternate shell). Opacity/transform only — compositor
+// work, no layout. The host's neutral mask never carries the desktop; this
+// beat is the GUI's own. Reduced motion skips it.
+function playHomeGuiArrival() {
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches === true) {
+    return;
+  }
+  const arriving = [".desktop-backdrop", ".toolbar", ".desktop-workspace", ".taskbar"]
+    .map((selector) => document.querySelector(selector))
+    .filter((node) => node && !node.hidden);
+  for (const node of arriving) {
+    node.classList.add("home-gui-arriving");
+  }
+  window.setTimeout(() => {
+    for (const node of arriving) {
+      node.classList.remove("home-gui-arriving");
+    }
+  }, 760);
 }
 
 function startHomeGuiClock() {
@@ -197,6 +359,30 @@ export function closeHomeGuiWindowsForTarget(targetId) {
   }
 }
 
+export function openHomeGuiTarget(target, options = {}) {
+  const query = options.query && typeof options.query === "object" ? options.query : {};
+  // Wallet connectors open as an in-rail ceremony sheet — not a second
+  // desktop product window — when the wallet asks for sheet presentation
+  // or the wallet rail is already open.
+  if (
+    isConnectorSheetTarget(target) &&
+    (query.presentation === "sheet" || walletRailOpen())
+  ) {
+    showConnectorSheet(target, { ...options, query: { ...query, presentation: "sheet" } }).catch(
+      (error) => {
+        console.error("connector sheet open failed", error);
+        openTarget(target, options);
+      },
+    );
+    return;
+  }
+  openTarget(target, options);
+}
+
+export function noteHomeGuiConnectorSheetSummaryRefresh(homeToken) {
+  noteConnectorSheetSummaryRefresh(homeToken);
+}
+
 export function homeGuiHasWindows() {
   return shellState.windows.size > 0;
 }
@@ -209,15 +395,34 @@ export function closeHomeGuiWindow(windowId) {
   closeWindow(windowId);
 }
 
-export async function relaunchHomeGuiTarget(windowId, target) {
-  if (await closeWindow(windowId) !== true) {
-    return false;
-  }
+export function relaunchHomeGuiTarget(windowId, target) {
+  closeWindow(windowId);
   window.setTimeout(() => openTarget(target), 0);
-  return true;
 }
 
 export function deliverMessageToHomeGuiTargetFrame(target, payload, options = null) {
+  // Prefer an open rail over a desktop window — same capsule, user's
+  // current surface. Focus shows the rail; window focus is the fallback.
+  if (target === "wallet" && walletRailOpen()) {
+    const railFrame = walletRailFrame();
+    if (railFrame?.contentWindow) {
+      railFrame.contentWindow.postMessage(payload, OPAQUE_FRAME_TARGET);
+      if (options?.focus === true) {
+        showWalletRail();
+      }
+      return true;
+    }
+  }
+  if (target === "inbox" && inboxRailOpen()) {
+    const railFrame = inboxRailFrame();
+    if (railFrame?.contentWindow) {
+      railFrame.contentWindow.postMessage(payload, OPAQUE_FRAME_TARGET);
+      if (options?.focus === true) {
+        showInboxRail();
+      }
+      return true;
+    }
+  }
   const entries = [...shellState.windows.values()]
     .filter((entry) => entry.kind === "browser" && entry.targetId === target)
     .sort((left, right) => Number(right.serial || 0) - Number(left.serial || 0));
@@ -237,6 +442,10 @@ export function openHomeGuiTargetWithPayload(target, payload) {
   let deliveredCount = 0;
   if (deliverMessageToHomeGuiTargetFrame(target, payload, { focus: true })) {
     deliveredCount += 1;
+  } else if (target === "wallet" && targetById(shellState.currentSummary, "wallet")) {
+    showWalletRail();
+  } else if (target === "inbox" && targetById(shellState.currentSummary, "inbox")) {
+    showInboxRail();
   } else if (targetById(shellState.currentSummary, target)) {
     openTarget(target);
   } else {
@@ -255,6 +464,57 @@ export function openHomeGuiTargetWithPayload(target, payload) {
   return true;
 }
 
+/* Shell UI preferences arrive from the host (the canonical store). Apply to
+   this document's theme/dock state,
+   then fan out to every mounted app frame so their vendored theme runtimes
+   follow. Cosmetic only; values were validated against closed sets by the
+   host. */
+export function applyHomeGuiUiPreferences(preferences) {
+  const entries = preferences && typeof preferences === "object" ? preferences : {};
+  rememberSharedUiPreferences(entries);
+  if (typeof entries.theme === "string" && window.elastosTheme) {
+    window.elastosTheme.set(entries.theme);
+  }
+  if (typeof entries.accentCustom === "string" && window.elastosTheme?.setAccentCustom) {
+    window.elastosTheme.setAccentCustom(entries.accentCustom);
+  }
+  if (typeof entries.accent === "string" && window.elastosTheme?.setAccent) {
+    window.elastosTheme.setAccent(entries.accent);
+  }
+  if (typeof entries.dockAutoHide === "string") {
+    setDockAutoHide(entries.dockAutoHide === "on");
+  }
+  if (typeof entries.sounds === "string") {
+    setUiSoundsEnabled(entries.sounds === "on");
+  }
+  if (typeof entries.focusMode === "string") {
+    setFocusModeEnabled(entries.focusMode === "on");
+  }
+  broadcastHomeGuiUiPreferences(entries);
+}
+
+function broadcastHomeGuiUiPreferences(preferences) {
+  const message = { type: "elastos:ui-preference", preferences };
+  for (const entry of shellState.windows.values()) {
+    const frame = entry?.node?.querySelector(".window-frame");
+    try {
+      frame?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
+    } catch (_error) {
+      // Frame mid-teardown; the boot push covers the next mount.
+    }
+  }
+  try {
+    walletRailFrame()?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
+  } catch (_error) {
+    // Rail not mounted.
+  }
+  try {
+    inboxRailFrame()?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
+  } catch (_error) {
+    // Rail not mounted.
+  }
+}
+
 export function broadcastHomeGuiRuntimeEvents(events) {
   const message = {
     type: "elastos:runtime-events",
@@ -269,10 +529,91 @@ export function broadcastHomeGuiRuntimeEvents(events) {
       console.warn("could not deliver runtime event to app frame", error);
     }
   }
+  const railFrame = walletRailFrame();
+  try {
+    railFrame?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
+  } catch (error) {
+    console.warn("could not deliver runtime event to wallet rail", error);
+  }
+  const inboxFrame = inboxRailFrame();
+  try {
+    inboxFrame?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
+  } catch (error) {
+    console.warn("could not deliver runtime event to inbox rail", error);
+  }
 }
 
 export function homeGuiMessageContextForSource(source, origin, homeToken) {
   if (!source || !origin || !homeToken) {
+    return null;
+  }
+  const railFrame = walletRailFrame();
+  let railWindow = null;
+  try {
+    railWindow = railFrame?.contentWindow || null;
+  } catch (_error) {
+    railWindow = null;
+  }
+  if (railWindow && railWindow === source) {
+    if (origin !== OPAQUE_CAPSULE_ORIGIN) {
+      return null;
+    }
+    const expectedToken = homeLaunchTokenFromRoute(
+      railFrame?.dataset?.route || railFrame?.getAttribute("src") || "",
+    );
+    if (expectedToken && expectedToken === homeToken) {
+      return {
+        kind: "app-frame",
+        targetId: "wallet",
+        windowId: "wallet-rail",
+        homeToken,
+      };
+    }
+    return null;
+  }
+  const inboxFrame = inboxRailFrame();
+  let inboxWindow = null;
+  try {
+    inboxWindow = inboxFrame?.contentWindow || null;
+  } catch (_error) {
+    inboxWindow = null;
+  }
+  if (inboxWindow && inboxWindow === source) {
+    if (origin !== OPAQUE_CAPSULE_ORIGIN) {
+      return null;
+    }
+    const expectedToken = homeLaunchTokenFromRoute(
+      inboxFrame?.dataset?.route || inboxFrame?.getAttribute("src") || "",
+    );
+    if (expectedToken && expectedToken === homeToken) {
+      return {
+        kind: "app-frame",
+        targetId: "inbox",
+        windowId: "inbox-rail",
+        homeToken,
+      };
+    }
+    return null;
+  }
+  const sheetFrame = connectorSheetFrame();
+  let sheetWindow = null;
+  try {
+    sheetWindow = sheetFrame?.contentWindow || null;
+  } catch (_error) {
+    sheetWindow = null;
+  }
+  if (sheetWindow && sheetWindow === source) {
+    const expectedToken = homeLaunchTokenFromRoute(
+      sheetFrame?.dataset?.route || sheetFrame?.getAttribute("src") || "",
+    );
+    if (expectedToken && expectedToken === homeToken) {
+      return {
+        kind: "app-frame",
+        targetId: connectorSheetTarget() || "wallet-metamask",
+        windowId: "connector-sheet",
+        homeToken,
+      };
+    }
     return null;
   }
   for (const entry of shellState.windows.values()) {
@@ -347,15 +688,7 @@ export function closeHomeGuiWindowForToken(homeToken) {
   return true;
 }
 
-export function openHomeGuiTarget(target, options = {}) {
-  return openTarget(target, options);
-}
-
-export function attachAuthorizedHomeGuiTarget(launched) {
-  return attachAuthorizedTarget(launched);
-}
-
-export async function relaunchHomeGuiWindowForToken(homeToken) {
+export function relaunchHomeGuiWindowForToken(homeToken) {
   const entry = homeGuiWindowEntryForToken(homeToken);
   if (!entry) {
     return false;
@@ -364,11 +697,13 @@ export async function relaunchHomeGuiWindowForToken(homeToken) {
   if (targetId === "browser") {
     return renewBrowserWindowAuthority(id);
   }
-  if (await closeWindow(id) !== true) {
-    return false;
-  }
+  closeWindow(id);
   window.setTimeout(() => openTarget(targetId, { query: launchQuery || {} }), 0);
   return true;
+}
+
+export function attachAuthorizedHomeGuiTarget(launched) {
+  return attachAuthorizedTarget(launched);
 }
 
 export function renewHomeGuiBrowserWindowAuthority(
@@ -432,7 +767,20 @@ export function syncHomeGuiChrome(previous, summary) {
   updateClock();
   syncIdentity(summary);
   renderInboxBadge(summary);
+  syncWalletRailAvailability(summary);
   maybeShowWalletApprovalToast(previous, summary);
+  recordNotifications(summary);
+  syncControlCentre(summary);
+}
+
+/* Menus are self-declared UI, not authority: the host verifies the sender's
+   frame identity and forwards only that window's launch token. */
+export function setHomeGuiMenuManifest(homeToken, menus) {
+  const resolvedId = homeGuiWindowEntryForToken(homeToken)?.id || "";
+  if (!resolvedId) {
+    return;
+  }
+  setMenuManifest(resolvedId, menus);
 }
 
 export function renderHomeGuiShell(summary, options = {}) {
@@ -512,28 +860,171 @@ function fullscreenApi() {
   return { root, request, exit };
 }
 
+/* About ElastOS: window-chrome close, verified runtime version, and an
+   honest update path (System About owns check/install — no fake badges). */
+let aboutOverlayBound = false;
+
+function aboutOverlayNode() {
+  return document.querySelector("#about-overlay");
+}
+
+function aboutRuntimeVersion(summary) {
+  const version = summary?.runtime?.version;
+  return typeof version === "string" && version.trim() ? version.trim() : "";
+}
+
+/* Prefer an explicit summary flag when present; never invent “up to date”. */
+function aboutUpdateSignal(summary) {
+  const runtime = summary?.runtime;
+  if (!runtime || typeof runtime !== "object") {
+    return null;
+  }
+  if (runtime.update_available === true) {
+    return { state: "available", label: "Update available" };
+  }
+  if (runtime.update_available === false) {
+    return { state: "current", label: "Up to date" };
+  }
+  const note = typeof runtime.update_status === "string" ? runtime.update_status.trim() : "";
+  if (note) {
+    return { state: "info", label: note };
+  }
+  return null;
+}
+
+function syncAboutOverlayFacts(overlay) {
+  const summary = shellState.currentSummary;
+  const versionLine = overlay.querySelector("#about-version");
+  if (versionLine) {
+    const version = aboutRuntimeVersion(summary);
+    versionLine.textContent = version ? `Version ${version}` : "";
+    versionLine.hidden = !version;
+  }
+  const identityLine = overlay.querySelector("#about-identity");
+  if (identityLine) {
+    const name = document.querySelector("#toolbar-identity-menu-name")?.textContent?.trim();
+    identityLine.textContent = name ? `Signed in as ${name}` : "";
+    identityLine.hidden = !name;
+  }
+  const updateLine = overlay.querySelector("#about-update");
+  if (updateLine) {
+    const signal = aboutUpdateSignal(summary);
+    if (signal) {
+      updateLine.textContent = signal.label;
+      updateLine.dataset.state = signal.state;
+      updateLine.hidden = false;
+    } else {
+      updateLine.textContent = "";
+      delete updateLine.dataset.state;
+      updateLine.hidden = true;
+    }
+  }
+}
+
+function openSystemAboutFromOverlay() {
+  hideAboutOverlay({ restoreFocus: false });
+  if (!targetById(shellState.currentSummary, "system")) {
+    return;
+  }
+  openTarget("system", { query: { settings: "about" } });
+}
+
+function showAboutOverlay() {
+  const overlay = aboutOverlayNode();
+  if (!overlay) {
+    return;
+  }
+  syncAboutOverlayFacts(overlay);
+  overlay.hidden = false;
+  overlay.inert = false;
+  overlay.setAttribute("aria-hidden", "false");
+  overlay.querySelector("#about-close")?.focus();
+}
+
+function hideAboutOverlay({ restoreFocus = true } = {}) {
+  const overlay = aboutOverlayNode();
+  if (!overlay || overlay.hidden) {
+    return;
+  }
+  overlay.hidden = true;
+  overlay.inert = true;
+  overlay.setAttribute("aria-hidden", "true");
+  if (restoreFocus) {
+    toolbarHomeButton?.focus();
+  }
+}
+
+function bindAboutOverlay() {
+  if (aboutOverlayBound) {
+    return;
+  }
+  aboutOverlayBound = true;
+  document.querySelector("#identity-menu-about")?.addEventListener("click", () => {
+    showAboutOverlay();
+  });
+  const overlay = aboutOverlayNode();
+  if (!overlay) {
+    return;
+  }
+  overlay.querySelector("#about-close")?.addEventListener("click", () => hideAboutOverlay());
+  overlay.querySelector("#about-more")?.addEventListener("click", () => openSystemAboutFromOverlay());
+  overlay.querySelector("#about-software-update")?.addEventListener("click", () => {
+    openSystemAboutFromOverlay();
+  });
+  overlay.addEventListener("pointerdown", (event) => {
+    if (!event.target.closest(".about-card")) {
+      hideAboutOverlay({ restoreFocus: false });
+    }
+  });
+  overlay.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      hideAboutOverlay();
+      return;
+    }
+    if (event.key === "Tab") {
+      const focusables = [
+        overlay.querySelector("#about-close"),
+        overlay.querySelector("#about-more"),
+        overlay.querySelector("#about-software-update"),
+      ].filter((node) => node && !node.disabled && !node.hidden);
+      if (focusables.length < 2) {
+        event.preventDefault();
+        focusables[0]?.focus();
+        return;
+      }
+      event.preventDefault();
+      const index = focusables.indexOf(document.activeElement);
+      const next = event.shiftKey
+        ? (index <= 0 ? focusables.length - 1 : index - 1)
+        : (index >= focusables.length - 1 ? 0 : index + 1);
+      focusables[next].focus();
+    }
+  });
+}
+
 function syncFullscreenButton() {
   if (!toolbarFullscreenButton) {
     return;
   }
-  const active = Boolean(fullscreenElement());
-  toolbarFullscreenButton.setAttribute("aria-pressed", active ? "true" : "false");
-  toolbarFullscreenButton.setAttribute("aria-label", active ? "Exit fullscreen" : "Enter fullscreen");
-  toolbarFullscreenButton.title = active ? "Exit fullscreen" : "Fullscreen";
+  // Window fullscreen stage (dedicated Space) — not the browser Fullscreen API.
+  const id = shellState.activeWindowId;
+  const entry = id ? shellState.windows.get(id) : null;
+  const active = entry?.fullscreenStage === true;
+  const text = active ? "Exit Fullscreen" : "Enter Fullscreen";
+  const label = toolbarFullscreenButton.querySelector(".control-centre-row-label");
+  if (label) {
+    label.textContent = text;
+  }
+  toolbarFullscreenButton.setAttribute("aria-label", text);
+  toolbarFullscreenButton.title = text;
 }
 
 function toggleHomeGuiFullscreen() {
-  const { root, request, exit } = fullscreenApi();
-  if (!request || !exit) {
-    return;
-  }
-  if (fullscreenElement()) {
-    const exitResult = exit.call(document);
-    exitResult?.catch?.(() => {});
-    return;
-  }
-  const requestResult = request.call(root);
-  requestResult?.catch?.(() => {});
+  hideControlCentre({ restoreFocus: false });
+  toggleActiveFullscreenStage();
+  syncFullscreenButton();
 }
 
 function trackPointerDown(event) {
@@ -562,16 +1053,32 @@ function bindHomeGuiFullscreenControl() {
   if (!toolbarFullscreenButton) {
     return;
   }
-  const { request, exit } = fullscreenApi();
-  if (!request || !exit) {
-    toolbarFullscreenButton.disabled = true;
-    toolbarFullscreenButton.title = "Fullscreen is not available in this browser";
-    return;
-  }
+  toolbarFullscreenButton.hidden = false;
   toolbarFullscreenButton.addEventListener("click", toggleHomeGuiFullscreen);
-  document.addEventListener("fullscreenchange", syncFullscreenButton);
-  document.addEventListener("webkitfullscreenchange", syncFullscreenButton);
   syncFullscreenButton();
+}
+
+/* Grid/list view for the launcher (macOS Apps panel view control). This is a
+   session-only preference inside the opaque GUI. */
+let launcherViewMemory = "grid";
+
+function applyLauncherView(view) {
+  const list = view === "list";
+  launcher.dataset.view = list ? "list" : "grid";
+  launcherViewToggle?.setAttribute("aria-pressed", list ? "true" : "false");
+  launcherViewToggle?.setAttribute(
+    "aria-label",
+    list ? "Switch to grid view" : "Switch to list view",
+  );
+}
+
+function bindLauncherViewToggle() {
+  applyLauncherView(launcherViewMemory);
+  launcherViewToggle?.addEventListener("click", () => {
+    const next = launcher.dataset.view === "list" ? "grid" : "list";
+    launcherViewMemory = next;
+    applyLauncherView(next);
+  });
 }
 
 export function bindHomeGuiInteractions(options = {}) {
@@ -596,7 +1103,9 @@ export function bindHomeGuiInteractions(options = {}) {
     : null;
   shellState.requestSummaryRefresh = homeGuiHostActions.requestSummaryRefresh;
 
-  toolbarHomeButton?.addEventListener("click", () => {
+  // The brand button itself toggles the ElastOS menu (bound in
+  // bindIdentityMenu); the go-home action lives inside it as Show desktop.
+  identityMenuShowDesktopButton?.addEventListener("click", () => {
     activateHomeGui().catch((error) => {
       console.error("home-gui activation failed", error);
     });
@@ -606,10 +1115,35 @@ export function bindHomeGuiInteractions(options = {}) {
     if (!targetById(shellState.currentSummary, "inbox")) {
       return;
     }
-    openTarget("inbox");
+    toggleInboxRail();
   });
 
   bindHomeGuiFullscreenControl();
+  bindLauncherViewToggle();
+
+  identityMenuSystemButton?.addEventListener("click", () => {
+    if (!targetById(shellState.currentSummary, "system")) {
+      return;
+    }
+    openTarget("system");
+  });
+
+  document.querySelector("#identity-menu-marketplace")?.addEventListener("click", () => {
+    if (!targetById(shellState.currentSummary, "marketplace")) {
+      return;
+    }
+    openTarget("marketplace");
+  });
+
+  document.querySelector("#identity-menu-shortcuts")?.addEventListener("click", () => {
+    toggleShortcutsOverlay();
+  });
+
+  document.querySelector("#identity-menu-lock")?.addEventListener("click", () => {
+    window.dispatchEvent(new CustomEvent("elastos:request-lock"));
+  });
+
+  bindAboutOverlay();
 
   toolbarSignOutButton?.addEventListener("click", () => {
     document.body.dataset.homeStatus = "booting";
@@ -622,12 +1156,16 @@ export function bindHomeGuiInteractions(options = {}) {
       });
   });
 
-  launcherToggleButton?.addEventListener("click", () => {
-    toggleLauncher();
+  document.querySelector("#toolbar-spotlight")?.addEventListener("click", () => {
+    showSpotlight();
   });
 
-  closeLauncherButton?.addEventListener("click", () => {
-    hideLauncher();
+  document.querySelector("#toolbar-mission-control")?.addEventListener("click", () => {
+    toggleExpose();
+  });
+
+  launcherToggleButton?.addEventListener("click", () => {
+    toggleLauncher();
   });
 
   launcherSearch?.addEventListener("input", () => {
@@ -660,24 +1198,36 @@ export function bindHomeGuiInteractions(options = {}) {
       clearDesktopSelection();
       return;
     }
-    if ((event.key === "Enter" || event.key === " ") && shellState.selectedDesktopTargetId) {
+    if (event.key === "Enter" && shellState.selectedDesktopTargetId) {
       event.preventDefault();
       event.stopPropagation();
       openSelectedDesktopEntry();
+      return;
+    }
+    if ((event.key === "a" || event.key === "A") && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      selectAllDesktopIcons();
+      return;
+    }
+    if (event.key.startsWith("Arrow") && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      handleDesktopArrowKey(event);
     }
   });
 
   document.addEventListener("pointermove", (event) => {
     trackPointerMove(event);
     continueTargetDrag(event);
+    updateDesktopMarquee(event);
   });
 
   document.addEventListener("pointerup", (event) => {
     finishTargetDrag(event);
+    finishDesktopMarquee(event);
   });
 
   document.addEventListener("pointercancel", (event) => {
     finishTargetDrag(event);
+    finishDesktopMarquee(event);
   });
 
   document.addEventListener("pointerdown", (event) => {
@@ -712,7 +1262,7 @@ export function bindHomeGuiInteractions(options = {}) {
 
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && shellState.contextMenuOpen) {
-      hideDesktopContextMenu();
+      hideDesktopContextMenu({ restoreFocus: true });
     }
     if (event.key === "Escape" && !launcher.hidden) {
       hideLauncher();
@@ -754,6 +1304,7 @@ export function bindHomeGuiInteractions(options = {}) {
       return;
     }
     clearDesktopSelection();
+    beginDesktopMarquee(event);
   });
 
   desktopContextMenu?.addEventListener("click", (event) => {

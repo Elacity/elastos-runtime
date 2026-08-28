@@ -1,25 +1,12 @@
 //! DID key encoding, domain-separated signing, and release envelope verification.
 
 use ed25519_dalek::Signer;
-use ed25519_dalek::{Verifier as Ed25519Verifier, VerifyingKey};
+use ed25519_dalek::Verifier as Ed25519Verifier;
 use elastos_runtime::signature;
 
-// DID key encoding lives in elastos-identity — single source of truth.
-pub use elastos_identity::{encode_did_key, MULTICODEC_ED25519_PUB};
-
-pub fn decode_did_key(did: &str) -> anyhow::Result<VerifyingKey> {
-    let multibase_part = did
-        .strip_prefix("did:key:z")
-        .ok_or_else(|| anyhow::anyhow!("DID must start with did:key:z"))?;
-    let bytes = bs58::decode(multibase_part)
-        .into_vec()
-        .map_err(|e| anyhow::anyhow!("Invalid base58 in DID: {}", e))?;
-    if bytes.len() != 34 || bytes[0] != 0xed || bytes[1] != 0x01 {
-        anyhow::bail!("Invalid Ed25519 did:key encoding (expected 34 bytes with 0xed01 prefix)");
-    }
-    let key_bytes: [u8; 32] = bytes[2..34].try_into().unwrap();
-    Ok(VerifyingKey::from_bytes(&key_bytes)?)
-}
+// DID key encoding and strict decoding live in elastos-identity — one source
+// of truth for collaboration Profile identities.
+pub use elastos_identity::{decode_did_key, encode_did_key, encode_signing_key_did};
 
 /// Sign arbitrary payload bytes with a domain separator.
 /// Returns `(signature_hex, signer_did)`.
@@ -38,7 +25,7 @@ pub fn domain_separated_sign(
     let digest = hasher.finalize();
 
     let sig = sk.sign(&digest);
-    let did = encode_did_key(&sk.verifying_key());
+    let did = encode_signing_key_did(sk);
     (hex::encode(sig.to_bytes()), did)
 }
 
@@ -146,7 +133,7 @@ mod tests {
     #[test]
     fn test_encode_decode_did_roundtrip() {
         let (_, vk) = generate_keypair();
-        let did = encode_did_key(&vk);
+        let did = encode_did_key(&vk).unwrap();
         assert!(did.starts_with("did:key:z6Mk"));
         let decoded = decode_did_key(&did).unwrap();
         assert_eq!(decoded.as_bytes(), vk.as_bytes());
@@ -192,7 +179,7 @@ mod tests {
         });
         let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
         let (other_sk, _) = generate_keypair();
-        let wrong_did = encode_did_key(&other_sk.verifying_key());
+        let wrong_did = encode_signing_key_did(&other_sk);
         let result = verify_release_envelope(&envelope_bytes, "test", &wrong_did);
         assert!(result.is_err());
     }

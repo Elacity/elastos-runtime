@@ -1,6 +1,6 @@
 //! Shared provider capability-resource mapping.
 //!
-//! HTTP host adapters and the Carrier bridge must derive the same capability
+//! HTTP host adapters and the resource bridge must derive the same capability
 //! resource from the same provider request. Keeping that logic here prevents
 //! local and capsule-kernel calls from drifting.
 
@@ -54,11 +54,6 @@ pub fn build_capability_resource(
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| "chain provider request missing network".to_string())?;
             validate_chain_network(network)?;
-            if op == "has_access_by_content_id" {
-                return Ok(format!(
-                    "elastos://chain/{network}/rights/has_access_by_content_id"
-                ));
-            }
             if op == "erc1271_is_valid_signature" {
                 return Ok(format!("elastos://chain/{network}/proof/erc1271"));
             }
@@ -234,7 +229,6 @@ fn chain_op_required_action(op: &str) -> Option<Action> {
         | "balance"
         | "transaction"
         | "receipt"
-        | "has_access_by_content_id"
         | "proof"
         | "erc1271_is_valid_signature"
         | "contract_call"
@@ -285,9 +279,19 @@ fn ipfs_op_required_action(op: &str) -> Option<Action> {
 
 fn object_op_required_action(op: &str) -> Option<Action> {
     match op {
-        "roots" | "list" | "stat" | "read" | "download" | "status" | "events" => Some(Action::Read),
+        "roots"
+        | "list"
+        | "stat"
+        | "read"
+        | "download"
+        | "status"
+        | "events"
+        | "list_runtime_custody"
+        | "open_viewer"
+        | "read_viewer"
+        | "close_viewer" => Some(Action::Read),
         "write" | "mkdir" | "rename" | "move" | "copy" | "trash" | "restore" | "publish"
-        | "unpublish" | "repair" | "share" => Some(Action::Write),
+        | "unpublish" | "repair" | "share" | "buy" => Some(Action::Write),
         "delete_permanently" | "empty_trash" => Some(Action::Delete),
         _ => None,
     }
@@ -418,6 +422,11 @@ fn object_resource(op: &str) -> Result<String, String> {
             "unpublish",
             "repair",
             "share",
+            "list_runtime_custody",
+            "buy",
+            "open_viewer",
+            "read_viewer",
+            "close_viewer",
         ],
     )
 }
@@ -844,13 +853,100 @@ mod tests {
             "elastos://chain/meta/networks"
         );
         assert_eq!(
+            build_capability_resource("rights", "has_access_by_content_id", &serde_json::json!({}))
+                .unwrap(),
+            "elastos://rights/access/has_access_by_content_id",
+            "the active provisional rights-provider mapping is preserved until product cutover"
+        );
+        assert!(
+            build_capability_resource("custody", "release_contribution", &serde_json::json!({}))
+                .is_err(),
+            "inactive custody registration is Runtime-internal until product cutover"
+        );
+        assert!(
+            build_capability_resource("custody", "status", &serde_json::json!({})).is_err(),
+            "inactive custody registration is Runtime-internal until product cutover"
+        );
+        assert!(
+            build_capability_resource("protect", "open_protection_session", &serde_json::json!({}))
+                .is_err(),
+            "protect registration is Runtime-internal until product cutover"
+        );
+        assert!(
+            build_capability_resource("protect", "status", &serde_json::json!({})).is_err(),
+            "protect registration is Runtime-internal until product cutover"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "resolve_protected_content_creator_mint",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content creator mint resolution must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "resolve_protected_content_mint_receipt",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content mint receipt bind must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "resolve_protected_content_verified_listing",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content verified listing resolution must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "resolve_protected_content_purchase",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content purchase assembly must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "resolve_protected_content_purchase_access",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content purchase access corroboration must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "protected_content_rights_evidence",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content rights evidence must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "resolve_protected_content_policy",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content policy resolution must stay Runtime-internal"
+        );
+        assert!(
             build_capability_resource(
                 "chain",
                 "has_access_by_content_id",
                 &serde_json::json!({"network": "esc-mainnet"})
             )
-            .unwrap(),
-            "elastos://chain/esc-mainnet/rights/has_access_by_content_id"
+            .is_err(),
+            "legacy Chain rights rail must not remain capsule-invokable"
         );
         assert_eq!(
             build_capability_resource(

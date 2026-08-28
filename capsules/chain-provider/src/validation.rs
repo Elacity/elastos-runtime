@@ -1,4 +1,5 @@
 use super::*;
+use elastos_protected_content_contracts::{CanonicalContract, RuntimeOperationIssuerKeyV1};
 use sha2::Digest;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,19 +41,6 @@ pub(super) fn validate_evm_hash(value: &str) -> Result<(), String> {
     validate_hex(value, Some(32), "EVM hash")
 }
 
-pub(super) fn validate_content_id(value: &str) -> Result<(), String> {
-    if value.is_empty() || value.len() > 256 {
-        return Err("content id must be 1-256 characters".to_string());
-    }
-    if value
-        .chars()
-        .any(|ch| ch.is_ascii_whitespace() || ch.is_ascii_control() || ch == '/' || ch == '\\')
-    {
-        return Err("content id must be an opaque CID or content identifier".to_string());
-    }
-    Ok(())
-}
-
 pub(super) fn validate_subject(value: &str) -> Result<(), String> {
     if value.is_empty() || value.len() > 256 {
         return Err("subject must be 1-256 characters".to_string());
@@ -64,13 +52,6 @@ pub(super) fn validate_subject(value: &str) -> Result<(), String> {
         return Err("subject must be an opaque principal, DID, or account identifier".to_string());
     }
     Ok(())
-}
-
-pub(super) fn validate_right(value: &str) -> Result<(), String> {
-    match value {
-        "view" | "stream" | "download" | "execute" => Ok(()),
-        _ => Err("right must be view, stream, download, or execute".to_string()),
-    }
 }
 
 pub(super) fn validate_hex(value: &str, bytes: Option<usize>, label: &str) -> Result<(), String> {
@@ -132,6 +113,45 @@ pub(super) fn decode_hex(
         decoded.push((high << 4) | low);
     }
     Ok(decoded)
+}
+
+pub(super) fn decode_contract_hex<T: CanonicalContract>(
+    value: &str,
+    max_bytes: usize,
+    label: &str,
+) -> Result<T, String> {
+    if value.strip_prefix("0x").is_none_or(|raw| {
+        raw.chars()
+            .any(|ch| !ch.is_ascii_lowercase() && !ch.is_ascii_digit())
+    }) {
+        return Err(format!("{label} must be lowercase 0x-prefixed hex"));
+    }
+    let bytes = decode_hex(value, None, label)?;
+    if bytes.is_empty() || bytes.len() > max_bytes {
+        return Err(format!("{label} size is invalid"));
+    }
+    T::from_canonical_bytes(&bytes).map_err(|err| err.to_string())
+}
+
+pub(super) fn parse_runtime_issuer(value: &Value) -> Result<RuntimeOperationIssuerKeyV1, String> {
+    let value = value
+        .as_str()
+        .ok_or_else(|| "protected-content Runtime issuer must be a string".to_string())?;
+    if value.strip_prefix("0x").is_none_or(|raw| {
+        raw.chars()
+            .any(|ch| !ch.is_ascii_lowercase() && !ch.is_ascii_digit())
+    }) {
+        return Err(
+            "protected-content Runtime issuer must be lowercase 0x-prefixed hex".to_string(),
+        );
+    }
+    let bytes = decode_hex(value, Some(32), "protected-content Runtime issuer")?;
+    RuntimeOperationIssuerKeyV1::new(
+        bytes
+            .try_into()
+            .map_err(|_| "protected-content Runtime issuer must be 32 bytes".to_string())?,
+    )
+    .map_err(|_| "protected-content Runtime issuer is invalid".to_string())
 }
 
 pub(super) fn hex_value(byte: u8) -> Option<u8> {

@@ -4,6 +4,11 @@ fn provider_body(value: serde_json::Value) -> Body {
     Body::from(serde_json::to_vec(&value).unwrap())
 }
 
+fn protected_content_gateway_mock_test_guard() -> &'static tokio::sync::Mutex<()> {
+    static GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 async fn post_library(
     app: axum::Router,
     token: &str,
@@ -29,9 +34,614 @@ async fn post_library(
     let payload = if bytes.is_empty() {
         serde_json::Value::Null
     } else {
-        serde_json::from_slice(&bytes).unwrap()
+        serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+            panic!(
+                "invalid json response (status={status}): {err}; body={}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
     };
     (status, payload)
+}
+
+fn make_box(box_type: &[u8; 4], content: &[u8]) -> Vec<u8> {
+    let size = (8 + content.len()) as u32;
+    let mut out = Vec::with_capacity(size as usize);
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(box_type);
+    out.extend_from_slice(content);
+    out
+}
+
+fn make_fullbox(box_type: &[u8; 4], flags: u32, payload: &[u8]) -> Vec<u8> {
+    let mut content = vec![0u8];
+    content.extend_from_slice(&flags.to_be_bytes()[1..]);
+    content.extend_from_slice(payload);
+    make_box(box_type, &content)
+}
+
+fn make_clear_track(track_id: u32, handler_type: &[u8; 4]) -> Vec<u8> {
+    let mut tkhd_payload = vec![0u8; 12];
+    tkhd_payload[8..12].copy_from_slice(&track_id.to_be_bytes());
+    let tkhd = make_fullbox(b"tkhd", 0, &tkhd_payload);
+    let mut hdlr_payload = vec![0u8; 4];
+    hdlr_payload.extend_from_slice(handler_type);
+    let hdlr = make_fullbox(b"hdlr", 0, &hdlr_payload);
+    let (entry_type, fixed) = match handler_type {
+        b"vide" => (b"avc1", 78usize),
+        b"soun" => (b"mp4a", 28usize),
+        _ => panic!("unsupported handler"),
+    };
+    let entry = make_box(entry_type, &vec![0u8; fixed]);
+    let mut stsd_payload = vec![0u8; 4];
+    stsd_payload.extend_from_slice(&1u32.to_be_bytes());
+    stsd_payload.extend_from_slice(&entry);
+    let stsd = make_box(b"stsd", &stsd_payload);
+    let stbl = make_box(b"stbl", &stsd);
+    let minf = make_box(b"minf", &stbl);
+    let mut mdia_content = Vec::new();
+    mdia_content.extend_from_slice(&hdlr);
+    mdia_content.extend_from_slice(&minf);
+    let mdia = make_box(b"mdia", &mdia_content);
+    let mut trak_content = Vec::new();
+    trak_content.extend_from_slice(&tkhd);
+    trak_content.extend_from_slice(&mdia);
+    make_box(b"trak", &trak_content)
+}
+
+fn make_clear_segment(track_id: u32, payload: &[u8]) -> Vec<u8> {
+    let mut tfhd_payload = Vec::new();
+    tfhd_payload.extend_from_slice(&track_id.to_be_bytes());
+    tfhd_payload.extend_from_slice(&1u32.to_be_bytes());
+    tfhd_payload.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    tfhd_payload.extend_from_slice(&0u32.to_be_bytes());
+    let tfhd = make_fullbox(b"tfhd", 0x020038, &tfhd_payload);
+    let tfdt = make_fullbox(b"tfdt", 0, &1u32.to_be_bytes());
+    let mut trun_payload = Vec::new();
+    trun_payload.extend_from_slice(&1u32.to_be_bytes());
+    trun_payload.extend_from_slice(&0i32.to_be_bytes());
+    trun_payload.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    let trun = make_fullbox(b"trun", 0x000201, &trun_payload);
+    let mut traf_content = Vec::new();
+    traf_content.extend_from_slice(&tfhd);
+    traf_content.extend_from_slice(&tfdt);
+    traf_content.extend_from_slice(&trun);
+    let traf = make_box(b"traf", &traf_content);
+    let mfhd = make_fullbox(b"mfhd", 0, &1u32.to_be_bytes());
+    let mut moof_content = Vec::new();
+    moof_content.extend_from_slice(&mfhd);
+    moof_content.extend_from_slice(&traf);
+    let mut moof = make_box(b"moof", &moof_content);
+    let data_offset = (moof.len() + 8) as i32;
+    let trun_offset = moof
+        .windows(4)
+        .position(|window| window == b"trun")
+        .expect("trun box present")
+        - 4;
+    let trun_data_offset_at = trun_offset + 16;
+    moof[trun_data_offset_at..trun_data_offset_at + 4].copy_from_slice(&data_offset.to_be_bytes());
+    let mdat = make_box(b"mdat", payload);
+    let mut out = moof;
+    out.extend_from_slice(&mdat);
+    out
+}
+
+fn clear_runtime_custody_media(seed: u8) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let ftyp = make_box(b"ftyp", b"isom\0\0\0\0isomiso6");
+    let trak_video = make_clear_track(1, b"vide");
+    let trak_audio = make_clear_track(2, b"soun");
+    let trex_video = make_fullbox(
+        b"trex",
+        0,
+        &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    );
+    let trex_audio = make_fullbox(
+        b"trex",
+        0,
+        &[0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    );
+    let mut mvex_content = Vec::new();
+    mvex_content.extend_from_slice(&trex_video);
+    mvex_content.extend_from_slice(&trex_audio);
+    let mvex = make_box(b"mvex", &mvex_content);
+    let mvhd = make_box(b"mvhd", &[0u8; 4]);
+    let mut moov_content = Vec::new();
+    moov_content.extend_from_slice(&mvhd);
+    moov_content.extend_from_slice(&trak_video);
+    moov_content.extend_from_slice(&trak_audio);
+    moov_content.extend_from_slice(&mvex);
+    let moov = make_box(b"moov", &moov_content);
+    let clear_segments = [0usize, 1]
+        .into_iter()
+        .map(|index| {
+            let track_id = if index % 2 == 0 { 1 } else { 2 };
+            let payload = vec![
+                seed,
+                track_id as u8,
+                (index & 0xff) as u8,
+                ((index >> 8) & 0xff) as u8,
+                b's',
+                b'e',
+                b'g',
+                b'x',
+            ];
+            make_clear_segment(track_id, &payload)
+        })
+        .collect();
+    ([ftyp, moov].concat(), clear_segments)
+}
+
+fn library_object_path(data_dir: &std::path::Path, uri: &str) -> std::path::PathBuf {
+    elastos_common::localhost::rooted_localhost_fs_path(data_dir, uri).unwrap()
+}
+
+fn library_publish_records_dir(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+) -> std::path::PathBuf {
+    let root = crate::auth::principal_localhost_root(principal_id);
+    library_object_path(
+        data_dir,
+        &format!("{root}/.AppData/LocalHost/.Runtime/Library/Published"),
+    )
+}
+
+fn assert_no_publish_records(data_dir: &std::path::Path, principal_id: &str) {
+    let records_dir = library_publish_records_dir(data_dir, principal_id);
+    if records_dir.exists() {
+        assert!(std::fs::read_dir(records_dir).unwrap().next().is_none());
+    }
+}
+
+fn runtime_custody_creator_test_input(
+    principal_id: &str,
+    object_uri: &str,
+    seed: u8,
+    wallet_account_id: &str,
+) -> crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput {
+    let (clear_init_segment, clear_segments) = clear_runtime_custody_media(seed);
+    crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput {
+        object_uri: object_uri.to_string(),
+        principal_id: principal_id.to_string(),
+        mime_type: "video/mp4".to_string(),
+        codecs: "avc1.64001f,mp4a.40.2".to_string(),
+        wallet_account_id: wallet_account_id.to_string(),
+        copies: "0x2".to_string(),
+        price: MOCK_PROTECTED_CONTENT_LISTING_PRICE.to_string(),
+        clear_init_segment,
+        clear_segments,
+        source_storage: "protected_principal_root".to_string(),
+    }
+}
+
+fn seed_completed_runtime_custody_mint(
+    data_dir: &std::path::Path,
+    input: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput,
+) -> crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts {
+    let protected_content_root = data_dir.join("protected-content");
+    std::fs::create_dir_all(&protected_content_root).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &protected_content_root,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+    let journal = crate::protected_content_runtime::runtime_mint_journal(data_dir);
+    let (protected_init_segment, protected_segments) =
+        crate::protected_content_runtime::tests::media_components(0x41);
+    let node_public_key = |seed: u8| {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        elastos_protected_content_contracts::NodePublicKey::new(
+            signing_key.verifying_key().to_bytes(),
+        )
+        .unwrap()
+    };
+    let node_bindings = vec![
+        elastos_protected_content_runtime::RuntimeMintNodeBinding::new(
+            node_public_key(0x11),
+            elastos_protected_content_contracts::CustodyPoolOperatorIdV1::new([0x21; 32]),
+            elastos_protected_content_contracts::CustodyPoolFailureDomainIdV1::new([0x31; 32]),
+            elastos_protected_content_contracts::Digest32::new([0x41; 32]),
+        )
+        .unwrap(),
+        elastos_protected_content_runtime::RuntimeMintNodeBinding::new(
+            node_public_key(0x12),
+            elastos_protected_content_contracts::CustodyPoolOperatorIdV1::new([0x22; 32]),
+            elastos_protected_content_contracts::CustodyPoolFailureDomainIdV1::new([0x32; 32]),
+            elastos_protected_content_contracts::Digest32::new([0x42; 32]),
+        )
+        .unwrap(),
+        elastos_protected_content_runtime::RuntimeMintNodeBinding::new(
+            node_public_key(0x13),
+            elastos_protected_content_contracts::CustodyPoolOperatorIdV1::new([0x23; 32]),
+            elastos_protected_content_contracts::CustodyPoolFailureDomainIdV1::new([0x33; 32]),
+            elastos_protected_content_contracts::Digest32::new([0x43; 32]),
+        )
+        .unwrap(),
+    ];
+    let content_access_id =
+        elastos_protected_content_contracts::ContentAccessIdV1::new([0x51; 16]).unwrap();
+    let media_identity =
+        elastos_protected_content_provider_contracts::CencFmp4MediaIdentityV1::new_from_bytes(
+            &protected_init_segment,
+            &protected_segments,
+            input.mime_type.clone(),
+            input.codecs.clone(),
+        )
+        .unwrap();
+    let threshold = elastos_protected_content_contracts::ThresholdV1::new(2, 3).unwrap();
+    let node_set = elastos_protected_content_contracts::NodeSetV1::new(
+        threshold,
+        node_bindings
+            .iter()
+            .map(|node| node.node_public_key())
+            .collect(),
+    )
+    .unwrap();
+    let key_envelope = elastos_protected_content_contracts::KeyEnvelopeIdentityV1::new(
+        media_identity.encrypted_content().clone(),
+        elastos_protected_content_contracts::Digest32::new([0x52; 32]),
+        256,
+        node_set.node_set_id().unwrap(),
+        threshold,
+        elastos_protected_content_contracts::CustodyPoolIdentityV1::new(
+            elastos_protected_content_contracts::Digest32::new([0x53; 32]),
+            128,
+        )
+        .unwrap(),
+        elastos_protected_content_contracts::CustodyEpochIdentityV1::new(
+            elastos_protected_content_contracts::Digest32::new([0x54; 32]),
+            128,
+        )
+        .unwrap(),
+        elastos_protected_content_contracts::CustodyCommitteeAuthorizationIdentityV1::new(
+            elastos_protected_content_contracts::Digest32::new([0x55; 32]),
+            128,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let policy = elastos_protected_content_contracts::RightsPolicyIdentityV1::new(
+        elastos_protected_content_contracts::Digest32::new([0x56; 32]),
+        128,
+    )
+    .unwrap();
+    let draft = elastos_protected_content_runtime::RuntimeMintDraft::new(
+        &protected_init_segment,
+        &protected_segments,
+        input.mime_type.clone(),
+        input.codecs.clone(),
+        content_access_id,
+        key_envelope,
+        policy,
+        elastos_protected_content_contracts::Digest32::new([0x61; 32]),
+        threshold,
+        node_bindings.clone(),
+    )
+    .unwrap();
+    journal.persist_bound(&draft).unwrap();
+    let request_id = elastos_protected_content_runtime::RuntimeMintIntent::request_id_for_source(
+        &input.principal_id,
+        &input.object_uri,
+        &input.source_storage,
+    )
+    .unwrap();
+    let intent = elastos_protected_content_runtime::RuntimeMintIntent::new(
+        input.principal_id.clone(),
+        &input.object_uri,
+        &input.source_storage,
+        input.mime_type.clone(),
+        input.codecs.clone(),
+        &input.clear_init_segment,
+        &input.clear_segments,
+        draft.content_access_id(),
+        draft.pool(),
+        draft.epoch(),
+        draft.committee(),
+        node_bindings.clone(),
+    )
+    .unwrap();
+    journal.persist_intent(&intent).unwrap();
+    journal
+        .mark_intent_protect_effect_started(request_id)
+        .unwrap();
+    journal
+        .mark_intent_protect_closed_before_draft(request_id)
+        .unwrap();
+    for (index, node) in node_bindings.iter().enumerate() {
+        journal
+            .mark_node_effect_started(draft.mint_id(), node.node_public_key())
+            .unwrap();
+        journal
+            .mark_node_receipt(
+                draft.mint_id(),
+                elastos_protected_content_runtime::RuntimeMintNodeReceipt::new(
+                    node.node_public_key(),
+                    elastos_protected_content_contracts::RuntimeCustodyProvisioningIdV1::new(
+                        elastos_protected_content_contracts::Digest32::new([0x71 + index as u8; 32]),
+                    )
+                    .unwrap(),
+                    elastos_protected_content_contracts::CustodyNodeProvisioningRecordIdentityV1::new(
+                        elastos_protected_content_contracts::Digest32::new([0x81 + index as u8; 32]),
+                        128 + index as u32,
+                    )
+                    .unwrap(),
+                    node.owner_state_root(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    journal.mark_custody_provisioned(draft.mint_id()).unwrap();
+    let content_id =
+        crate::protected_content_runtime::runtime_protected_content_id(draft.encrypted_content())
+            .unwrap();
+    let requirement =
+        elastos_protected_content_runtime::RuntimeContentAvailabilityRequirement::new(
+            mock_protected_content_provider_signer_did(),
+            content_id.clone(),
+            input.principal_id.clone(),
+            "protected-content-replication/v1",
+            3,
+            600,
+            60,
+        )
+        .unwrap();
+    let evidence = elastos_protected_content_runtime::RuntimeVerifiedContentAvailability::new(
+        TEST_CIDV1,
+        content_id.clone(),
+        input.principal_id.clone(),
+        &requirement,
+        3,
+        crate::auth::now_ts(),
+        elastos_protected_content_contracts::Digest32::new([0xa1; 32]),
+        draft.encrypted_content().clone(),
+        draft.media_identity().media_manifest_root(),
+    )
+    .unwrap();
+    journal
+        .mark_content_available(draft.mint_id(), &requirement, evidence.clone())
+        .unwrap();
+    seed_mock_published_protected_content(
+        &content_id,
+        &input.principal_id,
+        draft.media_identity(),
+        &protected_init_segment,
+        &protected_segments,
+        evidence.checked_at(),
+    );
+    journal
+        .mark_intent_completed(request_id, draft.mint_id())
+        .unwrap();
+    crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts {
+        content_cid: TEST_CIDV1.to_string(),
+        mint_id: draft.mint_id(),
+        content_id,
+        availability: json!({
+            "status": "local_pinned",
+            "provider": "mock-content-provider",
+            "replicas": 3
+        }),
+        receipt: json!({
+            "schema": "elastos.content.availability.receipt/v1",
+            "cid": TEST_CIDV1
+        }),
+        content_security: json!({
+            "mode": "runtime_custody",
+            "access": "buyer_purchase_required"
+        }),
+    }
+}
+
+fn seed_runtime_custody_creator_listing_for_buy(
+    data_dir: &std::path::Path,
+    publisher_principal_id: &str,
+    facts: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
+    seller_address: &str,
+    native_purchase: bool,
+) -> crate::protected_content_runtime::RuntimeCustodyListingRecord {
+    let mint = crate::protected_content_runtime::runtime_mint_journal(data_dir)
+        .load(facts.mint_id)
+        .unwrap();
+    let metadata_cid = TEST_CIDV0;
+    let token_uri = format!("ipfs://{metadata_cid}/metadata.json");
+    let pay_token = if native_purchase {
+        "0x0000000000000000000000000000000000000000".to_string()
+    } else {
+        MOCK_PROTECTED_CONTENT_PAY_TOKEN.to_ascii_lowercase()
+    };
+    let terminal = elastos_protected_content_runtime::RuntimeMintCreatorTerminalEvidence::new(
+        metadata_cid,
+        &token_uri,
+        seller_address.to_ascii_lowercase(),
+        "eip155:8453",
+        "base-mainnet",
+        MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY.to_ascii_lowercase(),
+        MOCK_PROTECTED_CONTENT_TOKEN_ID,
+        MOCK_PROTECTED_CONTENT_OPERATIVE.to_ascii_lowercase(),
+        MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+        pay_token,
+        (!native_purchase).then_some(MOCK_PROTECTED_CONTENT_PAYMENT_PROCESSOR.to_ascii_lowercase()),
+        format!("0x{}", hex::encode([0xc1; 32])),
+    )
+    .unwrap();
+    crate::protected_content_runtime::persist_runtime_custody_creator_listing(
+        data_dir,
+        &mint,
+        facts,
+        publisher_principal_id,
+        &terminal,
+    )
+    .unwrap();
+    crate::protected_content_runtime::load_runtime_custody_listing(data_dir, facts.mint_id)
+        .unwrap()
+        .unwrap()
+}
+
+fn runtime_custody_listing_path_for_test(
+    data_dir: &std::path::Path,
+    mint_id: elastos_protected_content_contracts::Digest32,
+) -> std::path::PathBuf {
+    data_dir
+        .join("protected-content/runtime-listings")
+        .join(format!("{}.json", hex::encode(mint_id.as_bytes())))
+}
+
+fn runtime_custody_viewer_record_path_for_test(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    mint_id: elastos_protected_content_contracts::Digest32,
+) -> std::path::PathBuf {
+    data_dir
+        .join("protected-content/runtime-open")
+        .join(hex::encode(mint_id.as_bytes()))
+        .join("viewers")
+        .join(format!(
+            "{}.json",
+            hex::encode(sha2::Sha256::digest(principal_id.as_bytes()))
+        ))
+}
+
+async fn write_library_bytes(app: &axum::Router, token: &str, uri: &str, bytes: &[u8]) {
+    let (status, payload) = post_library(
+        app.clone(),
+        token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "uri={uri} payload={payload}");
+    assert_eq!(payload["status"], "ok", "uri={uri} payload={payload}");
+}
+
+async fn create_runtime_custody_publish_directory(
+    data_dir: &std::path::Path,
+    app: &axum::Router,
+    token: &str,
+    directory_uri: &str,
+    seed: u8,
+) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let directory_path = library_object_path(data_dir, directory_uri);
+    std::fs::create_dir_all(directory_path.join("segments")).unwrap();
+    let (init, segments) = clear_runtime_custody_media(seed);
+    write_library_bytes(app, token, &format!("{directory_uri}/init.mp4"), &init).await;
+    for (index, segment) in segments.iter().enumerate() {
+        write_library_bytes(
+            app,
+            token,
+            &format!("{directory_uri}/segments/{index:08}.m4s"),
+            segment,
+        )
+        .await;
+    }
+    (init, segments)
+}
+
+async fn publish_runtime_custody(
+    app: &axum::Router,
+    token: &str,
+    uri: &str,
+) -> (StatusCode, serde_json::Value) {
+    post_library(
+        app.clone(),
+        token,
+        "publish",
+        json!({
+            "uri": uri,
+            "protection": {
+                "mode": "runtime_custody",
+                "mime_type": "video/mp4",
+                "codecs": "avc1.64001f,mp4a.40.2",
+                "wallet_account_id": "wallet-account-1",
+                "copies": "0x1",
+                "price": "0xde0b6b3a7640000"
+            }
+        }),
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test helper binds every fixture fact explicitly"
+)]
+async fn assert_invalid_runtime_custody_media_declaration(
+    data_dir: &std::path::Path,
+    app: &axum::Router,
+    token: &str,
+    principal_id: &str,
+    uri: &str,
+    field: &str,
+    value: &str,
+    expected_message: &str,
+) {
+    let mut protection = serde_json::Map::new();
+    protection.insert(
+        "mode".into(),
+        serde_json::Value::String("runtime_custody".into()),
+    );
+    protection.insert(
+        "mime_type".into(),
+        serde_json::Value::String("video/mp4".into()),
+    );
+    protection.insert(
+        "codecs".into(),
+        serde_json::Value::String("avc1.64001f,mp4a.40.2".into()),
+    );
+    protection.insert(
+        "wallet_account_id".into(),
+        serde_json::Value::String("wallet-account-1".into()),
+    );
+    protection.insert("copies".into(), serde_json::Value::String("0x1".into()));
+    protection.insert(
+        "price".into(),
+        serde_json::Value::String("0xde0b6b3a7640000".into()),
+    );
+    protection.insert(field.into(), serde_json::Value::String(value.to_string()));
+    let (publish_status, publish) = post_library(
+        app.clone(),
+        token,
+        "publish",
+        json!({
+            "uri": uri,
+            "protection": serde_json::Value::Object(protection),
+        }),
+    )
+    .await;
+    assert_eq!(publish_status, StatusCode::OK);
+    assert_eq!(publish["status"], "error");
+    let message = publish["message"].as_str().unwrap();
+    assert_eq!(message, expected_message);
+    assert!(!message.contains(uri));
+    assert!(!message.contains(&data_dir.display().to_string()));
+    assert_no_publish_records(data_dir, principal_id);
+}
+
+async fn assert_runtime_custody_publish_error(
+    data_dir: &std::path::Path,
+    app: &axum::Router,
+    token: &str,
+    principal_id: &str,
+    uri: &str,
+    expected_message: &str,
+) -> serde_json::Value {
+    let (status, payload) = publish_runtime_custody(app, token, uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "error");
+    let message = payload["message"].as_str().unwrap();
+    assert_eq!(message, expected_message);
+    let payload_text = payload.to_string();
+    assert!(!payload_text.contains(uri));
+    assert!(!payload_text.contains(&data_dir.display().to_string()));
+    assert!(!payload_text.contains("segx"));
+    assert_no_publish_records(data_dir, principal_id);
+    payload
 }
 
 async fn put_library_upload(
@@ -5388,206 +5998,1763 @@ async fn test_library_provider_rejects_key_release_policy_until_provider_exists(
 }
 
 #[tokio::test]
-async fn test_library_provider_runs_protected_content_receipt_chain_for_recipient() {
+async fn test_library_provider_publish_rejects_removed_fixture_and_unknown_protection_fields() {
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(library_protected_content_test_state(dir.path()).await);
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
     let root = crate::auth::principal_localhost_root(&authority.principal_id);
-    let uri = format!("{root}/Documents/protected-fixture.txt");
+    let uri = format!("{root}/Documents/rejected-protected-input");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &uri, 0x40).await;
 
-    let (write_status, _) = post_library(
-        app.clone(),
-        &token,
-        "write",
-        json!({
-            "uri": uri,
-            "data": base64::engine::general_purpose::STANDARD.encode(b"protected fixture"),
-        }),
-    )
-    .await;
-    assert_eq!(write_status, StatusCode::OK);
+    let rejection_cases = [
+        (
+            json!({
+                "uri": uri,
+                "protected_content_fixture": true,
+            }),
+            "protected_content_fixture",
+        ),
+        (
+            json!({
+                "uri": uri,
+                "protection": {
+                    "mode": "fixture",
+                    "mime_type": "video/mp4",
+                    "codecs": "avc1.64001f,mp4a.40.2"
+                }
+            }),
+            "unknown variant `fixture`",
+        ),
+        (
+            json!({
+                "uri": uri,
+                "protection": {
+                    "mode": "runtime_custody",
+                    "mime_type": "video/mp4",
+                    "codecs": "avc1.64001f,mp4a.40.2",
+                    "extra": true
+                }
+            }),
+            "unknown field `extra`",
+        ),
+    ];
 
-    let (publish_status, publish) = post_library(
-        app.clone(),
-        &token,
-        "publish",
-        json!({
-            "uri": uri,
-            "protected_content_fixture": true,
-        }),
-    )
-    .await;
-    assert_eq!(publish_status, StatusCode::OK);
-    assert_eq!(publish["status"], "ok");
-    assert_eq!(
-        publish["data"]["content_security"]["published_payload"],
-        "protected_content_fixture"
-    );
-    assert_eq!(
-        publish["data"]["content_security"]["key_release_required"],
-        true
-    );
-    assert_eq!(
-        publish["data"]["content_security"]["production_encryption"],
-        false
-    );
-    assert_eq!(
-        publish["data"]["content_security"]["sealed_object"]["schema"],
-        "elastos.sealed.object/v1"
-    );
+    for (body, expected_fragment) in rejection_cases {
+        let (publish_status, publish) = post_library(app.clone(), &token, "publish", body).await;
+        assert_eq!(publish_status, StatusCode::OK);
+        assert_eq!(publish["status"], "error");
+        let message = publish["message"].as_str().unwrap();
+        assert!(message.contains(expected_fragment), "{publish}");
+        assert!(!message.contains(&uri));
+        assert!(!message.contains(&dir.path().display().to_string()));
+        assert_no_publish_records(dir.path(), &authority.principal_id);
+    }
 
-    let (share_status, share) = post_library(
-        app.clone(),
-        &token,
-        "share",
-        json!({
-            "uri": uri,
-            "recipients": [authority.principal_id],
-            "key_release_policy": "recipient_key_release",
-        }),
-    )
-    .await;
-    assert_eq!(share_status, StatusCode::OK);
-    assert_eq!(share["status"], "ok");
-    assert_eq!(share["data"]["policy"], "recipient_scoped");
-    assert_eq!(share["data"]["key_release"]["required"], true);
-    assert_eq!(
-        share["data"]["key_release"]["status"],
-        "provider_receipt_chain_required"
-    );
-    assert_eq!(
-        share["data"]["protected_content"]["configured_provider_count"],
-        4
-    );
-    assert_eq!(
-        share["data"]["protected_content"]["encrypted_recipient_sharing"]["status"],
-        "provider_chain_ready"
-    );
-
-    let (access_status, access) = post_library(
-        app.clone(),
-        &token,
-        "shared_access",
-        json!({
-            "uri": uri,
-            "recipient": authority.principal_id,
-        }),
-    )
-    .await;
-    assert_eq!(access_status, StatusCode::OK);
-    assert_eq!(
-        access["status"], "ok",
-        "protected access response: {access}"
-    );
-    assert_eq!(
-        access["data"]["access"]["open"]["status"],
-        "ready_for_protected_viewer_session"
-    );
-    assert_eq!(
-        access["data"]["access"]["open"]["provider"],
-        "decrypt-provider"
-    );
-    assert_eq!(
-        access["data"]["access"]["open"]["transport"],
-        "runtime-protected-provider-chain"
-    );
-    let protected = &access["data"]["access"]["open"]["protected_content"];
-    assert_eq!(protected["schema"], "elastos.library.protected-open/v1");
-    assert_eq!(
-        protected["drm_receipt"]["schema"],
-        "elastos.drm.open.receipt/v1"
-    );
-    assert_eq!(
-        protected["rights_receipt"]["schema"],
-        "elastos.rights.decision.receipt/v1"
-    );
-    assert_eq!(protected["rights_receipt"]["allowed"], true);
-    assert_eq!(
-        protected["key_release_receipt"]["schema"],
-        "elastos.release.receipt/v1"
-    );
-    assert_eq!(protected["key_release_receipt"]["provider"], "key-provider");
-    assert_eq!(
-        protected["decrypt_session"]["schema"],
-        "elastos.decrypt.session/v1"
-    );
-    assert_eq!(
-        protected["viewer"]["required_interface"],
-        "elastos.viewer/document@1"
-    );
-    assert_eq!(protected["raw_cek_exposed"], false);
-    assert_eq!(protected["raw_plaintext_exposed"], false);
-    let protected_text = protected.to_string();
-    assert!(!protected_text.contains("fixture-wrapped"));
-    assert!(!protected_text.contains("provider_credentials"));
+    let overlong = "x".repeat(256);
+    for (field, value, expected_message) in [
+        ("mime_type", "", "invalid protected publish mime_type"),
+        (
+            "mime_type",
+            "video/mp4 ",
+            "invalid protected publish mime_type",
+        ),
+        (
+            "mime_type",
+            overlong.as_str(),
+            "invalid protected publish mime_type",
+        ),
+        ("codecs", "", "invalid protected publish codecs"),
+        (
+            "codecs",
+            "avc1.64001f, mp4a.40.2",
+            "invalid protected publish codecs",
+        ),
+        (
+            "codecs",
+            overlong.as_str(),
+            "invalid protected publish codecs",
+        ),
+    ] {
+        assert_invalid_runtime_custody_media_declaration(
+            dir.path(),
+            &app,
+            &token,
+            &authority.principal_id,
+            &uri,
+            field,
+            value,
+            expected_message,
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
-async fn test_library_protected_shared_access_fails_closed_without_providers() {
+async fn test_library_provider_runtime_custody_publish_fails_closed_without_composition_or_record()
+{
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(library_test_state(dir.path()).await);
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
     let root = crate::auth::principal_localhost_root(&authority.principal_id);
-    let uri = format!("{root}/Documents/protected-missing-providers.txt");
+    let uri = format!("{root}/Documents/protected-clear-media");
+    let directory_path = library_object_path(dir.path(), &uri);
+    std::fs::create_dir_all(directory_path.join("segments")).unwrap();
 
-    let (write_status, _) = post_library(
-        app.clone(),
+    let (init, segments) = clear_runtime_custody_media(0x41);
+    write_library_bytes(&app, &token, &format!("{uri}/init.mp4"), &init).await;
+    for index in (0..segments.len()).rev() {
+        write_library_bytes(
+            &app,
+            &token,
+            &format!("{uri}/segments/{index:08}.m4s"),
+            &segments[index],
+        )
+        .await;
+    }
+
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
         &token,
-        "write",
-        json!({
-            "uri": uri,
-            "data": base64::engine::general_purpose::STANDARD.encode(b"protected fixture"),
-        }),
+        &authority.principal_id,
+        &uri,
+        crate::protected_content_runtime::RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE,
     )
     .await;
-    assert_eq!(write_status, StatusCode::OK);
+    assert!(!dir.path().join("protected-content/runtime-mint").exists());
+}
 
-    let (publish_status, publish) = post_library(
-        app.clone(),
-        &token,
-        "publish",
-        json!({
-            "uri": uri,
-            "protected_content_fixture": true,
-        }),
+#[tokio::test]
+async fn test_runtime_custody_creator_tail_pending_or_failed_never_persists_listing() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_content_publish_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let runtime_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &token);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-tail-pending",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x81, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &input);
+    let mint_id = facts.mint_id;
+    let replay_content_cid = facts.content_cid.clone();
+    let replay_content_id = facts.content_id.clone();
+
+    let err = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &runtime_authority,
+        registry.clone(),
+        input.clone(),
+        facts,
     )
-    .await;
-    assert_eq!(publish_status, StatusCode::OK);
-    assert_eq!(publish["status"], "ok");
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Runtime custody creator mint is pending exact Wallet or Chain settlement"
+    );
+    assert_eq!(mock_content_publish_request_count(), 1);
+    assert!(
+        crate::protected_content_runtime::load_runtime_custody_listing(dir.path(), mint_id)
+            .unwrap()
+            .is_none()
+    );
 
-    let (share_status, share) = post_library(
-        app.clone(),
-        &token,
-        "share",
-        json!({
-            "uri": uri,
-            "recipients": [authority.principal_id],
-            "key_release_policy": "recipient_key_release",
-        }),
+    let approval_request_id = wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    let _tx_hash = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    set_mock_protected_content_chain_receipt_error();
+    let replay_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let replay_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &replay_token);
+    let replay_facts = crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts {
+        content_cid: replay_content_cid,
+        mint_id,
+        content_id: replay_content_id,
+        availability: json!({"status": "local_pinned"}),
+        receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
+        content_security: json!({"mode": "runtime_custody"}),
+    };
+    let err = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &replay_authority,
+        registry,
+        input,
+        replay_facts,
     )
-    .await;
-    assert_eq!(share_status, StatusCode::OK);
-    assert_eq!(share["status"], "ok");
-    assert_eq!(share["data"]["key_release"]["required"], true);
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Runtime custody creator mint is unavailable"
+    );
+    assert_eq!(
+        wallet_provider
+            .provider
+            .latest_transaction_approval_request_id()
+            .await
+            .as_deref(),
+        Some(approval_request_id.as_str())
+    );
+    assert_eq!(mock_content_publish_request_count(), 1);
+    assert!(
+        crate::protected_content_runtime::load_runtime_custody_listing(dir.path(), mint_id)
+            .unwrap()
+            .is_none()
+    );
+}
 
-    let (access_status, access) = post_library(
+#[tokio::test]
+async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutable() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_content_publish_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let runtime_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &token);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-tail-confirmed",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x82, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &input);
+    let mint_id = facts.mint_id;
+    let replay_content_cid = facts.content_cid.clone();
+    let replay_content_id = facts.content_id.clone();
+
+    let pending = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &runtime_authority,
+        registry.clone(),
+        input.clone(),
+        facts,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        pending.to_string(),
+        "Runtime custody creator mint is pending exact Wallet or Chain settlement"
+    );
+    let approval_request_id = wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    let _tx_hash = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+
+    let replay_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let replay_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &replay_token);
+    let replay_facts = crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts {
+        content_cid: replay_content_cid.clone(),
+        mint_id,
+        content_id: replay_content_id.clone(),
+        availability: json!({"status": "local_pinned"}),
+        receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
+        content_security: json!({"mode": "runtime_custody"}),
+    };
+    let ok = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &replay_authority,
+        registry.clone(),
+        input.clone(),
+        replay_facts,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok.mint_id, mint_id);
+    let listing_path = dir
+        .path()
+        .join("protected-content/runtime-listings")
+        .join(format!("{}.json", hex::encode(mint_id.as_bytes())));
+    let listing: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(listing_path).unwrap()).unwrap();
+    assert_eq!(listing["cid"], replay_content_cid);
+    assert_eq!(listing["content_id"], replay_content_id);
+    assert_eq!(
+        listing["seller_address"],
+        MOCK_MANAGED_EVM_ADDRESS.to_ascii_lowercase()
+    );
+    assert_eq!(listing["chain_namespace"], "eip155:8453");
+    assert_eq!(listing["network"], "base-mainnet");
+    assert_eq!(
+        listing["ledger"],
+        MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY.to_ascii_lowercase()
+    );
+    assert_eq!(listing["token_id"], MOCK_PROTECTED_CONTENT_TOKEN_ID);
+    assert_eq!(
+        listing["operative"],
+        MOCK_PROTECTED_CONTENT_OPERATIVE.to_ascii_lowercase()
+    );
+    assert_eq!(listing["price"], MOCK_PROTECTED_CONTENT_LISTING_PRICE);
+    assert_eq!(
+        listing["pay_token"],
+        MOCK_PROTECTED_CONTENT_PAY_TOKEN.to_ascii_lowercase()
+    );
+    assert_eq!(mock_content_publish_request_count(), 1);
+
+    let replay_again_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let replay_again_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &replay_again_token);
+    let replay_again_facts = crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts {
+        content_cid: replay_content_cid,
+        mint_id,
+        content_id: replay_content_id,
+        availability: json!({"status": "local_pinned"}),
+        receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
+        content_security: json!({"mode": "runtime_custody"}),
+    };
+    let replay = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &replay_again_authority,
+        registry,
+        input,
+        replay_again_facts,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.mint_id, mint_id);
+    assert_eq!(mock_content_publish_request_count(), 1);
+    assert_eq!(
+        wallet_provider
+            .provider
+            .latest_transaction_approval_request_id()
+            .await
+            .as_deref(),
+        Some(approval_request_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn test_runtime_custody_creator_tail_listing_error_is_unavailable_without_duplicates() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_content_publish_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let runtime_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &token);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-tail-listing-error",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x83, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &input);
+    let mint_id = facts.mint_id;
+    let replay_content_cid = facts.content_cid.clone();
+    let replay_content_id = facts.content_id.clone();
+
+    let pending = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &runtime_authority,
+        registry.clone(),
+        input.clone(),
+        facts,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        pending.to_string(),
+        "Runtime custody creator mint is pending exact Wallet or Chain settlement"
+    );
+    let approval_request_id = wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    let initial_mint = crate::protected_content_runtime::runtime_mint_journal(dir.path())
+        .load(mint_id)
+        .unwrap();
+    let initial_effect = initial_mint
+        .creator_state()
+        .and_then(|state| state.effect())
+        .cloned()
+        .expect("creator effect bound after pending result");
+    let _tx_hash = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    let signed_transaction = wallet_provider
+        .provider
+        .latest_transaction_signed_transaction()
+        .await
+        .expect("completed mock transaction");
+    reset_mock_chain_broadcast_count(&signed_transaction);
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 0);
+    set_mock_protected_content_chain_listing_error();
+
+    let replay_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let replay_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &replay_token);
+    let replay_facts = crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts {
+        content_cid: replay_content_cid.clone(),
+        mint_id,
+        content_id: replay_content_id.clone(),
+        availability: json!({"status": "local_pinned"}),
+        receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
+        content_security: json!({"mode": "runtime_custody"}),
+    };
+    let err = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &replay_authority,
+        registry.clone(),
+        input.clone(),
+        replay_facts,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Runtime custody creator mint is unavailable"
+    );
+    assert!(
+        crate::protected_content_runtime::load_runtime_custody_listing(dir.path(), mint_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(mock_content_publish_request_count(), 1);
+    assert_eq!(
+        wallet_provider
+            .provider
+            .latest_transaction_approval_request_id()
+            .await
+            .as_deref(),
+        Some(approval_request_id.as_str())
+    );
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 1);
+    let errored_mint = crate::protected_content_runtime::runtime_mint_journal(dir.path())
+        .load(mint_id)
+        .unwrap();
+    let errored_effect = errored_mint
+        .creator_state()
+        .and_then(|state| state.effect())
+        .cloned()
+        .expect("creator effect still bound after listing error");
+    assert_eq!(errored_effect.effect_id(), initial_effect.effect_id());
+    assert_eq!(
+        errored_effect.approval_request_id(),
+        initial_effect.approval_request_id()
+    );
+    assert_eq!(
+        errored_effect.request_sha256(),
+        initial_effect.request_sha256()
+    );
+
+    let replay_again_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let replay_again_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &replay_again_token);
+    let replay_again_facts = crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts {
+        content_cid: replay_content_cid,
+        mint_id,
+        content_id: replay_content_id,
+        availability: json!({"status": "local_pinned"}),
+        receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
+        content_security: json!({"mode": "runtime_custody"}),
+    };
+    let err = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &replay_again_authority,
+        registry,
+        input,
+        replay_again_facts,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Runtime custody creator mint is unavailable"
+    );
+    assert!(
+        crate::protected_content_runtime::load_runtime_custody_listing(dir.path(), mint_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(mock_content_publish_request_count(), 1);
+    assert_eq!(
+        wallet_provider
+            .provider
+            .latest_transaction_approval_request_id()
+            .await
+            .as_deref(),
+        Some(approval_request_id.as_str())
+    );
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 1);
+    let replayed_mint = crate::protected_content_runtime::runtime_mint_journal(dir.path())
+        .load(mint_id)
+        .unwrap();
+    let replayed_effect = replayed_mint
+        .creator_state()
+        .and_then(|state| state.effect())
+        .cloned()
+        .expect("creator effect still bound after listing error replay");
+    assert_eq!(replayed_effect.effect_id(), initial_effect.effect_id());
+    assert_eq!(
+        replayed_effect.approval_request_id(),
+        initial_effect.approval_request_id()
+    );
+    assert_eq!(
+        replayed_effect.request_sha256(),
+        initial_effect.request_sha256()
+    );
+}
+
+#[tokio::test]
+async fn test_library_provider_runtime_custody_buy_is_denied_before_purchase() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (status, payload) = post_library(
         app,
         &token,
-        "shared_access",
+        "buy",
         json!({
-            "uri": uri,
-            "recipient": authority.principal_id,
+            "mint_id": "00".repeat(32),
+            "account_id": "wallet:eip155:8453:0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
         }),
     )
     .await;
-    assert_eq!(access_status, StatusCode::OK);
-    assert_eq!(access["status"], "error");
-    assert!(access["message"]
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "error");
+    assert_eq!(
+        payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+    );
+}
+
+#[tokio::test]
+async fn test_library_provider_runtime_custody_marketplace_buy_is_denied_before_purchase() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), MARKETPLACE_CAPSULE_ID, &authority);
+    let (status, payload) = post_library(
+        app,
+        &token,
+        "buy",
+        json!({
+            "mint_id": "00".repeat(32),
+            "account_id": "wallet:eip155:8453:0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "error");
+    assert_eq!(
+        payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+    );
+}
+
+#[tokio::test]
+async fn test_library_provider_runtime_custody_buy_rejects_caller_supplied_purchase_authority_fields(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), MARKETPLACE_CAPSULE_ID, &authority);
+    let (status, payload) = post_library(
+        app,
+        &token,
+        "buy",
+        json!({
+            "mint_id": "00".repeat(32),
+            "wallet_request_hex": "00",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "error");
+    assert!(
+        payload["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown field"),
+        "{payload}"
+    );
+}
+
+#[tokio::test]
+async fn test_runtime_custody_buy_raw_provider_call_requires_gateway_wallet_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = crate::library::handle_object_provider_runtime_request_with_gateway(
+        dir.path(),
+        Arc::new(ProviderRegistry::new()),
+        &json!({
+            "op": "buy",
+            "principal_id": "person:local:raw-provider-buy",
+            "mint_id": "00".repeat(32),
+            "account_id": "wallet:eip155:8453:0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(response["status"], "error");
+    assert_eq!(
+        response["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+    );
+}
+
+#[tokio::test]
+async fn test_runtime_custody_buy_fails_before_effects_when_fresh_availability_is_unavailable() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-no-availability",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x91, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        false,
+    );
+    let app = gateway_router(state);
+    let (status, payload) = post_library(
+        app,
+        &token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "error");
+    assert_eq!(
+        payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+    );
+    assert_eq!(
+        wallet_provider
+            .provider
+            .latest_transaction_approval_request_id()
+            .await,
+        None
+    );
+    assert!(
+        crate::protected_content_runtime::load_runtime_custody_purchase(
+            dir.path(),
+            &authority.principal_id,
+            facts.mint_id,
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_runtime_custody_buy_native_terminal_replay_is_exact_and_listing_stays_immutable() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-native",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x92, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        true,
+    );
+    let listing_path = runtime_custody_listing_path_for_test(dir.path(), facts.mint_id);
+    let listing_before = std::fs::read(&listing_path).unwrap();
+    let app = gateway_router(state);
+
+    let (pending_status, pending_payload) = post_library(
+        app.clone(),
+        &token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(pending_status, StatusCode::OK);
+    assert_eq!(pending_payload["status"], "error");
+    assert_eq!(
+        pending_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+    let approval_request_id = wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    let _tx_hash = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    let signed_transaction = wallet_provider
+        .provider
+        .latest_transaction_signed_transaction()
+        .await
+        .expect("completed mock transaction");
+    reset_mock_chain_broadcast_count(&signed_transaction);
+    let replay_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (ok_status, ok_payload) = post_library(
+        app.clone(),
+        &replay_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(ok_status, StatusCode::OK);
+    assert_eq!(ok_payload["status"], "ok");
+    assert_eq!(ok_payload["data"]["availability"]["status"], "buyer_owned");
+    assert_eq!(
+        mock_chain_raw_request_count("resolve_protected_content_purchase"),
+        1
+    );
+    assert_eq!(
+        mock_chain_raw_request_count("resolve_protected_content_purchase_access"),
+        1
+    );
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 1);
+    let purchase = crate::protected_content_runtime::load_runtime_custody_purchase(
+        dir.path(),
+        &authority.principal_id,
+        facts.mint_id,
+    )
+    .unwrap()
+    .unwrap();
+    let purchase_json = serde_json::to_string(&purchase).unwrap();
+    assert!(!purchase_json.contains(&signed_transaction));
+    assert!(!purchase_json.contains("\"signed_result\""));
+    assert!(!purchase_json.contains("session_id"));
+    assert!(!purchase_json.contains("grant_id"));
+    assert!(!purchase_json.contains("http://"));
+
+    set_mock_protected_content_listing_quantity("0x0");
+    let replay_again_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (replay_status, replay_payload) = post_library(
+        app,
+        &replay_again_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(replay_status, StatusCode::OK);
+    assert_eq!(replay_payload["status"], "ok");
+    assert_eq!(
+        replay_payload["data"]["availability"]["status"],
+        "buyer_owned"
+    );
+    assert_eq!(
+        wallet_provider
+            .provider
+            .latest_transaction_approval_request_id()
+            .await
+            .as_deref(),
+        Some(approval_request_id.as_str())
+    );
+    assert_eq!(
+        mock_chain_raw_request_count("resolve_protected_content_purchase"),
+        1
+    );
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 1);
+    assert_eq!(std::fs::read(listing_path).unwrap(), listing_before);
+}
+
+#[tokio::test]
+async fn test_runtime_custody_buy_erc20_orders_approval_then_buy_without_duplicate_plan() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-erc20",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x93, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        false,
+    );
+    let app = gateway_router(state);
+
+    let (pending_one_status, pending_one_payload) = post_library(
+        app.clone(),
+        &token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(pending_one_status, StatusCode::OK);
+    assert_eq!(pending_one_payload["status"], "error");
+    assert_eq!(
+        pending_one_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+    let approval_request_one = wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    let _approval_tx_hash = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    let signed_approval = wallet_provider
+        .provider
+        .latest_transaction_signed_transaction()
+        .await
+        .expect("completed approval transaction");
+    reset_mock_chain_broadcast_count(&signed_approval);
+
+    let replay_one_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (pending_two_status, pending_two_payload) = post_library(
+        app.clone(),
+        &replay_one_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(pending_two_status, StatusCode::OK);
+    assert_eq!(pending_two_payload["status"], "error");
+    assert_eq!(
+        pending_two_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+    let approval_request_two = wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    assert_ne!(approval_request_one, approval_request_two);
+    assert_eq!(mock_chain_broadcast_count(&signed_approval), 1);
+    assert_eq!(
+        mock_chain_raw_request_count("resolve_protected_content_purchase"),
+        1
+    );
+    let _buy_tx_hash = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    let signed_buy = wallet_provider
+        .provider
+        .latest_transaction_signed_transaction()
+        .await
+        .expect("completed buy transaction");
+    reset_mock_chain_broadcast_count(&signed_buy);
+
+    let replay_two_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (ok_status, ok_payload) = post_library(
+        app.clone(),
+        &replay_two_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(ok_status, StatusCode::OK);
+    assert_eq!(ok_payload["status"], "ok");
+    assert_eq!(ok_payload["data"]["availability"]["status"], "buyer_owned");
+    assert_eq!(mock_chain_broadcast_count(&signed_approval), 1);
+    assert_eq!(mock_chain_broadcast_count(&signed_buy), 1);
+    assert_eq!(
+        mock_chain_raw_request_count("resolve_protected_content_purchase"),
+        1
+    );
+
+    let replay_again_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (replay_status, replay_payload) = post_library(
+        app,
+        &replay_again_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(replay_status, StatusCode::OK);
+    assert_eq!(replay_payload["status"], "ok");
+    assert_eq!(mock_chain_broadcast_count(&signed_approval), 1);
+    assert_eq!(mock_chain_broadcast_count(&signed_buy), 1);
+    assert_eq!(
+        mock_chain_raw_request_count("resolve_protected_content_purchase"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_runtime_custody_buy_access_corroboration_stays_nonterminal_until_allow() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-access-pending",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x94, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        true,
+    );
+    let app = gateway_router(state);
+    let _ = post_library(
+        app.clone(),
+        &token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    let _tx_hash = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    let signed_transaction = wallet_provider
+        .provider
+        .latest_transaction_signed_transaction()
+        .await
+        .expect("completed mock transaction");
+    reset_mock_chain_broadcast_count(&signed_transaction);
+
+    for set_mode in [
+        set_mock_protected_content_purchase_access_denied as fn(),
+        set_mock_protected_content_purchase_access_error as fn(),
+    ] {
+        reset_mock_protected_content_purchase_fixture();
+        set_mock_protected_content_purchase_native();
+        set_mode();
+        let replay_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+        let (status, payload) = post_library(
+            app.clone(),
+            &replay_token,
+            "buy",
+            json!({
+                "mint_id": hex::encode(facts.mint_id.as_bytes()),
+                "account_id": wallet_account_id,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["status"], "error");
+        assert_eq!(
+            payload["message"],
+            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+        );
+        let purchase = crate::protected_content_runtime::load_runtime_custody_purchase(
+            dir.path(),
+            &authority.principal_id,
+            facts.mint_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            purchase.progress,
+            crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+                confirmed_buy: Some(_)
+            }
+        ));
+    }
+
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+    let replay_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (ok_status, ok_payload) = post_library(
+        app,
+        &replay_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(ok_status, StatusCode::OK);
+    assert_eq!(ok_payload["status"], "ok");
+    assert_eq!(ok_payload["data"]["availability"]["status"], "buyer_owned");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    reset_mock_content_publish_requests();
+    reset_mock_chain_raw_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    registry
+        .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "object",
+            std::sync::Arc::new(crate::library::ObjectProvider::new(
+                dir.path().to_path_buf(),
+                std::sync::Arc::downgrade(&registry),
+            )),
+        )
+        .await
+        .unwrap();
+
+    let _process_fixture = crate::protected_content_runtime::tests::register_runtime_custody_process_providers_for_test_registry(
+        dir.path(),
+        &registry,
+    )
+    .await;
+    let creator = passkey_authority_with_profile_role_credential(
+        dir.path(),
+        "creator",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-creator",
+    );
+    let buyer = passkey_authority_with_profile_role_credential(
+        dir.path(),
+        "buyer",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-buyer",
+    );
+    let creator_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &creator);
+    let buyer_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &buyer);
+    let creator_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&creator.principal_id, 1)
+        .await;
+    let buyer_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&buyer.principal_id, 2)
+        .await;
+    let app = gateway_router(state.clone());
+
+    let creator_root = crate::auth::principal_localhost_root(&creator.principal_id);
+    let uri = format!("{creator_root}/Documents/protected-runtime-proof");
+    let (clear_init, clear_segments) = clear_runtime_custody_media(0xa1);
+    write_library_bytes(
+        &app,
+        &creator_token,
+        &format!("{uri}/init.mp4"),
+        &clear_init,
+    )
+    .await;
+    for (index, segment) in clear_segments.iter().enumerate() {
+        write_library_bytes(
+            &app,
+            &creator_token,
+            &format!("{uri}/segments/{index:08}.m4s"),
+            segment,
+        )
+        .await;
+    }
+    let publish_body = json!({
+        "uri": uri,
+        "protection": {
+            "mode": "runtime_custody",
+            "mime_type": "video/mp4",
+            "codecs": "avc1.64001f,mp4a.40.2",
+            "wallet_account_id": creator_account_id,
+            "copies": "0x2",
+            "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+        },
+    });
+    let (publish_pending_status, publish_pending) =
+        post_library(app.clone(), &creator_token, "publish", publish_body.clone()).await;
+    assert_eq!(publish_pending_status, StatusCode::OK);
+    assert_eq!(publish_pending["status"], "error");
+    assert_eq!(
+        publish_pending["message"],
+        "Runtime custody creator mint is pending exact Wallet or Chain settlement"
+    );
+    let creator_signed_transaction = {
+        let _ = wallet_provider
+            .provider
+            .complete_latest_transaction_approval()
+            .await;
+        wallet_provider
+            .provider
+            .latest_transaction_signed_transaction()
+            .await
+            .expect("completed creator transaction")
+    };
+    reset_mock_chain_broadcast_count(&creator_signed_transaction);
+
+    let (publish_ok_status, publish_ok) =
+        post_library(app.clone(), &creator_token, "publish", publish_body).await;
+    assert_eq!(publish_ok_status, StatusCode::OK);
+    assert_eq!(publish_ok["status"], "ok", "{publish_ok}");
+    let mint_id_hex = publish_ok["data"]["content_security"]["mint_id"]
         .as_str()
         .unwrap()
-        .contains("drm provider unavailable"));
+        .to_string();
+    let mint_id = elastos_protected_content_contracts::Digest32::new(
+        hex::decode(&mint_id_hex).unwrap().try_into().unwrap(),
+    );
+    let listing_path = runtime_custody_listing_path_for_test(dir.path(), mint_id);
+    let listing_before_buy = std::fs::read(&listing_path).unwrap();
+    assert_eq!(mock_content_publish_request_count(), 2);
+    assert_eq!(mock_chain_broadcast_count(&creator_signed_transaction), 1);
+
+    let (buy_pending_status, buy_pending) = post_library(
+        app.clone(),
+        &buyer_token,
+        "buy",
+        json!({
+            "mint_id": mint_id_hex,
+            "account_id": buyer_account_id.clone(),
+        }),
+    )
+    .await;
+    assert_eq!(buy_pending_status, StatusCode::OK);
+    assert_eq!(buy_pending["status"], "error");
+    assert_eq!(
+        buy_pending["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+    let buyer_approval_request_one = wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    let buyer_signed_approval = {
+        let _ = wallet_provider
+            .provider
+            .complete_latest_transaction_approval()
+            .await;
+        wallet_provider
+            .provider
+            .latest_transaction_signed_transaction()
+            .await
+            .expect("completed buyer approval transaction")
+    };
+    reset_mock_chain_broadcast_count(&buyer_signed_approval);
+
+    let (buy_pending_two_status, buy_pending_two) = post_library(
+        app.clone(),
+        &buyer_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(mint_id.as_bytes()),
+            "account_id": buyer_account_id.clone(),
+        }),
+    )
+    .await;
+    assert_eq!(buy_pending_two_status, StatusCode::OK);
+    assert_eq!(buy_pending_two["status"], "error");
+    assert_eq!(
+        buy_pending_two["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+    let buyer_approval_request_two = wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    assert_ne!(buyer_approval_request_one, buyer_approval_request_two);
+    assert_eq!(mock_chain_broadcast_count(&buyer_signed_approval), 1);
+
+    let buyer_signed_transaction = {
+        let _ = wallet_provider
+            .provider
+            .complete_latest_transaction_approval()
+            .await;
+        wallet_provider
+            .provider
+            .latest_transaction_signed_transaction()
+            .await
+            .expect("completed buyer transaction")
+    };
+    reset_mock_chain_broadcast_count(&buyer_signed_transaction);
+
+    let (buy_ok_status, buy_ok) = post_library(
+        app.clone(),
+        &buyer_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(mint_id.as_bytes()),
+            "account_id": buyer_account_id.clone(),
+        }),
+    )
+    .await;
+    assert_eq!(buy_ok_status, StatusCode::OK);
+    assert_eq!(buy_ok["status"], "ok", "{buy_ok}");
+    assert_eq!(buy_ok["data"]["availability"]["status"], "buyer_owned");
+    assert_eq!(mock_chain_broadcast_count(&buyer_signed_approval), 1);
+    assert_eq!(mock_chain_broadcast_count(&buyer_signed_transaction), 1);
+    assert_eq!(std::fs::read(&listing_path).unwrap(), listing_before_buy);
+
+    let purchase = crate::protected_content_runtime::load_runtime_custody_purchase(
+        dir.path(),
+        &buyer.principal_id,
+        mint_id,
+    )
+    .unwrap()
+    .expect("terminal purchase record");
+    assert_eq!(purchase.principal_id, buyer.principal_id);
+    assert_eq!(
+        purchase.account_id,
+        format!(
+            "wallet:eip155:8453:{}",
+            mock_managed_evm_address(2).unwrap()
+        )
+    );
+    assert!(matches!(
+        purchase.progress,
+        crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Complete { .. }
+    ));
+
+    wallet_provider.clear_requests().await;
+    let (open_status, open_payload) = post_library(
+        app.clone(),
+        &buyer_token,
+        "open_viewer",
+        json!({
+            "mint_id": hex::encode(mint_id.as_bytes()),
+        }),
+    )
+    .await;
+    let open_wallet_ops = wallet_provider.recorded_v2_operation_kinds().await;
+    assert_eq!(open_status, StatusCode::OK);
+    assert_eq!(
+        open_payload["status"], "ok",
+        "wallet_ops={open_wallet_ops:?} payload={open_payload}"
+    );
+    assert_eq!(
+        open_wallet_ops,
+        vec![WalletOperationKind::RequestProtectedContentRightsSignature]
+    );
+    let viewer_handle = open_payload["data"]["viewer_session_handle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (init_status, init_payload) = post_library(
+        app.clone(),
+        &buyer_token,
+        "read_viewer",
+        json!({
+            "mint_id": hex::encode(mint_id.as_bytes()),
+            "viewer_session_handle": viewer_handle,
+        }),
+    )
+    .await;
+    assert_eq!(init_status, StatusCode::OK);
+    assert_eq!(init_payload["status"], "ok", "{init_payload}");
+    let init_bytes = base64::engine::general_purpose::STANDARD
+        .decode(init_payload["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(init_bytes, clear_init);
+
+    let (segment_status, segment_payload) = post_library(
+        app.clone(),
+        &buyer_token,
+        "read_viewer",
+        json!({
+            "mint_id": hex::encode(mint_id.as_bytes()),
+            "viewer_session_handle": open_payload["data"]["viewer_session_handle"],
+            "segment_index": 0,
+        }),
+    )
+    .await;
+    assert_eq!(segment_status, StatusCode::OK);
+    assert_eq!(segment_payload["status"], "ok", "{segment_payload}");
+    let segment_bytes = base64::engine::general_purpose::STANDARD
+        .decode(segment_payload["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(segment_bytes, clear_segments[0]);
+
+    let (close_status, close_payload) = post_library(
+        app,
+        &buyer_token,
+        "close_viewer",
+        json!({
+            "mint_id": hex::encode(mint_id.as_bytes()),
+            "viewer_session_handle": open_payload["data"]["viewer_session_handle"],
+        }),
+    )
+    .await;
+    assert_eq!(close_status, StatusCode::OK);
+    assert_eq!(close_payload["status"], "ok", "{close_payload}");
+
+    let viewer_record_path =
+        runtime_custody_viewer_record_path_for_test(dir.path(), &buyer.principal_id, mint_id);
+    let viewer_record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&viewer_record_path).unwrap()).unwrap();
+    assert_eq!(viewer_record["lifecycle_status"], "closed");
+    assert!(viewer_record["pending_close_result"].is_null());
+    assert!(viewer_record["pending_cancel_result"].is_null());
+    assert_eq!(std::fs::read(&listing_path).unwrap(), listing_before_buy);
+}
+
+#[tokio::test]
+async fn test_library_provider_runtime_custody_open_is_denied_before_purchase() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (status, payload) = post_library(
+        app,
+        &token,
+        "open_viewer",
+        json!({
+            "mint_id": "00".repeat(32),
+            "proof_binding_id": "caller-selected-proof",
+            "session_id": "caller-selected-session",
+            "grant_id": "caller-selected-grant",
+            "wallet_request_hex": "00",
+            "wallet_response_hex": "00",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "error");
+    assert_eq!(
+        payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE
+    );
+}
+
+#[tokio::test]
+async fn test_library_provider_runtime_custody_publish_rejects_invalid_input_layouts() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let invalid_message = "Runtime custody publish input invalid";
+
+    let file_uri = format!("{root}/Documents/protected-file-target.mp4");
+    write_library_bytes(&app, &token, &file_uri, b"not a directory").await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &file_uri,
+        invalid_message,
+    )
+    .await;
+
+    let missing_init_uri = format!("{root}/Documents/protected-missing-init");
+    let missing_init_path = library_object_path(dir.path(), &missing_init_uri);
+    std::fs::create_dir_all(missing_init_path.join("segments")).unwrap();
+    let (_, missing_init_segments) = clear_runtime_custody_media(0x52);
+    write_library_bytes(
+        &app,
+        &token,
+        &format!("{missing_init_uri}/segments/00000000.m4s"),
+        &missing_init_segments[0],
+    )
+    .await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &missing_init_uri,
+        invalid_message,
+    )
+    .await;
+
+    let missing_segments_uri = format!("{root}/Documents/protected-missing-segments");
+    let (missing_segments_init, _) = clear_runtime_custody_media(0x52);
+    write_library_bytes(
+        &app,
+        &token,
+        &format!("{missing_segments_uri}/init.mp4"),
+        &missing_segments_init,
+    )
+    .await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &missing_segments_uri,
+        invalid_message,
+    )
+    .await;
+
+    let empty_segments_uri = format!("{root}/Documents/protected-empty-segments");
+    let empty_segments_path = library_object_path(dir.path(), &empty_segments_uri);
+    std::fs::create_dir_all(empty_segments_path.join("segments")).unwrap();
+    let (empty_segments_init, _) = clear_runtime_custody_media(0x53);
+    write_library_bytes(
+        &app,
+        &token,
+        &format!("{empty_segments_uri}/init.mp4"),
+        &empty_segments_init,
+    )
+    .await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &empty_segments_uri,
+        invalid_message,
+    )
+    .await;
+
+    let empty_segment_uri = format!("{root}/Documents/protected-empty-segment");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &empty_segment_uri, 0x54)
+        .await;
+    write_library_bytes(
+        &app,
+        &token,
+        &format!("{empty_segment_uri}/segments/00000000.m4s"),
+        &[],
+    )
+    .await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &empty_segment_uri,
+        invalid_message,
+    )
+    .await;
+
+    let gap_uri = format!("{root}/Documents/protected-gap");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &gap_uri, 0x55).await;
+    std::fs::remove_file(library_object_path(
+        dir.path(),
+        &format!("{gap_uri}/segments/00000000.m4s"),
+    ))
+    .unwrap();
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &gap_uri,
+        invalid_message,
+    )
+    .await;
+
+    let wrong_name_uri = format!("{root}/Documents/protected-wrong-name");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &wrong_name_uri, 0x56).await;
+    std::fs::rename(
+        library_object_path(
+            dir.path(),
+            &format!("{wrong_name_uri}/segments/00000000.m4s"),
+        ),
+        library_object_path(
+            dir.path(),
+            &format!("{wrong_name_uri}/segments/segment0.m4s"),
+        ),
+    )
+    .unwrap();
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &wrong_name_uri,
+        invalid_message,
+    )
+    .await;
+
+    let extra_root_uri = format!("{root}/Documents/protected-extra-root-entry");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &extra_root_uri, 0x57).await;
+    write_library_bytes(
+        &app,
+        &token,
+        &format!("{extra_root_uri}/notes.txt"),
+        b"extra root entry",
+    )
+    .await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &extra_root_uri,
+        invalid_message,
+    )
+    .await;
+
+    let symlink_uri = format!("{root}/Documents/protected-symlink");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &symlink_uri, 0x58).await;
+    let symlink_path =
+        library_object_path(dir.path(), &format!("{symlink_uri}/segments/00000000.m4s"));
+    std::fs::remove_file(&symlink_path).unwrap();
+    let symlink_target = dir.path().join("symlink-target.bin");
+    std::fs::write(&symlink_target, b"symlink-target").unwrap();
+    std::os::unix::fs::symlink(&symlink_target, &symlink_path).unwrap();
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &symlink_uri,
+        invalid_message,
+    )
+    .await;
+
+    let non_file_uri = format!("{root}/Documents/protected-non-file");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &non_file_uri, 0x59).await;
+    let non_file_path =
+        library_object_path(dir.path(), &format!("{non_file_uri}/segments/00000000.m4s"));
+    std::fs::remove_file(&non_file_path).unwrap();
+    std::fs::create_dir_all(&non_file_path).unwrap();
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &non_file_uri,
+        invalid_message,
+    )
+    .await;
+
+    let oversize_uri = format!("{root}/Documents/protected-oversize");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &oversize_uri, 0x5a).await;
+    let oversize_segment_path =
+        library_object_path(dir.path(), &format!("{oversize_uri}/segments/00000000.m4s"));
+    let oversize_file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&oversize_segment_path)
+        .unwrap();
+    oversize_file
+        .set_len(
+            elastos_protected_content_provider_contracts::MAX_PROTECT_MEDIA_PART_BYTES_V1 as u64
+                + 1,
+        )
+        .unwrap();
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &oversize_uri,
+        invalid_message,
+    )
+    .await;
+
+    let malformed_init_uri = format!("{root}/Documents/protected-malformed-init");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &malformed_init_uri, 0x5b)
+        .await;
+    write_library_bytes(
+        &app,
+        &token,
+        &format!("{malformed_init_uri}/init.mp4"),
+        b"not an mp4 init",
+    )
+    .await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &malformed_init_uri,
+        invalid_message,
+    )
+    .await;
+
+    let malformed_segment_uri = format!("{root}/Documents/protected-malformed-segment");
+    create_runtime_custody_publish_directory(
+        dir.path(),
+        &app,
+        &token,
+        &malformed_segment_uri,
+        0x5c,
+    )
+    .await;
+    write_library_bytes(
+        &app,
+        &token,
+        &format!("{malformed_segment_uri}/segments/00000000.m4s"),
+        b"not a valid segment",
+    )
+    .await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &malformed_segment_uri,
+        invalid_message,
+    )
+    .await;
+
+    let unknown_track_uri = format!("{root}/Documents/protected-unknown-track");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &unknown_track_uri, 0x5d)
+        .await;
+    let unknown_track_segment = make_clear_segment(99, b"badsegxx");
+    write_library_bytes(
+        &app,
+        &token,
+        &format!("{unknown_track_uri}/segments/00000000.m4s"),
+        &unknown_track_segment,
+    )
+    .await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &unknown_track_uri,
+        invalid_message,
+    )
+    .await;
 }
 
 #[tokio::test]

@@ -11,6 +11,7 @@ pub mod browser_engine_protocol;
 pub mod browser_sessions;
 pub(crate) mod capsule_inventory;
 pub mod gateway;
+pub(crate) mod gateway_local_control;
 pub mod handlers;
 pub mod middleware;
 pub mod routes;

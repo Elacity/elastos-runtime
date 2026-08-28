@@ -107,7 +107,7 @@ impl Runtime {
                     .ok()
                     .and_then(|guard| guard.get(capsule_id).cloned())
                     .unwrap_or_default();
-                let ctx = crate::carrier_bridge::BridgeContext {
+                let ctx = crate::resource_bridge::BridgeContext {
                     provider_registry: host_reg.clone(),
                     capability_manager: host_cap_mgr.clone(),
                     pending_store: host_pending.clone(),
@@ -117,13 +117,13 @@ impl Runtime {
                     data_dir: Some(host_data_dir.clone()),
                 };
                 let response = host_handle
-                    .block_on(crate::carrier_bridge::handle_component_carrier_request(
+                    .block_on(crate::resource_bridge::handle_component_resource_request(
                         line, ctx,
                     ))
                     .map_err(|err| err.to_string())?;
                 serde_json::to_string(&response).map_err(|err| err.to_string())
             }));
-            tracing::info!("Component Carrier bridge configured");
+            tracing::info!("Component resource bridge configured");
         }
 
         let mut guard = self.provider_registry.write().await;
@@ -648,6 +648,7 @@ mod tests {
             permissions: Permissions::default(),
             microvm: None,
             providers: None,
+            icon: None,
             viewer: None,
             signature: None,
         }

@@ -1227,8 +1227,14 @@ fn validate_dest_path(data_dir: &Path, dest: &Path) -> Result<(), String> {
         dest.to_path_buf()
     };
 
-    // Allowed prefixes
+    // Allowed prefixes. The destination path above is canonicalized, so the
+    // roots must be canonicalized too (macOS: /tmp and $TMPDIR are symlinks
+    // into /private).
+    let data_dir = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
     let tmp_dir = std::env::temp_dir();
+    let tmp_dir = tmp_dir.canonicalize().unwrap_or(tmp_dir);
 
     if !resolved.starts_with(&data_dir) && !resolved.starts_with(&tmp_dir) {
         return Err(format!(
@@ -1265,7 +1271,13 @@ fn validate_source_path(data_dir: &Path, src: &Path) -> Result<(), String> {
         src.to_path_buf()
     };
 
+    // The source path above is canonicalized, so the allowed roots must be
+    // canonicalized too (macOS: /tmp and $TMPDIR are symlinks into /private).
+    let data_dir = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
     let tmp_dir = std::env::temp_dir();
+    let tmp_dir = tmp_dir.canonicalize().unwrap_or(tmp_dir);
 
     if !resolved.starts_with(&data_dir) && !resolved.starts_with(&tmp_dir) {
         return Err(format!(
@@ -1702,7 +1714,7 @@ mod tests {
         let data_dir = data_dir();
         let tmp = std::env::temp_dir().join("elastos-test-file");
         let result = validate_source_path(&data_dir, &tmp);
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]

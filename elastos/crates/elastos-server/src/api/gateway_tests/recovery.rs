@@ -32,6 +32,48 @@ fn assert_wallet_authority(request: &WalletProviderRequestV2, expected: &Runtime
     assert_eq!(request.authority.launch_id, expected.launch_id());
 }
 
+async fn export_full_recovery_bundle_response(
+    app: &axum::Router,
+    data_dir: &std::path::Path,
+    authority: &TestPasskeyAuthority,
+    principal: &crate::auth::PrincipalRecord,
+) -> Response {
+    let intent = json!({
+        "principal_id": authority.principal_id,
+        "localhost_root": principal.localhost_root,
+        "label": "Recovery test",
+        "download_password": null,
+    });
+    let step_up = step_up_token_for_app_context(
+        data_dir,
+        SYSTEM_CAPSULE_ID,
+        &authority.system_token,
+        "auth.full-recovery-bundle.export",
+        &intent,
+    );
+    app.clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/auth/recovery/full-export")
+                .header("x-elastos-home-token", authority.system_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "schema": "elastos.full-recovery-bundle.export.request/v1",
+                        "principal_id": intent["principal_id"],
+                        "localhost_root": intent["localhost_root"],
+                        "label": intent["label"],
+                        "step_up_token": step_up,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
 async fn create_and_export_raw_full_recovery_bundle(
     app: &axum::Router,
     data_dir: &std::path::Path,
@@ -61,46 +103,109 @@ async fn create_and_export_raw_full_recovery_bundle(
         .unwrap();
     assert_eq!(create.status(), StatusCode::OK);
 
-    let intent = json!({
-        "principal_id": authority.principal_id,
-        "localhost_root": principal.localhost_root,
-        "label": "Recovery test",
-        "download_password": null,
-    });
-    let step_up = step_up_token_for_app_context(
-        data_dir,
-        SYSTEM_CAPSULE_ID,
-        &authority.system_token,
-        "auth.full-recovery-bundle.export",
-        &intent,
-    );
-    let export = app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/auth/recovery/full-export")
-                .header("x-elastos-home-token", authority.system_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({
-                        "schema": "elastos.full-recovery-bundle.export.request/v1",
-                        "principal_id": intent["principal_id"],
-                        "localhost_root": intent["localhost_root"],
-                        "label": intent["label"],
-                        "step_up_token": step_up,
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let export = export_full_recovery_bundle_response(app, data_dir, authority, principal).await;
     assert_eq!(export.status(), StatusCode::OK);
     let body = axum::body::to_bytes(export.into_body(), usize::MAX)
         .await
         .unwrap();
     serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+async fn full_recovery_export_marks_handoff_only_after_the_complete_bundle_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("alex"));
+    let principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+
+    let unavailable = gateway_router(
+        wallet_test_state_with_shared_provider(
+            dir.path(),
+            Arc::new(RejectingFullRecoveryWalletProvider),
+        )
+        .await,
+    );
+    let failed =
+        export_full_recovery_bundle_response(&unavailable, dir.path(), &authority, &principal)
+            .await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let retained = crate::auth::load_principal_root_protection(
+        dir.path(),
+        &principal.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap()
+    .expect("System retains the exact staged Recovery Kit after later export failure");
+    let retained_protector = retained.protectors.first().unwrap();
+    assert!(retained_protector.verified_at.is_none());
+    let retained_protector_id = retained_protector.protector_id.clone();
+    let retained_archive = retained_protector.archive.clone();
+
+    let ready = gateway_router(wallet_test_state(dir.path()).await);
+    let exported =
+        export_full_recovery_bundle_response(&ready, dir.path(), &authority, &principal).await;
+    assert_eq!(exported.status(), StatusCode::OK);
+
+    let handed = crate::auth::load_principal_root_protection(
+        dir.path(),
+        &principal.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap()
+    .expect("successful System export keeps root protection");
+    let handed_protector = handed.protectors.first().unwrap();
+    assert_eq!(handed_protector.protector_id, retained_protector_id);
+    assert_eq!(handed_protector.archive, retained_archive);
+    assert!(handed_protector.verified_at.is_some());
+
+    let restarted = gateway_router(test_state(dir.path()));
+    let status = restarted
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/auth/recovery/status")
+                .header("x-elastos-home-token", authority.system_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(status.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["recovery_configured"], true);
+    assert!(payload["required_actions"].as_array().unwrap().is_empty());
+}
+
+struct RejectingFullRecoveryWalletProvider;
+
+#[async_trait::async_trait]
+impl Provider for RejectingFullRecoveryWalletProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "rejecting recovery test provider supports only raw requests".into(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["wallet"]
+    }
+
+    fn name(&self) -> &'static str {
+        "rejecting-full-recovery-wallet-provider"
+    }
+
+    async fn send_raw(
+        &self,
+        _request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        Err(ProviderError::Provider(
+            "simulated Wallet recovery export failure".into(),
+        ))
+    }
 }
 
 async fn import_raw_full_recovery_bundle(
@@ -466,7 +571,13 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
 }
 
 #[tokio::test]
-async fn test_full_recovery_activation_blocks_existing_plaintext_gba_save_atomically() {
+async fn test_full_recovery_activation_migrates_existing_plaintext_gba_save() {
+    // First-run reality: the shell (and here a GBA save) writes declared
+    // plaintext before a person can reach Recovery, while the offline
+    // migration path demands protection that cannot exist yet. Activation
+    // therefore migrates surviving plaintext under its own guard: the export
+    // succeeds, the object becomes an envelope, and the original bytes land
+    // in a backup under the Home's backups directory.
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(wallet_test_state(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("alex"));
@@ -494,62 +605,79 @@ async fn test_full_recovery_activation_blocks_existing_plaintext_gba_save_atomic
         "auth.full-recovery-bundle.export",
         &export_intent,
     );
-    let auth_state_path = crate::auth::auth_state_path(dir.path()).unwrap();
-    let auth_state_before = std::fs::read(&auth_state_path).unwrap();
-    let archive_key_path =
-        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), "ElastOS/System/Auth")
-            .unwrap()
-            .join("recovery-archive.key");
-    assert!(!archive_key_path.exists());
 
-    for _ in 0..2 {
-        let response = app
-            .clone()
-            .oneshot(
-                test_browser_request("localhost:61180", "null")
-                    .method("POST")
-                    .uri("/api/auth/recovery/full-export")
-                    .header("x-elastos-home-token", authority.system_token.as_str())
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        json!({
-                            "schema": "elastos.full-recovery-bundle.export.request/v1",
-                            "principal_id": export_intent["principal_id"],
-                            "localhost_root": export_intent["localhost_root"],
-                            "label": export_intent["label"],
-                            "step_up_token": fresh_token,
-                            "download_password": null
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let outcome: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            outcome["schema"],
-            crate::auth::PRINCIPAL_ROOT_MIGRATION_REQUIRED_SCHEMA
-        );
-        assert_eq!(outcome["status"], "migration_required");
-        assert_eq!(outcome["code"], "declared_plaintext_objects");
-        assert_eq!(outcome["plaintext_object_count"], 1);
-    }
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/auth/recovery/full-export")
+                .header("x-elastos-home-token", authority.system_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "schema": "elastos.full-recovery-bundle.export.request/v1",
+                        "principal_id": export_intent["principal_id"],
+                        "localhost_root": export_intent["localhost_root"],
+                        "label": export_intent["label"],
+                        "step_up_token": fresh_token,
+                        "download_password": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 
-    assert_eq!(std::fs::read(&save_path).unwrap(), b"existing uCity save");
-    assert_eq!(std::fs::read(auth_state_path).unwrap(), auth_state_before);
-    assert!(!archive_key_path.exists());
+    let migrated = std::fs::read(&save_path).unwrap();
+    assert_ne!(migrated, b"existing uCity save");
+    let envelope: Value = serde_json::from_slice(&migrated).expect("migrated object is JSON");
+    assert!(envelope["schema"]
+        .as_str()
+        .is_some_and(|schema| schema.starts_with("elastos.principal-root.object/")));
+
     assert!(crate::auth::load_principal_root_protection(
         dir.path(),
         &authority.principal_id,
         &principal.localhost_root,
     )
     .unwrap()
-    .is_none());
+    .is_some());
+
+    let backups_root = dir.path().join("backups");
+    let backup_entry = std::fs::read_dir(&backups_root)
+        .expect("backups directory exists")
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("principal-root-migration-")
+        })
+        .expect("migration backup directory exists");
+    let mut backed_up = Vec::new();
+    let mut pending = vec![backup_entry.path()];
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            pending.extend(
+                std::fs::read_dir(&path)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path()),
+            );
+        } else if std::fs::read(&path)
+            .map(|bytes| bytes == b"existing uCity save")
+            .unwrap_or(false)
+        {
+            backed_up.push(path);
+        }
+    }
+    assert!(
+        !backed_up.is_empty(),
+        "backup must preserve the original plaintext bytes"
+    );
 }
 
 #[tokio::test]
@@ -823,6 +951,151 @@ async fn test_full_recovery_bundle_recovers_existing_account_under_new_passkey()
         .find(|request| request.operation.kind() == WalletOperationKind::ImportManagedRecoverySet)
         .expect("post-reassignment typed managed recovery-set import");
     assert_wallet_authority(import_request, &post_recovery_authority);
+}
+
+/// A Full Recovery Bundle carries the signed People identity, and importing
+/// it on a genuinely fresh machine — a different data root with a different
+/// device key — restores the same Profile DID and authorizes the new device
+/// through the normal signed-revision path, reported honestly in the response.
+#[tokio::test]
+async fn test_full_recovery_bundle_restores_people_identity_on_a_fresh_machine() {
+    let original_dir = tempfile::tempdir().unwrap();
+    let (original_state, _original_provider) =
+        wallet_chain_test_state_with_observer(original_dir.path()).await;
+    let original_app = gateway_router(original_state);
+    let original = passkey_authority_with_name(original_dir.path(), Some("original"));
+    let original_principal = crate::auth::load_principal_for_proof_binding(
+        original_dir.path(),
+        &original.proof_binding_id,
+    )
+    .unwrap();
+    let _ = elastos_identity::load_or_create_did(original_dir.path()).unwrap();
+    crate::auth::store_test_principal_root_protection(original_dir.path(), &original.principal_id);
+    let saved = crate::collaboration_profile_authority::update_profile_authority(
+        original_dir.path(),
+        &original.principal_id,
+        &original_principal.localhost_root,
+        &original.proof_binding_id,
+        "Original Person",
+        Some("original"),
+        crate::auth::now_ts(),
+    )
+    .unwrap();
+    let profile_did = saved.document().profile_did.clone();
+
+    let export_intent = json!({
+        "principal_id": original.principal_id,
+        "localhost_root": original_principal.localhost_root,
+        "label": "Everything",
+        "download_password": "test password",
+    });
+    let fresh_token = step_up_token_for_app_context(
+        original_dir.path(),
+        SYSTEM_CAPSULE_ID,
+        &original.system_token,
+        "auth.full-recovery-bundle.export",
+        &export_intent,
+    );
+    let export = original_app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/auth/recovery/full-export")
+                .header("x-elastos-home-token", original.system_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "schema": "elastos.full-recovery-bundle.export.request/v1",
+                        "principal_id": export_intent["principal_id"],
+                        "localhost_root": export_intent["localhost_root"],
+                        "label": export_intent["label"],
+                        "step_up_token": fresh_token,
+                        "download_password": "test password"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(export.status(), StatusCode::OK);
+    let export_body = axum::body::to_bytes(export.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let export_json: serde_json::Value = serde_json::from_slice(&export_body).unwrap();
+
+    // The fresh machine: a different data root whose device key cannot be the
+    // original's.
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let (fresh_state, _fresh_provider) =
+        wallet_chain_test_state_with_observer(fresh_dir.path()).await;
+    let fresh_app = gateway_router(fresh_state);
+    let replacement = passkey_authority_with_name(fresh_dir.path(), Some("replacement"));
+    let replacement_principal = crate::auth::load_principal_for_proof_binding(
+        fresh_dir.path(),
+        &replacement.proof_binding_id,
+    )
+    .unwrap();
+
+    let import = fresh_app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/auth/recovery/full-import")
+                .header("x-elastos-home-token", replacement.system_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "schema": "elastos.full-recovery-bundle.import.request/v1",
+                        "principal_id": replacement.principal_id,
+                        "localhost_root": replacement_principal.localhost_root,
+                        "package": export_json,
+                        "password": "test password",
+                        "reassign_to_current_principal": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let import_status = import.status();
+    let import_body = axum::body::to_bytes(import.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let import_text = String::from_utf8(import_body.to_vec()).unwrap();
+    assert_eq!(
+        import_status,
+        StatusCode::OK,
+        "unexpected recovery response: {import_text}"
+    );
+    let import_json: serde_json::Value = serde_json::from_str(&import_text).unwrap();
+    assert_eq!(import_json["status"], "reassigned");
+    let people = &import_json["people_identity_restore"];
+    assert_eq!(people["status"], "restored");
+    assert_eq!(people["profile_did"], profile_did);
+    assert_eq!(people["rebound_device"], true);
+    assert_eq!(people["contact_store_restored"], false);
+
+    // The recovered head on the fresh machine is the next signed revision,
+    // keeps the person's name, and authorizes exactly this machine's device.
+    let recovered_head = crate::collaboration_profile_authority::load_profile_authority(
+        fresh_dir.path(),
+        &original_principal.principal_id,
+        &original_principal.localhost_root,
+    )
+    .unwrap()
+    .expect("recovered profile authority present");
+    assert_eq!(recovered_head.document().profile_did, profile_did);
+    assert_eq!(
+        recovered_head.document().revision,
+        saved.document().revision + 1
+    );
+    assert_eq!(recovered_head.document().display_name, "Original Person");
+    let (_, fresh_device_did) = elastos_identity::load_or_create_did(fresh_dir.path()).unwrap();
+    assert!(recovered_head.authorizes_endpoint(&fresh_device_did));
 }
 
 struct MalformedFullRecoveryWalletProvider;

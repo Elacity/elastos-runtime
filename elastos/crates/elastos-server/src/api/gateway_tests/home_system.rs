@@ -1,4 +1,5 @@
 use super::*;
+use elastos_runtime::signature::{generate_keypair, SigningKey};
 
 const HOME_CLI_CAPSULE_ID_FOR_TEST: &str = "home-cli";
 
@@ -77,6 +78,154 @@ async fn home_test_post_json(
     (status, payload)
 }
 
+pub(super) fn configured_discovery_network_profile_for_test(
+    trusted_signing_key: &SigningKey,
+    network_id: &str,
+) -> crate::collaboration_network::VerifiedCollaborationNetworkProfile {
+    let signer_did = crate::crypto::encode_signing_key_did(trusted_signing_key);
+    let payload = crate::collaboration_network::CollaborationNetworkProfile {
+        schema: crate::collaboration_network::COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
+        network_id: network_id.to_string(),
+        revision: 1,
+        previous_profile_sha256: None,
+        signer_did: signer_did.clone(),
+        bootstrap_peers: Vec::new(),
+        default_conversation: None,
+    };
+    let payload_bytes =
+        crate::collaboration_network::canonical_collaboration_network_profile_payload_bytes(
+            &payload,
+        )
+        .unwrap();
+    let (signature, envelope_signer_did) = crate::crypto::domain_separated_sign(
+        trusted_signing_key,
+        crate::collaboration_network::COLLABORATION_NETWORK_PROFILE_SIGNATURE_DOMAIN,
+        &payload_bytes,
+    );
+    let bytes = serde_json::to_vec(
+        &serde_json::to_value(
+            crate::collaboration_network::SignedCollaborationNetworkProfile {
+                payload,
+                signature,
+                signer_did: envelope_signer_did,
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    match crate::collaboration_network::validate_collaboration_network_profile(
+        Some(&bytes),
+        network_id,
+        &[signer_did],
+        None,
+    )
+    .unwrap()
+    {
+        crate::collaboration_network::CollaborationNetworkProfileMode::Configured(profile) => {
+            profile
+        }
+        crate::collaboration_network::CollaborationNetworkProfileMode::Isolated => {
+            panic!("configured discovery profile expected")
+        }
+    }
+}
+
+struct TestCollaborationMessageScope<'a> {
+    network_id: &'a str,
+    conversation_id: &'a str,
+}
+
+fn signed_discovery_message_for_test(
+    signing_key: &SigningKey,
+    sender_profile_did: &str,
+    scope: TestCollaborationMessageScope<'_>,
+    recipient: elastos_common::collaboration_protocol::CollaborationRecipient,
+    payload_type: &str,
+    payload: serde_json::Value,
+    validity: std::ops::Range<u64>,
+) -> Vec<u8> {
+    let message = elastos_common::collaboration_protocol::CollaborationMessage {
+        schema: elastos_common::collaboration_protocol::COLLABORATION_MESSAGE_SCHEMA_V1.to_string(),
+        network_id: scope.network_id.to_string(),
+        conversation_id: scope.conversation_id.to_string(),
+        message_id: crate::collaboration_core::random_hex_128().unwrap(),
+        nonce: crate::collaboration_core::random_hex_128().unwrap(),
+        created_at: validity.start,
+        expires_at: validity.end,
+        sender_profile_did: sender_profile_did.to_string(),
+        sender_service: crate::collaboration_discovery::COLLABORATION_DISCOVERY_SERVICE.to_string(),
+        recipient,
+        payload_type: payload_type.to_string(),
+        payload,
+    };
+    let payload_bytes =
+        elastos_common::collaboration_protocol::canonical_collaboration_message_bytes(&message)
+            .unwrap();
+    let (signature, signer_did) = crate::crypto::domain_separated_sign(
+        signing_key,
+        elastos_common::collaboration_protocol::COLLABORATION_MESSAGE_SIGNATURE_DOMAIN_V1,
+        &payload_bytes,
+    );
+    elastos_common::collaboration_protocol::canonical_signed_collaboration_message_bytes(
+        &elastos_common::collaboration_protocol::SignedCollaborationMessage {
+            payload: message,
+            signature,
+            signer_did,
+        },
+    )
+    .unwrap()
+}
+
+fn signed_contact_decision_for_test(
+    recipient_key: &SigningKey,
+    network_id: &str,
+    request_bytes: &[u8],
+    recipient_profile_did: &str,
+    decided_at: u64,
+) -> Vec<u8> {
+    let request: elastos_common::collaboration_protocol::SignedCollaborationMessage =
+        serde_json::from_slice(request_bytes).unwrap();
+    let request_payload: crate::collaboration_discovery::CollaborationContactRequestPayload =
+        serde_json::from_value(request.payload.payload.clone()).unwrap();
+    let requester_profile = crate::collaboration_profile_authority::verify_signed_profile_document(
+        &request_payload.signed_profile,
+    )
+    .unwrap();
+    let payload = crate::collaboration_discovery::CollaborationContactDecisionReceipt {
+        schema: crate::collaboration_discovery::COLLABORATION_CONTACT_DECISION_RECEIPT_SCHEMA_V1
+            .to_string(),
+        network_id: network_id.to_string(),
+        request_envelope_sha256:
+            elastos_common::collaboration_protocol::collaboration_message_envelope_sha256(
+                request_bytes,
+            ),
+        conversation_id: crate::collaboration_discovery::COLLABORATION_DISCOVERY_CONTACT_ID
+            .to_string(),
+        requester_profile_did: requester_profile.document().profile_did.clone(),
+        requester_endpoint_did: request.signer_did,
+        request_message_id: request.payload.message_id,
+        request_message_nonce: request.payload.nonce,
+        recipient_profile_did: recipient_profile_did.to_string(),
+        recipient_endpoint_did: crate::crypto::encode_signing_key_did(recipient_key),
+        decision: crate::collaboration_discovery::CollaborationContactDecision::Accepted,
+        decided_at,
+    };
+    let payload_bytes = serde_json::to_vec(&serde_json::to_value(&payload).unwrap()).unwrap();
+    let (signature, signer_did) = crate::crypto::domain_separated_sign(
+        recipient_key,
+        crate::collaboration_discovery::COLLABORATION_CONTACT_DECISION_RECEIPT_SIGNATURE_DOMAIN_V1,
+        &payload_bytes,
+    );
+    crate::collaboration_discovery::canonical_signed_collaboration_contact_decision_receipt_bytes(
+        &crate::collaboration_discovery::SignedCollaborationContactDecisionReceipt {
+            payload,
+            signature,
+            signer_did,
+        },
+    )
+    .unwrap()
+}
+
 fn assert_isolated_launch_route(route: &str, app: &str) -> url::Url {
     let route = url::Url::parse("http://localhost")
         .unwrap()
@@ -116,6 +265,68 @@ fn home_shell_shared_facts(summary: &serde_json::Value) -> serde_json::Value {
         "capsule_interfaces": summary["capsule_interfaces"],
         "targets": summary["targets"],
     })
+}
+
+fn file_snapshot(root: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
+    fn visit(root: &std::path::Path, path: &std::path::Path, out: &mut BTreeMap<String, Vec<u8>>) {
+        let mut entries = std::fs::read_dir(path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                visit(root, &path, out);
+            } else if entry.file_type().unwrap().is_file() {
+                out.insert(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string(),
+                    std::fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+
+    let mut snapshot = BTreeMap::new();
+    visit(root, root, &mut snapshot);
+    snapshot
+}
+
+pub(super) fn write_home_principal_object_json_for_authority(
+    data_dir: &std::path::Path,
+    authority: &TestPasskeyAuthority,
+    filename: &str,
+    value: serde_json::Value,
+) {
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{localhost_root}/.AppData/ElastOS/Home/{filename}");
+    let path = elastos_common::localhost::rooted_localhost_fs_path(data_dir, &uri).unwrap();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let relative = parent.strip_prefix(data_dir).unwrap();
+            let mut current = data_dir.to_path_buf();
+            for component in relative.components() {
+                current.push(component.as_os_str());
+                std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&value).unwrap();
+    crate::auth::write_principal_root_object(
+        data_dir,
+        &authority.principal_id,
+        &localhost_root,
+        &uri,
+        &path,
+        &bytes,
+    )
+    .unwrap();
 }
 
 #[tokio::test]
@@ -605,7 +816,8 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     assert_eq!(public_payload["authority"]["principal_id"], "");
     assert_eq!(public_payload["authority"]["session_id"], "");
     assert_eq!(public_payload["authority"]["wallet_connected"], false);
-    assert!(public_payload["identity"]["handle"].is_null());
+    assert!(public_payload["identity"]["profile"].is_null());
+    assert!(public_payload["identity"]["profile_setup_display_name"].is_null());
     assert!(public_payload["identity"]["device_did"].is_null());
     assert_eq!(public_payload["browser_state"]["principal_id"], "");
     assert_eq!(public_payload["browser_state"]["localhost_root"], "");
@@ -699,8 +911,12 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["authority"]["signed_in"], true);
-    assert_eq!(payload["identity"]["handle"], "anders");
-    assert!(payload["identity"]["device_did"].is_string());
+    assert!(payload["identity"]["profile"].is_null());
+    assert_eq!(payload["identity"]["profile_setup_display_name"], "anders");
+    // Decided under invariant 1: the local device DID reaches exactly one
+    // browser surface, System (asserted below at /api/apps/system/summary).
+    // The Home shell has no consumer for it, so the Home summary strips it.
+    assert!(payload["identity"]["device_did"].is_null());
     assert_eq!(payload["home"]["route"], "/apps/home/");
     assert_eq!(payload["home"]["attach_kind"], "iframe");
     assert_eq!(payload["app"]["id"], "home");
@@ -1032,6 +1248,26 @@ async fn test_services_summary_projects_configured_remote_exit_without_ticket() 
         .iter()
         .any(|offer| offer["offer_id"] == "configured:remote-exit:mac-browser-exit"));
 
+    let browser_token = issue_home_launch_token(dir.path(), BROWSER_CAPSULE_ID).unwrap();
+    let browser = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/apps/browser/summary")
+                .header("x-elastos-home-token", browser_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(browser.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(browser.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(!text.contains("peer_did"));
+    assert!(!text.contains("connect_ticket"));
+
     let remove = app
         .oneshot(
             test_browser_request("localhost:61180", "null")
@@ -1237,26 +1473,28 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
     let right_app = gateway_router(test_state(right.path()));
     let left_authority = passkey_authority_with_name(left.path(), Some("Alice"));
     let right_authority = passkey_authority_with_name(right.path(), Some("Bob"));
+    crate::auth::store_test_principal_root_protection(left.path(), &left_authority.principal_id);
+    crate::auth::store_test_principal_root_protection(right.path(), &right_authority.principal_id);
     let (_, left_did) = elastos_identity::load_or_create_did(left.path()).unwrap();
     let (_, right_did) = elastos_identity::load_or_create_did(right.path()).unwrap();
 
     for (app, token, body) in [
         (
             left_app.clone(),
-            left_authority.system_token.as_str(),
-            r#"{"handle":"Alice"}"#,
+            left_authority.people_token.as_str(),
+            r#"{"display_name":"Alice"}"#,
         ),
         (
             right_app.clone(),
-            right_authority.system_token.as_str(),
-            r#"{"handle":"Bob"}"#,
+            right_authority.people_token.as_str(),
+            r#"{"display_name":"Bob"}"#,
         ),
     ] {
         let response = app
             .oneshot(
                 test_browser_request("localhost:61180", "null")
                     .method("POST")
-                    .uri("/api/apps/system/identity/profile-card")
+                    .uri("/api/apps/people/profile")
                     .header("x-elastos-home-token", token)
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(body))
@@ -1273,9 +1511,9 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
     write_home_principal_object_json_for_authority(
         left.path(),
         &left_authority,
-        "people-contacts.json",
+        "services-peer-contacts.json",
         json!({
-            "schema": "elastos.people.contacts-state/v1",
+            "schema": "elastos.services.peer-contacts-state/v1",
             "principal_id": left_authority.principal_id,
             "localhost_root": crate::auth::principal_localhost_root(&left_authority.principal_id),
             "updated_at": 10,
@@ -1296,9 +1534,9 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
     write_home_principal_object_json_for_authority(
         right.path(),
         &right_authority,
-        "people-contacts.json",
+        "services-peer-contacts.json",
         json!({
-            "schema": "elastos.people.contacts-state/v1",
+            "schema": "elastos.services.peer-contacts-state/v1",
             "principal_id": right_authority.principal_id,
             "localhost_root": crate::auth::principal_localhost_root(&right_authority.principal_id),
             "updated_at": 10,
@@ -1391,6 +1629,15 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
 
     let right_inbox_token =
         app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &right_authority);
+    let (launch_status, _) = home_test_post_json(
+        &right_app,
+        "/api/apps/home/launch",
+        &right_authority.home_token,
+        "http://localhost:61180",
+        json!({ "target": INBOX_CAPSULE_ID }),
+    )
+    .await;
+    assert_eq!(launch_status, StatusCode::OK);
     let inbox = right_app
         .clone()
         .oneshot(
@@ -1531,6 +1778,8 @@ async fn test_services_remote_exit_request_local_only_does_not_save_requested_st
     let left_app = gateway_router(test_state(left.path()));
     let left_authority = passkey_authority_with_name(left.path(), Some("Alice"));
     let right_authority = passkey_authority_with_name(right.path(), Some("Bob"));
+    crate::auth::store_test_principal_root_protection(left.path(), &left_authority.principal_id);
+    crate::auth::store_test_principal_root_protection(right.path(), &right_authority.principal_id);
     let right_did = elastos_identity::load_or_create_did(right.path())
         .unwrap()
         .1;
@@ -1538,9 +1787,9 @@ async fn test_services_remote_exit_request_local_only_does_not_save_requested_st
     write_home_principal_object_json_for_authority(
         left.path(),
         &left_authority,
-        "people-contacts.json",
+        "services-peer-contacts.json",
         json!({
-            "schema": "elastos.people.contacts-state/v1",
+            "schema": "elastos.services.peer-contacts-state/v1",
             "principal_id": left_authority.principal_id,
             "localhost_root": crate::auth::principal_localhost_root(&left_authority.principal_id),
             "updated_at": 10,
@@ -1561,15 +1810,30 @@ async fn test_services_remote_exit_request_local_only_does_not_save_requested_st
     write_home_principal_object_json_for_authority(
         right.path(),
         &right_authority,
-        "people-contacts.json",
+        "services-peer-contacts.json",
         json!({
-            "schema": "elastos.people.contacts-state/v1",
+            "schema": "elastos.services.peer-contacts-state/v1",
             "principal_id": right_authority.principal_id,
             "localhost_root": crate::auth::principal_localhost_root(&right_authority.principal_id),
             "updated_at": 10,
             "contacts": {}
         }),
     );
+
+    let profile = left_app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/people/profile")
+                .header("x-elastos-home-token", left_authority.people_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"display_name":"Alice"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(profile.status(), StatusCode::OK);
 
     let left_services_token =
         app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &left_authority);
@@ -1657,7 +1921,7 @@ async fn test_services_remote_exit_request_local_only_does_not_save_requested_st
 }
 
 #[tokio::test]
-async fn test_home_summary_reports_people_contacts_from_accepted_conversation_members() {
+async fn test_home_summary_does_not_turn_conversation_members_into_people_contacts() {
     let dir = tempfile::tempdir().unwrap();
     let guest = tempfile::tempdir().unwrap();
     let state = library_test_state(dir.path()).await;
@@ -1683,13 +1947,16 @@ async fn test_home_summary_reports_people_contacts_from_accepted_conversation_me
     .unwrap();
     std::fs::create_dir_all(dir.path().join("bin")).unwrap();
     std::fs::write(dir.path().join("bin/ipfs-provider"), "").unwrap();
-    let (_, owner_did) = elastos_identity::load_or_create_did(dir.path()).unwrap();
-    let (_, guest_did) = elastos_identity::load_or_create_did(guest.path()).unwrap();
+    let (_owner_device_did, owner_profile) =
+        test_signed_room_profile(dir.path(), 31, "Owner", Some("owner"));
+    let (_guest_device_did, guest_profile) =
+        test_signed_room_profile(guest.path(), 32, "Guest", Some("guest"));
+    let guest_profile_did = guest_profile.document().profile_did.clone();
 
     crate::room_service::seed_room_owner(
         dir.path(),
+        &owner_profile,
         crate::room_service::RoomOwnerSeedInput {
-            owner_did: owner_did.clone(),
             title: "Chat".to_string(),
         },
     )
@@ -1697,35 +1964,28 @@ async fn test_home_summary_reports_people_contacts_from_accepted_conversation_me
     let invite = crate::room_service::export_room_invite_envelope(
         dir.path(),
         crate::room_service::RoomInviteInput {
-            actor_did: owner_did.clone(),
-            invited_did: guest_did.clone(),
+            invited_profile_did: guest_profile_did.clone(),
             role: crate::room_service::RoomRole::Member,
         },
+        &owner_profile,
     )
     .unwrap();
     let imported = crate::room_service::import_room_invite_envelope(
         guest.path(),
         &serde_json::to_vec(&invite).unwrap(),
+        &guest_profile,
     )
     .unwrap();
-    crate::room_service::accept_room_invite(
+    crate::room_service::accept_room_invite_for_test(
         guest.path(),
-        crate::room_service::RoomInviteAcceptInput {
-            actor_did: guest_did,
-            invite_id: imported.invite_id.clone(),
-        },
+        &guest_profile_did,
+        &imported.invite_id,
     )
     .unwrap();
-    let acceptance = crate::room_service::export_room_acceptance_envelope_with_profile(
+    let acceptance = crate::room_service::export_room_acceptance_envelope(
         guest.path(),
         &imported.invite_id,
-        Some(crate::room_service::RoomProfileCardView {
-            schema: "elastos.profile-card/v1".to_string(),
-            profile_id: "profile:local:alice".to_string(),
-            display_name: "Alice".to_string(),
-            handle: Some("alice".to_string()),
-            updated_at: 42,
-        }),
+        &guest_profile,
     )
     .unwrap();
     crate::room_service::import_room_acceptance_envelope(
@@ -1751,88 +2011,111 @@ async fn test_home_summary_reports_people_contacts_from_accepted_conversation_me
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["people"]["schema"], "elastos.people.contacts/v1");
-    assert_eq!(payload["people"]["contact_count"], 1);
-    assert_eq!(payload["people"]["contacts"][0]["display_name"], "Alice");
-    assert_eq!(payload["people"]["service_offer_count"], 2);
-    let people_service_offers = payload["people"]["service_offers"].as_array().unwrap();
-    assert_eq!(people_service_offers.len(), 2);
-    assert_eq!(
-        people_service_offers[0]["schema"],
-        "elastos.service.offer/v1"
-    );
-    assert_eq!(
-        people_service_offers[0]["service_uri"],
-        "elastos://peer/conversation"
-    );
-    assert_eq!(people_service_offers[0]["enabled"], true);
-    assert_eq!(people_service_offers[0]["capsule_hint"], "chat-room");
-    assert!(people_service_offers.iter().any(|offer| {
-        offer["service_uri"] == "elastos://peer/browser-exit"
-            && offer["service_kind"] == "remote_exit"
-            && offer["display_name"] == "Alice's Browser Exit"
-            && offer["provider_uri"] == "elastos://exit/remote-carrier"
-            && offer["status"] == "requestable"
-            && offer["enabled"] == false
-            && offer["grant_required"] == true
-            && offer["grant_scope"] == "principal_scoped_remote_exit_grant"
-            && offer["capsule_hint"] == "browser"
-            && offer["route"].is_null()
-    }));
-    assert_eq!(payload["services"]["schema"], "elastos.runtime.services/v1");
-    assert_eq!(
-        payload["services"]["grant_model"],
-        "principal_scoped_provider_grant"
-    );
-    assert_eq!(
-        payload["services"]["capsule_contract"],
-        "capsule -> runtime capability -> provider grant -> service"
-    );
-    assert_eq!(payload["services"]["remote_offer_count"], 0);
-    assert_eq!(
-        payload["services"]["remote_offers"]
-            .as_array()
-            .unwrap()
-            .len(),
-        0
-    );
-    assert_eq!(payload["services"]["available_remote_offer_count"], 2);
-    assert_eq!(
-        payload["services"]["available_remote_offers"][0]["offer_id"],
-        people_service_offers[0]["offer_id"]
-    );
-    assert!(payload["services"]["available_remote_offers"]
+    assert_eq!(payload["people"]["contact_count"], 0);
+    assert!(payload["people"]["contacts"].as_array().unwrap().is_empty());
+    assert!(payload["people"]["service_offers"]
         .as_array()
         .unwrap()
-        .iter()
-        .any(|offer| offer["offer_id"]
-            .as_str()
-            .unwrap_or_default()
-            .ends_with(":browser-exit")
-            && offer["service_uri"] == "elastos://peer/browser-exit"
-            && offer["grant_required"] == true));
-    let remote_browser_exit_offer_id = payload["services"]["available_remote_offers"]
-        .as_array()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn test_people_profile_creation_requires_completed_system_recovery_without_partial_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+    assert!(
+        crate::auth::load_principal_root_protection(
+            dir.path(),
+            &principal.principal_id,
+            &principal.localhost_root,
+        )
         .unwrap()
-        .iter()
-        .find(|offer| offer["service_uri"] == "elastos://peer/browser-exit")
-        .and_then(|offer| offer["offer_id"].as_str())
+        .is_none(),
+        "this journey starts with no protection"
+    );
+    let before_profile_attempt = file_snapshot(dir.path());
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/people/profile")
+                    .header("x-elastos-home-token", authority.people_token.as_str())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"display_name":"Anders"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "schema": "elastos.people.profile-protection-required/v1",
+                "status": "recovery_required",
+                "action_target": "system",
+                "message": "Open System, choose Security, and download Recovery. Then retry creating your Profile."
+            })
+        );
+        assert_eq!(file_snapshot(dir.path()), before_profile_attempt);
+    }
+    assert!(
+        crate::collaboration_profile_authority::load_profile_authority(
+            dir.path(),
+            &principal.principal_id,
+            &principal.localhost_root,
+        )
         .unwrap()
-        .to_string();
-    let grant_required_selection = app
+        .is_none()
+    );
+    assert!(crate::auth::load_principal_root_protection(
+        dir.path(),
+        &principal.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap()
+    .is_none());
+
+    let export_intent = json!({
+        "principal_id": authority.principal_id,
+        "localhost_root": principal.localhost_root,
+        "label": "Recovery Kit",
+        "download_password": null,
+    });
+    let step_up = step_up_token_for_app_context(
+        dir.path(),
+        SYSTEM_CAPSULE_ID,
+        &authority.system_token,
+        "auth.full-recovery-bundle.export",
+        &export_intent,
+    );
+    let export = app
+        .clone()
         .oneshot(
             test_browser_request("localhost:61180", "null")
                 .method("POST")
-                .uri("/api/apps/services/offers")
-                .header(
-                    "x-elastos-home-token",
-                    app_token_for_authority(dir.path(), SERVICES_CAPSULE_ID, &authority),
-                )
+                .uri("/api/auth/recovery/full-export")
+                .header("x-elastos-home-token", authority.system_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    serde_json::json!({
-                        "offer_id": remote_browser_exit_offer_id,
-                        "section": "others",
-                        "selected": true
+                    json!({
+                        "schema": "elastos.full-recovery-bundle.export.request/v1",
+                        "principal_id": export_intent["principal_id"],
+                        "localhost_root": export_intent["localhost_root"],
+                        "label": export_intent["label"],
+                        "step_up_token": step_up,
+                        "download_password": null,
                     })
                     .to_string(),
                 ))
@@ -1840,81 +2123,75 @@ async fn test_home_summary_reports_people_contacts_from_accepted_conversation_me
         )
         .await
         .unwrap();
-    let status = grant_required_selection.status();
-    let body = axum::body::to_bytes(grant_required_selection.into_body(), usize::MAX)
+    assert_eq!(export.status(), StatusCode::OK);
+    let protection = crate::auth::load_principal_root_protection(
+        dir.path(),
+        &principal.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap()
+    .expect("System Recovery establishes root protection");
+    assert!(protection
+        .protectors
+        .iter()
+        .any(|protector| protector.verified_at.is_some()));
+
+    let profile = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/people/profile")
+                .header("x-elastos-home-token", authority.people_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"display_name":"Anders"}"#))
+                .unwrap(),
+        )
         .await
         .unwrap();
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
-    assert!(
-        String::from_utf8_lossy(&body).contains("service access request"),
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
-    assert_eq!(payload["services"]["local_offer_count"], 0);
-    assert!(
-        payload["services"]["available_local_offer_count"]
-            .as_u64()
-            .unwrap_or_default()
-            >= 1
-    );
-    assert!(payload["services"]["available_local_offers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|offer| offer["service_kind"] == "conversation_host"
-            && offer["grant_required"] == true
-            && offer["provider_uri"] == "elastos://carrier/room"));
-    assert!(payload["services"]["available_local_offers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|offer| offer["service_kind"] == "browser_engine"
-            && offer["provider_uri"] == "elastos://browser-engine/*"
-            && offer["runtime_contract"]["schema"] == "elastos.service.runtime-contract/v1"
-            && offer["runtime_contract"]["backing_substrate"] == "local_microvm"
-            && offer["runtime_contract"]["supported_display_modes"]
-                .as_array()
-                .unwrap()
-                .len()
-                == 1
-            && offer["runtime_contract"]["supported_display_modes"][0] == "webrtc_remote_display"
-            && offer["runtime_contract"]["supported_guarantee_levels"][0] == "mechanism_microvm"
-            && offer["runtime_contract"]["direct_network"] == false
-            && offer["runtime_contract"]["wallet_injection"] == false
-            && offer["route"] == "/apps/browser/"));
-    assert!(payload["services"]["available_local_offers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|offer| offer["service_kind"] == "content_availability"
-            && offer["provider_uri"] == "elastos://content/*"
-            && offer["grant_required"] == true));
-    assert_eq!(
-        payload["people"]["contacts"][0]["profile_card"]["display_name"],
-        "Alice"
-    );
-    assert_eq!(
-        payload["people"]["contacts"][0]["route"],
-        "/apps/chat-room/"
-    );
-    assert!(payload["people"]["contacts"][0]["contact_id"]
-        .as_str()
-        .unwrap()
-        .starts_with("contact:"));
+    assert_eq!(profile.status(), StatusCode::OK);
+
+    let restarted = gateway_router(test_state(dir.path()));
+    let summary = restarted
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/apps/people/summary")
+                .header("x-elastos-home-token", authority.people_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["identity"]["profile_readiness"]["status"], "ready");
+    assert_eq!(payload["identity"]["profile"]["display_name"], "Anders");
 }
 
 #[tokio::test]
-async fn test_people_invite_create_returns_conversation_join_link() {
+async fn test_people_invite_create_route_is_absent_and_read_only() {
     let dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _runtime = start_fake_runtime(dir.path(), bus, "people-invite-peer").await;
     let app = gateway_router(test_state(dir.path()));
     let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let profile = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/people/profile")
+                .header("x-elastos-home-token", authority.people_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"display_name":"Anders"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(profile.status(), StatusCode::OK);
+    let before = file_snapshot(dir.path());
 
     let response = app
         .oneshot(
@@ -1927,1520 +2204,18 @@ async fn test_people_invite_create_returns_conversation_join_link() {
         )
         .await
         .unwrap();
-    let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let invite_url = payload["invite_url"].as_str().unwrap_or_default();
-    assert!(invite_url.starts_with("elastos://peer/invite?token="));
-    assert_eq!(payload["issuer_gateway"], "http://localhost:61180");
-    assert_eq!(payload["room_title"], "Chat");
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(file_snapshot(dir.path()), before);
 }
 
 #[tokio::test]
-async fn test_people_discovery_toggle_persists_in_home_summary() {
+async fn test_people_contact_remove_requires_profile_contact_authority() {
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(test_state(dir.path()));
-    let token = people_app_token(dir.path());
-    let home_token = home_app_token(dir.path());
-
-    let response = app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery")
-                .header("x-elastos-home-token", token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"enabled":true}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["schema"], "elastos.people.discovery/v1");
-    assert_eq!(payload["enabled"], true);
-    assert_eq!(payload["visibility"], "everyone");
-    assert_eq!(payload["status"], "runtime_unavailable");
-    let expires_at = payload["expires_at"].as_u64().unwrap();
-    let remaining = payload["remaining_seconds"].as_u64().unwrap();
-    assert!(expires_at > crate::auth::now_ts());
-    assert!(remaining > 0 && remaining <= 600);
-
-    let summary = app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "http://localhost:61180")
-                .uri("/api/apps/home/summary")
-                .header("x-elastos-home-token", home_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(summary.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(summary.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["people"]["discovery"]["enabled"], true);
-    assert_eq!(payload["people"]["discovery"]["visibility"], "everyone");
-    assert_eq!(payload["people"]["discovery"]["expires_at"], expires_at);
-    assert!(
-        payload["people"]["discovery"]["remaining_seconds"]
-            .as_u64()
-            .unwrap()
-            <= 600
-    );
-}
-
-#[tokio::test]
-async fn test_people_discovery_expired_visibility_reports_off_and_refresh_does_not_publish() {
-    let dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let runtime = start_fake_runtime(dir.path(), bus, "people-expired").await;
-    let app = gateway_router(test_state(dir.path()));
-    let token = people_app_token(dir.path());
-    let home_token = home_app_token(dir.path());
-    let context = local_home_launch_token_context(dir.path()).unwrap();
-    let localhost_root = crate::auth::principal_localhost_root(&context.principal_id);
-    write_home_principal_object_json(
-        dir.path(),
-        "people-discovery.json",
-        json!({
-            "schema": "elastos.people.discovery-state/v1",
-            "principal_id": context.principal_id,
-            "localhost_root": localhost_root,
-            "enabled": true,
-            "enabled_until": crate::auth::now_ts().saturating_sub(1),
-            "updated_at": crate::auth::now_ts().saturating_sub(2),
-            "local_peer_id": "people-expired",
-            "peers": {},
-            "requests": {}
-        }),
-    );
-
-    let summary = app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "http://localhost:61180")
-                .uri("/api/apps/home/summary")
-                .header("x-elastos-home-token", home_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(summary.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(summary.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["people"]["discovery"]["enabled"], false);
-    assert_eq!(payload["people"]["discovery"]["visibility"], "off");
-    assert_eq!(payload["people"]["discovery"]["status"], "off");
-    assert_eq!(
-        payload["people"]["discovery"]["expires_at"],
-        serde_json::Value::Null
-    );
-
-    let refresh = app
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(refresh.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(refresh.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["enabled"], false);
-    assert_eq!(payload["visibility"], "off");
-    let requests = runtime.provider_requests.lock().await.clone();
-    assert!(
-        !requests
-            .iter()
-            .any(|request| { request["scheme"] == "peer" && request["op"] == "gossip_send" }),
-        "expired discovery refresh must not publish presence"
-    );
-}
-
-#[tokio::test]
-async fn test_people_discovery_refresh_finds_visible_peer() {
-    let left = tempfile::tempdir().unwrap();
-    let right = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _left_runtime = start_fake_runtime(left.path(), bus.clone(), "people-left").await;
-    let _right_runtime = start_fake_runtime(right.path(), bus, "people-right").await;
-    let left_app = gateway_router(test_state(left.path()));
-    let right_app = gateway_router(test_state(right.path()));
-    let left_token = people_app_token(left.path());
-    let right_token = people_app_token(right.path());
-
-    let left_enable = left_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery")
-                .header("x-elastos-home-token", left_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"enabled":true}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(left_enable.status(), StatusCode::OK);
-
-    let right_enable = right_app
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery")
-                .header("x-elastos-home-token", right_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"enabled":true}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(right_enable.status(), StatusCode::OK);
-
-    let left_refresh = left_app
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", left_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = left_refresh.status();
-    let body = axum::body::to_bytes(left_refresh.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["status"], "visible");
-    assert_eq!(payload["local_peer_id"], "people-left");
-    assert!(payload["discovered_peers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|peer| peer["peer_id"] == "people-right"));
-}
-
-#[tokio::test]
-async fn test_people_discovery_refresh_waits_for_pending_peer_capability() {
-    let dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _runtime =
-        start_fake_runtime_with_pending_capabilities(dir.path(), bus, "people-pending").await;
-    let app = gateway_router(test_state(dir.path()));
-    let token = people_app_token(dir.path());
-
-    let enable = app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery")
-                .header("x-elastos-home-token", token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"enabled":true}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(enable.status(), StatusCode::OK);
-
-    let refresh = app
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = refresh.status();
-    let body = axum::body::to_bytes(refresh.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["status"], "visible");
-    assert_eq!(payload["local_peer_id"], "people-pending");
-}
-
-#[tokio::test]
-async fn test_people_discovery_refresh_joins_configured_peer_ticket() {
-    let dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let runtime = start_fake_runtime(dir.path(), bus, "people-configured").await;
-    let config_dir = dir.path().join("config");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    std::fs::write(
-        config_dir.join("people-discovery-peers.json"),
-        serde_json::to_vec_pretty(&json!({
-            "schema": "elastos.people.discovery-peers/v1",
-            "peers": [
-                { "connect_ticket": "fake-configured-ticket" }
-            ]
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    let app = gateway_router(test_state(dir.path()));
-    let token = people_app_token(dir.path());
-
-    let enable = app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery")
-                .header("x-elastos-home-token", token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"enabled":true}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(enable.status(), StatusCode::OK);
-
-    let refresh = app
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = refresh.status();
-    let body = axum::body::to_bytes(refresh.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-
-    let requests = runtime.provider_requests.lock().await.clone();
-    assert!(requests.iter().any(|request| {
-        request["scheme"] == "peer"
-            && request["op"] == "connect"
-            && request["body"]["ticket"] == "fake-configured-ticket"
-    }));
-    assert!(requests.iter().any(|request| {
-        request["scheme"] == "peer"
-            && request["op"] == "gossip_join_peers"
-            && request["body"]["topic"] == "__elastos_internal/people-discovery-v1"
-            && request["body"]["peers"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|peer| peer == "trusted-source-peer")
-    }));
-}
-
-#[tokio::test]
-async fn test_people_discovery_refresh_reuses_recent_join_and_presence() {
-    let dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let runtime = start_fake_runtime(dir.path(), bus, "people-quiet").await;
-    let app = gateway_router(test_state(dir.path()));
-    let token = people_app_token(dir.path());
-
-    let enable = app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery")
-                .header("x-elastos-home-token", token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"enabled":true}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(enable.status(), StatusCode::OK);
-    runtime.provider_requests.lock().await.clear();
-
-    let refresh = app
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = refresh.status();
-    let body = axum::body::to_bytes(refresh.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["changed"], false);
-    assert!(payload["refresh_fingerprint"].as_str().unwrap_or("").len() >= 32);
-    assert!(payload["next_refresh_after_ms"].as_u64().unwrap_or(0) >= 3_000);
-
-    let requests = runtime.provider_requests.lock().await.clone();
-    assert!(requests
-        .iter()
-        .any(|request| { request["scheme"] == "peer" && request["op"] == "gossip_recv" }));
-    assert!(
-        requests.iter().all(|request| {
-            request["op"] != "connect"
-                && request["op"] != "gossip_join"
-                && request["op"] != "gossip_join_peers"
-                && request["op"] != "gossip_send"
-        }),
-        "recent background refresh should receive only, not redo Carrier bootstrap/presence: {requests:#?}"
-    );
-}
-
-fn read_home_principal_object_json(
-    data_dir: &std::path::Path,
-    filename: &str,
-) -> serde_json::Value {
-    let context = local_home_launch_token_context(data_dir).unwrap();
-    let localhost_root = crate::auth::principal_localhost_root(&context.principal_id);
-    let uri = format!("{localhost_root}/.AppData/ElastOS/Home/{filename}");
-    let path = elastos_common::localhost::rooted_localhost_fs_path(data_dir, &uri).unwrap();
-    if !path.is_file() {
-        return json!({});
-    }
-    let bytes = crate::auth::read_principal_root_object(
-        data_dir,
-        &context.principal_id,
-        &localhost_root,
-        &uri,
-        &path,
-    )
-    .unwrap();
-    serde_json::from_slice(&bytes).unwrap()
-}
-
-fn write_home_principal_object_json(
-    data_dir: &std::path::Path,
-    filename: &str,
-    value: serde_json::Value,
-) {
-    let context = local_home_launch_token_context(data_dir).unwrap();
-    let localhost_root = crate::auth::principal_localhost_root(&context.principal_id);
-    let uri = format!("{localhost_root}/.AppData/ElastOS/Home/{filename}");
-    let path = elastos_common::localhost::rooted_localhost_fs_path(data_dir, &uri).unwrap();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    let bytes = serde_json::to_vec_pretty(&value).unwrap();
-    crate::auth::write_principal_root_object(
-        data_dir,
-        &context.principal_id,
-        &localhost_root,
-        &uri,
-        &path,
-        &bytes,
-    )
-    .unwrap();
-}
-
-fn write_home_principal_object_json_for_authority(
-    data_dir: &std::path::Path,
-    authority: &TestPasskeyAuthority,
-    filename: &str,
-    value: serde_json::Value,
-) {
-    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
-    let uri = format!("{localhost_root}/.AppData/ElastOS/Home/{filename}");
-    let path = elastos_common::localhost::rooted_localhost_fs_path(data_dir, &uri).unwrap();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    let bytes = serde_json::to_vec_pretty(&value).unwrap();
-    crate::auth::write_principal_root_object(
-        data_dir,
-        &authority.principal_id,
-        &localhost_root,
-        &uri,
-        &path,
-        &bytes,
-    )
-    .unwrap();
-}
-
-#[tokio::test]
-async fn test_people_discovery_request_send_failure_does_not_save_requested_state() {
-    let left = tempfile::tempdir().unwrap();
-    let right = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _left_runtime =
-        start_fake_runtime(left.path(), bus.clone(), "people-left-request-fail").await;
-    let _right_runtime =
-        start_fake_runtime(right.path(), bus.clone(), "people-right-request-fail").await;
-    let left_app = gateway_router(test_state(left.path()));
-    let right_app = gateway_router(test_state(right.path()));
-    let left_token = people_app_token(left.path());
-    let right_token = people_app_token(right.path());
-
-    for (app, token) in [
-        (left_app.clone(), left_token.as_str()),
-        (right_app.clone(), right_token.as_str()),
-    ] {
-        let response = app
-            .oneshot(
-                test_browser_request("localhost:61180", "null")
-                    .method("POST")
-                    .uri("/api/apps/people/discovery")
-                    .header("x-elastos-home-token", token)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"enabled":true}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    let left_refresh = left_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", left_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(left_refresh.status(), StatusCode::OK);
-
-    bus.lock()
-        .await
-        .fail_message_substrings
-        .push(r#""kind":"request""#.to_string());
-    let request = left_app
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/requests")
-                .header("x-elastos-home-token", left_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"peer_id":"people-right-request-fail"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = request.status();
-    let body = axum::body::to_bytes(request.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
-    assert!(String::from_utf8_lossy(&body).contains("people discovery delivery failed"));
-
-    let state = read_home_principal_object_json(left.path(), "people-discovery.json");
-    assert!(state["requests"].as_object().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn test_people_discovery_accept_send_failure_does_not_save_joined_state() {
-    let left = tempfile::tempdir().unwrap();
-    let right = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _left_runtime =
-        start_fake_runtime(left.path(), bus.clone(), "people-left-accept-fail").await;
-    let _right_runtime =
-        start_fake_runtime(right.path(), bus.clone(), "people-right-accept-fail").await;
-    let left_app = gateway_router(test_state(left.path()));
-    let right_app = gateway_router(test_state(right.path()));
-    let left_token = people_app_token(left.path());
-    let right_token = people_app_token(right.path());
-
-    for (app, token) in [
-        (left_app.clone(), left_token.as_str()),
-        (right_app.clone(), right_token.as_str()),
-    ] {
-        let response = app
-            .oneshot(
-                test_browser_request("localhost:61180", "null")
-                    .method("POST")
-                    .uri("/api/apps/people/discovery")
-                    .header("x-elastos-home-token", token)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"enabled":true}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    let left_refresh = left_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", left_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(left_refresh.status(), StatusCode::OK);
-
-    let left_request = left_app
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/requests")
-                .header("x-elastos-home-token", left_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"peer_id":"people-right-accept-fail"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = axum::body::to_bytes(left_request.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let request_id = payload["requests"][0]["request_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let right_refresh = right_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", right_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = right_refresh.status();
-    let body = axum::body::to_bytes(right_refresh.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["requests"][0]["status"], "incoming");
-
-    bus.lock()
-        .await
-        .fail_message_substrings
-        .push(r#""kind":"acceptance""#.to_string());
-    let right_accept = right_app
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri(format!(
-                    "/api/apps/people/discovery/requests/{}/accept",
-                    request_id
-                ))
-                .header("x-elastos-home-token", right_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = right_accept.status();
-    let body = axum::body::to_bytes(right_accept.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
-
-    let state = read_home_principal_object_json(right.path(), "people-discovery.json");
-    assert_eq!(
-        state["requests"][&request_id]["status"].as_str(),
-        Some("incoming")
-    );
-    let contacts = read_home_principal_object_json(right.path(), "people-contacts.json");
-    assert!(contacts["contacts"]
-        .as_object()
-        .map(|contacts| contacts.is_empty())
-        .unwrap_or(true));
-}
-
-#[tokio::test]
-async fn test_people_discovery_join_send_failure_does_not_save_joined_state() {
-    let left = tempfile::tempdir().unwrap();
-    let right = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _left_runtime = start_fake_runtime(left.path(), bus.clone(), "people-left-join-fail").await;
-    let left_app = gateway_router(test_state(left.path()));
-    let left_token = people_app_token(left.path());
-    let (_, left_did) = elastos_identity::load_or_create_did(left.path()).unwrap();
-    let (_, right_did) = elastos_identity::load_or_create_did(right.path()).unwrap();
-    crate::room_service::seed_room_owner(
-        right.path(),
-        crate::room_service::RoomOwnerSeedInput {
-            owner_did: right_did.clone(),
-            title: "Chat".to_string(),
-        },
-    )
-    .unwrap();
-    let invite = crate::room_service::export_room_invite_envelope(
-        right.path(),
-        crate::room_service::RoomInviteInput {
-            actor_did: right_did.clone(),
-            invited_did: left_did,
-            role: crate::room_service::RoomRole::Member,
-        },
-    )
-    .unwrap();
-    let imported = crate::room_service::import_room_invite_envelope(
-        left.path(),
-        &serde_json::to_vec(&invite).unwrap(),
-    )
-    .unwrap();
-    let request_id = "request:join-send-fails".to_string();
-    let context = local_home_launch_token_context(left.path()).unwrap();
-    let localhost_root = crate::auth::principal_localhost_root(&context.principal_id);
-    write_home_principal_object_json(
-        left.path(),
-        "people-discovery.json",
-        json!({
-            "schema": "elastos.people.discovery-state/v1",
-            "principal_id": context.principal_id,
-            "localhost_root": localhost_root,
-            "enabled": true,
-            "updated_at": 42,
-            "local_peer_id": "people-left-join-fail",
-            "peers": {},
-            "requests": {
-                request_id.clone(): {
-                    "request_id": request_id.clone(),
-                    "peer_id": "people-right-join-fail",
-                    "did": imported.invited_by,
-                    "display_name": "Right",
-                    "handle": null,
-                    "created_at": 42,
-                    "status": "accepted",
-                    "invite_id": imported.invite_id,
-                }
-            }
-        }),
-    );
-
-    bus.lock()
-        .await
-        .fail_message_substrings
-        .push(request_id.clone());
-    let join = left_app
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri(format!(
-                    "/api/apps/people/discovery/requests/{}/join",
-                    request_id
-                ))
-                .header("x-elastos-home-token", left_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = join.status();
-    let body = axum::body::to_bytes(join.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
-
-    let state = read_home_principal_object_json(left.path(), "people-discovery.json");
-    assert_eq!(
-        state["requests"][&request_id]["status"].as_str(),
-        Some("accepted")
-    );
-}
-
-#[tokio::test]
-async fn test_people_discovery_request_accept_without_passkey_handle() {
-    let left = tempfile::tempdir().unwrap();
-    let right = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _left_runtime = start_fake_runtime(left.path(), bus.clone(), "people-left-no-handle").await;
-    let _right_runtime = start_fake_runtime(right.path(), bus, "people-right-no-handle").await;
-    let left_app = gateway_router(test_state(left.path()));
-    let right_app = gateway_router(test_state(right.path()));
-    let left_token = people_app_token(left.path());
-    let right_token = people_app_token(right.path());
-    let left_home_token = home_app_token(left.path());
-    let right_home_token = home_app_token(right.path());
-    let (_, left_did) = elastos_identity::load_or_create_did(left.path()).unwrap();
-
-    for (app, token) in [
-        (left_app.clone(), left_token.as_str()),
-        (right_app.clone(), right_token.as_str()),
-    ] {
-        let response = app
-            .oneshot(
-                test_browser_request("localhost:61180", "null")
-                    .method("POST")
-                    .uri("/api/apps/people/discovery")
-                    .header("x-elastos-home-token", token)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"enabled":true}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    let left_refresh = left_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", left_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(left_refresh.status(), StatusCode::OK);
-
-    let left_request = left_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/requests")
-                .header("x-elastos-home-token", left_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"peer_id":"people-right-no-handle"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = axum::body::to_bytes(left_request.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let request_id = payload["requests"][0]["request_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let right_refresh = right_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", right_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = right_refresh.status();
-    let body = axum::body::to_bytes(right_refresh.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["requests"][0]["status"], "incoming");
-    assert_eq!(payload["requests"][0]["did"], left_did);
-
-    let right_accept = right_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri(format!(
-                    "/api/apps/people/discovery/requests/{}/accept",
-                    request_id
-                ))
-                .header("x-elastos-home-token", right_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = right_accept.status();
-    let body = axum::body::to_bytes(right_accept.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["request_count"], 0);
-    assert!(payload["requests"].as_array().unwrap().is_empty());
-
-    let right_summary = right_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "http://localhost:61180")
-                .uri("/api/apps/home/summary")
-                .header("x-elastos-home-token", right_home_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = axum::body::to_bytes(right_summary.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(payload["people"]["contacts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|contact| {
-            contact["relationship"] == "connected"
-                && contact["device_label"] == "people-left-no-handle"
-        }));
-
-    let left_refresh = left_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", left_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = left_refresh.status();
-    let body = axum::body::to_bytes(left_refresh.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["request_count"], 0);
-    assert!(payload["requests"].as_array().unwrap().is_empty());
-
-    let left_summary = left_app
-        .oneshot(
-            test_browser_request("localhost:61180", "http://localhost:61180")
-                .uri("/api/apps/home/summary")
-                .header("x-elastos-home-token", left_home_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = axum::body::to_bytes(left_summary.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(payload["people"]["contacts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|contact| {
-            contact["relationship"] == "connected"
-                && contact["device_label"] == "people-right-no-handle"
-        }));
-}
-
-#[tokio::test]
-async fn test_people_discovery_request_accept_is_idempotent_for_active_member() {
-    let left = tempfile::tempdir().unwrap();
-    let right = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _left_runtime =
-        start_fake_runtime(left.path(), bus.clone(), "people-left-active-member").await;
-    let _right_runtime = start_fake_runtime(right.path(), bus, "people-right-active-member").await;
-    let left_app = gateway_router(test_state(left.path()));
-    let right_app = gateway_router(test_state(right.path()));
-    let left_token = people_app_token(left.path());
-    let right_token = people_app_token(right.path());
-    let (_, left_did) = elastos_identity::load_or_create_did(left.path()).unwrap();
-    let (_, right_did) = elastos_identity::load_or_create_did(right.path()).unwrap();
-
-    crate::room_service::seed_room_owner(
-        right.path(),
-        crate::room_service::RoomOwnerSeedInput {
-            owner_did: right_did.clone(),
-            title: "Chat".to_string(),
-        },
-    )
-    .unwrap();
-    let invite = crate::room_service::export_room_invite_envelope(
-        right.path(),
-        crate::room_service::RoomInviteInput {
-            actor_did: right_did,
-            invited_did: left_did.clone(),
-            role: crate::room_service::RoomRole::Member,
-        },
-    )
-    .unwrap();
-    crate::room_service::accept_room_invite(
-        right.path(),
-        crate::room_service::RoomInviteAcceptInput {
-            actor_did: left_did.clone(),
-            invite_id: invite.payload.invite_id,
-        },
-    )
-    .unwrap();
-
-    for (app, token) in [
-        (left_app.clone(), left_token.as_str()),
-        (right_app.clone(), right_token.as_str()),
-    ] {
-        let response = app
-            .oneshot(
-                test_browser_request("localhost:61180", "null")
-                    .method("POST")
-                    .uri("/api/apps/people/discovery")
-                    .header("x-elastos-home-token", token)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"enabled":true}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    let left_refresh = left_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", left_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(left_refresh.status(), StatusCode::OK);
-
-    let left_request = left_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/requests")
-                .header("x-elastos-home-token", left_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"peer_id":"people-right-active-member"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = axum::body::to_bytes(left_request.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let request_id = payload["requests"][0]["request_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let right_refresh = right_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", right_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = right_refresh.status();
-    let body = axum::body::to_bytes(right_refresh.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["requests"][0]["status"], "incoming");
-    assert_eq!(payload["requests"][0]["did"], left_did);
-
-    let right_accept = right_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri(format!(
-                    "/api/apps/people/discovery/requests/{}/accept",
-                    request_id
-                ))
-                .header("x-elastos-home-token", right_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = right_accept.status();
-    let body = axum::body::to_bytes(right_accept.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["request_count"], 0);
-    assert!(payload["requests"].as_array().unwrap().is_empty());
-
-    let repeated_accept = right_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri(format!(
-                    "/api/apps/people/discovery/requests/{}/accept",
-                    request_id
-                ))
-                .header("x-elastos-home-token", right_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = repeated_accept.status();
-    let body = axum::body::to_bytes(repeated_accept.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["request_count"], 0);
-    assert!(payload["requests"].as_array().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn test_people_discovery_request_accept_contact_round_trip() {
-    let left = tempfile::tempdir().unwrap();
-    let right = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _left_runtime = start_fake_runtime(left.path(), bus.clone(), "people-left").await;
-    let _right_runtime = start_fake_runtime(right.path(), bus, "people-right").await;
-    let left_app = gateway_router(test_state(left.path()));
-    let right_app = gateway_router(test_state(right.path()));
-    let left_authority = passkey_authority_with_name(left.path(), Some("Alice"));
-    let right_authority = passkey_authority_with_name(right.path(), Some("Bob"));
-    let (_, left_did) = elastos_identity::load_or_create_did(left.path()).unwrap();
-
-    for (app, token, body) in [
-        (
-            left_app.clone(),
-            left_authority.system_token.as_str(),
-            r#"{"handle":"Alice"}"#,
-        ),
-        (
-            right_app.clone(),
-            right_authority.system_token.as_str(),
-            r#"{"handle":"Bob"}"#,
-        ),
-    ] {
-        let response = app
-            .oneshot(
-                test_browser_request("localhost:61180", "null")
-                    .method("POST")
-                    .uri("/api/apps/system/identity/profile-card")
-                    .header("x-elastos-home-token", token)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    for (app, token) in [
-        (left_app.clone(), left_authority.people_token.as_str()),
-        (right_app.clone(), right_authority.people_token.as_str()),
-    ] {
-        let response = app
-            .oneshot(
-                test_browser_request("localhost:61180", "null")
-                    .method("POST")
-                    .uri("/api/apps/people/discovery")
-                    .header("x-elastos-home-token", token)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"enabled":true}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    let left_refresh = left_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", left_authority.people_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(left_refresh.status(), StatusCode::OK);
-
-    let left_request = left_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/requests")
-                .header("x-elastos-home-token", left_authority.people_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"peer_id":"people-right"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = left_request.status();
-    let body = axum::body::to_bytes(left_request.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let request_id = payload["requests"][0]["request_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_eq!(payload["requests"][0]["status"], "requested");
-
-    let right_refresh = right_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header(
-                    "x-elastos-home-token",
-                    right_authority.people_token.as_str(),
-                )
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = right_refresh.status();
-    let body = axum::body::to_bytes(right_refresh.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["requests"][0]["request_id"], request_id);
-    assert_eq!(payload["requests"][0]["status"], "incoming");
-    assert_eq!(payload["requests"][0]["did"], left_did);
-
-    let right_accept = right_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri(format!(
-                    "/api/apps/people/discovery/requests/{}/accept",
-                    request_id
-                ))
-                .header(
-                    "x-elastos-home-token",
-                    right_authority.people_token.as_str(),
-                )
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = right_accept.status();
-    let body = axum::body::to_bytes(right_accept.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["request_count"], 0);
-    assert!(payload["requests"].as_array().unwrap().is_empty());
-
-    let right_summary = right_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "http://localhost:61180")
-                .uri("/api/apps/home/summary")
-                .header("x-elastos-home-token", right_authority.home_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = axum::body::to_bytes(right_summary.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(payload["people"]["contacts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|contact| {
-            contact["display_name"] == "Alice"
-                && contact["relationship"] == "connected"
-                && contact["device_label"] == "people-left"
-        }));
-
-    let left_refresh = left_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", left_authority.people_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = left_refresh.status();
-    let body = axum::body::to_bytes(left_refresh.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["request_count"], 0);
-    assert!(payload["requests"].as_array().unwrap().is_empty());
-    assert!(!payload["discovered_peers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|peer| peer["peer_id"] == "people-right"));
-
-    let left_summary = left_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "http://localhost:61180")
-                .uri("/api/apps/home/summary")
-                .header("x-elastos-home-token", left_authority.home_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = axum::body::to_bytes(left_summary.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(payload["people"]["contacts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|contact| {
-            contact["display_name"] == "Bob"
-                && contact["relationship"] == "connected"
-                && contact["device_label"] == "people-right"
-        }));
-
-    let right_refresh = right_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/discovery/refresh")
-                .header(
-                    "x-elastos-home-token",
-                    right_authority.people_token.as_str(),
-                )
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = right_refresh.status();
-    let body = axum::body::to_bytes(right_refresh.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["request_count"], 0);
-    assert!(payload["requests"].as_array().unwrap().is_empty());
-    assert!(!payload["discovered_peers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|peer| peer["peer_id"] == "people-left"));
-
-    let right_summary = right_app
-        .oneshot(
-            test_browser_request("localhost:61180", "http://localhost:61180")
-                .uri("/api/apps/home/summary")
-                .header("x-elastos-home-token", right_authority.home_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = axum::body::to_bytes(right_summary.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(payload["people"]["contacts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|contact| contact["display_name"] == "Alice"));
-}
-
-#[tokio::test]
-async fn test_people_invite_create_allows_conversation_member_when_user_invites_are_open() {
-    let owner = tempfile::tempdir().unwrap();
-    let member = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _runtime = start_fake_runtime(member.path(), bus, "people-member-invite-peer").await;
-    let app = gateway_router(test_state(member.path()));
-    let authority = passkey_authority_with_name(member.path(), Some("alice"));
-    let (_, owner_did) = elastos_identity::load_or_create_did(owner.path()).unwrap();
-    let (_, member_did) = elastos_identity::load_or_create_did(member.path()).unwrap();
-
-    crate::room_service::seed_room_owner(
-        owner.path(),
-        crate::room_service::RoomOwnerSeedInput {
-            owner_did: owner_did.clone(),
-            title: "Chat".to_string(),
-        },
-    )
-    .unwrap();
-    let invite = crate::room_service::export_room_invite_envelope(
-        owner.path(),
-        crate::room_service::RoomInviteInput {
-            actor_did: owner_did,
-            invited_did: member_did.clone(),
-            role: crate::room_service::RoomRole::Member,
-        },
-    )
-    .unwrap();
-    let imported = crate::room_service::import_room_invite_envelope(
-        member.path(),
-        &serde_json::to_vec(&invite).unwrap(),
-    )
-    .unwrap();
-    crate::room_service::accept_room_invite(
-        member.path(),
-        crate::room_service::RoomInviteAcceptInput {
-            actor_did: member_did,
-            invite_id: imported.invite_id,
-        },
-    )
-    .unwrap();
-
-    let response = app
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/invites/create")
-                .header("x-elastos-home-token", authority.people_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(payload["invite_url"]
-        .as_str()
-        .unwrap_or_default()
-        .starts_with("elastos://peer/invite?token="));
-    assert_eq!(payload["issuer_gateway"], "http://localhost:61180");
-}
-
-#[tokio::test]
-async fn test_people_contact_remove_hides_accepted_conversation_contact_locally() {
-    let dir = tempfile::tempdir().unwrap();
-    let guest = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _runtime = start_fake_runtime(dir.path(), bus, "people-remove-peer").await;
     let app = gateway_router(test_state(dir.path()));
     let authority = passkey_authority_with_name(dir.path(), Some("anders"));
-    let (_, owner_did) = elastos_identity::load_or_create_did(dir.path()).unwrap();
-    let (_, guest_did) = elastos_identity::load_or_create_did(guest.path()).unwrap();
-
-    crate::room_service::seed_room_owner(
-        dir.path(),
-        crate::room_service::RoomOwnerSeedInput {
-            owner_did: owner_did.clone(),
-            title: "Chat".to_string(),
-        },
-    )
-    .unwrap();
-    let invite = crate::room_service::export_room_invite_envelope(
-        dir.path(),
-        crate::room_service::RoomInviteInput {
-            actor_did: owner_did.clone(),
-            invited_did: guest_did.clone(),
-            role: crate::room_service::RoomRole::Member,
-        },
-    )
-    .unwrap();
-    let imported = crate::room_service::import_room_invite_envelope(
-        guest.path(),
-        &serde_json::to_vec(&invite).unwrap(),
-    )
-    .unwrap();
-    crate::room_service::accept_room_invite(
-        guest.path(),
-        crate::room_service::RoomInviteAcceptInput {
-            actor_did: guest_did,
-            invite_id: imported.invite_id.clone(),
-        },
-    )
-    .unwrap();
-    let acceptance =
-        crate::room_service::export_room_acceptance_envelope(guest.path(), &imported.invite_id)
-            .unwrap();
-    crate::room_service::import_room_acceptance_envelope(
-        dir.path(),
-        &serde_json::to_vec(&acceptance).unwrap(),
-    )
-    .unwrap();
-    let contact_id = home_people_contact_id(&invite.payload.invited_did);
 
     let response = app
-        .clone()
         .oneshot(
             test_browser_request("localhost:61180", "null")
                 .method("POST")
@@ -3448,7 +2223,7 @@ async fn test_people_contact_remove_hides_accepted_conversation_contact_locally(
                 .header("x-elastos-home-token", authority.people_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    serde_json::json!({ "contact_id": contact_id }).to_string(),
+                    serde_json::json!({ "contact_id": "contact:missing" }).to_string(),
                 ))
                 .unwrap(),
         )
@@ -3458,41 +2233,301 @@ async fn test_people_contact_remove_hides_accepted_conversation_contact_locally(
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["schema"], "elastos.people.contact-remove/v1");
-    assert_eq!(payload["scope"], "local_people");
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{text}");
+    assert!(text.contains("Save your Profile before using People contacts"));
+}
 
-    let room_summary = crate::room_service::load_summary(dir.path()).unwrap();
-    assert_eq!(
-        room_summary
-            .room_control
-            .members
-            .iter()
-            .filter(|member| member.member_did != owner_did)
-            .count(),
-        1,
-        "People removal must not eject members from the conversation"
-    );
+#[tokio::test]
+async fn test_people_contact_remove_removes_exact_profile_contact_locally() {
+    const NETWORK: &str = "gateway-profile-contact-remove";
+    let now = crate::auth::now_ts();
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let _runtime = start_fake_runtime(dir.path(), bus, "profile-contact-remove").await;
+    let authority = passkey_authority_with_name(dir.path(), Some("Local"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
 
-    let summary = app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "http://localhost:61180")
-                .uri("/api/apps/home/summary")
-                .header("x-elastos-home-token", authority.home_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
+    let (trusted_key, _) = generate_keypair();
+    let network_profile = configured_discovery_network_profile_for_test(&trusted_key, NETWORK);
+    // Production keys the discovery service with the runtime device identity,
+    // which is the device the Profile authorizes — a revocation must be
+    // signed by an authorized device, so the test wires the same key.
+    let (runtime_device_key, _) = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    let discovery_service =
+        crate::collaboration_discovery_runtime::CollaborationDiscoveryService::new(
+            SigningKey::from_bytes(&runtime_device_key.to_bytes()),
+            network_profile.clone(),
+            Arc::new(elastos_runtime::provider::ProviderRegistry::new()),
         )
         .await
         .unwrap();
-    assert_eq!(summary.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(summary.into_body(), usize::MAX)
-        .await
+    let mut state = test_state(dir.path());
+    state.collaboration_discovery_service = Some(discovery_service);
+    let app = gateway_router(state);
+
+    let (status, _) = home_test_post_json(
+        &app,
+        "/api/apps/people/profile",
+        &authority.people_token,
+        "null",
+        serde_json::json!({ "display_name": "Local Profile" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let local_profile = crate::collaboration_profile_authority::load_profile_authority(
+        dir.path(),
+        &authority.principal_id,
+        &localhost_root,
+    )
+    .unwrap()
+    .unwrap();
+    let local_device_seed: [u8; 32] = std::fs::read(dir.path().join("identity/device.key"))
+        .unwrap()
+        .try_into()
         .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["people"]["contact_count"], 0);
-    assert!(payload["people"]["contacts"].as_array().unwrap().is_empty());
+    let (local_device_key, _) = elastos_identity::derive_did(&local_device_seed);
+    let local_device_did =
+        crate::collaboration_profile_authority::load_existing_device_did(dir.path())
+            .unwrap()
+            .unwrap();
+    let store = crate::collaboration_contact_store::CollaborationContactStore::new(
+        dir.path(),
+        &authority.principal_id,
+        &localhost_root,
+        network_profile,
+        &local_profile,
+        &local_device_did,
+    )
+    .unwrap();
+
+    let (remote_device_key, _) = generate_keypair();
+    let remote_device_key = SigningKey::from_bytes(&remote_device_key.to_bytes());
+    let remote_device_did = crate::crypto::encode_signing_key_did(&remote_device_key);
+    let (remote_profile_key, _) = generate_keypair();
+    let remote_profile = crate::collaboration_profile_authority::signed_profile_document_for_test(
+        &SigningKey::from_bytes(&remote_profile_key.to_bytes()),
+        "Remote Profile",
+        Some("remote"),
+        1,
+        None,
+        now,
+        vec![remote_device_did.clone()],
+    )
+    .unwrap();
+    let remote_advertisement = signed_discovery_message_for_test(
+        &remote_device_key,
+        &remote_profile.document().profile_did,
+        TestCollaborationMessageScope {
+            network_id: NETWORK,
+            conversation_id: crate::collaboration_discovery::COLLABORATION_DISCOVERY_DIRECTORY_ID,
+        },
+        elastos_common::collaboration_protocol::CollaborationRecipient {
+            kind: elastos_common::collaboration_protocol::CollaborationRecipientKind::Conversation,
+            id: crate::collaboration_discovery::COLLABORATION_DISCOVERY_DIRECTORY_ID.to_string(),
+        },
+        crate::collaboration_discovery::COLLABORATION_DISCOVERY_ADVERTISEMENT_PAYLOAD_TYPE,
+        serde_json::to_value(
+            crate::collaboration_discovery::CollaborationDiscoveryAdvertisementPayload {
+                signed_profile: remote_profile.signed_envelope().clone(),
+            },
+        )
+        .unwrap(),
+        now..now + crate::collaboration_discovery::COLLABORATION_DISCOVERY_ADVERTISEMENT_TTL_SECS,
+    );
+    let request = signed_discovery_message_for_test(
+        &local_device_key,
+        &local_profile.document().profile_did,
+        TestCollaborationMessageScope {
+            network_id: NETWORK,
+            conversation_id: crate::collaboration_discovery::COLLABORATION_DISCOVERY_CONTACT_ID,
+        },
+        elastos_common::collaboration_protocol::CollaborationRecipient {
+            kind: elastos_common::collaboration_protocol::CollaborationRecipientKind::Profile,
+            id: remote_profile.document().profile_did.clone(),
+        },
+        crate::collaboration_discovery::COLLABORATION_DISCOVERY_CONTACT_REQUEST_PAYLOAD_TYPE,
+        serde_json::to_value(
+            crate::collaboration_discovery::CollaborationContactRequestPayload {
+                advertisement_envelope_sha256:
+                    elastos_common::collaboration_protocol::collaboration_message_envelope_sha256(
+                        &remote_advertisement,
+                    ),
+                signed_profile: local_profile.signed_envelope().clone(),
+            },
+        )
+        .unwrap(),
+        (now + 1)
+            ..(now
+                + 1
+                + crate::collaboration_discovery::COLLABORATION_DISCOVERY_CONTACT_REQUEST_TTL_SECS),
+    );
+    store
+        .record_outgoing_contact_request(&request, &remote_advertisement, now + 1)
+        .unwrap();
+    store
+        .record_contact_decision_receipt(
+            &signed_contact_decision_for_test(
+                &remote_device_key,
+                NETWORK,
+                &request,
+                &remote_profile.document().profile_did,
+                now + 2,
+            ),
+            now + 2,
+        )
+        .unwrap();
+
+    let (status, people) = home_test_get_json(
+        &app,
+        "/api/apps/people/summary",
+        &authority.people_token,
+        "null",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(people["people"]["contact_count"], 1);
+    let conversation_id = people["people"]["contacts"][0]["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let contact_id = people["people"]["contacts"][0]["contact_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let before = file_snapshot(dir.path());
+
+    let (status, response) = home_test_post_json(
+        &app,
+        "/api/apps/people/contacts/remove",
+        &authority.people_token,
+        "null",
+        serde_json::json!({ "contact_id": contact_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["scope"], "profile_contact");
+    let after = file_snapshot(dir.path());
+    for (path, bytes) in before {
+        if !path.ends_with("/.AppData/ElastOS/People/contact-state.json") {
+            assert_eq!(
+                after.get(&path),
+                Some(&bytes),
+                "unexpected mutation: {path}"
+            );
+        }
+    }
+
+    let (status, people) = home_test_get_json(
+        &app,
+        "/api/apps/people/summary",
+        &authority.people_token,
+        "null",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Removal is visible, not a disappearance: the pair stays as a removed
+    // relationship with messaging off, named by its signed presentation.
+    assert_eq!(people["people"]["contact_count"], 1);
+    assert_eq!(people["people"]["contacts"][0]["relationship"], "removed");
+    assert_eq!(people["people"]["contacts"][0]["can_message"], false);
+    assert!(people["people"]["contacts"][0]["conversation_id"].is_string());
+
+    let local_readd_advertisement = signed_discovery_message_for_test(
+        &local_device_key,
+        &local_profile.document().profile_did,
+        TestCollaborationMessageScope {
+            network_id: NETWORK,
+            conversation_id: crate::collaboration_discovery::COLLABORATION_DISCOVERY_DIRECTORY_ID,
+        },
+        elastos_common::collaboration_protocol::CollaborationRecipient {
+            kind: elastos_common::collaboration_protocol::CollaborationRecipientKind::Conversation,
+            id: crate::collaboration_discovery::COLLABORATION_DISCOVERY_DIRECTORY_ID.to_string(),
+        },
+        crate::collaboration_discovery::COLLABORATION_DISCOVERY_ADVERTISEMENT_PAYLOAD_TYPE,
+        serde_json::to_value(
+            crate::collaboration_discovery::CollaborationDiscoveryAdvertisementPayload {
+                signed_profile: local_profile.signed_envelope().clone(),
+            },
+        )
+        .unwrap(),
+        (now + 3)
+            ..(now
+                + 3
+                + crate::collaboration_discovery::COLLABORATION_DISCOVERY_ADVERTISEMENT_TTL_SECS),
+    );
+    store
+        .store_local_advertisement(&local_readd_advertisement, now + 3)
+        .unwrap();
+
+    let readd_request = signed_discovery_message_for_test(
+        &remote_device_key,
+        &remote_profile.document().profile_did,
+        TestCollaborationMessageScope {
+            network_id: NETWORK,
+            conversation_id: crate::collaboration_discovery::COLLABORATION_DISCOVERY_CONTACT_ID,
+        },
+        elastos_common::collaboration_protocol::CollaborationRecipient {
+            kind: elastos_common::collaboration_protocol::CollaborationRecipientKind::Profile,
+            id: local_profile.document().profile_did.clone(),
+        },
+        crate::collaboration_discovery::COLLABORATION_DISCOVERY_CONTACT_REQUEST_PAYLOAD_TYPE,
+        serde_json::to_value(
+            crate::collaboration_discovery::CollaborationContactRequestPayload {
+                advertisement_envelope_sha256:
+                    elastos_common::collaboration_protocol::collaboration_message_envelope_sha256(
+                        &local_readd_advertisement,
+                    ),
+                signed_profile: remote_profile.signed_envelope().clone(),
+            },
+        )
+        .unwrap(),
+        (now + 4)
+            ..(now
+                + 4
+                + crate::collaboration_discovery::COLLABORATION_DISCOVERY_CONTACT_REQUEST_TTL_SECS),
+    );
+    store
+        .record_incoming_contact_request(&readd_request, now + 4)
+        .unwrap();
+    store
+        .record_contact_decision_receipt(
+            &signed_contact_decision_for_test(
+                &local_device_key,
+                NETWORK,
+                &readd_request,
+                &local_profile.document().profile_did,
+                now + 5,
+            ),
+            now + 5,
+        )
+        .unwrap();
+
+    let (status, people) = home_test_get_json(
+        &app,
+        "/api/apps/people/summary",
+        &authority.people_token,
+        "null",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(people["people"]["contact_count"], 1);
+    assert_eq!(people["people"]["contacts"][0]["relationship"], "connected");
+    assert_eq!(people["people"]["contacts"][0]["can_message"], true);
+    assert_eq!(
+        people["people"]["contacts"][0]["conversation_id"],
+        conversation_id
+    );
+    assert_eq!(
+        people["people"]["contacts"][0]["display_name"],
+        "Remote Profile"
+    );
 }
 
 #[tokio::test]
@@ -4057,7 +3092,8 @@ async fn test_system_summary_reports_identity_and_app_id() {
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["identity"]["handle"], "anders");
+    assert!(payload["identity"]["profile"].is_null());
+    assert_eq!(payload["identity"]["profile_setup_display_name"], "anders");
     assert!(payload["identity"]["device_did"].is_string());
     assert_eq!(payload["home"]["id"], "home");
     assert_eq!(payload["home"]["route"], "/apps/home/");
@@ -4289,26 +3325,49 @@ fn system_runtime_activity_filters_attach_noise() {
 }
 
 #[tokio::test]
-async fn test_system_handle_update_requires_shell_launch_token() {
+async fn test_removed_system_identity_mutations_cannot_succeed_or_mutate_state() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
 
-    let denied = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/apps/system/identity/handle")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"handle":"anders"}"#))
-                .unwrap(),
+    for uri in [
+        "/api/apps/system/identity/handle",
+        "/api/apps/system/identity/profile-card",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"display_name":"anders"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK, "{uri}");
+        assert!(
+            matches!(
+                response.status(),
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "{uri}: {}",
+            response.status()
+        );
+    }
+    assert!(
+        crate::collaboration_profile_authority::load_profile_authority(
+            dir.path(),
+            "person:local:missing",
+            &crate::auth::principal_localhost_root("person:local:missing"),
         )
-        .await
-        .unwrap();
-    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        .unwrap()
+        .is_none()
+    );
 }
 
 #[tokio::test]
-async fn test_system_handle_update_rejects_proofless_launch_token() {
+async fn test_people_profile_update_rejects_proofless_launch_token() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
 
@@ -4316,12 +3375,12 @@ async fn test_system_handle_update_rejects_proofless_launch_token() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/apps/system/identity/handle")
+                .uri("/api/apps/people/profile")
                 .header(HOST, "localhost:61180")
                 .header("origin", "null")
-                .header("x-elastos-home-token", system_app_token(dir.path()))
+                .header("x-elastos-home-token", people_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"handle":"anders"}"#))
+                .body(Body::from(r#"{"display_name":"anders"}"#))
                 .unwrap(),
         )
         .await
@@ -4338,12 +3397,13 @@ async fn test_system_handle_update_rejects_proofless_launch_token() {
 }
 
 #[tokio::test]
-async fn test_system_handle_derives_from_passkey_principal() {
+async fn test_people_profile_update_creates_signed_profile_under_passkey_principal_authority() {
     let dir = tempfile::tempdir().unwrap();
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
     let _runtime = start_fake_runtime(dir.path(), bus, "principal-handle-peer").await;
     let app = gateway_router(test_state(dir.path()));
     let authority = passkey_authority_with_name(dir.path(), Some("Anders"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
 
     let summary = app
         .clone()
@@ -4363,19 +3423,27 @@ async fn test_system_handle_derives_from_passkey_principal() {
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["identity"]["handle"], "Anders");
+    assert_eq!(payload["identity"]["profile_setup_display_name"], "Anders");
+    assert!(payload["identity"]["profile"].is_null());
+    assert_eq!(
+        payload["identity"]["profile_readiness"],
+        serde_json::json!({
+            "schema": "elastos.profile.readiness/v1",
+            "status": "setup_required",
+        })
+    );
 
     let update = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/apps/system/identity/handle")
+                .uri("/api/apps/people/profile")
                 .header(HOST, "localhost:61180")
                 .header("origin", "null")
-                .header("x-elastos-home-token", authority.system_token.as_str())
+                .header("x-elastos-home-token", authority.people_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"handle":"Anders Admin"}"#))
+                .body(Body::from(r#"{"display_name":"Anders Admin"}"#))
                 .unwrap(),
         )
         .await
@@ -4385,16 +3453,25 @@ async fn test_system_handle_derives_from_passkey_principal() {
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["handle"], "Anders Admin");
-    assert_eq!(payload["profile_card"]["schema"], "elastos.profile-card/v1");
-    assert_eq!(payload["profile_card"]["display_name"], "Anders Admin");
-    assert!(payload["profile_card"]["profile_id"]
-        .as_str()
-        .unwrap()
-        .starts_with("profile:local:"));
+    assert_eq!(payload["profile"]["schema"], "elastos.profile-summary/v1");
+    assert_eq!(payload["profile"]["display_name"], "Anders Admin");
+    assert_eq!(payload["profile_readiness"]["status"], "ready");
+    assert!(payload["profile"]["handle"].is_null());
+    assert!(payload["profile"].get("profile_did").is_none());
+    assert!(payload["profile"].get("previous_profile_sha256").is_none());
+    assert!(payload["profile"].get("revision").is_none());
+    assert!(payload["profile"].get("updated_at").is_none());
+    assert!(payload["profile"].get("signature").is_none());
+    assert!(payload["profile"].get("signer_did").is_none());
+    assert!(payload["profile"].get("collaboration_endpoint").is_none());
+    assert!(payload["profile"].get("collaboration_signers").is_none());
     assert!(elastos_identity::load_nickname(dir.path())
         .unwrap()
         .is_none());
+    let principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+    assert_eq!(principal.display_name, "Anders");
 
     let summary = app
         .clone()
@@ -4414,11 +3491,20 @@ async fn test_system_handle_derives_from_passkey_principal() {
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["identity"]["handle"], "Anders Admin");
     assert_eq!(
-        payload["identity"]["profile_card"]["display_name"],
+        payload["identity"]["profile"]["display_name"],
         "Anders Admin"
     );
+    assert_eq!(payload["identity"]["profile_readiness"]["status"], "ready");
+    assert!(payload["identity"]["profile_setup_display_name"].is_null());
+    assert!(payload["identity"]["profile"].get("signature").is_none());
+    assert!(payload["identity"]["profile"].get("signer_did").is_none());
+    assert!(payload["identity"]["profile"]
+        .get("collaboration_endpoint")
+        .is_none());
+    assert!(payload["identity"]["profile"]
+        .get("collaboration_signers")
+        .is_none());
 
     let chat_launch = app
         .clone()
@@ -4462,27 +3548,43 @@ async fn test_system_handle_derives_from_passkey_principal() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["display_name"], "Anders Admin");
+
+    let restarted_app = gateway_router(test_state(dir.path()));
+    let (status, payload) = home_test_get_json(
+        &restarted_app,
+        "/api/apps/home/summary",
+        &authority.home_token,
+        "http://localhost:61180",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["identity"]["profile_readiness"]["status"], "ready");
+    assert_eq!(
+        payload["identity"]["profile"]["display_name"],
+        "Anders Admin"
+    );
 }
 
 #[tokio::test]
-async fn test_people_profile_card_update_uses_people_launch_token() {
+async fn test_people_profile_update_uses_people_launch_token() {
     let dir = tempfile::tempdir().unwrap();
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
     let _runtime = start_fake_runtime(dir.path(), bus, "people-profile-peer").await;
     let app = gateway_router(test_state(dir.path()));
     let authority = passkey_authority_with_name(dir.path(), Some("Anders"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
 
     let update = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/apps/people/profile-card")
+                .uri("/api/apps/people/profile")
                 .header(HOST, "localhost:61180")
                 .header("origin", "null")
                 .header("x-elastos-home-token", authority.people_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"handle":"People Name"}"#))
+                .body(Body::from(r#"{"display_name":"People Name"}"#))
                 .unwrap(),
         )
         .await
@@ -4492,8 +3594,7 @@ async fn test_people_profile_card_update_uses_people_launch_token() {
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["handle"], "People Name");
-    assert_eq!(payload["profile_card"]["display_name"], "People Name");
+    assert_eq!(payload["profile"]["display_name"], "People Name");
 
     let summary = app
         .oneshot(
@@ -4514,9 +3615,458 @@ async fn test_people_profile_card_update_uses_people_launch_token() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
-        payload["identity"]["profile_card"]["display_name"],
+        payload["identity"]["profile"]["display_name"],
         "People Name"
     );
+}
+
+#[tokio::test]
+async fn test_home_and_people_summary_without_profile_are_side_effect_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_name(dir.path(), Some("Alex"));
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let profile_path =
+        crate::collaboration_profile_authority::profile_authority_path(dir.path(), &localhost_root)
+            .unwrap();
+    let before = file_snapshot(dir.path());
+    let before_identity: BTreeMap<_, _> = before
+        .iter()
+        .filter(|(path, _)| path.starts_with("identity/"))
+        .map(|(path, bytes)| (path.clone(), bytes.clone()))
+        .collect();
+
+    let (home_status, home_payload) = home_test_get_json(
+        &app,
+        "/api/apps/home/summary",
+        &authority.home_token,
+        "http://localhost:61180",
+    )
+    .await;
+    assert_eq!(home_status, StatusCode::OK);
+    assert!(home_payload["identity"]["profile"].is_null());
+    assert_eq!(
+        home_payload["identity"]["profile_readiness"]["status"],
+        "setup_required"
+    );
+    assert_eq!(
+        home_payload["identity"]["profile_setup_display_name"],
+        "Alex"
+    );
+
+    let (people_status, people_payload) = home_test_get_json(
+        &app,
+        "/api/apps/people/summary",
+        &authority.people_token,
+        "null",
+    )
+    .await;
+    assert_eq!(people_status, StatusCode::OK);
+    assert!(people_payload["identity"]["profile"].is_null());
+    assert_eq!(
+        people_payload["identity"]["profile_readiness"]["status"],
+        "setup_required"
+    );
+    assert_eq!(
+        people_payload["identity"]["profile_setup_display_name"],
+        "Alex"
+    );
+
+    let after = file_snapshot(dir.path());
+    let after_identity: BTreeMap<_, _> = after
+        .iter()
+        .filter(|(path, _)| path.starts_with("identity/"))
+        .map(|(path, bytes)| (path.clone(), bytes.clone()))
+        .collect();
+
+    assert_eq!(after, before);
+    assert_eq!(after_identity, before_identity);
+    assert!(!profile_path.exists());
+    assert!(!profile_path.parent().unwrap().exists());
+}
+
+#[tokio::test]
+async fn invalid_profile_projects_unavailable_without_mutating_or_claiming_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_name(dir.path(), Some("Alex"));
+    let principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+    crate::auth::store_test_principal_root_protection(dir.path(), &principal.principal_id);
+    let object_uri = crate::collaboration_profile_authority::profile_authority_object_uri(
+        &principal.localhost_root,
+    );
+    let profile_path = crate::collaboration_profile_authority::profile_authority_path(
+        dir.path(),
+        &principal.localhost_root,
+    )
+    .unwrap();
+    crate::auth::write_protected_principal_root_object(
+        dir.path(),
+        &principal.principal_id,
+        &principal.localhost_root,
+        &object_uri,
+        &profile_path,
+        b"invalid profile authority",
+    )
+    .unwrap();
+    let before = file_snapshot(dir.path());
+
+    for (path, token, origin) in [
+        (
+            "/api/apps/home/summary",
+            authority.home_token.as_str(),
+            "http://localhost:61180",
+        ),
+        (
+            "/api/apps/people/summary",
+            authority.people_token.as_str(),
+            "null",
+        ),
+    ] {
+        let (status, payload) = home_test_get_json(&app, path, token, origin).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(
+            payload["identity"]["profile_readiness"],
+            serde_json::json!({
+                "schema": "elastos.profile.readiness/v1",
+                "status": "unavailable",
+            }),
+            "{path}"
+        );
+        assert!(payload["identity"]["profile"].is_null(), "{path}");
+        assert!(
+            payload["identity"]["profile_setup_display_name"].is_null(),
+            "{path}"
+        );
+    }
+
+    assert_eq!(file_snapshot(dir.path()), before);
+}
+
+#[tokio::test]
+async fn authenticated_home_people_inbox_and_realtime_reads_are_observationally_pure() {
+    const NETWORK: &str = "gateway-read-purity";
+    let now = crate::auth::now_ts();
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let authority = passkey_authority_with_profile(dir.path(), "Local Profile");
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let local_profile = crate::collaboration_profile_authority::load_profile_authority(
+        dir.path(),
+        &authority.principal_id,
+        &localhost_root,
+    )
+    .unwrap()
+    .unwrap();
+    let local_seed: [u8; 32] = std::fs::read(dir.path().join("identity/device.key"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let (local_device_key, local_device_did) = elastos_identity::derive_did(&local_seed);
+    let local_device_key = SigningKey::from_bytes(&local_device_key.to_bytes());
+
+    let (trusted_key, _) = generate_keypair();
+    let network_profile = configured_discovery_network_profile_for_test(&trusted_key, NETWORK);
+    let discovery_service =
+        crate::collaboration_discovery_runtime::CollaborationDiscoveryService::new(
+            SigningKey::from_bytes(&local_device_key.to_bytes()),
+            network_profile.clone(),
+            Arc::new(elastos_runtime::provider::ProviderRegistry::new()),
+        )
+        .await
+        .unwrap();
+    let store = crate::collaboration_contact_store::CollaborationContactStore::new(
+        dir.path(),
+        &authority.principal_id,
+        &localhost_root,
+        network_profile,
+        &local_profile,
+        &local_device_did,
+    )
+    .unwrap();
+    let local_advertisement = signed_discovery_message_for_test(
+        &local_device_key,
+        &local_profile.document().profile_did,
+        TestCollaborationMessageScope {
+            network_id: NETWORK,
+            conversation_id: crate::collaboration_discovery::COLLABORATION_DISCOVERY_DIRECTORY_ID,
+        },
+        elastos_common::collaboration_protocol::CollaborationRecipient {
+            kind: elastos_common::collaboration_protocol::CollaborationRecipientKind::Conversation,
+            id: crate::collaboration_discovery::COLLABORATION_DISCOVERY_DIRECTORY_ID.to_string(),
+        },
+        crate::collaboration_discovery::COLLABORATION_DISCOVERY_ADVERTISEMENT_PAYLOAD_TYPE,
+        serde_json::to_value(
+            crate::collaboration_discovery::CollaborationDiscoveryAdvertisementPayload {
+                signed_profile: local_profile.signed_envelope().clone(),
+            },
+        )
+        .unwrap(),
+        now..now + crate::collaboration_discovery::COLLABORATION_DISCOVERY_ADVERTISEMENT_TTL_SECS,
+    );
+    store
+        .store_local_advertisement(&local_advertisement, now)
+        .unwrap();
+
+    let (remote_device_key, _) = generate_keypair();
+    let remote_device_key = SigningKey::from_bytes(&remote_device_key.to_bytes());
+    let remote_device_did = crate::crypto::encode_signing_key_did(&remote_device_key);
+    let (remote_profile_key, _) = generate_keypair();
+    let remote_profile = crate::collaboration_profile_authority::signed_profile_document_for_test(
+        &SigningKey::from_bytes(&remote_profile_key.to_bytes()),
+        "Remote Profile",
+        Some("remote"),
+        1,
+        None,
+        now,
+        vec![remote_device_did],
+    )
+    .unwrap();
+    let request = signed_discovery_message_for_test(
+        &remote_device_key,
+        &remote_profile.document().profile_did,
+        TestCollaborationMessageScope {
+            network_id: NETWORK,
+            conversation_id: crate::collaboration_discovery::COLLABORATION_DISCOVERY_CONTACT_ID,
+        },
+        elastos_common::collaboration_protocol::CollaborationRecipient {
+            kind: elastos_common::collaboration_protocol::CollaborationRecipientKind::Profile,
+            id: local_profile.document().profile_did.clone(),
+        },
+        crate::collaboration_discovery::COLLABORATION_DISCOVERY_CONTACT_REQUEST_PAYLOAD_TYPE,
+        serde_json::to_value(
+            crate::collaboration_discovery::CollaborationContactRequestPayload {
+                advertisement_envelope_sha256:
+                    elastos_common::collaboration_protocol::collaboration_message_envelope_sha256(
+                        &local_advertisement,
+                    ),
+                signed_profile: remote_profile.signed_envelope().clone(),
+            },
+        )
+        .unwrap(),
+        (now + 1)
+            ..(now
+                + 1
+                + crate::collaboration_discovery::COLLABORATION_DISCOVERY_CONTACT_REQUEST_TTL_SECS),
+    );
+    store
+        .record_incoming_contact_request(&request, now + 1)
+        .unwrap();
+
+    // This released Services-only object is inert evidence until an explicit
+    // authenticated launch owns its one-time rename.
+    write_home_principal_object_json_for_authority(
+        dir.path(),
+        &authority,
+        "people-contacts.json",
+        json!({
+            "schema": "elastos.people.contacts-state/v1",
+            "principal_id": authority.principal_id,
+            "localhost_root": localhost_root,
+            "updated_at": 10,
+            "contacts": {}
+        }),
+    );
+
+    let mut state = test_state(dir.path());
+    state.collaboration_discovery_service = Some(discovery_service.clone());
+    let app = gateway_router(state);
+    let legacy_uri = format!(
+        "{}/.AppData/ElastOS/Home/people-contacts.json",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let current_uri = format!(
+        "{}/.AppData/ElastOS/Home/services-peer-contacts.json",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let legacy_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &legacy_uri).unwrap();
+    let current_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &current_uri).unwrap();
+    let before_reads = file_snapshot(dir.path());
+    let before_registrations = discovery_service.registered_context_snapshot_for_test();
+    assert_eq!(
+        before_registrations["sync"]
+            .as_array()
+            .expect("sync registration snapshot must be an array")
+            .len(),
+        0
+    );
+    let before_client_state = discovery_service.client_state_snapshot_for_test();
+
+    let read_all = || async {
+        let (home_status, home) = home_test_get_json(
+            &app,
+            "/api/apps/home/summary",
+            &authority.home_token,
+            "http://localhost:61180",
+        )
+        .await;
+        assert_eq!(home_status, StatusCode::OK);
+        let (people_status, people) = home_test_get_json(
+            &app,
+            "/api/apps/people/summary",
+            &authority.people_token,
+            "null",
+        )
+        .await;
+        assert_eq!(people_status, StatusCode::OK);
+        let (inbox_status, inbox) =
+            home_test_get_json(&app, "/api/apps/inbox/summary", &inbox_token, "null").await;
+        assert_eq!(inbox_status, StatusCode::OK);
+        let (events_status, events) = home_test_get_json(
+            &app,
+            "/api/apps/home/events?wait_ms=0",
+            &authority.home_token,
+            "http://localhost:61180",
+        )
+        .await;
+        assert_eq!(events_status, StatusCode::OK);
+        (home, people, inbox, events)
+    };
+
+    let first = read_all().await;
+    let second = read_all().await;
+    assert_eq!(first.0["notifications"], second.0["notifications"]);
+    assert_eq!(first.1["people"], second.1["people"]);
+    assert_eq!(
+        first.1["discovery"]["status"],
+        second.1["discovery"]["status"]
+    );
+    assert_eq!(
+        first.1["discovery"]["request_count"],
+        second.1["discovery"]["request_count"]
+    );
+    assert_eq!(first.2["notifications"], second.2["notifications"]);
+    assert_eq!(first.3["cursor"], second.3["cursor"]);
+    for payload in [&first.0, &first.2] {
+        let contact_requests = payload["notifications"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["kind"] == "contact_request")
+            .count();
+        assert_eq!(contact_requests, 1);
+    }
+    assert_eq!(first.1["discovery"]["request_count"], 1);
+    assert_eq!(file_snapshot(dir.path()), before_reads);
+    assert_eq!(
+        discovery_service.registered_context_snapshot_for_test(),
+        before_registrations
+    );
+    assert_eq!(
+        discovery_service.client_state_snapshot_for_test(),
+        before_client_state
+    );
+    assert!(legacy_path.is_file());
+    assert!(!current_path.exists());
+
+    let (launch_status, _) = home_test_post_json(
+        &app,
+        "/api/apps/home/launch",
+        &authority.home_token,
+        "http://localhost:61180",
+        json!({ "target": INBOX_CAPSULE_ID }),
+    )
+    .await;
+    assert_eq!(launch_status, StatusCode::OK);
+    assert!(!legacy_path.exists());
+    assert!(current_path.is_file());
+
+    let after_launch = file_snapshot(dir.path());
+    let after_launch_registrations = discovery_service.registered_context_snapshot_for_test();
+    assert_eq!(
+        after_launch_registrations["sync"]
+            .as_array()
+            .expect("sync registration snapshot must be an array")
+            .len(),
+        1
+    );
+    let after_launch_client_state = discovery_service.client_state_snapshot_for_test();
+    let third = read_all().await;
+    let fourth = read_all().await;
+    assert_eq!(third.0["notifications"], fourth.0["notifications"]);
+    assert_eq!(third.1["people"], fourth.1["people"]);
+    assert_eq!(third.2["notifications"], fourth.2["notifications"]);
+    assert_eq!(third.3["cursor"], fourth.3["cursor"]);
+    assert_eq!(file_snapshot(dir.path()), after_launch);
+    assert_eq!(
+        discovery_service.registered_context_snapshot_for_test(),
+        after_launch_registrations
+    );
+    assert_eq!(
+        discovery_service.client_state_snapshot_for_test(),
+        after_launch_client_state
+    );
+}
+
+#[tokio::test]
+async fn test_home_summary_ignores_old_profile_card_identity_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_name(dir.path(), Some("Alex"));
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let old_profile_card_uri =
+        format!("{localhost_root}/.AppData/ElastOS/Profile/profile-card.json");
+    let old_profile_card_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &old_profile_card_uri)
+            .unwrap();
+    crate::auth::write_protected_principal_root_object(
+        dir.path(),
+        &authority.principal_id,
+        &localhost_root,
+        &old_profile_card_uri,
+        &old_profile_card_path,
+        serde_json::to_string_pretty(&json!({
+            "schema": "elastos.profile-card/v1",
+            "profile_id": "did:key:old-profile-card",
+            "display_name": "Legacy Name",
+            "handle": "legacy",
+            "updated_at": 1,
+        }))
+        .unwrap()
+        .as_bytes(),
+    )
+    .unwrap();
+
+    let (status, payload) = home_test_get_json(
+        &app,
+        "/api/apps/home/summary",
+        &authority.home_token,
+        "http://localhost:61180",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["identity"]["profile"].is_null());
+    assert_eq!(payload["identity"]["profile_setup_display_name"], "Alex");
+}
+
+#[tokio::test]
+async fn test_home_summary_fails_closed_for_invalid_existing_device_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("Alex"));
+    let request = test_browser_request("localhost:61180", "http://localhost:61180")
+        .uri("/api/apps/home/summary")
+        .header("x-elastos-home-token", authority.home_token.as_str())
+        .body(Body::empty())
+        .unwrap();
+    let context =
+        require_home_launch_token_context(dir.path(), request.headers(), HOME_CAPSULE_ID).unwrap();
+    std::fs::create_dir_all(dir.path().join("identity")).unwrap();
+    std::fs::write(dir.path().join("identity").join("device.key"), b"bad").unwrap();
+    let err = match load_gateway_identity_summary_for_context(dir.path(), &context) {
+        Ok(_) => panic!("invalid existing device.key should fail closed"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("device.key has invalid length"));
 }
 
 #[tokio::test]
@@ -4558,12 +4108,16 @@ async fn test_people_summary_requires_people_launch_token() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["schema"], "elastos.people.summary/v1");
-    assert_eq!(payload["identity"]["handle"], "Alex");
+    assert!(payload["identity"]["profile"].is_null());
+    assert_eq!(payload["identity"]["profile_setup_display_name"], "Alex");
     assert!(payload["people"]["contacts"].is_array());
     assert_eq!(
-        payload["people"]["discovery"]["schema"],
+        payload["discovery"]["schema"],
         "elastos.people.discovery/v1"
     );
+    assert_eq!(payload["discovery"]["configured"], false);
+    assert_eq!(payload["discovery"]["status"], "unconfigured");
+    assert!(payload["discovery"].get("peer_id").is_none());
 }
 
 #[tokio::test]
@@ -6480,8 +6034,8 @@ fn test_system_request_bodies_reject_hidden_authority_fields() {
         "active": "home-gui",
         "route": "/apps/home/"
     }));
-    assert_rejects_unknown_gateway_field::<SystemHandleUpdateRequest>(json!({
-        "handle": "alice",
+    assert_rejects_unknown_gateway_field::<PeopleProfileUpdateRequest>(json!({
+        "display_name": "alice",
         "did": "did:elastos:alice"
     }));
     assert_rejects_unknown_gateway_field::<SystemBackgroundOverlayRequest>(json!({
@@ -6543,6 +6097,7 @@ fn test_chat_request_bodies_reject_hidden_identity_fields() {
         "principal_id": "person:local:other"
     }));
     assert_rejects_unknown_gateway_field::<RoomSendBody>(json!({
+        "request_id": "chat-message:test",
         "body": "hello",
         "sender_id": "did:key:forged"
     }));

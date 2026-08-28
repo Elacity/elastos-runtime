@@ -14,7 +14,7 @@
       {
         "resource": "elastos://object/*",
         "actions": ["read", "write", "delete"],
-        "operations": ["roots", "list", "stat", "read", "download", "write", "mkdir", "rename", "move", "copy", "trash", "restore", "delete_permanently", "empty_trash", "status", "events", "publish", "unpublish", "repair", "share"]
+        "operations": ["roots", "list", "stat", "read", "download", "write", "mkdir", "rename", "move", "copy", "trash", "restore", "delete_permanently", "empty_trash", "status", "events", "publish", "unpublish", "repair", "share", "list_runtime_custody", "buy", "open_viewer", "read_viewer", "close_viewer"]
       }
     ],
     "audit_events": ["object.provider.requested", "object.provider.completed", "object.provider.failed"]
@@ -204,6 +204,51 @@
           "audit": "full",
           "resource": "elastos://object/*",
           "operation": "share"
+        },
+        {
+          "id": "list_runtime_custody",
+          "description": "Request runtime-custody listing through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://object/*",
+          "operation": "list_runtime_custody"
+        },
+        {
+          "id": "buy",
+          "description": "Request buy through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "buy"
+        },
+        {
+          "id": "open_viewer",
+          "description": "Request open_viewer through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://object/*",
+          "operation": "open_viewer"
+        },
+        {
+          "id": "read_viewer",
+          "description": "Request read_viewer through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://object/*",
+          "operation": "read_viewer"
+        },
+        {
+          "id": "close_viewer",
+          "description": "Request close_viewer through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://object/*",
+          "operation": "close_viewer"
         }
       ]
     }

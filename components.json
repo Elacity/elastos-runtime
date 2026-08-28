@@ -19,15 +19,6 @@
         "aarch64-linux"
       ]
     },
-    "chat": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "x86_64-linux",
-        "aarch64-linux"
-      ]
-    },
     "did-provider": {
       "cid": "",
       "sha256": "",
@@ -212,15 +203,6 @@
       ]
     },
     "tunnel-provider": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "x86_64-linux",
-        "aarch64-linux"
-      ]
-    },
-    "agent": {
       "cid": "",
       "sha256": "",
       "size": 0,
@@ -668,6 +650,87 @@
         }
       }
     },
+    "custody-provider": {
+      "install_path": "bin/custody-provider",
+      "description": "Host protected-content custody node provider binary for owner-only node provisioning and inactive Runtime-selected custody routes",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "custody-provider-linux-amd64",
+          "install_path": "bin/custody-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "custody-provider-linux-arm64",
+          "install_path": "bin/custody-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "custody-provider-darwin-arm64",
+          "install_path": "bin/custody-provider"
+        }
+      }
+    },
+    "protected-content-protect-provider": {
+      "install_path": "bin/protected-content-protect-provider",
+      "description": "Host protected-content protect provider binary for inactive Runtime-selected CENC origin packaging",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-protect-provider-linux-amd64",
+          "install_path": "bin/protected-content-protect-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-protect-provider-linux-arm64",
+          "install_path": "bin/protected-content-protect-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-protect-provider-darwin-arm64",
+          "install_path": "bin/protected-content-protect-provider"
+        }
+      }
+    },
+    "protected-content-decrypt-provider": {
+      "install_path": "bin/protected-content-decrypt-provider",
+      "description": "Host protected-content decrypt provider binary for inactive Runtime-selected scoped viewer sessions",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-decrypt-provider-linux-amd64",
+          "install_path": "bin/protected-content-decrypt-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-decrypt-provider-linux-arm64",
+          "install_path": "bin/protected-content-decrypt-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-decrypt-provider-darwin-arm64",
+          "install_path": "bin/protected-content-decrypt-provider"
+        }
+      }
+    },
     "webspace-provider": {
       "install_path": "bin/webspace-provider",
       "description": "Host WebSpace resolver binary for mounted localhost://WebSpaces/<moniker>/... handles",
@@ -866,28 +929,6 @@
           "release_path": "browser.tar.gz",
           "extract_path": "browser",
           "install_path": "capsules/browser"
-        }
-      }
-    },
-    "chat": {
-      "install_path": "capsules/chat",
-      "description": "Packaged microVM chat bundle for the full-screen Carrier chat path",
-      "platforms": {
-        "linux-amd64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "chat-linux-amd64.tar.gz",
-          "extract_path": "chat",
-          "install_path": "capsules/chat"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "chat-linux-arm64.tar.gz",
-          "extract_path": "chat",
-          "install_path": "capsules/chat"
         }
       }
     },
@@ -1218,7 +1259,7 @@
       ]
     },
     "home": {
-      "description": "Managed Home plus native Carrier chat",
+      "description": "Managed Home",
       "components": [
         "shell",
         "localhost-provider",
@@ -1254,7 +1295,7 @@
       ]
     },
     "demo": {
-      "description": "Home demo path with native chat, room, full-screen chat, site, sharing, GBA, and browser capsule surfaces",
+      "description": "Home demo path with Runtime-backed Chat, site, sharing, GBA, and Browser surfaces",
       "components": [
         "shell",
         "localhost-provider",
@@ -1282,7 +1323,6 @@
         "object-provider",
         "content-block-graph-provider",
         "browser",
-        "chat",
         "gba-emulator",
         "gba-ucity",
         "chat-room",
@@ -1296,17 +1336,6 @@
         "marketplace",
         "archive-manager",
         "inbox"
-      ]
-    },
-    "chat": {
-      "description": "Packaged full-screen microVM chat on a KVM-capable host",
-      "components": [
-        "shell",
-        "localhost-provider",
-        "did-provider",
-        "chat",
-        "crosvm",
-        "vmlinux"
       ]
     },
     "operator": {
@@ -1446,7 +1475,6 @@
         "wallet-walletconnect",
         "wallet",
         "browser",
-        "chat",
         "gba-emulator",
         "gba-ucity",
         "chat-room",

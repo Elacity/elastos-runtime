@@ -119,6 +119,10 @@ pub enum ProviderError {
     Provider(String),
     /// No provider for scheme
     NoProvider(String),
+    /// No verified route to the requested peer. Returned before any provider
+    /// effect, so a caller can distinguish an unreachable peer from a provider
+    /// that ran and failed.
+    Unavailable(String),
     /// IO error
     Io(std::io::Error),
 }
@@ -153,19 +157,39 @@ static NEXT_PROVIDER_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Carrier route for Runtime-mediated provider-to-provider invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderCarrierRoute {
+pub enum ProviderCarrierRoute {
     /// Internal Carrier connect ticket. Receipts intentionally do not expose it.
-    pub connect_ticket: String,
-    /// Optional expected remote peer DID/node identity for audit and policy.
-    pub peer_did: Option<String>,
-    /// Optional per-hop timeout. Runtime rejects zero-duration values.
-    pub timeout_ms: Option<u64>,
+    ConnectTicket {
+        connect_ticket: String,
+        /// Optional expected remote peer DID/node identity for audit and policy.
+        peer_did: Option<String>,
+        /// Optional per-hop timeout. Runtime rejects zero-duration values.
+        timeout_ms: Option<u64>,
+    },
+    /// Internal Carrier peer-DID route. Runtime resolves addressing privately.
+    PeerDid {
+        /// Expected remote peer DID/node identity for audit and policy.
+        peer_did: String,
+        /// Optional per-hop timeout. Runtime rejects zero-duration values.
+        timeout_ms: Option<u64>,
+    },
+}
+
+impl ProviderCarrierRoute {
+    pub fn timeout_ms(&self) -> Option<u64> {
+        match self {
+            Self::ConnectTicket { timeout_ms, .. } | Self::PeerDid { timeout_ms, .. } => {
+                *timeout_ms
+            }
+        }
+    }
 }
 
 /// Runtime transport used for provider-to-provider invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ProviderInvocationTransport {
     /// In-process Runtime provider registry.
+    #[default]
     Local,
     /// Carrier provider plane. Apps never select this directly.
     Carrier(ProviderCarrierRoute),
@@ -184,12 +208,6 @@ impl ProviderInvocationTransport {
             ProviderInvocationTransport::Local => None,
             ProviderInvocationTransport::Carrier(route) => Some(route),
         }
-    }
-}
-
-impl Default for ProviderInvocationTransport {
-    fn default() -> Self {
-        Self::Local
     }
 }
 
@@ -414,6 +432,7 @@ impl std::fmt::Display for ProviderError {
             ProviderError::InvalidUri(uri) => write!(f, "invalid URI: {}", uri),
             ProviderError::Provider(msg) => write!(f, "provider error: {}", msg),
             ProviderError::NoProvider(scheme) => write!(f, "no provider for scheme: {}", scheme),
+            ProviderError::Unavailable(msg) => write!(f, "peer unavailable: {}", msg),
             ProviderError::Io(e) => write!(f, "IO error: {}", e),
         }
     }
@@ -449,6 +468,11 @@ pub trait Provider: Send + Sync {
             "Provider does not support raw communication".into(),
         ))
     }
+
+    /// Shut down the provider and settle any owned lifecycle resources.
+    async fn shutdown(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
 }
 
 /// Reserved sub-provider names for `elastos://` hierarchical dispatch.
@@ -474,10 +498,14 @@ const RESERVED_SUB_NAMES: &[&str] = &[
     "rights",
     "key",
     "decrypt",
+    "protect",
     "inspect",
     "availability",
     "block-graph",
     "object",
+    "collaboration-direct",
+    "collaboration-profile",
+    "custody",
 ];
 
 /// Registry of providers
@@ -485,9 +513,28 @@ pub struct ProviderRegistry {
     /// Map of scheme -> provider
     providers: RwLock<HashMap<String, Arc<dyn Provider>>>,
     /// Sub-providers for elastos:// hierarchical dispatch (e.g., elastos://peer/...)
-    sub_providers: RwLock<HashMap<String, Arc<dyn Provider>>>,
+    sub_providers: RwLock<HashMap<String, SubProviderRegistration>>,
     /// Optional Carrier transport for Runtime-mediated provider invocation.
     carrier_invoker: RwLock<Option<Arc<dyn ProviderCarrierInvoker>>>,
+}
+
+enum SubProviderRegistration {
+    Ready(Arc<dyn Provider>),
+    Settling(SubProviderSettling),
+}
+
+struct SubProviderSettling {
+    provider: Arc<dyn Provider>,
+    shutdown_in_progress: bool,
+}
+
+impl SubProviderRegistration {
+    fn ready_provider(&self) -> Option<Arc<dyn Provider>> {
+        match self {
+            Self::Ready(provider) => Some(provider.clone()),
+            Self::Settling(_) => None,
+        }
+    }
 }
 
 impl ProviderRegistry {
@@ -552,33 +599,98 @@ impl ProviderRegistry {
                 name
             )));
         }
+        let mut sub_providers = self.sub_providers.write().await;
+        if sub_providers.contains_key(&name) {
+            return Err(ProviderError::Provider(format!(
+                "sub-provider '{}' is already registered",
+                name
+            )));
+        }
         tracing::info!(
             "Registered sub-provider '{}' for elastos://{}/...",
             provider.name(),
             name
         );
-        self.sub_providers.write().await.insert(name, provider);
+        sub_providers.insert(name, SubProviderRegistration::Ready(provider));
         Ok(())
     }
 
     /// Unregister a sub-provider from `elastos://` hierarchical dispatch.
     ///
     /// No-op if the name is not currently registered.
-    pub async fn unregister_sub_provider(&self, name: &str) {
+    pub async fn unregister_sub_provider(&self, name: &str) -> Result<(), ProviderError> {
         let key = name.to_lowercase();
-        if let Some(provider) = self.sub_providers.write().await.remove(&key) {
-            tracing::info!(
-                "Unregistered sub-provider '{}' for elastos://{}/...",
-                provider.name(),
-                key
-            );
+        let provider = {
+            let mut sub_providers = self.sub_providers.write().await;
+            let Some(entry) = sub_providers.get_mut(&key) else {
+                return Ok(());
+            };
+            match entry {
+                SubProviderRegistration::Ready(provider) => {
+                    let provider = provider.clone();
+                    *entry = SubProviderRegistration::Settling(SubProviderSettling {
+                        provider: provider.clone(),
+                        shutdown_in_progress: true,
+                    });
+                    provider
+                }
+                SubProviderRegistration::Settling(settling) => {
+                    if settling.shutdown_in_progress {
+                        return Err(ProviderError::Unavailable(format!(
+                            "sub-provider '{}' shutdown is already settling",
+                            key
+                        )));
+                    }
+                    settling.shutdown_in_progress = true;
+                    settling.provider.clone()
+                }
+            }
+        };
+        match provider.shutdown().await {
+            Ok(()) => {
+                let mut sub_providers = self.sub_providers.write().await;
+                let remove = sub_providers
+                    .get(&key)
+                    .map(|entry| {
+                        matches!(
+                            entry,
+                            SubProviderRegistration::Settling(SubProviderSettling { provider: current, .. })
+                                if Arc::ptr_eq(current, &provider)
+                        )
+                    })
+                    .unwrap_or(false);
+                if remove {
+                    sub_providers.remove(&key);
+                }
+                tracing::info!(
+                    "Unregistered sub-provider '{}' for elastos://{}/...",
+                    provider.name(),
+                    key
+                );
+                Ok(())
+            }
+            Err(error) => {
+                let mut sub_providers = self.sub_providers.write().await;
+                if let Some(SubProviderRegistration::Settling(settling)) =
+                    sub_providers.get_mut(&key)
+                {
+                    if Arc::ptr_eq(&settling.provider, &provider) {
+                        settling.shutdown_in_progress = false;
+                    }
+                }
+                Err(error)
+            }
         }
     }
 
     /// Get a sub-provider by name (case-insensitive).
     async fn get_sub_provider(&self, name: &str) -> Option<Arc<dyn Provider>> {
         let key = name.to_lowercase();
-        self.sub_providers.read().await.get(&key).cloned()
+        self.sub_providers
+            .read()
+            .await
+            .get(&key)
+            .and_then(SubProviderRegistration::ready_provider)
     }
 
     /// Split an `elastos://` path into `(sub_name, remainder)`.
@@ -705,7 +817,10 @@ impl ProviderRegistry {
     /// List all registered `elastos://` sub-provider schemes.
     pub async fn sub_provider_schemes(&self) -> Vec<String> {
         let sub_providers = self.sub_providers.read().await;
-        sub_providers.keys().cloned().collect()
+        sub_providers
+            .iter()
+            .filter_map(|(name, entry)| entry.ready_provider().map(|_| name.clone()))
+            .collect()
     }
 
     /// Check if a scheme has a registered provider
@@ -725,15 +840,15 @@ impl ProviderRegistry {
                 route: route.clone(),
                 provider: provider.name().to_string(),
             })
-            .chain(
-                sub_providers
-                    .iter()
-                    .map(|(route, provider)| ProviderRegistration {
+            .chain(sub_providers.iter().filter_map(|(route, provider)| {
+                provider
+                    .ready_provider()
+                    .map(|provider| ProviderRegistration {
                         route_kind: "elastos-sub-provider".to_string(),
                         route: route.clone(),
                         provider: provider.name().to_string(),
-                    }),
-            )
+                    })
+            }))
             .collect::<Vec<_>>();
         registrations.sort_by(|left, right| {
             left.route_kind
@@ -824,7 +939,10 @@ impl ProviderRegistry {
         {
             let key = scheme.to_lowercase();
             let sub = self.sub_providers.read().await;
-            if let Some(provider) = sub.get(&key).cloned() {
+            if let Some(provider) = sub
+                .get(&key)
+                .and_then(SubProviderRegistration::ready_provider)
+            {
                 drop(sub);
                 return provider.send_raw(request).await;
             }
@@ -982,12 +1100,23 @@ fn validate_provider_transfer_contract(
         }
     }
     if let Some(route) = invocation.transport.carrier_route() {
-        if route.connect_ticket.trim().is_empty() {
-            return Err(ProviderError::Provider(
-                "Carrier provider invocation requires connect_ticket".to_string(),
-            ));
+        match route {
+            ProviderCarrierRoute::ConnectTicket { connect_ticket, .. } => {
+                if connect_ticket.trim().is_empty() {
+                    return Err(ProviderError::Provider(
+                        "Carrier provider invocation requires connect_ticket".to_string(),
+                    ));
+                }
+            }
+            ProviderCarrierRoute::PeerDid { peer_did, .. } => {
+                if peer_did.trim().is_empty() {
+                    return Err(ProviderError::Provider(
+                        "Carrier provider invocation requires peer_did".to_string(),
+                    ));
+                }
+            }
         }
-        if route.timeout_ms == Some(0) {
+        if route.timeout_ms() == Some(0) {
             return Err(ProviderError::Provider(
                 "Carrier provider invocation timeout_ms must be greater than zero".to_string(),
             ));
@@ -1000,10 +1129,20 @@ fn apply_provider_transfer_response(
     response: &mut serde_json::Value,
     invocation: &ProviderInvocation,
 ) -> Result<(), ProviderError> {
-    match invocation.transfer {
+    let result = match invocation.transfer {
         ProviderTransfer::Json => Ok(()),
         ProviderTransfer::Bytes => apply_provider_byte_range(response, invocation),
         ProviderTransfer::Stream => apply_provider_stream_response(response, invocation),
+    };
+    redact_public_provider_runtime_metadata(response);
+    result
+}
+
+fn redact_public_provider_runtime_metadata(response: &mut serde_json::Value) {
+    if let Some(runtime_invocation) = response.pointer_mut("/data/runtime_invocation") {
+        if let Some(object) = runtime_invocation.as_object_mut() {
+            object.insert("carrier".to_string(), serde_json::Value::Null);
+        }
     }
 }
 
@@ -1384,7 +1523,7 @@ fn provider_transfer_receipt(invocation: &ProviderInvocation, status: &str) -> s
         "op": invocation.op,
         "capability": provider_invocation_capability(invocation),
         "transport": invocation.transport.as_str(),
-        "carrier": provider_carrier_route_receipt(invocation),
+        "carrier": serde_json::Value::Null,
         "transfer": invocation.transfer.as_str(),
         "range": range,
         "progress": progress,
@@ -1407,7 +1546,7 @@ fn provider_invocation_envelope(invocation: &ProviderInvocation) -> serde_json::
         "op": invocation.op,
         "capability": provider_invocation_capability(invocation),
         "transport": invocation.transport.as_str(),
-        "carrier": provider_carrier_route_receipt(invocation),
+        "carrier": serde_json::Value::Null,
         "transfer": invocation.transfer.as_str(),
         "range": invocation.range.map(|range| serde_json::json!({
             "start": range.start,
@@ -1427,16 +1566,6 @@ fn provider_invocation_envelope(invocation: &ProviderInvocation) -> serde_json::
     envelope
 }
 
-fn provider_carrier_route_receipt(invocation: &ProviderInvocation) -> Option<serde_json::Value> {
-    invocation.transport.carrier_route().map(|route| {
-        serde_json::json!({
-            "route": "connect_ticket",
-            "peer_did": route.peer_did.as_deref(),
-            "timeout_ms": route.timeout_ms,
-        })
-    })
-}
-
 fn provider_invocation_capability(invocation: &ProviderInvocation) -> String {
     format!(
         "provider:{}->{}:{}",
@@ -1454,17 +1583,18 @@ impl Default for ProviderRegistry {
 impl ProviderRegistry {
     /// Register a sub-provider bypassing the reserved-name guard (test only).
     async fn register_sub_provider_unchecked(&self, name: &str, provider: Arc<dyn Provider>) {
-        self.sub_providers
-            .write()
-            .await
-            .insert(name.to_lowercase(), provider);
+        self.sub_providers.write().await.insert(
+            name.to_lowercase(),
+            SubProviderRegistration::Ready(provider),
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::Mutex;
+    use std::time::Duration;
+    use tokio::sync::{Mutex, Notify};
 
     /// In-memory mock provider for testing registry routing
     struct MockProvider {
@@ -1622,6 +1752,105 @@ mod tests {
         }
     }
 
+    struct BlockingShutdownProvider {
+        entered_shutdown: Notify,
+        release_shutdown: Notify,
+        fail_shutdown: bool,
+    }
+
+    impl BlockingShutdownProvider {
+        fn new() -> Self {
+            Self::with_failure(false)
+        }
+
+        fn failing() -> Self {
+            Self::with_failure(true)
+        }
+
+        fn with_failure(fail_shutdown: bool) -> Self {
+            Self {
+                entered_shutdown: Notify::new(),
+                release_shutdown: Notify::new(),
+                fail_shutdown,
+            }
+        }
+    }
+
+    struct RetryOnceShutdownProvider {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RetryOnceShutdownProvider {
+        fn new() -> Self {
+            Self {
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RetryOnceShutdownProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "retry-once mock only supports shutdown".into(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            vec!["retry-once"]
+        }
+
+        fn name(&self) -> &'static str {
+            "retry-once-shutdown"
+        }
+
+        async fn shutdown(&self) -> Result<(), ProviderError> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                Err(ProviderError::Provider(
+                    "unclean shutdown receipt after child exit".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for BlockingShutdownProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "blocking mock only supports shutdown".into(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            vec!["blocking"]
+        }
+
+        fn name(&self) -> &'static str {
+            "blocking-shutdown"
+        }
+
+        async fn shutdown(&self) -> Result<(), ProviderError> {
+            self.entered_shutdown.notify_waiters();
+            self.release_shutdown.notified().await;
+            if self.fail_shutdown {
+                Err(ProviderError::Provider(
+                    "blocking shutdown failed to settle".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     fn decode_test_stream_response(response: &serde_json::Value) -> Vec<u8> {
         decode_provider_stream_payload(&response["data"]["stream"]).unwrap()
     }
@@ -1639,10 +1868,25 @@ mod tests {
             invocation: &ProviderInvocation,
             request: serde_json::Value,
         ) -> Result<serde_json::Value, ProviderError> {
+            let (connect_ticket, peer_did, timeout_ms) = match route {
+                ProviderCarrierRoute::ConnectTicket {
+                    connect_ticket,
+                    peer_did,
+                    timeout_ms,
+                } => (
+                    Some(connect_ticket.as_str()),
+                    peer_did.as_deref(),
+                    *timeout_ms,
+                ),
+                ProviderCarrierRoute::PeerDid {
+                    peer_did,
+                    timeout_ms,
+                } => (None, Some(peer_did.as_str()), *timeout_ms),
+            };
             self.requests.lock().await.push(serde_json::json!({
-                "connect_ticket": route.connect_ticket.as_str(),
-                "peer_did": route.peer_did.as_deref(),
-                "timeout_ms": route.timeout_ms,
+                "connect_ticket": connect_ticket,
+                "peer_did": peer_did,
+                "timeout_ms": timeout_ms,
                 "source": invocation.source.as_str(),
                 "target": invocation.target.as_str(),
                 "op": invocation.op.as_str(),
@@ -2076,32 +2320,58 @@ mod tests {
     async fn test_provider_invocation_rejects_predeclared_runtime_metadata() {
         let registry = ProviderRegistry::new();
         registry.register(Arc::new(RawMockProvider)).await;
-
-        for reserved in ["_runtime_invocation", "_runtime_transfer"] {
-            let err = registry
-                .invoke_provider(ProviderInvocation {
-                    source: "content-provider".to_string(),
-                    target: "raw".to_string(),
-                    op: "ping".to_string(),
-                    request: serde_json::json!({
-                        "op": "ping",
-                        reserved: {
-                            "schema": "spoofed"
+        let err = registry
+            .invoke_provider(ProviderInvocation {
+                source: "content-provider".to_string(),
+                target: "raw".to_string(),
+                op: "ping".to_string(),
+                request: serde_json::json!({
+                    "op": "ping",
+                    "_runtime_invocation": {
+                        "schema": "elastos.provider.invocation/v1",
+                        "transport": "carrier-provider-plane",
+                        "carrier": {
+                            "route": "peer_did",
+                            "peer_did": "did:key:zInjected"
                         }
-                    }),
-                    transfer: ProviderTransfer::Json,
-                    range: None,
-                    progress: None,
-                    transport: ProviderInvocationTransport::Local,
-                })
-                .await
-                .expect_err("runtime metadata should be reserved");
+                    }
+                }),
+                transfer: ProviderTransfer::Json,
+                range: None,
+                progress: None,
+                transport: ProviderInvocationTransport::Local,
+            })
+            .await
+            .expect_err("runtime metadata should be reserved");
 
-            assert!(err
-                .to_string()
-                .contains("provider invocation request must not predeclare runtime field"));
-            assert!(err.to_string().contains(reserved));
-        }
+        assert!(err
+            .to_string()
+            .contains("provider invocation request must not predeclare runtime field"));
+        assert!(err.to_string().contains("_runtime_invocation"));
+
+        let err = registry
+            .invoke_provider(ProviderInvocation {
+                source: "content-provider".to_string(),
+                target: "raw".to_string(),
+                op: "ping".to_string(),
+                request: serde_json::json!({
+                    "op": "ping",
+                    "_runtime_transfer": {
+                        "schema": "spoofed"
+                    }
+                }),
+                transfer: ProviderTransfer::Json,
+                range: None,
+                progress: None,
+                transport: ProviderInvocationTransport::Local,
+            })
+            .await
+            .expect_err("runtime metadata should be reserved");
+
+        assert!(err
+            .to_string()
+            .contains("provider invocation request must not predeclare runtime field"));
+        assert!(err.to_string().contains("_runtime_transfer"));
     }
 
     #[tokio::test]
@@ -2116,11 +2386,13 @@ mod tests {
                 transfer: ProviderTransfer::Bytes,
                 range: None,
                 progress: None,
-                transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute {
-                    connect_ticket: "ticket-secret".to_string(),
-                    peer_did: Some("did:key:zRemote".to_string()),
-                    timeout_ms: Some(5_000),
-                }),
+                transport: ProviderInvocationTransport::Carrier(
+                    ProviderCarrierRoute::ConnectTicket {
+                        connect_ticket: "ticket-secret".to_string(),
+                        peer_did: Some("did:key:zRemote".to_string()),
+                        timeout_ms: Some(5_000),
+                    },
+                ),
             })
             .await
             .expect_err("Carrier invocation without invoker should fail closed");
@@ -2153,11 +2425,13 @@ mod tests {
                     request_id: "carrier-transfer:test".to_string(),
                     expected_bytes: Some(4),
                 }),
-                transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute {
-                    connect_ticket: "ticket-secret".to_string(),
-                    peer_did: Some("did:key:zRemote".to_string()),
-                    timeout_ms: Some(5_000),
-                }),
+                transport: ProviderInvocationTransport::Carrier(
+                    ProviderCarrierRoute::ConnectTicket {
+                        connect_ticket: "ticket-secret".to_string(),
+                        peer_did: Some("did:key:zRemote".to_string()),
+                        timeout_ms: Some(5_000),
+                    },
+                ),
             })
             .await
             .unwrap();
@@ -2171,20 +2445,16 @@ mod tests {
             "carrier-provider-plane"
         );
         assert_eq!(
-            response["data"]["runtime_invocation"]["carrier"]["route"],
-            "connect_ticket"
-        );
-        assert_eq!(
-            response["data"]["runtime_invocation"]["carrier"]["peer_did"],
-            "did:key:zRemote"
+            response["data"]["runtime_invocation"]["carrier"],
+            serde_json::Value::Null
         );
         assert_eq!(
             response["_runtime_transfer"]["transport"],
             "carrier-provider-plane"
         );
         assert_eq!(
-            response["_runtime_transfer"]["carrier"]["route"],
-            "connect_ticket"
+            response["_runtime_transfer"]["carrier"],
+            serde_json::Value::Null
         );
         assert_eq!(
             response["_runtime_transfer"]["progress"]["request_id"],
@@ -2196,8 +2466,54 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["connect_ticket"], "ticket-secret");
         assert_eq!(
+            requests[0]["request"]["_runtime_invocation"]["carrier"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
             requests[0]["request"]["_runtime_invocation"]["capability"],
             "provider:content-provider->content:fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_provider_invocation_peer_did_route_remains_runtime_internal() {
+        let registry = ProviderRegistry::new();
+        let invoker = Arc::new(MockCarrierInvoker::default());
+        registry.set_carrier_invoker(invoker.clone()).await;
+
+        let response = registry
+            .invoke_provider(ProviderInvocation {
+                source: "content-provider".to_string(),
+                target: "content".to_string(),
+                op: "fetch".to_string(),
+                request: serde_json::json!({ "op": "fetch" }),
+                transfer: ProviderTransfer::Json,
+                range: None,
+                progress: None,
+                transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                    peer_did: "did:key:zPeer".to_string(),
+                    timeout_ms: Some(2_000),
+                }),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response["data"]["runtime_invocation"]["carrier"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            response["_runtime_transfer"]["carrier"],
+            serde_json::Value::Null
+        );
+
+        let requests = invoker.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["connect_ticket"], serde_json::Value::Null);
+        assert_eq!(requests[0]["peer_did"], "did:key:zPeer");
+        assert_eq!(
+            requests[0]["request"]["_runtime_invocation"]["carrier"],
+            serde_json::Value::Null
         );
     }
 
@@ -2245,6 +2561,18 @@ mod tests {
             .unwrap();
         assert!(registry.get_sub_provider("did").await.is_some());
 
+        let duplicate_peer = Arc::new(MockProvider::new());
+        let original_peer = registry.get_sub_provider("peer").await.unwrap();
+        let duplicate = registry
+            .register_sub_provider("peer", duplicate_peer)
+            .await
+            .unwrap_err();
+        assert!(duplicate.to_string().contains("already registered"));
+        assert!(Arc::ptr_eq(
+            &original_peer,
+            &registry.get_sub_provider("peer").await.unwrap()
+        ));
+
         for name in [
             "chain",
             "wallet",
@@ -2252,6 +2580,8 @@ mod tests {
             "rights",
             "key",
             "decrypt",
+            "protect",
+            "custody",
             "availability",
             "block-graph",
             "object",
@@ -2264,8 +2594,118 @@ mod tests {
         }
 
         // Unregister removes the route (case-insensitive)
-        registry.unregister_sub_provider("DiD").await;
+        registry.unregister_sub_provider("DiD").await.unwrap();
         assert!(registry.get_sub_provider("did").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unregister_sub_provider_keeps_name_reserved_until_shutdown_settles() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = Arc::new(BlockingShutdownProvider::new());
+        registry
+            .register_sub_provider("custody", provider.clone())
+            .await
+            .unwrap();
+
+        let unregister_registry = registry.clone();
+        let unregister_task = tokio::spawn(async move {
+            unregister_registry
+                .unregister_sub_provider("custody")
+                .await
+                .unwrap();
+        });
+
+        provider.entered_shutdown.notified().await;
+
+        let schemes =
+            tokio::time::timeout(Duration::from_millis(100), registry.sub_provider_schemes())
+                .await
+                .expect("registry reads should not block on shutdown");
+        assert!(!schemes.iter().any(|scheme| scheme == "custody"));
+        assert!(registry.get_sub_provider("custody").await.is_none());
+        let replacement = registry
+            .register_sub_provider("custody", Arc::new(MockProvider::new()))
+            .await
+            .unwrap_err();
+        assert!(replacement.to_string().contains("already registered"));
+
+        provider.release_shutdown.notify_waiters();
+        unregister_task.await.unwrap();
+
+        registry
+            .register_sub_provider("custody", Arc::new(MockProvider::new()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_unregister_sub_provider_keeps_route_reserved_on_shutdown_failure() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = Arc::new(BlockingShutdownProvider::failing());
+        registry
+            .register_sub_provider("custody", provider.clone())
+            .await
+            .unwrap();
+
+        let unregister_registry = registry.clone();
+        let unregister_task = tokio::spawn(async move {
+            unregister_registry
+                .unregister_sub_provider("custody")
+                .await
+                .unwrap_err()
+        });
+
+        provider.entered_shutdown.notified().await;
+        provider.release_shutdown.notify_waiters();
+
+        let error = unregister_task.await.unwrap();
+        assert!(error
+            .to_string()
+            .contains("blocking shutdown failed to settle"));
+        assert!(registry.get_sub_provider("custody").await.is_none());
+        let schemes = registry.sub_provider_schemes().await;
+        assert!(!schemes.iter().any(|scheme| scheme == "custody"));
+        let replacement = registry
+            .register_sub_provider("custody", Arc::new(MockProvider::new()))
+            .await
+            .unwrap_err();
+        assert!(replacement.to_string().contains("already registered"));
+    }
+
+    #[tokio::test]
+    async fn test_unregister_sub_provider_retries_settling_provider_after_unclean_shutdown() {
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_sub_provider("custody", Arc::new(RetryOnceShutdownProvider::new()))
+            .await
+            .unwrap();
+
+        let first_error = registry
+            .unregister_sub_provider("custody")
+            .await
+            .unwrap_err();
+        assert!(first_error
+            .to_string()
+            .contains("unclean shutdown receipt after child exit"));
+        assert!(registry.get_sub_provider("custody").await.is_none());
+        let replacement = registry
+            .register_sub_provider("custody", Arc::new(MockProvider::new()))
+            .await
+            .unwrap_err();
+        assert!(replacement.to_string().contains("already registered"));
+
+        registry.unregister_sub_provider("custody").await.unwrap();
+        assert!(registry.get_sub_provider("custody").await.is_none());
+        assert!(!registry
+            .sub_provider_schemes()
+            .await
+            .iter()
+            .any(|scheme| scheme == "custody"));
+
+        registry
+            .register_sub_provider("custody", Arc::new(MockProvider::new()))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

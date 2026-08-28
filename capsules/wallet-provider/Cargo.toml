@@ -14,6 +14,7 @@ aes-gcm = "0.10"
 base64 = "0.22"
 bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 elastos-auth = { path = "../../elastos/crates/elastos-auth" }
+elastos-protected-content-contracts = { path = "../../elastos/crates/elastos-protected-content-contracts" }
 elastos-wallet-contract = { path = "../../elastos/crates/elastos-wallet-contract" }
 hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa"] }

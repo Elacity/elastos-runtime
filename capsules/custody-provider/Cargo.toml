@@ -1,0 +1,35 @@
+[package]
+name = "custody-provider"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS protected-content custody node provider capsule"
+license = "MIT"
+
+[[bin]]
+name = "custody-provider"
+path = "src/main.rs"
+
+[dependencies]
+ed25519-dalek = "2.1"
+elastos-protected-content-contracts = { path = "../../elastos/crates/elastos-protected-content-contracts" }
+elastos-protected-content-custody = { path = "../../elastos/crates/elastos-protected-content-custody" }
+elastos-protected-content-provider-contracts = { path = "../../elastos/crates/elastos-protected-content-provider-contracts" }
+elastos-protected-content-rights = { path = "../../elastos/crates/elastos-protected-content-rights" }
+getrandom = "0.2"
+sha2 = "0.10"
+nix = { version = "0.29", features = ["fs", "user"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+zeroize = "1.9"
+
+[dev-dependencies]
+elastos-auth = { path = "../../elastos/crates/elastos-auth" }
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"
+tempfile = "3.12"
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

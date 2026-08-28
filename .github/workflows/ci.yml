@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.91.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -30,6 +30,10 @@ jobs:
           bash scripts/check-wci-alignment.sh
           node scripts/home-entropy-check.mjs
           node scripts/browser-entropy-check.mjs
+      - name: product UI source proofs
+        run: |
+          node scripts/home-shell-regression-smoke.mjs
+          node scripts/people-discovery-smoke.mjs
       - name: Browser close handshake
         run: node --test scripts/browser-window-close-handshake.test.mjs
       - name: cargo clippy
@@ -44,12 +48,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
+      - name: build provider process binaries for tests
+        run: |
+          cargo build --release --manifest-path capsules/protected-content-protect-provider/Cargo.toml --target-dir capsules/protected-content-protect-provider/target
+          cargo build --release --manifest-path capsules/protected-content-decrypt-provider/Cargo.toml --target-dir capsules/protected-content-decrypt-provider/target
+          cargo build --release --manifest-path capsules/custody-provider/Cargo.toml --target-dir capsules/custody-provider/target
       - name: cargo test
         working-directory: elastos
+        env:
+          ELASTOS_TEST_PROTECT_PROVIDER_BIN: ${{ github.workspace }}/capsules/protected-content-protect-provider/target/release/protected-content-protect-provider
+          ELASTOS_TEST_DECRYPT_PROVIDER_BIN: ${{ github.workspace }}/capsules/protected-content-decrypt-provider/target/release/protected-content-decrypt-provider
+          ELASTOS_TEST_CUSTODY_PROVIDER_BIN: ${{ github.workspace }}/capsules/custody-provider/target/release/custody-provider
         run: cargo test --workspace
         # Network-sensitive tests are #[ignore] and won't run.
         # Run them explicitly with: cargo test --workspace -- --ignored
@@ -59,7 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos

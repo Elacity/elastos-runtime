@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Retirement guard only. This checks that the released provisional DRM, rights,
+# key, and decrypt provider capsules remain fail closed. It does not verify the
+# canonical Runtime -> rights -> custody -> decrypt architecture.
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
@@ -47,7 +51,7 @@ def provider_roundtrip(name, requests):
     if result.returncode != 0:
         sys.stderr.write(result.stderr)
         raise SystemExit(
-            f"[protected-content-provider-contract] {name} exited with {result.returncode}"
+            f"[protected-content-provisional-retirement-guard] {name} exited with {result.returncode}"
         )
     lines = [line for line in result.stdout.splitlines() if line.strip()]
     assert_eq(len(lines), len(requests), f"{name} response count")
@@ -272,5 +276,5 @@ check_rights_provider()
 check_key_provider()
 check_decrypt_provider()
 
-print("[protected-content-provider-contract] PASS")
+print("[protected-content-provisional-retirement-guard] PASS")
 PY

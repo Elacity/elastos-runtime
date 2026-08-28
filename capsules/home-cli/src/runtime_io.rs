@@ -51,14 +51,14 @@ fn request_capability(resource: &str, action: &str) -> Result<String> {
     })
 }
 
-fn carrier_invoke(
+fn resource_invoke(
     token: &str,
     uri: &str,
     operation: &str,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value> {
     with_client(
-        |client| match client.carrier_invoke(uri, operation, body, token) {
+        |client| match client.resource_invoke(uri, operation, body, token) {
             Ok(value) => Ok(value),
             Err(err) => Err(anyhow!("Action {} {} failed: {}", operation, uri, err)),
         },
@@ -70,16 +70,16 @@ fn storage_read_utf8(token: &str, path: &str) -> Result<Vec<u8>> {
         "path": path,
         "encoding": "utf8",
     });
-    let result = carrier_invoke(token, path, "read", &body)?;
+    let result = resource_invoke(token, path, "read", &body)?;
     storage_read_bytes_from_result(&result)
 }
 
 fn storage_result_body(result: &serde_json::Value) -> Result<&serde_json::Value> {
     let response = result.get("response").unwrap_or(result);
-    if response.get("type").and_then(|value| value.as_str()) == Some("carrier_result") {
+    if response.get("type").and_then(|value| value.as_str()) == Some("resource_result") {
         return response
             .get("result")
-            .ok_or_else(|| anyhow!("carrier_result response missing result"));
+            .ok_or_else(|| anyhow!("resource_result response missing result"));
     }
     Ok(response)
 }
@@ -134,7 +134,7 @@ fn storage_read_bytes_from_result(result: &serde_json::Value) -> Result<Vec<u8>>
 }
 
 fn storage_write(token: &str, path: &str, content: Vec<u8>) -> Result<()> {
-    carrier_invoke(
+    resource_invoke(
         token,
         path,
         "write",

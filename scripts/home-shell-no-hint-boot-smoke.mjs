@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260725a";
+const moduleVersion = "home-20260802a";
 const requests = [];
 const localStorageValues = new Map([
   ["elastos.home.active-shell-hint", "home-gui"],
@@ -49,12 +49,14 @@ const homeGuiSelectors = [
   "#launcher-empty-state",
   "#launcher-search",
   "#launcher-toggle",
-  "#close-launcher",
+  "#launcher-view-toggle",
   "#toolbar-home",
+  "#toolbar-system",
+  "#toolbar-active-title",
   "#toolbar-inbox",
   "#toolbar-inbox-count",
-  "#toolbar-fullscreen",
-  "#toolbar-sign-out",
+  "#control-centre-fullscreen",
+  "#identity-menu-sign-out",
   "#clock",
   "#taskbar-targets",
   "#launcher-item-template",

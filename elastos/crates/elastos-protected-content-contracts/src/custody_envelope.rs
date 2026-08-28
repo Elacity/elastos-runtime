@@ -1,0 +1,1122 @@
+use curve25519_dalek::{constants::X25519_LOW_ORDER_POINTS, montgomery::MontgomeryPoint};
+use x_wing::TryKeyInit as _;
+
+use crate::canonical::{CanonicalBody, ContractError, Decoder, Encoder};
+use crate::custody_epoch::validate_custody_node_set;
+use crate::{
+    CanonicalContract, CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIdentityV1,
+    CustodyPoolIdentityV1, Digest32, EncryptedContentIdentityV1, KeyEnvelopeIdentityV1,
+    NodePublicKey, NodeSetV1, ProtectedContentBindingV1, RecipientKeyIdentityV1, ThresholdV1,
+};
+
+pub const CUSTODY_X_WING_AES256GCM_SUITE_ID_V1: &str =
+    "elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1";
+pub const CONTENT_KEY_COMMITMENT_DOMAIN_V1: &[u8] =
+    b"elastos.protected-content.content-key-commitment/v1";
+pub const STORED_SHARE_HPKE_INFO_V1: &[u8] = b"elastos.protected-content.stored-share/v1";
+pub const RELEASED_SHARE_HPKE_INFO_V1: &[u8] = b"elastos.protected-content.released-share/v1";
+pub const PQ_HYBRID_ML_KEM_768_EK_BYTES: usize = 1184;
+pub const PQ_HYBRID_X25519_PUBLIC_KEY_BYTES: usize = 32;
+pub const PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES: usize =
+    PQ_HYBRID_ML_KEM_768_EK_BYTES + PQ_HYBRID_X25519_PUBLIC_KEY_BYTES;
+pub const X_WING_DRAFT06_CIPHERTEXT_BYTES: usize = 1120;
+pub const PQ_HYBRID_AEAD_NONCE_BYTES: usize = 12;
+pub const PQ_HYBRID_WRAPPED_SHARE_BYTES: usize = 48;
+pub const PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES: usize =
+    X_WING_DRAFT06_CIPHERTEXT_BYTES + PQ_HYBRID_AEAD_NONCE_BYTES + PQ_HYBRID_WRAPPED_SHARE_BYTES;
+pub const PQ_HYBRID_SEALED_SHARE_MIN_BYTES: usize = PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES;
+pub const PQ_HYBRID_SEALED_SHARE_MAX_BYTES: usize = PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES;
+
+const X25519_MODULUS: [u8; 32] = [
+    0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+];
+
+pub(crate) fn validate_pq_hybrid_wrap_public_key(
+    bytes: &[u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES],
+    field: &'static str,
+) -> Result<(), ContractError> {
+    let mut x25519 = [0u8; PQ_HYBRID_X25519_PUBLIC_KEY_BYTES];
+    x25519.copy_from_slice(&bytes[PQ_HYBRID_ML_KEM_768_EK_BYTES..]);
+    validate_canonical_x25519_public_key(x25519, field)?;
+    if bytes[..PQ_HYBRID_ML_KEM_768_EK_BYTES]
+        .iter()
+        .all(|byte| *byte == 0)
+    {
+        return Err(ContractError::InvalidField(field));
+    }
+    x_wing::EncapsulationKey::new_from_slice(bytes)
+        .map_err(|_| ContractError::InvalidField(field))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeCustodyPublicKeyV1([u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES]);
+
+impl NodeCustodyPublicKeyV1 {
+    pub fn new(bytes: [u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES]) -> Result<Self, ContractError> {
+        validate_pq_hybrid_wrap_public_key(&bytes, "node_custody_public_key")?;
+        Ok(Self(bytes))
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES] {
+        &self.0
+    }
+
+    pub fn matches_public_key_bytes(&self, bytes: &[u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES]) -> bool {
+        &self.0 == bytes
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ShareCoordinateV1(u8);
+
+impl ShareCoordinateV1 {
+    pub fn new(value: u8) -> Result<Self, ContractError> {
+        if value == 0 {
+            return Err(ContractError::InvalidField("share_coordinate"));
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CustodyNodeIdentityV1 {
+    node_public_key: NodePublicKey,
+    custody_public_key: NodeCustodyPublicKeyV1,
+    pub(crate) share_coordinate: ShareCoordinateV1,
+}
+
+impl CustodyNodeIdentityV1 {
+    pub fn new(
+        node_public_key: NodePublicKey,
+        custody_public_key: NodeCustodyPublicKeyV1,
+        share_coordinate: ShareCoordinateV1,
+    ) -> Result<Self, ContractError> {
+        let value = Self {
+            node_public_key,
+            custody_public_key,
+            share_coordinate,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub const fn node_public_key(&self) -> NodePublicKey {
+        self.node_public_key
+    }
+
+    pub const fn custody_public_key(&self) -> NodeCustodyPublicKeyV1 {
+        self.custody_public_key
+    }
+
+    pub const fn share_coordinate(&self) -> ShareCoordinateV1 {
+        self.share_coordinate
+    }
+
+    pub fn stored_share_aad_bytes(
+        &self,
+        manifest_hash: Digest32,
+    ) -> Result<Vec<u8>, ContractError> {
+        StoredShareAadV1::new(manifest_hash, self.clone())?.canonical_bytes()
+    }
+
+    pub fn released_share_aad_bytes(
+        &self,
+        release_request_hash: Digest32,
+        binding: &ProtectedContentBindingV1,
+        decision_hash: Digest32,
+        recipient: &RecipientKeyIdentityV1,
+    ) -> Result<Vec<u8>, ContractError> {
+        ReleasedShareAadV1::new(
+            release_request_hash,
+            binding.clone(),
+            decision_hash,
+            self.clone(),
+            recipient.clone(),
+        )?
+        .canonical_bytes()
+    }
+}
+
+impl CanonicalBody for CustodyNodeIdentityV1 {
+    const DOMAIN: &'static str = "elastos.protected-content.custody-node-identity/v1";
+
+    fn validate(&self) -> Result<(), ContractError> {
+        NodePublicKey::new(*self.node_public_key.as_bytes())?;
+        NodeCustodyPublicKeyV1::new(*self.custody_public_key.as_bytes())?;
+        ShareCoordinateV1::new(self.share_coordinate.get())?;
+        Ok(())
+    }
+
+    fn encode_fields(&self, encoder: &mut Encoder) -> Result<(), ContractError> {
+        encoder.fixed(self.node_public_key.as_bytes());
+        encoder.fixed(self.custody_public_key.as_bytes());
+        encoder.u8(self.share_coordinate.get());
+        Ok(())
+    }
+
+    fn decode_fields(decoder: &mut Decoder<'_>) -> Result<Self, ContractError> {
+        Self::new(
+            NodePublicKey::new(decoder.fixed()?)?,
+            NodeCustodyPublicKeyV1::new(decoder.fixed()?)?,
+            ShareCoordinateV1::new(decoder.u8()?)?,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyEnvelopeManifestV1 {
+    encrypted_content: EncryptedContentIdentityV1,
+    custody_pool: CustodyPoolIdentityV1,
+    custody_epoch: CustodyEpochIdentityV1,
+    custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
+    threshold: ThresholdV1,
+    content_key_commitment: Digest32,
+    nodes: Vec<CustodyNodeIdentityV1>,
+}
+
+impl CustodyEnvelopeManifestV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        encrypted_content: EncryptedContentIdentityV1,
+        custody_pool: CustodyPoolIdentityV1,
+        custody_epoch: CustodyEpochIdentityV1,
+        custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
+        threshold: ThresholdV1,
+        content_key_commitment: Digest32,
+        mut nodes: Vec<CustodyNodeIdentityV1>,
+    ) -> Result<Self, ContractError> {
+        nodes.sort_unstable_by_key(|node| node.node_public_key());
+        for (index, node) in nodes.iter_mut().enumerate() {
+            node.share_coordinate = ShareCoordinateV1::new(
+                u8::try_from(index + 1)
+                    .map_err(|_| ContractError::InvalidField("share_coordinate"))?,
+            )?;
+        }
+        let value = Self {
+            encrypted_content,
+            custody_pool,
+            custody_epoch,
+            custody_committee_authorization,
+            threshold,
+            content_key_commitment,
+            nodes,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn encrypted_content(&self) -> &EncryptedContentIdentityV1 {
+        &self.encrypted_content
+    }
+
+    pub const fn custody_pool(&self) -> CustodyPoolIdentityV1 {
+        self.custody_pool
+    }
+
+    pub const fn threshold(&self) -> ThresholdV1 {
+        self.threshold
+    }
+
+    pub const fn custody_epoch(&self) -> CustodyEpochIdentityV1 {
+        self.custody_epoch
+    }
+
+    pub const fn custody_committee_authorization(&self) -> CustodyCommitteeAuthorizationIdentityV1 {
+        self.custody_committee_authorization
+    }
+
+    pub const fn content_key_commitment(&self) -> Digest32 {
+        self.content_key_commitment
+    }
+
+    pub fn nodes(&self) -> &[CustodyNodeIdentityV1] {
+        &self.nodes
+    }
+
+    pub fn manifest_hash(&self) -> Result<Digest32, ContractError> {
+        self.canonical_hash()
+    }
+
+    pub fn node_set(&self) -> Result<NodeSetV1, ContractError> {
+        NodeSetV1::new(
+            self.threshold,
+            self.nodes
+                .iter()
+                .map(|node| node.node_public_key())
+                .collect(),
+        )
+    }
+
+    pub fn node_index(&self, node_public_key: NodePublicKey) -> Option<usize> {
+        self.nodes
+            .binary_search_by_key(&node_public_key, |node| node.node_public_key())
+            .ok()
+    }
+
+    pub fn node(&self, node_public_key: NodePublicKey) -> Option<&CustodyNodeIdentityV1> {
+        self.node_index(node_public_key)
+            .map(|index| &self.nodes[index])
+    }
+
+    pub fn stored_share_aad_bytes_for_node(
+        &self,
+        node_public_key: NodePublicKey,
+    ) -> Result<Vec<u8>, ContractError> {
+        let node = self
+            .node(node_public_key)
+            .ok_or(ContractError::InvalidField("custody_node"))?;
+        node.stored_share_aad_bytes(self.manifest_hash()?)
+    }
+}
+
+impl CanonicalBody for CustodyEnvelopeManifestV1 {
+    const DOMAIN: &'static str = "elastos.protected-content.custody-envelope-manifest/v1";
+
+    fn validate(&self) -> Result<(), ContractError> {
+        self.encrypted_content.validate()?;
+        self.custody_pool.validate()?;
+        self.custody_epoch.validate()?;
+        self.custody_committee_authorization.validate()?;
+        validate_custody_node_set(&self.nodes, self.threshold, "custody_manifest.nodes")
+    }
+
+    fn encode_fields(&self, encoder: &mut Encoder) -> Result<(), ContractError> {
+        encoder.nested(&self.encrypted_content)?;
+        encoder.nested(&self.custody_pool)?;
+        encoder.nested(&self.custody_epoch)?;
+        encoder.nested(&self.custody_committee_authorization)?;
+        self.threshold.encode(encoder);
+        encoder.fixed(self.content_key_commitment.as_bytes());
+        encoder.u8(self.nodes.len() as u8);
+        for node in &self.nodes {
+            encoder.nested(node)?;
+        }
+        Ok(())
+    }
+
+    fn decode_fields(decoder: &mut Decoder<'_>) -> Result<Self, ContractError> {
+        let encrypted_content = decoder.nested("encrypted_content")?;
+        let custody_pool = decoder.nested("custody_pool")?;
+        let custody_epoch = decoder.nested("custody_epoch")?;
+        let custody_committee_authorization = decoder.nested("custody_committee_authorization")?;
+        let threshold = ThresholdV1::decode(decoder)?;
+        let content_key_commitment = Digest32::new(decoder.fixed()?);
+        let count = usize::from(decoder.u8()?);
+        let mut nodes = Vec::with_capacity(count);
+        for _ in 0..count {
+            nodes.push(decoder.nested("custody_node")?);
+        }
+        Self::new(
+            encrypted_content,
+            custody_pool,
+            custody_epoch,
+            custody_committee_authorization,
+            threshold,
+            content_key_commitment,
+            nodes,
+        )
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PqHybridSealedShareV1 {
+    envelope: Vec<u8>,
+}
+
+impl std::fmt::Debug for PqHybridSealedShareV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PqHybridSealedShareV1")
+            .field("envelope", &"[redacted]")
+            .finish()
+    }
+}
+
+impl PqHybridSealedShareV1 {
+    pub fn new(envelope: Vec<u8>) -> Result<Self, ContractError> {
+        let value = Self { envelope };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn envelope(&self) -> &[u8] {
+        &self.envelope
+    }
+
+    pub fn tamper_envelope(&self) -> Self {
+        let mut envelope = self.envelope.clone();
+        let index = X_WING_DRAFT06_CIPHERTEXT_BYTES + PQ_HYBRID_AEAD_NONCE_BYTES;
+        envelope[index] ^= 0x55;
+        Self::new(envelope).expect("tamper keeps PQ-hybrid share structure")
+    }
+}
+
+impl CanonicalBody for PqHybridSealedShareV1 {
+    const DOMAIN: &'static str = "elastos.protected-content.pq-hybrid-sealed-share/v1";
+
+    fn validate(&self) -> Result<(), ContractError> {
+        if self.envelope.len() != PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES {
+            return Err(ContractError::InvalidField("pq_hybrid_envelope"));
+        }
+        let eph: [u8; PQ_HYBRID_X25519_PUBLIC_KEY_BYTES] = self.envelope
+            [X_WING_DRAFT06_CIPHERTEXT_BYTES - PQ_HYBRID_X25519_PUBLIC_KEY_BYTES
+                ..X_WING_DRAFT06_CIPHERTEXT_BYTES]
+            .try_into()
+            .map_err(|_| ContractError::InvalidField("pq_hybrid_eph_x25519"))?;
+        validate_canonical_x25519_public_key(eph, "pq_hybrid_eph_x25519")?;
+        Ok(())
+    }
+
+    fn encode_fields(&self, encoder: &mut Encoder) -> Result<(), ContractError> {
+        encoder.bytes(&self.envelope)
+    }
+
+    fn decode_fields(decoder: &mut Decoder<'_>) -> Result<Self, ContractError> {
+        Self::new(decoder.bytes("pq_hybrid_envelope", PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES)?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyEnvelopeV1 {
+    manifest: CustodyEnvelopeManifestV1,
+    stored_shares: Vec<PqHybridSealedShareV1>,
+}
+
+impl CustodyEnvelopeV1 {
+    pub fn new(
+        manifest: CustodyEnvelopeManifestV1,
+        stored_shares: Vec<PqHybridSealedShareV1>,
+    ) -> Result<Self, ContractError> {
+        let value = Self {
+            manifest,
+            stored_shares,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn manifest(&self) -> &CustodyEnvelopeManifestV1 {
+        &self.manifest
+    }
+
+    pub fn stored_shares(&self) -> &[PqHybridSealedShareV1] {
+        &self.stored_shares
+    }
+
+    pub fn stored_share_for_node(
+        &self,
+        node_public_key: NodePublicKey,
+    ) -> Option<&PqHybridSealedShareV1> {
+        self.manifest
+            .node_index(node_public_key)
+            .map(|index| &self.stored_shares[index])
+    }
+
+    pub fn key_envelope_identity(&self) -> Result<KeyEnvelopeIdentityV1, ContractError> {
+        KeyEnvelopeIdentityV1::new(
+            self.manifest.encrypted_content.clone(),
+            self.canonical_hash()?,
+            u32::try_from(self.canonical_bytes()?.len())
+                .map_err(|_| ContractError::FieldTooLong("custody_envelope"))?,
+            self.manifest.node_set()?.node_set_id()?,
+            self.manifest.threshold,
+            self.manifest.custody_pool,
+            self.manifest.custody_epoch,
+            self.manifest.custody_committee_authorization,
+        )
+    }
+
+    pub fn matches_key_envelope_identity(
+        &self,
+        key_envelope: &KeyEnvelopeIdentityV1,
+    ) -> Result<bool, ContractError> {
+        Ok(self.key_envelope_identity()? == *key_envelope)
+    }
+}
+
+impl CanonicalBody for CustodyEnvelopeV1 {
+    const DOMAIN: &'static str = "elastos.protected-content.custody-envelope/v1";
+
+    fn validate(&self) -> Result<(), ContractError> {
+        self.manifest.canonical_bytes()?;
+        if self.stored_shares.len() != self.manifest.nodes.len() {
+            return Err(ContractError::InvalidField("stored_shares"));
+        }
+        for stored_share in &self.stored_shares {
+            stored_share.canonical_bytes()?;
+        }
+        Ok(())
+    }
+
+    fn encode_fields(&self, encoder: &mut Encoder) -> Result<(), ContractError> {
+        encoder.nested(&self.manifest)?;
+        encoder.u8(self.stored_shares.len() as u8);
+        for stored_share in &self.stored_shares {
+            encoder.nested(stored_share)?;
+        }
+        Ok(())
+    }
+
+    fn decode_fields(decoder: &mut Decoder<'_>) -> Result<Self, ContractError> {
+        let manifest = decoder.nested("custody_manifest")?;
+        let count = usize::from(decoder.u8()?);
+        let mut stored_shares = Vec::with_capacity(count);
+        for _ in 0..count {
+            stored_shares.push(decoder.nested("stored_share")?);
+        }
+        Self::new(manifest, stored_shares)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredShareAadV1 {
+    manifest_hash: Digest32,
+    node: CustodyNodeIdentityV1,
+}
+
+impl StoredShareAadV1 {
+    fn new(manifest_hash: Digest32, node: CustodyNodeIdentityV1) -> Result<Self, ContractError> {
+        let value = Self {
+            manifest_hash,
+            node,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+}
+
+impl CanonicalBody for StoredShareAadV1 {
+    const DOMAIN: &'static str = "elastos.protected-content.stored-share-aad/v1";
+
+    fn validate(&self) -> Result<(), ContractError> {
+        self.node.canonical_bytes()?;
+        Ok(())
+    }
+
+    fn encode_fields(&self, encoder: &mut Encoder) -> Result<(), ContractError> {
+        encoder.fixed(self.manifest_hash.as_bytes());
+        encoder.nested(&self.node)?;
+        Ok(())
+    }
+
+    fn decode_fields(decoder: &mut Decoder<'_>) -> Result<Self, ContractError> {
+        Self::new(
+            Digest32::new(decoder.fixed()?),
+            decoder.nested("custody_node")?,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleasedShareAadV1 {
+    release_request_hash: Digest32,
+    binding: ProtectedContentBindingV1,
+    decision_hash: Digest32,
+    node: CustodyNodeIdentityV1,
+    recipient: RecipientKeyIdentityV1,
+}
+
+impl ReleasedShareAadV1 {
+    fn new(
+        release_request_hash: Digest32,
+        binding: ProtectedContentBindingV1,
+        decision_hash: Digest32,
+        node: CustodyNodeIdentityV1,
+        recipient: RecipientKeyIdentityV1,
+    ) -> Result<Self, ContractError> {
+        let value = Self {
+            release_request_hash,
+            binding,
+            decision_hash,
+            node,
+            recipient,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+}
+
+impl CanonicalBody for ReleasedShareAadV1 {
+    const DOMAIN: &'static str = "elastos.protected-content.released-share-aad/v1";
+
+    fn validate(&self) -> Result<(), ContractError> {
+        self.binding.canonical_bytes()?;
+        self.node.canonical_bytes()?;
+        self.recipient.canonical_bytes()?;
+        Ok(())
+    }
+
+    fn encode_fields(&self, encoder: &mut Encoder) -> Result<(), ContractError> {
+        encoder.fixed(self.release_request_hash.as_bytes());
+        encoder.nested(&self.binding)?;
+        encoder.fixed(self.decision_hash.as_bytes());
+        encoder.nested(&self.node)?;
+        encoder.nested(&self.recipient)?;
+        Ok(())
+    }
+
+    fn decode_fields(decoder: &mut Decoder<'_>) -> Result<Self, ContractError> {
+        Self::new(
+            Digest32::new(decoder.fixed()?),
+            decoder.nested("binding")?,
+            Digest32::new(decoder.fixed()?),
+            decoder.nested("custody_node")?,
+            decoder.nested("recipient")?,
+        )
+    }
+}
+
+pub(crate) fn validate_canonical_x25519_public_key(
+    bytes: [u8; 32],
+    field: &'static str,
+) -> Result<(), ContractError> {
+    // RFC 7748 X25519 accepts non-canonical u-coordinate encodings at the
+    // primitive boundary. This contract intentionally applies a stricter local
+    // canonical-identity rule for stored public keys and HPKE encapped keys:
+    // exact canonical bytes only, plus low-order rejection before HPKE use.
+    if bytes[31] & 0x80 != 0 || le_bytes_ge(bytes, X25519_MODULUS) {
+        return Err(ContractError::InvalidField(field));
+    }
+    let point = MontgomeryPoint(bytes);
+    if X25519_LOW_ORDER_POINTS.contains(&point) {
+        return Err(ContractError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn le_bytes_ge(lhs: [u8; 32], rhs: [u8; 32]) -> bool {
+    for index in (0..32).rev() {
+        if lhs[index] != rhs[index] {
+            return lhs[index] > rhs[index];
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use curve25519_dalek::constants::X25519_LOW_ORDER_POINTS;
+    use ed25519_dalek::SigningKey;
+    use hex::encode;
+    use x_wing::TryKeyInit as _;
+
+    use super::*;
+    use crate::test_support::{
+        node_custody_public_key as shared_node_custody_public_key,
+        sealed_share as shared_sealed_share, xwing_public_key_bytes,
+    };
+
+    fn digest(byte: u8) -> Digest32 {
+        Digest32::new([byte; 32])
+    }
+
+    fn node_public_key(seed: u8) -> NodePublicKey {
+        let key = SigningKey::from_bytes(&[seed; 32]);
+        NodePublicKey::new(key.verifying_key().to_bytes()).unwrap()
+    }
+
+    fn custody_public_key(seed: u8) -> NodeCustodyPublicKeyV1 {
+        shared_node_custody_public_key(seed)
+    }
+
+    fn node(seed: u8, coordinate: u8) -> CustodyNodeIdentityV1 {
+        CustodyNodeIdentityV1::new(
+            node_public_key(seed),
+            custody_public_key(seed),
+            ShareCoordinateV1::new(coordinate).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn encrypted_content(byte: u8) -> EncryptedContentIdentityV1 {
+        EncryptedContentIdentityV1::new(digest(byte), 4096).unwrap()
+    }
+
+    fn content_key_commitment(seed: u8) -> Digest32 {
+        digest(seed)
+    }
+
+    fn custody_epoch_identity() -> CustodyEpochIdentityV1 {
+        CustodyEpochIdentityV1::new(digest(0x33), 512).unwrap()
+    }
+
+    fn custody_pool_identity(seed: u8) -> CustodyPoolIdentityV1 {
+        CustodyPoolIdentityV1::new(digest(seed), 512).unwrap()
+    }
+
+    fn custody_committee_authorization_identity(
+        seed: u8,
+    ) -> CustodyCommitteeAuthorizationIdentityV1 {
+        CustodyCommitteeAuthorizationIdentityV1::new(digest(seed), 512).unwrap()
+    }
+
+    fn manifest() -> CustodyEnvelopeManifestV1 {
+        CustodyEnvelopeManifestV1::new(
+            encrypted_content(0x11),
+            custody_pool_identity(0x35),
+            custody_epoch_identity(),
+            custody_committee_authorization_identity(0x36),
+            ThresholdV1::new(2, 3).unwrap(),
+            content_key_commitment(0x19),
+            vec![node(3, 3), node(1, 1), node(2, 2)],
+        )
+        .unwrap()
+    }
+
+    fn stored_share(seed: u8) -> PqHybridSealedShareV1 {
+        shared_sealed_share(seed)
+    }
+
+    fn valid_x25519_public_key_bytes(seed: u8) -> [u8; 32] {
+        let bytes = xwing_public_key_bytes(seed);
+        bytes[PQ_HYBRID_ML_KEM_768_EK_BYTES..].try_into().unwrap()
+    }
+
+    fn recipient(seed: u8) -> RecipientKeyIdentityV1 {
+        RecipientKeyIdentityV1::new(CUSTODY_X_WING_AES256GCM_SUITE_ID_V1, digest(seed)).unwrap()
+    }
+
+    #[test]
+    fn custody_manifest_sorts_nodes_and_assigns_deterministic_coordinates() {
+        let manifest = manifest();
+        let mut expected = vec![node_public_key(1), node_public_key(2), node_public_key(3)];
+        expected.sort_unstable();
+        assert_eq!(
+            manifest
+                .nodes()
+                .iter()
+                .map(|node| node.node_public_key())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            manifest
+                .nodes()
+                .iter()
+                .map(|node| node.share_coordinate().get())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn custody_envelope_round_trip_and_identity_vector_are_stable() {
+        let envelope = CustodyEnvelopeV1::new(
+            manifest(),
+            vec![stored_share(1), stored_share(2), stored_share(3)],
+        )
+        .unwrap();
+        let canonical = envelope.canonical_bytes().unwrap();
+        let decoded = CustodyEnvelopeV1::from_canonical_bytes(&canonical).unwrap();
+        assert_eq!(decoded, envelope);
+
+        assert_eq!(
+            encode(envelope.canonical_hash().unwrap().as_bytes()),
+            "508a9c5d23d00158b1373f183cf9be9749c87f6bad6ce3436efcf8551eed19de"
+        );
+
+        let key_envelope = envelope.key_envelope_identity().unwrap();
+        assert_eq!(
+            key_envelope.encrypted_content(),
+            envelope.manifest().encrypted_content()
+        );
+        assert_eq!(
+            key_envelope.node_set_id(),
+            envelope
+                .manifest()
+                .node_set()
+                .unwrap()
+                .node_set_id()
+                .unwrap()
+        );
+        assert_eq!(
+            key_envelope.custody_pool(),
+            envelope.manifest().custody_pool()
+        );
+        assert_eq!(
+            key_envelope.custody_committee_authorization(),
+            envelope.manifest().custody_committee_authorization()
+        );
+    }
+
+    #[test]
+    fn custody_manifest_rejects_duplicate_keys_bad_coordinates_and_bad_counts() {
+        assert_eq!(
+            ShareCoordinateV1::new(0),
+            Err(ContractError::InvalidField("share_coordinate"))
+        );
+
+        let threshold = ThresholdV1::new(2, 3).unwrap();
+        assert_eq!(
+            CustodyEnvelopeManifestV1::new(
+                encrypted_content(0x11),
+                custody_pool_identity(0x35),
+                custody_epoch_identity(),
+                custody_committee_authorization_identity(0x36),
+                threshold,
+                content_key_commitment(0x19),
+                vec![
+                    node(1, 1),
+                    CustodyNodeIdentityV1::new(
+                        node_public_key(2),
+                        custody_public_key(1),
+                        ShareCoordinateV1::new(2).unwrap()
+                    )
+                    .unwrap(),
+                    node(3, 3),
+                ],
+            ),
+            Err(ContractError::InvalidField("node_custody_public_key"))
+        );
+
+        assert_eq!(
+            CustodyEnvelopeManifestV1::new(
+                encrypted_content(0x11),
+                custody_pool_identity(0x35),
+                custody_epoch_identity(),
+                custody_committee_authorization_identity(0x36),
+                threshold,
+                content_key_commitment(0x19),
+                vec![node(1, 1), node(2, 2)],
+            ),
+            Err(ContractError::InvalidField("custody_manifest.nodes"))
+        );
+    }
+
+    #[test]
+    fn custody_public_key_rejects_low_order_noncanonical_and_high_bit_alias_bytes() {
+        for low_order in X25519_LOW_ORDER_POINTS.iter() {
+            let mut bytes = xwing_public_key_bytes(0x41);
+            bytes[PQ_HYBRID_ML_KEM_768_EK_BYTES..].copy_from_slice(&low_order.to_bytes());
+            assert_eq!(
+                NodeCustodyPublicKeyV1::new(bytes),
+                Err(ContractError::InvalidField("node_custody_public_key"))
+            );
+        }
+        let mut modulus = xwing_public_key_bytes(0x41);
+        modulus[PQ_HYBRID_ML_KEM_768_EK_BYTES..].copy_from_slice(&X25519_MODULUS);
+        assert_eq!(
+            NodeCustodyPublicKeyV1::new(modulus),
+            Err(ContractError::InvalidField("node_custody_public_key"))
+        );
+        let mut p_plus_one = X25519_MODULUS;
+        p_plus_one[0] = p_plus_one[0].wrapping_add(1);
+        let mut p_plus_one_bytes = xwing_public_key_bytes(0x41);
+        p_plus_one_bytes[PQ_HYBRID_ML_KEM_768_EK_BYTES..].copy_from_slice(&p_plus_one);
+        assert_eq!(
+            NodeCustodyPublicKeyV1::new(p_plus_one_bytes),
+            Err(ContractError::InvalidField("node_custody_public_key"))
+        );
+        let mut high_bit_alias = valid_x25519_public_key_bytes(0x51);
+        high_bit_alias[31] |= 0x80;
+        let mut high_bit_alias_bytes = xwing_public_key_bytes(0x51);
+        high_bit_alias_bytes[PQ_HYBRID_ML_KEM_768_EK_BYTES..].copy_from_slice(&high_bit_alias);
+        assert_eq!(
+            NodeCustodyPublicKeyV1::new(high_bit_alias_bytes),
+            Err(ContractError::InvalidField("node_custody_public_key"))
+        );
+        let mut zero_mlkem = xwing_public_key_bytes(0x41);
+        zero_mlkem[..PQ_HYBRID_ML_KEM_768_EK_BYTES].fill(0);
+        assert_eq!(
+            NodeCustodyPublicKeyV1::new(zero_mlkem),
+            Err(ContractError::InvalidField("node_custody_public_key"))
+        );
+    }
+
+    #[test]
+    fn custody_public_key_accepts_generated_valid_bytes_and_rejects_old_wire_order() {
+        let valid = xwing_public_key_bytes(0x41);
+        assert!(NodeCustodyPublicKeyV1::new(valid).is_ok());
+        let mut old_order = [0u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES];
+        old_order[..PQ_HYBRID_X25519_PUBLIC_KEY_BYTES]
+            .copy_from_slice(&valid[PQ_HYBRID_ML_KEM_768_EK_BYTES..]);
+        old_order[PQ_HYBRID_X25519_PUBLIC_KEY_BYTES..]
+            .copy_from_slice(&valid[..PQ_HYBRID_ML_KEM_768_EK_BYTES]);
+        assert!(x_wing::EncapsulationKey::new_from_slice(&old_order).is_err());
+        assert_eq!(
+            NodeCustodyPublicKeyV1::new(old_order),
+            Err(ContractError::InvalidField("node_custody_public_key"))
+        );
+    }
+
+    #[test]
+    fn custody_envelope_rejects_wrong_share_count_and_noncanonical_lengths() {
+        let manifest = manifest();
+        assert_eq!(
+            CustodyEnvelopeV1::new(manifest.clone(), vec![stored_share(1), stored_share(2)]),
+            Err(ContractError::InvalidField("stored_shares"))
+        );
+
+        let canonical = stored_share(1).canonical_bytes().unwrap();
+        assert_eq!(
+            PqHybridSealedShareV1::from_canonical_bytes(&canonical[..canonical.len() - 1]),
+            Err(ContractError::UnexpectedEnd)
+        );
+    }
+
+    #[test]
+    fn pq_hybrid_sealed_share_rejects_invalid_ciphertext_component() {
+        let valid = shared_sealed_share(0x62);
+        let mut envelope = valid.envelope().to_vec();
+        envelope[X_WING_DRAFT06_CIPHERTEXT_BYTES - PQ_HYBRID_X25519_PUBLIC_KEY_BYTES
+            ..X_WING_DRAFT06_CIPHERTEXT_BYTES]
+            .copy_from_slice(&[0u8; 32]);
+        assert_eq!(
+            PqHybridSealedShareV1::new(envelope),
+            Err(ContractError::InvalidField("pq_hybrid_eph_x25519"))
+        );
+        let mut high_bit = valid.envelope().to_vec();
+        high_bit[X_WING_DRAFT06_CIPHERTEXT_BYTES - 1] |= 0x80;
+        assert_eq!(
+            PqHybridSealedShareV1::new(high_bit),
+            Err(ContractError::InvalidField("pq_hybrid_eph_x25519"))
+        );
+    }
+
+    #[test]
+    fn envelope_identity_changes_when_bound_fields_mutate() {
+        let envelope = CustodyEnvelopeV1::new(
+            manifest(),
+            vec![stored_share(1), stored_share(2), stored_share(3)],
+        )
+        .unwrap();
+        let changed_content = CustodyEnvelopeV1::new(
+            CustodyEnvelopeManifestV1::new(
+                encrypted_content(0x12),
+                custody_pool_identity(0x35),
+                custody_epoch_identity(),
+                custody_committee_authorization_identity(0x36),
+                ThresholdV1::new(2, 3).unwrap(),
+                content_key_commitment(0x19),
+                vec![node(1, 1), node(2, 2), node(3, 3)],
+            )
+            .unwrap(),
+            vec![stored_share(1), stored_share(2), stored_share(3)],
+        )
+        .unwrap();
+        let changed_threshold = CustodyEnvelopeV1::new(
+            CustodyEnvelopeManifestV1::new(
+                encrypted_content(0x11),
+                custody_pool_identity(0x35),
+                custody_epoch_identity(),
+                custody_committee_authorization_identity(0x36),
+                ThresholdV1::new(3, 3).unwrap(),
+                content_key_commitment(0x19),
+                vec![node(1, 1), node(2, 2), node(3, 3)],
+            )
+            .unwrap(),
+            vec![stored_share(1), stored_share(2), stored_share(3)],
+        )
+        .unwrap();
+        let changed_epoch = CustodyEnvelopeV1::new(
+            CustodyEnvelopeManifestV1::new(
+                encrypted_content(0x11),
+                custody_pool_identity(0x35),
+                CustodyEpochIdentityV1::new(digest(0x39), 512).unwrap(),
+                custody_committee_authorization_identity(0x36),
+                ThresholdV1::new(2, 3).unwrap(),
+                content_key_commitment(0x19),
+                vec![node(1, 1), node(2, 2), node(3, 3)],
+            )
+            .unwrap(),
+            vec![stored_share(1), stored_share(2), stored_share(3)],
+        )
+        .unwrap();
+        let changed_node_set = CustodyEnvelopeV1::new(
+            CustodyEnvelopeManifestV1::new(
+                encrypted_content(0x11),
+                custody_pool_identity(0x35),
+                custody_epoch_identity(),
+                custody_committee_authorization_identity(0x36),
+                ThresholdV1::new(2, 3).unwrap(),
+                content_key_commitment(0x19),
+                vec![node(1, 1), node(2, 2), node(4, 3)],
+            )
+            .unwrap(),
+            vec![stored_share(1), stored_share(2), stored_share(3)],
+        )
+        .unwrap();
+        let changed_stored_share = CustodyEnvelopeV1::new(
+            manifest(),
+            vec![stored_share(1), stored_share(2), stored_share(4)],
+        )
+        .unwrap();
+        let changed_commitment = CustodyEnvelopeV1::new(
+            CustodyEnvelopeManifestV1::new(
+                encrypted_content(0x11),
+                custody_pool_identity(0x35),
+                custody_epoch_identity(),
+                custody_committee_authorization_identity(0x36),
+                ThresholdV1::new(2, 3).unwrap(),
+                content_key_commitment(0x1a),
+                vec![node(1, 1), node(2, 2), node(3, 3)],
+            )
+            .unwrap(),
+            vec![stored_share(1), stored_share(2), stored_share(3)],
+        )
+        .unwrap();
+        let changed_custody_key = CustodyEnvelopeV1::new(
+            CustodyEnvelopeManifestV1::new(
+                encrypted_content(0x11),
+                custody_pool_identity(0x35),
+                custody_epoch_identity(),
+                custody_committee_authorization_identity(0x36),
+                ThresholdV1::new(2, 3).unwrap(),
+                content_key_commitment(0x19),
+                vec![
+                    node(1, 1),
+                    CustodyNodeIdentityV1::new(
+                        node_public_key(2),
+                        custody_public_key(9),
+                        ShareCoordinateV1::new(2).unwrap(),
+                    )
+                    .unwrap(),
+                    node(3, 3),
+                ],
+            )
+            .unwrap(),
+            vec![stored_share(1), stored_share(2), stored_share(3)],
+        )
+        .unwrap();
+        let changed_pool = CustodyEnvelopeV1::new(
+            CustodyEnvelopeManifestV1::new(
+                encrypted_content(0x11),
+                custody_pool_identity(0x37),
+                custody_epoch_identity(),
+                custody_committee_authorization_identity(0x36),
+                ThresholdV1::new(2, 3).unwrap(),
+                content_key_commitment(0x19),
+                vec![node(1, 1), node(2, 2), node(3, 3)],
+            )
+            .unwrap(),
+            vec![stored_share(1), stored_share(2), stored_share(3)],
+        )
+        .unwrap();
+        let changed_authorization = CustodyEnvelopeV1::new(
+            CustodyEnvelopeManifestV1::new(
+                encrypted_content(0x11),
+                custody_pool_identity(0x35),
+                custody_epoch_identity(),
+                custody_committee_authorization_identity(0x38),
+                ThresholdV1::new(2, 3).unwrap(),
+                content_key_commitment(0x19),
+                vec![node(1, 1), node(2, 2), node(3, 3)],
+            )
+            .unwrap(),
+            vec![stored_share(1), stored_share(2), stored_share(3)],
+        )
+        .unwrap();
+
+        assert_ne!(
+            envelope.key_envelope_identity().unwrap().envelope_sha256(),
+            changed_content
+                .key_envelope_identity()
+                .unwrap()
+                .envelope_sha256()
+        );
+        assert_ne!(
+            envelope.key_envelope_identity().unwrap().envelope_sha256(),
+            changed_threshold
+                .key_envelope_identity()
+                .unwrap()
+                .envelope_sha256()
+        );
+        assert_ne!(
+            envelope.key_envelope_identity().unwrap().envelope_sha256(),
+            changed_epoch
+                .key_envelope_identity()
+                .unwrap()
+                .envelope_sha256()
+        );
+        assert_ne!(
+            envelope.key_envelope_identity().unwrap().envelope_sha256(),
+            changed_node_set
+                .key_envelope_identity()
+                .unwrap()
+                .envelope_sha256()
+        );
+        assert_ne!(
+            envelope.key_envelope_identity().unwrap().envelope_sha256(),
+            changed_stored_share
+                .key_envelope_identity()
+                .unwrap()
+                .envelope_sha256()
+        );
+        assert_ne!(
+            envelope.key_envelope_identity().unwrap().envelope_sha256(),
+            changed_commitment
+                .key_envelope_identity()
+                .unwrap()
+                .envelope_sha256()
+        );
+        assert_ne!(
+            envelope.key_envelope_identity().unwrap().envelope_sha256(),
+            changed_custody_key
+                .key_envelope_identity()
+                .unwrap()
+                .envelope_sha256()
+        );
+        assert!(!changed_pool
+            .matches_key_envelope_identity(&envelope.key_envelope_identity().unwrap())
+            .unwrap());
+        assert!(!changed_authorization
+            .matches_key_envelope_identity(&envelope.key_envelope_identity().unwrap())
+            .unwrap());
+        assert!(!changed_epoch
+            .matches_key_envelope_identity(&envelope.key_envelope_identity().unwrap())
+            .unwrap());
+        assert!(!changed_node_set
+            .matches_key_envelope_identity(&envelope.key_envelope_identity().unwrap())
+            .unwrap());
+        assert!(!changed_threshold
+            .matches_key_envelope_identity(&envelope.key_envelope_identity().unwrap())
+            .unwrap());
+    }
+
+    #[test]
+    fn stored_and_released_share_aad_are_mutation_sensitive() {
+        let manifest = manifest();
+        let node = manifest.node(node_public_key(1)).unwrap();
+        let stored_aad = node
+            .stored_share_aad_bytes(manifest.manifest_hash().unwrap())
+            .unwrap();
+        let changed_stored_aad = node
+            .stored_share_aad_bytes(Digest32::new([0x77; 32]))
+            .unwrap();
+        assert_ne!(stored_aad, changed_stored_aad);
+
+        let binding = {
+            let envelope = CustodyEnvelopeV1::new(
+                manifest.clone(),
+                vec![stored_share(1), stored_share(2), stored_share(3)],
+            )
+            .unwrap();
+            let profile_key = SigningKey::from_bytes(&[0x26; 32]);
+            ProtectedContentBindingV1::new(
+                manifest.encrypted_content().clone(),
+                envelope.key_envelope_identity().unwrap(),
+                crate::RightsPolicyIdentityV1::new(digest(0x44), 384).unwrap(),
+                crate::ProfileIdentityV1::from_public_key_bytes(
+                    profile_key.verifying_key().to_bytes(),
+                )
+                .unwrap(),
+                crate::WalletAddress::new([0x55; 20]),
+                crate::RuntimeSessionBindingV1::new(digest(0x66)).unwrap(),
+            )
+            .unwrap()
+        };
+        let released_aad = node
+            .released_share_aad_bytes(digest(0x10), &binding, digest(0x20), &recipient(0x30))
+            .unwrap();
+        let changed_released_aad = node
+            .released_share_aad_bytes(digest(0x11), &binding, digest(0x20), &recipient(0x30))
+            .unwrap();
+        assert_ne!(released_aad, changed_released_aad);
+    }
+}

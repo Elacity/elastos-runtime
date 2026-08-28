@@ -2,7 +2,7 @@ import {
   clearHomeAuthorityToken,
   fetchJson,
   setHomeAuthorityToken,
-} from "./shell-core.js?v=home-20260725a";
+} from "./shell-core.js?v=home-20260802a";
 
 const unlockPanel = document.querySelector("#home-unlock");
 const unlockCard = document.querySelector(".home-unlock-card");
@@ -300,7 +300,7 @@ async function runPasskeyCreate() {
       }),
     });
     setHomeAuthorityToken(response?.home_token);
-    await unlockComplete();
+    await unlockComplete(response);
   } finally {
     busy = false;
     setButtonsDisabled(false);
@@ -328,20 +328,36 @@ async function runPasskeySignIn(options = {}) {
       }),
     });
     setHomeAuthorityToken(response?.home_token);
-    await unlockComplete();
+    await unlockComplete(response);
   } finally {
     busy = false;
     setButtonsDisabled(false);
   }
 }
 
-async function unlockComplete() {
+async function unlockComplete(response) {
   setUnlockStatus("Opening Home", "success");
   if (unlockCallback) {
-    await unlockCallback();
+    await unlockCallback(response);
     return;
   }
   hideHomeUnlock();
+}
+
+export function profileReadinessActionTarget(response) {
+  const readiness = response && typeof response.profile_readiness === "object"
+    ? response.profile_readiness
+    : null;
+  if (readiness?.schema !== "elastos.profile.readiness/v1") {
+    return "system";
+  }
+  if (readiness.status === "setup_required") {
+    return "people";
+  }
+  if (readiness.status === "unavailable") {
+    return "system";
+  }
+  return readiness.status === "ready" ? "" : "system";
 }
 
 function reportUnlockError(error) {

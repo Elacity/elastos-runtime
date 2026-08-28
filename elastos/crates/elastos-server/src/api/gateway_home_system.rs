@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 
 use anyhow::Context as _;
 use elastos_common::CapsuleRole;
@@ -15,24 +16,18 @@ const HOME_DESKTOP_OBJECTS_SCHEMA: &str = "elastos.home.desktop-objects/v1";
 const HOME_SYSTEM_DESKTOP_OBJECT_SCHEMA: &str = "elastos.home.system-desktop-object/v1";
 const HOME_ACTIVE_SHELL_SCHEMA: &str = "elastos.home.active-shell/v1";
 const HOME_ACTIVE_SHELL_MAX_BYTES: usize = 4 * 1024;
-const HOME_PROFILE_CARD_SCHEMA: &str = "elastos.profile-card/v1";
-const HOME_PROFILE_CARD_MAX_BYTES: usize = 4 * 1024;
-const HOME_PEOPLE_CONTACTS_SCHEMA: &str = "elastos.people.contacts-state/v1";
-const HOME_PEOPLE_CONTACTS_MAX_BYTES: usize = 32 * 1024;
-const HOME_PEOPLE_REMOVED_CONTACTS_SCHEMA: &str = "elastos.people.removed-contacts/v1";
-const HOME_PEOPLE_REMOVED_CONTACTS_MAX_BYTES: usize = 16 * 1024;
+const HOME_PROFILE_SUMMARY_SCHEMA: &str = "elastos.profile-summary/v1";
+const HOME_ROOM_PROFILE_CARD_SCHEMA: &str = "elastos.profile-card/v1";
+const HOME_SERVICES_PEER_CONTACTS_SCHEMA: &str = "elastos.services.peer-contacts-state/v1";
+/// The released 0.6 schema string for the same object, named as People data
+/// while holding Services peer data. Accepted only by the one-time migration
+/// that renames the object and its schema together.
+const LEGACY_HOME_SERVICES_PEER_CONTACTS_SCHEMA: &str = "elastos.people.contacts-state/v1";
 const HOME_PEOPLE_DISCOVERY_SCHEMA: &str = "elastos.people.discovery/v1";
-const HOME_PEOPLE_DISCOVERY_STATE_SCHEMA: &str = "elastos.people.discovery-state/v1";
-const HOME_PEOPLE_DISCOVERY_PEERS_SCHEMA: &str = "elastos.people.discovery-peers/v1";
-const HOME_PEOPLE_DISCOVERY_MAX_BYTES: usize = 64 * 1024;
-const HOME_PEOPLE_DISCOVERY_PEERS_MAX_BYTES: usize = 64 * 1024;
-const HOME_PEOPLE_DISCOVERY_TOPIC: &str = "__elastos_internal/people-discovery-v1";
-const HOME_PEOPLE_DISCOVERY_ENABLED_SECS: u64 = 10 * 60;
-const HOME_PEOPLE_DISCOVERY_BOOTSTRAP_INTERVAL_SECS: u64 = 30;
-const HOME_PEOPLE_DISCOVERY_PRESENCE_INTERVAL_SECS: u64 = 15;
-const HOME_PEOPLE_DISCOVERY_REFRESH_FAST_MS: u64 = 3_000;
-const HOME_PEOPLE_DISCOVERY_REFRESH_SEARCH_MS: u64 = 5_000;
-const HOME_PEOPLE_DISCOVERY_REFRESH_IDLE_MS: u64 = 30_000;
+const PEOPLE_PROFILE_PROTECTION_REQUIRED_SCHEMA: &str =
+    "elastos.people.profile-protection-required/v1";
+const PEOPLE_PROFILE_PROTECTION_REQUIRED_MESSAGE: &str =
+    "Open System, choose Security, and download Recovery. Then retry creating your Profile.";
 const HOME_SERVICES_STATE_SCHEMA: &str = "elastos.services.state/v1";
 const HOME_SERVICES_STATE_MAX_BYTES: usize = 32 * 1024;
 const HOME_SERVICES_REQUESTS_SCHEMA: &str = "elastos.services.requests/v1";
@@ -42,6 +37,38 @@ const HOME_SERVICES_REMOTE_EXIT_TICKET_MAX_BYTES: usize = 8192;
 const HOME_BROWSER_EXIT_LOCAL_OFFER_ID: &str = "local:provider:browser-exit";
 const HOME_BROWSER_EXIT_PEER_SERVICE_URI: &str = "elastos://peer/browser-exit";
 const HOME_REMOTE_EXIT_SERVICE_KIND: &str = "remote_exit";
+pub(super) const PROFILE_REQUIRED_DISCOVERY_MESSAGE: &str =
+    "Save your Profile before turning on Discovery";
+const PROFILE_REQUIRED_PEOPLE_CONTACTS_MESSAGE: &str =
+    "Save your Profile before using People contacts";
+const PROFILE_REQUIRED_SERVICES_MESSAGE: &str =
+    "Save your Profile before using Services with other people";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ProfileRequiredError(&'static str);
+
+impl ProfileRequiredError {
+    fn message(self) -> &'static str {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ProfileRequiredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ProfileRequiredError {}
+
+pub(super) fn profile_required_error(message: &'static str) -> anyhow::Error {
+    ProfileRequiredError(message).into()
+}
+
+pub(super) fn profile_required_message(err: &anyhow::Error) -> Option<&'static str> {
+    err.downcast_ref::<ProfileRequiredError>()
+        .map(|error| error.message())
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +86,14 @@ struct HomeEventsResponse {
     keepalive: bool,
     retry_after_ms: u64,
     events: Vec<HomeRealtimeEvent>,
+}
+
+#[derive(Debug, Serialize)]
+struct PeopleProfileProtectionRequiredResponse {
+    schema: &'static str,
+    status: &'static str,
+    action_target: &'static str,
+    message: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,26 +117,17 @@ struct HomeRealtimeSnapshot {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct HomePeopleRemovedContacts {
-    schema: String,
-    principal_id: String,
-    localhost_root: String,
-    #[serde(default)]
-    contacts: BTreeMap<String, u64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct HomePeopleContactsState {
+struct HomeServicesPeerContactsState {
     schema: String,
     principal_id: String,
     localhost_root: String,
     updated_at: u64,
     #[serde(default)]
-    contacts: BTreeMap<String, HomePeopleContactRecord>,
+    contacts: BTreeMap<String, HomeServicesPeerContactRecord>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct HomePeopleContactRecord {
+struct HomeServicesPeerContactRecord {
     contact_id: String,
     peer_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -114,39 +140,47 @@ struct HomePeopleContactRecord {
     source: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct HomePeopleDiscoveryState {
-    schema: String,
-    principal_id: String,
-    localhost_root: String,
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PeopleDiscoveryUpdateRequest {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PeopleDiscoveryRequestCreate {
+    advertisement_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HomePeopleDiscoverySummary {
+    schema: &'static str,
+    configured: bool,
     enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    enabled_until: Option<u64>,
-    updated_at: u64,
+    expires_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    local_peer_id: Option<String>,
+    remaining_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_bootstrap_at: Option<u64>,
+    remote_visibility_may_remain_until: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_presence_sent_at: Option<u64>,
+    remote_visibility_remaining_seconds: Option<u64>,
+    status: String,
+    status_message: String,
+    discovered_count: usize,
     #[serde(default)]
-    peers: BTreeMap<String, HomePeopleDiscoveryPeerSummary>,
-    #[serde(default)]
-    requests: BTreeMap<String, HomePeopleDiscoveryRequestSummary>,
+    discovered_peers: Vec<HomePeopleDiscoveryPeerSummary>,
+    request_count: usize,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-struct HomePeopleDiscoveryPeersConfig {
-    #[serde(default)]
-    schema: String,
-    #[serde(default)]
-    peers: Vec<HomePeopleDiscoveryPeerConfig>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct HomePeopleDiscoveryPeerConfig {
-    #[serde(default)]
-    connect_ticket: String,
+#[derive(Debug, Clone, Serialize)]
+struct HomePeopleDiscoveryPeerSummary {
+    advertisement_id: String,
+    display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handle: Option<String>,
+    last_seen_at: u64,
+    status: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -223,34 +257,13 @@ pub(super) struct ServicesOfferUpdateRequest {
     selected: bool,
 }
 
-struct PeoplePeerRuntimeBlocking {
+struct ServicesPeerRuntimeBlocking {
     client: reqwest::blocking::Client,
     api_url: String,
     client_token: String,
     peer_cap: String,
     peer_id: String,
     connect_ticket: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct PeopleDiscoveryUpdateRequest {
-    enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct PeopleDiscoveryRequestCreate {
-    peer_id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct PeopleDiscoveryRequestJoinResponse {
-    schema: String,
-    status: String,
-    invite_id: String,
-    member_did: String,
-    discovery: HomePeopleDiscoverySummary,
 }
 
 pub(super) async fn home_summary(
@@ -265,7 +278,11 @@ pub(super) async fn home_summary(
 
     let (identity, authority, browser_state, appearance, runtime, home_state) =
         if let Some(context) = context.as_ref() {
-            let identity = load_gateway_identity_summary_for_context(&state.data_dir, context);
+            let identity = match load_gateway_identity_summary_for_context(&state.data_dir, context)
+            {
+                Ok(identity) => identity,
+                Err(err) => return home_error_response(err),
+            };
             let data_dir = state.data_dir.clone();
             let (runtime, mut home_state) =
                 tokio::join!(home_runtime_summary(&state.data_dir), async move {
@@ -273,27 +290,32 @@ pub(super) async fn home_summary(
                         .await
                         .unwrap_or_default()
                 });
-            if let Err(err) = apply_home_people_contacts_state(
+            let contact_authority = match load_configured_contact_authority_for_context(
                 &state.data_dir,
                 context,
+                state.collaboration_discovery_service.as_ref(),
+            ) {
+                Ok(authority) => authority,
+                Err(err) => return home_error_response(err),
+            };
+            if let Err(err) = apply_profile_people_authority(
                 &mut home_state.people,
-                &mut home_state.services,
+                contact_authority.as_ref().map(|authority| &authority.store),
             ) {
                 return home_error_response(err);
             }
-            if let Err(err) = filter_removed_people_contacts(
+            if let Err(err) = apply_contact_request_notification_projection(
                 &state.data_dir,
-                context,
-                &mut home_state.people,
-                &mut home_state.services,
+                contact_authority.as_ref().map(|authority| &authority.store),
+                &mut home_state.notifications,
             ) {
                 return home_error_response(err);
             }
-            home_state.people.discovery =
-                match home_people_discovery_summary(&state.data_dir, context) {
-                    Ok(discovery) => discovery,
-                    Err(err) => return home_error_response(err),
-                };
+            if let Err(err) =
+                apply_services_peer_authority(&state.data_dir, context, &mut home_state.services)
+            {
+                return home_error_response(err);
+            }
             if let Err(err) =
                 apply_home_services_selection(&state.data_dir, context, &mut home_state.services)
             {
@@ -347,7 +369,6 @@ pub(super) async fn home_summary(
         }
         append_home_service_access_notifications(&state.data_dir, context, &mut notifications);
     }
-
     let capsule_catalog = capsule_catalog_summary(&state.data_dir);
     let targets = home_targets_from_catalog(&capsule_catalog);
     let capsule_interfaces = capsule_interface_registry_summary_with_bindings(
@@ -365,7 +386,7 @@ pub(super) async fn home_summary(
             id: HOME_CAPSULE_ID.to_string(),
             route: HOME_ROUTE.to_string(),
         },
-        identity,
+        identity: identity.without_device_identity(),
         authority,
         browser_state,
         active_shell,
@@ -393,27 +414,42 @@ pub(super) async fn people_summary(
             Ok(context) => context,
             Err(err) => return home_error_response(err),
         };
-    let identity = load_gateway_identity_summary_for_context(&state.data_dir, &context);
+    let identity = match load_gateway_identity_summary_for_context(&state.data_dir, &context) {
+        Ok(identity) => identity,
+        Err(err) => return home_error_response(err),
+    };
     let data_dir = state.data_dir.clone();
+    let discovery_service = state.collaboration_discovery_service.clone();
+    let presence_port = state.collaboration_presence_product_port.clone();
     match tokio::task::spawn_blocking(move || {
         let mut state = home_state(&data_dir);
-        apply_home_people_contacts_state(
+        let contact_authority = load_configured_contact_authority_for_context(
             &data_dir,
             &context,
-            &mut state.people,
-            &mut state.services,
+            discovery_service.as_ref(),
         )?;
-        filter_removed_people_contacts(
-            &data_dir,
-            &context,
+        apply_profile_people_authority(
             &mut state.people,
-            &mut state.services,
+            contact_authority.as_ref().map(|authority| &authority.store),
         )?;
-        state.people.discovery = home_people_discovery_summary(&data_dir, &context)?;
+        let mut people = state.people;
+        let now = now_ts();
+        apply_contact_reachability(&mut people, presence_port.as_ref(), now);
+        let discovery = if let (Some(service), Some(authority)) =
+            (discovery_service.as_ref(), contact_authority.as_ref())
+        {
+            configured_people_discovery_summary(
+                &service.read_only_status(authority.store.as_ref(), &authority.profile, now)?,
+                now,
+            )
+        } else {
+            unconfigured_people_discovery_summary()
+        };
         Ok::<_, anyhow::Error>(serde_json::json!({
             "schema": "elastos.people.summary/v1",
-            "identity": identity,
-            "people": state.people,
+            "identity": identity.without_device_identity(),
+            "people": people,
+            "discovery": discovery,
         }))
     })
     .await
@@ -424,47 +460,93 @@ pub(super) async fn people_summary(
     }
 }
 
-pub(super) async fn people_invite_create(
+pub(super) async fn people_discovery_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<PeopleDiscoveryUpdateRequest>,
+) -> Response {
+    let summary = match configured_people_discovery_action(
+        &state,
+        &headers,
+        false,
+        move |service, authority, now| async move {
+            service
+                .set_enabled(
+                    authority.store.as_ref(),
+                    &authority.profile,
+                    body.enabled,
+                    now,
+                )
+                .await?;
+            service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now)?;
+            service.local_status(authority.store.as_ref(), &authority.profile, now)
+        },
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(response) => return response,
+    };
+    Json(summary).into_response()
+}
+
+pub(super) async fn people_discovery_refresh(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
-            Ok(context) => context,
-            Err(err) => return home_error_response(err),
-        };
-    let issuer_gateway = match chat_room_invite_gateway_origin(&headers) {
-        Some(value) => value,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "conversation invite needs a gateway origin",
-            )
-                .into_response()
-        }
-    };
-    let data_dir = state.data_dir.clone();
-    let inviter_profile =
-        home_profile_card_summary_for_context(&data_dir, &context).map(room_profile_card_from_home);
-    let context = context.clone();
-    match tokio::task::spawn_blocking(move || {
-        ensure_local_principal_room_session(&data_dir, &context)?;
-        let actor_did = ensure_local_room_owner_or_actor(&data_dir)?;
-        crate::room_service::export_room_join_invite(
-            &data_dir,
-            crate::room_service::RoomJoinInviteInput {
-                actor_did,
-                issuer_gateway,
-                inviter_profile,
-            },
-        )
-    })
+    let summary = match configured_people_discovery_action(
+        &state,
+        &headers,
+        false,
+        |service, authority, now| async move {
+            service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now)?;
+            service.local_status(authority.store.as_ref(), &authority.profile, now)
+        },
+    )
     .await
     {
-        Ok(Ok(output)) => Json(output).into_response(),
-        Ok(Err(err)) => room_service_error_response(err),
-        Err(err) => room_service_join_error_response(err),
+        Ok(summary) => summary,
+        Err(response) => return response,
+    };
+    Json(summary).into_response()
+}
+
+pub(super) async fn people_discovery_request_create(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<PeopleDiscoveryRequestCreate>,
+) -> Response {
+    let advertisement_id = body.advertisement_id.trim().to_string();
+    if advertisement_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "discovery advertisement id is required",
+        )
+            .into_response();
     }
+    let summary = match configured_people_discovery_action(
+        &state,
+        &headers,
+        true,
+        move |service, authority, now| async move {
+            service
+                .send_contact_request(
+                    authority.store.as_ref(),
+                    &advertisement_id,
+                    &authority.profile,
+                    now,
+                )
+                .await?;
+            service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now)?;
+            service.local_status(authority.store.as_ref(), &authority.profile, now)
+        },
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(response) => return response,
+    };
+    Json(summary).into_response()
 }
 
 pub(super) async fn people_contact_remove(
@@ -482,356 +564,1338 @@ pub(super) async fn people_contact_remove(
         return (StatusCode::BAD_REQUEST, "missing contact id").into_response();
     }
     let data_dir = state.data_dir.clone();
-    match tokio::task::spawn_blocking({
-        let contact_id = contact_id.clone();
+    let discovery_service = state.collaboration_discovery_service.clone();
+    let authority = match tokio::task::spawn_blocking({
         let context = context.clone();
+        let discovery_service = discovery_service.clone();
         move || {
-            let summary = crate::room_service::load_summary(&data_dir).unwrap_or_default();
-            let local_did = load_gateway_identity_summary(&data_dir).device_did;
-            if !home_people_contact_exists(
+            load_configured_contact_authority_for_context(
                 &data_dir,
                 &context,
-                &summary,
-                local_did.as_deref(),
-                contact_id.as_str(),
-            )? {
-                anyhow::bail!("people contact not found");
-            }
-            home_mark_people_contact_removed(&data_dir, &context, &contact_id, now_ts())?;
-            Ok::<_, anyhow::Error>(())
+                discovery_service.as_ref(),
+            )
         }
     })
     .await
     {
-        Ok(Ok(())) => Json(serde_json::json!({
-            "schema": "elastos.people.contact-remove/v1",
-            "contact_id": contact_id,
-            "scope": "local_people",
-            "message": "Removed contact from People."
-        }))
-        .into_response(),
-        Ok(Err(err)) => room_service_error_response(err),
-        Err(err) => room_service_join_error_response(err),
+        Ok(Ok(Some(authority))) => authority,
+        Ok(Ok(None)) => {
+            return room_service_error_response(profile_required_error(
+                PROFILE_REQUIRED_PEOPLE_CONTACTS_MESSAGE,
+            ))
+        }
+        Ok(Err(err)) => return room_service_error_response(err),
+        Err(err) => return room_service_join_error_response(err),
+    };
+    let Some(service) = discovery_service else {
+        return room_service_error_response(profile_required_error(
+            PROFILE_REQUIRED_PEOPLE_CONTACTS_MESSAGE,
+        ));
+    };
+    let remote_did = match authority.store.snapshot().map(|snapshot| {
+        snapshot
+            .contacts()
+            .iter()
+            .find(|contact| home_people_contact_id(contact.remote_profile_did()) == contact_id)
+            .map(|contact| contact.remote_profile_did().to_string())
+    }) {
+        Ok(Some(remote_did)) => remote_did,
+        Ok(None) => {
+            return room_service_error_response(anyhow::anyhow!("people contact not found"))
+        }
+        Err(err) => return room_service_error_response(err),
+    };
+    // Removal is signed and bilateral: the service mints the pair-scoped
+    // revocation and the store records it durably in one step. The peer's
+    // side learns through the sync loop; ours is removed as of this response.
+    if let Err(err) = service
+        .remove_contact(&authority.store, &authority.profile, &remote_did, now_ts())
+        .await
+    {
+        return room_service_error_response(err);
     }
+    if let Err(err) =
+        register_configured_contact_sync_for_context(&service, &context, &authority, now_ts())
+    {
+        return room_service_error_response(err);
+    }
+    if let Err(err) =
+        service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now_ts())
+    {
+        return room_service_error_response(err);
+    }
+    Json(serde_json::json!({
+        "schema": "elastos.people.contact-remove/v1",
+        "contact_id": contact_id,
+        "scope": "profile_contact",
+        "message": "Removed contact from People."
+    }))
+    .into_response()
 }
 
-pub(super) async fn people_profile_card_update(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-    Json(req): Json<SystemHandleUpdateRequest>,
-) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
-            Ok(context) => context,
-            Err(err) => return home_error_response(err),
-        };
-    match update_profile_card_for_context(&state.data_dir, &context, &req.handle) {
-        Ok(identity) => Json(identity).into_response(),
-        Err(err) => home_error_response(err),
+fn configured_people_summary_from_contact_store(
+    store: &crate::collaboration_contact_store::CollaborationContactStore,
+) -> anyhow::Result<HomePeopleSummary> {
+    let snapshot = store.snapshot()?;
+    let now = now_ts();
+    let mut contacts = snapshot
+        .contacts()
+        .iter()
+        .map(|contact| HomePeopleContactSummary {
+            contact_id: home_people_contact_id(contact.remote_profile_did()),
+            remote_profile_did: Some(contact.remote_profile_did().to_string()),
+            added_at: contact.added_at(),
+            conversation_id: Some(contact.conversation_id().to_string()),
+            display_name: contact.remote_display_name().to_string(),
+            handle: contact.remote_handle().map(str::to_string),
+            relationship: "connected".to_string(),
+            can_message: true,
+            device_label: None,
+            profile_card: None,
+            last_seen_at: None,
+            reachable: None,
+        })
+        .collect::<Vec<_>>();
+    // The complete People states, each projected from signed truth. Precedence
+    // per remote profile: connected, then requested (a fresh chain toward
+    // re-adding), then removed, then declined. History stays readable for a
+    // removed pair, so its conversation id rides along; nothing else does.
+    let mut seen: std::collections::HashSet<String> = snapshot
+        .contacts()
+        .iter()
+        .map(|contact| contact.remote_profile_did().to_string())
+        .collect();
+    for requested in store.outgoing_pending_requests(now)? {
+        if !seen.insert(requested.remote_profile_did.clone()) {
+            continue;
+        }
+        contacts.push(HomePeopleContactSummary {
+            contact_id: home_people_contact_id(&requested.remote_profile_did),
+            remote_profile_did: Some(requested.remote_profile_did.clone()),
+            added_at: requested.occurred_at,
+            conversation_id: None,
+            display_name: requested.display_name.clone(),
+            handle: requested.handle.clone(),
+            relationship: "requested".to_string(),
+            can_message: false,
+            device_label: None,
+            profile_card: None,
+            last_seen_at: None,
+            reachable: None,
+        });
     }
+    for removed in snapshot.removed() {
+        if !seen.insert(removed.remote_profile_did().to_string()) {
+            continue;
+        }
+        contacts.push(HomePeopleContactSummary {
+            contact_id: home_people_contact_id(removed.remote_profile_did()),
+            remote_profile_did: Some(removed.remote_profile_did().to_string()),
+            added_at: removed.removed_at(),
+            conversation_id: Some(removed.conversation_id().to_string()),
+            display_name: removed.display_name().to_string(),
+            handle: removed.handle().map(str::to_string),
+            relationship: if removed.removed_by_local() {
+                "removed".to_string()
+            } else {
+                "removed_you".to_string()
+            },
+            can_message: false,
+            device_label: None,
+            profile_card: None,
+            last_seen_at: None,
+            reachable: None,
+        });
+    }
+    for declined in store.declined_relationships()? {
+        if !seen.insert(declined.remote_profile_did.clone()) {
+            continue;
+        }
+        contacts.push(HomePeopleContactSummary {
+            contact_id: home_people_contact_id(&declined.remote_profile_did),
+            remote_profile_did: Some(declined.remote_profile_did.clone()),
+            added_at: declined.occurred_at,
+            conversation_id: None,
+            display_name: declined.display_name.clone(),
+            handle: declined.handle.clone(),
+            relationship: "declined".to_string(),
+            can_message: false,
+            device_label: None,
+            profile_card: None,
+            last_seen_at: None,
+            reachable: None,
+        });
+    }
+    Ok(HomePeopleSummary {
+        schema: "elastos.people.contacts/v1".to_string(),
+        contact_count: contacts.len(),
+        contacts,
+        service_offer_count: 0,
+        service_offers: Vec::new(),
+    })
 }
 
-async fn ensure_people_discovery_runtime_available(
+pub(super) struct ConfiguredContactAuthority {
+    pub(super) profile:
+        crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+    pub(super) store: std::sync::Arc<crate::collaboration_contact_store::CollaborationContactStore>,
+}
+
+/// Adds this principal's durable pending contact requests to one Home/Inbox
+/// read response. The contact store remains the only persistent truth.
+pub(super) fn apply_contact_request_notification_projection(
     data_dir: &std::path::Path,
+    contact_store: Option<
+        &std::sync::Arc<crate::collaboration_contact_store::CollaborationContactStore>,
+    >,
+    notifications: &mut HomeNotificationsSummary,
 ) -> anyhow::Result<()> {
-    if load_runtime_coords(data_dir).is_some() {
+    let pending = match contact_store {
+        Some(store) => store
+            .pending_incoming_requests()?
+            .iter()
+            .map(
+                |request| crate::notifications::PendingContactRequestNotification {
+                    request_hash: request.request_hash().to_string(),
+                    display_name: request.display_name().to_string(),
+                    handle: request.handle().map(ToOwned::to_owned),
+                    created_at: request.created_at(),
+                    expires_at: request.expires_at(),
+                },
+            )
+            .collect::<Vec<_>>(),
+        None => Vec::new(),
+    };
+    let mut summary = crate::notifications::load_summary(data_dir)?;
+    crate::notifications::project_contact_request_notifications(&mut summary, &pending);
+    *notifications = home_notifications_summary(summary);
+    Ok(())
+}
+
+pub(super) fn load_configured_contact_authority_for_context(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
+) -> anyhow::Result<Option<ConfiguredContactAuthority>> {
+    let Some(discovery_service) = discovery_service else {
+        return Ok(None);
+    };
+    let Some(profile) = load_profile_authority_for_context(data_dir, context)? else {
+        return Ok(None);
+    };
+    let local_device_did = crate::collaboration_profile_authority::load_existing_device_did(
+        data_dir,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("existing local device DID required for configured contacts"))?;
+    let store = std::sync::Arc::new(
+        crate::collaboration_contact_store::CollaborationContactStore::new(
+            data_dir,
+            &home_browser_principal_id(context),
+            &home_browser_localhost_root(context),
+            discovery_service.network_profile(),
+            &profile,
+            &local_device_did,
+        )?,
+    );
+    Ok(Some(ConfiguredContactAuthority { profile, store }))
+}
+
+pub(super) fn load_profile_authority_for_context(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<
+    Option<crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument>,
+> {
+    crate::collaboration_profile_authority::load_profile_authority(
+        data_dir,
+        &home_browser_principal_id(context),
+        &home_browser_localhost_root(context),
+    )
+}
+
+pub(super) fn register_configured_contact_sync_for_context(
+    discovery_service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    context: &HomeLaunchTokenContext,
+    authority: &ConfiguredContactAuthority,
+    now: u64,
+) -> anyhow::Result<()> {
+    discovery_service.register_sync_context(
+        authority.store.clone(),
+        authority.profile.clone(),
+        &context.session_id,
+        context.proof_binding_id.as_deref(),
+        &context.grant_id,
+        now,
+    )
+}
+
+async fn configured_people_discovery_action<F, Fut>(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    require_configured: bool,
+    action: F,
+) -> Result<HomePeopleDiscoverySummary, Response>
+where
+    F: FnOnce(
+        crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+        ConfiguredContactAuthority,
+        u64,
+    ) -> Fut,
+    Fut: Future<
+        Output = anyhow::Result<
+            crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus,
+        >,
+    >,
+{
+    let context =
+        match require_home_launch_token_context(&state.data_dir, headers, PEOPLE_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(error) => return Err(home_error_response(error)),
+        };
+    let presentation = match authenticated_presence_presentation_for_context(state, &context) {
+        Ok(presentation) => presentation,
+        Err(HomePresenceAuthenticationError::Denied) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "People discovery authorization denied",
+            )
+                .into_response());
+        }
+        Err(HomePresenceAuthenticationError::ProfileRequired) => {
+            return Err((StatusCode::CONFLICT, PROFILE_REQUIRED_DISCOVERY_MESSAGE).into_response());
+        }
+        Err(HomePresenceAuthenticationError::Internal) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "People discovery presentation is unavailable",
+            )
+                .into_response());
+        }
+    };
+    let now = now_ts();
+    let Some(service) = state.collaboration_discovery_service.clone() else {
+        if require_configured {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "collaboration discovery is not configured",
+            )
+                .into_response());
+        }
+        return Ok(unconfigured_people_discovery_summary());
+    };
+    let authority = match load_configured_contact_authority_for_context(
+        &state.data_dir,
+        &context,
+        Some(&service),
+    ) {
+        Ok(Some(authority)) => authority,
+        Ok(None) => {
+            return Err((StatusCode::CONFLICT, PROFILE_REQUIRED_DISCOVERY_MESSAGE).into_response())
+        }
+        Err(err) => return Err(home_error_response(err)),
+    };
+    if authority.profile.document().profile_did != presentation.profile.document().profile_did {
+        return Err(home_error_response(anyhow::anyhow!(
+            "configured contact profile does not match the authenticated presence profile"
+        )));
+    }
+    if let Err(err) =
+        register_configured_contact_sync_for_context(&service, &context, &authority, now)
+    {
+        return Err(home_error_response(err));
+    }
+    let status = action(service, authority, now)
+        .await
+        .map_err(home_error_response)?;
+    Ok(configured_people_discovery_summary(&status, now))
+}
+
+fn configured_people_discovery_summary(
+    status: &crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus,
+    now: u64,
+) -> HomePeopleDiscoverySummary {
+    let discovered_peers = status
+        .visible_people()
+        .iter()
+        .map(|person| HomePeopleDiscoveryPeerSummary {
+            advertisement_id: person.advertisement_id().to_string(),
+            display_name: person.display_name().to_string(),
+            handle: person.handle().map(str::to_string),
+            last_seen_at: person.last_seen_at(),
+            status: "visible".to_string(),
+        })
+        .collect::<Vec<_>>();
+    let request_count = status.incoming_requests().len();
+    let expires_at = status.expires_at();
+    let remaining_seconds = expires_at.map(|value| value.saturating_sub(now));
+    let remote_visibility_may_remain_until = status
+        .remote_visibility_may_remain_until()
+        .filter(|deadline| *deadline > now);
+    let remote_visibility_remaining_seconds =
+        remote_visibility_may_remain_until.map(|deadline| deadline.saturating_sub(now));
+    let (status_code, status_message) = if !status.enabled()
+        && remote_visibility_may_remain_until.is_some()
+    {
+        let remaining = remote_visibility_remaining_seconds.expect("derived from deadline");
+        (
+            "off_pending_expiry",
+            format!(
+                "Discovery is off on this Home. It stopped advertising locally, but may remain visible for another {remaining} seconds while withdrawal is unavailable.",
+            ),
+        )
+    } else if !status.enabled() {
+        ("off", "Discovery is off.".to_string())
+    } else if status.available() {
+        (
+            "visible",
+            "Discovery is on. Visibility lasts up to ten minutes, and both people must be visible at the same time."
+                .to_string(),
+        )
+    } else {
+        (
+            "relay_unavailable",
+            "Discovery is temporarily unavailable. Runtime will retry.".to_string(),
+        )
+    };
+    HomePeopleDiscoverySummary {
+        schema: HOME_PEOPLE_DISCOVERY_SCHEMA,
+        configured: true,
+        enabled: status.enabled(),
+        expires_at,
+        remaining_seconds,
+        remote_visibility_may_remain_until,
+        remote_visibility_remaining_seconds,
+        status: status_code.to_string(),
+        status_message,
+        discovered_count: discovered_peers.len(),
+        discovered_peers,
+        request_count,
+    }
+}
+
+fn unconfigured_people_discovery_summary() -> HomePeopleDiscoverySummary {
+    HomePeopleDiscoverySummary {
+        schema: HOME_PEOPLE_DISCOVERY_SCHEMA,
+        configured: false,
+        enabled: false,
+        expires_at: None,
+        remaining_seconds: None,
+        remote_visibility_may_remain_until: None,
+        remote_visibility_remaining_seconds: None,
+        status: "unconfigured".to_string(),
+        status_message: "Discovery isn’t available on this Home.".to_string(),
+        discovered_count: 0,
+        discovered_peers: Vec::new(),
+        request_count: 0,
+    }
+}
+
+#[cfg(test)]
+mod discovery_summary_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    use elastos_common::collaboration_protocol::{
+        canonical_collaboration_message_bytes, canonical_signed_collaboration_message_bytes,
+        collaboration_message_envelope_sha256, CollaborationMessage, CollaborationRecipient,
+        CollaborationRecipientKind, SignedCollaborationMessage, COLLABORATION_MESSAGE_SCHEMA_V1,
+        COLLABORATION_MESSAGE_SIGNATURE_DOMAIN_V1,
+    };
+    use elastos_runtime::signature::{generate_keypair, SigningKey};
+    use sha2::Sha256;
+
+    use crate::collaboration_contact_store::CollaborationContactStore;
+    use crate::collaboration_core::{
+        random_hex_128, CollaborationCore, CollaborationTransportIngestion,
+    };
+    use crate::collaboration_default_conversation::{
+        canonical_default_conversation_grant_bytes, verify_default_conversation_grant,
+        DefaultConversationAdmissionPolicy, DefaultConversationGrant,
+        VerifiedDefaultConversationGrant, DEFAULT_CONVERSATION_GRANT_SCHEMA_V1,
+    };
+    use crate::collaboration_device_authority::DefaultConversationDeviceAuthority;
+    use crate::collaboration_discovery::{
+        canonical_signed_collaboration_contact_decision_receipt_bytes,
+        CollaborationContactDecision, CollaborationContactDecisionReceipt,
+        CollaborationContactRequestPayload, CollaborationDiscoveryAdvertisementPayload,
+        SignedCollaborationContactDecisionReceipt,
+        COLLABORATION_CONTACT_DECISION_RECEIPT_SCHEMA_V1,
+        COLLABORATION_CONTACT_DECISION_RECEIPT_SIGNATURE_DOMAIN_V1,
+        COLLABORATION_DISCOVERY_ADVERTISEMENT_PAYLOAD_TYPE,
+        COLLABORATION_DISCOVERY_ADVERTISEMENT_TTL_SECS, COLLABORATION_DISCOVERY_CONTACT_ID,
+        COLLABORATION_DISCOVERY_CONTACT_REQUEST_PAYLOAD_TYPE,
+        COLLABORATION_DISCOVERY_CONTACT_REQUEST_TTL_SECS, COLLABORATION_DISCOVERY_DIRECTORY_ID,
+        COLLABORATION_DISCOVERY_SERVICE,
+    };
+    use crate::collaboration_network::{
+        canonical_collaboration_network_profile_payload_bytes,
+        validate_collaboration_network_profile, CollaborationNetworkProfile,
+        CollaborationNetworkProfileMode, DefaultConversationGrantDescriptor,
+        SignedCollaborationNetworkProfile, VerifiedCollaborationNetworkProfile,
+        COLLABORATION_NETWORK_PROFILE_SCHEMA, COLLABORATION_NETWORK_PROFILE_SIGNATURE_DOMAIN,
+    };
+    use crate::collaboration_presence::CollaborationPresenceProductPort;
+    use crate::collaboration_product::{CHAT_ROOM_CAPSULE, CHAT_SERVICE};
+
+    #[test]
+    fn configured_discovery_summary_preserves_incoming_status_and_redacts_peer_id() {
+        let summary = configured_people_discovery_summary(
+            &crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus::test_new(
+                true,
+                true,
+                Some(120),
+                None,
+                vec![
+                    crate::collaboration_discovery_runtime::DiscoveryVisiblePerson::test_new(
+                        "ad-123",
+                        "Remote",
+                        Some("remote".to_string()),
+                        100,
+                        120,
+                    ),
+                ],
+                vec![
+                    crate::collaboration_contact_store::PendingIncomingContactRequest::test_new(
+                        "0123456789abcdef0123456789abcdef",
+                        "did:key:zremote",
+                        "Requester",
+                        Some("requester".to_string()),
+                        101,
+                        160,
+                    ),
+                ],
+            ),
+            100,
+        );
+
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["request_count"], 1);
+        assert!(json.get("requests").is_none());
+        assert!(json["status_message"]
+            .as_str()
+            .unwrap()
+            .contains("ten minutes"));
+        assert_eq!(json["discovered_peers"][0]["advertisement_id"], "ad-123");
+        assert!(json["discovered_peers"][0].get("peer_id").is_none());
+    }
+
+    #[test]
+    fn configured_discovery_summary_honestly_reports_off_pending_expiry() {
+        let summary = configured_people_discovery_summary(
+            &crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus::test_new(
+                false,
+                false,
+                None,
+                Some(700),
+                Vec::new(),
+                Vec::new(),
+            ),
+            100,
+        );
+
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["status"], "off_pending_expiry");
+        assert_eq!(json["enabled"], false);
+        assert!(json["expires_at"].is_null());
+        assert_eq!(json["remote_visibility_may_remain_until"], 700);
+        assert_eq!(json["remote_visibility_remaining_seconds"], 600);
+        assert!(json["status_message"]
+            .as_str()
+            .unwrap()
+            .contains("another 600 seconds"));
+    }
+
+    #[test]
+    fn configured_discovery_summary_clears_expired_remote_visibility_projection() {
+        let summary = configured_people_discovery_summary(
+            &crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus::test_new(
+                false,
+                false,
+                None,
+                Some(100),
+                Vec::new(),
+                Vec::new(),
+            ),
+            100,
+        );
+
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["status"], "off");
+        assert!(json.get("remote_visibility_may_remain_until").is_none());
+        assert!(json.get("remote_visibility_remaining_seconds").is_none());
+    }
+
+    #[test]
+    fn configured_discovery_summary_reports_runtime_retry_and_one_request_count() {
+        let summary = configured_people_discovery_summary(
+            &crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus::test_new(
+                false,
+                true,
+                None,
+                None,
+                Vec::new(),
+                vec![
+                    crate::collaboration_contact_store::PendingIncomingContactRequest::test_new(
+                        "request-1",
+                        "did:key:z6MkRemote",
+                        "Remote",
+                        None,
+                        10,
+                        700,
+                    ),
+                ],
+            ),
+            100,
+        );
+
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["status"], "relay_unavailable");
+        assert_eq!(
+            json["status_message"],
+            "Discovery is temporarily unavailable. Runtime will retry."
+        );
+        assert_eq!(json["request_count"], 1);
+        assert!(json.get("pending_request_count").is_none());
+        assert!(json.get("requests").is_none());
+    }
+
+    const CONFIGURED_NETWORK: &str = "people-summary-contact-store-test";
+    const CONFIGURED_CONVERSATION: &str = "default-conversation";
+    const PRESENCE_PAYLOAD_TYPE: &str = "elastos.chat.presence/v1";
+    const PRESENCE_TTL_SECS: u64 = 45;
+
+    struct ConfiguredPeopleFixture {
+        local_key: SigningKey,
+        local_profile: crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+        remote_key: SigningKey,
+        profile: VerifiedCollaborationNetworkProfile,
+        grant: VerifiedDefaultConversationGrant,
+        core: Arc<CollaborationCore>,
+        store: Arc<CollaborationContactStore>,
+        presence: CollaborationPresenceProductPort,
+    }
+
+    fn configured_people_fixture() -> ConfiguredPeopleFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.keep();
+        fs::create_dir_all(&data_root).unwrap();
+        fs::set_permissions(&data_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let grant_bytes = canonical_default_conversation_grant_bytes(&DefaultConversationGrant {
+            schema: DEFAULT_CONVERSATION_GRANT_SCHEMA_V1.to_string(),
+            network_id: CONFIGURED_NETWORK.to_string(),
+            conversation_id: CONFIGURED_CONVERSATION.to_string(),
+            sender_service: CHAT_SERVICE.to_string(),
+            admission_policy: DefaultConversationAdmissionPolicy::ProfileScopedSigner,
+        })
+        .unwrap();
+        let digest = Sha256::digest(&grant_bytes);
+        let grant_cid = cid::Cid::new_v1(
+            0x55,
+            cid::multihash::Multihash::<64>::wrap(0x12, digest.as_slice()).unwrap(),
+        )
+        .to_string();
+        let (profile_signer, _) = generate_keypair();
+        let signer_did = crate::crypto::encode_signing_key_did(&profile_signer);
+        let payload = CollaborationNetworkProfile {
+            schema: COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
+            network_id: CONFIGURED_NETWORK.to_string(),
+            revision: 1,
+            previous_profile_sha256: None,
+            signer_did: signer_did.clone(),
+            bootstrap_peers: Vec::new(),
+            default_conversation: Some(DefaultConversationGrantDescriptor { grant_cid }),
+        };
+        let payload_bytes =
+            canonical_collaboration_network_profile_payload_bytes(&payload).unwrap();
+        let (signature, envelope_signer) = crate::crypto::domain_separated_sign(
+            &profile_signer,
+            COLLABORATION_NETWORK_PROFILE_SIGNATURE_DOMAIN,
+            &payload_bytes,
+        );
+        let profile_bytes = serde_json::to_vec(
+            &serde_json::to_value(SignedCollaborationNetworkProfile {
+                payload,
+                signature,
+                signer_did: envelope_signer,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let CollaborationNetworkProfileMode::Configured(profile) =
+            validate_collaboration_network_profile(
+                Some(&profile_bytes),
+                CONFIGURED_NETWORK,
+                &[signer_did],
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("configured profile expected");
+        };
+        let grant = verify_default_conversation_grant(&profile, &grant_bytes).unwrap();
+        let (local_key, _) = generate_keypair();
+        let local_did = crate::crypto::encode_signing_key_did(&local_key);
+        let principal_id = "person:local:configured-people-fixture";
+        let protection =
+            crate::auth::store_test_principal_root_protection(&data_root, principal_id);
+        let local_profile =
+            crate::collaboration_profile_authority::signed_profile_document_for_test(
+                &SigningKey::from_bytes(&generate_keypair().0.to_bytes()),
+                "Local",
+                Some("local"),
+                1,
+                None,
+                1,
+                vec![local_did.clone()],
+            )
+            .unwrap();
+        let (remote_key, _) = generate_keypair();
+        let core = Arc::new(
+            CollaborationCore::new(
+                &data_root,
+                local_key.clone(),
+                profile.clone(),
+                grant.clone(),
+                CHAT_ROOM_CAPSULE,
+            )
+            .unwrap(),
+        );
+        let store = Arc::new(
+            CollaborationContactStore::new(
+                &data_root,
+                principal_id,
+                &protection.localhost_root,
+                profile.clone(),
+                &local_profile,
+                &local_did,
+            )
+            .unwrap(),
+        );
+        let presence = CollaborationPresenceProductPort::new(core.clone()).unwrap();
+        ConfiguredPeopleFixture {
+            local_key,
+            local_profile,
+            remote_key,
+            profile,
+            grant,
+            core,
+            store,
+            presence,
+        }
+    }
+
+    fn canonical_test_payload_value<T: serde::Serialize>(
+        payload: &T,
+    ) -> anyhow::Result<serde_json::Value> {
+        // Same round-trip the production signer uses, so field order matches
+        // what the canonical-payload verifier demands.
+        Ok(serde_json::from_slice(&serde_json::to_vec(payload)?)?)
+    }
+
+    fn signed_discovery_message(
+        signing_key: &SigningKey,
+        sender_profile_did: &str,
+        conversation_id: &str,
+        recipient: CollaborationRecipient,
+        payload_type: &str,
+        payload: serde_json::Value,
+        validity: std::ops::Range<u64>,
+    ) -> Vec<u8> {
+        let message = CollaborationMessage {
+            schema: COLLABORATION_MESSAGE_SCHEMA_V1.to_string(),
+            network_id: CONFIGURED_NETWORK.to_string(),
+            conversation_id: conversation_id.to_string(),
+            message_id: random_hex_128().unwrap(),
+            nonce: random_hex_128().unwrap(),
+            created_at: validity.start,
+            expires_at: validity.end,
+            sender_profile_did: sender_profile_did.to_string(),
+            sender_service: COLLABORATION_DISCOVERY_SERVICE.to_string(),
+            recipient,
+            payload_type: payload_type.to_string(),
+            payload,
+        };
+        let payload_bytes = canonical_collaboration_message_bytes(&message).unwrap();
+        let (signature, signer_did) = crate::crypto::domain_separated_sign(
+            signing_key,
+            COLLABORATION_MESSAGE_SIGNATURE_DOMAIN_V1,
+            &payload_bytes,
+        );
+        canonical_signed_collaboration_message_bytes(&SignedCollaborationMessage {
+            payload: message,
+            signature,
+            signer_did,
+        })
+        .unwrap()
+    }
+
+    fn advertisement(signing_key: &SigningKey, display_name: &str, created_at: u64) -> Vec<u8> {
+        let handle = display_name.to_lowercase().replace(' ', "-");
+        let signed_profile =
+            crate::collaboration_profile_authority::signed_profile_document_for_test(
+                &SigningKey::from_bytes(&generate_keypair().0.to_bytes()),
+                display_name,
+                Some(&handle),
+                1,
+                None,
+                created_at,
+                vec![crate::crypto::encode_signing_key_did(signing_key)],
+            )
+            .unwrap();
+        signed_discovery_message(
+            signing_key,
+            &signed_profile.document().profile_did,
+            COLLABORATION_DISCOVERY_DIRECTORY_ID,
+            CollaborationRecipient {
+                kind: CollaborationRecipientKind::Conversation,
+                id: COLLABORATION_DISCOVERY_DIRECTORY_ID.to_string(),
+            },
+            COLLABORATION_DISCOVERY_ADVERTISEMENT_PAYLOAD_TYPE,
+            serde_json::to_value(CollaborationDiscoveryAdvertisementPayload {
+                signed_profile: signed_profile.signed_envelope().clone(),
+            })
+            .unwrap(),
+            created_at..created_at + COLLABORATION_DISCOVERY_ADVERTISEMENT_TTL_SECS,
+        )
+    }
+
+    fn outgoing_request_with_profile(
+        requester_key: &SigningKey,
+        requester_profile: &crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+        recipient_did: &str,
+        advertisement_hash: &str,
+        created_at: u64,
+    ) -> Vec<u8> {
+        signed_discovery_message(
+            requester_key,
+            &requester_profile.document().profile_did,
+            COLLABORATION_DISCOVERY_CONTACT_ID,
+            CollaborationRecipient {
+                kind: CollaborationRecipientKind::Profile,
+                id: recipient_did.to_string(),
+            },
+            COLLABORATION_DISCOVERY_CONTACT_REQUEST_PAYLOAD_TYPE,
+            serde_json::to_value(CollaborationContactRequestPayload {
+                advertisement_envelope_sha256: advertisement_hash.to_string(),
+                signed_profile: requester_profile.signed_envelope().clone(),
+            })
+            .unwrap(),
+            created_at..created_at + COLLABORATION_DISCOVERY_CONTACT_REQUEST_TTL_SECS,
+        )
+    }
+
+    fn decision_receipt(
+        recipient_key: &SigningKey,
+        request_bytes: &[u8],
+        decided_at: u64,
+        decision: CollaborationContactDecision,
+        recipient_profile_did: &str,
+    ) -> Vec<u8> {
+        let request: SignedCollaborationMessage = serde_json::from_slice(request_bytes).unwrap();
+        let request_payload: CollaborationContactRequestPayload =
+            serde_json::from_value(request.payload.payload.clone()).unwrap();
+        let requester_profile =
+            crate::collaboration_profile_authority::verify_signed_profile_document(
+                &request_payload.signed_profile,
+            )
+            .unwrap();
+        let payload = CollaborationContactDecisionReceipt {
+            schema: COLLABORATION_CONTACT_DECISION_RECEIPT_SCHEMA_V1.to_string(),
+            network_id: CONFIGURED_NETWORK.to_string(),
+            request_envelope_sha256: collaboration_message_envelope_sha256(request_bytes),
+            conversation_id: COLLABORATION_DISCOVERY_CONTACT_ID.to_string(),
+            requester_profile_did: requester_profile.document().profile_did.clone(),
+            requester_endpoint_did: request.signer_did,
+            request_message_id: request.payload.message_id,
+            request_message_nonce: request.payload.nonce,
+            recipient_profile_did: recipient_profile_did.to_string(),
+            recipient_endpoint_did: crate::crypto::encode_signing_key_did(recipient_key),
+            decision,
+            decided_at,
+        };
+        let payload_bytes = serde_json::to_vec(&serde_json::to_value(&payload).unwrap()).unwrap();
+        let (signature, signer_did) = crate::crypto::domain_separated_sign(
+            recipient_key,
+            COLLABORATION_CONTACT_DECISION_RECEIPT_SIGNATURE_DOMAIN_V1,
+            &payload_bytes,
+        );
+        canonical_signed_collaboration_contact_decision_receipt_bytes(
+            &SignedCollaborationContactDecisionReceipt {
+                payload,
+                signature,
+                signer_did,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn configured_people_summary_keeps_signed_profile_name_when_presence_conflicts() {
+        let now = now_ts();
+        let fixture = configured_people_fixture();
+        let remote_ad = advertisement(&fixture.remote_key, "Old Name", now);
+        let remote_profile =
+            crate::collaboration_profile_authority::verify_signed_profile_document(
+                &serde_json::from_value::<CollaborationDiscoveryAdvertisementPayload>(
+                    serde_json::from_slice::<SignedCollaborationMessage>(&remote_ad)
+                        .unwrap()
+                        .payload
+                        .payload,
+                )
+                .unwrap()
+                .signed_profile,
+            )
+            .unwrap();
+        let request_bytes = outgoing_request_with_profile(
+            &fixture.local_key,
+            &fixture.local_profile,
+            &remote_profile.document().profile_did,
+            &collaboration_message_envelope_sha256(&remote_ad),
+            now + 1,
+        );
+        fixture
+            .store
+            .record_outgoing_contact_request(&request_bytes, &remote_ad, now + 1)
+            .unwrap();
+        fixture
+            .store
+            .record_contact_decision_receipt(
+                &decision_receipt(
+                    &fixture.remote_key,
+                    &request_bytes,
+                    now + 2,
+                    CollaborationContactDecision::Accepted,
+                    crate::collaboration_profile_authority::verify_signed_profile_document(
+                        &serde_json::from_value::<CollaborationDiscoveryAdvertisementPayload>(
+                            serde_json::from_slice::<SignedCollaborationMessage>(&remote_ad)
+                                .unwrap()
+                                .payload
+                                .payload,
+                        )
+                        .unwrap()
+                        .signed_profile,
+                    )
+                    .unwrap()
+                    .document()
+                    .profile_did
+                    .as_str(),
+                ),
+                now + 2,
+            )
+            .unwrap();
+
+        let remote_authority = DefaultConversationDeviceAuthority::new(
+            fixture.remote_key.clone(),
+            fixture.profile.clone(),
+            fixture.grant.clone(),
+        )
+        .unwrap();
+        let remote_presence = remote_authority
+            .prepare_profile_outgoing(
+                &remote_profile,
+                CHAT_SERVICE,
+                PRESENCE_PAYLOAD_TYPE,
+                serde_json::json!({}),
+                now + 3,
+                PRESENCE_TTL_SECS,
+            )
+            .unwrap();
+        let transport_frame = remote_authority
+            .prepare_transport_frame(remote_presence.envelope_bytes())
+            .unwrap();
+        let ingestion = fixture
+            .core
+            .ingest_transport_frame(&transport_frame, now + 3)
+            .unwrap();
+        assert!(matches!(
+            ingestion,
+            CollaborationTransportIngestion::Incoming(_)
+        ));
+        let handoffs = fixture.presence.pending_presences().unwrap();
+        assert_eq!(handoffs.len(), 1);
+        fixture
+            .presence
+            .project_handoff(&handoffs[0], now + 3)
+            .unwrap();
+        let snapshot = fixture.presence.snapshot(now + 3).unwrap();
+        assert_eq!(snapshot.records().len(), 1);
+        assert_eq!(
+            snapshot.records()[0].sender_profile_did(),
+            remote_profile.document().profile_did
+        );
+        assert_eq!(snapshot.records()[0].display_name(), "Old Name");
+
+        // Presence and room attribution both use the signed Profile head.
+        // Product payloads cannot override the Profile's presentation data.
+        let authority = ConfiguredContactAuthority {
+            profile: fixture.local_profile.clone(),
+            store: fixture.store.clone(),
+        };
+        let names = gateway_room::room_profile_attribution_names(Some(&authority), None, None);
+        assert_eq!(
+            names
+                .get(&remote_profile.document().profile_did)
+                .map(String::as_str),
+            Some("Old Name")
+        );
+        assert_eq!(
+            names
+                .get(&fixture.local_profile.document().profile_did)
+                .map(String::as_str),
+            Some(fixture.local_profile.document().display_name.as_str())
+        );
+
+        let mut people = configured_people_summary_from_contact_store(&fixture.store).unwrap();
+        assert_eq!(people.contacts[0].display_name, "Old Name");
+        assert!(people.contacts[0].can_message);
+        assert!(people.contacts[0].conversation_id.is_some());
+        // The contact remains keyed by Profile DID. Its delivery endpoint is
+        // retained only inside the contact store and never reaches the browser.
+        assert_eq!(
+            people.contacts[0].remote_profile_did.as_deref(),
+            Some(remote_profile.document().profile_did.as_str())
+        );
+        let browser_projection = serde_json::to_value(&people).unwrap();
+        assert!(browser_projection["contacts"][0]
+            .get("remote_presence_device_did")
+            .is_none());
+        assert!(browser_projection["contacts"][0].get("route").is_none());
+        apply_profile_people_authority(&mut people, Some(&fixture.store)).unwrap();
+        assert_eq!(people.contacts[0].display_name, "Old Name");
+        assert_eq!(people.service_offer_count, 0);
+        assert!(people.service_offers.is_empty());
+    }
+
+    #[test]
+    fn profile_contact_store_removes_an_exact_accepted_contact_locally() {
+        let now = now_ts();
+        let fixture = configured_people_fixture();
+        let remote_advertisement = advertisement(&fixture.remote_key, "Remote", now);
+        let remote_profile =
+            crate::collaboration_profile_authority::verify_signed_profile_document(
+                &serde_json::from_value::<CollaborationDiscoveryAdvertisementPayload>(
+                    serde_json::from_slice::<SignedCollaborationMessage>(&remote_advertisement)
+                        .unwrap()
+                        .payload
+                        .payload,
+                )
+                .unwrap()
+                .signed_profile,
+            )
+            .unwrap();
+        let request = outgoing_request_with_profile(
+            &fixture.local_key,
+            &fixture.local_profile,
+            &remote_profile.document().profile_did,
+            &collaboration_message_envelope_sha256(&remote_advertisement),
+            now + 1,
+        );
+        fixture
+            .store
+            .record_outgoing_contact_request(&request, &remote_advertisement, now + 1)
+            .unwrap();
+        fixture
+            .store
+            .record_contact_decision_receipt(
+                &decision_receipt(
+                    &fixture.remote_key,
+                    &request,
+                    now + 2,
+                    CollaborationContactDecision::Accepted,
+                    &remote_profile.document().profile_did,
+                ),
+                now + 2,
+            )
+            .unwrap();
+
+        assert_eq!(fixture.store.snapshot().unwrap().contacts().len(), 1);
+        let revocation = signed_discovery_message(
+            &fixture.local_key,
+            &fixture.local_profile.document().profile_did,
+            &crate::collaboration_contact_store::stable_direct_conversation_id(
+                CONFIGURED_NETWORK,
+                fixture.local_profile.document().profile_did.as_str(),
+                &remote_profile.document().profile_did,
+            )
+            .unwrap(),
+            CollaborationRecipient {
+                kind: CollaborationRecipientKind::Profile,
+                id: remote_profile.document().profile_did.clone(),
+            },
+            crate::collaboration_discovery::COLLABORATION_CONTACT_REVOCATION_PAYLOAD_TYPE,
+            canonical_test_payload_value(
+                &crate::collaboration_discovery::CollaborationContactRevocationPayload {
+                    revoking_profile_did: fixture.local_profile.document().profile_did.clone(),
+                    revoked_profile_did: remote_profile.document().profile_did.clone(),
+                    end_verb: crate::collaboration_discovery::COLLABORATION_CONTACT_END_VERB_REMOVE
+                        .to_string(),
+                    removed_at: now + 3,
+                },
+            )
+            .unwrap(),
+            now + 3
+                ..now
+                    + 3
+                    + crate::collaboration_discovery::COLLABORATION_CONTACT_REVOCATION_TTL_SECS,
+        );
+        fixture
+            .store
+            .record_local_contact_revocation(&revocation, &fixture.local_profile, now + 3)
+            .unwrap();
+
+        let snapshot = fixture.store.snapshot().unwrap();
+        assert!(snapshot.contacts().is_empty());
+        assert_eq!(snapshot.removed().len(), 1);
+        assert!(snapshot.removed()[0].removed_by_local());
+
+        // The People summary keeps the pair visible in its removed state,
+        // named by the signed presentation, with messaging off.
+        let people = configured_people_summary_from_contact_store(&fixture.store).unwrap();
+        assert_eq!(people.contacts.len(), 1);
+        assert_eq!(people.contacts[0].relationship, "removed");
+        assert_eq!(people.contacts[0].display_name, "Remote");
+        assert!(!people.contacts[0].can_message);
+        assert!(people.contacts[0].conversation_id.is_some());
+
+        // An unsettled local removal is queued for durable delivery.
+        let resendable = fixture.store.resendable_contact_revocations(8).unwrap();
+        assert_eq!(resendable.len(), 1);
+        assert_eq!(
+            resendable[0].remote_profile_did,
+            remote_profile.document().profile_did
+        );
+    }
+
+    #[test]
+    fn profile_people_authority_ignores_legacy_people_contacts_without_profile_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("data");
+        fs::create_dir_all(&data_root).unwrap();
+        fs::set_permissions(&data_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let principal_id = "person:local:legacy-people-ignore".to_string();
+        let protection =
+            crate::auth::store_test_principal_root_protection(&data_root, &principal_id);
+        let context = HomeLaunchTokenContext {
+            principal_id: principal_id.clone(),
+            session_id: "session".to_string(),
+            proof_binding_id: Some("proof".to_string()),
+            grant_id: "grant".to_string(),
+        };
+        let legacy_path = home_services_peer_contacts_path(&data_root, &context).unwrap();
+        let legacy_state = HomeServicesPeerContactsState {
+            schema: HOME_SERVICES_PEER_CONTACTS_SCHEMA.to_string(),
+            principal_id,
+            localhost_root: protection.localhost_root.clone(),
+            updated_at: 11,
+            contacts: BTreeMap::from([(
+                "legacy-contact".to_string(),
+                HomeServicesPeerContactRecord {
+                    contact_id: "legacy-contact".to_string(),
+                    peer_id: "legacy-peer".to_string(),
+                    did: Some("did:key:zInvalid".to_string()),
+                    display_name: "Legacy Contact".to_string(),
+                    handle: Some("legacy".to_string()),
+                    added_at: 10,
+                    updated_at: 11,
+                    source: "legacy".to_string(),
+                },
+            )]),
+        };
+        let legacy_bytes = serde_json::to_vec_pretty(&legacy_state).unwrap();
+        crate::auth::write_principal_root_object(
+            &data_root,
+            &home_browser_principal_id(&context),
+            &home_browser_localhost_root(&context),
+            &home_services_peer_contacts_uri(&context),
+            &legacy_path,
+            &legacy_bytes,
+        )
+        .unwrap();
+        let before = fs::read(&legacy_path).unwrap();
+
+        let mut people = HomePeopleSummary {
+            schema: "elastos.people.contacts/v1".to_string(),
+            contact_count: 1,
+            contacts: vec![HomePeopleContactSummary {
+                contact_id: "room-contact".to_string(),
+                remote_profile_did: None,
+                added_at: 5,
+                conversation_id: None,
+                display_name: "Room Contact".to_string(),
+                handle: None,
+                relationship: "connected".to_string(),
+                can_message: false,
+                device_label: None,
+                profile_card: None,
+                last_seen_at: None,
+                reachable: None,
+            }],
+            service_offer_count: 0,
+            service_offers: Vec::new(),
+        };
+        apply_profile_people_authority(&mut people, None).unwrap();
+
+        assert_eq!(people.contact_count, 0);
+        assert!(people.contacts.is_empty());
+        assert_eq!(fs::read(&legacy_path).unwrap(), before);
+    }
+}
+
+/// Stamps each accepted contact with whether its delivery device has an
+/// unexpired presence heartbeat right now. `None` when presence is not
+/// configured — no basis is not the same fact as offline. Reuses the same
+/// presence projection People's snapshot reads; this mints no new signal and
+/// touches no store. Heartbeat-derived, so it stays out of the People
+/// realtime signature the way `last_seen_at` does.
+fn apply_contact_reachability(
+    people: &mut HomePeopleSummary,
+    presence_port: Option<&crate::collaboration_presence::CollaborationPresenceProductPort>,
+    now: u64,
+) {
+    let Some(port) = presence_port else {
+        return;
+    };
+    let Ok(snapshot) = port.snapshot(now) else {
+        return;
+    };
+    stamp_contact_reachability(people, &snapshot, now);
+}
+
+fn stamp_contact_reachability(
+    people: &mut HomePeopleSummary,
+    snapshot: &crate::collaboration_presence::CollaborationPresenceSnapshot,
+    now: u64,
+) {
+    for contact in &mut people.contacts {
+        let Some(profile_did) = contact.remote_profile_did.as_deref() else {
+            continue;
+        };
+        contact.reachable =
+            Some(snapshot.records().iter().any(|record| {
+                record.sender_profile_did() == profile_did && record.expires_at() > now
+            }));
+    }
+}
+
+fn apply_profile_people_authority(
+    people: &mut HomePeopleSummary,
+    contact_store: Option<
+        &std::sync::Arc<crate::collaboration_contact_store::CollaborationContactStore>,
+    >,
+) -> anyhow::Result<()> {
+    if let Some(store) = contact_store {
+        *people = configured_people_summary_from_contact_store(store)?;
         return Ok(());
     }
-    crate::runtime_control::ensure_runtime_for_home(data_dir)
-        .await
-        .map(|_| ())
+    *people = HomePeopleSummary::default();
+    Ok(())
 }
 
-pub(super) async fn people_discovery_update(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-    Json(body): Json<PeopleDiscoveryUpdateRequest>,
-) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
-            Ok(context) => context,
-            Err(err) => return home_error_response(err),
-        };
-    let data_dir = state.data_dir.clone();
-    match tokio::task::spawn_blocking(move || {
-        let mut discovery = home_people_discovery_state(&data_dir, &context)?;
-        let now = now_ts();
-        discovery.enabled = body.enabled;
-        discovery.enabled_until = body
-            .enabled
-            .then_some(now + HOME_PEOPLE_DISCOVERY_ENABLED_SECS);
-        discovery.updated_at = now;
-        if !discovery.enabled {
-            discovery.local_peer_id = None;
-            discovery.last_bootstrap_at = None;
-            discovery.last_presence_sent_at = None;
-        }
-        if discovery.enabled {
-            let _ = home_people_discovery_sync(&data_dir, &context, &mut discovery);
-        }
-        home_save_people_discovery_state(&data_dir, &context, &discovery)?;
-        let mut summary = home_people_discovery_summary(&data_dir, &context)?;
-        home_people_discovery_annotate_refresh(&mut summary, true);
-        Ok(summary)
-    })
-    .await
-    {
-        Ok(Ok(discovery)) => Json(discovery).into_response(),
-        Ok(Err(err)) => home_error_response(err),
-        Err(err) => home_error_response(anyhow::anyhow!(err)),
-    }
-}
-
-pub(super) async fn people_discovery_refresh(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
-            Ok(context) => context,
-            Err(err) => return home_error_response(err),
-        };
-    let data_dir = state.data_dir.clone();
-    if let Err(err) = ensure_people_discovery_runtime_available(&data_dir).await {
-        return home_error_response(anyhow::anyhow!(
-            "managed local runtime could not start: {err}"
-        ));
-    }
-    match tokio::task::spawn_blocking(move || {
-        let mut discovery = home_people_discovery_state(&data_dir, &context)?;
-        let now = now_ts();
-        let before_signature = home_people_discovery_state_signature(&discovery);
-        let expired = home_people_discovery_apply_expiry(&mut discovery, now);
-        if home_people_discovery_active(&discovery, now) {
-            home_people_discovery_sync(&data_dir, &context, &mut discovery)?;
-            discovery.updated_at = now;
-            home_save_people_discovery_state(&data_dir, &context, &discovery)?;
-        } else if expired {
-            home_save_people_discovery_state(&data_dir, &context, &discovery)?;
-        }
-        let after_signature = home_people_discovery_state_signature(&discovery);
-        let mut summary = home_people_discovery_summary(&data_dir, &context)?;
-        home_people_discovery_annotate_refresh(
-            &mut summary,
-            expired || before_signature != after_signature,
-        );
-        Ok(summary)
-    })
-    .await
-    {
-        Ok(Ok(discovery)) => Json(discovery).into_response(),
-        Ok(Err(err)) => home_error_response(err),
-        Err(err) => home_error_response(anyhow::anyhow!(err)),
-    }
-}
-
-pub(super) async fn people_discovery_request_create(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-    Json(body): Json<PeopleDiscoveryRequestCreate>,
-) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
-            Ok(context) => context,
-            Err(err) => return home_error_response(err),
-        };
-    let data_dir = state.data_dir.clone();
-    if let Err(err) = ensure_people_discovery_runtime_available(&data_dir).await {
-        return home_error_response(anyhow::anyhow!(
-            "managed local runtime could not start: {err}"
-        ));
-    }
-    match tokio::task::spawn_blocking(move || {
-        let peer_id = body.peer_id.trim();
-        if peer_id.is_empty() || peer_id.len() > 256 {
-            anyhow::bail!("discovery peer id is invalid");
-        }
-        let mut discovery = home_people_discovery_state(&data_dir, &context)?;
-        let peer = discovery
-            .peers
-            .get(peer_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("discovery peer is not visible"))?;
-        let now = now_ts();
-        let request_id = home_people_discovery_request_id(peer_id)?;
-        let request = HomePeopleDiscoveryRequestSummary {
-            request_id: request_id.clone(),
-            peer_id: peer.peer_id,
-            did: peer.did,
-            display_name: peer.display_name,
-            handle: peer.handle,
-            created_at: now,
-            status: "requested".to_string(),
-            invite_id: None,
-        };
-        if discovery.enabled {
-            home_people_discovery_send_request(&data_dir, &context, &mut discovery, &request)
-                .context("people discovery delivery failed")?;
-        }
-        discovery.requests.insert(request_id, request);
-        discovery.updated_at = now;
-        home_save_people_discovery_state(&data_dir, &context, &discovery)?;
-        home_people_discovery_summary(&data_dir, &context)
-    })
-    .await
-    {
-        Ok(Ok(discovery)) => Json(discovery).into_response(),
-        Ok(Err(err)) => home_error_response(err),
-        Err(err) => home_error_response(anyhow::anyhow!(err)),
-    }
-}
-
-pub(super) async fn people_discovery_request_accept(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-    Path(request_id): Path<String>,
-) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
-            Ok(context) => context,
-            Err(err) => return home_error_response(err),
-        };
-    let data_dir = state.data_dir.clone();
-    if let Err(err) = ensure_people_discovery_runtime_available(&data_dir).await {
-        return home_error_response(anyhow::anyhow!(
-            "managed local runtime could not start: {err}"
-        ));
-    }
-    match tokio::task::spawn_blocking(move || {
-        let request_id = request_id.trim().to_string();
-        if request_id.is_empty() || request_id.len() > 256 {
-            anyhow::bail!("discovery request id is invalid");
-        }
-        let mut discovery = home_people_discovery_state(&data_dir, &context)?;
-        let request = discovery
-            .requests
-            .get(&request_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("discovery request not found"))?;
-        if request.status != "incoming"
-            && request.status != "accepted_sent"
-            && request.status != "joined"
-        {
-            anyhow::bail!("discovery request is not waiting for acceptance");
-        }
-        let requester_did = request
-            .did
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("discovery request is missing a requester DID"))?
-            .to_string();
-        let now = now_ts();
-        home_people_discovery_send_acceptance(&data_dir, &context, &mut discovery, &request)
-            .context("people discovery delivery failed")?;
-        let _ = home_people_upsert_contact(
-            &data_dir,
-            &context,
-            HomePeopleContactUpsert {
-                peer_id: &request.peer_id,
-                did: &requester_did,
-                display_name: &request.display_name,
-                handle: request.handle.as_deref(),
-                source: "people_discovery",
-                updated_at: now,
-            },
-        )?;
-        if let Some(stored) = discovery.requests.get_mut(&request_id) {
-            stored.status = "joined".to_string();
-            stored.invite_id = None;
-        }
-        discovery.updated_at = now;
-        home_save_people_discovery_state(&data_dir, &context, &discovery)?;
-        home_people_discovery_summary(&data_dir, &context)
-    })
-    .await
-    {
-        Ok(Ok(discovery)) => Json(discovery).into_response(),
-        Ok(Err(err)) => home_error_response(err),
-        Err(err) => home_error_response(anyhow::anyhow!(err)),
-    }
-}
-
-pub(super) async fn people_discovery_request_join(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-    Path(request_id): Path<String>,
-) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
-            Ok(context) => context,
-            Err(err) => return home_error_response(err),
-        };
-    let data_dir = state.data_dir.clone();
-    if let Err(err) = ensure_people_discovery_runtime_available(&data_dir).await {
-        return home_error_response(anyhow::anyhow!(
-            "managed local runtime could not start: {err}"
-        ));
-    }
-    match tokio::task::spawn_blocking(move || {
-        let request_id = request_id.trim().to_string();
-        if request_id.is_empty() || request_id.len() > 256 {
-            anyhow::bail!("discovery request id is invalid");
-        }
-        let mut discovery = home_people_discovery_state(&data_dir, &context)?;
-        let request = discovery
-            .requests
-            .get(&request_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("discovery request not found"))?;
-        if request.status != "accepted" && request.status != "joined" {
-            anyhow::bail!("discovery request has no accepted invite to join");
-        }
-        let invite_id = request
-            .invite_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("accepted discovery request is missing an invite"))?
-            .to_string();
-        let (_, local_did) = elastos_identity::load_or_create_did(&data_dir)?;
-        let member = crate::room_service::accept_room_invite(
-            &data_dir,
-            crate::room_service::RoomInviteAcceptInput {
-                actor_did: local_did.clone(),
-                invite_id: invite_id.clone(),
-            },
-        )?;
-        let member_profile = home_profile_card_summary_for_context(&data_dir, &context)
-            .map(room_profile_card_from_home);
-        let acceptance = crate::room_service::export_room_acceptance_envelope_with_profile(
-            &data_dir,
-            &invite_id,
-            member_profile,
-        )?;
-        home_people_discovery_send_room_acceptance(
-            &data_dir,
-            &mut discovery,
-            &request,
-            &acceptance,
-        )
-        .context("people discovery delivery failed")?;
-        if let Some(stored) = discovery.requests.get_mut(&request_id) {
-            stored.status = "joined".to_string();
-        }
-        discovery.updated_at = now_ts();
-        home_save_people_discovery_state(&data_dir, &context, &discovery)?;
-        let summary = crate::room_service::load_summary(&data_dir).unwrap_or_default();
-        let _ = crate::notifications::sync_room_notifications(&data_dir, &summary);
-        let discovery = home_people_discovery_summary(&data_dir, &context)?;
-        Ok::<_, anyhow::Error>(PeopleDiscoveryRequestJoinResponse {
-            schema: "elastos.people.discovery-join/v1".to_string(),
-            status: "joined".to_string(),
-            invite_id,
-            member_did: member.member_did,
-            discovery,
+fn apply_services_peer_authority(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    services: &mut HomeServicesSummary,
+) -> anyhow::Result<()> {
+    let contacts = home_services_peer_contacts_state(data_dir, context)?;
+    let mut remote_offers = contacts
+        .contacts
+        .values()
+        .flat_map(|contact| {
+            home_service_offers_for_people_contact(&HomePeopleContactSummary {
+                contact_id: contact.contact_id.clone(),
+                remote_profile_did: None,
+                added_at: contact.added_at,
+                conversation_id: None,
+                display_name: contact.display_name.clone(),
+                handle: contact.handle.clone(),
+                relationship: "connected".to_string(),
+                can_message: true,
+                device_label: None,
+                profile_card: None,
+                last_seen_at: None,
+                reachable: None,
+            })
         })
-    })
-    .await
+        .collect::<Vec<_>>();
+    remote_offers.extend(home_configured_remote_exit_offers(data_dir));
+    remote_offers.sort_by(|left, right| {
+        left.service_kind
+            .cmp(&right.service_kind)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+            .then_with(|| left.offer_id.cmp(&right.offer_id))
+    });
+    services.remote_offer_count = remote_offers.len();
+    services.remote_offers = remote_offers;
+    Ok(())
+}
+
+pub(super) async fn people_profile_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<PeopleProfileUpdateRequest>,
+) -> Response {
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
+    if let Err(err) =
+        crate::collaboration_profile_authority::require_profile_authority_passkey_binding(
+            &state.data_dir,
+            &home_browser_principal_id(&context),
+            context.proof_binding_id.as_deref(),
+        )
     {
-        Ok(Ok(output)) => Json(output).into_response(),
-        Ok(Err(err)) => home_error_response(err),
-        Err(err) => home_error_response(anyhow::anyhow!(err)),
+        return (StatusCode::FORBIDDEN, err.to_string()).into_response();
+    }
+    if let Err(err) = crate::collaboration_profile_authority::validate_profile_authority_update(
+        &state.data_dir,
+        &req.display_name,
+        None,
+    ) {
+        return home_error_response(err);
+    }
+    let existing_profile = match crate::collaboration_profile_authority::load_profile_authority(
+        &state.data_dir,
+        &home_browser_principal_id(&context),
+        &home_browser_localhost_root(&context),
+    ) {
+        Ok(profile) => profile,
+        Err(err) => return home_error_response(err),
+    };
+    if existing_profile.is_none() {
+        let recovery = match crate::api::auth_gateway::principal_root_recovery_status_for_context(
+            &state, &context,
+        ) {
+            Ok(recovery) => recovery,
+            Err(err) => return home_error_response(err),
+        };
+        if !recovery.root_encrypted || !recovery.recovery_configured {
+            return (
+                StatusCode::CONFLICT,
+                Json(PeopleProfileProtectionRequiredResponse {
+                    schema: PEOPLE_PROFILE_PROTECTION_REQUIRED_SCHEMA,
+                    status: "recovery_required",
+                    action_target: "system",
+                    message: PEOPLE_PROFILE_PROTECTION_REQUIRED_MESSAGE,
+                }),
+            )
+                .into_response();
+        }
+    }
+    match update_profile_for_context(&state.data_dir, &context, &req.display_name) {
+        Ok(identity) => {
+            refresh_runtime_owned_contexts_after_profile_change(
+                &state.data_dir,
+                state.collaboration_discovery_service.as_ref(),
+            );
+            Json(identity.without_device_identity()).into_response()
+        }
+        Err(err) => home_error_response(err),
     }
 }
 
@@ -853,18 +1917,7 @@ pub(super) async fn services_summary(
             );
         }
         let mut home_state = home_state(&data_dir);
-        apply_home_people_contacts_state(
-            &data_dir,
-            &context,
-            &mut home_state.people,
-            &mut home_state.services,
-        )?;
-        filter_removed_people_contacts(
-            &data_dir,
-            &context,
-            &mut home_state.people,
-            &mut home_state.services,
-        )?;
+        apply_services_peer_authority(&data_dir, &context, &mut home_state.services)?;
         apply_home_services_selection(&data_dir, &context, &mut home_state.services)?;
         Ok::<_, anyhow::Error>(home_state.services)
     })
@@ -889,18 +1942,7 @@ pub(super) async fn services_offer_update(
     let data_dir = state.data_dir.clone();
     match tokio::task::spawn_blocking(move || {
         let mut home_state = home_state(&data_dir);
-        apply_home_people_contacts_state(
-            &data_dir,
-            &context,
-            &mut home_state.people,
-            &mut home_state.services,
-        )?;
-        filter_removed_people_contacts(
-            &data_dir,
-            &context,
-            &mut home_state.people,
-            &mut home_state.services,
-        )?;
+        apply_services_peer_authority(&data_dir, &context, &mut home_state.services)?;
         let offer_id = req.offer_id.trim();
         if offer_id.is_empty() {
             anyhow::bail!("service offer id is required");
@@ -943,7 +1985,11 @@ pub(super) async fn services_offer_update(
                     if offer.grant_required && !services_state.remote_offer_ids.contains(offer_id) {
                         let sent = home_services_send_access_request(&data_dir, &context, offer)
                             .map_err(|err| {
-                                anyhow::anyhow!("service access request delivery failed: {err}")
+                                if profile_required_message(&err).is_some() {
+                                    err
+                                } else {
+                                    anyhow::anyhow!("service access request delivery failed: {err}")
+                                }
                             })?;
                         services_state.remote_offer_requests.insert(
                             offer_id.to_string(),
@@ -1192,18 +2238,18 @@ fn home_save_services_requests_state(
     .with_context(|| format!("could not write {}", path.display()))
 }
 
-fn home_services_contact_record_for_offer(
+fn home_services_peer_contact_record_for_offer(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
     offer: &HomeServiceOfferSummary,
-) -> anyhow::Result<HomePeopleContactRecord> {
+) -> anyhow::Result<HomeServicesPeerContactRecord> {
     let contact_id = offer
         .contact_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("service offer is not tied to a person"))?;
-    let contacts = home_people_contacts_state(data_dir, context)?;
+    let contacts = home_services_peer_contacts_state(data_dir, context)?;
     contacts
         .contacts
         .get(contact_id)
@@ -1263,26 +2309,26 @@ fn home_services_send_access_request(
     {
         anyhow::bail!("only Browser Exit service requests are supported");
     }
-    let contact = home_services_contact_record_for_offer(data_dir, context, offer)?;
+    let contact = home_services_peer_contact_record_for_offer(data_dir, context, offer)?;
     let target_peer_id = contact.peer_id.trim();
     if target_peer_id.is_empty() {
         anyhow::bail!("service offer person has no Carrier peer route");
     }
-    let runtime = people_attach_peer_runtime_blocking(data_dir)?;
-    people_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
-    home_people_discovery_join_known_peers(
+    let runtime = services_attach_peer_runtime_blocking(data_dir)?;
+    services_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
+    services_gossip_join_known_peers_blocking(
         &runtime,
         HOME_SERVICES_REQUESTS_TOPIC,
         &[target_peer_id.to_string()],
     )?;
-    let requester_did = home_people_local_did(data_dir)?;
-    let profile = home_profile_card_summary_for_context(data_dir, context);
-    let requester_display_name = profile
-        .as_ref()
-        .map(|profile| profile.display_name.clone())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "ElastOS user".to_string());
-    let requester_handle = profile.as_ref().and_then(|profile| profile.handle.clone());
+    let requester_did = home_services_local_device_did(data_dir)?;
+    let profile = require_home_room_profile_card_projection_for_context(
+        data_dir,
+        context,
+        PROFILE_REQUIRED_SERVICES_MESSAGE,
+    )?;
+    let requester_display_name = profile.display_name.clone();
+    let requester_handle = profile.handle.clone();
     let created_at = now_ts();
     let request_id = home_services_new_access_request_id(target_peer_id)?;
     let payload = serde_json::json!({
@@ -1302,7 +2348,7 @@ fn home_services_send_access_request(
         "grant_scope": &offer.grant_scope,
         "created_at": created_at,
     });
-    let delivery = people_peer_provider_request_blocking(
+    let delivery = services_peer_provider_request_blocking(
         &runtime.client,
         &runtime.api_url,
         &runtime.client_token,
@@ -1357,19 +2403,19 @@ fn home_services_send_access_decision(
     if target_peer_id.is_empty() {
         anyhow::bail!("service access request has no requester peer route");
     }
-    let runtime = people_attach_peer_runtime_blocking(data_dir)?;
-    people_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
-    home_people_discovery_join_known_peers(
+    let runtime = services_attach_peer_runtime_blocking(data_dir)?;
+    services_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
+    services_gossip_join_known_peers_blocking(
         &runtime,
         HOME_SERVICES_REQUESTS_TOPIC,
         &[target_peer_id.to_string()],
     )?;
-    let profile = home_profile_card_summary_for_context(data_dir, context);
-    let provider_display_name = profile
-        .as_ref()
-        .map(|profile| profile.display_name.clone())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "ElastOS user".to_string());
+    let profile = require_home_room_profile_card_projection_for_context(
+        data_dir,
+        context,
+        PROFILE_REQUIRED_SERVICES_MESSAGE,
+    )?;
+    let provider_display_name = profile.display_name.clone();
     let created_at = now_ts();
     let mut payload = serde_json::json!({
         "schema": "elastos.service-access-decision/v1",
@@ -1400,7 +2446,7 @@ fn home_services_send_access_decision(
             "max_active_streams_per_principal": 2,
         });
     }
-    let delivery = people_peer_provider_request_blocking(
+    let delivery = services_peer_provider_request_blocking(
         &runtime.client,
         &runtime.api_url,
         &runtime.client_token,
@@ -1436,14 +2482,14 @@ fn home_services_sync_access_decisions(
     if known_peers.is_empty() {
         return Ok(());
     }
-    let runtime = people_attach_peer_runtime_blocking(data_dir)?;
-    people_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
-    home_people_discovery_join_known_peers(
+    let runtime = services_attach_peer_runtime_blocking(data_dir)?;
+    services_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
+    services_gossip_join_known_peers_blocking(
         &runtime,
         HOME_SERVICES_REQUESTS_TOPIC,
         &known_peers.iter().cloned().collect::<Vec<_>>(),
     )?;
-    let recv = people_peer_provider_request_blocking(
+    let recv = services_peer_provider_request_blocking(
         &runtime.client,
         &runtime.api_url,
         &runtime.client_token,
@@ -1698,7 +2744,7 @@ pub(super) fn home_services_sync_access_requests(
     if !home_services_local_exit_shared(data_dir, context)? {
         return Ok(());
     }
-    let contacts = home_people_contacts_state(data_dir, context)?;
+    let contacts = home_services_peer_contacts_state(data_dir, context)?;
     let known_peers = contacts
         .contacts
         .values()
@@ -1710,14 +2756,14 @@ pub(super) fn home_services_sync_access_requests(
     if known_peers.is_empty() {
         return Ok(());
     }
-    let runtime = people_attach_peer_runtime_blocking(data_dir)?;
-    people_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
-    home_people_discovery_join_known_peers(
+    let runtime = services_attach_peer_runtime_blocking(data_dir)?;
+    services_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
+    services_gossip_join_known_peers_blocking(
         &runtime,
         HOME_SERVICES_REQUESTS_TOPIC,
         &known_peers.iter().cloned().collect::<Vec<_>>(),
     )?;
-    let recv = people_peer_provider_request_blocking(
+    let recv = services_peer_provider_request_blocking(
         &runtime.client,
         &runtime.api_url,
         &runtime.client_token,
@@ -1815,9 +2861,9 @@ fn home_services_merge_access_request(
     {
         return false;
     }
-    let handle = clean_people_payload_handle(payload);
+    let handle = clean_services_peer_payload_handle(payload);
     let requester_display_name =
-        clean_people_payload_display_name(payload, handle.as_deref(), None);
+        clean_services_peer_payload_display_name(payload, handle.as_deref(), None);
     let now = now_ts();
     let created_at = payload
         .get("created_at")
@@ -1949,8 +2995,13 @@ fn home_services_mark_access_request(
     let Some(request) = state.requests.get(request_id).cloned() else {
         anyhow::bail!("service request not found");
     };
-    home_services_send_access_decision(data_dir, context, &request, status)
-        .with_context(|| "service access request delivery failed")?;
+    home_services_send_access_decision(data_dir, context, &request, status).map_err(|err| {
+        if profile_required_message(&err).is_some() {
+            err
+        } else {
+            err.context("service access request delivery failed")
+        }
+    })?;
     let Some(request) = state.requests.get_mut(request_id) else {
         anyhow::bail!("service request not found");
     };
@@ -2034,27 +3085,6 @@ fn available_service_offer(mut offer: HomeServiceOfferSummary) -> HomeServiceOff
         offer.status = "available".to_string();
     }
     offer
-}
-
-fn home_people_contact_exists(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-    summary: &crate::room_service::RoomSummary,
-    local_did: Option<&str>,
-    contact_id: &str,
-) -> anyhow::Result<bool> {
-    if summary
-        .room_control
-        .members
-        .iter()
-        .filter(|member| local_did != Some(member.member_did.as_str()))
-        .any(|member| home_people_contact_id(&member.member_did) == contact_id)
-    {
-        return Ok(true);
-    }
-    Ok(home_people_contacts_state(data_dir, context)?
-        .contacts
-        .contains_key(contact_id))
 }
 
 pub(super) async fn home_events(
@@ -2191,26 +3221,38 @@ async fn home_realtime_snapshot(
     let mut home_state = tokio::task::spawn_blocking(move || home_state(&data_dir))
         .await
         .unwrap_or_default();
-    if apply_home_people_contacts_state(
+    let contact_authority = load_configured_contact_authority_for_context(
         &state.data_dir,
         context,
-        &mut home_state.people,
-        &mut home_state.services,
+        state.collaboration_discovery_service.as_ref(),
+    );
+    let mut contact_authority_unavailable = contact_authority.is_err();
+    if apply_contact_request_notification_projection(
+        &state.data_dir,
+        contact_authority
+            .as_ref()
+            .ok()
+            .and_then(|authority| authority.as_ref())
+            .map(|authority| &authority.store),
+        &mut home_state.notifications,
     )
     .is_err()
     {
-        home_state.people = HomePeopleSummary::default();
-        home_state.services = HomeServicesSummary::default();
+        contact_authority_unavailable = true;
     }
-    if filter_removed_people_contacts(
-        &state.data_dir,
-        context,
+    if apply_profile_people_authority(
         &mut home_state.people,
-        &mut home_state.services,
+        contact_authority
+            .as_ref()
+            .ok()
+            .and_then(|authority| authority.as_ref())
+            .map(|authority| &authority.store),
     )
     .is_err()
     {
         home_state.people = HomePeopleSummary::default();
+    }
+    if apply_services_peer_authority(&state.data_dir, context, &mut home_state.services).is_err() {
         home_state.services = HomeServicesSummary::default();
     }
     if apply_home_services_selection(&state.data_dir, context, &mut home_state.services).is_err() {
@@ -2248,6 +3290,9 @@ async fn home_realtime_snapshot(
         })
         .collect::<Vec<_>>();
     notification_signature.sort();
+    if contact_authority_unavailable {
+        notification_signature.push("contact-authority-unavailable".to_string());
+    }
     let browser_sessions = super::gateway_browser::browser_gateway_session_status(
         &state.data_dir,
         &context.principal_id,
@@ -2373,13 +3418,16 @@ fn home_people_realtime_signature(people: &HomePeopleSummary) -> Vec<String> {
                 })
                 .unwrap_or_default();
             format!(
-                "{}:{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
                 contact.contact_id,
                 contact.display_name,
+                contact.handle.as_deref().unwrap_or_default(),
                 contact.relationship,
-                contact.route,
+                contact.conversation_id.as_deref().unwrap_or_default(),
                 contact.can_message,
                 contact.device_label.as_deref().unwrap_or_default(),
+                contact.remote_profile_did.as_deref().unwrap_or_default(),
+                contact.added_at,
                 profile
             )
         })
@@ -2648,110 +3696,104 @@ fn home_authority_summary(context: &HomeLaunchTokenContext) -> HomeAuthoritySumm
 fn standard_home_identity_summary() -> HomeIdentitySummary {
     HomeIdentitySummary {
         device_did: None,
-        handle: None,
-        profile_card: None,
+        profile_readiness: None,
+        profile_setup_display_name: None,
+        profile: None,
     }
 }
 
-pub(super) fn home_profile_card_summary_for_context(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-) -> Option<HomeProfileCardSummary> {
-    home_profile_card(data_dir, context).ok().flatten()
+pub(in crate::api) struct ProfileReadinessProjection {
+    pub readiness: ProfileReadinessSummary,
+    profile: Option<crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument>,
 }
 
-fn home_profile_card(
+pub(in crate::api) fn profile_readiness_for_principal(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    localhost_root: &str,
+) -> ProfileReadinessProjection {
+    match crate::collaboration_profile_authority::load_profile_authority(
+        data_dir,
+        principal_id,
+        localhost_root,
+    ) {
+        Ok(Some(profile)) => ProfileReadinessProjection {
+            readiness: ProfileReadinessSummary::ready(),
+            profile: Some(profile),
+        },
+        Ok(None) => ProfileReadinessProjection {
+            readiness: ProfileReadinessSummary::setup_required(),
+            profile: None,
+        },
+        Err(_) => ProfileReadinessProjection {
+            readiness: ProfileReadinessSummary::unavailable(),
+            profile: None,
+        },
+    }
+}
+
+pub(super) fn home_profile_readiness_projection_for_context(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> (ProfileReadinessSummary, Option<HomeProfileSummary>) {
+    let projection = profile_readiness_for_principal(
+        data_dir,
+        &home_browser_principal_id(context),
+        &home_browser_localhost_root(context),
+    );
+    let profile = projection.profile.map(|profile| HomeProfileSummary {
+        schema: HOME_PROFILE_SUMMARY_SCHEMA.to_string(),
+        display_name: profile.document().display_name.clone(),
+        handle: profile.document().handle.clone(),
+    });
+    (projection.readiness, profile)
+}
+
+pub(super) fn home_room_profile_card_projection_for_context(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
 ) -> anyhow::Result<Option<HomeProfileCardSummary>> {
-    let path = home_profile_card_path(data_dir, context)?;
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let bytes = crate::auth::read_principal_root_object(
-        data_dir,
-        &home_browser_principal_id(context),
-        &home_browser_localhost_root(context),
-        &home_profile_card_uri(context),
-        &path,
-    )?;
-    if bytes.len() > HOME_PROFILE_CARD_MAX_BYTES {
-        anyhow::bail!("profile card object is too large");
-    }
-    let card: HomeProfileCardSummary = serde_json::from_slice(&bytes)?;
-    validate_home_profile_card(context, card).map(Some)
+    home_room_profile_card_projection(data_dir, context)
 }
 
-fn home_save_profile_card(
+pub(super) fn require_home_room_profile_card_projection_for_context(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
-    display_name: &str,
-    updated_at: u64,
+    error_message: &'static str,
 ) -> anyhow::Result<HomeProfileCardSummary> {
-    let display_name = crate::auth::clean_principal_display_name(Some(display_name))?
-        .ok_or_else(|| anyhow::anyhow!("profile name must not be empty"))?;
-    let card = HomeProfileCardSummary {
-        schema: HOME_PROFILE_CARD_SCHEMA.to_string(),
-        profile_id: home_profile_id(context),
-        display_name,
-        handle: None,
-        updated_at,
-    };
-    let bytes = serde_json::to_vec_pretty(&card)?;
-    if bytes.len() > HOME_PROFILE_CARD_MAX_BYTES {
-        anyhow::bail!("profile card object is too large");
-    }
-    let path = home_profile_card_path(data_dir, context)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    crate::auth::write_principal_root_object(
+    home_room_profile_card_projection_for_context(data_dir, context)?
+        .ok_or_else(|| profile_required_error(error_message))
+}
+
+pub(super) fn home_room_profile_card_projection(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<Option<HomeProfileCardSummary>> {
+    crate::collaboration_profile_authority::load_profile_authority(
         data_dir,
         &home_browser_principal_id(context),
         &home_browser_localhost_root(context),
-        &home_profile_card_uri(context),
-        &path,
-        &bytes,
-    )?;
-    Ok(card)
-}
-
-fn validate_home_profile_card(
-    context: &HomeLaunchTokenContext,
-    card: HomeProfileCardSummary,
-) -> anyhow::Result<HomeProfileCardSummary> {
-    if card.schema != HOME_PROFILE_CARD_SCHEMA {
-        anyhow::bail!("unsupported profile card schema");
-    }
-    if card.profile_id != home_profile_id(context) {
-        anyhow::bail!("profile card id mismatch");
-    }
-    let display_name = crate::auth::clean_principal_display_name(Some(&card.display_name))?
-        .ok_or_else(|| anyhow::anyhow!("profile card display name must not be empty"))?;
-    Ok(HomeProfileCardSummary {
-        display_name,
-        ..card
+    )
+    .map(|profile| {
+        profile.map(|profile| HomeProfileCardSummary {
+            schema: HOME_ROOM_PROFILE_CARD_SCHEMA.to_string(),
+            profile_id: profile.document().profile_did.clone(),
+            display_name: profile.document().display_name.clone(),
+            handle: profile.document().handle.clone(),
+            updated_at: profile.document().updated_at,
+        })
     })
 }
 
-fn home_profile_card_uri(context: &HomeLaunchTokenContext) -> String {
-    format!(
-        "{}/.AppData/ElastOS/Profile/profile-card.json",
-        home_browser_localhost_root(context)
-    )
-}
-
-fn home_profile_card_path(
+#[cfg(test)]
+pub(super) fn home_profile_authority_path(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
 ) -> anyhow::Result<PathBuf> {
-    rooted_localhost_fs_path(data_dir, &home_profile_card_uri(context))
-        .ok_or_else(|| anyhow::anyhow!("invalid profile card object path"))
-}
-
-fn home_profile_id(context: &HomeLaunchTokenContext) -> String {
-    let digest = Sha256::digest(context.principal_id.as_bytes());
-    format!("profile:local:{}", hex::encode(&digest[..12]))
+    crate::collaboration_profile_authority::profile_authority_path(
+        data_dir,
+        &home_browser_localhost_root(context),
+    )
 }
 
 fn standard_home_authority_summary() -> HomeAuthoritySummary {
@@ -2956,7 +3998,7 @@ fn home_save_active_shell(
     }
     let path = home_active_shell_state_path(data_dir, context)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::auth::create_owner_only_dir_all(data_dir, parent)?;
     }
     crate::auth::write_principal_root_object(
         data_dir,
@@ -3303,7 +4345,7 @@ fn home_save_browser_state(
     }
     let path = home_browser_state_path(data_dir, context)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::auth::create_owner_only_dir_all(data_dir, parent)?;
     }
     crate::auth::write_principal_root_object(
         data_dir,
@@ -3316,9 +4358,11 @@ fn home_save_browser_state(
     Ok(state)
 }
 
-fn default_home_people_contacts_state(context: &HomeLaunchTokenContext) -> HomePeopleContactsState {
-    HomePeopleContactsState {
-        schema: HOME_PEOPLE_CONTACTS_SCHEMA.to_string(),
+fn default_home_services_peer_contacts_state(
+    context: &HomeLaunchTokenContext,
+) -> HomeServicesPeerContactsState {
+    HomeServicesPeerContactsState {
+        schema: HOME_SERVICES_PEER_CONTACTS_SCHEMA.to_string(),
         principal_id: home_browser_principal_id(context),
         localhost_root: home_browser_localhost_root(context),
         updated_at: 0,
@@ -3326,28 +4370,41 @@ fn default_home_people_contacts_state(context: &HomeLaunchTokenContext) -> HomeP
     }
 }
 
-fn home_people_contacts_uri(context: &HomeLaunchTokenContext) -> String {
+fn home_services_peer_contacts_uri(context: &HomeLaunchTokenContext) -> String {
+    format!(
+        "{}/.AppData/ElastOS/Home/services-peer-contacts.json",
+        home_browser_localhost_root(context)
+    )
+}
+
+/// The released 0.6 name for the Services peer contact object. It held
+/// Services peer data while being named as People data; the name now states
+/// the contents. Migration runs only from an explicit authenticated launch,
+/// never lazily from a summary read.
+fn legacy_home_services_peer_contacts_uri(context: &HomeLaunchTokenContext) -> String {
     format!(
         "{}/.AppData/ElastOS/Home/people-contacts.json",
         home_browser_localhost_root(context)
     )
 }
 
-fn home_people_contacts_path(
+/// One-time rename of the released object. The protected-object AAD binds
+/// the object URI, so this is a verified read at the legacy URI and a
+/// protected write at the honest one — never a bare file rename.
+pub(super) fn migrate_legacy_services_peer_contacts(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
-) -> anyhow::Result<PathBuf> {
-    rooted_localhost_fs_path(data_dir, &home_people_contacts_uri(context))
-        .ok_or_else(|| anyhow::anyhow!("invalid People contacts state root"))
-}
-
-fn home_people_contacts_state(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-) -> anyhow::Result<HomePeopleContactsState> {
-    let path = home_people_contacts_path(data_dir, context)?;
-    if !path.is_file() {
-        return Ok(default_home_people_contacts_state(context));
+) -> anyhow::Result<()> {
+    let new_path = home_services_peer_contacts_path(data_dir, context)?;
+    if new_path.is_file() {
+        return Ok(());
+    }
+    let legacy_uri = legacy_home_services_peer_contacts_uri(context);
+    let Some(legacy_path) = rooted_localhost_fs_path(data_dir, &legacy_uri) else {
+        anyhow::bail!("invalid Services peer contacts state root");
+    };
+    if !legacy_path.is_file() {
+        return Ok(());
     }
     let principal_id = home_browser_principal_id(context);
     let localhost_root = home_browser_localhost_root(context);
@@ -3355,56 +4412,91 @@ fn home_people_contacts_state(
         data_dir,
         &principal_id,
         &localhost_root,
-        &home_people_contacts_uri(context),
+        &legacy_uri,
+        &legacy_path,
+    ) {
+        Ok(bytes) => bytes,
+        // An unreadable legacy object migrates nothing; the read path then
+        // starts fresh exactly as it does for a corrupt object at the
+        // current name.
+        Err(err) if is_unencrypted_principal_root_state(&err) => return Ok(()),
+        Err(err) if is_missing_principal_root_state_file(&err) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    // Only a genuine Services peer object moves, and it moves whole: the
+    // released schema string was People-named too, so the migration renames
+    // the object and its schema together. Anything else at this name stays
+    // where it is, ignored, exactly as it was before the rename.
+    let Ok(mut state) = serde_json::from_slice::<HomeServicesPeerContactsState>(&bytes) else {
+        return Ok(());
+    };
+    if state.schema != LEGACY_HOME_SERVICES_PEER_CONTACTS_SCHEMA {
+        return Ok(());
+    }
+    state.schema = HOME_SERVICES_PEER_CONTACTS_SCHEMA.to_string();
+    if let Some(parent) = new_path.parent() {
+        crate::auth::create_owner_only_dir_all(data_dir, parent)?;
+    }
+    crate::auth::write_principal_root_object(
+        data_dir,
+        &principal_id,
+        &localhost_root,
+        &home_services_peer_contacts_uri(context),
+        &new_path,
+        &serde_json::to_vec_pretty(&state)?,
+    )?;
+    std::fs::remove_file(&legacy_path)?;
+    Ok(())
+}
+
+fn home_services_peer_contacts_path(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<PathBuf> {
+    rooted_localhost_fs_path(data_dir, &home_services_peer_contacts_uri(context))
+        .ok_or_else(|| anyhow::anyhow!("invalid Services peer contacts state root"))
+}
+
+fn home_services_peer_contacts_state(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<HomeServicesPeerContactsState> {
+    let path = home_services_peer_contacts_path(data_dir, context)?;
+    if !path.is_file() {
+        return Ok(default_home_services_peer_contacts_state(context));
+    }
+    let principal_id = home_browser_principal_id(context);
+    let localhost_root = home_browser_localhost_root(context);
+    let bytes = match crate::auth::read_principal_root_object(
+        data_dir,
+        &principal_id,
+        &localhost_root,
+        &home_services_peer_contacts_uri(context),
         &path,
     ) {
         Ok(bytes) => bytes,
         Err(err) if is_unencrypted_principal_root_state(&err) => {
-            return Ok(default_home_people_contacts_state(context));
+            return Ok(default_home_services_peer_contacts_state(context));
         }
         Err(err) if is_missing_principal_root_state_file(&err) => {
-            return Ok(default_home_people_contacts_state(context));
+            return Ok(default_home_services_peer_contacts_state(context));
         }
         Err(err) => return Err(err),
     };
-    let state: HomePeopleContactsState = serde_json::from_slice(&bytes)?;
-    if state.schema != HOME_PEOPLE_CONTACTS_SCHEMA {
-        anyhow::bail!("unsupported People contacts schema");
+    let state: HomeServicesPeerContactsState = serde_json::from_slice(&bytes)?;
+    if state.schema != HOME_SERVICES_PEER_CONTACTS_SCHEMA {
+        anyhow::bail!("unsupported Services peer contacts schema");
     }
     if state.principal_id != principal_id {
-        anyhow::bail!("People contacts principal mismatch");
+        anyhow::bail!("Services peer contacts principal mismatch");
     }
     if state.localhost_root != localhost_root {
-        anyhow::bail!("People contacts root mismatch");
+        anyhow::bail!("Services peer contacts root mismatch");
     }
     Ok(state)
 }
 
-fn home_save_people_contacts_state(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-    state: &HomePeopleContactsState,
-) -> anyhow::Result<()> {
-    let bytes = serde_json::to_vec_pretty(state)?;
-    if bytes.len() > HOME_PEOPLE_CONTACTS_MAX_BYTES {
-        anyhow::bail!("People contacts state is too large");
-    }
-    let path = home_people_contacts_path(data_dir, context)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    crate::auth::write_principal_root_object(
-        data_dir,
-        &home_browser_principal_id(context),
-        &home_browser_localhost_root(context),
-        &home_people_contacts_uri(context),
-        &path,
-        &bytes,
-    )?;
-    Ok(())
-}
-
-fn clean_people_person_display_name(display_name: Option<&str>, handle: Option<&str>) -> String {
+fn clean_services_peer_display_name(display_name: Option<&str>, handle: Option<&str>) -> String {
     let cleaned_display = display_name.and_then(|value| {
         crate::auth::clean_principal_display_name(Some(value))
             .ok()
@@ -3416,23 +4508,23 @@ fn clean_people_person_display_name(display_name: Option<&str>, handle: Option<&
     {
         return cleaned_display.unwrap_or_default();
     }
-    clean_people_contact_handle(handle)
+    clean_services_peer_handle(handle)
         .or(cleaned_display)
         .unwrap_or_else(|| "ElastOS user".to_string())
 }
 
-fn clean_people_contact_handle(handle: Option<&str>) -> Option<String> {
+fn clean_services_peer_handle(handle: Option<&str>) -> Option<String> {
     handle
         .map(str::trim)
         .filter(|value| !value.is_empty() && value.len() <= 128)
         .map(ToOwned::to_owned)
 }
 
-fn clean_people_payload_handle(payload: &serde_json::Value) -> Option<String> {
-    clean_people_contact_handle(payload.get("handle").and_then(serde_json::Value::as_str))
+fn clean_services_peer_payload_handle(payload: &serde_json::Value) -> Option<String> {
+    clean_services_peer_handle(payload.get("handle").and_then(serde_json::Value::as_str))
 }
 
-fn clean_people_payload_display_name(
+fn clean_services_peer_payload_display_name(
     payload: &serde_json::Value,
     handle: Option<&str>,
     fallback: Option<&str>,
@@ -3441,1221 +4533,10 @@ fn clean_people_payload_display_name(
         .get("display_name")
         .and_then(serde_json::Value::as_str)
         .or(fallback);
-    clean_people_person_display_name(display_name, handle)
+    clean_services_peer_display_name(display_name, handle)
 }
 
-fn home_people_discovery_request_visible(request: &HomePeopleDiscoveryRequestSummary) -> bool {
-    matches!(request.status.as_str(), "incoming" | "requested")
-}
-
-struct HomePeopleContactUpsert<'a> {
-    peer_id: &'a str,
-    did: &'a str,
-    display_name: &'a str,
-    handle: Option<&'a str>,
-    source: &'a str,
-    updated_at: u64,
-}
-
-fn home_people_upsert_contact(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-    upsert: HomePeopleContactUpsert<'_>,
-) -> anyhow::Result<(String, bool)> {
-    let peer_id = upsert.peer_id.trim();
-    if peer_id.is_empty() || peer_id.len() > 256 {
-        anyhow::bail!("People contact peer id is invalid");
-    }
-    let did = upsert.did.trim();
-    if did.is_empty() || did.len() > 512 {
-        anyhow::bail!("People contact DID is invalid");
-    }
-    let contact_id = home_people_contact_id(did);
-    let mut state = home_people_contacts_state(data_dir, context)?;
-    let removed_at = home_people_removed_contacts(data_dir, context)
-        .ok()
-        .and_then(|removed| removed.contacts.get(&contact_id).copied());
-    let existing = state.contacts.get(&contact_id).cloned();
-    let was_visible = existing.as_ref().is_some_and(|record| {
-        removed_at
-            .map(|removed_at| record.added_at > removed_at)
-            .unwrap_or(true)
-    });
-    let added_at = existing
-        .as_ref()
-        .map(|record| record.added_at)
-        .filter(|value| *value > 0)
-        .filter(|value| {
-            removed_at
-                .map(|removed_at| *value > removed_at)
-                .unwrap_or(true)
-        })
-        .unwrap_or(upsert.updated_at);
-    let handle = clean_people_contact_handle(upsert.handle);
-    let display_name =
-        clean_people_person_display_name(Some(upsert.display_name), handle.as_deref());
-    let record = HomePeopleContactRecord {
-        contact_id: contact_id.clone(),
-        peer_id: peer_id.to_string(),
-        did: Some(did.to_string()),
-        display_name,
-        handle,
-        added_at,
-        updated_at: upsert.updated_at,
-        source: upsert.source.to_string(),
-    };
-    let changed = existing
-        .as_ref()
-        .map(|existing| {
-            existing.peer_id != record.peer_id
-                || existing.did != record.did
-                || existing.display_name != record.display_name
-                || existing.handle != record.handle
-                || existing.added_at != record.added_at
-                || existing.updated_at != record.updated_at
-                || existing.source != record.source
-        })
-        .unwrap_or(true);
-    if changed {
-        state.contacts.insert(contact_id.clone(), record);
-        state.updated_at = upsert.updated_at;
-        home_save_people_contacts_state(data_dir, context, &state)?;
-    }
-    Ok((contact_id, !was_visible))
-}
-
-fn home_people_contact_summary_from_record(
-    record: &HomePeopleContactRecord,
-) -> Option<HomePeopleContactSummary> {
-    if record.contact_id.trim().is_empty() || record.peer_id.trim().is_empty() {
-        return None;
-    }
-    Some(HomePeopleContactSummary {
-        contact_id: record.contact_id.clone(),
-        added_at: record.added_at,
-        display_name: clean_people_person_display_name(
-            Some(&record.display_name),
-            record.handle.as_deref(),
-        ),
-        handle: record.handle.clone(),
-        relationship: "connected".to_string(),
-        route: format!("elastos://peer/{}", record.peer_id),
-        can_message: false,
-        device_label: Some(record.peer_id.clone()),
-        profile_card: None,
-        last_seen_at: Some(record.updated_at),
-    })
-}
-
-pub(super) fn apply_home_people_contacts_state(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-    people: &mut HomePeopleSummary,
-    services: &mut HomeServicesSummary,
-) -> anyhow::Result<()> {
-    let state = home_people_contacts_state(data_dir, context)?;
-    if state.contacts.is_empty() {
-        return Ok(());
-    }
-    let mut contacts = people
-        .contacts
-        .drain(..)
-        .map(|contact| (contact.contact_id.clone(), contact))
-        .collect::<BTreeMap<_, _>>();
-    for record in state.contacts.values() {
-        if let Some(contact) = home_people_contact_summary_from_record(record) {
-            contacts.insert(contact.contact_id.clone(), contact);
-        }
-    }
-    people.contacts = contacts.into_values().collect();
-    people.contacts.sort_by(|left, right| {
-        left.display_name
-            .to_lowercase()
-            .cmp(&right.display_name.to_lowercase())
-            .then_with(|| left.contact_id.cmp(&right.contact_id))
-    });
-    people.contact_count = people.contacts.len();
-    let non_contact_offers = people
-        .service_offers
-        .iter()
-        .filter(|offer| offer.contact_id.is_none())
-        .cloned()
-        .collect::<Vec<_>>();
-    people.service_offers = people
-        .contacts
-        .iter()
-        .flat_map(home_service_offers_for_people_contact)
-        .chain(non_contact_offers)
-        .collect();
-    people.service_offer_count = people.service_offers.len();
-    services.remote_offers = people.service_offers.clone();
-    services
-        .remote_offers
-        .extend(home_configured_remote_exit_offers(data_dir));
-    services.remote_offers.sort_by(|left, right| {
-        left.service_kind
-            .cmp(&right.service_kind)
-            .then_with(|| left.display_name.cmp(&right.display_name))
-            .then_with(|| left.offer_id.cmp(&right.offer_id))
-    });
-    services.remote_offer_count = services.remote_offers.len();
-    Ok(())
-}
-
-fn default_home_people_removed_contacts(
-    context: &HomeLaunchTokenContext,
-) -> HomePeopleRemovedContacts {
-    HomePeopleRemovedContacts {
-        schema: HOME_PEOPLE_REMOVED_CONTACTS_SCHEMA.to_string(),
-        principal_id: home_browser_principal_id(context),
-        localhost_root: home_browser_localhost_root(context),
-        contacts: BTreeMap::new(),
-    }
-}
-
-fn home_people_removed_contacts_path(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-) -> anyhow::Result<PathBuf> {
-    rooted_localhost_fs_path(data_dir, &home_people_removed_contacts_uri(context))
-        .ok_or_else(|| anyhow::anyhow!("invalid People state root"))
-}
-
-fn home_people_removed_contacts_uri(context: &HomeLaunchTokenContext) -> String {
-    format!(
-        "{}/.AppData/ElastOS/Home/people-removed-contacts.json",
-        home_browser_localhost_root(context)
-    )
-}
-
-fn home_people_removed_contacts(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-) -> anyhow::Result<HomePeopleRemovedContacts> {
-    let path = home_people_removed_contacts_path(data_dir, context)?;
-    if !path.is_file() {
-        return Ok(default_home_people_removed_contacts(context));
-    }
-    let principal_id = home_browser_principal_id(context);
-    let localhost_root = home_browser_localhost_root(context);
-    let bytes = match crate::auth::read_principal_root_object(
-        data_dir,
-        &principal_id,
-        &localhost_root,
-        &home_people_removed_contacts_uri(context),
-        &path,
-    ) {
-        Ok(bytes) => bytes,
-        Err(err) if is_unencrypted_principal_root_state(&err) => {
-            return Ok(default_home_people_removed_contacts(context));
-        }
-        Err(err) if is_missing_principal_root_state_file(&err) => {
-            return Ok(default_home_people_removed_contacts(context));
-        }
-        Err(err) => return Err(err),
-    };
-    let state: HomePeopleRemovedContacts = serde_json::from_slice(&bytes)?;
-    if state.schema != HOME_PEOPLE_REMOVED_CONTACTS_SCHEMA {
-        anyhow::bail!("unsupported People removed contacts schema");
-    }
-    if state.principal_id != principal_id {
-        anyhow::bail!("People removed contacts principal mismatch");
-    }
-    if state.localhost_root != localhost_root {
-        anyhow::bail!("People removed contacts root mismatch");
-    }
-    Ok(state)
-}
-
-fn home_save_people_removed_contacts(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-    state: &HomePeopleRemovedContacts,
-) -> anyhow::Result<()> {
-    let bytes = serde_json::to_vec_pretty(state)?;
-    if bytes.len() > HOME_PEOPLE_REMOVED_CONTACTS_MAX_BYTES {
-        anyhow::bail!("People removed contacts state is too large");
-    }
-    let path = home_people_removed_contacts_path(data_dir, context)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    crate::auth::write_principal_root_object(
-        data_dir,
-        &home_browser_principal_id(context),
-        &home_browser_localhost_root(context),
-        &home_people_removed_contacts_uri(context),
-        &path,
-        &bytes,
-    )?;
-    Ok(())
-}
-
-fn home_mark_people_contact_removed(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-    contact_id: &str,
-    removed_at: u64,
-) -> anyhow::Result<()> {
-    let mut state = home_people_removed_contacts(data_dir, context)?;
-    state.contacts.insert(contact_id.to_string(), removed_at);
-    home_save_people_removed_contacts(data_dir, context, &state)
-}
-
-fn default_home_people_discovery_state(
-    context: &HomeLaunchTokenContext,
-) -> HomePeopleDiscoveryState {
-    HomePeopleDiscoveryState {
-        schema: HOME_PEOPLE_DISCOVERY_STATE_SCHEMA.to_string(),
-        principal_id: home_browser_principal_id(context),
-        localhost_root: home_browser_localhost_root(context),
-        enabled: false,
-        enabled_until: None,
-        updated_at: 0,
-        local_peer_id: None,
-        last_bootstrap_at: None,
-        last_presence_sent_at: None,
-        peers: BTreeMap::new(),
-        requests: BTreeMap::new(),
-    }
-}
-
-fn home_people_discovery_uri(context: &HomeLaunchTokenContext) -> String {
-    format!(
-        "{}/.AppData/ElastOS/Home/people-discovery.json",
-        home_browser_localhost_root(context)
-    )
-}
-
-fn home_people_discovery_path(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-) -> anyhow::Result<PathBuf> {
-    rooted_localhost_fs_path(data_dir, &home_people_discovery_uri(context))
-        .ok_or_else(|| anyhow::anyhow!("invalid People discovery state root"))
-}
-
-fn home_people_discovery_state(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-) -> anyhow::Result<HomePeopleDiscoveryState> {
-    let path = home_people_discovery_path(data_dir, context)?;
-    if !path.is_file() {
-        return Ok(default_home_people_discovery_state(context));
-    }
-    let principal_id = home_browser_principal_id(context);
-    let localhost_root = home_browser_localhost_root(context);
-    let bytes = match crate::auth::read_principal_root_object(
-        data_dir,
-        &principal_id,
-        &localhost_root,
-        &home_people_discovery_uri(context),
-        &path,
-    ) {
-        Ok(bytes) => bytes,
-        Err(err) if is_unencrypted_principal_root_state(&err) => {
-            return Ok(default_home_people_discovery_state(context));
-        }
-        Err(err) if is_missing_principal_root_state_file(&err) => {
-            return Ok(default_home_people_discovery_state(context));
-        }
-        Err(err) => return Err(err),
-    };
-    let state: HomePeopleDiscoveryState = serde_json::from_slice(&bytes)?;
-    if state.schema != HOME_PEOPLE_DISCOVERY_STATE_SCHEMA {
-        anyhow::bail!("unsupported People discovery state schema");
-    }
-    if state.principal_id != principal_id {
-        anyhow::bail!("People discovery principal mismatch");
-    }
-    if state.localhost_root != localhost_root {
-        anyhow::bail!("People discovery root mismatch");
-    }
-    Ok(state)
-}
-
-fn home_save_people_discovery_state(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-    state: &HomePeopleDiscoveryState,
-) -> anyhow::Result<()> {
-    let bytes = serde_json::to_vec_pretty(state)?;
-    if bytes.len() > HOME_PEOPLE_DISCOVERY_MAX_BYTES {
-        anyhow::bail!("People discovery state is too large");
-    }
-    let path = home_people_discovery_path(data_dir, context)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    crate::auth::write_principal_root_object(
-        data_dir,
-        &home_browser_principal_id(context),
-        &home_browser_localhost_root(context),
-        &home_people_discovery_uri(context),
-        &path,
-        &bytes,
-    )?;
-    Ok(())
-}
-
-fn home_people_discovery_summary(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-) -> anyhow::Result<HomePeopleDiscoverySummary> {
-    let state = home_people_discovery_state(data_dir, context)?;
-    let now = now_ts();
-    let enabled = home_people_discovery_active(&state, now);
-    let expires_at = enabled.then_some(state.enabled_until.unwrap_or(now));
-    let remaining_seconds = expires_at.map(|expires_at| expires_at.saturating_sub(now));
-    let local_peer_id = enabled.then_some(state.local_peer_id.clone()).flatten();
-    let contacts = home_people_contacts_state(data_dir, context)?;
-    let removed_contacts = home_people_removed_contacts(data_dir, context)?;
-    let mut active_contact_peer_ids = BTreeSet::new();
-    let mut active_contact_dids = BTreeSet::new();
-    for contact in contacts.contacts.values() {
-        let removed_at = removed_contacts.contacts.get(&contact.contact_id).copied();
-        let active = removed_at
-            .map(|removed_at| contact.added_at > removed_at)
-            .unwrap_or(true);
-        if !active {
-            continue;
-        }
-        let peer_id = contact.peer_id.trim();
-        if !peer_id.is_empty() {
-            active_contact_peer_ids.insert(peer_id.to_string());
-        }
-        if let Some(did) = contact
-            .did
-            .as_deref()
-            .map(str::trim)
-            .filter(|did| !did.is_empty())
-        {
-            active_contact_dids.insert(did.to_string());
-        }
-    }
-    let status = if !enabled {
-        "off"
-    } else if local_peer_id.is_some() {
-        "visible"
-    } else {
-        "runtime_unavailable"
-    };
-    let status_message = match status {
-        "off" => "Discovery is off.".to_string(),
-        "visible" => "Discovery is on. Other ElastOS homes can request to add you when peer discovery is running.".to_string(),
-        _ => "Discovery is on, but local discovery is not reachable yet.".to_string(),
-    };
-    let mut discovered_peers = state
-        .peers
-        .into_values()
-        .filter(|peer| {
-            !active_contact_peer_ids.contains(peer.peer_id.trim())
-                && peer
-                    .did
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|did| !did.is_empty())
-                    .map(|did| !active_contact_dids.contains(did))
-                    .unwrap_or(true)
-        })
-        .collect::<Vec<_>>();
-    discovered_peers.sort_by(|left, right| {
-        right
-            .last_seen_at
-            .cmp(&left.last_seen_at)
-            .then_with(|| left.display_name.cmp(&right.display_name))
-    });
-    let mut requests = state
-        .requests
-        .into_values()
-        .filter(home_people_discovery_request_visible)
-        .collect::<Vec<_>>();
-    requests.sort_by(|left, right| right.created_at.cmp(&left.created_at));
-    Ok(HomePeopleDiscoverySummary {
-        schema: HOME_PEOPLE_DISCOVERY_SCHEMA.to_string(),
-        enabled,
-        expires_at,
-        remaining_seconds,
-        visibility: if enabled {
-            "everyone".to_string()
-        } else {
-            "off".to_string()
-        },
-        status: status.to_string(),
-        status_message,
-        topic: HOME_PEOPLE_DISCOVERY_TOPIC.to_string(),
-        local_peer_id,
-        discovered_count: discovered_peers.len(),
-        request_count: requests.len(),
-        discovered_peers,
-        requests,
-        changed: None,
-        refresh_fingerprint: None,
-        next_refresh_after_ms: None,
-    })
-}
-
-fn home_people_discovery_summary_signature(summary: &HomePeopleDiscoverySummary) -> String {
-    let value = serde_json::json!({
-        "enabled": summary.enabled,
-        "status": summary.status,
-        "local_peer_id": summary.local_peer_id,
-        "discovered_peers": summary.discovered_peers,
-        "requests": summary.requests,
-    });
-    stable_cursor_hash(&value)
-}
-
-fn home_people_discovery_state_signature(state: &HomePeopleDiscoveryState) -> String {
-    let requests = state
-        .requests
-        .values()
-        .filter(|request| home_people_discovery_request_visible(request))
-        .collect::<Vec<_>>();
-    let value = serde_json::json!({
-        "enabled": state.enabled,
-        "local_peer_id": state.local_peer_id,
-        "peers": state.peers,
-        "requests": requests,
-    });
-    stable_cursor_hash(&value)
-}
-
-fn home_people_discovery_next_refresh_after_ms(
-    summary: &HomePeopleDiscoverySummary,
-    changed: bool,
-) -> u64 {
-    if !summary.enabled {
-        return 0;
-    }
-    if changed {
-        return HOME_PEOPLE_DISCOVERY_REFRESH_FAST_MS;
-    }
-    if summary.discovered_count == 0 && summary.request_count == 0 {
-        return HOME_PEOPLE_DISCOVERY_REFRESH_SEARCH_MS;
-    }
-    HOME_PEOPLE_DISCOVERY_REFRESH_IDLE_MS
-}
-
-fn home_people_discovery_annotate_refresh(summary: &mut HomePeopleDiscoverySummary, changed: bool) {
-    summary.changed = Some(changed);
-    summary.refresh_fingerprint = Some(home_people_discovery_summary_signature(summary));
-    summary.next_refresh_after_ms = Some(home_people_discovery_next_refresh_after_ms(
-        summary, changed,
-    ));
-}
-
-fn home_people_discovery_peers_path(data_dir: &std::path::Path) -> std::path::PathBuf {
-    data_dir.join("config/people-discovery-peers.json")
-}
-
-fn home_people_discovery_configured_tickets(
-    data_dir: &std::path::Path,
-) -> anyhow::Result<Vec<String>> {
-    let path = home_people_discovery_peers_path(data_dir);
-    let Ok(raw) = std::fs::read(&path) else {
-        return Ok(Vec::new());
-    };
-    if raw.len() > HOME_PEOPLE_DISCOVERY_PEERS_MAX_BYTES {
-        anyhow::bail!("People discovery peers config is too large");
-    }
-    let config: HomePeopleDiscoveryPeersConfig =
-        serde_json::from_slice(&raw).with_context(|| {
-            format!(
-                "invalid People discovery peers config at {}",
-                path.display()
-            )
-        })?;
-    if !config.schema.trim().is_empty() && config.schema != HOME_PEOPLE_DISCOVERY_PEERS_SCHEMA {
-        anyhow::bail!("unsupported People discovery peers config schema");
-    }
-    let mut seen = BTreeSet::new();
-    Ok(config
-        .peers
-        .into_iter()
-        .filter_map(|peer| {
-            let ticket = peer.connect_ticket.trim().to_string();
-            if ticket.is_empty() || ticket.len() > 8192 || !seen.insert(ticket.clone()) {
-                return None;
-            }
-            Some(ticket)
-        })
-        .collect())
-}
-
-fn home_people_discovery_connect_configured_peers(
-    runtime: &PeoplePeerRuntimeBlocking,
-    data_dir: &std::path::Path,
-) -> Vec<String> {
-    let mut peers = BTreeSet::new();
-    let tickets = match home_people_discovery_configured_tickets(data_dir) {
-        Ok(tickets) => tickets,
-        Err(err) => {
-            tracing::warn!("people discovery peer bootstrap config ignored: {err}");
-            return Vec::new();
-        }
-    };
-    for ticket in tickets {
-        let response = match people_peer_provider_request_blocking(
-            &runtime.client,
-            &runtime.api_url,
-            &runtime.client_token,
-            &runtime.peer_cap,
-            "connect",
-            serde_json::json!({ "ticket": ticket }),
-        ) {
-            Ok(response) => response,
-            Err(err) => {
-                tracing::warn!("people discovery configured peer connect failed: {err}");
-                continue;
-            }
-        };
-        for field in ["added", "connected"] {
-            if let Some(values) = response
-                .get("data")
-                .and_then(|data| data.get(field))
-                .and_then(serde_json::Value::as_array)
-            {
-                for value in values {
-                    if let Some(peer) = value
-                        .as_str()
-                        .map(str::trim)
-                        .filter(|peer| !peer.is_empty())
-                    {
-                        peers.insert(peer.to_string());
-                    }
-                }
-            }
-        }
-    }
-    peers.into_iter().collect()
-}
-
-fn home_people_discovery_join_known_peers(
-    runtime: &PeoplePeerRuntimeBlocking,
-    topic: &str,
-    peers: &[String],
-) -> anyhow::Result<()> {
-    if peers.is_empty() {
-        return Ok(());
-    }
-    people_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
-        "gossip_join_peers",
-        serde_json::json!({ "topic": topic, "peers": peers }),
-    )
-    .map(|_| ())
-}
-
-fn home_people_discovery_sync(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-    state: &mut HomePeopleDiscoveryState,
-) -> anyhow::Result<()> {
-    let now = now_ts();
-    if home_people_discovery_apply_expiry(state, now) {
-        return Ok(());
-    }
-    let runtime = people_attach_peer_runtime_blocking(data_dir)?;
-    let local_peer_changed = state.local_peer_id.as_deref() != Some(runtime.peer_id.as_str());
-    let bootstrap_due = local_peer_changed
-        || state
-            .last_bootstrap_at
-            .map(|last| now.saturating_sub(last) >= HOME_PEOPLE_DISCOVERY_BOOTSTRAP_INTERVAL_SECS)
-            .unwrap_or(true);
-    if bootstrap_due {
-        let configured_peers = home_people_discovery_connect_configured_peers(&runtime, data_dir);
-        people_peer_gossip_join_blocking(&runtime, HOME_PEOPLE_DISCOVERY_TOPIC, "dht")?;
-        if let Err(err) = home_people_discovery_join_known_peers(
-            &runtime,
-            HOME_PEOPLE_DISCOVERY_TOPIC,
-            &configured_peers,
-        ) {
-            tracing::warn!("people discovery configured peer join failed: {err}");
-        }
-        state.last_bootstrap_at = Some(now);
-    }
-    let profile = home_profile_card_summary_for_context(data_dir, context);
-    let local_did = home_people_local_did(data_dir).ok();
-    let display_name = profile
-        .as_ref()
-        .map(|profile| profile.display_name.clone())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "ElastOS user".to_string());
-    let handle = profile.as_ref().and_then(|profile| profile.handle.clone());
-    let presence = serde_json::json!({
-        "schema": "elastos.people.discovery-presence/v1",
-        "kind": "presence",
-        "peer_id": &runtime.peer_id,
-        "did": local_did,
-        "display_name": display_name,
-        "handle": handle,
-        "updated_at": now,
-        "expires_at": now + 180,
-    });
-    let presence_due = local_peer_changed
-        || state
-            .last_presence_sent_at
-            .map(|last| now.saturating_sub(last) >= HOME_PEOPLE_DISCOVERY_PRESENCE_INTERVAL_SECS)
-            .unwrap_or(true);
-    if presence_due {
-        let _ = people_peer_provider_request_blocking(
-            &runtime.client,
-            &runtime.api_url,
-            &runtime.client_token,
-            &runtime.peer_cap,
-            "gossip_send",
-            serde_json::json!({
-                "topic": HOME_PEOPLE_DISCOVERY_TOPIC,
-                "sender_id": &runtime.peer_id,
-                "sender": display_name,
-                "message": presence.to_string(),
-                "ts": now,
-            }),
-        )?;
-        state.last_presence_sent_at = Some(now);
-    }
-    let recv = people_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
-        "gossip_recv",
-        serde_json::json!({
-            "topic": HOME_PEOPLE_DISCOVERY_TOPIC,
-            "consumer_id": format!("home-people-discovery:{}", context.principal_id),
-            "skip_sender_id": runtime.peer_id,
-            "limit": 64,
-        }),
-    )?;
-    let messages = recv
-        .get("data")
-        .and_then(|data| data.get("messages"))
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for message in messages {
-        let Some(content) = message.get("content").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Ok(payload) = serde_json::from_str::<serde_json::Value>(content) else {
-            continue;
-        };
-        match payload.get("kind").and_then(serde_json::Value::as_str) {
-            Some("presence") => merge_people_discovery_presence(state, &payload),
-            Some("request") => merge_people_discovery_request(state, &payload, &runtime.peer_id),
-            Some("invite") => {
-                let _ = merge_people_discovery_invite(data_dir, state, &payload, &runtime.peer_id);
-            }
-            Some("acceptance") => {
-                let _ = merge_people_discovery_acceptance(
-                    data_dir,
-                    context,
-                    state,
-                    &payload,
-                    &runtime.peer_id,
-                );
-            }
-            _ => {}
-        }
-    }
-    state.local_peer_id = Some(runtime.peer_id);
-    home_people_discovery_sync_contacts(data_dir, context, state)?;
-    prune_people_discovery_state(state, now);
-    Ok(())
-}
-
-fn home_people_discovery_send_request(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-    state: &mut HomePeopleDiscoveryState,
-    request: &HomePeopleDiscoveryRequestSummary,
-) -> anyhow::Result<()> {
-    let runtime = people_attach_peer_runtime_blocking(data_dir)?;
-    people_peer_gossip_join_blocking(&runtime, HOME_PEOPLE_DISCOVERY_TOPIC, "dht")?;
-    let requester_did = home_people_local_did(data_dir)?;
-    let profile = home_profile_card_summary_for_context(data_dir, context);
-    let display_name = profile
-        .as_ref()
-        .map(|profile| profile.display_name.clone())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "ElastOS user".to_string());
-    let handle = profile.as_ref().and_then(|profile| profile.handle.clone());
-    let payload = serde_json::json!({
-        "schema": "elastos.people.discovery-request/v1",
-        "kind": "request",
-        "request_id": &request.request_id,
-        "peer_id": &runtime.peer_id,
-        "requester_did": requester_did,
-        "target_peer_id": &request.peer_id,
-        "display_name": &display_name,
-        "handle": handle,
-        "created_at": request.created_at,
-    });
-    let _ = people_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
-        "gossip_send",
-        serde_json::json!({
-            "topic": HOME_PEOPLE_DISCOVERY_TOPIC,
-            "sender_id": &runtime.peer_id,
-            "sender": display_name,
-            "message": payload.to_string(),
-            "ts": request.created_at,
-        }),
-    )?;
-    state.local_peer_id = Some(runtime.peer_id);
-    Ok(())
-}
-
-fn home_people_discovery_send_acceptance(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-    state: &mut HomePeopleDiscoveryState,
-    request: &HomePeopleDiscoveryRequestSummary,
-) -> anyhow::Result<()> {
-    let runtime = people_attach_peer_runtime_blocking(data_dir)?;
-    people_peer_gossip_join_blocking(&runtime, HOME_PEOPLE_DISCOVERY_TOPIC, "dht")?;
-    let accepter_did = home_people_local_did(data_dir)?;
-    let profile = home_profile_card_summary_for_context(data_dir, context);
-    let display_name = profile
-        .as_ref()
-        .map(|profile| profile.display_name.clone())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "ElastOS user".to_string());
-    let handle = profile.as_ref().and_then(|profile| profile.handle.clone());
-    let now = now_ts();
-    let payload = serde_json::json!({
-        "schema": "elastos.people.discovery-acceptance/v1",
-        "kind": "acceptance",
-        "request_id": &request.request_id,
-        "peer_id": &runtime.peer_id,
-        "target_peer_id": &request.peer_id,
-        "accepter_did": accepter_did,
-        "display_name": &display_name,
-        "handle": handle,
-        "created_at": now,
-    });
-    let _ = people_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
-        "gossip_send",
-        serde_json::json!({
-            "topic": HOME_PEOPLE_DISCOVERY_TOPIC,
-            "sender_id": &runtime.peer_id,
-            "sender": display_name,
-            "message": payload.to_string(),
-            "ts": now,
-        }),
-    )?;
-    state.local_peer_id = Some(runtime.peer_id);
-    Ok(())
-}
-
-fn home_people_discovery_send_room_acceptance(
-    data_dir: &std::path::Path,
-    state: &mut HomePeopleDiscoveryState,
-    request: &HomePeopleDiscoveryRequestSummary,
-    acceptance: &crate::room_service::SignedRoomAcceptEnvelope,
-) -> anyhow::Result<()> {
-    let runtime = people_attach_peer_runtime_blocking(data_dir)?;
-    people_peer_gossip_join_blocking(&runtime, HOME_PEOPLE_DISCOVERY_TOPIC, "dht")?;
-    let now = now_ts();
-    let sender =
-        clean_people_person_display_name(Some(&request.display_name), request.handle.as_deref());
-    let payload = serde_json::json!({
-        "schema": "elastos.people.discovery-acceptance/v1",
-        "kind": "acceptance",
-        "request_id": &request.request_id,
-        "peer_id": &runtime.peer_id,
-        "target_peer_id": &request.peer_id,
-        "acceptance": acceptance,
-        "created_at": now,
-    });
-    let _ = people_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
-        "gossip_send",
-        serde_json::json!({
-            "topic": HOME_PEOPLE_DISCOVERY_TOPIC,
-            "sender_id": &runtime.peer_id,
-            "sender": sender,
-            "message": payload.to_string(),
-            "ts": now,
-        }),
-    )?;
-    state.local_peer_id = Some(runtime.peer_id);
-    Ok(())
-}
-
-fn merge_people_discovery_presence(
-    state: &mut HomePeopleDiscoveryState,
-    payload: &serde_json::Value,
-) {
-    let peer_id = payload
-        .get("peer_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("");
-    if peer_id.is_empty() || Some(peer_id) == state.local_peer_id.as_deref() {
-        return;
-    }
-    let last_seen_at = payload
-        .get("updated_at")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_else(now_ts);
-    let handle = clean_people_payload_handle(payload);
-    let display_name = clean_people_payload_display_name(payload, handle.as_deref(), None);
-    state.peers.insert(
-        peer_id.to_string(),
-        HomePeopleDiscoveryPeerSummary {
-            peer_id: peer_id.to_string(),
-            did: payload
-                .get("did")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned),
-            display_name,
-            handle,
-            last_seen_at,
-            status: "visible".to_string(),
-        },
-    );
-}
-
-fn merge_people_discovery_request(
-    state: &mut HomePeopleDiscoveryState,
-    payload: &serde_json::Value,
-    local_peer_id: &str,
-) {
-    if payload
-        .get("target_peer_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        != Some(local_peer_id)
-    {
-        return;
-    }
-    let request_id = payload
-        .get("request_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("");
-    let peer_id = payload
-        .get("peer_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("");
-    if request_id.is_empty() || peer_id.is_empty() {
-        return;
-    }
-    if let Some(existing) = state.requests.get_mut(request_id) {
-        let handle = clean_people_payload_handle(payload).or_else(|| existing.handle.clone());
-        let fallback_display_name = existing.display_name.clone();
-        existing.peer_id = peer_id.to_string();
-        existing.did = payload
-            .get("requester_did")
-            .or_else(|| payload.get("did"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .or_else(|| existing.did.clone());
-        existing.display_name = clean_people_payload_display_name(
-            payload,
-            handle.as_deref(),
-            Some(fallback_display_name.as_str()),
-        );
-        existing.handle = handle;
-        if existing.status != "joined" && existing.status != "accepted_sent" {
-            existing.status = "incoming".to_string();
-            existing.invite_id = None;
-        }
-        return;
-    }
-    let handle = clean_people_payload_handle(payload);
-    let display_name = clean_people_payload_display_name(payload, handle.as_deref(), None);
-    state.requests.insert(
-        request_id.to_string(),
-        HomePeopleDiscoveryRequestSummary {
-            request_id: request_id.to_string(),
-            peer_id: peer_id.to_string(),
-            did: payload
-                .get("requester_did")
-                .or_else(|| payload.get("did"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned),
-            display_name,
-            handle,
-            created_at: payload
-                .get("created_at")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_else(now_ts),
-            status: "incoming".to_string(),
-            invite_id: None,
-        },
-    );
-}
-
-fn merge_people_discovery_invite(
-    data_dir: &std::path::Path,
-    state: &mut HomePeopleDiscoveryState,
-    payload: &serde_json::Value,
-    local_peer_id: &str,
-) -> anyhow::Result<()> {
-    if payload
-        .get("target_peer_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        != Some(local_peer_id)
-    {
-        return Ok(());
-    }
-    let request_id = payload
-        .get("request_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("discovery invite is missing a request id"))?;
-    let peer_id = payload
-        .get("peer_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("discovery invite is missing a peer id"))?;
-    let invite_value = payload
-        .get("invite")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("discovery invite is missing a signed invite"))?;
-    let invite_bytes = serde_json::to_vec(&invite_value)?;
-    let imported = crate::room_service::import_room_invite_envelope(data_dir, &invite_bytes)?;
-    let handle = clean_people_payload_handle(payload);
-    let display_name = clean_people_payload_display_name(payload, handle.as_deref(), None);
-    let now = now_ts();
-    let entry = state
-        .requests
-        .entry(request_id.to_string())
-        .or_insert_with(|| HomePeopleDiscoveryRequestSummary {
-            request_id: request_id.to_string(),
-            peer_id: peer_id.to_string(),
-            did: Some(imported.invited_by.clone()),
-            display_name: display_name.clone(),
-            handle: handle.clone(),
-            created_at: now,
-            status: "accepted".to_string(),
-            invite_id: Some(imported.invite_id.clone()),
-        });
-    entry.peer_id = peer_id.to_string();
-    entry.did = Some(imported.invited_by);
-    entry.display_name = display_name;
-    entry.handle = handle;
-    entry.status = "accepted".to_string();
-    entry.invite_id = Some(imported.invite_id);
-    state.updated_at = now;
-    Ok(())
-}
-
-fn merge_people_discovery_acceptance(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-    state: &mut HomePeopleDiscoveryState,
-    payload: &serde_json::Value,
-    local_peer_id: &str,
-) -> anyhow::Result<()> {
-    if payload
-        .get("target_peer_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        != Some(local_peer_id)
-    {
-        return Ok(());
-    }
-    let request_id = payload
-        .get("request_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("discovery acceptance is missing a request id"))?;
-    let peer_id = payload
-        .get("peer_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("discovery acceptance is missing a peer id"))?;
-    let mut did = payload
-        .get("accepter_did")
-        .or_else(|| payload.get("did"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    let mut imported_room_acceptance = false;
-    if did.is_none() {
-        if let Some(acceptance_value) = payload.get("acceptance").cloned() {
-            let acceptance_bytes = serde_json::to_vec(&acceptance_value)?;
-            let member =
-                crate::room_service::import_room_acceptance_envelope(data_dir, &acceptance_bytes)?;
-            did = Some(member.member_did);
-            imported_room_acceptance = true;
-        }
-    }
-    let did =
-        did.ok_or_else(|| anyhow::anyhow!("discovery acceptance is missing an accepter DID"))?;
-    let fallback_display_name = state
-        .requests
-        .get(request_id)
-        .map(|request| request.display_name.clone());
-    let handle = clean_people_payload_handle(payload).or_else(|| {
-        state
-            .requests
-            .get(request_id)
-            .and_then(|request| request.handle.clone())
-    });
-    let display_name = clean_people_payload_display_name(
-        payload,
-        handle.as_deref(),
-        fallback_display_name.as_deref(),
-    );
-    let now = now_ts();
-    let _ = home_people_upsert_contact(
-        data_dir,
-        context,
-        HomePeopleContactUpsert {
-            peer_id,
-            did: &did,
-            display_name: &display_name,
-            handle: handle.as_deref(),
-            source: "people_discovery",
-            updated_at: now,
-        },
-    )?;
-    let entry = state
-        .requests
-        .entry(request_id.to_string())
-        .or_insert_with(|| HomePeopleDiscoveryRequestSummary {
-            request_id: request_id.to_string(),
-            peer_id: peer_id.to_string(),
-            did: Some(did.clone()),
-            display_name: display_name.clone(),
-            handle: handle.clone(),
-            created_at: now,
-            status: "joined".to_string(),
-            invite_id: None,
-        });
-    entry.peer_id = peer_id.to_string();
-    entry.did = Some(did);
-    entry.display_name = display_name;
-    entry.handle = handle;
-    entry.status = "joined".to_string();
-    entry.invite_id = None;
-    state.updated_at = now;
-    if imported_room_acceptance {
-        let summary = crate::room_service::load_summary(data_dir).unwrap_or_default();
-        let _ = crate::notifications::sync_room_notifications(data_dir, &summary);
-    }
-    Ok(())
-}
-
-fn home_people_discovery_sync_contacts(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-    state: &mut HomePeopleDiscoveryState,
-) -> anyhow::Result<()> {
-    let requests = state.requests.values().cloned().collect::<Vec<_>>();
-    for request in requests {
-        if request.status != "joined"
-            && request.status != "accepted_sent"
-            && request.status != "accepted"
-        {
-            continue;
-        }
-        let Some(did) = request
-            .did
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        let now = now_ts();
-        let (_, newly_visible) = home_people_upsert_contact(
-            data_dir,
-            context,
-            HomePeopleContactUpsert {
-                peer_id: &request.peer_id,
-                did,
-                display_name: &request.display_name,
-                handle: request.handle.as_deref(),
-                source: "people_discovery",
-                updated_at: now,
-            },
-        )?;
-        if let Some(stored) = state.requests.get_mut(&request.request_id) {
-            stored.status = "joined".to_string();
-            stored.invite_id = None;
-        }
-        if newly_visible {
-            let _ = home_people_discovery_send_acceptance(data_dir, context, state, &request);
-        }
-    }
-    Ok(())
-}
-
-fn prune_people_discovery_state(state: &mut HomePeopleDiscoveryState, now: u64) {
-    let _ = home_people_discovery_apply_expiry(state, now);
-    state
-        .peers
-        .retain(|_, peer| now.saturating_sub(peer.last_seen_at) <= 300);
-    while state.requests.len() > 64 {
-        let Some(oldest) = state
-            .requests
-            .iter()
-            .min_by_key(|(_, request)| request.created_at)
-            .map(|(request_id, _)| request_id.clone())
-        else {
-            break;
-        };
-        state.requests.remove(&oldest);
-    }
-}
-
-fn home_people_discovery_active(state: &HomePeopleDiscoveryState, now: u64) -> bool {
-    state.enabled
-        && state
-            .enabled_until
-            .map(|enabled_until| enabled_until > now)
-            .unwrap_or(false)
-}
-
-fn home_people_discovery_apply_expiry(state: &mut HomePeopleDiscoveryState, now: u64) -> bool {
-    if state.enabled && !home_people_discovery_active(state, now) {
-        state.enabled = false;
-        state.enabled_until = None;
-        state.local_peer_id = None;
-        state.last_bootstrap_at = None;
-        state.last_presence_sent_at = None;
-        state.updated_at = now;
-        return true;
-    }
-    false
-}
-
-fn home_people_local_did(data_dir: &std::path::Path) -> anyhow::Result<String> {
+fn home_services_local_device_did(data_dir: &std::path::Path) -> anyhow::Result<String> {
     let (_, did) = elastos_identity::load_or_create_did(data_dir)?;
     let did = did.trim();
     if did.is_empty() {
@@ -4664,23 +4545,17 @@ fn home_people_local_did(data_dir: &std::path::Path) -> anyhow::Result<String> {
     Ok(did.to_string())
 }
 
-fn home_people_discovery_request_id(peer_id: &str) -> anyhow::Result<String> {
-    let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).map_err(|err| anyhow::anyhow!("request id rng: {err}"))?;
-    Ok(format!("request:{peer_id}:{}", hex::encode(bytes)))
-}
-
-fn people_attach_peer_runtime_blocking(
+fn services_attach_peer_runtime_blocking(
     data_dir: &std::path::Path,
-) -> anyhow::Result<PeoplePeerRuntimeBlocking> {
-    let coords = load_runtime_coords(data_dir)
+) -> anyhow::Result<ServicesPeerRuntimeBlocking> {
+    let coords = load_home_runtime_coords(data_dir)
         .ok_or_else(|| anyhow::anyhow!("local ElastOS service is not running"))?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()?;
-    let token = people_attach_client_token_blocking(&client, &coords)
+    let token = services_attach_client_token_blocking(&client, &coords)
         .ok_or_else(|| anyhow::anyhow!("failed to attach to local ElastOS service"))?;
-    let cap = people_request_attached_capability_blocking(
+    let cap = services_request_attached_capability_blocking(
         &client,
         &coords.api_url,
         &token,
@@ -4688,7 +4563,7 @@ fn people_attach_peer_runtime_blocking(
         "message",
     )
     .ok_or_else(|| anyhow::anyhow!("failed to acquire Carrier peer capability"))?;
-    let response = people_peer_provider_request_blocking(
+    let response = services_peer_provider_request_blocking(
         &client,
         &coords.api_url,
         &token,
@@ -4711,7 +4586,7 @@ fn people_attach_peer_runtime_blocking(
         .filter(|value| !value.is_empty())
         .filter(|value| value.len() <= HOME_SERVICES_REMOTE_EXIT_TICKET_MAX_BYTES)
         .ok_or_else(|| anyhow::anyhow!("Carrier peer provider did not return a bounded ticket"))?;
-    Ok(PeoplePeerRuntimeBlocking {
+    Ok(ServicesPeerRuntimeBlocking {
         client,
         api_url: coords.api_url,
         client_token: token,
@@ -4721,12 +4596,12 @@ fn people_attach_peer_runtime_blocking(
     })
 }
 
-fn people_peer_gossip_join_blocking(
-    runtime: &PeoplePeerRuntimeBlocking,
+fn services_peer_gossip_join_blocking(
+    runtime: &ServicesPeerRuntimeBlocking,
     topic: &str,
     mode: &str,
 ) -> anyhow::Result<()> {
-    match people_peer_provider_request_blocking(
+    match services_peer_provider_request_blocking(
         &runtime.client,
         &runtime.api_url,
         &runtime.client_token,
@@ -4740,7 +4615,26 @@ fn people_peer_gossip_join_blocking(
     }
 }
 
-fn people_attach_client_token_blocking(
+fn services_gossip_join_known_peers_blocking(
+    runtime: &ServicesPeerRuntimeBlocking,
+    topic: &str,
+    peers: &[String],
+) -> anyhow::Result<()> {
+    if peers.is_empty() {
+        return Ok(());
+    }
+    services_peer_provider_request_blocking(
+        &runtime.client,
+        &runtime.api_url,
+        &runtime.client_token,
+        &runtime.peer_cap,
+        "gossip_join_peers",
+        serde_json::json!({ "topic": topic, "peers": peers }),
+    )
+    .map(|_| ())
+}
+
+fn services_attach_client_token_blocking(
     client: &reqwest::blocking::Client,
     coords: &GatewayRuntimeCoords,
 ) -> Option<String> {
@@ -4759,7 +4653,7 @@ fn people_attach_client_token_blocking(
         .map(|resp| resp.token)
 }
 
-fn people_request_attached_capability_blocking(
+fn services_request_attached_capability_blocking(
     client: &reqwest::blocking::Client,
     api: &str,
     client_token: &str,
@@ -4803,7 +4697,7 @@ fn people_request_attached_capability_blocking(
     None
 }
 
-fn people_peer_provider_request_blocking(
+fn services_peer_provider_request_blocking(
     client: &reqwest::blocking::Client,
     api: &str,
     client_token: &str,
@@ -4827,55 +4721,6 @@ fn people_peer_provider_request_blocking(
         );
     }
     Ok(body)
-}
-
-fn filter_removed_people_contacts(
-    data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
-    people: &mut HomePeopleSummary,
-    services: &mut HomeServicesSummary,
-) -> anyhow::Result<()> {
-    let removed = home_people_removed_contacts(data_dir, context)?;
-    if removed.contacts.is_empty() {
-        return Ok(());
-    }
-    people
-        .contacts
-        .retain(|contact| match removed.contacts.get(&contact.contact_id) {
-            Some(removed_at) => contact.added_at > *removed_at,
-            None => true,
-        });
-    people.contact_count = people.contacts.len();
-    let live_contact_ids = people
-        .contacts
-        .iter()
-        .map(|contact| contact.contact_id.as_str())
-        .collect::<BTreeSet<_>>();
-    people.service_offers.retain(|offer| {
-        offer
-            .contact_id
-            .as_deref()
-            .map(|contact_id| live_contact_ids.contains(contact_id))
-            .unwrap_or(true)
-    });
-    people.service_offer_count = people.service_offers.len();
-    services.remote_offers.retain(|offer| {
-        offer
-            .contact_id
-            .as_deref()
-            .map(|contact_id| live_contact_ids.contains(contact_id))
-            .unwrap_or(true)
-    });
-    services.remote_offer_count = services.remote_offers.len();
-    services.available_remote_offers.retain(|offer| {
-        offer
-            .contact_id
-            .as_deref()
-            .map(|contact_id| live_contact_ids.contains(contact_id))
-            .unwrap_or(true)
-    });
-    services.available_remote_offer_count = services.available_remote_offers.len();
-    Ok(())
 }
 
 fn sanitize_recent_targets(targets: Vec<String>) -> Vec<String> {
@@ -5031,7 +4876,10 @@ pub(super) async fn system_summary(
         system_runtime_log(&state.data_dir)
     );
     Json(SystemSummaryResponse {
-        identity: load_gateway_identity_summary_for_context(&state.data_dir, &context),
+        identity: match load_gateway_identity_summary_for_context(&state.data_dir, &context) {
+            Ok(identity) => identity,
+            Err(err) => return system_error_response(err),
+        },
         authority: home_authority_summary(&context),
         access: system_access_summary(&state.data_dir, &context),
         home: HomeCapsuleIdentity {
@@ -5402,7 +5250,7 @@ fn home_save_background_overlay(
 ) -> anyhow::Result<HomeAppearanceSummary> {
     let path = home_appearance_path(data_dir, context, HOME_BACKGROUND_OVERLAY_FILE)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::auth::create_owner_only_dir_all(data_dir, parent)?;
     }
     let payload = serde_json::json!({
         "enabled": enabled,
@@ -5427,7 +5275,7 @@ fn home_save_background_image(
 ) -> anyhow::Result<HomeAppearanceSummary> {
     let path = home_appearance_path(data_dir, context, file_name)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::auth::create_owner_only_dir_all(data_dir, parent)?;
     }
     remove_home_background_images(data_dir, context)?;
     crate::auth::write_principal_root_object(
@@ -5490,56 +5338,40 @@ fn parse_background_image_upload(
     Ok((file_name, body.to_vec()))
 }
 
-pub(super) async fn system_handle_update(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-    Json(req): Json<SystemHandleUpdateRequest>,
-) -> Response {
-    system_profile_card_update_inner(&state, &headers, req).await
-}
-
-pub(super) async fn system_profile_card_update(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-    Json(req): Json<SystemHandleUpdateRequest>,
-) -> Response {
-    system_profile_card_update_inner(&state, &headers, req).await
-}
-
-async fn system_profile_card_update_inner(
-    state: &GatewayState,
-    headers: &HeaderMap,
-    req: SystemHandleUpdateRequest,
-) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, headers, SYSTEM_CAPSULE_ID) {
-            Ok(context) => context,
-            Err(err) => return system_error_response(err),
-        };
-
-    match update_profile_card_for_context(&state.data_dir, &context, &req.handle) {
-        Ok(identity) => Json(identity).into_response(),
-        Err(err) => system_error_response(err),
-    }
-}
-
-fn update_profile_card_for_context(
+fn update_profile_for_context(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
-    handle: &str,
+    display_name: &str,
 ) -> anyhow::Result<HomeIdentitySummary> {
-    let Some(proof_binding_id) = context.proof_binding_id.as_deref() else {
-        anyhow::bail!("proof-bound passkey session required");
-    };
-    let principal =
-        crate::auth::set_principal_display_name(data_dir, proof_binding_id, handle, now_ts())?;
-    home_save_profile_card(
+    crate::collaboration_profile_authority::update_profile_authority(
         data_dir,
-        context,
-        &principal.display_name,
-        principal.updated_at,
+        &home_browser_principal_id(context),
+        &home_browser_localhost_root(context),
+        context
+            .proof_binding_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("proof-bound passkey session required"))?,
+        display_name,
+        None,
+        now_ts(),
     )?;
-    Ok(load_gateway_identity_summary_for_context(data_dir, context))
+    load_gateway_identity_summary_for_context(data_dir, context)
+}
+
+/// Refresh this Home's own delivery contexts after its Profile changed, so
+/// editing your name never stops your contacts from reaching you.
+fn refresh_runtime_owned_contexts_after_profile_change(
+    data_dir: &std::path::Path,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
+) {
+    let Some(service) = discovery_service else {
+        return;
+    };
+    if let Err(err) = service.register_runtime_owned_contexts(data_dir) {
+        tracing::debug!(error = %err, "refreshing collaboration contexts after a Profile change failed");
+    }
 }
 
 pub(super) async fn system_background_image_update(
@@ -5658,32 +5490,107 @@ mod home_realtime_tests {
     }
 
     #[test]
+    fn contact_reachability_answers_only_from_an_unexpired_presence_record() {
+        use crate::collaboration_presence::{
+            CollaborationPresenceSnapshot, CollaborationPresenceSnapshotRecord,
+        };
+        let contact = |device: Option<&str>| HomePeopleContactSummary {
+            contact_id: "contact:alice".to_string(),
+            remote_profile_did: device.map(str::to_string),
+            added_at: 10,
+            conversation_id: Some("conversation:alice".to_string()),
+            display_name: "Alice".to_string(),
+            handle: None,
+            relationship: "connected".to_string(),
+            can_message: true,
+            device_label: None,
+            profile_card: None,
+            last_seen_at: None,
+            reachable: None,
+        };
+        let mut people = HomePeopleSummary {
+            contact_count: 3,
+            contacts: vec![
+                contact(Some("did:key:zlive")),
+                contact(Some("did:key:zgone")),
+                contact(None),
+            ],
+            ..HomePeopleSummary::default()
+        };
+        let now = 100;
+        let snapshot = CollaborationPresenceSnapshot::for_test(vec![
+            // Unexpired heartbeat: reachable now.
+            CollaborationPresenceSnapshotRecord::for_test("did:key:zlive", 90, now + 30),
+            // Expired heartbeat: presence is configured and says not-now.
+            CollaborationPresenceSnapshotRecord::for_test("did:key:zgone", 40, now),
+        ]);
+
+        stamp_contact_reachability(&mut people, &snapshot, now);
+
+        assert_eq!(people.contacts[0].reachable, Some(true));
+        assert_eq!(people.contacts[1].reachable, Some(false));
+        // No delivery device on record: no basis, and no invented answer.
+        assert_eq!(people.contacts[2].reachable, None);
+    }
+
+    #[test]
     fn people_realtime_signature_ignores_contact_last_seen_heartbeat() {
         let mut people = HomePeopleSummary {
             contact_count: 1,
             contacts: vec![HomePeopleContactSummary {
                 contact_id: "contact:alice".to_string(),
+                remote_profile_did: None,
                 added_at: 10,
+                conversation_id: None,
                 display_name: "Alice".to_string(),
                 handle: None,
                 relationship: "conversation".to_string(),
-                route: "/apps/chat-room/".to_string(),
                 can_message: true,
                 device_label: Some("MacBook".to_string()),
                 profile_card: None,
                 last_seen_at: Some(20),
+                reachable: Some(true),
             }],
             ..HomePeopleSummary::default()
         };
         let before = home_people_realtime_signature(&people);
 
         people.contacts[0].last_seen_at = Some(30);
+        people.contacts[0].reachable = Some(false);
         let after = home_people_realtime_signature(&people);
 
         assert_eq!(
             before, after,
             "presence heartbeat metadata must not emit people.changed events"
         );
+    }
+
+    #[test]
+    fn people_realtime_signature_tracks_remote_profile_did_changes() {
+        let mut people = HomePeopleSummary {
+            contact_count: 1,
+            contacts: vec![HomePeopleContactSummary {
+                contact_id: "contact:alice".to_string(),
+                remote_profile_did: Some("did:key:zold".to_string()),
+                added_at: 10,
+                conversation_id: Some("conversation:alice".to_string()),
+                display_name: "Alice".to_string(),
+                handle: Some("alice".to_string()),
+                relationship: "connected".to_string(),
+                can_message: false,
+                device_label: None,
+                profile_card: None,
+                last_seen_at: None,
+                reachable: None,
+            }],
+            ..HomePeopleSummary::default()
+        };
+        let before = home_people_realtime_signature(&people);
+
+        people.contacts[0].remote_profile_did = Some("did:key:znew".to_string());
+        let after = home_people_realtime_signature(&people);
+
+        assert_ne!(before, after);
     }
 
     #[test]

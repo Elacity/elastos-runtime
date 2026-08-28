@@ -25,6 +25,30 @@ sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+cargo_target_root_for_manifest() {
+  local manifest_path="$1"
+  local manifest_dir
+  manifest_dir="$(cd "$(dirname "${manifest_path}")" && pwd)"
+  if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    if [[ "${CARGO_TARGET_DIR}" = /* ]]; then
+      printf '%s\n' "${CARGO_TARGET_DIR}"
+    else
+      printf '%s\n' "${repo_root}/${CARGO_TARGET_DIR}"
+    fi
+  elif [[ "${manifest_dir}" == "${repo_root}/elastos"* ]]; then
+    printf '%s\n' "${repo_root}/elastos/target"
+  else
+    printf '%s\n' "${manifest_dir}/target"
+  fi
+}
+
+cargo_built_binary_path() {
+  local manifest_path="$1"
+  local profile="$2"
+  local binary="$3"
+  printf '%s\n' "$(cargo_target_root_for_manifest "${manifest_path}")/${profile}/${binary}"
+}
+
 find_debugfs() {
   if [[ -n "${ELASTOS_DEBUGFS_BIN:-}" && -x "${ELASTOS_DEBUGFS_BIN}" ]]; then
     printf '%s\n' "${ELASTOS_DEBUGFS_BIN}"
@@ -232,7 +256,7 @@ fi
 
 data_dir="${test_home}/Library/Application Support/elastos"
 log_dir="${log_dir:-${test_home}/logs}"
-gateway_bin="${repo_root}/elastos/target/release/elastos"
+gateway_bin="$(cargo_built_binary_path "${repo_root}/elastos/Cargo.toml" release elastos)"
 gateway_log="${log_dir}/gateway-$(date -u +%Y%m%dT%H%M%SZ).log"
 home_url="http://${addr}/apps/home/"
 
@@ -292,7 +316,7 @@ principal_root_upgrade_log="${gateway_log%.log}-principal-root-upgrade.json"
     >"$principal_root_upgrade_log"
 )
 
-python3 - "$repo_root" "$test_home" "$addr" "$gateway_log" <<'PY'
+GATEWAY_BIN="$gateway_bin" python3 - "$repo_root" "$test_home" "$addr" "$gateway_log" <<'PY'
 import os
 import sys
 
@@ -308,6 +332,7 @@ if os.fork() != 0:
 
 os.chdir(os.path.join(repo, "elastos"))
 os.environ["HOME"] = home
+os.environ["ELASTOS_GATEWAY_BIN"] = os.environ["GATEWAY_BIN"]
 
 stdin = os.open(os.devnull, os.O_RDONLY)
 stdout = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -318,8 +343,8 @@ os.close(stdin)
 os.close(stdout)
 
 os.execv(
-    "./target/release/elastos",
-    ["./target/release/elastos", "gateway", "--addr", addr],
+    os.environ["ELASTOS_GATEWAY_BIN"],
+    [os.environ["ELASTOS_GATEWAY_BIN"], "gateway", "--addr", addr],
 )
 PY
 
@@ -334,7 +359,7 @@ http_code="$(curl -fsS -o /dev/null -w '%{http_code}' "$home_url")"
 served_hash="$(curl -fsS "$home_url" | shasum -a 256 | cut -d ' ' -f 1)"
 installed_hash="$(shasum -a 256 "${data_dir}/capsules/home/browser/index.html" | cut -d ' ' -f 1)"
 source_hash="$(shasum -a 256 "${repo_root}/capsules/home/browser/index.html" | cut -d ' ' -f 1)"
-home_cli_renderer_source="${repo_root}/capsules/home-cli/target/release/home-cli"
+home_cli_renderer_source="$(cargo_built_binary_path "${repo_root}/capsules/home-cli/Cargo.toml" release home-cli)"
 home_cli_renderer_installed="${data_dir}/bin/home-cli"
 
 if [[ ! -f "$home_cli_renderer_source" || ! -f "$home_cli_renderer_installed" ]]; then

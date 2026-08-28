@@ -11,10 +11,17 @@ use elastos_auth::{
     ethereum_signed_message_hash, normalize_evm_address, recover_evm_address, validate_evm_address,
     verify_siwe_challenge, AuthChallengeInput, AuthChallengeV1, ProofBinding,
 };
+use elastos_protected_content_contracts::{
+    AtomicReplayClaimer, CanonicalContract as ProtectedContentCanonicalContract, ReplayClaimError,
+    ReplayClaimKeyV1, RightsRequestV1, RightsVerificationContextV1, WalletAddress,
+    WalletSignedRightsRequestV1, RIGHTS_CLOCK_SKEW_SECS,
+};
 use elastos_wallet_contract::{
-    ManagedRecoveryKeyEntryV1, ManagedRecoverySetV1, ValidatedChainOutcomeBindingV1,
-    ValidatedChainOutcomeV1, WalletAuthorityV2, WalletProviderOperationV2, WalletProviderRequestV2,
-    WalletProviderResponseV2, WalletResultV2, WALLET_BUS_OPERATION, WALLET_PROTOCOL_VERSION,
+    ManagedRecoveryKeyEntryV1, ManagedRecoverySetV1, ProtectedContentRightsSignatureResultV1,
+    ValidatedChainOutcomeBindingV1, ValidatedChainOutcomeV1, WalletAuthorityV2,
+    WalletProviderOperationV2, WalletProviderRequestV2, WalletProviderResponseV2, WalletResultV2,
+    MAX_PROTECTED_CONTENT_RIGHTS_WIRE_BYTES, PROTECTED_CONTENT_RIGHTS_SIGNATURE_INTENT,
+    PROTECTED_CONTENT_RIGHTS_SIGNATURE_RESOURCE, WALLET_BUS_OPERATION, WALLET_PROTOCOL_VERSION,
 };
 use k256::ecdsa::SigningKey;
 use rand::rngs::OsRng;
@@ -274,6 +281,16 @@ impl WalletProvider {
                 signature,
                 Some(signature_type),
                 public_key.as_deref(),
+            ),
+            WalletProviderOperationV2::RequestProtectedContentRightsSignature {
+                account_id,
+                canonical_rights_request_hex,
+                reason,
+            } => self.request_protected_content_rights_signature(
+                request,
+                account_id,
+                canonical_rights_request_hex,
+                reason,
             ),
             WalletProviderOperationV2::RequestApproval {
                 account_id,

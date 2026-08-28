@@ -135,24 +135,126 @@ The contract and its limits live in
 
 ### 3. Build Runtime-mediated protected content
 
-Protected content uses the same effect path as ordinary content:
+The target protected-content design uses the same effect path as ordinary
+content:
 
-`viewer -> Runtime capability -> protected-content coordinator -> providers`
+`viewer -> Runtime -> rights provider -> custody providers -> decrypt provider`
 
-The coordinator resolves the content object, checks availability, verifies
-rights, requests key release, creates a decrypt or render session, and records
-the result. Each dependency has a typed contract and fails closed. Viewers
-receive scoped output or a scoped session, not content keys, chain RPC, wallet
-authority, storage APIs, or provider credentials.
+Runtime will resolve the content object, check availability, verify rights,
+request recipient-encrypted custody contributions, create a scoped decrypt or
+render session, and record the result. Each dependency will have a typed
+contract and fail closed. Viewers will receive scoped output or a scoped
+session, not content keys, custody shares, chain RPC, Wallet authority, storage
+APIs, provider routes, network locations, or credentials.
+
+The dependency order for this work is strict:
+
+A. define and review the canonical source contracts and custody crypto
+   boundary;
+B. define source-only provider protocols and custody-node state without making
+   them active product paths;
+C. add Wallet-rights, typed Chain evidence, and Runtime-owned durable
+   coordination as source-only prerequisites;
+D. implement inactive Runtime provider lifecycle, registration, routing, audit,
+   and exact identity-bound reconciliation
+   (`feat/protected-content-runtime-lifecycle` from rights `43a83e5b`); do not
+   continue `feat/protected-content-runtime-coordinator-v1`;
+E. PQ-hybrid share wrap, recipient possession, decrypt-session wrap, and the
+   Runtime mint journal/2-of-3 provision are on the current review tree
+   (`elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1`, X-Wing draft-06
+   confidentiality only). This remains a source-only permissioned draft; the
+   current authority signatures remain classical and are not claimed
+   quantum-safe. Full PQ authorization remains a pre-activation decision.
+   External cryptographic review is still required. The Runtime mint journal
+   separates durable 2-of-3 custody provisioning from identity-only verified
+   content availability. The private server adapter publishes the fixed
+   descriptor/init/indexed-segment directory through existing `elastos://content`,
+   reads its signed status receipt, and refetches its generic manifest/files.
+   It pins Runtime-selected provider, object, and publisher identities plus
+   exact CENC media identity, policy, replica requirement, and freshness before
+   buy/open. A separate inactive Runtime test-provider composition covers
+   mint -> availability -> buy -> open ->
+   init/segment read -> close; it is not the process-backed product proof.
+   The decrypt provider generates each operation-scoped recipient key and keeps
+   its secret private; the authenticated Profile must authorize that exact
+   public key. Separate focused tests now prove the passkey-bound Profile
+   signing adapter and Runtime release-operation assembly seams.
+   Separate lower-level Runtime lifecycle tests and decrypt-provider process
+   tests prove PQ-hybrid reconstruction, CENC media reads, close replay,
+   restart, and old-handle absence. The current process-backed inactive proof
+   now uses production rights wiring, three independently addressed
+   custody-provider processes, one protect-provider process, and the
+   decrypt-provider process, and already covers the combined wrong-object/media
+   binding and durable replay cases. The remaining ordered product gates are:
+   A. package and provision the new protect provider, three custody instances,
+      and decrypt provider through the existing component/install/supervisor
+      model, internal and inactive only;
+   B. make protect and decrypt production-callable through the existing
+      `ProviderRegistry`, and add one Runtime-owned protected-content product
+      service for mint/buy/open/read/close orchestration and journals, still
+      inactive;
+   C. wire the existing Library creator import/mint/list flow to
+      protect -> custody -> content availability with identity-only Runtime
+      state;
+   D. wire the existing Marketplace buy flow and Library open/viewer flow to
+      the existing Wallet/transaction/Chain and release/decrypt path;
+   E. land one atomic cutover commit that activates the new route and removes
+      the provisional `drm` / `rights` / `key` / old `decrypt` startup, DTO,
+      provider-resource/catalog, build/install/component/WCI/test/doc surface,
+      with no fallback or dual path; and
+   F. prove the minimum installed one-Runtime/two-principal product acceptance.
+
+The first honest product proof is one installed Runtime with two human
+principals. Current source pins one local Runtime device issuer; multi-Runtime
+issuer admission and cross-Runtime protected-content exchange are later
+explicit pre-public-network gates.
+
+Share wrap on this current review tree is PQ-hybrid. It is still not a product
+mint path. First minted objects must stay PQ-hybrid; do not add a classical
+journey. PR #15 / `feat/dkms-esp-port` is research evidence for
+PQ-hybrid envelope crypto, threshold tests, node-local custody, lifecycle
+scenarios, CENC/play, and UX shape. Its public `shares[]` metadata, PQ-off
+decrypt defaults, raw-CEK/reference operations, old DRM orchestration, direct
+TCP/IP topology, and standalone harness must not become the product path.
+
+The published protected-content lifecycle prefix currently reaches
+`origin/feat/protected-content-runtime-lifecycle` at `34465959`. The earlier
+published `origin/feat/protected-content-custody-provider` branch remains
+historical source-only evidence for the custody-provider introduction. Local
+`feat/protected-content-runtime-lifecycle` adds the inactive Runtime-owned
+mint/list/buy/open/release/decrypt/close source path without changing
+installed product behavior. It also adds Wallet-rights, a private Runtime
+coordinator, typed Chain evidence, and a typed rights evaluator on that source
+line. Do not continue `feat/protected-content-runtime-coordinator-v1`. Rights
+evaluation invokes existing `chain` evidence through the Runtime registry. The
+remaining-work plan is the
+[Protected-content integration plan](docs/PROTECTED_CONTENT_EXTRACTION.md).
+
+Carrier remains transport only throughout that sequence. It carries
+Runtime-selected traffic, but it does not define rights authority, custody
+policy, or capsule-visible contract meaning.
 
 New protected objects should carry encrypted payload identity, rights policy,
-algorithm metadata, key envelopes, provenance, availability receipts, and a
-declared viewer interface. Cryptographic upgrades use versioned envelopes and
-migration rules. A permissioned key service can precede a public network, but
-production claims require independent review and operational evidence.
+algorithm metadata, provenance, availability receipts, declared viewer
+interface, CEK commitment, and object-bound pool/epoch/committee-authorization
+identities. Public metadata must not carry custody shares. `CustodyEnvelopeV1`
+remains a private ephemeral provisioning bundle; durable custody storage is one
+node-sealed share per selected custody node. The first product proof must use
+three distinct custody provider identities and state roots for a 2-of-3
+committee. First minted objects use PQ-hybrid envelopes. Later cryptographic
+successors use versioned envelopes and migration rules; 0.7 does not mint
+classical-only objects to migrate later.
+A permissioned key service can precede a public network, but production claims
+require independent review and operational evidence.
 
-See [Protected content](docs/PROTECTED_CONTENT.md) and the provider-specific
-contracts for rights, key release, and decryption.
+The repository now has a canonical source-only v1 review line in
+[Protected-content v1 contracts](docs/PROTECTED_CONTENT_CONTRACTS_V1.md),
+[Protected content](docs/PROTECTED_CONTENT.md), and
+[Protected-content integration plan](docs/PROTECTED_CONTENT_EXTRACTION.md). The current installed/provider
+path still uses the older provisional `elastos_common::protected_content` DTOs
+plus fail-closed provider stubs. The canonical source line is not product proof
+until Runtime, providers, Library, Wallet, Chain, custody, decrypt output, and
+viewer are connected in one no-fallback path.
 
 ### 4. Add wallet, DID, and node proofs behind Runtime authority
 
@@ -232,6 +334,16 @@ Executable capsule isolation remains governed by
 [Principle 18](PRINCIPLES.md#18-executable-capsules-are-isolated-execution-environments)
 and [Capsule model](docs/CAPSULE_MODEL.md).
 
+The gateway already serves read-only content by CID at `/s/<cid>/`. Once
+capsule packages are signed and content-addressed, opening a capsule's CID
+should load the capsule itself: the gateway resolves the package, verifies
+it, and boots it with whatever host it declares — a game capsule loads its
+emulator, and the Home GUI capsule loads the Home host first, the same way
+today's launch path binds a viewer to its executable actor. A capsule's CID
+then works as a shareable link to the running thing, not just to its files.
+This depends on the signed package contract above; an unsigned directory
+served by CID must stay inert content.
+
 ### 7. Keep Home as the Runtime-owned front door
 
 Home is the default user surface. Runtime owns identity, object access,
@@ -307,11 +419,21 @@ operator commands; current acceptance and known limits belong in
 
 People is the trust surface for profiles, contacts, requests, device bindings,
 and service discovery. Chat owns direct, group, and public conversations.
-Inbox owns review of contact, pairing, conversation, and capability requests.
+Inbox owns review of contact, conversation, and capability requests.
+
+The identity split must stay explicit:
+
+- passkeys authorize a local principal; they are never the network identity;
+- a principal-owned Profile DID is the stable person/contact identity;
+- a device DID is endpoint and signing identity only;
+- signed profile documents authorize the current delivery device bindings and
+  must be retained by highest accepted revision plus previous-hash linkage;
+- direct conversations are scoped to Profile DIDs, not to device rotation.
 
 The product must distinguish people from devices and contacts from
 conversations. Discovery is opt-in and describes its actual network scope.
-Deterministic signed invites remain available when discovery is unavailable.
+Deterministic signed invites remain available as an explicit alternate
+onboarding path.
 Stable transport identifiers stay out of ordinary UI.
 
 Service offers can arrive through trusted People and Carrier relationships, but
@@ -325,15 +447,28 @@ Direct messages cannot be presented as private unless their transport and
 storage enforce that claim. Local composition and reading should remain usable
 without waiting for remote transport.
 
+Profile identity and transport routing must not drift:
+
+- the signed public profile document is the public identity truth;
+- older or conflicting profile revisions must fail closed once a newer accepted
+  revision is retained;
+- device revocation becomes effective when the newer signed profile revision is
+  observed, not by transport metadata alone;
+- direct messages need both proofs: the device signature proves the sending
+  endpoint, and the retained signed profile document proves that device is
+  currently authorized for the participant Profile DID;
+- Carrier/bootstrap configuration remains connectivity only and never becomes
+  person, contact, or conversation authority.
+
 The target contract carries authenticated messages, object updates, presence,
 and attachments between runtimes. Runtime must verify the sender, capability,
 replay policy, and destination object. Unauthenticated raw gossip does not meet
 that contract. Compatibility bridges may map external systems into the target
 contract, but they do not define the native model.
 
-See [People and conversations](docs/PEOPLE_CONVERSATIONS.md) for implemented
-behavior and [Tasks](TASKS.md#collaboration-and-messaging) for open
-outcomes.
+See [People and conversations](docs/PEOPLE_CONVERSATIONS.md) for the target
+model and ordered implementation slices, and
+[Tasks](TASKS.md#collaboration-and-messaging) for open outcomes.
 
 ### 10. Keep release, install, share, and sites on truthful paths
 

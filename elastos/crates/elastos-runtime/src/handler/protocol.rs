@@ -1,7 +1,7 @@
 //! Internal runtime-control wire protocol.
 //!
 //! This is not the public capsule-kernel ABI. First-party app capsules use the
-//! `elastos-guest` `carrier_invoke` lane; this protocol remains for shell
+//! `elastos-guest` `resource_invoke` lane; this protocol remains for shell
 //! control, legacy stdio bridge tests, and explicitly authorized internal flows.
 use serde::{Deserialize, Serialize};
 
@@ -339,11 +339,11 @@ mod tests {
 
     #[test]
     fn test_capsule_kernel_abi_is_not_runtime_control_protocol() {
-        let kernel_request = r#"{"type":"carrier_invoke","uri":"elastos://did/*","operation":"get_did","body":{},"token":"tok"}"#;
+        let kernel_request = r#"{"type":"resource_invoke","uri":"elastos://did/*","operation":"get_did","body":{},"token":"tok"}"#;
         let result: Result<RuntimeRequest, _> = serde_json::from_str(kernel_request);
         assert!(
             result.is_err(),
-            "carrier_invoke belongs to elastos-guest and the Carrier bridge, not this control protocol"
+            "resource_invoke belongs to elastos-guest and the resource bridge, not this control protocol"
         );
     }
 

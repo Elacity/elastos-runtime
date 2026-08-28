@@ -18,6 +18,9 @@ const ELASTOS_VERSION: &str = env!("ELASTOS_VERSION");
 pub struct GatewayControlPlane {
     pub provider_registry: Arc<provider::ProviderRegistry>,
     pub host_helpers: Vec<api::server::HostHelperProcess>,
+    pub carrier_service: Option<crate::carrier::CarrierRuntimeService>,
+    pub collaboration_context: api::gateway::GatewayCollaborationContext,
+    pub collaboration_service: Option<crate::collaboration_startup::CollaborationRuntimeService>,
 }
 
 pub async fn run_gateway_direct<F, Fut>(
@@ -44,14 +47,25 @@ where
     api::auth_gateway::verify_configured_principal_roots_ready(&data_dir)?;
     let cache_path = cache_dir.unwrap_or_else(|| data_dir.join("gateway-cache"));
     std::fs::create_dir_all(&cache_path)?;
-    let control_plane = setup_control_plane().await?;
-    let _host_helpers = control_plane.host_helpers;
-
-    api::gateway::start_gateway_server(
+    let GatewayControlPlane {
+        provider_registry,
+        host_helpers: _host_helpers,
+        mut carrier_service,
+        collaboration_context,
+        mut collaboration_service,
+    } = setup_control_plane().await?;
+    let server_result = api::gateway::start_gateway_server_with_collaboration_context(
         &addr,
-        Some(control_plane.provider_registry),
+        Some(provider_registry),
+        collaboration_context,
         cache_path,
         data_dir,
+    )
+    .await;
+    finish_gateway_result(
+        server_result,
+        &mut collaboration_service,
+        &mut carrier_service,
     )
     .await
 }
@@ -90,191 +104,237 @@ where
     let components_data = tokio::fs::read_to_string(&components_path).await?;
     let registry: setup::ComponentsManifest = serde_json::from_str(&components_data)?;
 
-    let control_plane = setup_control_plane().await?;
-    let _host_helpers = control_plane.host_helpers;
-    for external in ["ipfs-provider", "kubo"] {
-        if registry.external.contains_key(external) {
-            eprintln!("[gateway] ensuring external '{}'", external);
+    let GatewayControlPlane {
+        provider_registry,
+        host_helpers: _host_helpers,
+        mut carrier_service,
+        collaboration_context,
+        mut collaboration_service,
+    } = setup_control_plane().await?;
+    let run_result: anyhow::Result<()> = async {
+        for external in ["ipfs-provider", "kubo"] {
+            if registry.external.contains_key(external) {
+                eprintln!("[gateway] ensuring external '{}'", external);
+                supervisor_require_ok(
+                    &supervisor::Supervisor::new(data_dir.clone(), registry.clone()),
+                    supervisor::SupervisorRequest::DownloadExternal {
+                        name: external.to_string(),
+                        platform: setup::detect_platform(),
+                    },
+                )
+                .await?;
+            }
+        }
+        register_installed_ipfs_provider(&data_dir, &provider_registry).await?;
+
+        let mut sup_inner = supervisor::Supervisor::new(data_dir.clone(), registry);
+        sup_inner.set_provider_registry(provider_registry.clone());
+        if let Some(port) = collaboration_context.chat_product_port.clone() {
+            sup_inner.set_collaboration_chat_product_port(port);
+        }
+        if let Some(port) = collaboration_context.presence_product_port.clone() {
+            sup_inner.set_collaboration_presence_product_port(port);
+        }
+        if let Some(service) = collaboration_context.discovery_service.clone() {
+            sup_inner.set_collaboration_discovery_service(service);
+        }
+        // Infrastructure trust domain: gateway capsules (ipfs-provider, tunnel-provider)
+        // are trusted service-plane components, not user application capsules.  They run
+        // under runtime/service authority and are explicitly outside the user shell
+        // approval model.  No CapabilityManager or PendingRequestStore is attached —
+        // if an infrastructure capsule ever requests a capability, the bridge returns
+        // a clear "infrastructure_capsule" denial rather than silently granting.
+        let sup = Arc::new(sup_inner);
+
+        eprintln!(
+        "[gateway] Trust domain: infrastructure (service-plane capsules, no user shell approval)"
+    );
+
+        let (tunnel_capsules, tunnel_externals) =
+            sup.resolve_launch_plan("tunnel-provider").await?;
+
+        let mut externals = Vec::<String>::new();
+        for ext in tunnel_externals {
+            if !externals.contains(&ext) {
+                externals.push(ext);
+            }
+        }
+
+        let mut capsules = Vec::<String>::new();
+        for cap in tunnel_capsules {
+            if !capsules.contains(&cap) {
+                capsules.push(cap);
+            }
+        }
+
+        for ext in &externals {
+            eprintln!("[gateway] ensuring external '{}'", ext);
             supervisor_require_ok(
-                &supervisor::Supervisor::new(data_dir.clone(), registry.clone()),
+                &sup,
                 supervisor::SupervisorRequest::DownloadExternal {
-                    name: external.to_string(),
+                    name: ext.clone(),
                     platform: setup::detect_platform(),
                 },
             )
             .await?;
         }
-    }
-    register_installed_ipfs_provider(&data_dir, &control_plane.provider_registry).await?;
 
-    let mut sup_inner = supervisor::Supervisor::new(data_dir.clone(), registry);
-    sup_inner.set_provider_registry(control_plane.provider_registry.clone());
-    // Infrastructure trust domain: gateway capsules (ipfs-provider, tunnel-provider)
-    // are trusted service-plane components, not user application capsules.  They run
-    // under runtime/service authority and are explicitly outside the user shell
-    // approval model.  No CapabilityManager or PendingRequestStore is attached —
-    // if an infrastructure capsule ever requests a capability, the bridge returns
-    // a clear "infrastructure_capsule" denial rather than silently granting.
-    let sup = Arc::new(sup_inner);
-
-    eprintln!(
-        "[gateway] Trust domain: infrastructure (service-plane capsules, no user shell approval)"
-    );
-
-    let (tunnel_capsules, tunnel_externals) = sup.resolve_launch_plan("tunnel-provider").await?;
-
-    let mut externals = Vec::<String>::new();
-    for ext in tunnel_externals {
-        if !externals.contains(&ext) {
-            externals.push(ext);
+        for cap in &capsules {
+            eprintln!("[gateway] ensuring capsule '{}'", cap);
+            supervisor_require_ok(
+                &sup,
+                supervisor::SupervisorRequest::EnsureCapsule { name: cap.clone() },
+            )
+            .await?;
         }
-    }
 
-    let mut capsules = Vec::<String>::new();
-    for cap in tunnel_capsules {
-        if !capsules.contains(&cap) {
-            capsules.push(cap);
+        let mut handles = Vec::<String>::new();
+        let mut tunnel_host_ip: Option<String> = None;
+        for cap in &capsules {
+            eprintln!("[gateway] launching infrastructure capsule '{}'", cap);
+            let resp = supervisor_require_ok(
+                &sup,
+                supervisor::SupervisorRequest::LaunchCapsule {
+                    name: cap.clone(),
+                    config: serde_json::json!({}),
+                    principal_id: None,
+                },
+            )
+            .await?;
+            let handle = resp
+                .handle
+                .ok_or_else(|| anyhow::anyhow!("launch response missing handle for '{}'", cap))?;
+            if cap == "tunnel-provider" {
+                tunnel_host_ip = resp.path.clone();
+            }
+            handles.push(handle);
         }
-    }
 
-    for ext in &externals {
-        eprintln!("[gateway] ensuring external '{}'", ext);
-        supervisor_require_ok(
+        let gateway_resp = supervisor_require_ok(
             &sup,
-            supervisor::SupervisorRequest::DownloadExternal {
-                name: ext.clone(),
-                platform: setup::detect_platform(),
+            supervisor::SupervisorRequest::StartGateway {
+                addr: bind_addr.clone(),
+                cache_dir: cache_dir.map(|p| p.to_string_lossy().to_string()),
             },
         )
         .await?;
-    }
+        let effective_addr = gateway_resp.path.unwrap_or(bind_addr);
 
-    for cap in &capsules {
-        eprintln!("[gateway] ensuring capsule '{}'", cap);
-        supervisor_require_ok(
-            &sup,
-            supervisor::SupervisorRequest::EnsureCapsule { name: cap.clone() },
+        println!("Gateway: http://{}", effective_addr);
+
+        let port = effective_addr.rsplit(':').next().unwrap_or("8090");
+        let tunnel_target = if let Some(ref host_ip) = tunnel_host_ip {
+            format!("http://{}:{}", host_ip, port)
+        } else {
+            format!("http://{}", effective_addr)
+        };
+
+        eprintln!("[gateway] requesting public tunnel for {}", tunnel_target);
+        let tunnel_resp = provider_send_raw_retry(
+            &provider_registry,
+            "tunnel",
+            &serde_json::json!({
+                "op": "start",
+                "target": tunnel_target,
+            }),
+            std::time::Duration::from_secs(30),
         )
         .await?;
-    }
-
-    let mut handles = Vec::<String>::new();
-    let mut tunnel_host_ip: Option<String> = None;
-    for cap in &capsules {
-        eprintln!("[gateway] launching infrastructure capsule '{}'", cap);
-        let resp = supervisor_require_ok(
-            &sup,
-            supervisor::SupervisorRequest::LaunchCapsule {
-                name: cap.clone(),
-                config: serde_json::json!({}),
-                principal_id: None,
-            },
+        eprintln!("[gateway] tunnel-provider start: {}", tunnel_resp);
+        let url =
+            wait_for_public_tunnel_url(&provider_registry, std::time::Duration::from_secs(90))
+                .await?;
+        let public_base = format!("{}/", url.trim_end_matches('/'));
+        let public_apps = api::browser_capsules::list_launchable_browser_capsules(&data_dir)
+            .into_iter()
+            .map(|app| app.name)
+            .collect::<Vec<_>>();
+        let hosted_apps = crate::browser_app_hosts::record_ephemeral_browser_app_urls(
+            &data_dir,
+            public_apps.iter().map(String::as_str),
+            Some(&public_base),
         )
-        .await?;
-        let handle = resp
-            .handle
-            .ok_or_else(|| anyhow::anyhow!("launch response missing handle for '{}'", cap))?;
-        if cap == "tunnel-provider" {
-            tunnel_host_ip = resp.path.clone();
-        }
-        handles.push(handle);
-    }
-
-    let gateway_resp = supervisor_require_ok(
-        &sup,
-        supervisor::SupervisorRequest::StartGateway {
-            addr: bind_addr.clone(),
-            cache_dir: cache_dir.map(|p| p.to_string_lossy().to_string()),
-        },
-    )
-    .await?;
-    let effective_addr = gateway_resp.path.unwrap_or(bind_addr);
-
-    println!("Gateway: http://{}", effective_addr);
-
-    let port = effective_addr.rsplit(':').next().unwrap_or("8090");
-    let tunnel_target = if let Some(ref host_ip) = tunnel_host_ip {
-        format!("http://{}:{}", host_ip, port)
-    } else {
-        format!("http://{}", effective_addr)
-    };
-
-    eprintln!("[gateway] requesting public tunnel for {}", tunnel_target);
-    let tunnel_resp = provider_send_raw_retry(
-        &control_plane.provider_registry,
-        "tunnel",
-        &serde_json::json!({
-            "op": "start",
-            "target": tunnel_target,
-        }),
-        std::time::Duration::from_secs(30),
-    )
-    .await?;
-    eprintln!("[gateway] tunnel-provider start: {}", tunnel_resp);
-    let url = wait_for_public_tunnel_url(
-        &control_plane.provider_registry,
-        std::time::Duration::from_secs(90),
-    )
-    .await?;
-    let public_base = format!("{}/", url.trim_end_matches('/'));
-    let public_apps = api::browser_capsules::list_launchable_browser_capsules(&data_dir)
-        .into_iter()
-        .map(|app| app.name)
-        .collect::<Vec<_>>();
-    let hosted_apps = crate::browser_app_hosts::record_ephemeral_browser_app_urls(
-        &data_dir,
-        public_apps.iter().map(String::as_str),
-        Some(&public_base),
-    )
-    .unwrap_or_default();
-    println!("Public URL: {}", public_base);
-    for hosted in hosted_apps
-        .iter()
-        .filter(|hosted| hosted.canonical_url.is_some())
-    {
-        println!(
-            "Hosted app: {} {}",
-            hosted.app,
-            hosted.canonical_url.as_deref().unwrap_or_default()
-        );
-    }
-
-    if let Some(ref publish_path) = publish {
-        match publish_to_content_availability(&control_plane.provider_registry, publish_path).await
+        .unwrap_or_default();
+        println!("Public URL: {}", public_base);
+        for hosted in hosted_apps
+            .iter()
+            .filter(|hosted| hosted.canonical_url.is_some())
         {
-            Ok(cid) => {
-                let filename = publish_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "file".to_string());
-                let install_url = format!("{}s/{}/{}", public_base, cid, filename);
+            println!(
+                "Hosted app: {} {}",
+                hosted.app,
+                hosted.canonical_url.as_deref().unwrap_or_default()
+            );
+        }
 
-                println!();
-                println!("Install:   curl -fsSL {} | bash", install_url);
-            }
-            Err(e) => {
-                eprintln!("[gateway] failed to publish {:?}: {}", publish_path, e);
-                println!("Installer URL template: {}s/<cid>/install.sh", public_base);
+        if let Some(ref publish_path) = publish {
+            match publish_to_content_availability(&provider_registry, publish_path).await {
+                Ok(cid) => {
+                    let filename = publish_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "file".to_string());
+                    let install_url = format!("{}s/{}/{}", public_base, cid, filename);
+
+                    println!();
+                    println!("Install:   curl -fsSL {} | bash", install_url);
+                }
+                Err(e) => {
+                    eprintln!("[gateway] failed to publish {:?}: {}", publish_path, e);
+                    println!("Installer URL template: {}s/<cid>/install.sh", public_base);
+                }
             }
         }
+
+        eprintln!("[gateway] runtime gateway running; press Ctrl+C to stop");
+        tokio::signal::ctrl_c().await?;
+
+        for handle in handles.iter().rev() {
+            let _ = sup
+                .handle_request(supervisor::SupervisorRequest::StopCapsule {
+                    handle: handle.clone(),
+                })
+                .await;
+        }
+        let _ = crate::browser_app_hosts::record_ephemeral_browser_app_urls(
+            &data_dir,
+            public_apps.iter().map(String::as_str),
+            None,
+        );
+        Ok(())
     }
+    .await;
+    finish_gateway_result(run_result, &mut collaboration_service, &mut carrier_service).await
+}
 
-    eprintln!("[gateway] runtime gateway running; press Ctrl+C to stop");
-    tokio::signal::ctrl_c().await?;
+async fn finish_gateway_result(
+    run_result: anyhow::Result<()>,
+    service: &mut Option<crate::collaboration_startup::CollaborationRuntimeService>,
+    carrier_service: &mut Option<crate::carrier::CarrierRuntimeService>,
+) -> anyhow::Result<()> {
+    let shutdown_result = shutdown_collaboration_service(service).await;
+    let carrier_shutdown = shutdown_carrier_service(carrier_service).await;
+    run_result?;
+    shutdown_result.and(carrier_shutdown)
+}
 
-    for handle in handles.iter().rev() {
-        let _ = sup
-            .handle_request(supervisor::SupervisorRequest::StopCapsule {
-                handle: handle.clone(),
-            })
-            .await;
+async fn shutdown_collaboration_service(
+    service: &mut Option<crate::collaboration_startup::CollaborationRuntimeService>,
+) -> anyhow::Result<()> {
+    if let Some(service) = service.as_mut() {
+        service.shutdown().await?;
     }
-    let _ = crate::browser_app_hosts::record_ephemeral_browser_app_urls(
-        &data_dir,
-        public_apps.iter().map(String::as_str),
-        None,
-    );
+    *service = None;
+    Ok(())
+}
 
+async fn shutdown_carrier_service(
+    service: &mut Option<crate::carrier::CarrierRuntimeService>,
+) -> anyhow::Result<()> {
+    if let Some(service) = service.as_mut() {
+        service.shutdown().await?;
+    }
+    *service = None;
     Ok(())
 }
 
@@ -451,6 +511,8 @@ mod tests {
     use elastos_runtime::provider::{Provider, ProviderError, ResourceRequest, ResourceResponse};
     use tokio::sync::Mutex;
 
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     struct MockContentProvider {
         requests: Mutex<Vec<serde_json::Value>>,
     }
@@ -524,5 +586,33 @@ mod tests {
             .decode(data)
             .unwrap();
         assert_eq!(bytes, b"#!/bin/sh\n");
+    }
+
+    #[tokio::test]
+    async fn gateway_success_and_error_both_await_collaboration_shutdown() {
+        for (run_result, expect_error) in [
+            (Ok(()), false),
+            (Err(anyhow::anyhow!("gateway failed")), true),
+        ] {
+            let collaboration_stopped = Arc::new(AtomicBool::new(false));
+            let carrier_stopped = Arc::new(AtomicBool::new(false));
+            let mut collaboration_service = Some(
+                crate::collaboration_startup::CollaborationRuntimeService::test_pending_service(
+                    collaboration_stopped.clone(),
+                ),
+            );
+            let mut carrier_service =
+                Some(crate::carrier::CarrierRuntimeService::test_pending_service(
+                    carrier_stopped.clone(),
+                ));
+            let result =
+                finish_gateway_result(run_result, &mut collaboration_service, &mut carrier_service)
+                    .await;
+            assert!(collaboration_service.is_none());
+            assert!(carrier_service.is_none());
+            assert!(collaboration_stopped.load(Ordering::SeqCst));
+            assert!(carrier_stopped.load(Ordering::SeqCst));
+            assert_eq!(result.is_err(), expect_error);
+        }
     }
 }

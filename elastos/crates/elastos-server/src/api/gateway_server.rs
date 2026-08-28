@@ -8,17 +8,66 @@ use tokio::net::TcpListener;
 
 use super::{gateway_router_with_api_url, GatewayState, GATEWAY_VERSION};
 
+#[derive(Clone, Default)]
+pub struct GatewayCollaborationContext {
+    pub chat_product_port: Option<crate::collaboration_product::CollaborationChatProductPort>,
+    pub presence_product_port:
+        Option<crate::collaboration_presence::CollaborationPresenceProductPort>,
+    pub discovery_service:
+        Option<crate::collaboration_discovery_runtime::CollaborationDiscoveryService>,
+}
+
 pub async fn start_gateway_server(
     addr: &str,
     provider_registry: Option<Arc<ProviderRegistry>>,
+    collaboration_chat_product_port: Option<
+        crate::collaboration_product::CollaborationChatProductPort,
+    >,
+    collaboration_presence_product_port: Option<
+        crate::collaboration_presence::CollaborationPresenceProductPort,
+    >,
+    cache_dir: PathBuf,
+    data_dir: PathBuf,
+) -> anyhow::Result<()> {
+    start_gateway_server_with_collaboration_context(
+        addr,
+        provider_registry,
+        GatewayCollaborationContext {
+            chat_product_port: collaboration_chat_product_port,
+            presence_product_port: collaboration_presence_product_port,
+            discovery_service: None,
+        },
+        cache_dir,
+        data_dir,
+    )
+    .await
+}
+
+pub(crate) async fn start_gateway_server_with_collaboration_context(
+    addr: &str,
+    provider_registry: Option<Arc<ProviderRegistry>>,
+    collaboration: GatewayCollaborationContext,
     cache_dir: PathBuf,
     data_dir: PathBuf,
 ) -> anyhow::Result<()> {
     crate::auth::verify_auth_audit_chain_ready(&data_dir)?;
     let listener = TcpListener::bind(addr).await?;
+    let gateway_local_control = match provider_registry.as_ref() {
+        Some(registry) => Some(
+            crate::api::gateway_local_control::start_gateway_local_control(
+                &data_dir,
+                registry.clone(),
+            )
+            .await?,
+        ),
+        None => None,
+    };
     let gateway_api_url = trusted_gateway_api_url(addr)?;
     let state = GatewayState {
         provider_registry,
+        collaboration_chat_product_port: collaboration.chat_product_port,
+        collaboration_presence_product_port: collaboration.presence_product_port,
+        collaboration_discovery_service: collaboration.discovery_service,
         identity_manager: Arc::new(OnceLock::new()),
         cache_dir,
         data_dir,
@@ -55,8 +104,16 @@ pub async fn start_gateway_server(
     .await;
     browser_lifecycle_reconciler.cancel();
     let reconciliation_result = browser_lifecycle_reconciler.join().await;
+    let local_control_result = async {
+        if let Some(control) = gateway_local_control {
+            control.shutdown().await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
     serve_result?;
     reconciliation_result.map_err(anyhow::Error::msg)?;
+    local_control_result?;
     Ok(())
 }
 

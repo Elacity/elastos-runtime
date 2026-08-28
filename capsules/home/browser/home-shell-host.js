@@ -16,27 +16,28 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-20260725a";
+} from "./shell-core.js?v=home-20260802a";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
   isHomeAuthError,
   refreshHomeSession,
   requestPasskeyStepUp,
+  profileReadinessActionTarget,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260725a";
+} from "./shell-auth.js?v=home-20260802a";
 import {
   handleHomeWalletConnectorEffect,
   WALLET_CONNECTOR_EFFECT_TYPE,
-} from "./home-wallet-connector-host.js?v=home-20260725a";
+} from "./home-wallet-connector-host.js?v=home-20260802a";
 import {
   createHomeClipboardFrameState,
   createHomeClipboardHost,
   createHomeClipboardPrompt,
   homeClipboardTargetSupported,
 } from "./home-clipboard-host.js?v=home-20260726a";
-import { loadOrCreateHomeBrowserContextId } from "./home-browser-context.js?v=home-20260725a";
+import { loadOrCreateHomeBrowserContextId } from "./home-browser-context.js?v=home-20260805a";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -45,6 +46,7 @@ const HOME_EVENTS_RETRY_MS = 2_000;
 const HOME_EVENTS_HIDDEN_RETRY_MS = 30_000;
 const HOME_EVENTS_STREAM_URL = "/api/apps/home/events/stream";
 const SESSION_REFRESH_MS = 10 * 60 * 1000;
+const PRESENCE_HEARTBEAT_MS = 15_000;
 const ACTIVE_SHELL_HINT_KEY = "elastos.home.active-shell-hint";
 const HOME_CLI_SHELL_ID = "home-cli";
 const OPAQUE_CAPSULE_ORIGIN = "null";
@@ -75,7 +77,7 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   inbox: "visible-target",
   library: new Set(["archive-manager", "documents", "gba-emulator", "library"]),
   marketplace: "runtime-target",
-  people: new Set(["chat-room"]),
+  people: new Set(["chat-room", "system"]),
   services: new Set(["browser", "chat-room"]),
   system: "visible-target",
   "wallet": new Set(["wallet-metamask", "wallet-unisat"]),
@@ -162,6 +164,7 @@ function clearLaunchedAppContexts() {
 }
 
 function enterHostAuthGate() {
+  stopHomePresenceHeartbeat();
   shellState.activeShellRootLaunchSeq += 1;
   shellState.activeShellRootTarget = "";
   shellState.activeShellRootRoute = "";
@@ -185,7 +188,14 @@ function enterHostAuthGate() {
 
 async function showHostAuthGate(options = {}) {
   enterHostAuthGate();
-  const unlockReady = showHomeUnlock(() => boot(), {
+  const unlockReady = showHomeUnlock(async (response) => {
+    await boot();
+    const profileActionTarget = profileReadinessActionTarget(response);
+    if (profileActionTarget) {
+      await activateDesktopShell(response.home_token);
+      await openTargetFromHomeGui(profileActionTarget);
+    }
+  }, {
     ...options,
     surface: "neutral",
   });
@@ -1125,6 +1135,23 @@ window.addEventListener("message", (event) => {
     requestShellSummaryRefresh({ reason: "child-message" });
     return;
   }
+  if (data.type === "home:menu-manifest") {
+    // Menus are self-declared UI, not authority: a window may only shape its
+    // OWN entry in the menu bar. The host does not know GUI window ids, so it
+    // forwards the sender's launch token and lets the isolated GUI resolve
+    // which of its windows that token belongs to.
+    if (context.kind !== "app-frame" || !context.homeToken) {
+      console.warn("home ignored unauthorized menu-manifest message", context.targetId);
+      return;
+    }
+    postToActiveShell({
+      type: "home:gui-command",
+      command: "set-menu-manifest",
+      homeToken: context.homeToken,
+      menus: data.menus,
+    });
+    return;
+  }
   if (data.type === "home:active-shell-applied") {
     const trustedSystemApp = context.kind === "app-frame" && context.targetId === SYSTEM_APP_ID;
     const trustedRootShell = context.kind === "shell-frame" &&
@@ -1511,12 +1538,19 @@ async function boot() {
   document.body.dataset.homeStatus = "booting";
   let summary = null;
   const deferHomeGuiForBootHint = Boolean(activeShellBootHintTarget());
+  let sessionRefused = false;
   try {
     await refreshHomeSession();
   } catch (error) {
     if (!isHomeAuthError(error)) {
       throw error;
     }
+    // A session the Runtime will not renew cannot mint the launch tokens
+    // every window needs. The summary can still read as signed — a live
+    // grant whose principal is gone does exactly that — so trusting it here
+    // boots a signed-looking desktop of empty frames. Ask for the passkey
+    // instead: sign-in is the recovery, and it is one click away.
+    sessionRefused = true;
   }
   try {
     summary = await refreshShellSummary({ deferHomeGuiForBootHint });
@@ -1526,6 +1560,12 @@ async function boot() {
       return;
     }
     throw error;
+  }
+  if (sessionRefused) {
+    document.body.dataset.homeStatus = "ready";
+    await showHostAuthGate({ presentation: "prompt" });
+    startShellTimers();
+    return;
   }
   if (!homeSummarySignedIn(summary)) {
     document.body.dataset.homeStatus = "ready";
@@ -1603,6 +1643,60 @@ function homeSummaryHasProofBoundSession(summary) {
   );
 }
 
+function stopHomePresenceHeartbeat() {
+  if (shellState.presenceHeartbeatTimer !== null) {
+    window.clearInterval(shellState.presenceHeartbeatTimer);
+    shellState.presenceHeartbeatTimer = null;
+  }
+}
+
+function publishHomePresence() {
+  if (
+    !homeSummaryHasProofBoundSession(shellState.currentSummary) ||
+    shellState.presenceHeartbeatInFlight
+  ) {
+    return shellState.presenceHeartbeatInFlight || Promise.resolve(null);
+  }
+  const pending = fetchJson("/api/apps/home/collaboration/presence", {
+    method: "POST",
+    body: JSON.stringify({}),
+  })
+    .catch((error) => {
+      if (isHomeAuthError(error)) {
+        stopHomePresenceHeartbeat();
+      }
+      // Presence needs a saved Profile. Before one exists the Runtime
+      // answers 409 every heartbeat, so a first run scrolls its console
+      // with a refusal it already predicted. Stop asking until something
+      // about this Home changes.
+      if (error?.status === 409) {
+        stopHomePresenceHeartbeat();
+      }
+      return null;
+    })
+    .finally(() => {
+      if (shellState.presenceHeartbeatInFlight === pending) {
+        shellState.presenceHeartbeatInFlight = null;
+      }
+    });
+  shellState.presenceHeartbeatInFlight = pending;
+  return pending;
+}
+
+function syncHomePresenceHeartbeat(summary) {
+  if (!homeSummaryHasProofBoundSession(summary)) {
+    stopHomePresenceHeartbeat();
+    return;
+  }
+  if (shellState.presenceHeartbeatTimer === null) {
+    shellState.presenceHeartbeatTimer = window.setInterval(
+      publishHomePresence,
+      PRESENCE_HEARTBEAT_MS,
+    );
+    publishHomePresence();
+  }
+}
+
 function refreshSignedHomeSession() {
   if (!homeSummaryHasProofBoundSession(shellState.currentSummary)) {
     return Promise.resolve(null);
@@ -1629,6 +1723,7 @@ async function refreshShellSummary({
   shellState.currentSummary = summary;
   shellState.requestSummaryRefresh = refreshShellSummary;
   document.body.dataset.homeAuthority = homeSummarySignedIn(summary) ? "signed" : "unsigned";
+  syncHomePresenceHeartbeat(summary);
 
   if (homeSummarySignedIn(summary)) {
     ensureHomeEventChannel();

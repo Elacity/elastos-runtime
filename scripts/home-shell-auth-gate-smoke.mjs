@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260725a";
+const moduleVersion = "home-20260802a";
 const requests = [];
 const windowListeners = new Map();
+const intervals = new Map();
+let nextIntervalId = 1;
+let signedSummary = false;
+let resolvePresenceHeartbeat = null;
+let presenceResponseMode = "pending";
 
 class FakeClassList {
   constructor() {
@@ -202,12 +207,20 @@ globalThis.window = {
     }
     windowListeners.get(type).push(callback);
   },
-  clearInterval() {},
-  clearTimeout() {},
-  setInterval: () => 0,
+  clearInterval(id) {
+    intervals.delete(id);
+  },
+  clearTimeout(id) {
+    if (id) clearImmediate(id);
+  },
+  setInterval(callback, delay) {
+    const id = nextIntervalId++;
+    intervals.set(id, { callback, delay });
+    return id;
+  },
   setTimeout(callback) {
-    if (typeof callback === "function") {
-      callback();
+    if (typeof callback === "function" && callback.name !== "pollHomeEvents") {
+      return setImmediate(callback);
     }
     return 0;
   },
@@ -230,7 +243,9 @@ globalThis.fetch = async (url, init = {}) => {
   if (url === "/api/apps/home/summary") {
     return jsonResponse({
       app: { id: "home", route: "/apps/home/" },
-      authority: { signed_in: false },
+      authority: signedSummary
+        ? { signed_in: true, proof_binding_id: "proof:passkey:host" }
+        : { signed_in: false },
       active_shell: {
         schema: "elastos.home.active-shell/v1",
         active: "home-gui",
@@ -241,6 +256,28 @@ globalThis.fetch = async (url, init = {}) => {
   }
   if (url === "/api/auth/passkey/status") {
     return jsonResponse({ registered: true, guest_registration_enabled: false });
+  }
+  if (url === "/api/auth/sessions/refresh") {
+    return jsonResponse({ home_token: "trusted-home-host-token" });
+  }
+  if (url === "/api/apps/home/collaboration/presence") {
+    if (presenceResponseMode === "auth-failure") {
+      return failedResponse(401, "Unauthorized", "expired Home authority");
+    }
+    if (presenceResponseMode === "success") {
+      return jsonResponse({
+        configured: true,
+        queued: true,
+        next_heartbeat_after_ms: 15_000,
+      });
+    }
+    return new Promise((resolve) => {
+      resolvePresenceHeartbeat = () => resolve(jsonResponse({
+        configured: true,
+        queued: true,
+        next_heartbeat_after_ms: 15_000,
+      }));
+    });
   }
   return jsonResponse({ ok: true });
 };
@@ -300,5 +337,140 @@ assert(
 );
 assert(activeShellRoot.hidden === true, "locked summary refresh showed the active shell root");
 assert(activeShellFrame.hidden === true, "locked summary refresh showed the active shell frame");
+
+assert(
+  !requests.some((request) => request.url === "/api/apps/home/collaboration/presence"),
+  "unsigned Home published collaboration presence",
+  requests,
+);
+signedSummary = true;
+for (const listener of windowListeners.get("message") || []) {
+  listener({
+    origin: "http://localhost:61180",
+    source: window,
+    data: { type: "home:refresh-summary" },
+  });
+}
+for (
+  let attempt = 0;
+  attempt < 20 && !requests.some((request) => request.url === "/api/apps/home/collaboration/presence");
+  attempt += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+const heartbeatRequests = () => requests.filter(
+  (request) => request.url === "/api/apps/home/collaboration/presence",
+);
+assert(heartbeatRequests().length === 1, "proof-bound Home did not emit one presence heartbeat", requests);
+assert(
+  JSON.stringify(heartbeatRequests()[0].body) === "{}",
+  "Home presence heartbeat forwarded authority fields",
+  heartbeatRequests()[0],
+);
+assert(
+  heartbeatRequests()[0].headers["x-elastos-home-token"] === "trusted-home-host-token",
+  "Home presence heartbeat did not carry the trusted host token",
+  heartbeatRequests()[0],
+);
+const presenceIntervals = [...intervals.values()].filter(({ delay }) => delay === 15_000);
+assert(presenceIntervals.length === 1, "Home created more than one presence timer", presenceIntervals);
+presenceIntervals[0].callback();
+presenceIntervals[0].callback();
+assert(heartbeatRequests().length === 1, "in-flight presence heartbeat was not coalesced", requests);
+resolvePresenceHeartbeat();
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+presenceResponseMode = "auth-failure";
+presenceIntervals[0].callback();
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert(heartbeatRequests().length === 2, "Home did not make the next normal heartbeat", requests);
+assert(
+  ![...intervals.values()].some(({ delay }) => delay === 15_000),
+  "Home kept retrying presence after an authorization failure",
+  [...intervals.values()],
+);
+
+presenceResponseMode = "success";
+const summaryCountBeforeRestart = requests.filter(
+  (request) => request.url === "/api/apps/home/summary",
+).length;
+for (const listener of windowListeners.get("message") || []) {
+  listener({
+    origin: "http://localhost:61180",
+    source: window,
+    data: { type: "home:refresh-summary" },
+  });
+}
+for (
+  let attempt = 0;
+  attempt < 20 && heartbeatRequests().length < 3;
+  attempt += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(heartbeatRequests().length === 3, "later proof-bound summary did not restart presence", requests);
+assert(
+  [...intervals.values()].filter(({ delay }) => delay === 15_000).length === 1,
+  "proof-bound restart did not retain exactly one presence timer",
+  [...intervals.values()],
+);
+
+signedSummary = false;
+for (const listener of windowListeners.get("message") || []) {
+  listener({
+    origin: "http://localhost:61180",
+    source: window,
+    data: { type: "home:refresh-summary" },
+  });
+}
+for (
+  let attempt = 0;
+  attempt < 20 && requests.filter((request) => request.url === "/api/apps/home/summary").length < summaryCountBeforeRestart + 2;
+  attempt += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  ![...intervals.values()].some(({ delay }) => delay === 15_000),
+  "Home kept the presence timer after becoming unsigned",
+  [...intervals.values()],
+);
+presenceIntervals[0].callback();
+assert(heartbeatRequests().length === 3, "unsigned Home emitted from a stale presence timer", requests);
+
+const { profileReadinessActionTarget } = await import(
+  `../capsules/home/browser/shell-auth.js?v=${moduleVersion}`
+);
+assert(profileReadinessActionTarget({
+  profile_readiness: {
+    schema: "elastos.profile.readiness/v1",
+    status: "setup_required",
+  },
+}) === "people", "Home did not direct explicit Profile setup to People");
+assert(profileReadinessActionTarget({
+  profile_readiness: {
+    schema: "elastos.profile.readiness/v1",
+    status: "ready",
+  },
+}) === "", "Home treated a ready Profile as action-required");
+assert(profileReadinessActionTarget({
+  profile_readiness: {
+    schema: "elastos.profile.readiness/v1",
+    status: "unavailable",
+  },
+}) === "system", "Home did not route invalid Profile authority to System Recovery");
+assert(profileReadinessActionTarget({}) === "system", "Home silently accepted missing Profile readiness");
+assert(profileReadinessActionTarget({
+  profile_readiness: {
+    schema: "elastos.profile.readiness/unknown",
+    status: "ready",
+  },
+}) === "system", "Home silently accepted an unknown Profile readiness schema");
+assert(profileReadinessActionTarget({
+  profile_readiness: {
+    schema: "elastos.profile.readiness/v1",
+    status: "unknown",
+  },
+}) === "system", "Home silently accepted an unknown Profile readiness status");
 
 console.log("[home-shell-auth-gate] PASS");

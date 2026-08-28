@@ -100,6 +100,87 @@ pub(super) fn spawn_rpc_sequence_server(responses: Vec<(&'static str, Value)>) -
     format!("http://{addr}")
 }
 
+#[derive(Clone)]
+pub(super) enum RpcReply {
+    Result(Value),
+    Error(Value),
+}
+
+pub(super) fn spawn_rpc_sequence_asserting_server(
+    responses: Vec<(&'static str, Value, Value)>,
+) -> String {
+    spawn_rpc_sequence_asserting_server_with_replies(
+        responses
+            .into_iter()
+            .map(|(method, params, result)| (method, params, RpcReply::Result(result)))
+            .collect(),
+    )
+}
+
+pub(super) fn spawn_rpc_sequence_asserting_server_with_replies(
+    responses: Vec<(&'static str, Value, RpcReply)>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for (expected_method, expected_params, reply) in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            let body_start = loop {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    panic!("connection closed before headers");
+                }
+                request.extend_from_slice(&buf[..n]);
+                if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..body_start]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length:")
+                        .or_else(|| line.strip_prefix("content-length:"))
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .expect("request must include Content-Length");
+            while request.len() < body_start + content_length {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let body = &request[body_start..body_start + content_length];
+            let rpc: Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(rpc["method"], expected_method);
+            assert_eq!(rpc["params"], expected_params);
+            let body = match reply {
+                RpcReply::Result(result) => json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": result,
+                }),
+                RpcReply::Error(error) => json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": error,
+                }),
+            }
+            .to_string();
+            let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    format!("http://{addr}")
+}
+
 pub(super) fn spawn_eth_call_server(expected_data: String, result: Value) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();

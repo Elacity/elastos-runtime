@@ -669,7 +669,7 @@ async fn test_browser_open_attaches_runtime_stream_for_remote_carrier_exit() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
-    let close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    let close_calls = BrowserCloseCallRecorder::new();
     let app = gateway_router(
         browser_engine_remote_carrier_exit_test_state_with_close_calls(
             dir.path(),
@@ -752,7 +752,7 @@ async fn test_browser_open_attaches_runtime_stream_for_remote_carrier_exit() {
         .await
         .unwrap();
     assert_eq!(close.status(), StatusCode::OK);
-    let calls = close_calls.lock().await;
+    let calls = close_calls.snapshot().await;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["op"], "close_stream");
     assert_eq!(calls[0]["stream_id"], stream_id);
@@ -764,7 +764,7 @@ async fn test_browser_close_stream_failure_retires_page_and_queues_stream_cleanu
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
-    let close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    let close_calls = BrowserCloseCallRecorder::new();
     let app = gateway_router(
         browser_engine_remote_carrier_exit_test_state_with_close_failures(
             dir.path(),
@@ -818,7 +818,7 @@ async fn test_browser_close_stream_failure_retires_page_and_queues_stream_cleanu
     let failed_message = String::from_utf8(failed_body.to_vec()).unwrap();
     assert!(failed_message.contains("simulated remote Carrier Exit close_stream failure"));
     {
-        let calls = close_calls.lock().await;
+        let calls = close_calls.snapshot().await;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["stream_id"], stream_id);
     }
@@ -850,7 +850,7 @@ async fn test_browser_close_stream_failure_retires_page_and_queues_stream_cleanu
         .unwrap();
     assert_eq!(retry_close.status(), StatusCode::BAD_REQUEST);
     {
-        let calls = close_calls.lock().await;
+        let calls = close_calls.snapshot().await;
         assert_eq!(calls.len(), 1);
     }
 
@@ -867,7 +867,7 @@ async fn test_browser_close_stream_failure_retires_page_and_queues_stream_cleanu
         .await
         .unwrap();
     assert_eq!(exact_retry.status(), StatusCode::OK);
-    assert_eq!(close_calls.lock().await.len(), 2);
+    assert_eq!(close_calls.snapshot().await.len(), 2);
     assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
     assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 0);
     assert!(!browser_principal_has_live_sessions(dir.path(), &authority.principal_id).await);
@@ -878,7 +878,7 @@ async fn test_browser_open_failure_closes_remote_carrier_stream_reservation() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
-    let close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    let close_calls = BrowserCloseCallRecorder::new();
     let app = gateway_router(
         rejecting_browser_engine_remote_carrier_exit_test_state_with_close_calls(
             dir.path(),
@@ -902,7 +902,7 @@ async fn test_browser_open_failure_closes_remote_carrier_stream_reservation() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let calls = close_calls.lock().await;
+    let calls = close_calls.snapshot().await;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["op"], "close_stream");
     assert!(calls[0]["stream_id"]
@@ -916,7 +916,7 @@ async fn test_browser_open_failure_retries_pending_remote_exit_cleanup() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
-    let close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    let close_calls = BrowserCloseCallRecorder::new();
     let app = gateway_router(
         rejecting_browser_engine_remote_carrier_exit_test_state_with_close_failures(
             dir.path(),
@@ -945,7 +945,7 @@ async fn test_browser_open_failure_retries_pending_remote_exit_cleanup() {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    let calls = close_calls.lock().await;
+    let calls = close_calls.snapshot().await;
     assert_eq!(calls.len(), 3);
     assert_eq!(calls[1]["stream_id"], calls[0]["stream_id"]);
     assert_ne!(calls[2]["stream_id"], calls[0]["stream_id"]);
@@ -1131,8 +1131,11 @@ async fn test_browser_async_open_returns_job_and_polls_same_principal_result() {
         .unwrap();
     assert_eq!(blocked.status(), StatusCode::NOT_FOUND);
 
+    // Poll until the job reports completion. The bound is a deadlock guard, not
+    // a timing budget: this runs on real time, so a tight round count turns the
+    // machine's load into a test failure.
     let mut completed = None;
-    for _ in 0..10 {
+    for _ in 0..200 {
         let status_response = app
             .clone()
             .oneshot(
@@ -1857,7 +1860,7 @@ async fn test_browser_session_capacity_tracks_multiple_pages_for_principal() {
     let authority = passkey_authority(dir.path());
     let first_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
     let second_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
-    let close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    let close_calls = BrowserCloseCallRecorder::new();
     let app = gateway_router(
         browser_engine_remote_carrier_exit_test_state_with_close_calls(
             dir.path(),
@@ -1935,7 +1938,7 @@ async fn test_browser_session_capacity_tracks_multiple_pages_for_principal() {
         "additional launches must receive a new Runtime stream"
     );
     {
-        let calls = close_calls.lock().await;
+        let calls = close_calls.snapshot().await;
         assert_eq!(calls.len(), 0);
     }
 
@@ -2079,7 +2082,7 @@ async fn test_browser_session_capacity_tracks_multiple_pages_for_principal() {
         .unwrap();
     assert_eq!(first_close_response.status(), StatusCode::OK);
     {
-        let calls = close_calls.lock().await;
+        let calls = close_calls.snapshot().await;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["op"], "close_stream");
         assert_eq!(calls[0]["stream_id"], first_stream_id);
@@ -2101,7 +2104,7 @@ async fn test_browser_session_capacity_tracks_multiple_pages_for_principal() {
         .unwrap();
     assert_eq!(second_close_response.status(), StatusCode::OK);
     {
-        let calls = close_calls.lock().await;
+        let calls = close_calls.snapshot().await;
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1]["op"], "close_stream");
         assert_eq!(calls[1]["stream_id"], second_stream_id);
@@ -2308,11 +2311,8 @@ async fn test_browser_resources_in_use_requires_exact_did_not_act_reconciliation
     assert_eq!(payload["outcome"]["effects"]["page_acquired"], false);
     assert_eq!(payload["outcome"]["effects"]["vm_acquired"], false);
     assert_eq!(payload["outcome"]["effects"]["stream_acquired"], true);
-    assert_eq!(
-        reconciliation_calls.load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
-    assert_eq!(close_calls.lock().await.len(), 0);
+    assert_eq!(reconciliation_calls.count(), 1);
+    assert_eq!(close_calls.snapshot().await.len(), 0);
     assert_eq!(browser_page_session_count(dir.path()).await, 0);
     assert_eq!(
         browser_launch_reconciliation_obligation_count(dir.path()).await,
@@ -2393,11 +2393,8 @@ async fn test_exact_vz_did_not_act_releases_all_runtime_obligations_without_reco
     assert_eq!(payload["outcome"]["effects"]["page_acquired"], false);
     assert_eq!(payload["outcome"]["effects"]["vm_acquired"], false);
     assert_eq!(payload["outcome"]["effects"]["stream_acquired"], true);
-    assert_eq!(
-        reconciliation_calls.load(std::sync::atomic::Ordering::SeqCst),
-        0
-    );
-    assert!(close_calls.lock().await.is_empty());
+    assert_eq!(reconciliation_calls.count(), 0);
+    assert!(close_calls.snapshot().await.is_empty());
     assert_eq!(browser_page_session_count(dir.path()).await, 0);
     assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
     assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 0);
@@ -2452,11 +2449,8 @@ async fn test_mismatched_vz_did_not_act_remains_fail_closed() {
         payload["outcome"]["ownership"],
         "launch_reconciliation_pending"
     );
-    assert_eq!(
-        reconciliation_calls.load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
-    assert!(close_calls.lock().await.is_empty());
+    assert_eq!(reconciliation_calls.count(), 1);
+    assert!(close_calls.snapshot().await.is_empty());
     assert_eq!(
         browser_launch_reconciliation_obligation_count(dir.path()).await,
         1
@@ -2498,11 +2492,8 @@ async fn test_exact_terminal_vz_settlement_releases_restart_reconciliation_oblig
     assert_eq!(payload["outcome"]["state"], "terminal_post_effect_cleanup");
     assert_eq!(payload["outcome"]["effects"]["page_acquired"], false);
     assert_eq!(payload["outcome"]["effects"]["vm_acquired"], true);
-    assert_eq!(
-        reconciliation_calls.load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
-    assert!(close_calls.lock().await.is_empty());
+    assert_eq!(reconciliation_calls.count(), 1);
+    assert!(close_calls.snapshot().await.is_empty());
     assert_eq!(browser_page_session_count(dir.path()).await, 0);
     assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
     assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 0);
@@ -2551,11 +2542,8 @@ async fn test_mismatched_terminal_vz_settlement_retains_restart_reconciliation_o
         payload["outcome"]["ownership"],
         "launch_reconciliation_pending"
     );
-    assert_eq!(
-        reconciliation_calls.load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
-    assert!(close_calls.lock().await.is_empty());
+    assert_eq!(reconciliation_calls.count(), 1);
+    assert!(close_calls.snapshot().await.is_empty());
     assert_eq!(
         browser_launch_reconciliation_obligation_count(dir.path()).await,
         1
@@ -2596,11 +2584,8 @@ async fn test_browser_launch_response_loss_reconciles_and_closes_exact_effect() 
     assert_eq!(payload["outcome"]["state"], "terminal_post_effect_cleanup");
     assert_eq!(payload["outcome"]["effects"]["page_acquired"], true);
     assert_eq!(payload["outcome"]["effects"]["vm_acquired"], true);
-    assert_eq!(close_calls.lock().await.len(), 1);
-    assert_eq!(
-        reconciliation_calls.load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
+    assert_eq!(close_calls.snapshot().await.len(), 1);
+    assert_eq!(reconciliation_calls.count(), 1);
     assert_eq!(browser_page_session_count(dir.path()).await, 0);
     assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
     assert_eq!(
@@ -2641,11 +2626,8 @@ async fn test_browser_malformed_success_reconciles_instead_of_releasing_ownershi
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["outcome"]["state"], "terminal_post_effect_cleanup");
-    assert_eq!(close_calls.lock().await.len(), 1);
-    assert_eq!(
-        reconciliation_calls.load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
+    assert_eq!(close_calls.snapshot().await.len(), 1);
+    assert_eq!(reconciliation_calls.count(), 1);
     assert_eq!(
         browser_launch_reconciliation_obligation_count(dir.path()).await,
         0
@@ -2699,7 +2681,7 @@ async fn test_browser_provider_crash_blocks_until_terminal_proof_then_allows_new
         first["outcome"]["ownership"],
         "launch_reconciliation_pending"
     );
-    assert_eq!(close_calls.lock().await.len(), 0);
+    assert_eq!(close_calls.snapshot().await.len(), 0);
     assert_eq!(
         browser_launch_reconciliation_obligation_count(dir.path()).await,
         1
@@ -2727,7 +2709,7 @@ async fn test_browser_provider_crash_blocks_until_terminal_proof_then_allows_new
     assert!(String::from_utf8(replacement.to_vec())
         .unwrap()
         .contains("cleanup is pending"));
-    assert!(reconciliation_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    assert!(reconciliation_calls.count() >= 2);
     assert_eq!(
         browser_launch_reconciliation_obligation_count(dir.path()).await,
         1
@@ -2757,8 +2739,8 @@ async fn test_browser_provider_crash_blocks_until_terminal_proof_then_allows_new
         terminal_replacement["engine_page"]["schema"],
         "elastos.browser.engine.page/v1"
     );
-    assert_eq!(close_calls.lock().await.len(), 0);
-    assert!(reconciliation_calls.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+    assert_eq!(close_calls.snapshot().await.len(), 0);
+    assert!(reconciliation_calls.count() >= 3);
     assert_eq!(
         browser_launch_reconciliation_obligation_count(dir.path()).await,
         0
@@ -3086,6 +3068,9 @@ async fn browser_wallet_read_timeout_test_state(
         .unwrap();
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -5073,7 +5058,7 @@ async fn test_browser_no_first_frame_cleanup_retries_exact_effect_without_replac
     let owner_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
     let replacement_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
     let engine_close_calls = Arc::new(TokioMutex::new(Vec::new()));
-    let exit_close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    let exit_close_calls = BrowserCloseCallRecorder::new();
     let ownership = Arc::new(MockBrowserOwnershipCounts::default());
     let app = gateway_router(
         browser_engine_retrying_close_test_state(
@@ -5124,7 +5109,7 @@ async fn test_browser_no_first_frame_cleanup_retries_exact_effect_without_replac
     assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 1);
     assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 0);
     assert_eq!(engine_close_calls.lock().await.len(), 1);
-    assert_eq!(exit_close_calls.lock().await.len(), 1);
+    assert_eq!(exit_close_calls.snapshot().await.len(), 1);
     assert_eq!(ownership.snapshot(), (1, 1, 1, 0, 1));
 
     let replacement = app
@@ -5292,6 +5277,10 @@ async fn test_browser_pending_cleanup_rejects_foreign_authority_and_effect_subst
 
     let foreign_provider_close_calls = Arc::new(TokioMutex::new(Vec::new()));
     registry
+        .unregister_sub_provider("browser-engine")
+        .await
+        .unwrap();
+    registry
         .register_sub_provider(
             "browser-engine",
             Arc::new(MockForeignIdentityBrowserEngineProvider {
@@ -5322,6 +5311,10 @@ async fn test_browser_pending_cleanup_rejects_foreign_authority_and_effect_subst
     assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 1);
 
     let restored_close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    registry
+        .unregister_sub_provider("browser-engine")
+        .await
+        .unwrap();
     registry
         .register_sub_provider(
             "browser-engine",
@@ -5357,7 +5350,7 @@ async fn test_browser_close_transport_and_exit_failures_retry_independent_cleanu
     let owner_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
     let retry_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
     let engine_close_calls = Arc::new(TokioMutex::new(Vec::new()));
-    let exit_close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    let exit_close_calls = BrowserCloseCallRecorder::new();
     let app = gateway_router(
         browser_engine_retrying_close_test_state(
             dir.path(),
@@ -5413,7 +5406,7 @@ async fn test_browser_close_transport_and_exit_failures_retry_independent_cleanu
     assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 1);
     assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 1);
     assert_eq!(engine_close_calls.lock().await.len(), 1);
-    assert_eq!(exit_close_calls.lock().await.len(), 1);
+    assert_eq!(exit_close_calls.snapshot().await.len(), 1);
 
     let retry_open = app
         .clone()
@@ -5434,7 +5427,7 @@ async fn test_browser_close_transport_and_exit_failures_retry_independent_cleanu
     assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
     assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 0);
     assert_eq!(engine_close_calls.lock().await.len(), 2);
-    assert_eq!(exit_close_calls.lock().await.len(), 2);
+    assert_eq!(exit_close_calls.snapshot().await.len(), 2);
     let retry_open = axum::body::to_bytes(retry_open.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -6617,6 +6610,9 @@ async fn test_browser_net_provider_fails_closed_without_adapter_provider() {
     seed_test_browser_capsules(dir.path());
     let app = gateway_router(GatewayState {
         provider_registry: Some(Arc::new(ProviderRegistry::new())),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: dir.path().to_path_buf(),
         data_dir: dir.path().to_path_buf(),

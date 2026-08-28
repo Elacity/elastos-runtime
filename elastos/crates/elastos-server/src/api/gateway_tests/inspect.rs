@@ -145,6 +145,9 @@ async fn inspect_test_state(dir: &std::path::Path) -> GatewayState {
 
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: dir.to_path_buf(),
         data_dir: dir.to_path_buf(),

@@ -4,30 +4,34 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Inbox · ElastOS</title>
+  <script src="./elastos-theme.js"></script>
+  <link rel="stylesheet" href="./elastos-ui.css">
   <style>
+    /* Inbox's own names map onto the shared tokens, so its layout rules below
+       stay as they are and the whole app follows the theme. Nothing here picks
+       a colour of its own. */
     :root {
-      color-scheme: light;
-      --bg: #ffffff;
-      --sidebar-bg: #f9f9f9;
-      --toolbar-bg: #fafafa;
-      --panel: #ffffff;
-      --panel-strong: #ffffff;
-      --panel-soft: #f9f9f9;
-      --line: #e5e7eb;
-      --line-strong: #d1d5db;
-      --ink: #1f2937;
-      --muted: #6b7280;
-      --brand: #f6921a;
-      --accent: #007aff;
-      --accent-soft: #e5f0ff;
-      --danger: #b14c5a;
-      --shadow: none;
+      --bg: var(--el-bg);
+      --sidebar-bg: var(--el-surface);
+      --toolbar-bg: var(--el-surface);
+      --panel: var(--el-surface-raised);
+      --panel-strong: var(--el-surface-raised);
+      --panel-soft: var(--el-inset);
+      --line: var(--el-hairline);
+      --line-strong: var(--el-hairline-strong);
+      --ink: var(--el-text);
+      --muted: var(--el-muted);
+      --brand: var(--el-brand);
+      --accent: var(--el-accent);
+      --accent-soft: var(--el-accent-soft);
+      --danger: var(--el-danger);
+      --shadow: var(--el-shadow-1);
       --border: var(--line);
       --border-strong: var(--line-strong);
       --text: var(--ink);
-      --radius-lg: 8px;
-      --radius-md: 6px;
-      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      --radius-lg: var(--el-radius-lg);
+      --radius-md: var(--el-radius-md);
+      font-family: var(--el-font);
     }
 
     * {
@@ -91,7 +95,7 @@
       display: flex;
       flex-direction: column;
       gap: 4px;
-      padding: 20px;
+      padding: 12px 12px 16px;
       border: 0;
       border-right: 1px solid var(--line);
       border-radius: 0;
@@ -227,7 +231,7 @@
       border-radius: 6px;
       border: 1px solid var(--border);
       padding: 5px 10px;
-      background: #fff;
+      background: var(--panel);
       color: var(--text);
       cursor: pointer;
       font-weight: 600;
@@ -239,7 +243,7 @@
     .entry-action:hover,
     .entry-action:focus-visible {
       border-color: var(--border-strong);
-      background: #f9fafb;
+      background: var(--panel-soft);
       outline: none;
     }
 
@@ -256,15 +260,15 @@
       grid-template-columns: minmax(0, 1fr) auto;
       gap: 12px;
       padding: 12px;
-      border: 1px solid #d0d0d0;
+      border: 1px solid var(--border);
       border-radius: 8px;
       background: var(--panel-soft);
       box-shadow: none;
     }
 
     .entry[data-severity="attention"] {
-      border-color: rgba(0, 122, 255, 0.35);
-      background: #f5f9ff;
+      border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+      background: var(--accent-soft);
     }
 
     .entry-copy {
@@ -323,13 +327,13 @@
     .entry-action.primary {
       background: var(--text);
       border-color: var(--text);
-      color: #f8fbff;
+      color: var(--bg);
     }
 
     .entry-action.danger {
       color: var(--danger);
-      border-color: rgba(177, 76, 90, 0.24);
-      background: rgba(177, 76, 90, 0.08);
+      border-color: color-mix(in srgb, var(--danger) 24%, transparent);
+      background: color-mix(in srgb, var(--danger) 8%, transparent);
     }
 
     .entry-action:disabled {
@@ -344,7 +348,7 @@
       place-items: center;
       margin: 12px;
       padding: 20px;
-      border: 1px solid #d0d0d0;
+      border: 1px solid var(--border);
       border-radius: 8px;
       background: var(--panel-soft);
       text-align: center;
@@ -699,6 +703,9 @@
       if (typeof actionId === "string" && actionId.startsWith("room-approve-request:")) {
         actions.appendChild(createActionButton("Approve", actionId, "primary"));
         actions.appendChild(createActionButton("Deny", "room-deny-request:" + actionId.slice("room-approve-request:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("contact-accept-request:")) {
+        actions.appendChild(createActionButton("Accept", actionId, "primary"));
+        actions.appendChild(createActionButton("Decline", "contact-decline-request:" + actionId.slice("contact-accept-request:".length), "danger"));
       } else if (typeof actionId === "string" && actionId.startsWith("wallet-approve-request:")) {
         const requestId = actionId.slice("wallet-approve-request:".length);
         actions.appendChild(createButton("Approve", (button) => approveWalletRequest(button, requestId), "primary"));
@@ -721,7 +728,7 @@
         actions.appendChild(createActionButton("Reject", "wallet-price-http-deny:" + actionId.slice("wallet-price-http-approve:".length), "danger"));
       }
 
-      if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request") {
+      if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request" && entry.kind !== "contact_request") {
         actions.appendChild(createActionButton("Dismiss", "notification-dismiss:" + entry.id));
       }
       article.append(copy, actions);
@@ -919,7 +926,9 @@
 
     function markVisibleRead(notifications) {
       const unreadIds = state.entries
-        .filter((entry) => entry && entry.id && !entry.read && entry.kind !== "wallet_approval_request")
+        .filter((entry) => entry && entry.id && !entry.read
+          && entry.kind !== "wallet_approval_request"
+          && entry.kind !== "contact_request")
         .map((entry) => entry.id);
       if (unreadIds.length === 0) {
         return;

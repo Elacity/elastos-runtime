@@ -41,7 +41,8 @@ Supported operations are intentionally narrow:
 - `estimate_gas`: perform a validated EVM gas preflight for Browser dapp compatibility; requires network, selected `from`, `to`, value, and hex data validation and does not sign or broadcast.
 - `transaction`: read an EVM transaction by hash.
 - `receipt`: read an EVM transaction receipt by hash.
-- `has_access_by_content_id`: typed rights-read for protected content; validates network, configured contract, content ID, subject, and right, then calls an approved ABI selector.
+- `has_access_by_content_id`: typed rights-read for protected content; validates network, configured contract, content ID, subject, and right, then calls an approved ABI selector. Capsules cannot mint this as a capability. The v1 Runtime evaluator uses `protected_content_rights_evidence`.
+- `protected_content_rights_evidence`: Runtime-internal typed evidence for the protected-content rights evaluator. Request is the signed Runtime release operation only. Not capsule-mintable.
 - `proof`: create typed evidence over status or sync-health without exposing the backend.
 - `erc1271_is_valid_signature`: verify a smart-account signature with the typed ERC-1271 `isValidSignature(bytes32,bytes)` ABI without exposing arbitrary `eth_call`.
 - `prepare_transaction`: build a typed unsigned EIP-155 legacy EVM transaction intent with nonce, gas price, and gas limit resolved by the provider; the intent requires wallet approval before signing.
@@ -101,7 +102,7 @@ Current supported ABI:
 {
   "id": "has_access_by_content_id",
   "contract": "0x0000000000000000000000000000000000000001",
-  "abi": "has_access_by_content_id_string_address_string",
+  "abi": "has_access_by_content_id_address_bytes16",
   "selector": "0x12345678"
 }
 ```
@@ -109,13 +110,13 @@ Current supported ABI:
 The provider encodes:
 
 ```text
-hasAccessByContentId(string contentId, address subject, string right) -> bool
+hasAccessByContentId(address subject, bytes16 contentId) -> bool
 ```
 
 The selector is configured explicitly so the provider does not need arbitrary ABI
 loading or contract SDKs. Missing config, mismatched contracts, malformed
-selectors, invalid subjects, invalid rights, and malformed return values all fail
-closed.
+selectors, invalid subjects, invalid `bytes16` content-access IDs, and malformed
+return values all fail closed.
 
 ## Backend Policy
 

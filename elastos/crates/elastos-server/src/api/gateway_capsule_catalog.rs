@@ -666,6 +666,9 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let state = GatewayState {
             provider_registry: None,
+            collaboration_chat_product_port: None,
+            collaboration_presence_product_port: None,
+            collaboration_discovery_service: None,
             identity_manager: Arc::new(std::sync::OnceLock::new()),
             cache_dir: data_dir.path().to_path_buf(),
             data_dir: data_dir.path().to_path_buf(),
@@ -1015,6 +1018,7 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         for (name, role) in [
             ("browser", CapsuleRole::App),
+            ("chat-room", CapsuleRole::App),
             ("wallet", CapsuleRole::App),
             ("documents", CapsuleRole::Viewer),
             ("archive-manager", CapsuleRole::Viewer),
@@ -1048,7 +1052,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["object-provider"]
         );
-        assert_eq!(by_name["chat"].projection.cli.state, "available");
+        assert!(!by_name.contains_key("chat"));
+        assert_eq!(by_name["chat-room"].projection.cli.state, "facts-only");
         assert_eq!(by_name["browser"].projection.cli.state, "facts-only");
 
         let home_targets = home_targets_from_catalog(&catalog);
@@ -1360,6 +1365,9 @@ mod tests {
             .unwrap();
         let state = GatewayState {
             provider_registry: Some(registry),
+            collaboration_chat_product_port: None,
+            collaboration_presence_product_port: None,
+            collaboration_discovery_service: None,
             identity_manager: Arc::new(std::sync::OnceLock::new()),
             cache_dir: data_dir.path().to_path_buf(),
             data_dir: data_dir.path().to_path_buf(),

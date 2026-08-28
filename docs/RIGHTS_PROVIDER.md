@@ -1,61 +1,48 @@
 # Rights Provider
 
-`rights-provider` is the protected-content policy boundary. It answers typed
-questions for the DRM open path:
+`rights-provider` will be the canonical protected-content policy boundary.
+Runtime will ask one typed policy question for the exact authenticated Profile,
+Wallet, object, action, policy identity, chain, contract, selector, and evidence
+window. The provider will use typed `chain-provider` reads and return signed
+evidence. It will not release key material or select custody nodes.
 
-`capsule -> runtime capability -> elastos://rights/* -> rights-provider -> policy backend`
+The intended path is:
 
-Capsules do not receive contract SDK objects, chain RPC, wallet RPC,
-key-backend SDKs, raw CEKs, or provider credentials. The provider validates the
-question and fails closed until a reviewed dDRM/chain policy backend is
-configured.
+`Runtime coordinator -> rights-provider -> chain-provider`
 
-## Operations
+Capsules may request a protected-content action, but they do not call rights or
+Chain providers directly. They do not supply provider routes, RPC URLs, contract
+transports, endpoint DIDs, IP addresses, ports, or credentials.
 
-- `status`: list supported rights questions and blocked raw authority.
-- `has_access_by_content_id`: ask whether a principal/session has a specific
-  right for a content ID.
-- `is_subscription_active`: ask whether a principal/session has an active plan.
-- `can_stream`: ask whether protected content can be streamed.
-- `can_download`: ask whether protected content can be downloaded.
+## Current source state
 
-Supported rights are shared with the protected-content schema:
+The canonical source-only contract is `RightsPolicyBodyV1` with matching typed
+evidence request and result values in
+`elastos-protected-content-contracts`. `elastos-protected-content-rights`
+evaluates those contracts and can acquire Chain evidence through a
+Runtime-owned `ProviderRegistry` invoke of `chain` /
+`protected_content_rights_evidence`. That adapter is source-only. It does not
+replace the installed provisional `rights-provider`.
 
-```text
-view, stream, download, execute
-```
-
-## Capability Schema
-
-| Scope | Resource |
-|-------|----------|
-| Status | `elastos://rights/meta/status` |
-| Access | `elastos://rights/access/has_access_by_content_id` |
-| Subscription | `elastos://rights/subscription/is_subscription_active` |
-| Stream | `elastos://rights/content/can_stream` |
-| Download | `elastos://rights/content/can_download` |
-
-## Current Status
-
-The current provider is intentionally fail-closed. It gives Runtime, DRM, and
-future key/decrypt providers one stable contract without pretending production
-dDRM reads are ready.
-
-The next slice is to configure a reviewed policy backend that can call approved
-typed `chain-provider` rights reads such as:
-
-```text
-hasAccessByContentId(string contentId, address subject, string right) -> bool
-```
-
-Do not add generic contract calls, raw RPC passthrough, wallet objects, or
-frontend-only license checks to this provider.
+Released 0.6 also contains an older provisional `rights-provider` capsule. It
+uses the old `elastos_common::protected_content` DTO and supports a wider set of
+unwired operations. It remains fail closed and must be replaced atomically
+during Runtime integration. It is not a second supported contract.
 
 ## Verification
+
+Canonical source-only contract:
+
+```bash
+(cd elastos && cargo test -p elastos-protected-content-contracts)
+(cd elastos && cargo test -p elastos-protected-content-rights -- --nocapture)
+(cd elastos && cargo test -p elastos-server protected_content_runtime -- --nocapture)
+```
+
+Provisional retirement guard only:
 
 ```bash
 cargo test --manifest-path capsules/rights-provider/Cargo.toml
 cargo clippy --manifest-path capsules/rights-provider/Cargo.toml -- -D warnings
-cargo test -p elastos-server --manifest-path elastos/Cargo.toml provider_resource
-bash scripts/check-wci-alignment.sh
+bash scripts/protected-content-provider-contract-smoke.sh
 ```

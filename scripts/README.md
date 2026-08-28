@@ -10,7 +10,7 @@ automatically a stable end-user command.
 - `install.sh` runs the signed installer.
 - `setup-source-home.sh` builds and provisions a source Home.
 - `home-demo-local.sh` and `chat-demo-local.sh` start disposable local demos.
-- `agent.sh`, `chat.sh`, and `share-demo.sh` run focused demos.
+- `share-demo.sh` runs the focused sharing demo.
 - `setup-crosvm.sh` installs VM prerequisites.
 - `publish-release.sh` is the low-level release publisher.
 - `vendor-walletconnect-adapter.sh` refreshes the pinned WalletConnect asset.
@@ -71,8 +71,9 @@ Common branch gates include:
 - `wallet-product-safety-smoke.sh` for product Wallet release safety
 - `wallet-connector-transaction-smoke.mjs` for fake-DOM, fake-provider
   connector handoff source proof, not hosted Browser acceptance
-- `protected-content-provider-contract-smoke.sh` for rights, key, decrypt, and
-  DRM provider boundaries
+- `protected-content-provider-contract-smoke.sh` as the fail-closed retirement
+  guard for the provisional rights, key, decrypt, and DRM providers; it does not
+  verify the canonical v1 custody path
 - `people-conversations-local-smoke.sh` for profile, discovery, contacts, and
   Chat handoff
 - `capsule-inspector-act-check.sh` for Inspector scope and Inbox approval
