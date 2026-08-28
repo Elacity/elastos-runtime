@@ -10,7 +10,7 @@ Install the host tools first:
 
 ```bash
 xcode-select --install
-brew install node e2fsprogs
+brew install node e2fsprogs coturn
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup target add wasm32-unknown-unknown
 ```

@@ -1306,7 +1306,7 @@ async function buildApp(options = {}) {
               kind: "output",
               terminal: true,
               data: {
-                schema: "elastos.model.output.object/v1",
+                schema: "elastos.model.output.content/v1",
                 resource_id: longResourceId,
               },
             },
@@ -1317,6 +1317,55 @@ async function buildApp(options = {}) {
   });
   app.setSessionMode("studio");
   app.setDraft("Reject overlong result.");
+  await app.sendDraft();
+  await flushAsync();
+  await flushTimers();
+  assert.equal(app.snapshot().statusMessage, "Model provider unavailable.");
+  assert.equal(app.snapshot().studioResult, null);
+}
+
+{
+  const runId =
+    "run:sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+  const { app, flushAsync, flushTimers } = await buildApp({
+    offers: [studioOffer("offer:vision-object", "Vision", "image.generate")],
+    createResponse: {
+      status: "ok",
+      data: {
+        schema: "elastos.model.run/v1",
+        run_id: runId,
+        offer_id: "offer:vision-object",
+        operation: "image.generate",
+        status: "running",
+        sequence_cursor: 0,
+      },
+    },
+    eventPages: [
+      {
+        status: "ok",
+        data: {
+          schema: "elastos.model.run-events/v1",
+          run_id: runId,
+          next_cursor: 1,
+          has_more: false,
+          events: [
+            {
+              schema: "elastos.model.run-event/v1",
+              sequence: 1,
+              kind: "output",
+              terminal: true,
+              data: {
+                schema: "elastos.model.output.object/v1",
+                resource_id: "object:studio-result-1",
+              },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  app.setSessionMode("studio");
+  app.setDraft("Reject object output.");
   await app.sendDraft();
   await flushAsync();
   await flushTimers();
@@ -1433,8 +1482,8 @@ async function buildApp(options = {}) {
               kind: "output",
               terminal: true,
               data: {
-                schema: "elastos.model.output.object/v1",
-                resource_id: "object:studio-result-1",
+                schema: "elastos.model.output.content/v1",
+                resource_id: "studio-result-1",
               },
             },
           ],
@@ -1447,11 +1496,11 @@ async function buildApp(options = {}) {
   await app.sendDraft();
   await flushAsync();
   await flushTimers();
-  assert.equal(app.snapshot().studioResult?.resourceId, "object:studio-result-1");
+  assert.equal(app.snapshot().studioResult?.resourceId, "studio-result-1");
   assert.equal(app.setSessionMode("chat"), true);
-  assert.equal(app.snapshot().studioResult?.resourceId, "object:studio-result-1");
+  assert.equal(app.snapshot().studioResult?.resourceId, "studio-result-1");
   assert.equal(app.setSessionMode("studio"), true);
-  assert.equal(app.snapshot().studioResult?.resourceId, "object:studio-result-1");
+  assert.equal(app.snapshot().studioResult?.resourceId, "studio-result-1");
 }
 
 {
@@ -1485,7 +1534,7 @@ async function buildApp(options = {}) {
               kind: "output",
               terminal: true,
               data: {
-                schema: "elastos.model.output.object/v1",
+                schema: "elastos.model.output.content/v1",
                 resource_id: "",
               },
             },
@@ -1560,6 +1609,7 @@ assert(originalSource.includes("copyNode.hidden = view.copyHidden;"));
 assert(originalSource.includes("chatNode.disabled = view.modeSwitchDisabled;"));
 assert(originalSource.includes("buildNode.disabled = view.modeSwitchDisabled;"));
 assert(originalSource.includes("studioNode.disabled = view.modeSwitchDisabled;"));
+assert(!/MODEL_OBJECT_OUTPUT_SCHEMA|elastos:\/\/object\//.test(originalSource));
 assert(!/home:clipboard-request|home:clipboard-ready|home:clipboard-result|home:clipboard-cancel/.test(originalSource));
 assert(
   !/(["'](?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)["']\s*:|\b(?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)\s*:)/i.test(originalSource),

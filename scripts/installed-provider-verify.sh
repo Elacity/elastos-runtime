@@ -159,6 +159,15 @@ fi
 
 need_cmd jq
 need_cmd awk
+if ! command -v sha256sum >/dev/null 2>&1 || ! command -v sha512sum >/dev/null 2>&1; then
+    need_cmd shasum
+fi
+if ! command -v sha256sum >/dev/null 2>&1; then
+    sha256sum() { shasum -a 256 "$@"; }
+fi
+if ! command -v sha512sum >/dev/null 2>&1; then
+    sha512sum() { shasum -a 512 "$@"; }
+fi
 need_cmd sha256sum
 need_cmd sha512sum
 

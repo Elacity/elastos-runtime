@@ -3105,7 +3105,8 @@ fn spawn_control_proxy(
 fn join_control_proxy_bounded(handle: thread::JoinHandle<bool>, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while !handle.is_finished() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(25));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(remaining.min(Duration::from_millis(25)));
     }
     if !handle.is_finished() {
         return false;
@@ -3997,14 +3998,22 @@ mod tests {
             thread::spawn(|| false),
             Duration::from_secs(1),
         ));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            finished_tx.send(()).unwrap();
+            true
+        });
+        started_rx.recv().unwrap();
         assert!(!join_control_proxy_bounded(
-            thread::spawn(|| {
-                thread::sleep(Duration::from_millis(50));
-                true
-            }),
+            worker,
             Duration::from_millis(1),
         ));
-        thread::sleep(Duration::from_millis(60));
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]

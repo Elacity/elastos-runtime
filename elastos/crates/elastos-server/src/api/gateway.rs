@@ -1374,10 +1374,10 @@ fn inbox_error_response(err: anyhow::Error) -> Response {
 }
 
 fn system_error_response(err: anyhow::Error) -> Response {
-    let appearance_request = gateway_home_system::home_appearance_preference_request_message(&err);
-    let text = appearance_request
-        .map(str::to_string)
-        .unwrap_or_else(|| err.to_string());
+    if let Some(text) = gateway_home_system::home_appearance_preference_request_message(&err) {
+        return (StatusCode::BAD_REQUEST, text.to_string()).into_response();
+    }
+    let text = err.to_string();
     let status = if text.contains("home launch token")
         || text.contains("admin passkey required")
         || text.contains("proof-bound passkey session required")
@@ -1385,8 +1385,6 @@ fn system_error_response(err: anyhow::Error) -> Response {
         || text.contains("passkey step-up")
     {
         StatusCode::FORBIDDEN
-    } else if appearance_request.is_some() {
-        StatusCode::BAD_REQUEST
     } else if text.contains("nickname must")
         || text.contains("missing")
         || text.contains("background image")
@@ -1409,13 +1407,16 @@ fn home_error_response(err: anyhow::Error) -> Response {
         .map(str::to_string)
         .or_else(|| appearance_request.map(str::to_string))
         .unwrap_or_else(|| err.to_string());
-    let status = if text.contains("home launch token") || text.contains("gateway identity") {
-        StatusCode::FORBIDDEN
-    } else if profile_required.is_some() {
-        StatusCode::CONFLICT
-    } else if appearance_request.is_some() {
-        StatusCode::BAD_REQUEST
-    } else if text.contains("service access request delivery failed: service offer")
+    if text.contains("home launch token") || text.contains("gateway identity") {
+        return (StatusCode::FORBIDDEN, text).into_response();
+    }
+    if profile_required.is_some() {
+        return (StatusCode::CONFLICT, text).into_response();
+    }
+    if appearance_request.is_some() {
+        return (StatusCode::BAD_REQUEST, text).into_response();
+    }
+    let status = if text.contains("service access request delivery failed: service offer")
         || text.contains("service access request delivery failed: only Browser Exit")
     {
         StatusCode::BAD_REQUEST
