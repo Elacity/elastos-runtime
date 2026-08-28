@@ -1797,15 +1797,22 @@ assert(
   "Root AGENTS.md must preserve the operator contract headings, actual branch roles, target proof discipline, public-live approval rule, and Browser claim discipline",
 );
 assert(
-  linuxSourceHomeRestart.includes("process_matches_gateway_listener") &&
-    linuxSourceHomeRestart.includes("refusing to kill unrelated listener") &&
-    linuxSourceHomeRestart.includes("http_status") &&
-    linuxSourceHomeRestart.includes("OK=0") &&
-    linuxSourceHomeRestart.includes("Linux source-home restart verification failed") &&
-    linuxSourceHomeRestartSmoke.includes("live_failure_receipt") &&
-    linuxSourceHomeRestartSmoke.includes("hash_mismatch_receipt") &&
-    linuxSourceHomeRestartSmoke.includes("unrelated_listener_protected"),
-  "Linux source-home restart must preserve safe listener ownership checks and ok=false failure receipts",
+  linuxSourceHomeRestart.includes('gateway = data_dir / "bin" / "elastos"') &&
+    linuxSourceHomeRestart.includes("elastos.source-home.installation-receipt/v1") &&
+    linuxSourceHomeRestart.includes("elastos.linux-source-home-gateway-pid/v1") &&
+    linuxSourceHomeRestart.includes('pathlib.Path("/proc")') &&
+    linuxSourceHomeRestart.includes("pidfd_send_signal") &&
+    linuxSourceHomeRestart.includes("listener_pids") &&
+    linuxSourceHomeRestart.includes("principal_root_rollback") &&
+    !linuxSourceHomeRestart.includes("pkill") &&
+    !linuxSourceHomeRestart.includes("--gateway-bin") &&
+    !linuxSourceHomeRestart.includes("--pid-file") &&
+    !linuxSourceHomeRestart.includes("target/release/elastos") &&
+    linuxSourceHomeRestartSmoke.includes("stable_installation_receipt") &&
+    linuxSourceHomeRestartSmoke.includes("source_dirt_rejected") &&
+    linuxSourceHomeRestartSmoke.includes("rollback_and_failure_cleanup") &&
+    linuxSourceHomeRestartSmoke.includes("home_services_parity"),
+  "Linux source-home restart must use the stable receipt-bound Runtime, exact Linux process ownership, and one bounded rollback",
 );
 const debugPolicy = read("DEBUG.md");
 const gbaDemoSmoke = read("scripts/gba-demo-smoke.sh");
