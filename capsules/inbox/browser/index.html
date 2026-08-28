@@ -171,11 +171,22 @@
       border-radius: 4px;
       background: transparent;
       color: var(--ink);
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
     }
 
-    .summary-card.active,
     .summary-card:hover {
       background: var(--line);
+    }
+
+    .summary-card.active {
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+
+    .summary-card.active strong {
+      color: var(--accent);
     }
 
     .summary-card strong {
@@ -247,34 +258,101 @@
       outline: none;
     }
 
-    .entry-list {
+    .entry-split {
       display: grid;
-      gap: 8px;
+      grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
       min-height: 0;
+      flex: 1 1 auto;
+    }
+
+    .entry-rows {
+      display: grid;
+      gap: 2px;
       overflow: auto;
       padding: 12px;
+      border-right: 1px solid var(--line);
     }
 
-    .entry {
+    .entry-row {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 12px;
+      gap: 6px;
       padding: 12px;
-      border: 1px solid var(--border);
+      border: 1px solid transparent;
       border-radius: 8px;
-      background: var(--panel-soft);
-      box-shadow: none;
+      background: transparent;
+      color: var(--ink);
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
     }
 
-    .entry[data-severity="attention"] {
-      border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+    .entry-row:hover,
+    .entry-row:focus-visible {
+      background: var(--panel-soft);
+      outline: none;
+    }
+
+    .entry-row.active {
       background: var(--accent-soft);
     }
 
-    .entry-copy {
-      display: grid;
+    .entry-row-top {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
       gap: 8px;
-      min-width: 0;
+    }
+
+    .entry-row-title {
+      overflow: hidden;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .entry-row-time {
+      flex: 0 0 auto;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0;
+    }
+
+    .entry-row-snippet {
+      overflow: hidden;
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .entry-row-unread .entry-row-title::before {
+      content: "";
+      display: inline-block;
+      width: 7px;
+      height: 7px;
+      margin-right: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+      vertical-align: 1px;
+    }
+
+    .entry-detail {
+      display: block;
+      min-height: 0;
+      overflow: auto;
+      padding: 18px 20px;
+    }
+
+    .entry-detail-placeholder {
+      display: grid;
+      place-items: center;
+      height: 100%;
+      color: var(--muted);
+      font-size: 13px;
+      letter-spacing: 0;
     }
 
     .entry-title-row {
@@ -300,28 +378,31 @@
       color: var(--accent);
       font-size: 0.72rem;
       font-weight: 700;
-      letter-spacing: 0.04em;
+      letter-spacing: 0;
       text-transform: uppercase;
     }
 
     .entry-time {
       color: var(--muted);
       font-size: 12px;
+      letter-spacing: 0;
     }
 
     .entry-body {
+      margin-top: 10px;
       color: var(--muted);
       font-size: 13px;
+      letter-spacing: 0;
       line-height: 1.45;
     }
 
     .entry-actions {
       display: flex;
       flex-wrap: wrap;
-      justify-content: flex-end;
-      align-content: flex-start;
-      gap: 6px;
-      min-width: 160px;
+      gap: 8px;
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
     }
 
     .entry-action.primary {
@@ -352,6 +433,58 @@
       border-radius: 8px;
       background: var(--panel-soft);
       text-align: center;
+    }
+
+    html[data-inbox-presentation="rail"] .sidebar {
+      display: none;
+    }
+
+    html[data-inbox-presentation="rail"] .shell {
+      grid-template-columns: 1fr;
+    }
+
+    html[data-inbox-presentation="rail"] .toolbar {
+      display: none;
+    }
+
+    html[data-inbox-presentation="rail"] .entry-split {
+      grid-template-columns: 1fr;
+    }
+
+    html[data-inbox-presentation="rail"] .entry-detail {
+      display: none;
+    }
+
+    html[data-inbox-presentation="rail"] .entry-rows {
+      gap: 8px;
+      border-right: 0;
+    }
+
+    html[data-inbox-presentation="rail"] .entry-rail-card {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-soft);
+    }
+
+    html[data-inbox-presentation="rail"] .entry-rail-card .entry-row-title {
+      white-space: normal;
+    }
+
+    html[data-inbox-presentation="rail"] .entry-rail-card .entry-row-snippet {
+      display: -webkit-box;
+      white-space: normal;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 3;
+      overflow: hidden;
+    }
+
+    html[data-inbox-presentation="rail"] .entry-rail-card .entry-actions {
+      margin-top: 8px;
+      padding-top: 10px;
     }
 
     @media (max-width: 900px) {
@@ -385,24 +518,19 @@
         box-shadow: none;
       }
 
-      .toolbar,
-      .entry {
-        grid-template-columns: 1fr;
-      }
-
       .toolbar {
         display: flex;
         gap: 8px;
       }
 
-      .entry {
-        gap: 8px;
-        padding: 8px;
+      .entry-split {
+        grid-template-columns: 1fr;
+        grid-template-rows: minmax(160px, 42%) minmax(0, 1fr);
       }
 
-      .entry-actions {
-        justify-content: flex-start;
-        min-width: 0;
+      .entry-rows {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
       }
 
       .summary-stack {
@@ -423,31 +551,34 @@
   <section id="inbox-shell" class="shell hidden">
     <aside class="sidebar">
       <div class="sidebar-title">Inbox</div>
-      <div class="summary-stack" aria-label="Inbox summary">
-        <article class="summary-card active">
+      <div class="summary-stack" role="group" aria-label="Inbox filters">
+        <button class="summary-card active" type="button" data-filter="all" aria-pressed="true">
           <strong id="pending-count">0</strong>
           <span>Pending</span>
-        </article>
-        <article class="summary-card">
+        </button>
+        <button class="summary-card" type="button" data-filter="review" aria-pressed="false">
           <strong id="review-count">0</strong>
-          <span>Review</span>
-        </article>
+          <span>Needs Review</span>
+        </button>
       </div>
     </aside>
 
     <main class="main">
       <div class="toolbar">
         <div class="toolbar-title">
-          <h1>Requests</h1>
+          <h1 id="list-title">Requests</h1>
           <p id="status-text" class="status">Loading...</p>
         </div>
         <button id="refresh" class="action-secondary" type="button">Refresh</button>
       </div>
 
-      <section id="entry-list" class="entry-list" aria-live="polite"></section>
+      <div id="entry-split" class="entry-split">
+        <section id="entry-rows" class="entry-rows" role="listbox" aria-label="Requests"></section>
+        <section id="entry-detail" class="entry-detail" aria-live="polite"></section>
+      </div>
       <section id="empty-state" class="empty-state hidden">
         <div>
-          <h2>No requests</h2>
+          <h2 id="empty-title">No requests</h2>
         </div>
       </section>
     </main>
@@ -457,16 +588,16 @@
     const INBOX_SAFETY_REFRESH_MS = 5 * 60 * 1000;
     const launchParams = new URLSearchParams(window.location.search);
     const homeParentOrigin = launchParams.get("home_origin") || "";
+    const presentation = launchParams.get("presentation") === "rail" ? "rail" : "window";
+    document.documentElement.dataset.inboxPresentation = presentation;
 
     const state = {
       homeToken: new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "",
       entries: [],
       refreshInFlight: null,
+      filter: "all",
+      selectedId: "",
     };
-
-    if (state.homeToken && homeParentOrigin && window.top !== window) {
-      window.top.postMessage({ type: "home:app-ready", homeToken: state.homeToken }, homeParentOrigin);
-    }
 
     const elements = {
       lockedShell: document.getElementById("locked-shell"),
@@ -475,9 +606,16 @@
       pendingCount: document.getElementById("pending-count"),
       reviewCount: document.getElementById("review-count"),
       refresh: document.getElementById("refresh"),
-      entryList: document.getElementById("entry-list"),
+      entryRows: document.getElementById("entry-rows"),
+      entryDetail: document.getElementById("entry-detail"),
+      entrySplit: document.getElementById("entry-split"),
       emptyState: document.getElementById("empty-state"),
+      emptyTitle: document.getElementById("empty-title"),
+      listTitle: document.getElementById("list-title"),
+      filterButtons: [...document.querySelectorAll(".summary-card[data-filter]")],
     };
+
+    announceHomeChrome();
 
     function showLocked() {
       elements.lockedShell.classList.remove("hidden");
@@ -513,6 +651,17 @@
       }
     }
 
+    function notifyRailChrome() {
+      if (presentation !== "rail" || window.parent === window) {
+        return;
+      }
+      const unreadPending = state.entries.filter((entry) => entry && !entry.read).length;
+      window.parent.postMessage({
+        type: "inbox:pending-count",
+        count: unreadPending,
+      }, "*");
+    }
+
     function runtimeEventIsRelevant(event) {
       const kind = String(event && event.kind || "");
       const scope = String(event && event.scope || "");
@@ -531,6 +680,69 @@
         requestInboxRefresh().catch(() => {});
       }
     }
+
+    function announceHomeChrome() {
+      if (!state.homeToken || !homeParentOrigin || window.top === window) {
+        return;
+      }
+      window.top.postMessage({
+        type: "home:app-ready",
+        homeToken: state.homeToken,
+      }, homeParentOrigin);
+      window.top.postMessage({
+        type: "home:menu-manifest",
+        homeToken: state.homeToken,
+        menus: [
+          {
+            title: "File",
+            items: [
+              { label: "Refresh", cmd: "refresh" },
+              { label: "Close Window", cmd: "__close-window" },
+            ],
+          },
+          {
+            title: "View",
+            items: [
+              { label: "All Pending", cmd: "filter-all" },
+              { label: "Needs Review", cmd: "filter-review" },
+            ],
+          },
+        ],
+      }, homeParentOrigin);
+    }
+
+    function isTrustedHomeParentEvent(event) {
+      return event.origin === "null" && event.source === window.parent;
+    }
+
+    function handleMenuCommand(cmd) {
+      switch (cmd) {
+        case "refresh":
+          triggerRefresh().catch(() => {});
+          return;
+        case "filter-all":
+          setFilter("all");
+          return;
+        case "filter-review":
+          setFilter("review");
+          return;
+        default:
+      }
+    }
+
+    window.addEventListener("message", (event) => {
+      if (!isTrustedHomeParentEvent(event)) {
+        return;
+      }
+      const message = event.data || {};
+      if (message.type === "elastos:inbox-chrome-command" && message.cmd === "refresh") {
+        triggerRefresh().catch(() => {});
+        return;
+      }
+      if (message.type === "elastos:menu-command" && typeof message.cmd === "string") {
+        handleMenuCommand(message.cmd);
+      }
+    });
 
     async function api(path, options) {
       const request = Object.assign({ method: "GET" }, options || {});
@@ -619,8 +831,8 @@
       const payload = await api("/api/apps/inbox/summary");
       const notifications = payload.notifications || {};
       state.entries = Array.isArray(notifications.entries) ? notifications.entries : [];
-      renderInbox(notifications);
-      markVisibleRead(notifications);
+      renderInbox();
+      markVisibleRead();
       notifyHome();
     }
 
@@ -639,62 +851,120 @@
       return state.refreshInFlight;
     }
 
-    function renderInbox(notifications) {
-      const entries = state.entries;
-      const attentionCount = Number(notifications.attention_count || 0);
-      elements.pendingCount.textContent = String(entries.length);
-      elements.reviewCount.textContent = String(attentionCount);
-      elements.entryList.replaceChildren();
-      for (const entry of entries) {
-        elements.entryList.appendChild(createEntry(entry));
+    function filteredEntries() {
+      if (state.filter === "review") {
+        return state.entries.filter((entry) => entry && entry.severity === "attention");
       }
-      elements.emptyState.classList.toggle("hidden", entries.length !== 0);
-      setStatus(entries.length === 0 ? "" : `${entries.length} pending.`);
+      return state.entries;
     }
 
-    function createEntry(entry) {
-      const article = document.createElement("article");
-      article.className = "entry";
-      article.dataset.notificationId = entry.id || "";
-      article.dataset.severity = entry.severity || "info";
+    function setFilter(filter) {
+      state.filter = filter === "review" ? "review" : "all";
+      for (const button of elements.filterButtons) {
+        const active = button.dataset.filter === state.filter;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-pressed", active ? "true" : "false");
+      }
+      elements.listTitle.textContent = state.filter === "review" ? "Needs Review" : "Requests";
+      renderInbox();
+    }
 
-      const copy = document.createElement("div");
-      copy.className = "entry-copy";
+    function renderInbox() {
+      const entries = filteredEntries();
+      const attentionCount = state.entries.filter((entry) => entry && entry.severity === "attention").length;
+      elements.pendingCount.textContent = String(state.entries.length);
+      elements.reviewCount.textContent = String(attentionCount);
+      if (!entries.some((entry) => entry.id === state.selectedId)) {
+        state.selectedId = entries.length ? entryId(entries[0]) : "";
+      }
+      elements.entryRows.replaceChildren();
+      if (presentation === "rail") {
+        for (const entry of entries) {
+          elements.entryRows.appendChild(createRailCard(entry));
+        }
+        elements.entryDetail.replaceChildren();
+      } else {
+        for (const entry of entries) {
+          elements.entryRows.appendChild(createRow(entry));
+        }
+        renderDetail(entries.find((entry) => entryId(entry) === state.selectedId) || null);
+      }
+      const empty = entries.length === 0;
+      elements.emptyState.classList.toggle("hidden", !empty);
+      elements.entrySplit.classList.toggle("hidden", empty);
+      elements.emptyTitle.textContent =
+        state.filter === "review" && state.entries.length !== 0
+          ? "No requests need review"
+          : "No requests";
+      setStatus(state.entries.length === 0 ? "" : `${state.entries.length} pending.`);
+      notifyRailChrome();
+    }
 
-      const titleRow = document.createElement("div");
-      titleRow.className = "entry-title-row";
-      const title = document.createElement("div");
-      title.className = "entry-title";
+    function entryId(entry) {
+      return entry && typeof entry.id === "string" ? entry.id : "";
+    }
+
+    function createRow(entry) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "entry-row";
+      row.setAttribute("role", "option");
+      row.setAttribute("aria-selected", entryId(entry) === state.selectedId ? "true" : "false");
+      row.classList.toggle("active", entryId(entry) === state.selectedId);
+      row.classList.toggle("entry-row-unread", !entry.read);
+
+      const top = document.createElement("div");
+      top.className = "entry-row-top";
+      const title = document.createElement("span");
+      title.className = "entry-row-title";
       title.textContent = publicInboxText(entry.title, "Request");
-      titleRow.appendChild(title);
-      if (entry.severity === "attention") {
-        const badge = document.createElement("span");
-        badge.className = "entry-badge";
-        badge.textContent = "Review";
-        titleRow.appendChild(badge);
-      }
+      const time = document.createElement("span");
+      time.className = "entry-row-time";
+      time.textContent = entry.created_at ? formatInboxTime(entry.created_at) : "";
+      top.append(title, time);
+
+      const snippet = document.createElement("span");
+      snippet.className = "entry-row-snippet";
+      snippet.textContent = publicInboxText(entry.body, "This request needs your review.");
+
+      row.append(top, snippet);
+      row.addEventListener("click", () => {
+        state.selectedId = entryId(entry);
+        renderInbox();
+      });
+      return row;
+    }
+
+    function createRailCard(entry) {
+      const card = document.createElement("article");
+      card.className = "entry-rail-card";
       if (!entry.read) {
-        const badge = document.createElement("span");
-        badge.className = "entry-badge";
-        badge.textContent = "New";
-        titleRow.appendChild(badge);
+        card.classList.add("entry-row-unread");
       }
 
-      const time = document.createElement("time");
-      time.className = "entry-time";
-      if (entry.created_at) {
-        time.dateTime = new Date(entry.created_at * 1000).toISOString();
-        time.textContent = formatInboxTime(entry.created_at);
-      }
+      const top = document.createElement("div");
+      top.className = "entry-row-top";
+      const title = document.createElement("span");
+      title.className = "entry-row-title";
+      title.textContent = publicInboxText(entry.title, "Request");
+      const time = document.createElement("span");
+      time.className = "entry-row-time";
+      time.textContent = entry.created_at ? formatInboxTime(entry.created_at) : "";
+      top.append(title, time);
 
-      const body = document.createElement("p");
-      body.className = "entry-body";
-      body.textContent = publicInboxText(entry.body, "This request needs your review.");
-
-      copy.append(titleRow, time, body);
+      const snippet = document.createElement("span");
+      snippet.className = "entry-row-snippet";
+      snippet.textContent = publicInboxText(entry.body, "This request needs your review.");
 
       const actions = document.createElement("div");
       actions.className = "entry-actions";
+      fillEntryActions(actions, entry);
+
+      card.append(top, snippet, actions);
+      return card;
+    }
+
+    function fillEntryActions(actions, entry) {
       if (typeof entry.source_app === "string" && entry.source_app.trim()) {
         actions.appendChild(createButton("Open", () => openSource(entry.source_app)));
       }
@@ -731,8 +1001,52 @@
       if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request" && entry.kind !== "contact_request") {
         actions.appendChild(createActionButton("Dismiss", "notification-dismiss:" + entry.id));
       }
-      article.append(copy, actions);
-      return article;
+    }
+
+    function renderDetail(entry) {
+      elements.entryDetail.replaceChildren();
+      if (!entry) {
+        const placeholder = document.createElement("div");
+        placeholder.className = "entry-detail-placeholder";
+        placeholder.textContent = "Select a request";
+        elements.entryDetail.appendChild(placeholder);
+        return;
+      }
+
+      const titleRow = document.createElement("div");
+      titleRow.className = "entry-title-row";
+      const title = document.createElement("div");
+      title.className = "entry-title";
+      title.textContent = publicInboxText(entry.title, "Request");
+      titleRow.appendChild(title);
+      if (entry.severity === "attention") {
+        const badge = document.createElement("span");
+        badge.className = "entry-badge";
+        badge.textContent = "Review";
+        titleRow.appendChild(badge);
+      }
+      if (!entry.read) {
+        const badge = document.createElement("span");
+        badge.className = "entry-badge";
+        badge.textContent = "New";
+        titleRow.appendChild(badge);
+      }
+
+      const time = document.createElement("time");
+      time.className = "entry-time";
+      if (entry.created_at) {
+        time.dateTime = new Date(entry.created_at * 1000).toISOString();
+        time.textContent = formatInboxTime(entry.created_at);
+      }
+
+      const body = document.createElement("p");
+      body.className = "entry-body";
+      body.textContent = publicInboxText(entry.body, "This request needs your review.");
+
+      const actions = document.createElement("div");
+      actions.className = "entry-actions";
+      fillEntryActions(actions, entry);
+      elements.entryDetail.append(titleRow, time, body, actions);
     }
 
     function createButton(label, onClick, className) {
@@ -905,8 +1219,10 @@
     }
 
     function setButtonsDisabled(disabled) {
-      for (const button of elements.entryList.querySelectorAll("button")) {
-        button.disabled = disabled;
+      for (const container of [elements.entryRows, elements.entryDetail]) {
+        for (const button of container.querySelectorAll("button")) {
+          button.disabled = disabled;
+        }
       }
       elements.refresh.disabled = disabled;
     }
@@ -924,7 +1240,7 @@
       }, homeParentOrigin);
     }
 
-    function markVisibleRead(notifications) {
+    function markVisibleRead() {
       const unreadIds = state.entries
         .filter((entry) => entry && entry.id && !entry.read
           && entry.kind !== "wallet_approval_request"
@@ -942,8 +1258,7 @@
             entry.read = true;
           }
         }
-        const unreadCount = Math.max(0, Number(notifications.unread_count || 0) - unreadIds.length);
-        renderInbox(Object.assign({}, notifications, { unread_count: unreadCount }));
+        renderInbox();
         notifyHome();
       });
     }
@@ -968,11 +1283,51 @@
     }
 
     elements.refresh.addEventListener("click", () => {
+      triggerRefresh().catch(() => {});
+    });
+
+    for (const button of elements.filterButtons) {
+      button.addEventListener("click", () => {
+        setFilter(button.dataset.filter);
+      });
+    }
+
+    elements.entryRows.addEventListener("keydown", (event) => {
+      if (presentation === "rail" || !["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+        return;
+      }
+      const entries = filteredEntries();
+      if (!entries.length) {
+        return;
+      }
+      const currentIndex = entries.findIndex((entry) => entryId(entry) === state.selectedId);
+      const index = currentIndex >= 0 ? currentIndex : 0;
+      let next = index;
+      if (event.key === "ArrowDown") {
+        next = Math.min(entries.length - 1, index + 1);
+      } else if (event.key === "ArrowUp") {
+        next = Math.max(0, index - 1);
+      } else if (event.key === "Home") {
+        next = 0;
+      } else {
+        next = entries.length - 1;
+      }
+      if (next === index) {
+        return;
+      }
+      event.preventDefault();
+      state.selectedId = entryId(entries[next]);
+      renderInbox();
+      const rows = elements.entryRows.querySelectorAll(".entry-row");
+      rows[next]?.focus();
+    });
+
+    function triggerRefresh() {
       setButtonsDisabled(true);
-      loadInbox()
+      return requestInboxRefresh()
         .catch((error) => setStatus(error.message || "Could not refresh."))
         .finally(() => setButtonsDisabled(false));
-    });
+    }
 
     if (!state.homeToken) {
       showLocked();

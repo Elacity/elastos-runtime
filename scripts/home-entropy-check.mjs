@@ -769,37 +769,31 @@ for (const file of activeHtmlFiles) {
   assertStaticControlsAreNamed(file);
 }
 
-// Documents still owns its palette. Chat Room took the shared token sheet, so
-// it is checked below by the stronger rule instead: names must resolve to
-// shared tokens, and the file must name no colour of its own.
-const lightTokenFiles = [
-  "capsules/documents/browser/index.html",
-];
-
-const lightTokens = new Map([
-  ["--bg", "#edf1fb"],
-  ["--bg-strong", "#e3e9fb"],
-  ["--panel", "rgba(255, 255, 255, 0.9)"],
-  ["--panel-strong", "#ffffff"],
-  ["--panel-soft", "#eef2ff"],
-  ["--line", "rgba(83, 103, 164, 0.14)"],
-  ["--line-strong", "rgba(83, 103, 164, 0.22)"],
-  ["--ink", "#1d2438"],
-  ["--muted", "#66708a"],
-  ["--brand", "#f6921a"],
-  ["--brand-soft", "#fff1dc"],
-  ["--accent", "#5f76d8"],
-  ["--accent-soft", "#e8edff"],
-  ["--accent-deep", "#3c53a7"],
-  ["--danger", "#b14c5a"],
-]);
-
-for (const file of lightTokenFiles) {
-  const source = read(file);
-  for (const [token, value] of lightTokens) {
-    assertToken(source, file, token, value);
-  }
+// Documents now uses the shared token sheet. Check the stronger rule: it must
+// map onto canonical shared tokens and must not re-declare its own palette.
+const documentsStyle = read("capsules/documents/browser/index.html");
+for (const [token, value] of new Map([
+  ["--bg", "var(--el-bg)"],
+  ["--panel", "color-mix(in srgb, var(--el-surface) 94%, transparent)"],
+  ["--panel-strong", "color-mix(in srgb, var(--el-surface-raised) 96%, transparent)"],
+  ["--panel-soft", "color-mix(in srgb, var(--el-surface-raised) 84%, var(--el-accent-faint))"],
+  ["--line", "var(--el-hairline)"],
+  ["--line-strong", "var(--el-hairline-strong)"],
+  ["--text", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "var(--el-accent)"],
+  ["--accent-soft", "var(--el-accent-soft)"],
+  ["--accent-deep", "var(--el-accent-strong)"],
+  ["--danger", "var(--el-danger)"],
+])) {
+  assertToken(documentsStyle, "capsules/documents/browser/index.html", token, value);
 }
+assert(
+  documentsStyle.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    documentsStyle.includes('<script src="./elastos-theme.js"></script>'),
+  "Documents must load the vendored shared token sheet and theme runtime",
+);
 
 const chatRoomStyle = read("capsules/chat-room/browser/style.css");
 for (const [token, value] of new Map([
@@ -907,15 +901,14 @@ for (const [token, value] of new Map([
 
 const libraryStyle = read("capsules/library/browser/library.css");
 for (const [token, value] of new Map([
-  ["--bg", "#f6f7f9"],
-  ["--sidebar-bg", "#f0f1f4"],
-  ["--panel", "#ffffff"],
-  ["--panel-soft", "#f3f4f6"],
-  ["--line", "rgba(60, 60, 67, 0.14)"],
-  ["--ink", "#1d1d1f"],
-  ["--muted", "#6b6b6b"],
-  ["--brand", "#f6921a"],
-  ["--accent", "#007aff"],
+  ["--bg", "var(--el-bg)"],
+  ["--panel", "var(--el-surface-raised)"],
+  ["--panel-soft", "var(--el-inset)"],
+  ["--line", "var(--el-hairline)"],
+  ["--ink", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "var(--el-accent)"],
 ])) {
   assertToken(libraryStyle, "capsules/library/browser/library.css", token, value);
 }
@@ -4682,6 +4675,8 @@ assert(
   "Marketplace must read the canonical catalog and interface registry",
 );
 const marketplaceUi = read("capsules/marketplace/browser/marketplace.js");
+const marketplaceBehaviorSmoke = read("scripts/marketplace-product-behavior-smoke.mjs");
+const marketplaceLayoutSmoke = read("scripts/marketplace-product-layout-smoke.mjs");
 assert(
   marketplaceUi.includes("const installed = capsule.installed === true;") &&
     marketplaceUi.includes('type: "home:open-target"') &&
@@ -4696,17 +4691,21 @@ assert(
     marketplaceUi.includes("function executableActions(") &&
     marketplaceUi.includes("binding?.executable !== true") &&
     marketplaceUi.includes("function relationshipSection(") &&
-    !marketplaceUi.includes('name.includes("wallet")') &&
-    !marketplaceUi.includes('name.includes("provider")') &&
-    !marketplaceUi.includes('name.includes("gba")') &&
+    marketplaceUi.includes("function isValidCapsuleIconVariant(capsuleName, entry)") &&
+    marketplaceUi.includes('route.startsWith(`/apps/${capsuleName}/`)') &&
+    !marketplaceUi.includes("FIRST_PARTY_ICON_IDS") &&
+    !marketplaceUi.includes("OWN_ICON_CAPSULES") &&
+    !marketplaceUi.includes("resolveFirstPartyIconId") &&
     !marketplaceUi.includes("function isStaffPick(") &&
     !marketplaceUi.includes("function isPopular("),
-  "Marketplace must project canonical roles, relationships, and executable bindings without name-based guesses",
+  "Marketplace must project canonical roles, relationships, executable bindings, and declared icon routes without name-based guesses",
 );
 assert(
   marketplaceUi.includes('size: capsule.cid ? "Verified app" : "Local app"') &&
-    marketplaceUi.includes('storage: capsule.cid ? "SmartWeb" : "Local"') &&
-    marketplaceUi.includes("App identity:") &&
+    marketplaceUi.includes('sourceSummary: capsule.cid ? "SmartWeb" : "Local"') &&
+    marketplaceUi.includes("Trust:") &&
+    marketplaceUi.includes("Status:") &&
+    marketplaceUi.includes("Available actions") &&
     !marketplaceUi.includes("CID-backed") &&
     !marketplaceUi.includes("Content ID") &&
     !marketplaceUi.includes("Signed package") &&
@@ -4715,7 +4714,22 @@ assert(
     !marketplaceUi.includes("signed CID manifests") &&
     !marketplaceUi.includes("capsule catalog route missing") &&
     !marketplaceUi.includes("`CID:"),
-  "Marketplace must describe app trust in user-facing language instead of raw CID/package jargon",
+  "Marketplace must describe app trust and status in user-facing language instead of raw CID/package jargon",
+);
+assert(
+  marketplaceUi.includes("function announceHomeChrome()") &&
+    marketplaceUi.includes("lastHomeMenuManifestSignature") &&
+    marketplaceUi.includes('if (event.origin !== "null" || event.source !== window.parent) {') &&
+    !marketplaceUi.includes("window.location.origin") &&
+    !marketplaceUi.includes("onerror="),
+  "Marketplace must keep the exact Home menu boundary and bind icon fallback without inline event attributes",
+);
+assert(
+  marketplaceBehaviorSmoke.includes("marketplace-product-behavior-smoke: OK") &&
+    marketplaceLayoutSmoke.includes("marketplace-product-layout-smoke: OK") &&
+    read("justfile").includes("node scripts/marketplace-product-behavior-smoke.mjs") &&
+    read("justfile").includes("node scripts/marketplace-product-layout-smoke.mjs"),
+  "Marketplace UIUX must stay wired into the focused source and browser gates",
 );
 assert(
   read("elastos/crates/elastos-server/src/api/gateway_marketplace.rs").includes(
@@ -4867,7 +4881,10 @@ const libraryDesktopIcon = read("capsules/library/browser/icons/sidebar-folder-d
 const libraryMenuSmoke = read("scripts/library-menu-smoke.mjs");
 const libraryPerformanceSmoke = read("scripts/library-performance-smoke.mjs");
 const libraryLiveSmoke = read("scripts/library-live-smoke.sh");
+const archiveBehaviorSmoke = read("scripts/archive-product-behavior-smoke.mjs");
+const archiveLayoutSmoke = read("scripts/archive-product-layout-smoke.mjs");
 const namespacesDoc = read("docs/NAMESPACES.md");
+const justfile = read("justfile");
 const chatStyle = read("capsules/chat-room/browser/style.css");
 const gba = read("capsules/gba-emulator/browser/index.html");
 const gbaStyle = read("capsules/gba-emulator/browser/style.css");
@@ -4875,8 +4892,10 @@ const gbaJs = read("capsules/gba-emulator/browser/emulator.js");
 const gbaInputJs = read("capsules/gba-emulator/browser/gba-input.js");
 const walletMetamask = read("capsules/wallet-metamask/browser/index.html");
 const walletMetamaskJs = read("capsules/wallet-metamask/browser/wallet-metamask.js");
+const walletMetamaskStyle = read("capsules/wallet-metamask/browser/style.css");
 const walletUnisat = read("capsules/wallet-unisat/browser/index.html");
 const walletUnisatJs = read("capsules/wallet-unisat/browser/wallet-unisat.js");
+const walletUnisatStyle = read("capsules/wallet-unisat/browser/style.css");
 const walletConnectorTransactionSmoke = read(
   "scripts/wallet-connector-transaction-smoke.mjs",
 );
@@ -5020,6 +5039,7 @@ const walletWalletconnect = read("capsules/wallet-walletconnect/browser/index.ht
 const walletWalletconnectJs = read(
   "capsules/wallet-walletconnect/browser/wallet-walletconnect.js",
 );
+const walletWalletconnectStyle = read("capsules/wallet-walletconnect/browser/style.css");
 const homeSmoke = read("scripts/home-camofox-smoke.mjs");
 const systemSmoke = read("scripts/system-camofox-smoke.mjs");
 const homeVirtualAuthSmoke = read(
@@ -5319,13 +5339,25 @@ assert(
   "Inbox Inspector approval must require fresh same-principal passkey proof before approved provider dispatch",
   inboxInspectorApprovalBoundary,
 );
-assert(
-  inbox.includes('entry.kind !== "wallet_approval_request"') &&
-    inbox.includes("const unreadIdSet = new Set(unreadIds)") &&
-    inbox.includes("unread_count: unreadCount") &&
-    !inbox.includes("renderInbox(Object.assign({}, notifications, { unread_count: 0 }))"),
-  "Inbox auto-read must not locally mark wallet approval requests as read when clearing ordinary visible notifications",
-);
+{
+  const markVisibleReadBlock = inbox.slice(
+    inbox.indexOf("function markVisibleRead() {"),
+    inbox.indexOf("function formatInboxTime(", inbox.indexOf("function markVisibleRead() {")),
+  );
+  assert(
+    markVisibleReadBlock.includes('entry.kind !== "wallet_approval_request"') &&
+      markVisibleReadBlock.includes('entry.kind !== "contact_request"') &&
+      markVisibleReadBlock.includes("const unreadIds = state.entries") &&
+      markVisibleReadBlock.includes("const unreadIdSet = new Set(unreadIds)") &&
+      markVisibleReadBlock.includes("for (const entry of state.entries)") &&
+      markVisibleReadBlock.includes("if (unreadIdSet.has(entry.id))") &&
+      markVisibleReadBlock.includes("entry.read = true;") &&
+      markVisibleReadBlock.includes("renderInbox();") &&
+      !markVisibleReadBlock.includes("unread_count") &&
+      !markVisibleReadBlock.includes("Object.assign({}, notifications"),
+    "Inbox auto-read must derive eligible unread ids from current entries, mark only matching entries as read, rerender from current state, and avoid synthesizing notification unread_count",
+  );
+}
 assert(
   inbox.includes("capability-approve-request:") &&
     inbox.includes("capability-deny-request:") &&
@@ -5498,6 +5530,21 @@ assert(
     libraryApp.includes('menuAction("Compress Selected to ZIP"') &&
     libraryState.includes('"compress_archive"'),
   "Library Compress to ZIP must be provider-owned, capability-gated, cache-invalidating, and available for single objects and same-folder selections",
+);
+assert(
+  archiveManager.includes('<script src="./elastos-theme.js"></script>') &&
+    archiveManager.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    archiveManager.includes('window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);') &&
+    archiveManager.includes('type: "home:menu-manifest"') &&
+    archiveManager.includes('title: "File"') &&
+    archiveManager.includes('title: "Edit"') &&
+    archiveManager.includes('return event.origin === "null" && event.source === window.parent;') &&
+    !archiveManager.includes("event.origin !== homeParentOrigin || event.source !== window.top") &&
+    archiveBehaviorSmoke.includes("archive-product-behavior-smoke: OK") &&
+    archiveLayoutSmoke.includes("archive-product-layout-smoke: OK") &&
+    justfile.includes("node scripts/archive-product-behavior-smoke.mjs") &&
+    justfile.includes("node scripts/archive-product-layout-smoke.mjs"),
+  "Archive must use the shared UI tokens, the accepted Home top-out or trusted-parent-in boundary, and dedicated source or browser smokes wired into the normal UIUX gate",
 );
 assert(
     archiveManagerManifest.includes('"name": "archive-manager"') &&
@@ -5879,7 +5926,8 @@ assert(
     libraryRender.includes("This space is empty") &&
     libraryRender.includes("Add files or folders to this space.") &&
     libraryRender.includes('${visible} item${visible === 1 ? "" : "s"}') &&
-    libraryRender.includes('elements.currentTitle.textContent || "Library"') &&
+    libraryRender.includes('const currentCrumb = elements.breadcrumbs.querySelector(".crumb-current");') &&
+    libraryRender.includes('elements.footerRight.textContent = currentCrumb?.textContent || "Library";') &&
     !libraryRender.includes("No connected spaces") &&
     libraryActions.includes("This Space is read-only.") &&
     !libraryActions.includes("Mounted WebSpaces are read-only resolver handles."),
@@ -6856,8 +6904,10 @@ assert(
   "Library toolbar must stack on narrow screens",
 );
 assert(
-  libraryCss.includes("padding: 4px;") && libraryCss.includes("border-radius: 14px;"),
-  "Library mobile panels must use compact Home-aligned spacing",
+  libraryCss.includes("@media (max-width: 720px)") &&
+    libraryCss.includes(".shell {\n        gap: 0;") &&
+    libraryCss.includes("padding: 0;"),
+  "Library narrow layouts must keep the donor full-bleed shell without clipped mobile padding wrappers",
 );
 assert(
   chatStyle.includes("grid-template-columns: 220px minmax(0, 1fr);") &&
@@ -10647,7 +10697,13 @@ assert(
   walletMetamask.includes('id="wallet-connect"') &&
     walletMetamask.includes('id="wallet-state"') &&
     walletMetamask.includes('id="wallet-accounts"') &&
-    walletMetamask.includes('id="wallet-requests"'),
+    walletMetamask.includes('id="wallet-requests"') &&
+    walletMetamask.includes('<script src="./elastos-theme.js"></script>') &&
+    walletMetamask.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    [...walletMetamaskStyle.matchAll(/letter-spacing:\s*([^;]+);/g)].every(([, value]) => value.trim() === "0") &&
+    !walletMetamaskStyle.includes("linear-gradient(") &&
+    !walletMetamaskStyle.includes("radial-gradient(") &&
+    walletMetamaskStyle.includes('font-family: var(--el-font, "Inter", sans-serif);'),
   "MetaMask must live in a dedicated connector capsule with connected-account visibility",
 );
 assert(
@@ -10730,7 +10786,13 @@ assert(
   walletUnisat.includes('id="wallet-connect"') &&
     walletUnisat.includes('id="wallet-state"') &&
     walletUnisat.includes('id="wallet-accounts"') &&
-    walletUnisat.includes('id="wallet-requests"'),
+    walletUnisat.includes('id="wallet-requests"') &&
+    walletUnisat.includes('<script src="./elastos-theme.js"></script>') &&
+    walletUnisat.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    [...walletUnisatStyle.matchAll(/letter-spacing:\s*([^;]+);/g)].every(([, value]) => value.trim() === "0") &&
+    !walletUnisatStyle.includes("linear-gradient(") &&
+    !walletUnisatStyle.includes("radial-gradient(") &&
+    walletUnisatStyle.includes('font-family: var(--el-font, "Inter", sans-serif);'),
   "UniSat must live in a dedicated connector capsule with connected-account visibility",
 );
 assert(
@@ -10762,9 +10824,18 @@ assert(
   "Wallet must provide balances and built-in Bitcoin accounts without manual Bitcoin proof linking",
 );
 assert(
-  wallet.includes("wallet.js?v=wallet-20260726b") &&
+  walletJs.includes("homeClipboard.start();") &&
+    !walletJs.includes('window.top.postMessage({ type: "home:app-ready", homeToken: activeHomeToken }, homeParentOrigin);') &&
+    walletPreferencesForConnectorContinuity.includes('type: "home:open-target"'),
+  "Wallet must keep one canonical Home Clipboard/app-ready path and one exact Home connector-launch path.",
+);
+assert(
+  wallet.includes("wallet.js?v=wallet-20260819f") &&
     wallet.includes('id="wallet-send"') &&
     wallet.includes('id="wallet-receive"') &&
+    wallet.includes('id="wallet-account-card"') &&
+    wallet.includes('id="wallet-hero-pending"') &&
+    wallet.includes('id="wallet-signers"') &&
     wallet.includes("data-wallet-create-account") &&
     wallet.includes("data-wallet-import-recovery-key") &&
     (wallet.match(/data-wallet-create-account/g) || []).length === 2 &&
@@ -10779,7 +10850,9 @@ assert(
     walletJs.includes("openReceiveFlow") &&
     walletJs.includes("openSendFlow") &&
     walletJs.includes("balance_key") &&
-    walletJs.includes("wallet-detail-summary") &&
+    walletJs.includes("wallet-account-card") &&
+    walletJs.includes("wallet-hero-pending") &&
+    walletJs.includes("wallet-signers") &&
     walletJs.includes("fundedSendableAccounts"),
   "Wallet must expose Send/Receive plus canonical Accounts/Settings create-import surfaces with cache-busted assets",
 );
@@ -10821,11 +10894,11 @@ assert(
 assert(
   wallet.includes("wallet-settings-drawer") &&
     wallet.includes("wallet-settings-main") &&
-    wallet.includes("wallet-settings-side") &&
-    wallet.indexOf('class="wallet-settings-side"') <
-      wallet.indexOf('id="wallet-methods"') &&
-    !wallet.includes("<h2>Wallet settings</h2>") &&
-    !wallet.includes("<h3>Identity</h3>") &&
+    wallet.includes("<h2>Settings</h2>") &&
+    wallet.includes("<h3>Manage accounts</h3>") &&
+    wallet.includes("<h3>Display currency</h3>") &&
+    !wallet.includes("wallet-settings-side") &&
+    !wallet.includes("<h3>Appearance</h3>") &&
     !wallet.includes('id="wallet-theme"') &&
     !wallet.includes("data-wallet-theme") &&
     !walletJs.includes("applyStoredTheme") &&
@@ -10841,8 +10914,9 @@ assert(
 assert(
   !wallet.includes("wallet-brand") &&
     walletJs.includes("selectedAccountId") &&
-    walletJs.includes("wallet-detail-address") &&
-    walletJs.includes("wallet-detail-qr") &&
+    walletJs.includes("wallet-account-card-address") &&
+    walletJs.includes("wallet-account-card-copy") &&
+    walletJs.includes("wallet-copy-icon") &&
     walletJs.includes('account.proof_type === "siwe"') &&
     walletJs.includes("unavailable: Boolean(payload.unavailable)") &&
     !walletJs.includes("Balances update through approved Runtime providers.") &&
@@ -10862,13 +10936,12 @@ assert(
     walletJs.includes("balanceTargetsForAccounts") &&
     walletJs.includes("accountForAsset") &&
     walletJs.includes("account_ids") &&
-    walletJs.includes("accountActionsNode.hidden = accounts.length > 0") &&
-    walletJs.includes("onWalletActionClick") &&
+    walletJs.includes("openAccountMenu") &&
+    walletJs.includes("data-wallet-account-menu") &&
     !walletJs.includes("createAccountTile") &&
     !walletStyle.includes(".wallet-create-card") &&
     walletJs.includes("create_new: index === 0") &&
     walletJs.includes("Create an EVM account for supported networks.") &&
-    walletJs.includes("dataset.walletAccountMenu") &&
     walletJs.includes("/api/apps/wallet/wallet/default") &&
     walletJs.includes("openRenameAccount") &&
     walletJs.includes('method: "PUT"') &&
@@ -10918,37 +10991,33 @@ assert(
   "wallet-provider manifest must keep principal-sensitive operations off its public interface while retaining internal audit truth",
 );
 assert(
-  wallet.includes(
-    '<section id="wallet-account-detail" class="wallet-detail" aria-label="Default account"></section>',
-  ) &&
+  wallet.includes('id="wallet-account-card"') &&
+    wallet.includes('id="wallet-account-card-address"') &&
+    wallet.includes('id="wallet-account-card-copy"') &&
+    wallet.includes('id="wallet-hero-back"') &&
     wallet.indexOf('class="wallet-hero-balance"') <
       wallet.indexOf('id="wallet-delta"') &&
     wallet.indexOf('id="wallet-delta"') <
-      wallet.indexOf('id="wallet-account-detail"') &&
+      wallet.indexOf('id="wallet-account-card"') &&
     wallet.indexOf('id="wallet-total-balance"') <
       wallet.indexOf('class="wallet-action-row"') &&
     walletJs.includes("renderHeroAccount(allAccounts)") &&
     walletJs.includes("selectedOrDefaultAccount") &&
     walletJs.includes("defaultWalletAccount") &&
     walletJs.includes("latestDefault") &&
-    walletJs.includes("wallet-detail-inline") &&
+    walletJs.includes("has-account-card") &&
     walletJs.includes(
       'selectedAccountId = selectedAccountId === accountId ? "" : accountId',
     ) &&
-    walletJs.includes(
-      'getSelectedAccountId() === account.account_id ? "Show default wallet" : "Show in hero"',
-    ) &&
     walletJs.includes("clearAccountSelection") &&
     walletJs.includes("is-selected") &&
-    walletJs.includes("wallet-detail-qr") &&
+    walletJs.includes("accountCardCopyNode.replaceChildren") &&
+    walletJs.includes("openReceiveFlow") &&
     walletJs.includes("/api/wallet/qr") &&
     !walletJs.includes("visibleAccounts") &&
     !walletJs.includes("Selected account ·") &&
     !walletJs.includes("Hide details") &&
     !walletJs.includes("clearAccountFilter") &&
-    !walletJs.includes("accountDetailNode.scrollIntoView") &&
-    !walletJs.includes("wallet-detail-balance") &&
-    !walletJs.includes("wallet-detail-section") &&
     !walletJs.includes("No transactions yet") &&
     !walletJs.includes("closeOverlaySurfaces") &&
     !walletJs.includes("walletPageNode") &&
@@ -10956,55 +11025,39 @@ assert(
       walletStyle,
       ".wallet-hero-row {",
       "Wallet hero row style",
-    ).includes(
-      "grid-template-columns: minmax(240px, 1fr) minmax(160px, 0.6fr) minmax(190px, 220px)",
-    ) &&
+    ).includes("grid-template-columns: 1fr;") &&
     sourceBlock(walletStyle, ".wallet-delta {", "Wallet graph style").includes(
       "justify-self: center",
     ) &&
     sourceBlock(
       walletStyle,
-      ".wallet-detail {",
-      "Wallet detail style",
-    ).includes("justify-self: end") &&
+      "@container wallet-hero-front (min-width: 700px)",
+      "Wallet wide hero layout",
+    ).includes("grid-template-columns: minmax(0, 1fr) minmax(240px, 340px);") &&
     sourceBlock(
       walletStyle,
-      "@media (max-width: 780px)",
-      "Wallet mobile media",
-    ).includes(".wallet-detail {\n    justify-self: center;") &&
-    !sourceBlock(
+      "\n.wallet-account-card {",
+      "Wallet account card style",
+    ).includes("margin: 6px auto 0;") &&
+    sourceBlock(
       walletStyle,
-      ".wallet-detail {",
-      "Wallet detail style",
-    ).includes("min-height:") &&
-    !sourceBlock(
-      walletStyle,
-      ".wallet-detail {",
-      "Wallet detail style",
-    ).includes("border:") &&
-    !sourceBlock(
-      walletStyle,
-      ".wallet-detail {",
-      "Wallet detail style",
-    ).includes("background:") &&
-    !sourceBlock(
-      walletStyle,
-      ".wallet-detail {",
-      "Wallet detail style",
-    ).includes("position: fixed") &&
-    walletStyle.includes(".wallet-detail-inline") &&
-    walletStyle.includes("width: 156px;") &&
-    walletStyle.includes("width: 132px;") &&
+      "@container wallet-hero-front (min-width: 700px)",
+      "Wallet wide hero layout",
+    ).includes("justify-self: end") &&
+    walletStyle.includes(".wallet-hero-face-back .wallet-qr") &&
+    walletStyle.includes(".wallet-account-card-copy") &&
     walletStyle.includes(
       "grid-template-columns: repeat(auto-fill, minmax(200px, 1fr))",
     ) &&
-    walletStyle.includes("min-height: 118px") &&
+    !walletStyle.includes(".wallet-detail") &&
+    !walletStyle.includes(".wallet-detail-inline") &&
+    !walletStyle.includes(".wallet-detail-qr") &&
+    !walletStyle.includes(".wallet-detail-address") &&
+    !walletStyle.includes(".wallet-detail-summary") &&
     !walletStyle.includes(".wallet-address") &&
     !walletStyle.includes(".wallet-detail-close") &&
-    !walletStyle.includes(".wallet-detail-balance") &&
-    !walletStyle.includes(".wallet-detail-section") &&
     walletStyle.includes(".wallet-account.is-selected"),
-  "Wallet hero must keep balance/actions on the left, graph centered, QR/address on the right, center QR on mobile, and denser account cards without separate containers, side sheets, scroll jumps, transactions placeholders, or duplicate balances",
+  "Wallet hero must keep the reviewed front-face balance and branded account card, move QR/address into the receive face, and avoid stale detail-pane or placeholder chrome",
 );
 assert(
   gatewayApi.includes('WALLET_CAPSULE_ID => "Wallet"') &&
@@ -11059,6 +11112,19 @@ assert(
   !walletMetamask.includes("WalletConnect") &&
     !walletMetamaskJs.includes("walletconnect"),
   "WalletConnect must not be visible until a pinned connector exists",
+);
+assert(
+  walletWalletconnect.includes('id="wallet-connect"') &&
+    walletWalletconnect.includes('id="wallet-state"') &&
+    walletWalletconnect.includes('id="wallet-accounts"') &&
+    walletWalletconnect.includes('id="wallet-requests"') &&
+    walletWalletconnect.includes('<script src="./elastos-theme.js"></script>') &&
+    walletWalletconnect.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    [...walletWalletconnectStyle.matchAll(/letter-spacing:\s*([^;]+);/g)].every(([, value]) => value.trim() === "0") &&
+    !walletWalletconnectStyle.includes("linear-gradient(") &&
+    !walletWalletconnectStyle.includes("radial-gradient(") &&
+    walletWalletconnectStyle.includes('font-family: var(--el-font, "Inter", sans-serif);'),
+  "WalletConnect connector UI must use the same shared-token surface without adding a second authority path",
 );
 assert(
   !system.includes("<dt>Wallet requests</dt>") &&

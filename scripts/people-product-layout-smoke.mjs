@@ -527,18 +527,21 @@ async function assertFirstRunScenario(frame, width) {
   await waitFor(() => frame.evaluate(() => document.querySelector("#profile-title")?.textContent === "Create your Profile"));
   await assertNoOverflow(frame, `first run at ${width}px`);
   await assertVisible(frame, [
+    "#people-count",
     "#profile-title",
     "#profile-description",
     "#profile-name",
     "#profile-submit",
   ], `first run at ${width}px`);
   const state = await frame.evaluate(() => ({
+    count: document.querySelector("#people-count")?.textContent?.trim() || "",
     title: document.querySelector("#profile-title")?.textContent?.trim() || "",
     description: document.querySelector("#profile-description")?.textContent?.trim() || "",
     value: document.querySelector("#profile-name")?.value || "",
     placeholder: document.querySelector("#profile-name")?.getAttribute("placeholder") || "",
     submit: document.querySelector("#profile-submit")?.textContent?.trim() || "",
   }));
+  assert(state.count === "0 contacts", "first run contact count is wrong", state);
   assert(state.title === "Create your Profile", "first run title is wrong", state);
   assert(
     state.description === "Your Profile is your signed identity for People and Chat.",
@@ -566,17 +569,23 @@ async function assertReadyOffScenario(frame, page, width) {
     "#discovery-status",
     "#discovery-toggle",
     "#discovery-refresh",
+    "#discovery-visible-count",
+    "#discovery-requests-count",
   ], `ready/off discovery controls at ${width}px`);
   const offState = await frame.evaluate(() => ({
     profileName: document.querySelector("#profile-name")?.value || "",
     status: document.querySelector("#discovery-status")?.textContent?.trim() || "",
     toggle: document.querySelector("#discovery-toggle")?.textContent?.trim() || "",
     refreshDisabled: document.querySelector("#discovery-refresh")?.disabled === true,
+    visibleCount: document.querySelector("#discovery-visible-count")?.textContent?.trim() || "",
+    requestCount: document.querySelector("#discovery-requests-count")?.textContent?.trim() || "",
   }));
   assert(offState.profileName === "Ready Profile", "ready/off should show the saved profile name", offState);
   assert(offState.status === "Discovery is off.", "ready/off should show the off discovery state", offState);
   assert(offState.toggle === "Turn On", "ready/off should offer discovery opt-in", offState);
   assert(offState.refreshDisabled === false, "ready/off should keep Refresh usable", offState);
+  assert(offState.visibleCount === "0 visible", "ready/off visible count is wrong", offState);
+  assert(offState.requestCount === "0 requests", "ready/off request count is wrong", offState);
 
   await frame.locator("#discovery-refresh").click();
   await waitForStatus(frame, "Refresh requested.");
@@ -605,6 +614,8 @@ async function assertVisibleDiscoveryScenario(frame, page, width) {
     "#discovery-status",
     "#discovery-toggle",
     "#discovery-refresh",
+    "#discovery-visible-count",
+    "#discovery-requests-count",
     '#discovery-list [data-action="discovery-request"]',
     '#discovery-requests-list [data-action="open-inbox"]',
   ], `visible discovery controls at ${width}px`);
@@ -613,6 +624,8 @@ async function assertVisibleDiscoveryScenario(frame, page, width) {
     status: document.querySelector("#discovery-status")?.textContent?.trim() || "",
     addContact: document.querySelector('#discovery-list [data-action="discovery-request"]')?.textContent?.trim() || "",
     inbox: document.querySelector('#discovery-requests-list [data-action="open-inbox"]')?.textContent?.trim() || "",
+    visibleCount: document.querySelector("#discovery-visible-count")?.textContent?.trim() || "",
+    requestCount: document.querySelector("#discovery-requests-count")?.textContent?.trim() || "",
   }));
   assert(
     /540 seconds/.test(discoveryState.status),
@@ -621,6 +634,8 @@ async function assertVisibleDiscoveryScenario(frame, page, width) {
   );
   assert(discoveryState.addContact === "Add contact", "visible discovery action is wrong", discoveryState);
   assert(discoveryState.inbox === "Open Inbox", "visible inbox action is wrong", discoveryState);
+  assert(discoveryState.visibleCount === "1 visible", "visible discovery count is wrong", discoveryState);
+  assert(discoveryState.requestCount === "1 request", "visible request count is wrong", discoveryState);
 
   await frame.locator('#discovery-list [data-action="discovery-request"]').click();
   await waitForStatus(frame, "Contact request queued.");

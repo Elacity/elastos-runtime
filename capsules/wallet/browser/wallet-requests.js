@@ -21,8 +21,14 @@ export function createWalletRequests({
   showStatus,
 }) {
   function renderRequests(requests, focusRequestId = "") {
+    if (!requestsNode) {
+      return false;
+    }
     requestsNode.replaceChildren();
-    requestsPanelNode.hidden = requests.length === 0;
+    if (requestsPanelNode) {
+      requestsPanelNode.hidden = requests.length === 0;
+    }
+    requestsNode.hidden = requests.length === 0;
     let focused = null;
     for (const request of requests) {
       const card = requestCard(request, readText(request.request_id) === focusRequestId);
@@ -110,7 +116,7 @@ export function createWalletRequests({
   }
 
   function openPendingReview() {
-    requestsPanelNode?.scrollIntoView({ behavior: "smooth", block: "start" });
+    (requestsNode || requestsPanelNode)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 
   async function onRequestClick(event) {
