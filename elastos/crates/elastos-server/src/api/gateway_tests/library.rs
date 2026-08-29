@@ -8338,7 +8338,7 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
     );
     let listing_path = runtime_custody_listing_path_for_test(dir.path(), mint_id);
     let listing_before_buy = std::fs::read(&listing_path).unwrap();
-    assert_eq!(mock_content_publish_request_count(), 2);
+    assert_eq!(mock_content_publish_request_count(), 3);
     assert_eq!(mock_chain_broadcast_count(&creator_signed_transaction), 1);
 
     let (buy_pending_status, buy_pending) = post_library(
@@ -8565,7 +8565,7 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
     assert_eq!(segment_bytes, clear_segments[0]);
 
     let (close_status, close_payload) = post_library(
-        app,
+        app.clone(),
         &player_token,
         "close_viewer",
         json!({
@@ -8589,6 +8589,76 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
     assert!(viewer_record["pending_close_result"].is_null());
     assert!(viewer_record["pending_cancel_result"].is_null());
     assert_eq!(std::fs::read(&listing_path).unwrap(), listing_before_buy);
+
+    crate::protected_content_runtime::tests::make_runtime_custody_listing_imported_without_creator_mint(
+        dir.path(),
+        mint_id,
+    );
+    let imported_player_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        ELACITY_PLAYER_CAPSULE_ID_FOR_TEST,
+        &buyer,
+    );
+    let (_, imported_open) = post_library(
+        app.clone(),
+        &imported_player_token,
+        "open_viewer",
+        json!({"mint_id": mint_id_hex}),
+    )
+    .await;
+    assert_eq!(imported_open["status"], "ok", "{imported_open}");
+    let (_, imported_replay) = post_library(
+        app.clone(),
+        &imported_player_token,
+        "open_viewer",
+        json!({"mint_id": mint_id_hex}),
+    )
+    .await;
+    assert_eq!(imported_replay, imported_open);
+    let imported_handle = imported_open["data"]["viewer_session_handle"]
+        .as_str()
+        .unwrap();
+    let (_, imported_init) = post_library(
+        app.clone(),
+        &imported_player_token,
+        "read_viewer",
+        json!({"mint_id": mint_id_hex, "viewer_session_handle": imported_handle}),
+    )
+    .await;
+    assert_eq!(imported_init["status"], "ok", "{imported_init}");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(imported_init["data"]["data"].as_str().unwrap())
+            .unwrap(),
+        clear_init
+    );
+    let (_, imported_segment) = post_library(
+        app.clone(),
+        &imported_player_token,
+        "read_viewer",
+        json!({
+            "mint_id": mint_id_hex,
+            "viewer_session_handle": imported_handle,
+            "segment_index": 0,
+        }),
+    )
+    .await;
+    assert_eq!(imported_segment["status"], "ok", "{imported_segment}");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(imported_segment["data"]["data"].as_str().unwrap())
+            .unwrap(),
+        clear_segments[0]
+    );
+    let (_, imported_close) = post_library(
+        app,
+        &imported_player_token,
+        "close_viewer",
+        json!({"mint_id": mint_id_hex, "viewer_session_handle": imported_handle}),
+    )
+    .await;
+    assert_eq!(imported_close["status"], "ok", "{imported_close}");
+    assert!(!dir.path().join("protected-content/runtime-mint").exists());
 }
 
 #[tokio::test]

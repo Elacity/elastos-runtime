@@ -2986,6 +2986,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
         crate::protected_content_runtime::verify_fresh_runtime_custody_availability(
             &state.data_dir,
             &registry,
+            &listing_record,
             mint_id,
             now,
         )

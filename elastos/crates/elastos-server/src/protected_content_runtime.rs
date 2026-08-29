@@ -48,7 +48,7 @@ use elastos_protected_content_rights::{
 };
 use elastos_protected_content_runtime::RuntimeProviderCallError;
 use elastos_protected_content_runtime::{
-    bind_buy, cancel_prepared_recipient, cancel_prepared_recipient_with_result_by_handle,
+    cancel_prepared_recipient, cancel_prepared_recipient_with_result_by_handle,
     close_viewer_session_with_result, open_viewer_session, prepare_recipient,
     read_viewer_media_part, resolve_runtime_mint_selected_nodes, PersistedRuntimeMint,
     PersistedRuntimeReleaseOperation, RuntimeContentAvailabilityRequirement,
@@ -5167,12 +5167,12 @@ impl RuntimeCustodyViewerRecord {
 
     fn to_runtime_viewer_session(
         &self,
-        mint: &PersistedRuntimeMint,
+        encrypted_content: &EncryptedContentIdentityV1,
     ) -> anyhow::Result<RuntimeViewerSession> {
         RuntimeViewerSession::from_persisted_parts(
             self.audit_request_id()?,
             self.viewer_session_handle_bytes()?,
-            mint.draft().encrypted_content().clone(),
+            encrypted_content.clone(),
             RightsActionV1::View,
             self.expires_at,
         )
@@ -5475,12 +5475,11 @@ fn validate_runtime_custody_evm_address(value: &str) -> anyhow::Result<()> {
 pub(crate) async fn verify_fresh_runtime_custody_availability(
     data_dir: &Path,
     registry: &Arc<ProviderRegistry>,
+    listing: &RuntimeCustodyListingRecord,
     mint_id: Digest32,
     now_unix_seconds: u64,
 ) -> anyhow::Result<(RuntimeMintDraft, RuntimeVerifiedContentAvailability)> {
     let expected_mint_id = hex::encode(mint_id.as_bytes());
-    let listing = load_runtime_custody_listing(data_dir, mint_id)?
-        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE))?;
     if listing.package.mint_id != expected_mint_id {
         anyhow::bail!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
     }
@@ -5511,9 +5510,15 @@ pub(crate) async fn open_runtime_custody_viewer(
         anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
     }
     let profile_did = load_runtime_custody_profile_did(data_dir, &input.principal_id)?;
-    let mint = runtime_mint_journal(data_dir)
-        .load(mint_id)
-        .map_err(|_| anyhow::anyhow!("Runtime custody mint selection is invalid"))?;
+    let listing = load_runtime_custody_listing(data_dir, mint_id)?
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE))?;
+    let asset = validate_runtime_custody_viewer_asset(
+        &listing,
+        &input.principal_id,
+        &profile_did,
+        mint_id,
+        &purchase,
+    )?;
     let launch_id = input
         .launch_id
         .as_deref()
@@ -5532,7 +5537,6 @@ pub(crate) async fn open_runtime_custody_viewer(
     else {
         anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
     };
-    let buy = reconstructed_buy_receipt(&mint, &purchase, &profile_did)?;
     let runtime_session_binding = derive_runtime_custody_session_binding(
         &input.principal_id,
         &profile_did,
@@ -5559,9 +5563,10 @@ pub(crate) async fn open_runtime_custody_viewer(
                 if record.matches_runtime_session_binding(&runtime_session_binding)
                     && !record.is_expired(viewer_now) =>
             {
-                let session = record.to_runtime_viewer_session(&mint)?;
+                let session =
+                    record.to_runtime_viewer_session(&asset.media_identity.encrypted_content())?;
                 return runtime_custody_viewer_public_response(
-                    &mint,
+                    &asset.media_identity,
                     mint_id,
                     session.viewer_session_handle(),
                     session.expires_at(),
@@ -5585,6 +5590,7 @@ pub(crate) async fn open_runtime_custody_viewer(
                 let _ = settle_runtime_custody_viewer_cleanup(
                     data_dir,
                     registry.clone(),
+                    &listing,
                     &input.principal_id,
                     mint_id,
                     record,
@@ -5595,9 +5601,10 @@ pub(crate) async fn open_runtime_custody_viewer(
             | RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent => {}
         }
     }
-    let (_, fresh_availability) = verify_fresh_runtime_custody_availability(
+    let (draft, fresh_availability) = verify_fresh_runtime_custody_availability(
         data_dir,
         &registry,
+        &listing,
         mint_id,
         crate::auth::now_ts(),
     )
@@ -5605,6 +5612,7 @@ pub(crate) async fn open_runtime_custody_viewer(
     if fresh_availability.content_cid() != purchase.cid {
         anyhow::bail!("Runtime custody content availability is unavailable");
     }
+    let buy = reconstructed_buy_receipt(&draft, &fresh_availability, &purchase, &profile_did)?;
     let composition = load_runtime_custody_composition(data_dir, registry.clone())?
         .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE))?;
     let (device_key, _) =
@@ -5612,12 +5620,9 @@ pub(crate) async fn open_runtime_custody_viewer(
             .ok_or_else(|| anyhow::anyhow!("local Runtime device signing key is missing"))?;
     let runtime_issuer = RuntimeOperationIssuerKeyV1::new(device_key.verifying_key().to_bytes())
         .map_err(|_| anyhow::anyhow!("local Runtime device signing key is invalid"))?;
-    let (media_identity, protected_init) = fetch_runtime_custody_open_media(
-        registry.as_ref(),
-        &purchase.cid,
-        mint.draft().media_identity(),
-    )
-    .await?;
+    let (media_identity, protected_init) =
+        fetch_runtime_custody_open_media(registry.as_ref(), &purchase.cid, draft.media_identity())
+            .await?;
     let now = crate::auth::now_ts();
     let audit_request_id = runtime_open_audit_id(&input.principal_id, mint_id, now);
     let decrypt = RuntimeDecryptRegistryAdapter::new(registry.clone());
@@ -5676,6 +5681,7 @@ pub(crate) async fn open_runtime_custody_viewer(
                 let _ = settle_runtime_custody_viewer_cleanup(
                     data_dir,
                     registry.clone(),
+                    &listing,
                     &input.principal_id,
                     mint_id,
                     open_pending.clone(),
@@ -5686,8 +5692,8 @@ pub(crate) async fn open_runtime_custody_viewer(
         };
     let policy = match resolve_runtime_rights_policy(
         registry.as_ref(),
-        mint.draft().encrypted_content(),
-        mint.draft().content_access_id(),
+        draft.encrypted_content(),
+        draft.content_access_id(),
         RightsActionV1::View,
     )
     .await
@@ -5697,6 +5703,7 @@ pub(crate) async fn open_runtime_custody_viewer(
             let _ = settle_runtime_custody_viewer_cleanup(
                 data_dir,
                 registry.clone(),
+                &listing,
                 &input.principal_id,
                 mint_id,
                 open_pending.clone(),
@@ -5722,6 +5729,7 @@ pub(crate) async fn open_runtime_custody_viewer(
             let _ = settle_runtime_custody_viewer_cleanup(
                 data_dir,
                 registry.clone(),
+                &listing,
                 &input.principal_id,
                 mint_id,
                 open_pending.clone(),
@@ -5739,6 +5747,7 @@ pub(crate) async fn open_runtime_custody_viewer(
             let _ = settle_runtime_custody_viewer_cleanup(
                 data_dir,
                 registry.clone(),
+                &listing,
                 &input.principal_id,
                 mint_id,
                 open_pending.clone(),
@@ -5772,6 +5781,7 @@ pub(crate) async fn open_runtime_custody_viewer(
             let _ = settle_runtime_custody_viewer_cleanup(
                 data_dir,
                 registry.clone(),
+                &listing,
                 &input.principal_id,
                 mint_id,
                 open_pending.clone(),
@@ -5829,6 +5839,7 @@ pub(crate) async fn open_runtime_custody_viewer(
                     let _ = settle_runtime_custody_viewer_cleanup(
                         data_dir,
                         registry.clone(),
+                        &listing,
                         &input.principal_id,
                         mint_id,
                         open_pending.clone(),
@@ -5842,6 +5853,7 @@ pub(crate) async fn open_runtime_custody_viewer(
             let _ = settle_runtime_custody_viewer_cleanup(
                 data_dir,
                 registry.clone(),
+                &listing,
                 &input.principal_id,
                 mint_id,
                 open_pending.clone(),
@@ -5863,6 +5875,7 @@ pub(crate) async fn open_runtime_custody_viewer(
             let _ = settle_runtime_custody_viewer_cleanup(
                 data_dir,
                 registry.clone(),
+                &listing,
                 &input.principal_id,
                 mint_id,
                 open_pending.clone(),
@@ -5878,6 +5891,7 @@ pub(crate) async fn open_runtime_custody_viewer(
                 let _ = settle_runtime_custody_viewer_cleanup(
                     data_dir,
                     registry.clone(),
+                    &listing,
                     &input.principal_id,
                     mint_id,
                     open_pending.clone(),
@@ -5893,7 +5907,7 @@ pub(crate) async fn open_runtime_custody_viewer(
             prepared_recipient: &prepared,
             signed_runtime_release_operation: &operation,
             expected_terminal_issuer,
-            content_key_commitment: mint.draft().content_key_commitment(),
+            content_key_commitment: draft.content_key_commitment(),
             media_identity: &media_identity,
             protected_init_segment: &protected_init,
             signed_node_contributions: &contributions,
@@ -5908,6 +5922,7 @@ pub(crate) async fn open_runtime_custody_viewer(
             let _ = settle_runtime_custody_viewer_cleanup(
                 data_dir,
                 registry.clone(),
+                &listing,
                 &input.principal_id,
                 mint_id,
                 open_pending.clone(),
@@ -5934,6 +5949,7 @@ pub(crate) async fn open_runtime_custody_viewer(
         let _ = settle_runtime_custody_viewer_cleanup(
             data_dir,
             registry.clone(),
+            &listing,
             &input.principal_id,
             mint_id,
             open_pending,
@@ -5941,7 +5957,7 @@ pub(crate) async fn open_runtime_custody_viewer(
         .await;
         return Err(error);
     }
-    runtime_custody_viewer_public_response(&mint, mint_id, &handle, expires_at)
+    runtime_custody_viewer_public_response(draft.media_identity(), mint_id, &handle, expires_at)
 }
 
 pub(crate) async fn read_runtime_custody_viewer(
@@ -5966,9 +5982,15 @@ pub(crate) async fn read_runtime_custody_viewer(
         anyhow::bail!("Runtime custody viewer session is unavailable");
     }
     let profile_did = load_runtime_custody_profile_did(data_dir, principal_id)?;
-    let mint = runtime_mint_journal(data_dir)
-        .load(mint_id)
-        .map_err(|_| anyhow::anyhow!("Runtime custody mint selection is invalid"))?;
+    let listing = load_runtime_custody_listing(data_dir, mint_id)?
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody viewer session is unavailable"))?;
+    let asset = validate_runtime_custody_viewer_asset(
+        &listing,
+        principal_id,
+        &profile_did,
+        mint_id,
+        &purchase,
+    )?;
     let runtime_session_binding = require_runtime_custody_session_binding(
         principal_id,
         &profile_did,
@@ -5994,7 +6016,7 @@ pub(crate) async fn read_runtime_custody_viewer(
     let now = crate::auth::now_ts();
     let session = match record.lifecycle_status {
         RuntimeCustodyViewerLifecycleStatus::Active if !record.is_expired(now) => {
-            record.to_runtime_viewer_session(&mint)?
+            record.to_runtime_viewer_session(asset.media_identity.encrypted_content())?
         }
         RuntimeCustodyViewerLifecycleStatus::OpenPending
         | RuntimeCustodyViewerLifecycleStatus::Active
@@ -6002,6 +6024,7 @@ pub(crate) async fn read_runtime_custody_viewer(
             let _ = settle_runtime_custody_viewer_cleanup(
                 data_dir,
                 registry.clone(),
+                &listing,
                 principal_id,
                 mint_id,
                 record,
@@ -6021,7 +6044,7 @@ pub(crate) async fn read_runtime_custody_viewer(
                 .map_err(|_| anyhow::anyhow!("Runtime custody viewer media part is invalid"))?,
         );
         if usize::try_from(segment_index).ok()
-            >= Some(mint.draft().media_identity().encrypted_segments().len())
+            >= Some(asset.media_identity.encrypted_segments().len())
         {
             anyhow::bail!("Runtime custody viewer media part is invalid");
         }
@@ -6049,6 +6072,7 @@ pub(crate) async fn read_runtime_custody_viewer(
         let _ = settle_runtime_custody_viewer_cleanup(
             data_dir,
             registry,
+            &listing,
             principal_id,
             mint_id,
             record,
@@ -6086,9 +6110,15 @@ pub(crate) async fn close_runtime_custody_viewer(
         anyhow::bail!("Runtime custody viewer session is unavailable");
     }
     let profile_did = load_runtime_custody_profile_did(data_dir, principal_id)?;
-    let mint = runtime_mint_journal(data_dir)
-        .load(mint_id)
-        .map_err(|_| anyhow::anyhow!("Runtime custody mint selection is invalid"))?;
+    let listing = load_runtime_custody_listing(data_dir, mint_id)?
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody viewer session is unavailable"))?;
+    let asset = validate_runtime_custody_viewer_asset(
+        &listing,
+        principal_id,
+        &profile_did,
+        mint_id,
+        &purchase,
+    )?;
     let runtime_session_binding = require_runtime_custody_session_binding(
         principal_id,
         &profile_did,
@@ -6119,6 +6149,7 @@ pub(crate) async fn close_runtime_custody_viewer(
             let settled = settle_runtime_custody_viewer_cleanup(
                 data_dir,
                 registry.clone(),
+                &listing,
                 principal_id,
                 mint_id,
                 record.clone(),
@@ -6135,7 +6166,8 @@ pub(crate) async fn close_runtime_custody_viewer(
             })
         }
         RuntimeCustodyViewerLifecycleStatus::Active => {
-            let session = record.to_runtime_viewer_session(&mint)?;
+            let session =
+                record.to_runtime_viewer_session(asset.media_identity.encrypted_content())?;
             Some(
                 match close_viewer_session_with_result(
                     &RuntimeDecryptRegistryAdapter::new(registry),
@@ -6301,6 +6333,67 @@ pub(crate) fn load_runtime_custody_purchase(
     Ok(Some(record))
 }
 
+fn validate_runtime_custody_viewer_asset(
+    listing: &RuntimeCustodyListingRecord,
+    principal_id: &str,
+    profile_did: &str,
+    mint_id: Digest32,
+    purchase: &RuntimeCustodyPurchaseRecord,
+) -> anyhow::Result<DecodedRuntimePortableAsset> {
+    let package = &listing.package;
+    let chain_id = package
+        .chain_namespace
+        .strip_prefix("eip155:")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE))?;
+    if purchase.schema != RUNTIME_PURCHASE_SCHEMA_V1
+        || package.mint_id != hex::encode(mint_id.as_bytes())
+        || purchase.principal_id != principal_id
+        || purchase.profile_did != profile_did
+        || purchase.mint_id != package.mint_id
+        || purchase.content_id != package.content_id
+        || purchase.cid != package.content_cid
+        || purchase.listing_sha256 != listing.portable_package_digest()
+        || !purchase
+            .seller_address
+            .eq_ignore_ascii_case(&package.seller_address)
+        || purchase.chain_namespace != package.chain_namespace
+        || purchase.network != package.network
+        || !purchase.ledger.eq_ignore_ascii_case(&package.ledger)
+        || !purchase.token_id.eq_ignore_ascii_case(&package.token_id)
+        || !purchase.operative.eq_ignore_ascii_case(&package.operative)
+        || purchase.price != package.price
+        || !purchase.pay_token.eq_ignore_ascii_case(&package.pay_token)
+        || purchase.buy_stage.chain_namespace != package.chain_namespace
+        || purchase.buy_stage.network != package.network
+        || purchase
+            .payment_processor
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            != package
+                .payment_processor
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+    {
+        anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
+    }
+    let RuntimeCustodyPurchaseProgress::Complete { terminal } = &purchase.progress else {
+        anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
+    };
+    if !terminal.access_evidence.has_access
+        || terminal.access_evidence.network != package.network
+        || terminal.access_evidence.chain_id != chain_id
+        || !terminal
+            .access_evidence
+            .wallet
+            .eq_ignore_ascii_case(&purchase.address)
+        || terminal.access_evidence.content_access_id != package.content_access_id
+    {
+        anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
+    }
+    package.decode_and_validate()
+}
+
 pub(crate) fn persist_runtime_custody_purchase(
     data_dir: &Path,
     purchase: &RuntimeCustodyPurchaseRecord,
@@ -6363,7 +6456,7 @@ fn validate_runtime_custody_viewer_record_identity(
     data_dir: &Path,
     path: &Path,
     record: &RuntimeCustodyViewerRecord,
-) -> anyhow::Result<Digest32> {
+) -> anyhow::Result<(Digest32, RuntimeCustodyListingRecord)> {
     if record.schema != RUNTIME_VIEWER_SCHEMA_V1 {
         anyhow::bail!("viewer record schema is invalid");
     }
@@ -6379,10 +6472,17 @@ fn validate_runtime_custody_viewer_record_identity(
     {
         anyhow::bail!("viewer record identities do not match the durable purchase");
     }
-    let mint = runtime_mint_journal(data_dir)
-        .load(mint_id)
-        .map_err(|_| anyhow::anyhow!("viewer record mint is unavailable"))?;
-    if runtime_protected_content_id(mint.draft().encrypted_content())? != record.content_id {
+    let listing = load_runtime_custody_listing(data_dir, mint_id)?
+        .ok_or_else(|| anyhow::anyhow!("viewer record listing is unavailable"))?;
+    let asset = validate_runtime_custody_viewer_asset(
+        &listing,
+        &record.principal_id,
+        &record.profile_did,
+        mint_id,
+        &purchase,
+    )?;
+    if runtime_protected_content_id(asset.media_identity.encrypted_content())? != record.content_id
+    {
         anyhow::bail!("viewer record content does not match the durable mint");
     }
     let _ = record.audit_request_id()?;
@@ -6390,17 +6490,16 @@ fn validate_runtime_custody_viewer_record_identity(
     if record.expires_at == 0 {
         anyhow::bail!("viewer record expiry is invalid");
     }
-    let max_media_part_index =
-        u32::try_from(mint.draft().media_identity().encrypted_segments().len())
-            .map_err(|_| anyhow::anyhow!("viewer record media position is invalid"))?
-            .saturating_add(1);
+    let max_media_part_index = u32::try_from(asset.media_identity.encrypted_segments().len())
+        .map_err(|_| anyhow::anyhow!("viewer record media position is invalid"))?
+        .saturating_add(1);
     if record.next_media_part_index > max_media_part_index {
         anyhow::bail!("viewer record media position is invalid");
     }
     if record.lifecycle_status != RuntimeCustodyViewerLifecycleStatus::OpenPending {
-        let _ = record.to_runtime_viewer_session(&mint)?;
+        let _ = record.to_runtime_viewer_session(asset.media_identity.encrypted_content())?;
     }
-    Ok(mint_id)
+    Ok((mint_id, listing))
 }
 
 fn persist_runtime_custody_viewer_record(
@@ -6422,17 +6521,25 @@ fn persist_runtime_custody_viewer_record(
 async fn settle_runtime_custody_viewer_cleanup(
     data_dir: &Path,
     registry: Arc<ProviderRegistry>,
+    listing: &RuntimeCustodyListingRecord,
     principal_id: &str,
     mint_id: Digest32,
     mut record: RuntimeCustodyViewerRecord,
 ) -> anyhow::Result<RuntimeCustodyViewerRecord> {
-    let mint = runtime_mint_journal(data_dir)
-        .load(mint_id)
-        .map_err(|_| anyhow::anyhow!("Runtime custody mint selection is invalid"))?;
+    let purchase = load_runtime_custody_purchase(data_dir, principal_id, mint_id)?
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody viewer session is unavailable"))?;
+    let asset = validate_runtime_custody_viewer_asset(
+        listing,
+        principal_id,
+        &record.profile_did,
+        mint_id,
+        &purchase,
+    )?;
     let decrypt = RuntimeDecryptRegistryAdapter::new(registry);
     match record.lifecycle_status {
         RuntimeCustodyViewerLifecycleStatus::OpenPending => {
-            let session = record.to_runtime_viewer_session(&mint)?;
+            let session =
+                record.to_runtime_viewer_session(asset.media_identity.encrypted_content())?;
             let close_result = match record.open_pending_close_result() {
                 Some(RuntimeCustodyOpenPendingCloseResult::Closed) => {
                     RuntimeViewerSessionCloseResult::Closed
@@ -6488,7 +6595,8 @@ async fn settle_runtime_custody_viewer_cleanup(
         }
         RuntimeCustodyViewerLifecycleStatus::Active
         | RuntimeCustodyViewerLifecycleStatus::CleanupPending => {
-            let session = record.to_runtime_viewer_session(&mint)?;
+            let session =
+                record.to_runtime_viewer_session(asset.media_identity.encrypted_content())?;
             match close_viewer_session_with_result(&decrypt, &session).await {
                 Ok(result) => {
                     record.mark_terminal(result, crate::auth::now_ts());
@@ -6579,19 +6687,22 @@ pub async fn reconcile_runtime_custody_viewers_after_decrypt_registration(
                     "Runtime custody viewer reconciliation exceeds unresolved record limit"
                 );
             }
-            let mint_id = validate_runtime_custody_viewer_record_identity(data_dir, &path, &record)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "Runtime custody viewer reconciliation found invalid {:?} record at {}: {}",
-                        lifecycle_status,
-                        path.display(),
-                        error
-                    )
-                })?;
+            let (mint_id, listing) = validate_runtime_custody_viewer_record_identity(
+                data_dir, &path, &record,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Runtime custody viewer reconciliation found invalid {:?} record at {}: {}",
+                    lifecycle_status,
+                    path.display(),
+                    error
+                )
+            })?;
             let principal_id = record.principal_id.clone();
             if let Err(error) = settle_runtime_custody_viewer_cleanup(
                 data_dir,
                 registry.clone(),
+                &listing,
                 &principal_id,
                 mint_id,
                 record,
@@ -6610,7 +6721,8 @@ pub async fn reconcile_runtime_custody_viewers_after_decrypt_registration(
 }
 
 fn reconstructed_buy_receipt(
-    mint: &elastos_protected_content_runtime::PersistedRuntimeMint,
+    draft: &RuntimeMintDraft,
+    availability: &RuntimeVerifiedContentAvailability,
     purchase: &RuntimeCustodyPurchaseRecord,
     current_profile_did: &str,
 ) -> anyhow::Result<elastos_protected_content_runtime::RuntimeBuyReceipt> {
@@ -6627,10 +6739,10 @@ fn reconstructed_buy_receipt(
     };
     let effect = RuntimeVerifiedPurchaseEffect::new(
         RuntimeProtectedContentPurchaseIntent::new(
-            mint.draft().mint_id(),
-            mint.draft().encrypted_content().clone(),
-            mint.draft().key_envelope().clone(),
-            mint.draft().policy().clone(),
+            draft.mint_id(),
+            draft.encrypted_content().clone(),
+            draft.key_envelope().clone(),
+            draft.policy().clone(),
             RightsActionV1::View,
             purchase.chain_namespace.clone(),
             purchase.network.clone(),
@@ -6652,7 +6764,14 @@ fn reconstructed_buy_receipt(
         terminal.confirmed_at,
     )
     .map_err(runtime_open_error)?;
-    bind_buy(mint, &purchase.principal_id, profile_identity, &effect).map_err(runtime_open_error)
+    draft
+        .bind_verified_buy(
+            availability,
+            &purchase.principal_id,
+            profile_identity,
+            &effect,
+        )
+        .map_err(runtime_open_error)
 }
 
 struct RuntimeReleaseWalletInvocation<'a> {
@@ -7005,12 +7124,11 @@ fn valid_runtime_viewer_launch_id(value: &str) -> bool {
 }
 
 fn runtime_custody_viewer_public_response(
-    mint: &PersistedRuntimeMint,
+    media_identity: &CencFmp4MediaIdentityV1,
     mint_id: Digest32,
     viewer_session_handle: &[u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
     expires_at: u64,
 ) -> anyhow::Result<Value> {
-    let media_identity = mint.draft().media_identity();
     let segment_count = u32::try_from(media_identity.encrypted_segments().len())
         .map_err(|_| anyhow::anyhow!("Runtime custody viewer session is unavailable"))?;
     Ok(json!({
