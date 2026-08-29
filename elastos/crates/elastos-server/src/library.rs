@@ -114,6 +114,8 @@ struct LibraryPublishRecord {
     content_security: Value,
     receipt: Value,
     availability: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    listing_uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2039,6 +2041,7 @@ async fn library_publish(
             content_security: facts.content_security,
             receipt: facts.receipt,
             availability: facts.availability,
+            listing_uri: facts.listing_uri,
         };
         write_publish_record(data_dir, principal_id, &record)?;
         let object = library_object(data_dir, principal_id, &target.uri)?;
@@ -2051,6 +2054,7 @@ async fn library_publish(
                 "cid": facts.content_cid,
                 "content_id": facts.content_id,
                 "mint_id": hex::encode(facts.mint_id.as_bytes()),
+                "listing_uri": record.listing_uri,
                 "availability": record.availability,
                 "object": object,
             }),
@@ -2062,6 +2066,7 @@ async fn library_publish(
             "receipt": record.receipt,
             "availability": record.availability,
             "content_security": record.content_security,
+            "listing_uri": record.listing_uri,
             "published_at": record.published_at,
         }));
     }
@@ -2127,6 +2132,7 @@ async fn library_publish(
         content_security,
         receipt,
         availability,
+        listing_uri: None,
     };
     write_publish_record(data_dir, principal_id, &record)?;
     let object = library_object(data_dir, principal_id, &target.uri)?;

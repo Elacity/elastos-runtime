@@ -3525,6 +3525,7 @@ pub(crate) struct RuntimeCustodyLibraryPublishFacts {
     pub availability: Value,
     pub receipt: Value,
     pub content_security: Value,
+    pub listing_uri: Option<String>,
 }
 
 async fn prepare_runtime_custody_library_source(
@@ -4369,6 +4370,7 @@ fn runtime_custody_library_publish_facts(
             "mint_id": mint_id_hex,
             "required_providers": [],
         }),
+        listing_uri: None,
     }
 }
 
@@ -4408,6 +4410,8 @@ pub(crate) struct RuntimePortableListingPackage {
 pub(crate) enum RuntimeCustodyListingOrigin {
     LocalCreator {
         principal_id: String,
+        listing_uri: String,
+        package_sha256: String,
     },
     Imported {
         listing_uri: String,
@@ -4417,10 +4421,19 @@ pub(crate) enum RuntimeCustodyListingOrigin {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeCustodyListingAvailabilitySummary {
+    checked_at: u64,
+    observed_replicas: u32,
+    receipt_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeCustodyListingRecord {
     pub(crate) schema: String,
     pub(crate) origin: RuntimeCustodyListingOrigin,
     pub(crate) package: RuntimePortableListingPackage,
+    pub(crate) availability: RuntimeCustodyListingAvailabilitySummary,
 }
 
 impl RuntimeCustodyListingRecord {
@@ -4430,26 +4443,54 @@ impl RuntimeCustodyListingRecord {
         }
         self.package.decode_and_validate()?;
         match &self.origin {
-            RuntimeCustodyListingOrigin::LocalCreator { principal_id } => {
+            RuntimeCustodyListingOrigin::LocalCreator {
+                principal_id,
+                listing_uri,
+                package_sha256,
+            } => {
                 validate_runtime_custody_public_text(principal_id)?;
+                validate_runtime_portable_listing_origin(
+                    listing_uri,
+                    package_sha256,
+                    &self.package,
+                )?;
             }
             RuntimeCustodyListingOrigin::Imported {
                 listing_uri,
                 package_sha256,
             } => {
-                if listing_uri
-                    != &format!("elastos://{}", runtime_portable_listing_cid(listing_uri)?)
-                    || package_sha256.len() != 64
-                    || hex::decode(package_sha256).map_or(true, |bytes| bytes.len() != 32)
-                    || package_sha256
-                        != &hex::encode(sha2::Sha256::digest(serde_json::to_vec(&self.package)?))
-                {
-                    anyhow::bail!("Runtime custody listing is invalid");
-                }
+                validate_runtime_portable_listing_origin(
+                    listing_uri,
+                    package_sha256,
+                    &self.package,
+                )?;
             }
+        }
+        if self.availability.checked_at == 0
+            || self.availability.observed_replicas < PROTECTED_CONTENT_MIN_REPLICAS
+            || self.availability.receipt_digest.len() != 64
+            || hex::decode(&self.availability.receipt_digest)
+                .map_or(true, |bytes| bytes.len() != 32)
+        {
+            anyhow::bail!("Runtime custody listing is invalid");
         }
         Ok(())
     }
+}
+
+fn validate_runtime_portable_listing_origin(
+    listing_uri: &str,
+    package_sha256: &str,
+    package: &RuntimePortableListingPackage,
+) -> anyhow::Result<()> {
+    if listing_uri != format!("elastos://{}", runtime_portable_listing_cid(listing_uri)?)
+        || package_sha256.len() != 64
+        || hex::decode(package_sha256).map_or(true, |bytes| bytes.len() != 32)
+        || package_sha256 != hex::encode(sha2::Sha256::digest(serde_json::to_vec(package)?))
+    {
+        anyhow::bail!("Runtime custody listing is invalid");
+    }
+    Ok(())
 }
 
 struct DecodedRuntimePortableAsset {
@@ -4706,7 +4747,7 @@ async fn verify_runtime_portable_media(
     registry: &Arc<ProviderRegistry>,
     package: &RuntimePortableListingPackage,
     decoded: &DecodedRuntimePortableAsset,
-) -> anyhow::Result<Digest32> {
+) -> anyhow::Result<(Digest32, RuntimeCustodyListingAvailabilitySummary)> {
     let receipt = fetch_content_availability_receipt(registry, &package.content_cid).await?;
     let signed_receipt: crate::content::SignedAvailabilityReceipt =
         serde_json::from_slice(&receipt)
@@ -4729,7 +4770,7 @@ async fn verify_runtime_portable_media(
         &decoded.media_identity,
     )
     .await?;
-    verify_protected_content_receipt(
+    let availability = verify_protected_content_receipt(
         &package.content_cid,
         &manifest,
         &receipt,
@@ -4764,7 +4805,14 @@ async fn verify_runtime_portable_media(
     if draft.mint_id() != parse_mint_id_hex(&package.mint_id)? {
         anyhow::bail!("Runtime custody portable listing is invalid");
     }
-    Ok(draft.mint_id())
+    Ok((
+        draft.mint_id(),
+        RuntimeCustodyListingAvailabilitySummary {
+            checked_at: availability.checked_at(),
+            observed_replicas: availability.observed_replicas(),
+            receipt_digest: hex::encode(availability.receipt_digest().as_bytes()),
+        },
+    ))
 }
 
 pub(crate) async fn import_runtime_custody_listing(
@@ -4785,7 +4833,15 @@ pub(crate) async fn import_runtime_custody_listing(
     let decoded = package.decode_and_validate()?;
     if manifest.schema != "elastos.content.object.manifest/v1"
         || manifest.kind != "protected-content-listing"
-        || !manifest.links.is_empty()
+        || manifest.links.len() != 2
+        || !manifest
+            .links
+            .iter()
+            .any(|link| link.rel == "encrypted-content" && link.cid == package.content_cid)
+        || !manifest
+            .links
+            .iter()
+            .any(|link| link.rel == "metadata" && link.cid == package.metadata_cid)
         || manifest.object_did.as_deref() != Some(package.content_id.as_str())
         || manifest.publisher_did.as_deref() != Some(package.publisher_profile_did.as_str())
     {
@@ -4793,7 +4849,8 @@ pub(crate) async fn import_runtime_custody_listing(
     }
     verify_runtime_portable_metadata(&registry, &package, &decoded).await?;
     verify_runtime_portable_chain(&registry, &package).await?;
-    let verified = verify_runtime_portable_media(data_dir, &registry, &package, &decoded).await?;
+    let (verified, availability) =
+        verify_runtime_portable_media(data_dir, &registry, &package, &decoded).await?;
     let package_sha256 = hex::encode(sha2::Sha256::digest(&bytes));
     let expected = RuntimeCustodyListingRecord {
         schema: RUNTIME_LISTING_SCHEMA_V1.to_string(),
@@ -4802,11 +4859,20 @@ pub(crate) async fn import_runtime_custody_listing(
             package_sha256,
         },
         package,
+        availability,
     };
     expected.validate()?;
     if let Some(existing) = load_runtime_custody_listing(data_dir, verified)? {
-        if existing != expected {
+        if existing.schema != expected.schema
+            || existing.origin != expected.origin
+            || existing.package != expected.package
+            || (existing.availability.checked_at == expected.availability.checked_at
+                && existing.availability != expected.availability)
+        {
             anyhow::bail!("Runtime custody listing is invalid");
+        }
+        if expected.availability.checked_at > existing.availability.checked_at {
+            persist_runtime_custody_listing(data_dir, &expected)?;
         }
     } else {
         persist_runtime_custody_listing(data_dir, &expected)?;
@@ -5250,7 +5316,7 @@ fn runtime_custody_listing_summary(
     listing_bytes: &[u8],
     record: &RuntimeCustodyListingRecord,
 ) -> anyhow::Result<Value> {
-    let availability = runtime_custody_listing_availability(data_dir, record)?;
+    let availability = runtime_custody_listing_availability(record);
     let access_state =
         runtime_custody_listing_access_state(data_dir, principal_id, listing_bytes, record)?;
     let media = record.package.decode_and_validate()?.media_identity;
@@ -5271,33 +5337,17 @@ fn runtime_custody_listing_summary(
     }))
 }
 
-fn runtime_custody_listing_availability(
-    data_dir: &Path,
-    record: &RuntimeCustodyListingRecord,
-) -> anyhow::Result<Value> {
-    let mint_id = parse_mint_id_hex(&record.package.mint_id)?;
-    let mint = runtime_mint_journal(data_dir)
-        .load(mint_id)
-        .map_err(|_| anyhow::anyhow!("Runtime custody listing is invalid"))?;
-    let evidence = mint
-        .content_availability()
-        .ok_or_else(|| anyhow::anyhow!("Runtime custody listing is invalid"))?;
-    let expected_content_id = runtime_protected_content_id(mint.draft().encrypted_content())
-        .map_err(|_| anyhow::anyhow!("Runtime custody listing is invalid"))?;
-    if record.package.content_id != expected_content_id
-        || record.package.content_cid != evidence.content_cid()
-    {
-        anyhow::bail!("Runtime custody listing is invalid");
-    }
-    Ok(json!({
+fn runtime_custody_listing_availability(record: &RuntimeCustodyListingRecord) -> Value {
+    json!({
         "schema": RUNTIME_CUSTODY_LISTING_AVAILABILITY_SCHEMA_V1,
         "status": "last_verified_receipt",
-        "checked_at": evidence.checked_at(),
-        "required_replicas": evidence.required_replicas(),
-        "observed_replicas": evidence.observed_replicas(),
+        "checked_at": record.availability.checked_at,
+        "required_replicas": PROTECTED_CONTENT_MIN_REPLICAS,
+        "observed_replicas": record.availability.observed_replicas,
+        "receipt_digest": record.availability.receipt_digest,
         "recheck_before_buy": true,
         "recheck_before_open": true,
-    }))
+    })
 }
 
 fn runtime_custody_listing_access_state(
@@ -5309,7 +5359,8 @@ fn runtime_custody_listing_access_state(
     if matches!(
         &record.origin,
         RuntimeCustodyListingOrigin::LocalCreator {
-            principal_id: creator
+            principal_id: creator,
+            ..
         } if creator == principal_id
     ) {
         return Ok(RUNTIME_CUSTODY_LISTING_ACCESS_CREATOR);
@@ -6198,13 +6249,13 @@ pub(crate) fn load_runtime_custody_listing_bytes(
     Ok(Some(fs::read(path)?))
 }
 
-pub(crate) fn persist_runtime_custody_creator_listing(
+pub(crate) fn runtime_custody_creator_listing_package(
     data_dir: &Path,
     mint: &PersistedRuntimeMint,
     facts: &RuntimeCustodyLibraryPublishFacts,
     publisher_principal_id: &str,
     terminal: &RuntimeMintCreatorTerminalEvidence,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RuntimePortableListingPackage> {
     let mint_id = mint.draft().mint_id();
     let availability = mint
         .content_availability()
@@ -6213,44 +6264,65 @@ pub(crate) fn persist_runtime_custody_creator_listing(
     if availability.publisher_identity() != publisher_profile_did {
         anyhow::bail!("Runtime custody listing is invalid");
     }
+    Ok(RuntimePortableListingPackage {
+        schema: RUNTIME_PORTABLE_LISTING_SCHEMA_V1.to_string(),
+        mint_id: hex::encode(mint_id.as_bytes()),
+        content_id: facts.content_id.clone(),
+        content_access_id: format!(
+            "0x{}",
+            hex::encode(mint.draft().content_access_id().as_bytes())
+        ),
+        content_cid: facts.content_cid.clone(),
+        metadata_cid: terminal.metadata_cid().to_string(),
+        token_uri: terminal.token_uri().to_string(),
+        publisher_profile_did,
+        display_name: facts.display_name.clone(),
+        media_identity_base64: base64::engine::general_purpose::STANDARD
+            .encode(mint.draft().media_identity().canonical_bytes()?),
+        key_envelope_identity_base64: base64::engine::general_purpose::STANDARD
+            .encode(mint.draft().key_envelope().canonical_bytes()?),
+        rights_policy_identity_base64: base64::engine::general_purpose::STANDARD
+            .encode(mint.draft().policy().canonical_bytes()?),
+        content_key_commitment_base64: base64::engine::general_purpose::STANDARD
+            .encode(mint.draft().content_key_commitment().as_bytes()),
+        quantity: terminal.quantity().to_string(),
+        seller_address: terminal.seller().to_ascii_lowercase(),
+        chain_namespace: terminal.chain_namespace().to_string(),
+        network: terminal.network().to_string(),
+        ledger: terminal.ledger().to_ascii_lowercase(),
+        token_id: terminal.token_id().to_ascii_lowercase(),
+        operative: terminal.operative().to_ascii_lowercase(),
+        price: terminal.price().to_string(),
+        pay_token: terminal.pay_token().to_ascii_lowercase(),
+        payment_processor: terminal.payment_processor().map(str::to_ascii_lowercase),
+        mint_transaction_hash: terminal.transaction_hash().to_ascii_lowercase(),
+        published_at: terminal.published_at(),
+    })
+}
+
+pub(crate) fn persist_runtime_custody_creator_listing(
+    data_dir: &Path,
+    mint: &PersistedRuntimeMint,
+    package: RuntimePortableListingPackage,
+    publisher_principal_id: &str,
+    listing_uri: String,
+) -> anyhow::Result<()> {
+    let mint_id = mint.draft().mint_id();
+    let evidence = mint
+        .content_availability()
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody listing is invalid"))?;
     let expected = RuntimeCustodyListingRecord {
         schema: RUNTIME_LISTING_SCHEMA_V1.to_string(),
         origin: RuntimeCustodyListingOrigin::LocalCreator {
             principal_id: publisher_principal_id.to_string(),
+            package_sha256: hex::encode(sha2::Sha256::digest(serde_json::to_vec(&package)?)),
+            listing_uri,
         },
-        package: RuntimePortableListingPackage {
-            schema: RUNTIME_PORTABLE_LISTING_SCHEMA_V1.to_string(),
-            mint_id: hex::encode(mint_id.as_bytes()),
-            content_id: facts.content_id.clone(),
-            content_access_id: format!(
-                "0x{}",
-                hex::encode(mint.draft().content_access_id().as_bytes())
-            ),
-            content_cid: facts.content_cid.clone(),
-            metadata_cid: terminal.metadata_cid().to_string(),
-            token_uri: terminal.token_uri().to_string(),
-            publisher_profile_did,
-            display_name: facts.display_name.clone(),
-            media_identity_base64: base64::engine::general_purpose::STANDARD
-                .encode(mint.draft().media_identity().canonical_bytes()?),
-            key_envelope_identity_base64: base64::engine::general_purpose::STANDARD
-                .encode(mint.draft().key_envelope().canonical_bytes()?),
-            rights_policy_identity_base64: base64::engine::general_purpose::STANDARD
-                .encode(mint.draft().policy().canonical_bytes()?),
-            content_key_commitment_base64: base64::engine::general_purpose::STANDARD
-                .encode(mint.draft().content_key_commitment().as_bytes()),
-            quantity: terminal.quantity().to_string(),
-            seller_address: terminal.seller().to_ascii_lowercase(),
-            chain_namespace: terminal.chain_namespace().to_string(),
-            network: terminal.network().to_string(),
-            ledger: terminal.ledger().to_ascii_lowercase(),
-            token_id: terminal.token_id().to_ascii_lowercase(),
-            operative: terminal.operative().to_ascii_lowercase(),
-            price: terminal.price().to_string(),
-            pay_token: terminal.pay_token().to_ascii_lowercase(),
-            payment_processor: terminal.payment_processor().map(str::to_ascii_lowercase),
-            mint_transaction_hash: terminal.transaction_hash().to_ascii_lowercase(),
-            published_at: terminal.published_at(),
+        package,
+        availability: RuntimeCustodyListingAvailabilitySummary {
+            checked_at: evidence.checked_at(),
+            observed_replicas: evidence.observed_replicas(),
+            receipt_digest: hex::encode(evidence.receipt_digest().as_bytes()),
         },
     };
     expected.validate()?;

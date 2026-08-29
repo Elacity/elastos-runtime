@@ -2597,6 +2597,56 @@ async fn publish_runtime_custody_creator_metadata(
     ))
 }
 
+async fn publish_runtime_custody_creator_listing(
+    registry: &ProviderRegistry,
+    data_dir: &std::path::Path,
+    mint: &elastos_protected_content_runtime::PersistedRuntimeMint,
+    facts: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
+    publisher_principal_id: &str,
+    terminal: &elastos_protected_content_runtime::RuntimeMintCreatorTerminalEvidence,
+) -> anyhow::Result<String> {
+    let package = crate::protected_content_runtime::runtime_custody_creator_listing_package(
+        data_dir,
+        mint,
+        facts,
+        publisher_principal_id,
+        terminal,
+    )?;
+    let parent = data_dir.join("protected-content");
+    std::fs::create_dir_all(&parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix("creator-listing-")
+        .tempdir_in(&parent)?;
+    std::fs::write(
+        staging.path().join("listing.json"),
+        serde_json::to_vec(&package)?,
+    )?;
+    let links = [
+        ("metadata".to_string(), package.metadata_cid.clone()),
+        ("encrypted-content".to_string(), package.content_cid.clone()),
+    ];
+    let requirements = crate::content::ContentPublishRequirements::new(3, true)?;
+    let cid = crate::content::publish_directory_via_provider_with_kind_links_and_requirements(
+        registry,
+        staging.path(),
+        "protected-content-listing",
+        Some(&package.content_id),
+        Some(&package.publisher_profile_did),
+        &links,
+        requirements,
+    )
+    .await?;
+    let listing_uri = format!("elastos://{cid}");
+    crate::protected_content_runtime::persist_runtime_custody_creator_listing(
+        data_dir,
+        mint,
+        package,
+        publisher_principal_id,
+        listing_uri.clone(),
+    )?;
+    Ok(listing_uri)
+}
+
 fn runtime_custody_metadata_name(object_uri: &str) -> &str {
     object_uri
         .rsplit('/')
@@ -3224,7 +3274,7 @@ async fn runtime_custody_publish_creator_tail_from_facts(
     authority: &RuntimeWalletAuthority,
     registry: Arc<ProviderRegistry>,
     input: crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput,
-    facts: crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
+    mut facts: crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
 ) -> anyhow::Result<crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts> {
     let mint_journal = crate::protected_content_runtime::runtime_mint_journal(&state.data_dir);
     let mut mint = mint_journal
@@ -3258,13 +3308,17 @@ async fn runtime_custody_publish_creator_tail_from_facts(
             {
                 anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
             }
-            crate::protected_content_runtime::persist_runtime_custody_creator_listing(
-                &state.data_dir,
-                &mint,
-                &facts,
-                &input.principal_id,
-                terminal,
-            )?;
+            facts.listing_uri = Some(
+                publish_runtime_custody_creator_listing(
+                    registry.as_ref(),
+                    &state.data_dir,
+                    &mint,
+                    &facts,
+                    &input.principal_id,
+                    terminal,
+                )
+                .await?,
+            );
             return Ok(facts);
         }
     }
@@ -3369,13 +3423,17 @@ async fn runtime_custody_publish_creator_tail_from_facts(
     mint = mint_journal
         .mark_creator_completed(facts.mint_id, terminal.clone())
         .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
-    crate::protected_content_runtime::persist_runtime_custody_creator_listing(
-        &state.data_dir,
-        &mint,
-        &facts,
-        &input.principal_id,
-        &terminal,
-    )?;
+    facts.listing_uri = Some(
+        publish_runtime_custody_creator_listing(
+            registry.as_ref(),
+            &state.data_dir,
+            &mint,
+            &facts,
+            &input.principal_id,
+            &terminal,
+        )
+        .await?,
+    );
     Ok(facts)
 }
 

@@ -61,6 +61,15 @@ fn mock_content_publish_request_count() -> usize {
     mock_content_publish_requests().lock().unwrap().len()
 }
 
+fn mock_runtime_listing_publish_failure() -> &'static std::sync::Mutex<bool> {
+    static FAIL: std::sync::OnceLock<std::sync::Mutex<bool>> = std::sync::OnceLock::new();
+    FAIL.get_or_init(|| std::sync::Mutex::new(false))
+}
+
+fn set_mock_runtime_listing_publish_failure(fail: bool) {
+    *mock_runtime_listing_publish_failure().lock().unwrap() = fail;
+}
+
 fn mock_published_protected_content(
 ) -> &'static std::sync::Mutex<Option<MockPublishedProtectedContentState>> {
     static STATE: std::sync::OnceLock<
@@ -124,6 +133,7 @@ fn seed_mock_immutable_content_object(
     bytes: Vec<u8>,
     object_did: Option<&str>,
     publisher_did: Option<&str>,
+    links: Vec<crate::content::ContentObjectLink>,
 ) {
     let file = mock_protected_content_file(path, &bytes);
     let manifest = crate::content::ContentObjectManifest {
@@ -131,7 +141,7 @@ fn seed_mock_immutable_content_object(
         kind: kind.to_string(),
         content_digest: mock_protected_content_manifest_digest(std::slice::from_ref(&file)),
         files: vec![file],
-        links: Vec::new(),
+        links,
         object_did: object_did.map(str::to_string),
         publisher_did: publisher_did.map(str::to_string),
     };
@@ -233,6 +243,21 @@ fn seed_mock_published_protected_content(
         files.insert(path.clone(), segment.clone());
     }
     store_mock_published_protected_content(object_identity, publisher_did, files, checked_at);
+}
+
+fn advance_mock_published_protected_content_receipt() {
+    let mut published = mock_published_protected_content().lock().unwrap();
+    let state = published.as_mut().unwrap();
+    state.receipt.payload.checked_at += 1;
+    let payload_bytes =
+        serde_json::to_string(&serde_json::to_value(&state.receipt.payload).unwrap()).unwrap();
+    let (signature, signer_did) = crate::crypto::domain_separated_sign(
+        &mock_protected_content_provider_signing_key(),
+        "elastos.content.availability.receipt.v1",
+        payload_bytes.as_bytes(),
+    );
+    state.receipt.signature = signature;
+    state.receipt.signer_did = signer_did;
 }
 
 fn mock_protected_content_chain_mode() -> &'static std::sync::Mutex<MockProtectedContentChainMode> {
@@ -1275,6 +1300,14 @@ impl Provider for MockContentProvider {
                         .lock()
                         .unwrap()
                         .push(request.clone());
+                }
+                if request.get("object_kind").and_then(Value::as_str)
+                    == Some("protected-content-listing")
+                    && *mock_runtime_listing_publish_failure().lock().unwrap()
+                {
+                    return Err(ProviderError::Provider(
+                        "mock protected content listing publish failed".to_string(),
+                    ));
                 }
                 if request.get("object_kind").and_then(|value| value.as_str()) == Some("sealed") {
                     validate_mock_sealed_publish_request(request)?;

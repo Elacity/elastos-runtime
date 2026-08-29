@@ -1151,44 +1151,54 @@ fn runtime_custody_listing_record_for_test(
     let draft = mint_draft_for_composition_journal_test();
     let publisher_profile_did = derived_device_key_for_seed(0x66).1;
     let content_id = super::runtime_protected_content_id(draft.encrypted_content()).unwrap();
+    let package = super::RuntimePortableListingPackage {
+        schema: super::RUNTIME_PORTABLE_LISTING_SCHEMA_V1.to_string(),
+        mint_id: hex::encode(mint_id.as_bytes()),
+        content_id,
+        content_access_id: format!("0x{}", hex::encode(draft.content_access_id().as_bytes())),
+        content_cid: ContentAvailabilityTestProvider::CID.to_string(),
+        metadata_cid: ContentAvailabilityTestProvider::CID.to_string(),
+        token_uri: format!(
+            "ipfs://{}/metadata.json",
+            ContentAvailabilityTestProvider::CID
+        ),
+        publisher_profile_did,
+        display_name: display_name.to_string(),
+        media_identity_base64: base64::engine::general_purpose::STANDARD
+            .encode(draft.media_identity().canonical_bytes().unwrap()),
+        key_envelope_identity_base64: base64::engine::general_purpose::STANDARD
+            .encode(draft.key_envelope().canonical_bytes().unwrap()),
+        rights_policy_identity_base64: base64::engine::general_purpose::STANDARD
+            .encode(draft.policy().canonical_bytes().unwrap()),
+        content_key_commitment_base64: base64::engine::general_purpose::STANDARD
+            .encode(draft.content_key_commitment().as_bytes()),
+        quantity: "0x2".to_string(),
+        seller_address: "0x0000000000000000000000000000000000000011".to_string(),
+        chain_namespace: "eip155:8453".to_string(),
+        network: "base-mainnet".to_string(),
+        ledger: "0x0000000000000000000000000000000000000022".to_string(),
+        token_id: "0x1".to_string(),
+        operative: "0x0000000000000000000000000000000000000033".to_string(),
+        price: "0x5".to_string(),
+        pay_token: "0x0000000000000000000000000000000000000044".to_string(),
+        payment_processor: Some("0x0000000000000000000000000000000000000055".to_string()),
+        mint_transaction_hash: format!("0x{}", hex::encode([0x68; 32])),
+        published_at,
+    };
     super::RuntimeCustodyListingRecord {
         schema: super::RUNTIME_LISTING_SCHEMA_V1.to_string(),
         origin: super::RuntimeCustodyListingOrigin::LocalCreator {
             principal_id: publisher_principal_id.to_string(),
+            listing_uri: format!("elastos://{}", ContentAvailabilityTestProvider::CID),
+            package_sha256: hex::encode(sha2::Sha256::digest(
+                serde_json::to_vec(&package).unwrap(),
+            )),
         },
-        package: super::RuntimePortableListingPackage {
-            schema: super::RUNTIME_PORTABLE_LISTING_SCHEMA_V1.to_string(),
-            mint_id: hex::encode(mint_id.as_bytes()),
-            content_id,
-            content_access_id: format!("0x{}", hex::encode(draft.content_access_id().as_bytes())),
-            content_cid: ContentAvailabilityTestProvider::CID.to_string(),
-            metadata_cid: ContentAvailabilityTestProvider::CID.to_string(),
-            token_uri: format!(
-                "ipfs://{}/metadata.json",
-                ContentAvailabilityTestProvider::CID
-            ),
-            publisher_profile_did,
-            display_name: display_name.to_string(),
-            media_identity_base64: base64::engine::general_purpose::STANDARD
-                .encode(draft.media_identity().canonical_bytes().unwrap()),
-            key_envelope_identity_base64: base64::engine::general_purpose::STANDARD
-                .encode(draft.key_envelope().canonical_bytes().unwrap()),
-            rights_policy_identity_base64: base64::engine::general_purpose::STANDARD
-                .encode(draft.policy().canonical_bytes().unwrap()),
-            content_key_commitment_base64: base64::engine::general_purpose::STANDARD
-                .encode(draft.content_key_commitment().as_bytes()),
-            quantity: "0x2".to_string(),
-            seller_address: "0x0000000000000000000000000000000000000011".to_string(),
-            chain_namespace: "eip155:8453".to_string(),
-            network: "base-mainnet".to_string(),
-            ledger: "0x0000000000000000000000000000000000000022".to_string(),
-            token_id: "0x1".to_string(),
-            operative: "0x0000000000000000000000000000000000000033".to_string(),
-            price: "0x5".to_string(),
-            pay_token: "0x0000000000000000000000000000000000000044".to_string(),
-            payment_processor: Some("0x0000000000000000000000000000000000000055".to_string()),
-            mint_transaction_hash: format!("0x{}", hex::encode([0x68; 32])),
-            published_at,
+        package,
+        availability: super::RuntimeCustodyListingAvailabilitySummary {
+            checked_at: NOW,
+            observed_replicas: 3,
+            receipt_digest: hex::encode([0x67; 32]),
         },
     }
 }
@@ -1307,7 +1317,6 @@ async fn runtime_custody_listings_project_public_summary_and_access_state() {
     let mint = runtime_mint_journal(&harness.data_dir)
         .load(harness.mint_id)
         .unwrap();
-    let availability = mint.content_availability().unwrap();
     let buyer_principal_id = "person:local:buyer";
     install_profile_authority_keeping_device_key(&harness.data_dir, buyer_principal_id);
     let buyer_profile_did = load_profile_did_for_test(&harness.data_dir, buyer_principal_id);
@@ -1353,9 +1362,10 @@ async fn runtime_custody_listings_project_public_summary_and_access_state() {
     let expected_availability = json!({
         "schema": super::RUNTIME_CUSTODY_LISTING_AVAILABILITY_SCHEMA_V1,
         "status": "last_verified_receipt",
-        "checked_at": availability.checked_at(),
-        "required_replicas": availability.required_replicas(),
-        "observed_replicas": availability.observed_replicas(),
+        "checked_at": NOW,
+        "required_replicas": 3,
+        "observed_replicas": 3,
+        "receipt_digest": hex::encode([0x67; 32]),
         "recheck_before_buy": true,
         "recheck_before_open": true,
     });

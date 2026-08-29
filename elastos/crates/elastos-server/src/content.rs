@@ -2484,6 +2484,27 @@ pub(crate) async fn publish_directory_via_provider_with_kind_and_requirements(
     .await
 }
 
+pub(crate) async fn publish_directory_via_provider_with_kind_links_and_requirements(
+    registry: &ProviderRegistry,
+    dir: &Path,
+    object_kind: &str,
+    object_did: Option<&str>,
+    publisher_did: Option<&str>,
+    links: &[(String, String)],
+    requirements: ContentPublishRequirements,
+) -> anyhow::Result<String> {
+    publish_directory_via_provider_impl(
+        registry,
+        dir,
+        object_kind,
+        object_did,
+        publisher_did,
+        links,
+        Some(requirements),
+    )
+    .await
+}
+
 pub async fn publish_directory_via_provider_with_kind_and_links(
     registry: &ProviderRegistry,
     dir: &Path,
@@ -8276,8 +8297,15 @@ fn directory_object_manifest(
 
 fn validate_content_object_kind(kind: &str) -> Result<String, ProviderError> {
     match kind {
-        "capsule" | "directory" | "document" | "protected-content" | "release" | "sealed"
-        | "share" | "site" => Ok(kind.to_string()),
+        "capsule"
+        | "directory"
+        | "document"
+        | "protected-content"
+        | "protected-content-listing"
+        | "release"
+        | "sealed"
+        | "share"
+        | "site" => Ok(kind.to_string()),
         _ => Err(ProviderError::Provider(format!(
             "unsupported content object kind: {kind}"
         ))),
@@ -10839,6 +10867,14 @@ mod tests {
         assert!(invalid_link_cid
             .to_string()
             .contains("invalid content object link cid"));
+    }
+
+    #[test]
+    fn content_object_kind_accepts_protected_content_listing() {
+        assert_eq!(
+            validate_content_object_kind("protected-content-listing").unwrap(),
+            "protected-content-listing"
+        );
     }
 
     #[tokio::test]

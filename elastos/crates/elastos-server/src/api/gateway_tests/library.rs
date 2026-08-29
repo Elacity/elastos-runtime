@@ -28,6 +28,8 @@ fn protected_content_gateway_mock_test_guard() -> &'static tokio::sync::Mutex<()
 }
 
 const ELACITY_PLAYER_CAPSULE_ID_FOR_TEST: &str = "elacity-player";
+const RUNTIME_PORTABLE_LISTING_TEST_CID: &str =
+    "bafybeibwzif2r5tn7z7cq4f5a2mmepmab4s4m5a2hqu5v4f4uzkd3t2u7m";
 
 async fn post_library(
     app: axum::Router,
@@ -452,6 +454,7 @@ fn seed_completed_runtime_custody_mint(
             "mode": "runtime_custody",
             "access": "buyer_purchase_required"
         }),
+        listing_uri: None,
     }
 }
 
@@ -489,12 +492,20 @@ fn seed_runtime_custody_creator_listing_for_buy(
         crate::auth::now_ts(),
     )
     .unwrap();
-    crate::protected_content_runtime::persist_runtime_custody_creator_listing(
+    let package = crate::protected_content_runtime::runtime_custody_creator_listing_package(
         data_dir,
         &mint,
         facts,
         publisher_principal_id,
         &terminal,
+    )
+    .unwrap();
+    crate::protected_content_runtime::persist_runtime_custody_creator_listing(
+        data_dir,
+        &mint,
+        package,
+        publisher_principal_id,
+        format!("elastos://{RUNTIME_PORTABLE_LISTING_TEST_CID}"),
     )
     .unwrap();
     crate::protected_content_runtime::load_runtime_custody_listing(data_dir, facts.mint_id)
@@ -6172,6 +6183,7 @@ async fn test_runtime_custody_creator_tail_pending_or_failed_never_persists_list
         .await
         .unwrap();
     reset_mock_content_publish_requests();
+    set_mock_runtime_listing_publish_failure(false);
     reset_mock_protected_content_chain_mode();
     reset_mock_protected_content_purchase_fixture();
 
@@ -6235,6 +6247,7 @@ async fn test_runtime_custody_creator_tail_pending_or_failed_never_persists_list
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
+        listing_uri: None,
     };
     let err = runtime_custody_publish_creator_tail_for_test(
         &state,
@@ -6276,6 +6289,7 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
         .await
         .unwrap();
     reset_mock_content_publish_requests();
+    set_mock_runtime_listing_publish_failure(false);
     reset_mock_protected_content_chain_mode();
     reset_mock_protected_content_purchase_fixture();
 
@@ -6332,6 +6346,39 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
+        listing_uri: None,
+    };
+    set_mock_runtime_listing_publish_failure(true);
+    let publish_error = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &replay_authority,
+        registry.clone(),
+        input.clone(),
+        replay_facts,
+    )
+    .await
+    .unwrap_err();
+    assert!(publish_error
+        .to_string()
+        .contains("mock protected content listing publish failed"));
+    assert!(
+        crate::protected_content_runtime::load_runtime_custody_listing(dir.path(), mint_id)
+            .unwrap()
+            .is_none()
+    );
+    set_mock_runtime_listing_publish_failure(false);
+    let replay_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let replay_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &replay_token);
+    let replay_facts = crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts {
+        content_cid: replay_content_cid.clone(),
+        mint_id,
+        content_id: replay_content_id.clone(),
+        display_name: "protected-tail.mp4".to_string(),
+        availability: json!({"status": "local_pinned"}),
+        receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
+        content_security: json!({"mode": "runtime_custody"}),
+        listing_uri: None,
     };
     let ok = runtime_custody_publish_creator_tail_for_test(
         &state,
@@ -6343,6 +6390,7 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
     .await
     .unwrap();
     assert_eq!(ok.mint_id, mint_id);
+    assert_eq!(ok.listing_uri, Some(format!("elastos://{TEST_CIDV1}")));
     let listing =
         crate::protected_content_runtime::load_runtime_custody_listing(dir.path(), mint_id)
             .unwrap()
@@ -6371,7 +6419,26 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
         listing.package.pay_token,
         MOCK_PROTECTED_CONTENT_PAY_TOKEN.to_ascii_lowercase()
     );
-    assert_eq!(mock_content_publish_request_count(), 1);
+    let publish_requests = mock_content_publish_requests().lock().unwrap().clone();
+    assert_eq!(publish_requests.len(), 3);
+    let listing_publish = &publish_requests[2];
+    assert_eq!(listing_publish["object_kind"], "protected-content-listing");
+    assert_eq!(listing_publish["object_did"], listing.package.content_id);
+    assert_eq!(
+        listing_publish["publisher_did"],
+        listing.package.publisher_profile_did
+    );
+    assert_eq!(
+        listing_publish["availability_requirements"],
+        json!({"min_replicas": 3, "require_live_multi_peer_proof": true})
+    );
+    assert_eq!(
+        listing_publish["links"],
+        json!([
+            {"rel": "metadata", "cid": listing.package.metadata_cid},
+            {"rel": "encrypted-content", "cid": listing.package.content_cid},
+        ])
+    );
 
     let replay_again_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
     let replay_again_authority =
@@ -6384,6 +6451,7 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
+        listing_uri: None,
     };
     let replay = runtime_custody_publish_creator_tail_for_test(
         &state,
@@ -6395,12 +6463,15 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
     .await
     .unwrap();
     assert_eq!(replay.mint_id, mint_id);
+    assert_eq!(replay.listing_uri, ok.listing_uri);
     let replayed_listing =
         crate::protected_content_runtime::load_runtime_custody_listing(dir.path(), mint_id)
             .unwrap()
             .unwrap();
     assert_eq!(replayed_listing, listing);
-    assert_eq!(mock_content_publish_request_count(), 1);
+    let publish_requests = mock_content_publish_requests().lock().unwrap();
+    assert_eq!(publish_requests.len(), 4);
+    assert_eq!(publish_requests[2], publish_requests[3]);
     assert_eq!(
         wallet_provider
             .provider
@@ -6494,6 +6565,7 @@ async fn test_runtime_custody_creator_tail_listing_error_is_unavailable_without_
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
+        listing_uri: None,
     };
     let err = runtime_custody_publish_creator_tail_for_test(
         &state,
@@ -6552,6 +6624,7 @@ async fn test_runtime_custody_creator_tail_listing_error_is_unavailable_without_
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
+        listing_uri: None,
     };
     let err = runtime_custody_publish_creator_tail_for_test(
         &state,
@@ -7751,7 +7824,20 @@ async fn test_runtime_custody_buy_requires_a_valid_chain_transaction_default() {
 }
 
 #[cfg(unix)]
-async fn run_runtime_custody_portable_listing_import(custody_mismatch: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimePortableListingMismatch {
+    None,
+    Package,
+    Links,
+    Cid,
+    Publisher,
+}
+
+#[cfg(unix)]
+async fn run_runtime_custody_portable_listing_import(
+    mismatch: RuntimePortableListingMismatch,
+    refresh_availability: bool,
+) {
     #[derive(serde::Serialize)]
     struct PortableMetadataFixture<'a> {
         schema: &'static str,
@@ -7816,20 +7902,39 @@ async fn run_runtime_custody_portable_listing_import(custody_mismatch: bool) {
         .unwrap(),
         None,
         None,
+        Vec::new(),
     );
-    const LISTING_CID: &str = "bafybeibwzif2r5tn7z7cq4f5a2mmepmab4s4m5a2hqu5v4f4uzkd3t2u7m";
     let mut portable_package = listing.package.clone();
-    if custody_mismatch {
+    if mismatch == RuntimePortableListingMismatch::Package {
         portable_package.content_key_commitment_base64 =
             base64::engine::general_purpose::STANDARD.encode([0x7d; 32]);
     }
+    let mut links = vec![
+        crate::content::ContentObjectLink {
+            rel: "encrypted-content".to_string(),
+            cid: portable_package.content_cid.clone(),
+        },
+        crate::content::ContentObjectLink {
+            rel: "metadata".to_string(),
+            cid: portable_package.metadata_cid.clone(),
+        },
+    ];
+    if mismatch == RuntimePortableListingMismatch::Links {
+        links.pop();
+    }
+    let manifest_publisher = if mismatch == RuntimePortableListingMismatch::Publisher {
+        mock_protected_content_provider_signer_did()
+    } else {
+        portable_package.publisher_profile_did.clone()
+    };
     seed_mock_immutable_content_object(
-        LISTING_CID,
+        RUNTIME_PORTABLE_LISTING_TEST_CID,
         "protected-content-listing",
         "listing.json",
         serde_json::to_vec(&portable_package).unwrap(),
         Some(&portable_package.content_id),
-        Some(&portable_package.publisher_profile_did),
+        Some(&manifest_publisher),
+        links,
     );
 
     let dir = tempfile::tempdir().unwrap();
@@ -7856,7 +7961,14 @@ async fn run_runtime_custody_portable_listing_import(custody_mismatch: bool) {
     let app = gateway_router(state);
 
     assert!(!dir.path().join("protected-content/runtime-mint").exists());
-    let listing_uri = format!("elastos://{LISTING_CID}");
+    let listing_uri = format!(
+        "elastos://{}",
+        if mismatch == RuntimePortableListingMismatch::Cid {
+            TEST_CIDV0
+        } else {
+            RUNTIME_PORTABLE_LISTING_TEST_CID
+        }
+    );
     let (status, imported) = post_library(
         app.clone(),
         &token,
@@ -7867,7 +7979,7 @@ async fn run_runtime_custody_portable_listing_import(custody_mismatch: bool) {
 
     assert_eq!(status, StatusCode::OK);
     let listing_path = runtime_custody_listing_path_for_test(dir.path(), facts.mint_id);
-    if custody_mismatch {
+    if mismatch != RuntimePortableListingMismatch::None {
         assert_eq!(imported["status"], "error", "{imported}");
         assert!(!listing_path.exists());
         reset_mock_immutable_content_objects();
@@ -7880,7 +7992,21 @@ async fn run_runtime_custody_portable_listing_import(custody_mismatch: bool) {
     );
     assert_eq!(imported["data"]["listing_uri"], listing_uri);
     assert_eq!(imported["data"]["status"], "verified");
+    let imported_record =
+        crate::protected_content_runtime::load_runtime_custody_listing(dir.path(), facts.mint_id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(imported_record.package, listing.package);
     let persisted = std::fs::read(&listing_path).unwrap();
+    let immutable_before = serde_json::to_vec(&(
+        &imported_record.schema,
+        &imported_record.origin,
+        &imported_record.package,
+    ))
+    .unwrap();
+    if refresh_availability {
+        advance_mock_published_protected_content_receipt();
+    }
     let (_, replay) = post_library(
         app,
         &token,
@@ -7889,7 +8015,22 @@ async fn run_runtime_custody_portable_listing_import(custody_mismatch: bool) {
     )
     .await;
     assert_eq!(replay, imported);
-    assert_eq!(std::fs::read(listing_path).unwrap(), persisted);
+    let replayed =
+        crate::protected_content_runtime::load_runtime_custody_listing(dir.path(), facts.mint_id)
+            .unwrap()
+            .unwrap();
+    if refresh_availability {
+        assert_eq!(
+            serde_json::to_vec(&(&replayed.schema, &replayed.origin, &replayed.package)).unwrap(),
+            immutable_before
+        );
+        let before = serde_json::to_value(&imported_record.availability).unwrap();
+        let after = serde_json::to_value(&replayed.availability).unwrap();
+        assert!(after["checked_at"].as_u64() > before["checked_at"].as_u64());
+        assert_ne!(after["receipt_digest"], before["receipt_digest"]);
+    } else {
+        assert_eq!(std::fs::read(listing_path).unwrap(), persisted);
+    }
     assert!(!dir.path().join("protected-content/runtime-mint").exists());
     reset_mock_immutable_content_objects();
 }
@@ -7897,13 +8038,26 @@ async fn run_runtime_custody_portable_listing_import(custody_mismatch: bool) {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_runtime_custody_imports_verified_projection_without_creator_mint_journal() {
-    run_runtime_custody_portable_listing_import(false).await;
+    run_runtime_custody_portable_listing_import(RuntimePortableListingMismatch::None, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn test_runtime_custody_import_rejects_chain_metadata_custody_mismatch() {
-    run_runtime_custody_portable_listing_import(true).await;
+async fn test_runtime_custody_import_advances_verified_availability_summary() {
+    run_runtime_custody_portable_listing_import(RuntimePortableListingMismatch::None, true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_runtime_custody_import_rejects_manifest_and_package_mismatch() {
+    for mismatch in [
+        RuntimePortableListingMismatch::Package,
+        RuntimePortableListingMismatch::Links,
+        RuntimePortableListingMismatch::Cid,
+        RuntimePortableListingMismatch::Publisher,
+    ] {
+        run_runtime_custody_portable_listing_import(mismatch, false).await;
+    }
 }
 
 #[cfg(unix)]
@@ -8395,6 +8549,7 @@ async fn test_runtime_custody_creator_tail_rejects_resolved_source_drift_before_
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
+        listing_uri: None,
     };
     let err = runtime_custody_publish_creator_tail_for_test(
         &state,
