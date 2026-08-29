@@ -82,12 +82,7 @@ mod tests {
     fn request_decoders() -> [fn(&[u8]) -> bool; 3] {
         [
             |bytes| {
-                ValidatedRightsProviderRequestV1::decode_and_validate_at(
-                    bytes,
-                    runtime_operation_issuer_for_seed(0x42),
-                    NOW + 10,
-                )
-                .is_ok()
+                ValidatedRightsProviderRequestV1::decode_and_validate_at(bytes, NOW + 10).is_ok()
             },
             |bytes| {
                 ValidatedCustodyProviderRequestV1::decode_and_validate_at(

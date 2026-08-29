@@ -3063,10 +3063,8 @@ fn chain_evidence_for_request_at(
     evidence_now: u64,
     has_access: bool,
 ) -> Value {
-    let operation = request.signed_runtime_release_operation().unwrap();
     let validated = ValidatedRightsProviderRequestV1::decode_and_validate_at(
         &request.to_json_vec().unwrap(),
-        operation.statement().runtime_operation_issuer(),
         now_unix_seconds,
     )
     .unwrap();
@@ -6293,7 +6291,6 @@ async fn runtime_custody_registry_adapter_process_happy_path_uses_public_provisi
     let rights_validation_now = crate::auth::now_ts();
     let validated_rights = match ValidatedRightsProviderRequestV1::decode_and_validate_at(
         &rights_request.to_json_vec().unwrap(),
-        runtime_operation_issuer_for_seed(0x21),
         rights_validation_now,
     ) {
         Ok(validated) => validated,
@@ -9406,12 +9403,9 @@ impl LibraryProcessCustodyDispatcher {
                     )
                 }),
             "evaluate" => {
-                let validated = ValidatedRightsProviderRequestV1::decode_and_validate_at(
-                    &bytes,
-                    self.expected_issuer,
-                    now,
-                )
-                .map_err(|error| ProviderError::Provider(error.to_string()))?;
+                let validated =
+                    ValidatedRightsProviderRequestV1::decode_and_validate_at(&bytes, now)
+                        .map_err(|error| ProviderError::Provider(error.to_string()))?;
                 self.nodes
                     .iter()
                     .find(|(node, _)| *node == validated.selected_node_public_key())

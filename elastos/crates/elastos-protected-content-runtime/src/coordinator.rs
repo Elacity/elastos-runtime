@@ -515,7 +515,6 @@ impl<'a> RuntimeReleaseCoordinator<'a> {
             if response
                 .validate_against_request_at(
                     &request,
-                    self.expected_runtime_issuer,
                     self.response_validation_now(context.now_unix_seconds),
                 )
                 .is_err()
@@ -2245,7 +2244,6 @@ mod tests {
 
         let validated = ValidatedRightsProviderRequestV1::decode_and_validate_at(
             &rights_request.to_json_vec().unwrap(),
-            runtime_issuer(0x42),
             NOW + 6,
         )
         .unwrap();

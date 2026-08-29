@@ -3,7 +3,7 @@ use std::future::Future;
 use ed25519_dalek::SigningKey;
 use elastos_protected_content_contracts::{
     CanonicalContract, Digest32, NodePublicKey, RightsEvaluationEvidenceV1,
-    RuntimeOperationIssuerKeyV1, SignedRuntimeReleaseOperationV1,
+    SignedRuntimeReleaseOperationV1,
 };
 use elastos_protected_content_provider_contracts::{
     RightsProviderRequestV1, RightsProviderResponseV1, ValidatedRightsProviderRequestV1,
@@ -91,7 +91,6 @@ pub fn parse_chain_rights_evidence_data(
 
 pub async fn evaluate_rights_via_chain<F, Fut>(
     node_signing_key: SigningKey,
-    expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
     request: &RightsProviderRequestV1,
     now_unix_seconds: u64,
     invoke_chain: F,
@@ -105,12 +104,9 @@ where
     let request_bytes = request
         .to_json_vec()
         .map_err(|_| RightsEvaluationErrorV1::Contract)?;
-    let validated = ValidatedRightsProviderRequestV1::decode_and_validate_at(
-        &request_bytes,
-        expected_runtime_issuer,
-        now_unix_seconds,
-    )
-    .map_err(|_| RightsEvaluationErrorV1::Contract)?;
+    let validated =
+        ValidatedRightsProviderRequestV1::decode_and_validate_at(&request_bytes, now_unix_seconds)
+            .map_err(|_| RightsEvaluationErrorV1::Contract)?;
     if validated.selected_node_public_key() != node_public_key {
         return Err(RightsEvaluationErrorV1::WrongSelectedNode);
     }

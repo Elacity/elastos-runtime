@@ -270,14 +270,11 @@ impl CustodyProvider {
             Ok(bytes) => bytes,
             Err(_) => return invalid_request(),
         };
-        let request = match ValidatedRightsProviderRequestV1::decode_and_validate_at(
-            &request_bytes,
-            state.expected_runtime_issuer,
-            now,
-        ) {
-            Ok(request) => request,
-            Err(_) => return invalid_request(),
-        };
+        let request =
+            match ValidatedRightsProviderRequestV1::decode_and_validate_at(&request_bytes, now) {
+                Ok(request) => request,
+                Err(_) => return invalid_request(),
+            };
         if request.selected_node_public_key() != state.node_public_key {
             return invalid_request();
         }
