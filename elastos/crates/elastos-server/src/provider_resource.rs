@@ -281,6 +281,7 @@ fn object_op_required_action(op: &str) -> Option<Action> {
         | "open_viewer"
         | "read_viewer"
         | "close_viewer" => Some(Action::Read),
+        "import_runtime_custody" => Some(Action::Write),
         "write" | "mkdir" | "rename" | "move" | "copy" | "trash" | "restore" | "publish"
         | "unpublish" | "repair" | "share" | "buy" => Some(Action::Write),
         "delete_permanently" | "empty_trash" => Some(Action::Delete),
@@ -414,6 +415,7 @@ fn object_resource(op: &str) -> Result<String, String> {
             "repair",
             "share",
             "list_runtime_custody",
+            "import_runtime_custody",
             "buy",
             "open_viewer",
             "read_viewer",

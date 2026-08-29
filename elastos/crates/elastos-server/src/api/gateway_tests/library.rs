@@ -277,36 +277,8 @@ fn seed_completed_runtime_custody_mint(
     let journal = crate::protected_content_runtime::runtime_mint_journal(data_dir);
     let (protected_init_segment, protected_segments) =
         crate::protected_content_runtime::tests::media_components(0x41);
-    let node_public_key = |seed: u8| {
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
-        elastos_protected_content_contracts::NodePublicKey::new(
-            signing_key.verifying_key().to_bytes(),
-        )
-        .unwrap()
-    };
-    let node_bindings = vec![
-        elastos_protected_content_runtime::RuntimeMintNodeBinding::new(
-            node_public_key(0x11),
-            elastos_protected_content_contracts::CustodyPoolOperatorIdV1::new([0x21; 32]),
-            elastos_protected_content_contracts::CustodyPoolFailureDomainIdV1::new([0x31; 32]),
-            elastos_protected_content_contracts::Digest32::new([0x41; 32]),
-        )
-        .unwrap(),
-        elastos_protected_content_runtime::RuntimeMintNodeBinding::new(
-            node_public_key(0x12),
-            elastos_protected_content_contracts::CustodyPoolOperatorIdV1::new([0x22; 32]),
-            elastos_protected_content_contracts::CustodyPoolFailureDomainIdV1::new([0x32; 32]),
-            elastos_protected_content_contracts::Digest32::new([0x42; 32]),
-        )
-        .unwrap(),
-        elastos_protected_content_runtime::RuntimeMintNodeBinding::new(
-            node_public_key(0x13),
-            elastos_protected_content_contracts::CustodyPoolOperatorIdV1::new([0x23; 32]),
-            elastos_protected_content_contracts::CustodyPoolFailureDomainIdV1::new([0x33; 32]),
-            elastos_protected_content_contracts::Digest32::new([0x43; 32]),
-        )
-        .unwrap(),
-    ];
+    let (node_bindings, pool_identity, epoch_identity, committee_identity) =
+        crate::protected_content_runtime::tests::library_publish_test_mint_composition(data_dir);
     let content_access_id =
         elastos_protected_content_contracts::ContentAccessIdV1::new([0x51; 16]).unwrap();
     let media_identity =
@@ -332,21 +304,9 @@ fn seed_completed_runtime_custody_mint(
         256,
         node_set.node_set_id().unwrap(),
         threshold,
-        elastos_protected_content_contracts::CustodyPoolIdentityV1::new(
-            elastos_protected_content_contracts::Digest32::new([0x53; 32]),
-            128,
-        )
-        .unwrap(),
-        elastos_protected_content_contracts::CustodyEpochIdentityV1::new(
-            elastos_protected_content_contracts::Digest32::new([0x54; 32]),
-            128,
-        )
-        .unwrap(),
-        elastos_protected_content_contracts::CustodyCommitteeAuthorizationIdentityV1::new(
-            elastos_protected_content_contracts::Digest32::new([0x55; 32]),
-            128,
-        )
-        .unwrap(),
+        pool_identity,
+        epoch_identity,
+        committee_identity,
     )
     .unwrap();
     let policy = elastos_protected_content_contracts::RightsPolicyIdentityV1::new(
@@ -427,11 +387,21 @@ fn seed_completed_runtime_custody_mint(
     let content_id =
         crate::protected_content_runtime::runtime_protected_content_id(draft.encrypted_content())
             .unwrap();
+    let publisher_profile_did = crate::collaboration_profile_authority::load_profile_authority(
+        data_dir,
+        &input.principal_id,
+        &crate::auth::principal_localhost_root(&input.principal_id),
+    )
+    .unwrap()
+    .unwrap()
+    .document()
+    .profile_did
+    .clone();
     let requirement =
         elastos_protected_content_runtime::RuntimeContentAvailabilityRequirement::new(
             mock_protected_content_provider_signer_did(),
             content_id.clone(),
-            input.principal_id.clone(),
+            publisher_profile_did.clone(),
             "protected-content-replication/v1",
             3,
             600,
@@ -441,7 +411,7 @@ fn seed_completed_runtime_custody_mint(
     let evidence = elastos_protected_content_runtime::RuntimeVerifiedContentAvailability::new(
         TEST_CIDV1,
         content_id.clone(),
-        input.principal_id.clone(),
+        publisher_profile_did.clone(),
         &requirement,
         3,
         crate::auth::now_ts(),
@@ -455,7 +425,7 @@ fn seed_completed_runtime_custody_mint(
         .unwrap();
     seed_mock_published_protected_content(
         &content_id,
-        &input.principal_id,
+        &publisher_profile_did,
         draft.media_identity(),
         &protected_init_segment,
         &protected_segments,
@@ -469,8 +439,6 @@ fn seed_completed_runtime_custody_mint(
         mint_id: draft.mint_id(),
         content_id,
         display_name: "protected-tail.mp4".to_string(),
-        mime_type: input.mime_type.clone(),
-        codecs: input.codecs.clone(),
         availability: json!({
             "status": "local_pinned",
             "provider": "mock-content-provider",
@@ -6207,7 +6175,7 @@ async fn test_runtime_custody_creator_tail_pending_or_failed_never_persists_list
     reset_mock_protected_content_chain_mode();
     reset_mock_protected_content_purchase_fixture();
 
-    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let authority = passkey_authority_with_profile(dir.path(), "admin");
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
     let runtime_authority =
         runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &token);
@@ -6264,8 +6232,6 @@ async fn test_runtime_custody_creator_tail_pending_or_failed_never_persists_list
         mint_id,
         content_id: replay_content_id,
         display_name: "protected-tail.mp4".to_string(),
-        mime_type: input.mime_type.clone(),
-        codecs: input.codecs.clone(),
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
@@ -6313,7 +6279,7 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
     reset_mock_protected_content_chain_mode();
     reset_mock_protected_content_purchase_fixture();
 
-    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let authority = passkey_authority_with_profile(dir.path(), "admin");
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
     let runtime_authority =
         runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &token);
@@ -6363,8 +6329,6 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
         mint_id,
         content_id: replay_content_id.clone(),
         display_name: "protected-tail.mp4".to_string(),
-        mime_type: input.mime_type.clone(),
-        codecs: input.codecs.clone(),
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
@@ -6383,30 +6347,28 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
         crate::protected_content_runtime::load_runtime_custody_listing(dir.path(), mint_id)
             .unwrap()
             .unwrap();
-    assert_eq!(listing.cid, replay_content_cid);
-    assert_eq!(listing.content_id, replay_content_id);
-    assert_eq!(listing.display_name, "protected-tail.mp4");
-    assert_eq!(listing.mime_type, input.mime_type);
-    assert_eq!(listing.codecs, input.codecs);
-    assert_eq!(listing.quantity, "0x2");
+    assert_eq!(listing.package.content_cid, replay_content_cid);
+    assert_eq!(listing.package.content_id, replay_content_id);
+    assert_eq!(listing.package.display_name, "protected-tail.mp4");
+    assert_eq!(listing.package.quantity, "0x2");
     assert_eq!(
-        listing.seller_address,
+        listing.package.seller_address,
         MOCK_MANAGED_EVM_ADDRESS.to_ascii_lowercase()
     );
-    assert_eq!(listing.chain_namespace, "eip155:8453");
-    assert_eq!(listing.network, "base-mainnet");
+    assert_eq!(listing.package.chain_namespace, "eip155:8453");
+    assert_eq!(listing.package.network, "base-mainnet");
     assert_eq!(
-        listing.ledger,
+        listing.package.ledger,
         MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY.to_ascii_lowercase()
     );
-    assert_eq!(listing.token_id, MOCK_PROTECTED_CONTENT_TOKEN_ID);
+    assert_eq!(listing.package.token_id, MOCK_PROTECTED_CONTENT_TOKEN_ID);
     assert_eq!(
-        listing.operative,
+        listing.package.operative,
         MOCK_PROTECTED_CONTENT_OPERATIVE.to_ascii_lowercase()
     );
-    assert_eq!(listing.price, MOCK_PROTECTED_CONTENT_LISTING_PRICE);
+    assert_eq!(listing.package.price, MOCK_PROTECTED_CONTENT_LISTING_PRICE);
     assert_eq!(
-        listing.pay_token,
+        listing.package.pay_token,
         MOCK_PROTECTED_CONTENT_PAY_TOKEN.to_ascii_lowercase()
     );
     assert_eq!(mock_content_publish_request_count(), 1);
@@ -6419,8 +6381,6 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
         mint_id,
         content_id: replay_content_id,
         display_name: "protected-tail.mp4".to_string(),
-        mime_type: input.mime_type.clone(),
-        codecs: input.codecs.clone(),
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
@@ -6465,7 +6425,7 @@ async fn test_runtime_custody_creator_tail_listing_error_is_unavailable_without_
     reset_mock_protected_content_chain_mode();
     reset_mock_protected_content_purchase_fixture();
 
-    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let authority = passkey_authority_with_profile(dir.path(), "admin");
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
     let runtime_authority =
         runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &token);
@@ -6531,8 +6491,6 @@ async fn test_runtime_custody_creator_tail_listing_error_is_unavailable_without_
         mint_id,
         content_id: replay_content_id.clone(),
         display_name: "protected-tail.mp4".to_string(),
-        mime_type: input.mime_type.clone(),
-        codecs: input.codecs.clone(),
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
@@ -6591,8 +6549,6 @@ async fn test_runtime_custody_creator_tail_listing_error_is_unavailable_without_
         mint_id,
         content_id: replay_content_id,
         display_name: "protected-tail.mp4".to_string(),
-        mime_type: input.mime_type.clone(),
-        codecs: input.codecs.clone(),
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
@@ -7795,6 +7751,162 @@ async fn test_runtime_custody_buy_requires_a_valid_chain_transaction_default() {
 }
 
 #[cfg(unix)]
+async fn run_runtime_custody_portable_listing_import(custody_mismatch: bool) {
+    #[derive(serde::Serialize)]
+    struct PortableMetadataFixture<'a> {
+        schema: &'static str,
+        name: &'a str,
+        mime_type: &'a str,
+        codecs: &'a str,
+        encrypted_content_cid: &'a str,
+        content_access_id: &'a str,
+        protected_content_identity: &'a str,
+        mint_id: &'a str,
+        publisher_profile_did: &'a str,
+        media_identity_base64: &'a str,
+        key_envelope_identity_base64: &'a str,
+        rights_policy_identity_base64: &'a str,
+        content_key_commitment_base64: &'a str,
+    }
+
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    reset_mock_immutable_content_objects();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    let creator_dir = tempfile::tempdir().unwrap();
+    let creator = passkey_authority_with_profile_role_credential(
+        creator_dir.path(),
+        "portable-listing-creator",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-portable-listing-creator",
+    );
+    let input = runtime_custody_creator_test_input(
+        &creator.principal_id,
+        "localhost://Users/creator/Documents/protected-tail.mp4",
+        0x82,
+        "wallet-account:0x1111111111111111111111111111111111111111",
+    );
+    let facts = seed_completed_runtime_custody_mint(creator_dir.path(), &input);
+    let listing = seed_runtime_custody_creator_listing_for_buy(
+        creator_dir.path(),
+        &creator.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        false,
+    );
+    seed_mock_immutable_content_object(
+        TEST_CIDV0,
+        "directory",
+        "metadata.json",
+        serde_json::to_vec(&PortableMetadataFixture {
+            schema: "elastos.protected-content.metadata/v1",
+            name: &listing.package.display_name,
+            mime_type: &input.mime_type,
+            codecs: &input.codecs,
+            encrypted_content_cid: &listing.package.content_cid,
+            content_access_id: &listing.package.content_access_id,
+            protected_content_identity: &listing.package.content_id,
+            mint_id: &listing.package.mint_id,
+            publisher_profile_did: &listing.package.publisher_profile_did,
+            media_identity_base64: &listing.package.media_identity_base64,
+            key_envelope_identity_base64: &listing.package.key_envelope_identity_base64,
+            rights_policy_identity_base64: &listing.package.rights_policy_identity_base64,
+            content_key_commitment_base64: &listing.package.content_key_commitment_base64,
+        })
+        .unwrap(),
+        None,
+        None,
+    );
+    const LISTING_CID: &str = "bafybeibwzif2r5tn7z7cq4f5a2mmepmab4s4m5a2hqu5v4f4uzkd3t2u7m";
+    let mut portable_package = listing.package.clone();
+    if custody_mismatch {
+        portable_package.content_key_commitment_base64 =
+            base64::engine::general_purpose::STANDARD.encode([0x7d; 32]);
+    }
+    seed_mock_immutable_content_object(
+        LISTING_CID,
+        "protected-content-listing",
+        "listing.json",
+        serde_json::to_vec(&portable_package).unwrap(),
+        Some(&portable_package.content_id),
+        Some(&portable_package.publisher_profile_did),
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_library_publish_test_composition(dir.path());
+    let composition = "protected-content/custody-composition.json";
+    std::fs::copy(
+        creator_dir.path().join(composition),
+        dir.path().join(composition),
+    )
+    .unwrap();
+    let (state, _) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    let buyer = passkey_authority_with_profile_role_credential(
+        dir.path(),
+        "portable-listing-buyer",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-portable-listing-buyer",
+    );
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &buyer);
+    let app = gateway_router(state);
+
+    assert!(!dir.path().join("protected-content/runtime-mint").exists());
+    let listing_uri = format!("elastos://{LISTING_CID}");
+    let (status, imported) = post_library(
+        app.clone(),
+        &token,
+        "import_runtime_custody",
+        json!({ "listing_uri": listing_uri }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let listing_path = runtime_custody_listing_path_for_test(dir.path(), facts.mint_id);
+    if custody_mismatch {
+        assert_eq!(imported["status"], "error", "{imported}");
+        assert!(!listing_path.exists());
+        reset_mock_immutable_content_objects();
+        return;
+    }
+    assert_eq!(imported["status"], "ok", "{imported}");
+    assert_eq!(
+        imported["data"]["schema"],
+        "elastos.library.runtime-custody-import/v1"
+    );
+    assert_eq!(imported["data"]["listing_uri"], listing_uri);
+    assert_eq!(imported["data"]["status"], "verified");
+    let persisted = std::fs::read(&listing_path).unwrap();
+    let (_, replay) = post_library(
+        app,
+        &token,
+        "import_runtime_custody",
+        json!({ "listing_uri": listing_uri }),
+    )
+    .await;
+    assert_eq!(replay, imported);
+    assert_eq!(std::fs::read(listing_path).unwrap(), persisted);
+    assert!(!dir.path().join("protected-content/runtime-mint").exists());
+    reset_mock_immutable_content_objects();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_runtime_custody_imports_verified_projection_without_creator_mint_journal() {
+    run_runtime_custody_portable_listing_import(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_runtime_custody_import_rejects_chain_metadata_custody_mismatch() {
+    run_runtime_custody_portable_listing_import(true).await;
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
@@ -8214,7 +8326,7 @@ async fn test_runtime_custody_creator_tail_rejects_resolved_source_drift_before_
     reset_mock_protected_content_purchase_fixture();
     reset_mock_chain_raw_requests();
 
-    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let authority = passkey_authority_with_profile(dir.path(), "admin");
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
     let runtime_authority =
         runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &token);
@@ -8280,8 +8392,6 @@ async fn test_runtime_custody_creator_tail_rejects_resolved_source_drift_before_
         mint_id,
         content_id: replay_content_id,
         display_name: "protected-tail.mp4".to_string(),
-        mime_type: input.mime_type.clone(),
-        codecs: input.codecs.clone(),
         availability: json!({"status": "local_pinned"}),
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),

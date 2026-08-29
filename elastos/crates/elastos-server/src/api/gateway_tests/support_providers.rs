@@ -69,6 +69,20 @@ fn mock_published_protected_content(
     STATE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+type MockImmutableContentFiles = BTreeMap<String, Vec<u8>>;
+type MockImmutableContentObjects = BTreeMap<String, MockImmutableContentFiles>;
+
+fn mock_immutable_content_objects(
+) -> &'static std::sync::Mutex<MockImmutableContentObjects> {
+    static OBJECTS: std::sync::OnceLock<std::sync::Mutex<MockImmutableContentObjects>> =
+        std::sync::OnceLock::new();
+    OBJECTS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+fn reset_mock_immutable_content_objects() {
+    mock_immutable_content_objects().lock().unwrap().clear();
+}
+
 fn mock_protected_content_provider_signing_key() -> ed25519_dalek::SigningKey {
     elastos_identity::derive_did(&[0x5a; 32]).0
 }
@@ -101,6 +115,37 @@ fn mock_protected_content_manifest_digest(files: &[crate::content::ContentObject
         hasher.update(b"\0");
     }
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn seed_mock_immutable_content_object(
+    cid: &str,
+    kind: &str,
+    path: &str,
+    bytes: Vec<u8>,
+    object_did: Option<&str>,
+    publisher_did: Option<&str>,
+) {
+    let file = mock_protected_content_file(path, &bytes);
+    let manifest = crate::content::ContentObjectManifest {
+        schema: "elastos.content.object.manifest/v1".to_string(),
+        kind: kind.to_string(),
+        content_digest: mock_protected_content_manifest_digest(std::slice::from_ref(&file)),
+        files: vec![file],
+        links: Vec::new(),
+        object_did: object_did.map(str::to_string),
+        publisher_did: publisher_did.map(str::to_string),
+    };
+    let files = BTreeMap::from([
+        (path.to_string(), bytes),
+        (
+            crate::content::CONTENT_OBJECT_MANIFEST_PATH.to_string(),
+            serde_json::to_vec(&manifest).unwrap(),
+        ),
+    ]);
+    mock_immutable_content_objects()
+        .lock()
+        .unwrap()
+        .insert(cid.to_string(), files);
 }
 
 fn store_mock_published_protected_content(
@@ -1132,6 +1177,24 @@ impl Provider for MockContentProvider {
         &self,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
+        let immutable = match (
+            request.get("op").and_then(Value::as_str),
+            request.get("cid").and_then(Value::as_str),
+            request.get("path").and_then(Value::as_str),
+        ) {
+            (Some("fetch"), Some(cid), Some(path)) => mock_immutable_content_objects()
+                .lock()
+                .unwrap()
+                .get(cid)
+                .and_then(|files| files.get(path))
+                .cloned(),
+            _ => None,
+        };
+        if let Some(bytes) = immutable {
+            return Ok(json!({"status": "ok", "data": {
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }}));
+        }
         if request.get("cid").and_then(|value| value.as_str()) == Some(TEST_CIDV1) {
             let published = mock_published_protected_content().lock().unwrap().clone();
             if let Some(published) = published {

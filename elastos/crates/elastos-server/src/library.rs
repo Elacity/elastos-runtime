@@ -324,6 +324,10 @@ enum ObjectProviderRequest {
     ListRuntimeCustody {
         principal_id: String,
     },
+    ImportRuntimeCustody {
+        principal_id: String,
+        listing_uri: String,
+    },
     Buy {
         principal_id: String,
         mint_id: String,
@@ -479,6 +483,7 @@ impl Provider for ObjectProvider {
                 .await
             }
             request @ (ObjectProviderRequest::ListRuntimeCustody { .. }
+            | ObjectProviderRequest::ImportRuntimeCustody { .. }
             | ObjectProviderRequest::Buy { .. }
             | ObjectProviderRequest::OpenViewer { .. }
             | ObjectProviderRequest::ReadViewer { .. }
@@ -523,6 +528,7 @@ pub fn handle_object_provider_raw_request(data_dir: &Path, request: &Value) -> V
         | ObjectProviderRequest::Unpublish { .. }
         | ObjectProviderRequest::Repair { .. }
         | ObjectProviderRequest::ListRuntimeCustody { .. }
+        | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::Buy { .. }
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
@@ -748,6 +754,7 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
             library_repair(&data_dir, registry, &principal_id, &uri).await
         }
         request @ (ObjectProviderRequest::ListRuntimeCustody { .. }
+        | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::Buy { .. }
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
@@ -1841,6 +1848,7 @@ fn handle_library_request(
         | ObjectProviderRequest::Unpublish { .. }
         | ObjectProviderRequest::Repair { .. }
         | ObjectProviderRequest::ListRuntimeCustody { .. }
+        | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::Buy { .. }
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
@@ -1865,6 +1873,18 @@ async fn handle_runtime_custody_library_request(
                 &data_dir,
                 &principal_id,
             )
+        }
+        ObjectProviderRequest::ImportRuntimeCustody {
+            principal_id,
+            listing_uri,
+        } => {
+            crate::protected_content_runtime::import_runtime_custody_listing(
+                &data_dir,
+                registry,
+                &principal_id,
+                &listing_uri,
+            )
+            .await
         }
         ObjectProviderRequest::Buy {
             principal_id,
@@ -3344,6 +3364,7 @@ fn library_request_touches_webspace(request: &ObjectProviderRequest) -> bool {
         | ObjectProviderRequest::EmptyTrash { .. }
         | ObjectProviderRequest::Events { .. }
         | ObjectProviderRequest::ListRuntimeCustody { .. }
+        | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::Buy { .. }
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }

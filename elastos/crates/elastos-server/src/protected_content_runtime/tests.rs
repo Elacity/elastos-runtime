@@ -1148,29 +1148,48 @@ fn runtime_custody_listing_record_for_test(
     display_name: &str,
     published_at: u64,
 ) -> super::RuntimeCustodyListingRecord {
+    let draft = mint_draft_for_composition_journal_test();
+    let publisher_profile_did = derived_device_key_for_seed(0x66).1;
+    let content_id = super::runtime_protected_content_id(draft.encrypted_content()).unwrap();
     super::RuntimeCustodyListingRecord {
         schema: super::RUNTIME_LISTING_SCHEMA_V1.to_string(),
-        mint_id: hex::encode(mint_id.as_bytes()),
-        content_id: format!("content:{}", hex::encode([mint_id.as_bytes()[0]; 16])),
-        content_access_id: format!("0x{}", hex::encode([mint_id.as_bytes()[1]; 16])),
-        cid: format!("bafybei{}", "a".repeat(16)),
-        metadata_cid: format!("bafybei{}", "b".repeat(16)),
-        token_uri: "ipfs://bafybeicreatormetadata/metadata.json".to_string(),
-        publisher_principal_id: publisher_principal_id.to_string(),
-        display_name: display_name.to_string(),
-        mime_type: MEDIA_MIME_TYPE_V1.to_string(),
-        codecs: MEDIA_CODECS_V1.to_string(),
-        quantity: "0x2".to_string(),
-        seller_address: "0x0000000000000000000000000000000000000011".to_string(),
-        chain_namespace: "eip155:8453".to_string(),
-        network: "base-mainnet".to_string(),
-        ledger: "0x0000000000000000000000000000000000000022".to_string(),
-        token_id: "0x1".to_string(),
-        operative: "0x0000000000000000000000000000000000000033".to_string(),
-        price: "0x5".to_string(),
-        pay_token: "0x0000000000000000000000000000000000000044".to_string(),
-        payment_processor: Some("0x0000000000000000000000000000000000000055".to_string()),
-        published_at,
+        origin: super::RuntimeCustodyListingOrigin::LocalCreator {
+            principal_id: publisher_principal_id.to_string(),
+        },
+        package: super::RuntimePortableListingPackage {
+            schema: super::RUNTIME_PORTABLE_LISTING_SCHEMA_V1.to_string(),
+            mint_id: hex::encode(mint_id.as_bytes()),
+            content_id,
+            content_access_id: format!("0x{}", hex::encode(draft.content_access_id().as_bytes())),
+            content_cid: ContentAvailabilityTestProvider::CID.to_string(),
+            metadata_cid: ContentAvailabilityTestProvider::CID.to_string(),
+            token_uri: format!(
+                "ipfs://{}/metadata.json",
+                ContentAvailabilityTestProvider::CID
+            ),
+            publisher_profile_did,
+            display_name: display_name.to_string(),
+            media_identity_base64: base64::engine::general_purpose::STANDARD
+                .encode(draft.media_identity().canonical_bytes().unwrap()),
+            key_envelope_identity_base64: base64::engine::general_purpose::STANDARD
+                .encode(draft.key_envelope().canonical_bytes().unwrap()),
+            rights_policy_identity_base64: base64::engine::general_purpose::STANDARD
+                .encode(draft.policy().canonical_bytes().unwrap()),
+            content_key_commitment_base64: base64::engine::general_purpose::STANDARD
+                .encode(draft.content_key_commitment().as_bytes()),
+            quantity: "0x2".to_string(),
+            seller_address: "0x0000000000000000000000000000000000000011".to_string(),
+            chain_namespace: "eip155:8453".to_string(),
+            network: "base-mainnet".to_string(),
+            ledger: "0x0000000000000000000000000000000000000022".to_string(),
+            token_id: "0x1".to_string(),
+            operative: "0x0000000000000000000000000000000000000033".to_string(),
+            price: "0x5".to_string(),
+            pay_token: "0x0000000000000000000000000000000000000044".to_string(),
+            payment_processor: Some("0x0000000000000000000000000000000000000055".to_string()),
+            mint_transaction_hash: format!("0x{}", hex::encode([0x68; 32])),
+            published_at,
+        },
     }
 }
 
@@ -1235,38 +1254,13 @@ async fn runtime_custody_prebuy_availability_harness(
     assert_eq!(available.draft().mint_id(), mint_draft.mint_id());
     assert!(available.content_availability().is_some());
 
-    super::persist_runtime_custody_listing(
-        &data_dir,
-        &super::RuntimeCustodyListingRecord {
-            schema: super::RUNTIME_LISTING_SCHEMA_V1.to_string(),
-            mint_id: hex::encode(mint_draft.mint_id().as_bytes()),
-            content_id: super::runtime_protected_content_id(mint_draft.encrypted_content())
-                .unwrap(),
-            content_access_id: format!(
-                "0x{}",
-                hex::encode(mint_draft.content_access_id().as_bytes())
-            ),
-            cid: ContentAvailabilityTestProvider::CID.to_string(),
-            metadata_cid: "bafybeicreatormetadata".to_string(),
-            token_uri: "ipfs://bafybeicreatormetadata/metadata.json".to_string(),
-            publisher_principal_id: "person:local:creator".to_string(),
-            display_name: "protected-video.mp4".to_string(),
-            mime_type: MEDIA_MIME_TYPE_V1.to_string(),
-            codecs: MEDIA_CODECS_V1.to_string(),
-            quantity: "0x2".to_string(),
-            seller_address: "0x0000000000000000000000000000000000000011".to_string(),
-            chain_namespace: "eip155:8453".to_string(),
-            network: "base-mainnet".to_string(),
-            ledger: "0x0000000000000000000000000000000000000022".to_string(),
-            token_id: "0x1".to_string(),
-            operative: "0x0000000000000000000000000000000000000033".to_string(),
-            price: "0x5".to_string(),
-            pay_token: "0x0000000000000000000000000000000000000033".to_string(),
-            payment_processor: Some("0x0000000000000000000000000000000000000044".to_string()),
-            published_at: fixture_now.saturating_sub(2),
-        },
-    )
-    .unwrap();
+    let listing = runtime_custody_listing_record_for_test(
+        mint_draft.mint_id(),
+        "person:local:creator",
+        "protected-video.mp4",
+        fixture_now.saturating_sub(2),
+    );
+    super::persist_runtime_custody_listing(&data_dir, &listing).unwrap();
 
     let (init_segment, encrypted_segments) = media_components(0x41);
     let media_identity = CencFmp4MediaIdentityV1::new_from_bytes(
@@ -2292,15 +2286,15 @@ fn persist_runtime_custody_purchase_for_mint(
             "sha256:{}",
             hex::encode(sha2::Sha256::digest(&listing_bytes))
         ),
-        seller_address: listing.seller_address.clone(),
-        chain_namespace: listing.chain_namespace.clone(),
-        network: listing.network.clone(),
-        ledger: listing.ledger.clone(),
-        token_id: listing.token_id.clone(),
-        operative: listing.operative.clone(),
-        price: listing.price.clone(),
-        pay_token: listing.pay_token.clone(),
-        payment_processor: listing.payment_processor.clone(),
+        seller_address: listing.package.seller_address.clone(),
+        chain_namespace: listing.package.chain_namespace.clone(),
+        network: listing.package.network.clone(),
+        ledger: listing.package.ledger.clone(),
+        token_id: listing.package.token_id.clone(),
+        operative: listing.package.operative.clone(),
+        price: listing.package.price.clone(),
+        pay_token: listing.package.pay_token.clone(),
+        payment_processor: listing.package.payment_processor.clone(),
         availability_receipt_digest: format!(
             "sha256:{}",
             hex::encode(
@@ -2318,8 +2312,8 @@ fn persist_runtime_custody_purchase_for_mint(
             effect_id: "runtime-effect:11111111111111111111111111111111".to_string(),
             approval_request_id: "wallet-request:11111111111111111111111111111111".to_string(),
             request_sha256: format!("sha256:{}", hex::encode([0xac; 32])),
-            chain_namespace: listing.chain_namespace.clone(),
-            network: listing.network.clone(),
+            chain_namespace: listing.package.chain_namespace.clone(),
+            network: listing.package.network.clone(),
             to: "0x2222222222222222222222222222222222222222".to_string(),
             value: "0x1".to_string(),
             data: "0x".to_string(),
@@ -2335,7 +2329,7 @@ fn persist_runtime_custody_purchase_for_mint(
                     network: "esc-mainnet".to_string(),
                     chain_id: 20,
                     wallet: wallet_address_hex(wallet(7)),
-                    content_access_id: listing.content_access_id.clone(),
+                    content_access_id: listing.package.content_access_id.clone(),
                     has_access: true,
                     finalized_block_number: 44,
                     finalized_block_hash: format!("0x{}", hex::encode([0xad; 32])),
@@ -8333,7 +8327,9 @@ fn library_publish_request_id(input: &RuntimeCustodyLibraryPublishInput) -> Dige
 }
 
 #[cfg(unix)]
-fn write_library_publish_test_composition(data_dir: &Path) -> (SignedCustodyEpochV1, u64) {
+pub(crate) fn write_library_publish_test_composition(
+    data_dir: &Path,
+) -> (SignedCustodyEpochV1, u64) {
     let now = crate::auth::now_ts();
     let epoch = signed_custody_epoch();
     write_owner_only_custody_composition_config(
@@ -8345,6 +8341,41 @@ fn write_library_publish_test_composition(data_dir: &Path) -> (SignedCustodyEpoc
     // so any fixture that must produce the identical pool/committee identity
     // has to reuse this exact value instead of reading the clock again.
     (epoch, now)
+}
+
+#[cfg(unix)]
+pub(crate) fn library_publish_test_mint_composition(
+    data_dir: &Path,
+) -> (
+    Vec<RuntimeMintNodeBinding>,
+    CustodyPoolIdentityV1,
+    elastos_protected_content_contracts::CustodyEpochIdentityV1,
+    CustodyCommitteeAuthorizationIdentityV1,
+) {
+    write_library_publish_test_composition(data_dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    let composition = load_runtime_custody_composition(data_dir, registry)
+        .unwrap()
+        .unwrap();
+    let configured = composition.configured_nodes().unwrap();
+    let selected = resolve_runtime_mint_selected_nodes(
+        composition.expected_policy_authority,
+        composition.expected_authorization_identity,
+        &composition.signed_pool,
+        &composition.signed_epoch,
+        &composition.signed_committee_authorization,
+        crate::auth::now_ts(),
+        &configured,
+    )
+    .unwrap();
+    let bindings = selected.iter().map(|node| node.binding().clone()).collect();
+    let pool = composition.signed_pool.pool_identity().unwrap();
+    let epoch = composition.signed_epoch.epoch_identity().unwrap();
+    let committee = composition
+        .signed_committee_authorization
+        .authorization_identity()
+        .unwrap();
+    (bindings, pool, epoch, committee)
 }
 
 #[cfg(unix)]

@@ -1,7 +1,8 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use elastos_protected_content_contracts::Digest32;
+use base64::Engine as _;
+use elastos_protected_content_contracts::{CanonicalContract, Digest32};
 use sha2::Digest as _;
 
 use super::*;
@@ -121,29 +122,29 @@ struct ResolvedProtectedContentCreatorMint {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ResolvedProtectedContentMintReceipt {
-    schema: String,
-    network: String,
-    chain_id: u64,
-    token_id: String,
-    operative: String,
+pub(crate) struct ResolvedProtectedContentMintReceipt {
+    pub(crate) schema: String,
+    pub(crate) network: String,
+    pub(crate) chain_id: u64,
+    pub(crate) token_id: String,
+    pub(crate) operative: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ResolvedProtectedContentVerifiedListing {
-    schema: String,
-    network: String,
-    chain_id: u64,
-    seller: String,
-    ledger: String,
-    token_id: String,
-    operative: String,
-    quantity: String,
-    price: String,
-    pay_token: String,
+pub(crate) struct ResolvedProtectedContentVerifiedListing {
+    pub(crate) schema: String,
+    pub(crate) network: String,
+    pub(crate) chain_id: u64,
+    pub(crate) seller: String,
+    pub(crate) ledger: String,
+    pub(crate) token_id: String,
+    pub(crate) operative: String,
+    pub(crate) quantity: String,
+    pub(crate) price: String,
+    pub(crate) pay_token: String,
     #[serde(default)]
-    payment_processor: Option<String>,
+    pub(crate) payment_processor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,6 +193,12 @@ struct RuntimeCustodyCreatorMetadata<'a> {
     encrypted_content_cid: &'a str,
     content_access_id: String,
     protected_content_identity: &'a str,
+    mint_id: String,
+    publisher_profile_did: &'a str,
+    media_identity_base64: String,
+    key_envelope_identity_base64: String,
+    rights_policy_identity_base64: String,
+    content_key_commitment_base64: String,
 }
 
 #[derive(Clone)]
@@ -1528,6 +1535,7 @@ pub(super) async fn gateway_provider_proxy(
             | "shared_access"
             | "events" => &[LIBRARY_CAPSULE_ID],
             "open_viewer" | "read_viewer" | "close_viewer" => &[ELACITY_PLAYER_CAPSULE_ID],
+            "import_runtime_custody" => &[LIBRARY_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
             "list_runtime_custody" | "buy" => &[LIBRARY_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
             _ => {
                 return (
@@ -2206,7 +2214,7 @@ fn runtime_custody_purchase_stage_record(
 fn runtime_custody_purchase_transaction_request(
     principal_id: &str,
     buyer_account: &RuntimeCustodyCreatorAccount,
-    listing: &crate::protected_content_runtime::RuntimeCustodyListingRecord,
+    listing: &crate::protected_content_runtime::RuntimePortableListingPackage,
     listing_sha256: &str,
     mint_id: elastos_protected_content_contracts::Digest32,
     stage: &ResolvedProtectedContentPurchaseStep,
@@ -2270,7 +2278,7 @@ fn runtime_custody_purchase_transaction_request(
 fn validate_runtime_custody_purchase_stage_request(
     principal_id: &str,
     buyer_account: &RuntimeCustodyCreatorAccount,
-    listing: &crate::protected_content_runtime::RuntimeCustodyListingRecord,
+    listing: &crate::protected_content_runtime::RuntimePortableListingPackage,
     listing_sha256: &str,
     mint_id: elastos_protected_content_contracts::Digest32,
     stage: &crate::protected_content_runtime::RuntimeCustodyPurchaseStageRecord,
@@ -2311,7 +2319,7 @@ struct RuntimeCustodyExpectedPurchaseIdentity<'a> {
     content_id: &'a str,
     content_cid: &'a str,
     listing_sha256: &'a str,
-    listing: &'a crate::protected_content_runtime::RuntimeCustodyListingRecord,
+    listing: &'a crate::protected_content_runtime::RuntimePortableListingPackage,
     buyer_account: &'a RuntimeCustodyCreatorAccount,
 }
 
@@ -2365,7 +2373,7 @@ fn validate_runtime_custody_purchase_record_identity(
 
 async fn resolve_runtime_custody_purchase_plan(
     state: &GatewayState,
-    listing: &crate::protected_content_runtime::RuntimeCustodyListingRecord,
+    listing: &crate::protected_content_runtime::RuntimePortableListingPackage,
 ) -> anyhow::Result<ResolvedProtectedContentPurchase> {
     let response = wallet_chain_provider_data(
         state,
@@ -2450,7 +2458,7 @@ async fn resolve_runtime_custody_purchase_plan(
 
 async fn resolve_runtime_custody_purchase_access(
     state: &GatewayState,
-    listing: &crate::protected_content_runtime::RuntimeCustodyListingRecord,
+    listing: &crate::protected_content_runtime::RuntimePortableListingPackage,
     buyer_account: &RuntimeCustodyCreatorAccount,
     content_access_id_hex: &str,
     request_id: &str,
@@ -2545,16 +2553,28 @@ async fn publish_runtime_custody_creator_metadata(
     mime_type: &str,
     codecs: &str,
     facts: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
-    content_access_id: elastos_protected_content_contracts::ContentAccessIdV1,
+    mint: &elastos_protected_content_runtime::PersistedRuntimeMint,
+    publisher_profile_did: &str,
 ) -> anyhow::Result<(String, String)> {
+    let draft = mint.draft();
     let metadata = RuntimeCustodyCreatorMetadata {
         schema: "elastos.protected-content.metadata/v1",
         name: runtime_custody_metadata_name(object_uri),
         mime_type,
         codecs,
         encrypted_content_cid: &facts.content_cid,
-        content_access_id: format!("0x{}", hex::encode(content_access_id.as_bytes())),
+        content_access_id: format!("0x{}", hex::encode(draft.content_access_id().as_bytes())),
         protected_content_identity: &facts.content_id,
+        mint_id: hex::encode(draft.mint_id().as_bytes()),
+        publisher_profile_did,
+        media_identity_base64: base64::engine::general_purpose::STANDARD
+            .encode(draft.media_identity().canonical_bytes()?),
+        key_envelope_identity_base64: base64::engine::general_purpose::STANDARD
+            .encode(draft.key_envelope().canonical_bytes()?),
+        rights_policy_identity_base64: base64::engine::general_purpose::STANDARD
+            .encode(draft.policy().canonical_bytes()?),
+        content_key_commitment_base64: base64::engine::general_purpose::STANDARD
+            .encode(draft.content_key_commitment().as_bytes()),
     };
     let bytes = serde_json::to_vec(&metadata)?;
     let parent = data_dir.join("protected-content");
@@ -2874,7 +2894,8 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
     .ok_or_else(|| {
         anyhow::anyhow!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE)
     })?;
-    let listing = parse_runtime_custody_listing_bytes(&listing_bytes)?;
+    let listing_record = parse_runtime_custody_listing_bytes(&listing_bytes)?;
+    let listing = &listing_record.package;
     let persisted_purchase = crate::protected_content_runtime::load_runtime_custody_purchase(
         &state.data_dir,
         &input.principal_id,
@@ -2904,7 +2925,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
     if listing.mint_id != input.mint_id
         || listing.content_id != expected_content_id
         || listing.content_access_id != expected_content_access_id
-        || listing.cid != availability.content_cid()
+        || listing.content_cid != availability.content_cid()
     {
         anyhow::bail!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
     }
@@ -2937,7 +2958,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                 content_id: &expected_content_id,
                 content_cid: availability.content_cid(),
                 listing_sha256: &listing_sha256,
-                listing: &listing,
+                listing,
                 buyer_account: &buyer_account,
             };
             validate_runtime_custody_purchase_record_identity(&existing, &expected_identity)?;
@@ -2947,14 +2968,14 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
             let buyer_account =
                 resolve_runtime_custody_buyer_account(state, authority, &listing.chain_namespace)
                     .await?;
-            let purchase_plan = resolve_runtime_custody_purchase_plan(state, &listing).await?;
+            let purchase_plan = resolve_runtime_custody_purchase_plan(state, listing).await?;
             let mut steps = purchase_plan.steps.iter();
             let approval_request = match purchase_plan.steps.as_slice() {
                 [approval, buy] if approval.stage == "approval" && buy.stage == "buy" => {
                     Some(runtime_custody_purchase_transaction_request(
                         &input.principal_id,
                         &buyer_account,
-                        &listing,
+                        listing,
                         &listing_sha256,
                         mint_id,
                         approval,
@@ -2973,7 +2994,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
             let buy_request = runtime_custody_purchase_transaction_request(
                 &input.principal_id,
                 &buyer_account,
-                &listing,
+                listing,
                 &listing_sha256,
                 mint_id,
                 buy_step,
@@ -3040,7 +3061,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
             validate_runtime_custody_purchase_stage_request(
                 &input.principal_id,
                 &buyer_account,
-                &listing,
+                listing,
                 &listing_sha256,
                 mint_id,
                 stage,
@@ -3051,7 +3072,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
     let buy_request = validate_runtime_custody_purchase_stage_request(
         &input.principal_id,
         &buyer_account,
-        &listing,
+        listing,
         &listing_sha256,
         mint_id,
         &purchase.buy_stage,
@@ -3250,6 +3271,11 @@ async fn runtime_custody_publish_creator_tail_from_facts(
     let creator_state = match mint.creator_state().cloned() {
         Some(existing) => existing,
         None => {
+            let publisher_profile_did =
+                crate::protected_content_runtime::load_runtime_custody_profile_did(
+                    &state.data_dir,
+                    &input.principal_id,
+                )?;
             let (metadata_cid, token_uri) = publish_runtime_custody_creator_metadata(
                 registry.as_ref(),
                 &state.data_dir,
@@ -3257,7 +3283,8 @@ async fn runtime_custody_publish_creator_tail_from_facts(
                 &input.mime_type,
                 &input.codecs,
                 &facts,
-                mint.draft().content_access_id(),
+                &mint,
+                &publisher_profile_did,
             )
             .await?;
             let creator_state = elastos_protected_content_runtime::RuntimeMintCreatorState::new(
@@ -3622,6 +3649,7 @@ fn library_operation_needs_runtime_coordinator(op: &str) -> bool {
             | "repair"
             | "sync"
             | "list_runtime_custody"
+            | "import_runtime_custody"
             | "buy"
             | "open_viewer"
             | "read_viewer"
