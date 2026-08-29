@@ -8661,6 +8661,433 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
     assert!(!dir.path().join("protected-content/runtime-mint").exists());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_runtime_custody_two_runtime_portable_listing_gateway_journey() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    reset_mock_chain_raw_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+
+    let shared_content = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    let runtime_a = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(runtime_a.path(), 0x5a);
+    let content_a = TwoRuntimeContentProvider::new(0x5a, shared_content.clone());
+    let (state_a, wallet_a) = wallet_chain_test_state_with_observer(runtime_a.path()).await;
+    let registry_a = state_a.provider_registry.as_ref().unwrap().clone();
+    registry_a
+        .register_sub_provider("content", content_a.clone())
+        .await
+        .unwrap();
+    registry_a
+        .register_sub_provider(
+            "object",
+            std::sync::Arc::new(crate::library::ObjectProvider::new(
+                runtime_a.path().to_path_buf(),
+                std::sync::Arc::downgrade(&registry_a),
+            )),
+        )
+        .await
+        .unwrap();
+    let process_fixture = crate::protected_content_runtime::tests::register_runtime_custody_process_providers_for_test_registry(
+        runtime_a.path(),
+        &registry_a,
+    )
+    .await;
+    crate::protected_content_runtime::tests::register_runtime_custody_mock_media_provider_for_test_registry(
+        runtime_a.path(),
+        &registry_a,
+    )
+    .await;
+    let creator = passkey_authority_with_profile_role_credential(
+        runtime_a.path(),
+        "two-runtime-creator",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-two-runtime-creator",
+    );
+    let creator_token = app_token_for_authority(runtime_a.path(), LIBRARY_CAPSULE_ID, &creator);
+    let creator_account = wallet_a
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&creator.principal_id, 1)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_a.provider,
+        &creator.principal_id,
+        "eip155:8453",
+        &creator_account,
+        10,
+    )
+    .await;
+    let app_a = gateway_router(state_a);
+    let creator_uri = format!(
+        "{}/Documents/two-runtime-proof.mp4",
+        crate::auth::principal_localhost_root(&creator.principal_id)
+    );
+    write_library_bytes(&app_a, &creator_token, &creator_uri, b"media").await;
+    let publish_body = json!({
+        "uri": creator_uri,
+        "protection": {
+            "mode": "runtime_custody",
+            "copies": "0x1",
+            "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+        },
+    });
+    let (_, publish_pending) = post_library(
+        app_a.clone(),
+        &creator_token,
+        "publish",
+        publish_body.clone(),
+    )
+    .await;
+    assert_eq!(
+        publish_pending["message"],
+        "Runtime custody creator mint is pending exact Wallet or Chain settlement"
+    );
+    let creator_approval_id = wallet_a
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    let _ = wallet_a
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    let creator_transaction = wallet_a
+        .provider
+        .latest_transaction_signed_transaction()
+        .await
+        .unwrap();
+    reset_mock_chain_broadcast_count(&creator_transaction);
+    let (_, published) = post_library(
+        app_a.clone(),
+        &creator_token,
+        "publish",
+        publish_body.clone(),
+    )
+    .await;
+    assert_eq!(published["status"], "ok", "{published}");
+    let mint_id_hex = published["data"]["content_security"]["mint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mint_id = elastos_protected_content_contracts::Digest32::new(
+        hex::decode(&mint_id_hex).unwrap().try_into().unwrap(),
+    );
+    let listing_uri = published["data"]["listing_uri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(listing_uri, format!("elastos://{TWO_RUNTIME_LISTING_CID}"));
+    let listing_a =
+        crate::protected_content_runtime::load_runtime_custody_listing(runtime_a.path(), mint_id)
+            .unwrap()
+            .unwrap();
+    let package_digest_a = match &listing_a.origin {
+        crate::protected_content_runtime::RuntimeCustodyListingOrigin::LocalCreator {
+            package_sha256,
+            ..
+        } => package_sha256.clone(),
+        _ => panic!("creator listing must retain local origin"),
+    };
+    let (_, publish_replay) =
+        post_library(app_a.clone(), &creator_token, "publish", publish_body).await;
+    assert_eq!(publish_replay["data"]["listing_uri"], listing_uri);
+    assert_eq!(mock_chain_broadcast_count(&creator_transaction), 1);
+    assert_eq!(
+        wallet_a
+            .provider
+            .latest_transaction_approval_request_id()
+            .await
+            .as_deref(),
+        Some(creator_approval_id.as_str())
+    );
+    let publish_requests = content_a
+        .requests()
+        .into_iter()
+        .filter(|request| request["op"] == "publish")
+        .collect::<Vec<_>>();
+    assert_eq!(publish_requests.len(), 4);
+    assert_eq!(publish_requests[2], publish_requests[3]);
+    assert_eq!(
+        publish_requests[2]["object_kind"],
+        "protected-content-listing"
+    );
+    assert_eq!(
+        publish_requests[2]["object_did"],
+        listing_a.package.content_id
+    );
+    assert_eq!(
+        publish_requests[2]["publisher_did"],
+        listing_a.package.publisher_profile_did
+    );
+    assert_eq!(
+        publish_requests[2]["availability_requirements"],
+        json!({"min_replicas": 3, "require_live_multi_peer_proof": true})
+    );
+    assert_eq!(publish_requests[2]["links"].as_array().unwrap().len(), 2);
+
+    let runtime_b = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(runtime_b.path(), 0x5b);
+    let content_b = TwoRuntimeContentProvider::new(0x5b, shared_content);
+    assert_ne!(content_a.signer_did(), content_b.signer_did());
+    let (state_b, wallet_b) = wallet_chain_test_state_with_observer(runtime_b.path()).await;
+    let registry_b = state_b.provider_registry.as_ref().unwrap().clone();
+    registry_b
+        .register_sub_provider("content", content_b.clone())
+        .await
+        .unwrap();
+    registry_b
+        .register_sub_provider(
+            "object",
+            std::sync::Arc::new(crate::library::ObjectProvider::new(
+                runtime_b.path().to_path_buf(),
+                std::sync::Arc::downgrade(&registry_b),
+            )),
+        )
+        .await
+        .unwrap();
+    crate::protected_content_runtime::tests::attach_runtime_custody_process_providers_for_buyer_runtime(
+        &process_fixture,
+        runtime_b.path(),
+        &registry_b,
+    )
+    .await;
+    let buyer = passkey_authority_with_profile_role_credential(
+        runtime_b.path(),
+        "two-runtime-buyer",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-two-runtime-buyer",
+    );
+    assert_ne!(creator.principal_id, buyer.principal_id);
+    let buyer_token = app_token_for_authority(runtime_b.path(), LIBRARY_CAPSULE_ID, &buyer);
+    let buyer_account = wallet_b
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&buyer.principal_id, 2)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_b.provider,
+        &buyer.principal_id,
+        "eip155:8453",
+        &buyer_account,
+        10,
+    )
+    .await;
+    let app_b = gateway_router(state_b);
+    let (_, imported) = post_library(
+        app_b.clone(),
+        &buyer_token,
+        "import_runtime_custody",
+        json!({"listing_uri": listing_uri}),
+    )
+    .await;
+    assert_eq!(imported["status"], "ok", "{imported}");
+    assert_eq!(imported["data"]["listing_uri"], listing_uri);
+    let listing_b =
+        crate::protected_content_runtime::load_runtime_custody_listing(runtime_b.path(), mint_id)
+            .unwrap()
+            .unwrap();
+    let package_digest_b = match &listing_b.origin {
+        crate::protected_content_runtime::RuntimeCustodyListingOrigin::Imported {
+            package_sha256,
+            ..
+        } => package_sha256.clone(),
+        _ => panic!("buyer listing must retain imported origin"),
+    };
+    assert_eq!(listing_a.package, listing_b.package);
+    assert_eq!(package_digest_a, package_digest_b);
+    assert!(!runtime_b
+        .path()
+        .join("protected-content/runtime-mint")
+        .exists());
+
+    let prebuy_requests = content_b.requests().len();
+    let prebuy_player = projection_launch_token_for_authority_context(
+        runtime_b.path(),
+        ELACITY_PLAYER_CAPSULE_ID_FOR_TEST,
+        &buyer,
+    );
+    let (_, denied_open) = post_library(
+        app_b.clone(),
+        &prebuy_player,
+        "open_viewer",
+        json!({"mint_id": mint_id_hex}),
+    )
+    .await;
+    assert_eq!(denied_open["status"], "error", "{denied_open}");
+    assert_eq!(content_b.requests().len(), prebuy_requests);
+    let viewer_record_path =
+        runtime_custody_viewer_record_path_for_test(runtime_b.path(), &buyer.principal_id, mint_id);
+    assert!(!viewer_record_path.exists());
+    crate::protected_content_runtime::tests::assert_no_unresolved_runtime_custody_release_for_test(
+        runtime_b.path(),
+    );
+
+    let (_, listed_before) = post_library(
+        app_b.clone(),
+        &buyer_token,
+        "list_runtime_custody",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        listed_before["data"]["listings"][0]["access_state"],
+        "available"
+    );
+    let (_, buy_pending) = post_library(
+        app_b.clone(),
+        &buyer_token,
+        "buy",
+        json!({"mint_id": mint_id_hex}),
+    )
+    .await;
+    assert_eq!(
+        buy_pending["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+    let buyer_approval_id = wallet_b
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    let _ = wallet_b
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    let buyer_transaction = wallet_b
+        .provider
+        .latest_transaction_signed_transaction()
+        .await
+        .unwrap();
+    reset_mock_chain_broadcast_count(&buyer_transaction);
+    let (_, bought) = post_library(
+        app_b.clone(),
+        &buyer_token,
+        "buy",
+        json!({"mint_id": mint_id_hex}),
+    )
+    .await;
+    assert_eq!(bought["status"], "ok", "{bought}");
+    let (_, buy_replay) = post_library(
+        app_b.clone(),
+        &buyer_token,
+        "buy",
+        json!({"mint_id": mint_id_hex}),
+    )
+    .await;
+    assert_eq!(buy_replay, bought);
+    assert_eq!(mock_chain_broadcast_count(&buyer_transaction), 1);
+    assert_eq!(
+        wallet_b
+            .provider
+            .latest_transaction_approval_request_id()
+            .await
+            .as_deref(),
+        Some(buyer_approval_id.as_str())
+    );
+    let (_, listed_after) = post_library(
+        app_b.clone(),
+        &buyer_token,
+        "list_runtime_custody",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        listed_after["data"]["listings"][0]["access_state"],
+        "purchased"
+    );
+
+    let player_token = projection_launch_token_for_authority_context(
+        runtime_b.path(),
+        ELACITY_PLAYER_CAPSULE_ID_FOR_TEST,
+        &buyer,
+    );
+    let (_, opened) = post_library(
+        app_b.clone(),
+        &player_token,
+        "open_viewer",
+        json!({"mint_id": mint_id_hex}),
+    )
+    .await;
+    assert_eq!(opened["status"], "ok", "{opened}");
+    let viewer_handle = opened["data"]["viewer_session_handle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, open_replay) = post_library(
+        app_b.clone(),
+        &player_token,
+        "open_viewer",
+        json!({"mint_id": mint_id_hex}),
+    )
+    .await;
+    assert_eq!(open_replay, opened);
+    let (clear_init, clear_segments) =
+        crate::protected_content_runtime::tests::runtime_custody_gateway_media_output_for_test();
+    let (_, init) = post_library(
+        app_b.clone(),
+        &player_token,
+        "read_viewer",
+        json!({"mint_id": mint_id_hex, "viewer_session_handle": viewer_handle}),
+    )
+    .await;
+    assert_eq!(init["status"], "ok", "{init}");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(init["data"]["data"].as_str().unwrap())
+            .unwrap(),
+        clear_init
+    );
+    let (_, segment) = post_library(
+        app_b.clone(),
+        &player_token,
+        "read_viewer",
+        json!({
+            "mint_id": mint_id_hex,
+            "viewer_session_handle": viewer_handle,
+            "segment_index": 0,
+        }),
+    )
+    .await;
+    assert_eq!(segment["status"], "ok", "{segment}");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(segment["data"]["data"].as_str().unwrap())
+            .unwrap(),
+        clear_segments[0]
+    );
+    let (_, closed) = post_library(
+        app_b,
+        &player_token,
+        "close_viewer",
+        json!({"mint_id": mint_id_hex, "viewer_session_handle": viewer_handle}),
+    )
+    .await;
+    assert_eq!(closed["status"], "ok", "{closed}");
+    let viewer: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&viewer_record_path).unwrap()).unwrap();
+    assert_eq!(viewer["lifecycle_status"], "closed");
+    let purchase = crate::protected_content_runtime::load_runtime_custody_purchase(
+        runtime_b.path(),
+        &buyer.principal_id,
+        mint_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(purchase.listing_sha256, listing_b.portable_package_digest());
+    assert!(matches!(
+        purchase.progress,
+        crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Complete { .. }
+    ));
+    crate::protected_content_runtime::tests::assert_no_unresolved_runtime_custody_release_for_test(
+        runtime_b.path(),
+    );
+    assert!(!runtime_b
+        .path()
+        .join("protected-content/runtime-mint")
+        .exists());
+}
+
 #[tokio::test]
 async fn test_runtime_custody_creator_tail_rejects_resolved_source_drift_before_chain_effect() {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;

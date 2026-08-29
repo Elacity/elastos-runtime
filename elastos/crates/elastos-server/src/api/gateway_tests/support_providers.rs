@@ -81,8 +81,7 @@ fn mock_published_protected_content(
 type MockImmutableContentFiles = BTreeMap<String, Vec<u8>>;
 type MockImmutableContentObjects = BTreeMap<String, MockImmutableContentFiles>;
 
-fn mock_immutable_content_objects(
-) -> &'static std::sync::Mutex<MockImmutableContentObjects> {
+fn mock_immutable_content_objects() -> &'static std::sync::Mutex<MockImmutableContentObjects> {
     static OBJECTS: std::sync::OnceLock<std::sync::Mutex<MockImmutableContentObjects>> =
         std::sync::OnceLock::new();
     OBJECTS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
@@ -667,6 +666,12 @@ impl Provider for MockChainProvider {
                         == MockProtectedContentChainMode::CreatorMintResolveDrift
                     {
                         "0x00000000000000000000000000000000000000cc"
+                    } else if mock_protected_content_purchase_fixture()
+                        .lock()
+                        .unwrap()
+                        .native_purchase
+                    {
+                        "0x0000000000000000000000000000000000000000"
                     } else {
                         MOCK_PROTECTED_CONTENT_PAY_TOKEN
                     },
@@ -697,7 +702,15 @@ impl Provider for MockChainProvider {
                     "network": "base-mainnet",
                     "chain_namespace": "eip155:8453",
                     "ledger": MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
-                    "pay_token": MOCK_PROTECTED_CONTENT_PAY_TOKEN,
+                    "pay_token": if mock_protected_content_purchase_fixture()
+                        .lock()
+                        .unwrap()
+                        .native_purchase
+                    {
+                        "0x0000000000000000000000000000000000000000"
+                    } else {
+                        MOCK_PROTECTED_CONTENT_PAY_TOKEN
+                    },
                     "abi": "elacity_mint_v1",
                     "function": "mint(string,uint16,bytes,bytes)"
                 }
@@ -1180,6 +1193,225 @@ impl Provider for MockChainProvider {
 }
 
 struct MockContentProvider;
+
+const TWO_RUNTIME_LISTING_CID: &str = "bafybeibwzif2r5tn7z7cq4f5a2mmepmab4s4m5a2hqu5v4f4uzkd3t2u7m";
+
+type TwoRuntimeContentStore =
+    std::sync::Arc<std::sync::Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>>>;
+
+struct TwoRuntimeContentProvider {
+    signing_key: ed25519_dalek::SigningKey,
+    objects: TwoRuntimeContentStore,
+    requests: std::sync::Mutex<Vec<Value>>,
+}
+
+impl TwoRuntimeContentProvider {
+    fn new(seed: u8, objects: TwoRuntimeContentStore) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            signing_key: elastos_identity::derive_did(&[seed; 32]).0,
+            objects,
+            requests: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn signer_did(&self) -> String {
+        crate::crypto::domain_separated_sign(
+            &self.signing_key,
+            "elastos.content.availability.receipt.v1",
+            b"two-runtime-content-provider",
+        )
+        .1
+    }
+
+    fn requests(&self) -> Vec<Value> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn cid_for_kind(kind: &str) -> &'static str {
+        match kind {
+            "protected-content" => TEST_CIDV1,
+            "protected-content-listing" => TWO_RUNTIME_LISTING_CID,
+            _ => TEST_CIDV0,
+        }
+    }
+
+    fn publish(&self, request: &Value) -> Result<Value, ProviderError> {
+        let kind = required_test_str(request, "object_kind")?;
+        let entries = request
+            .get("files")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ProviderError::Provider("content publish requires files".into()))?;
+        let mut files = BTreeMap::new();
+        for entry in entries {
+            let path = required_test_str(entry, "path")?;
+            let data = required_test_str(entry, "data")?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|error| ProviderError::Provider(error.to_string()))?;
+            if files.insert(path.to_string(), bytes).is_some() {
+                return Err(ProviderError::Provider(
+                    "content publish contains duplicate paths".into(),
+                ));
+            }
+        }
+        let mut manifest_files = files
+            .iter()
+            .map(|(path, bytes)| mock_protected_content_file(path, bytes))
+            .collect::<Vec<_>>();
+        manifest_files.sort_by(|left, right| left.path.cmp(&right.path));
+        let manifest = crate::content::ContentObjectManifest {
+            schema: "elastos.content.object.manifest/v1".to_string(),
+            kind: kind.to_string(),
+            content_digest: mock_protected_content_manifest_digest(&manifest_files),
+            files: manifest_files,
+            links: serde_json::from_value(
+                request.get("links").cloned().unwrap_or_else(|| json!([])),
+            )
+            .map_err(|error| ProviderError::Provider(error.to_string()))?,
+            object_did: request
+                .get("object_did")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            publisher_did: request
+                .get("publisher_did")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+        files.insert(
+            crate::content::CONTENT_OBJECT_MANIFEST_PATH.to_string(),
+            serde_json::to_vec(&manifest)
+                .map_err(|error| ProviderError::Provider(error.to_string()))?,
+        );
+        let cid = Self::cid_for_kind(kind);
+        let mut objects = self.objects.lock().unwrap();
+        if let Some(existing) = objects.get(cid) {
+            if existing != &files {
+                return Err(ProviderError::Provider(
+                    "content address already binds different bytes".into(),
+                ));
+            }
+        } else {
+            objects.insert(cid.to_string(), files);
+        }
+        Ok(json!({
+            "status": "ok",
+            "data": {
+                "cid": cid,
+                "uri": format!("elastos://{cid}"),
+                "availability": {
+                    "status": "network_available",
+                    "provider": "two-runtime-content-provider",
+                    "replicas": 3,
+                }
+            }
+        }))
+    }
+
+    fn status(&self, cid: &str) -> Result<Value, ProviderError> {
+        let objects = self.objects.lock().unwrap();
+        let files = objects
+            .get(cid)
+            .ok_or_else(|| ProviderError::Provider("content object is unavailable".into()))?;
+        let manifest: crate::content::ContentObjectManifest = serde_json::from_slice(
+            files
+                .get(crate::content::CONTENT_OBJECT_MANIFEST_PATH)
+                .ok_or_else(|| ProviderError::Provider("content manifest is unavailable".into()))?,
+        )
+        .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        let publisher_did = manifest
+            .publisher_did
+            .clone()
+            .ok_or_else(|| ProviderError::Provider("content publisher is unavailable".into()))?;
+        let payload = crate::content::AvailabilityReceipt {
+            schema: "elastos.content.availability.receipt/v1".to_string(),
+            cid: cid.to_string(),
+            uri: format!("elastos://{cid}"),
+            object_did: manifest.object_did,
+            publisher_did,
+            provider: "content".to_string(),
+            policy: "protected-content-replication/v1".to_string(),
+            status: "network_available".to_string(),
+            replicas: 3,
+            peer_selection: json!({"live_multi_peer_proof": true}),
+            quota: json!({}),
+            repair_worker: json!({}),
+            storage_market: json!({}),
+            repair_graph: json!({}),
+            abuse_controls: json!({}),
+            accounting: json!({}),
+            checked_at: crate::auth::now_ts(),
+        };
+        let payload_bytes =
+            serde_json::to_string(&serde_json::to_value(&payload).unwrap()).unwrap();
+        let (signature, signer_did) = crate::crypto::domain_separated_sign(
+            &self.signing_key,
+            "elastos.content.availability.receipt.v1",
+            payload_bytes.as_bytes(),
+        );
+        Ok(json!({
+            "status": "ok",
+            "data": {
+                "cid": cid,
+                "uri": format!("elastos://{cid}"),
+                "availability": {
+                    "status": "network_available",
+                    "provider": "two-runtime-content-provider",
+                    "replicas": 3,
+                },
+                "receipt": crate::content::SignedAvailabilityReceipt {
+                    payload,
+                    signature,
+                    signer_did,
+                }
+            }
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for TwoRuntimeContentProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "two-runtime content provider only supports raw requests".into(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["content"]
+    }
+
+    fn name(&self) -> &'static str {
+        "two-runtime-content-provider"
+    }
+
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        self.requests.lock().unwrap().push(request.clone());
+        match request.get("op").and_then(Value::as_str) {
+            Some("publish") => self.publish(request),
+            Some("status") => self.status(required_test_str(request, "cid")?),
+            Some("fetch") => {
+                let cid = required_test_str(request, "cid")?;
+                let path = required_test_str(request, "path")?;
+                let objects = self.objects.lock().unwrap();
+                let bytes = objects
+                    .get(cid)
+                    .and_then(|files| files.get(path))
+                    .ok_or_else(|| ProviderError::Provider("content file is unavailable".into()))?;
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "cid": cid,
+                        "path": path,
+                        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                    }
+                }))
+            }
+            _ => Err(ProviderError::Provider(
+                "unsupported two-runtime content operation".into(),
+            )),
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl Provider for MockContentProvider {

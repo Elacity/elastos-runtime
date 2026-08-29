@@ -11986,6 +11986,8 @@ async fn register_test_decrypt_provider(
 #[cfg(unix)]
 pub(crate) struct RuntimeCustodyProcessProviderFixture {
     _nodes_temp: tempfile::TempDir,
+    nodes: Vec<(NodePublicKey, Arc<ProviderRegistry>)>,
+    composition: RuntimeCustodyCompositionConfigFile,
 }
 
 #[cfg(unix)]
@@ -12093,24 +12095,31 @@ pub(crate) async fn register_runtime_custody_process_providers_for_test_registry
     let pool = signed_custody_pool_for_epoch(&epoch, (now.saturating_sub(60), now + 3_600));
     let authorization =
         signed_committee_authorization_for_epoch(pool.pool_identity().unwrap(), &epoch);
-    write_owner_only_custody_composition_config(
-        data_dir,
-        &RuntimeCustodyCompositionConfigFile {
-            schema: CUSTODY_COMPOSITION_SCHEMA_V1.to_string(),
-            expected_policy_authority_base64: raw_b64_32(
-                SigningKey::from_bytes(&[0x71; 32])
-                    .verifying_key()
-                    .to_bytes(),
-            ),
-            expected_committee_authorization_identity_base64: canonical_b64(
-                &authorization.authorization_identity().unwrap(),
-            ),
-            signed_pool_base64: canonical_b64(&pool),
-            signed_epoch_base64: canonical_b64(&epoch),
-            signed_committee_authorization_base64: canonical_b64(&authorization),
-            routes: process_custody_play_routes(&epoch, owner_state_roots),
-        },
-    );
+    let composition = RuntimeCustodyCompositionConfigFile {
+        schema: CUSTODY_COMPOSITION_SCHEMA_V1.to_string(),
+        expected_policy_authority_base64: raw_b64_32(
+            SigningKey::from_bytes(&[0x71; 32])
+                .verifying_key()
+                .to_bytes(),
+        ),
+        expected_committee_authorization_identity_base64: canonical_b64(
+            &authorization.authorization_identity().unwrap(),
+        ),
+        signed_pool_base64: canonical_b64(&pool),
+        signed_epoch_base64: canonical_b64(&epoch),
+        signed_committee_authorization_base64: canonical_b64(&authorization),
+        routes: process_custody_play_routes(&epoch, owner_state_roots),
+    };
+    write_owner_only_custody_composition_config(data_dir, &composition);
+    let nodes = ordered_fixtures
+        .iter()
+        .map(|fixture| {
+            (
+                fixture.provisioned.node_public_key,
+                fixture.registry.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
 
     register_protect_provider(registry, &protect_binary)
         .await
@@ -12120,15 +12129,7 @@ pub(crate) async fn register_runtime_custody_process_providers_for_test_registry
             CUSTODY_PROVIDER_ID,
             Arc::new(LibraryProcessCustodyDispatcher {
                 expected_issuer: runtime_issuer,
-                nodes: ordered_fixtures
-                    .iter()
-                    .map(|fixture| {
-                        (
-                            fixture.provisioned.node_public_key,
-                            fixture.registry.clone(),
-                        )
-                    })
-                    .collect(),
+                nodes: nodes.clone(),
             }),
         )
         .await
@@ -12141,7 +12142,49 @@ pub(crate) async fn register_runtime_custody_process_providers_for_test_registry
     register_test_decrypt_provider(registry, runtime_issuer).await;
     RuntimeCustodyProcessProviderFixture {
         _nodes_temp: nodes_temp,
+        nodes,
+        composition,
     }
+}
+
+#[cfg(unix)]
+pub(crate) async fn attach_runtime_custody_process_providers_for_buyer_runtime(
+    fixture: &RuntimeCustodyProcessProviderFixture,
+    data_dir: &Path,
+    registry: &Arc<ProviderRegistry>,
+) {
+    owner_only_dir(data_dir);
+    write_owner_only_custody_composition_config(data_dir, &fixture.composition);
+    let (runtime_device_key, _) = elastos_identity::load_or_create_did(data_dir).unwrap();
+    let runtime_issuer =
+        RuntimeOperationIssuerKeyV1::new(runtime_device_key.verifying_key().to_bytes()).unwrap();
+    registry
+        .register_runtime_provider_target(
+            CUSTODY_PROVIDER_ID,
+            Arc::new(LibraryProcessCustodyDispatcher {
+                expected_issuer: runtime_issuer,
+                nodes: fixture.nodes.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    registry
+        .set_carrier_invoker(Arc::new(LoopbackCustodyCarrierInvoker {
+            registry: Arc::downgrade(registry),
+        }))
+        .await;
+    register_test_decrypt_provider(registry, runtime_issuer).await;
+}
+
+#[cfg(unix)]
+pub(crate) fn assert_no_unresolved_runtime_custody_release_for_test(data_dir: &Path) {
+    let release_root = data_dir.join("protected-content/runtime-release");
+    assert!(list_unresolved_runtime_releases(&release_root)
+        .unwrap()
+        .is_empty());
+    assert!(unresolved_release_audit_records(&release_root)
+        .unwrap()
+        .is_empty());
 }
 
 #[cfg(unix)]
