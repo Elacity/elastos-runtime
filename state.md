@@ -21,17 +21,14 @@ volatile proof logs remain outside the repository.
   ancestor of the published lifecycle and is already present in the active
   integration. The latest published protected-branch repairs need no new
   extraction.
-- The active unpublished branch contains the implementation prefix through
-  `3ece9042`, tree `a17c799d4ffd837a4c65888ec9601ee6216c52fa`. The source
-  worktree was clean at that implementation prefix before this document update.
-  The branch has no upstream and contains both the published lifecycle and UIUX
-  candidate tips.
-- Relative to `origin/upstream/0.7-dev@90bbe15b`, the `3ece9042` implementation
-  prefix has 15 unique commits behind and 98 unique commits ahead. Its merge
-  base is `854d9dc9`. At that prefix, the upstream tip was not integrated. This
-  merge makes `90bbe15b` an ancestor of the active branch. Its changes overlap
-  27 files also changed locally, including Chain provider source and tests and
-  protected-content documents.
+- The active unpublished `feat/protected-content-uiux-reconstruction` branch
+  contains the implementation prefix through `84569da5`, tree
+  `ffc3501c251bd5152ecd45cf07bc63ec6a336e0f`. The source worktree was clean at
+  that prefix before this document update. The branch has no upstream and
+  contains both published lifecycle and UIUX candidate tips.
+- Relative to `origin/upstream/0.7-dev@90bbe15b`, the `84569da5` implementation
+  prefix is 0 commits behind and 107 commits ahead. The upstream tip is an
+  ancestor of the active branch.
 - Upstream `90bbe15b` records Irzhy's verified Base 8453 evidence and changes
   `TASKS.md`, Chain provider source and tests, `docs/CHAIN_PROVIDER.md`,
   `docs/PROTECTED_CONTENT.md`, and
@@ -40,21 +37,24 @@ volatile proof logs remain outside the repository.
   upstream collaboration and Browser local-exit orphan cleanup.
 - The protected-content source path remains inactive. Installed proof and one
   atomic cutover remain open.
-- The inactive combined proof uses one Runtime and two principals. Commit
-  `f657242c` completed cross-Runtime custody release issuer admission: creator
-  Runtime authority still controls provisioning, while release authenticates
-  the buyer Runtime issuer declared by the signed operation and bound by the
-  buyer Profile. The remaining cross-Runtime source boundary is a portable
-  immutable listing package and typed buyer import/projection.
-- Commit `3ece9042` removed Runtime `runtime-open/envelope.bin` state. Playback
-  reconstructs from the authenticated release operation, verified signed
-  epoch, released contributions and terminal receipt, recipient possession,
-  and public CEK commitment. Provisioning still uses `CustodyEnvelopeV1`.
-- The combined one-Runtime protected-content gateway proof now uses the private
-  Runtime targets for protect, media, custody, and decrypt. Its Carrier fixture
-  supplies authenticated source endpoint identity before the selected custody
-  target handles the request. Public provider projection still excludes these
-  targets.
+- Commits `3026992b`, `ed7a8bfc`, and `7f6e47f9` provide portable listing
+  publication and import, buyer purchase, and buyer open, read, and close
+  without creator Runtime mint state. The package binds the public custody
+  identity to Chain-committed metadata and uses one immutable listing
+  projection on each Runtime.
+- Commits `ba7f6cea` and `84569da5` complete exact buyer Runtime rights admission
+  and the two-Runtime source journey. Runtime A keeps provisioning authority for
+  the real process-backed 2-of-3 custody nodes. Runtime B imports the listing,
+  buys it, and completes open, read, and close with its own Profile, Wallet,
+  device identity, state, and signed release operation.
+- Playback reconstructs from the authenticated release operation, verified
+  signed epoch, released contributions and terminal receipt, recipient
+  possession, and public CEK commitment. Provisioning still uses
+  `CustodyEnvelopeV1`; Runtime stores no playback copy of the custody envelope.
+- The combined protected-content gateway proof uses private Runtime targets for
+  protect, media, custody, and decrypt. Carrier supplies authenticated endpoint
+  transport before the Runtime-selected custody target handles the request.
+  Public provider projection excludes these targets.
 
 ## Branch Hygiene
 
@@ -185,9 +185,9 @@ integrated source adapted these useful parts to the typed Runtime path:
 Current video opens in `elacity-player`. Document and 3D viewers remain later
 typed-viewer scope. External cryptographic review remains open before public
 dKMS or production confidentiality claims. Global listing discovery and public
-custody governance remain later work. Buyer Runtime issuer admission is
-complete. A shared listing link, portable immutable listing package, and typed
-buyer import/projection are the remaining 0.7 source boundary.
+custody governance remain later work. The shared listing link, portable import,
+buyer Runtime rights admission, and exact two-Runtime 2-of-3 source journey are
+complete. Installed proof and the atomic authority cutover remain open.
 
 ## Capsule Execution Truth
 

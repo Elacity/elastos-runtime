@@ -9,6 +9,13 @@ All notable changes to the public ElastOS Runtime repository.
   lifecycle with collaboration, Home/platform, Wallet, GBA, model-provider,
   Assistant, Library, Marketplace, and player UIUX. The Runtime-owned
   protected-content path remains inactive until installed proof and cutover.
+- Protected-content creators publish one canonical Chain-bound listing package
+  through content addressing. A buyer Runtime imports the shared listing,
+  verifies it, and uses the same immutable projection for purchase and playback.
+- The source proof now covers two distinct Runtimes and real process-backed
+  2-of-3 custody nodes. The creator Runtime provisions the nodes; the buyer
+  Runtime completes import, deny-before-buy, purchase, open, read, and close
+  through its own Profile, Wallet, device identity, and signed release.
 - A bounded read-only protected-content audit verifies source and installed
   artifact parity, private provider declarations, profile and role facts, and
   operator prerequisites. Its redacted receipt reports readiness for active
