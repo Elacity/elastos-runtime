@@ -7837,6 +7837,7 @@ enum RuntimePortableListingMismatch {
 async fn run_runtime_custody_portable_listing_import(
     mismatch: RuntimePortableListingMismatch,
     refresh_availability: bool,
+    buy_imported: bool,
 ) {
     #[derive(serde::Serialize)]
     struct PortableMetadataFixture<'a> {
@@ -7859,6 +7860,9 @@ async fn run_runtime_custody_portable_listing_import(
     reset_mock_immutable_content_objects();
     reset_mock_protected_content_chain_mode();
     reset_mock_protected_content_purchase_fixture();
+    if buy_imported {
+        set_mock_protected_content_purchase_native();
+    }
     let creator_dir = tempfile::tempdir().unwrap();
     let creator = passkey_authority_with_profile_role_credential(
         creator_dir.path(),
@@ -7878,7 +7882,7 @@ async fn run_runtime_custody_portable_listing_import(
         &creator.principal_id,
         &facts,
         MOCK_MANAGED_EVM_ADDRESS,
-        false,
+        buy_imported,
     );
     seed_mock_immutable_content_object(
         TEST_CIDV0,
@@ -7938,6 +7942,7 @@ async fn run_runtime_custody_portable_listing_import(
     );
 
     let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
     crate::protected_content_runtime::tests::write_library_publish_test_composition(dir.path());
     let composition = "protected-content/custody-composition.json";
     std::fs::copy(
@@ -7945,7 +7950,7 @@ async fn run_runtime_custody_portable_listing_import(
         dir.path().join(composition),
     )
     .unwrap();
-    let (state, _) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
     let registry = state.provider_registry.as_ref().unwrap().clone();
     registry
         .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
@@ -7957,6 +7962,20 @@ async fn run_runtime_custody_portable_listing_import(
         crate::auth::RuntimePrincipalRole::Admin,
         "gateway-test-passkey-portable-listing-buyer",
     );
+    if buy_imported {
+        let account_id = wallet_provider
+            .provider
+            .seed_managed_evm_account_for_principal(&buyer.principal_id)
+            .await;
+        set_mock_wallet_transaction_default(
+            &wallet_provider.provider,
+            &buyer.principal_id,
+            "eip155:8453",
+            &account_id,
+            10,
+        )
+        .await;
+    }
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &buyer);
     let app = gateway_router(state);
 
@@ -8008,7 +8027,7 @@ async fn run_runtime_custody_portable_listing_import(
         advance_mock_published_protected_content_receipt();
     }
     let (_, replay) = post_library(
-        app,
+        app.clone(),
         &token,
         "import_runtime_custody",
         json!({ "listing_uri": listing_uri }),
@@ -8029,22 +8048,129 @@ async fn run_runtime_custody_portable_listing_import(
         assert!(after["checked_at"].as_u64() > before["checked_at"].as_u64());
         assert_ne!(after["receipt_digest"], before["receipt_digest"]);
     } else {
-        assert_eq!(std::fs::read(listing_path).unwrap(), persisted);
+        assert_eq!(std::fs::read(&listing_path).unwrap(), persisted);
     }
     assert!(!dir.path().join("protected-content/runtime-mint").exists());
+    if buy_imported {
+        let (_, listed) =
+            post_library(app.clone(), &token, "list_runtime_custody", json!({})).await;
+        assert_eq!(listed["status"], "ok", "{listed}");
+        assert_eq!(
+            listed["data"]["listings"][0]["mint_id"],
+            portable_package.mint_id
+        );
+        assert_eq!(listed["data"]["listings"][0]["access_state"], "available");
+        let (_, pending) = post_library(
+            app.clone(),
+            &token,
+            "buy",
+            json!({"mint_id": portable_package.mint_id}),
+        )
+        .await;
+        assert_eq!(
+            pending["message"],
+            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+        );
+        assert!(!dir.path().join("protected-content/runtime-mint").exists());
+        let approval_request_id = wallet_provider
+            .provider
+            .latest_transaction_approval_request_id()
+            .await
+            .unwrap();
+        advance_mock_published_protected_content_receipt();
+        let (_, refreshed) = post_library(
+            app.clone(),
+            &token,
+            "import_runtime_custody",
+            json!({"listing_uri": listing_uri}),
+        )
+        .await;
+        assert_eq!(refreshed, imported);
+        let refreshed_record = crate::protected_content_runtime::load_runtime_custody_listing(
+            dir.path(),
+            facts.mint_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&(
+                &refreshed_record.schema,
+                &refreshed_record.origin,
+                &refreshed_record.package,
+            ))
+            .unwrap(),
+            immutable_before
+        );
+        let availability_before = serde_json::to_value(&replayed.availability).unwrap();
+        let availability_after = serde_json::to_value(&refreshed_record.availability).unwrap();
+        assert!(
+            availability_after["checked_at"].as_u64() > availability_before["checked_at"].as_u64()
+        );
+        assert_ne!(
+            availability_after["receipt_digest"],
+            availability_before["receipt_digest"]
+        );
+        let _ = wallet_provider
+            .provider
+            .complete_latest_transaction_approval()
+            .await;
+        let signed_transaction = wallet_provider
+            .provider
+            .latest_transaction_signed_transaction()
+            .await
+            .unwrap();
+        reset_mock_chain_broadcast_count(&signed_transaction);
+        let (_, bought) = post_library(
+            app.clone(),
+            &token,
+            "buy",
+            json!({"mint_id": portable_package.mint_id}),
+        )
+        .await;
+        assert_eq!(bought["status"], "ok", "{bought}");
+        let (_, replayed) = post_library(
+            app.clone(),
+            &token,
+            "buy",
+            json!({"mint_id": portable_package.mint_id}),
+        )
+        .await;
+        assert_eq!(replayed, bought);
+        let (_, listed) = post_library(app, &token, "list_runtime_custody", json!({})).await;
+        assert_eq!(listed["data"]["listings"][0]["access_state"], "purchased");
+        assert_eq!(mock_chain_broadcast_count(&signed_transaction), 1);
+        assert_eq!(
+            wallet_provider
+                .provider
+                .latest_transaction_approval_request_id()
+                .await
+                .as_deref(),
+            Some(approval_request_id.as_str())
+        );
+        assert!(!dir.path().join("protected-content/runtime-mint").exists());
+    }
     reset_mock_immutable_content_objects();
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn test_runtime_custody_imports_verified_projection_without_creator_mint_journal() {
-    run_runtime_custody_portable_listing_import(RuntimePortableListingMismatch::None, false).await;
+    run_runtime_custody_portable_listing_import(RuntimePortableListingMismatch::None, false, false)
+        .await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn test_runtime_custody_import_advances_verified_availability_summary() {
-    run_runtime_custody_portable_listing_import(RuntimePortableListingMismatch::None, true).await;
+    run_runtime_custody_portable_listing_import(RuntimePortableListingMismatch::None, true, false)
+        .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_runtime_custody_imported_listing_lists_and_buys_without_creator_mint_journal() {
+    run_runtime_custody_portable_listing_import(RuntimePortableListingMismatch::None, false, true)
+        .await;
 }
 
 #[cfg(unix)]
@@ -8056,7 +8182,7 @@ async fn test_runtime_custody_import_rejects_manifest_and_package_mismatch() {
         RuntimePortableListingMismatch::Cid,
         RuntimePortableListingMismatch::Publisher,
     ] {
-        run_runtime_custody_portable_listing_import(mismatch, false).await;
+        run_runtime_custody_portable_listing_import(mismatch, false, false).await;
     }
 }
 

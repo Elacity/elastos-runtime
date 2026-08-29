@@ -4437,7 +4437,7 @@ pub(crate) struct RuntimeCustodyListingRecord {
 }
 
 impl RuntimeCustodyListingRecord {
-    fn validate(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.schema != RUNTIME_LISTING_SCHEMA_V1 {
             anyhow::bail!("Runtime custody listing is invalid");
         }
@@ -4475,6 +4475,14 @@ impl RuntimeCustodyListingRecord {
             anyhow::bail!("Runtime custody listing is invalid");
         }
         Ok(())
+    }
+
+    pub(crate) fn portable_package_digest(&self) -> String {
+        let package_sha256 = match &self.origin {
+            RuntimeCustodyListingOrigin::LocalCreator { package_sha256, .. }
+            | RuntimeCustodyListingOrigin::Imported { package_sha256, .. } => package_sha256,
+        };
+        format!("sha256:{package_sha256}")
     }
 }
 
@@ -4747,13 +4755,14 @@ async fn verify_runtime_portable_media(
     registry: &Arc<ProviderRegistry>,
     package: &RuntimePortableListingPackage,
     decoded: &DecodedRuntimePortableAsset,
-) -> anyhow::Result<(Digest32, RuntimeCustodyListingAvailabilitySummary)> {
+    now_unix_seconds: u64,
+) -> anyhow::Result<(RuntimeMintDraft, RuntimeVerifiedContentAvailability)> {
+    let trusted_receipt_signer_did =
+        crate::collaboration_profile_authority::load_existing_device_did(data_dir)?
+            .ok_or_else(|| anyhow::anyhow!("local Runtime device signing key is missing"))?;
     let receipt = fetch_content_availability_receipt(registry, &package.content_cid).await?;
-    let signed_receipt: crate::content::SignedAvailabilityReceipt =
-        serde_json::from_slice(&receipt)
-            .map_err(|_| anyhow::anyhow!("protected content availability receipt is invalid"))?;
     let requirement = RuntimeContentAvailabilityRequirement::new(
-        &signed_receipt.signer_did,
+        trusted_receipt_signer_did,
         &package.content_id,
         &package.publisher_profile_did,
         PROTECTED_CONTENT_REPLICATION_POLICY,
@@ -4776,7 +4785,7 @@ async fn verify_runtime_portable_media(
         &receipt,
         &decoded.media_identity,
         &requirement,
-        crate::auth::now_ts(),
+        now_unix_seconds,
     )?;
     let composition = load_runtime_custody_composition(data_dir, registry.clone())?
         .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE))?;
@@ -4787,7 +4796,7 @@ async fn verify_runtime_portable_media(
         &composition.signed_pool,
         &composition.signed_epoch,
         &composition.signed_committee_authorization,
-        crate::auth::now_ts(),
+        now_unix_seconds,
         &configured_nodes,
     )?;
     let draft = RuntimeMintDraft::new(
@@ -4805,14 +4814,7 @@ async fn verify_runtime_portable_media(
     if draft.mint_id() != parse_mint_id_hex(&package.mint_id)? {
         anyhow::bail!("Runtime custody portable listing is invalid");
     }
-    Ok((
-        draft.mint_id(),
-        RuntimeCustodyListingAvailabilitySummary {
-            checked_at: availability.checked_at(),
-            observed_replicas: availability.observed_replicas(),
-            receipt_digest: hex::encode(availability.receipt_digest().as_bytes()),
-        },
-    ))
+    Ok((draft, availability))
 }
 
 pub(crate) async fn import_runtime_custody_listing(
@@ -4849,8 +4851,19 @@ pub(crate) async fn import_runtime_custody_listing(
     }
     verify_runtime_portable_metadata(&registry, &package, &decoded).await?;
     verify_runtime_portable_chain(&registry, &package).await?;
-    let (verified, availability) =
-        verify_runtime_portable_media(data_dir, &registry, &package, &decoded).await?;
+    let (draft, verified_availability) = verify_runtime_portable_media(
+        data_dir,
+        &registry,
+        &package,
+        &decoded,
+        crate::auth::now_ts(),
+    )
+    .await?;
+    let availability = RuntimeCustodyListingAvailabilitySummary {
+        checked_at: verified_availability.checked_at(),
+        observed_replicas: verified_availability.observed_replicas(),
+        receipt_digest: hex::encode(verified_availability.receipt_digest().as_bytes()),
+    };
     let package_sha256 = hex::encode(sha2::Sha256::digest(&bytes));
     let expected = RuntimeCustodyListingRecord {
         schema: RUNTIME_LISTING_SCHEMA_V1.to_string(),
@@ -4862,7 +4875,7 @@ pub(crate) async fn import_runtime_custody_listing(
         availability,
     };
     expected.validate()?;
-    if let Some(existing) = load_runtime_custody_listing(data_dir, verified)? {
+    if let Some(existing) = load_runtime_custody_listing(data_dir, draft.mint_id())? {
         if existing.schema != expected.schema
             || existing.origin != expected.origin
             || existing.package != expected.package
@@ -5267,7 +5280,6 @@ pub(crate) fn list_runtime_custody_listings(
         listings.push(runtime_custody_listing_summary(
             data_dir,
             principal_id,
-            &bytes,
             &record,
         )?);
     }
@@ -5313,12 +5325,10 @@ fn select_runtime_custody_listing_paths(root: &Path) -> anyhow::Result<(Vec<Path
 fn runtime_custody_listing_summary(
     data_dir: &Path,
     principal_id: &str,
-    listing_bytes: &[u8],
     record: &RuntimeCustodyListingRecord,
 ) -> anyhow::Result<Value> {
     let availability = runtime_custody_listing_availability(record);
-    let access_state =
-        runtime_custody_listing_access_state(data_dir, principal_id, listing_bytes, record)?;
+    let access_state = runtime_custody_listing_access_state(data_dir, principal_id, record)?;
     let media = record.package.decode_and_validate()?.media_identity;
     Ok(json!({
         "schema": RUNTIME_LISTING_SCHEMA_V1,
@@ -5353,7 +5363,6 @@ fn runtime_custody_listing_availability(record: &RuntimeCustodyListingRecord) ->
 fn runtime_custody_listing_access_state(
     data_dir: &Path,
     principal_id: &str,
-    listing_bytes: &[u8],
     record: &RuntimeCustodyListingRecord,
 ) -> anyhow::Result<&'static str> {
     if matches!(
@@ -5374,14 +5383,10 @@ fn runtime_custody_listing_access_state(
     {
         anyhow::bail!("Runtime custody purchase is invalid");
     }
-    let listing_sha256 = format!(
-        "sha256:{}",
-        hex::encode(sha2::Sha256::digest(listing_bytes))
-    );
     let purchased = matches!(
         purchase.progress,
         RuntimeCustodyPurchaseProgress::Complete { .. }
-    ) && purchase.listing_sha256 == listing_sha256;
+    ) && purchase.listing_sha256 == record.portable_package_digest();
     Ok(if purchased {
         RUNTIME_CUSTODY_LISTING_ACCESS_PURCHASED
     } else {
@@ -5469,70 +5474,26 @@ fn validate_runtime_custody_evm_address(value: &str) -> anyhow::Result<()> {
 
 pub(crate) async fn verify_fresh_runtime_custody_availability(
     data_dir: &Path,
-    registry: &ProviderRegistry,
+    registry: &Arc<ProviderRegistry>,
     mint_id: Digest32,
     now_unix_seconds: u64,
-) -> anyhow::Result<RuntimeVerifiedContentAvailability> {
+) -> anyhow::Result<(RuntimeMintDraft, RuntimeVerifiedContentAvailability)> {
     let expected_mint_id = hex::encode(mint_id.as_bytes());
     let listing = load_runtime_custody_listing(data_dir, mint_id)?
         .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE))?;
     if listing.package.mint_id != expected_mint_id {
         anyhow::bail!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
     }
-    let mint = runtime_mint_journal(data_dir)
-        .load(mint_id)
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE))?;
-    let persisted = mint
-        .content_availability()
-        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE))?;
-    let expected_content_id = runtime_protected_content_id(mint.draft().encrypted_content())
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE))?;
-    if listing.package.content_id != expected_content_id
-        || listing.package.content_cid != persisted.content_cid()
-    {
-        anyhow::bail!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
-    }
-    let requirement = RuntimeContentAvailabilityRequirement::new(
-        persisted.expected_provider_did(),
-        persisted.object_identity(),
-        persisted.publisher_identity(),
-        persisted.policy(),
-        persisted.required_replicas(),
-        PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS,
-        PROTECTED_CONTENT_AVAILABILITY_MAX_FUTURE_SKEW_SECS,
-    )
-    .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
-    let content_cid = persisted.content_cid();
-    let receipt = fetch_content_availability_receipt(registry, content_cid)
-        .await
-        .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
-    let manifest = crate::content::fetch_content_object_manifest(registry, content_cid)
-        .await
-        .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
-    verify_protected_content_manifest_and_files(
+    let decoded = listing.package.decode_and_validate()?;
+    verify_runtime_portable_media(
+        data_dir,
         registry,
-        content_cid,
-        &manifest,
-        mint.draft().media_identity(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
-    let verified = verify_protected_content_receipt(
-        content_cid,
-        &manifest,
-        &receipt,
-        mint.draft().media_identity(),
-        &requirement,
+        &listing.package,
+        &decoded,
         now_unix_seconds,
     )
-    .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
-    if verified.content_cid() != listing.package.content_cid
-        || verified.encrypted_content() != mint.draft().encrypted_content()
-        || verified.media_manifest_root() != mint.draft().media_identity().media_manifest_root()
-    {
-        anyhow::bail!("Runtime custody content availability is unavailable");
-    }
-    Ok(verified)
+    .await
+    .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))
 }
 
 pub(crate) async fn open_runtime_custody_viewer(
@@ -5634,9 +5595,9 @@ pub(crate) async fn open_runtime_custody_viewer(
             | RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent => {}
         }
     }
-    let fresh_availability = verify_fresh_runtime_custody_availability(
+    let (_, fresh_availability) = verify_fresh_runtime_custody_availability(
         data_dir,
-        registry.as_ref(),
+        &registry,
         mint_id,
         crate::auth::now_ts(),
     )
@@ -6236,17 +6197,6 @@ pub(crate) fn load_runtime_custody_listing(
     let record: RuntimeCustodyListingRecord = serde_json::from_slice(&fs::read(path)?)?;
     record.validate()?;
     Ok(Some(record))
-}
-
-pub(crate) fn load_runtime_custody_listing_bytes(
-    data_dir: &Path,
-    mint_id: Digest32,
-) -> anyhow::Result<Option<Vec<u8>>> {
-    let path = runtime_listing_path(data_dir, mint_id);
-    if !path.exists() {
-        return Ok(None);
-    }
-    Ok(Some(fs::read(path)?))
 }
 
 pub(crate) fn runtime_custody_creator_listing_package(

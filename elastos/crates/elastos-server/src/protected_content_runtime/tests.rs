@@ -204,8 +204,12 @@ impl ContentAvailabilityTestConfig {
     }
 
     fn accepted_now() -> Self {
+        Self::accepted_at(crate::auth::now_ts())
+    }
+
+    fn accepted_at(checked_at: u64) -> Self {
         Self {
-            checked_at: crate::auth::now_ts(),
+            checked_at,
             ..Self::accepted()
         }
     }
@@ -223,7 +227,7 @@ impl ContentAvailabilityTestProvider {
     const CID: &'static str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
 
     fn new(seed: u8, config: ContentAvailabilityTestConfig) -> Arc<Self> {
-        Self::with_signing_key(SigningKey::from_bytes(&[seed; 32]), config)
+        Self::with_signing_key(elastos_identity::derive_did(&[seed; 32]).0, config)
     }
 
     fn with_signing_key(
@@ -1211,6 +1215,8 @@ async fn runtime_custody_prebuy_availability_harness(
     let data_dir = temp.path().join("data");
     owner_only_dir(&data_dir);
     owner_only_dir(&data_dir.join("protected-content"));
+    write_device_key(&data_dir, 0x61);
+    write_library_publish_test_composition(&data_dir);
 
     let mint_draft = mint_draft_for_composition_journal_test();
     let fixture_now = crate::auth::now_ts();
@@ -1245,7 +1251,16 @@ async fn runtime_custody_prebuy_availability_harness(
     let expected_provider_did =
         ContentAvailabilityTestProvider::new(0x61, ContentAvailabilityTestConfig::accepted())
             .signer_did();
-    let requirement = availability_requirement(expected_provider_did);
+    let requirement = RuntimeContentAvailabilityRequirement::new(
+        expected_provider_did,
+        super::runtime_protected_content_id(mint_draft.encrypted_content()).unwrap(),
+        derived_device_key_for_seed(0x66).1,
+        super::PROTECTED_CONTENT_REPLICATION_POLICY,
+        super::PROTECTED_CONTENT_MIN_REPLICAS,
+        super::PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS,
+        super::PROTECTED_CONTENT_AVAILABILITY_MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
     let evidence = elastos_protected_content_runtime::RuntimeVerifiedContentAvailability::new(
         ContentAvailabilityTestProvider::CID,
         requirement.expected_object_identity(),
@@ -1647,19 +1662,20 @@ async fn protected_content_availability_rejects_wrong_signed_receipt_or_refetche
 
 #[tokio::test]
 async fn runtime_custody_prebuy_availability_refetches_fresh_exact_receipt_without_publish() {
+    let now = crate::auth::now_ts();
     let harness = runtime_custody_prebuy_availability_harness(
         0x61,
         ContentAvailabilityTestConfig {
-            checked_at: NOW,
+            checked_at: now,
             ..ContentAvailabilityTestConfig::accepted()
         },
     )
     .await;
-    let verified = super::verify_fresh_runtime_custody_availability(
+    let (_, verified) = super::verify_fresh_runtime_custody_availability(
         &harness.data_dir,
-        harness.registry.as_ref(),
+        &harness.registry,
         harness.mint_id,
-        NOW,
+        now,
     )
     .await
     .unwrap();
@@ -1685,19 +1701,20 @@ async fn runtime_custody_prebuy_availability_refetches_fresh_exact_receipt_witho
 
 #[tokio::test]
 async fn runtime_custody_prebuy_availability_rejects_stale_receipt() {
+    let now = crate::auth::now_ts();
     let harness = runtime_custody_prebuy_availability_harness(
         0x61,
         ContentAvailabilityTestConfig {
-            checked_at: NOW - super::PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS - 1,
+            checked_at: now - super::PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS - 1,
             ..ContentAvailabilityTestConfig::accepted()
         },
     )
     .await;
     assert!(super::verify_fresh_runtime_custody_availability(
         &harness.data_dir,
-        harness.registry.as_ref(),
+        &harness.registry,
         harness.mint_id,
-        NOW,
+        now,
     )
     .await
     .is_err());
@@ -1705,47 +1722,48 @@ async fn runtime_custody_prebuy_availability_rejects_stale_receipt() {
 
 #[tokio::test]
 async fn runtime_custody_prebuy_availability_rejects_wrong_receipt_binding_or_manifest() {
+    let now = crate::auth::now_ts();
     let cases = [
         ContentAvailabilityTestConfig {
             receipt_object_identity: Some("did:key:wrong#content".to_string()),
-            ..ContentAvailabilityTestConfig::accepted()
+            ..ContentAvailabilityTestConfig::accepted_at(now)
         },
         ContentAvailabilityTestConfig {
             receipt_publisher_did: Some("did:key:wrong#publisher".to_string()),
-            ..ContentAvailabilityTestConfig::accepted()
+            ..ContentAvailabilityTestConfig::accepted_at(now)
         },
         ContentAvailabilityTestConfig {
             policy: "wrong-policy".to_string(),
-            ..ContentAvailabilityTestConfig::accepted()
+            ..ContentAvailabilityTestConfig::accepted_at(now)
         },
         ContentAvailabilityTestConfig {
             replicas: 2,
-            ..ContentAvailabilityTestConfig::accepted()
+            ..ContentAvailabilityTestConfig::accepted_at(now)
         },
         ContentAvailabilityTestConfig {
             live_multi_peer_proof: None,
-            ..ContentAvailabilityTestConfig::accepted()
+            ..ContentAvailabilityTestConfig::accepted_at(now)
         },
         ContentAvailabilityTestConfig {
             live_multi_peer_proof: Some(false),
-            ..ContentAvailabilityTestConfig::accepted()
+            ..ContentAvailabilityTestConfig::accepted_at(now)
         },
         ContentAvailabilityTestConfig {
             malformed_receipt: true,
-            ..ContentAvailabilityTestConfig::accepted()
+            ..ContentAvailabilityTestConfig::accepted_at(now)
         },
         ContentAvailabilityTestConfig {
             mutate_manifest_extra_file: true,
-            ..ContentAvailabilityTestConfig::accepted()
+            ..ContentAvailabilityTestConfig::accepted_at(now)
         },
     ];
     for config in cases {
         let harness = runtime_custody_prebuy_availability_harness(0x61, config).await;
         assert!(super::verify_fresh_runtime_custody_availability(
             &harness.data_dir,
-            harness.registry.as_ref(),
+            &harness.registry,
             harness.mint_id,
-            NOW,
+            now,
         )
         .await
         .is_err());
@@ -1753,14 +1771,14 @@ async fn runtime_custody_prebuy_availability_rejects_wrong_receipt_binding_or_ma
 
     let wrong_signer = runtime_custody_prebuy_availability_harness(
         0x62,
-        ContentAvailabilityTestConfig::accepted(),
+        ContentAvailabilityTestConfig::accepted_at(now),
     )
     .await;
     assert!(super::verify_fresh_runtime_custody_availability(
         &wrong_signer.data_dir,
-        wrong_signer.registry.as_ref(),
+        &wrong_signer.registry,
         wrong_signer.mint_id,
-        NOW,
+        now,
     )
     .await
     .is_err());
@@ -1781,7 +1799,7 @@ async fn runtime_custody_prebuy_availability_requires_existing_mint_and_listing_
     .unwrap();
     assert!(super::verify_fresh_runtime_custody_availability(
         &missing_listing.data_dir,
-        missing_listing.registry.as_ref(),
+        &missing_listing.registry,
         missing_listing.mint_id,
         NOW,
     )
@@ -1796,7 +1814,7 @@ async fn runtime_custody_prebuy_availability_requires_existing_mint_and_listing_
     .await;
     assert!(super::verify_fresh_runtime_custody_availability(
         &wrong_mint.data_dir,
-        wrong_mint.registry.as_ref(),
+        &wrong_mint.registry,
         digest(0x33),
         NOW,
     )
@@ -2267,9 +2285,6 @@ fn persist_runtime_custody_purchase_for_mint(
     profile_did: &str,
     now: u64,
 ) -> RuntimeCustodyPurchaseRecord {
-    let listing_bytes = super::load_runtime_custody_listing_bytes(data_dir, mint.draft().mint_id())
-        .unwrap()
-        .expect("runtime custody listing bytes");
     let listing = super::load_runtime_custody_listing(data_dir, mint.draft().mint_id())
         .unwrap()
         .expect("runtime custody listing");
@@ -2292,10 +2307,7 @@ fn persist_runtime_custody_purchase_for_mint(
             .unwrap()
             .content_cid()
             .to_string(),
-        listing_sha256: format!(
-            "sha256:{}",
-            hex::encode(sha2::Sha256::digest(&listing_bytes))
-        ),
+        listing_sha256: listing.portable_package_digest(),
         seller_address: listing.package.seller_address.clone(),
         chain_namespace: listing.package.chain_namespace.clone(),
         network: listing.package.network.clone(),
@@ -4055,7 +4067,7 @@ fn mint_draft_for_composition_journal_test() -> RuntimeMintDraft {
                 node.node_public_key(),
                 CustodyPoolOperatorIdV1::new([0x80 + node_seed; 32]),
                 CustodyPoolFailureDomainIdV1::new([0x90 + node_seed; 32]),
-                Digest32::new([0x50 + node_seed; 32]),
+                Digest32::new([0x3f + node_seed; 32]),
             )
             .unwrap()
         })

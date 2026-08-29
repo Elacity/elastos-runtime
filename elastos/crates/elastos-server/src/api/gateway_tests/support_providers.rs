@@ -298,10 +298,9 @@ fn reset_mock_protected_content_purchase_fixture() {
 }
 
 fn set_mock_protected_content_purchase_native() {
-    mock_protected_content_purchase_fixture()
-        .lock()
-        .unwrap()
-        .native_purchase = true;
+    let mut fixture = mock_protected_content_purchase_fixture().lock().unwrap();
+    fixture.native_purchase = true;
+    fixture.listing_quantity = "0x1".to_string();
 }
 
 fn set_mock_protected_content_purchase_access_denied() {
