@@ -206,6 +206,44 @@ mod tests {
     }
 
     #[test]
+    fn runtime_init_envelope_starts_with_zero_offers() {
+        let base_path =
+            crate::test_support::temp_root_path("model-provider-process", "runtime-init");
+        std::fs::create_dir_all(&base_path).unwrap();
+        let journal_dir = base_path.join("journal");
+        let init = serde_json::json!({
+            "op": "init",
+            "config": {
+                "base_path": base_path,
+                "allowed_paths": [],
+                "read_only": false,
+                "encryption_key": "",
+                "extra": {
+                    "provider_id": "model-provider",
+                    "journal_dir": journal_dir,
+                    "offers": [],
+                }
+            }
+        });
+        let status = serde_json::json!({ "op": "status" });
+        let input = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&init).unwrap(),
+            serde_json::to_string(&status).unwrap()
+        );
+
+        let mut output = Vec::new();
+        run_stdio_io(BufReader::new(Cursor::new(input.into_bytes())), &mut output).unwrap();
+        let lines = decode_lines(&output);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["status"], "ok");
+        assert_eq!(lines[1]["status"], "ok");
+        assert_eq!(lines[1]["data"]["provider"], crate::contract::PROVIDER_ID);
+        assert_eq!(lines[1]["data"]["offers_ready"], 0);
+    }
+
+    #[test]
     fn oversized_response_is_replaced_with_small_typed_error() {
         let response = serde_json::json!({
             "status": "ok",

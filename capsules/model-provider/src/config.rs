@@ -39,16 +39,29 @@ pub struct BridgeProviderConfig {
     #[serde(default)]
     pub base_path: String,
     #[serde(default)]
+    pub allowed_paths: Vec<String>,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub encryption_key: String,
+    #[serde(default)]
     pub extra: Value,
 }
 
 impl BridgeProviderConfig {
     pub fn validate(&self) -> Result<()> {
+        let _ = self.read_only;
         if !self.base_path.is_empty() {
             validate_bounded_trimmed(&self.base_path, "base_path", MAX_BASE_PATH_BYTES)?;
             if !Path::new(&self.base_path).is_absolute() {
                 anyhow::bail!("base_path must be an absolute path");
             }
+        }
+        for allowed_path in &self.allowed_paths {
+            validate_bounded_trimmed(allowed_path, "allowed_paths", MAX_BASE_PATH_BYTES)?;
+        }
+        if !self.encryption_key.is_empty() {
+            validate_bounded_trimmed(&self.encryption_key, "encryption_key", MAX_SECRET_BYTES)?;
         }
         let extra_bytes = serde_json::to_vec(&self.extra)?;
         if extra_bytes.len() > MAX_INIT_EXTRA_BYTES {
@@ -489,6 +502,9 @@ mod tests {
 
         let bridge = BridgeProviderConfig {
             base_path: "/tmp/base".to_string(),
+            allowed_paths: Vec::new(),
+            read_only: false,
+            encryption_key: String::new(),
             extra: json!({
                 "journal_dir": "/tmp/model-provider",
                 "offers": [{
@@ -516,6 +532,26 @@ mod tests {
         };
         let extra = serde_json::from_value::<ProviderInitExtra>(bridge.extra).unwrap();
         assert!(extra.validate(&bridge.base_path).is_err());
+    }
+
+    #[test]
+    fn bridge_provider_config_accepts_runtime_init_envelope_fields() {
+        let bridge: BridgeProviderConfig = serde_json::from_value(json!({
+            "base_path": "/tmp/model-provider",
+            "allowed_paths": [],
+            "read_only": false,
+            "encryption_key": "",
+            "extra": {
+                "provider_id": "model-provider",
+                "journal_dir": "/tmp/model-provider/journal",
+                "offers": []
+            }
+        }))
+        .unwrap();
+
+        bridge.validate().unwrap();
+        let extra = serde_json::from_value::<ProviderInitExtra>(bridge.extra).unwrap();
+        extra.validate(&bridge.base_path).unwrap();
     }
 
     #[test]

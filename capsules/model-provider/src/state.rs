@@ -1396,6 +1396,9 @@ mod tests {
         ModelProviderState::from_init(
             BridgeProviderConfig {
                 base_path: root.to_string(),
+                allowed_paths: Vec::new(),
+                read_only: false,
+                encryption_key: String::new(),
                 extra: serde_json::json!({
                     "provider_id": "model-provider",
                     "offers": offers,
@@ -1447,6 +1450,9 @@ mod tests {
         let error = match ModelProviderState::from_init(
             BridgeProviderConfig {
                 base_path: temp_root("duplicate"),
+                allowed_paths: Vec::new(),
+                read_only: false,
+                encryption_key: String::new(),
                 extra: serde_json::json!({
                     "provider_id": "model-provider",
                     "offers": [offer("same"), offer("same")]
