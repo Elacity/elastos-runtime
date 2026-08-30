@@ -10,10 +10,17 @@ Usage:
   scripts/mac-source-home-restart.sh [options]
 
 Options:
-  --test-home <path>      Source-home root. Default: $MAC_TEST_HOME or ~/elastos-mac-test-home.
+  --test-home <path>      Source-home root. Default: $MAC_TEST_HOME or ~/
+  --init                  First-provision admission: require exact clean-source
+                          receipt parity (the strict validation path). Without
+                          it, the helper starts an existing installation and
+                          skips source-parity checks.
   --addr <host:port>      Gateway bind address. Default: $MAC_GATEWAY_ADDR or localhost:61180.
   --log-dir <path>        Restart log directory. Default: <test-home>/logs.
   --dry-run               Validate and print the restart plan without file or process effects.
+  --down                  Safe shutdown only: stop the owned gateway and this
+                          installation's helper processes, then exit. No
+                          upgrade, validation, or start is performed.
   --json-out <path>       Active receipt. Default: <data-dir>/receipts/mac-source-home-restart.json.
   --wait-seconds <n>      Seconds to wait for Home after start. Default: 40.
 
@@ -145,7 +152,7 @@ PY
 }
 
 validate_installation_receipt() {
-  python3 - "$installation_receipt" "$gateway_bin" "$data_dir" "$repo_root" <<'PY'
+  python3 - "$installation_receipt" "$gateway_bin" "$data_dir" "$repo_root" "$init_mode" <<'PY'
 import hashlib
 import json
 import os
@@ -203,7 +210,8 @@ def read_hash(path, limit, owner_only=False, executable=False, keep_payload=Fals
             pass
 
 
-receipt_path, runtime_path, data_path, source_path = map(pathlib.Path, sys.argv[1:])
+receipt_path, runtime_path, data_path, source_path = map(pathlib.Path, sys.argv[1:5])
+init_mode = sys.argv[5] == "1"
 receipt_hash, payload = read_hash(
     receipt_path, MAX_RECEIPT, owner_only=True, keep_payload=True
 )
@@ -230,7 +238,7 @@ source = receipt.get("source")
 runtime = receipt.get("runtime")
 if not isinstance(source, dict) or set(source) != {"commit", "tree", "clean"}:
     reject("source")
-if source.get("clean") is not True:
+if init_mode and source.get("clean") is not True:
     reject("source_clean")
 if not isinstance(runtime, dict) or set(runtime) != {
     "built_sha256",
@@ -251,50 +259,51 @@ for name in (
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
 ):
     env.pop(name, None)
-git_values = []
-try:
-    for revision in ("HEAD", "HEAD^{tree}"):
-        result = subprocess.run(
-            ["git", "-C", str(source_path), "rev-parse", "--verify", revision],
+if init_mode:
+    git_values = []
+    try:
+        for revision in ("HEAD", "HEAD^{tree}"):
+            result = subprocess.run(
+                ["git", "-C", str(source_path), "rev-parse", "--verify", revision],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+                text=True,
+            )
+            value = result.stdout.strip().lower()
+            if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", value):
+                reject("source_git")
+            git_values.append(value)
+    except (OSError, subprocess.SubprocessError):
+        reject("source_git")
+    if source.get("commit") != git_values[0] or source.get("tree") != git_values[1]:
+        reject("source_identity")
+    try:
+        status = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source_path),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=10,
             check=False,
-            text=True,
         )
-        value = result.stdout.strip().lower()
-        if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", value):
-            reject("source_git")
-        git_values.append(value)
-except (OSError, subprocess.SubprocessError):
-    reject("source_git")
-if source.get("commit") != git_values[0] or source.get("tree") != git_values[1]:
-    reject("source_identity")
-try:
-    status = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(source_path),
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-        ],
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        timeout=10,
-        check=False,
-    )
-except (OSError, subprocess.SubprocessError):
-    reject("source_git")
-if status.returncode != 0:
-    reject("source_git")
-if status.stdout:
-    reject("source_dirty")
+    except (OSError, subprocess.SubprocessError):
+        reject("source_git")
+    if status.returncode != 0:
+        reject("source_git")
+    if status.stdout:
+        reject("source_dirty")
 runtime_hash, _ = read_hash(runtime_path, MAX_RUNTIME, executable=True)
 components_hash, _ = read_hash(data_path / "components.json", MAX_COMPONENTS)
 capsules_hash, _ = read_hash(
@@ -365,6 +374,13 @@ verify_browser_helper_freshness() {
   local initrd="${data_dir}/bin/initrd"
   local rootfs="${data_dir}/browser-vm/rootfs.ext4"
   local debugfs
+  if [[ ! -f "$initrd" && ! -f "$rootfs" ]]; then
+    # No Browser VM artifacts installed: the documented no-Browser Mac path.
+    # Browser VM launch stays unavailable; everything else proceeds.
+    printf 'mac-source-home-restart: Browser VM artifacts absent; skipping Browser helper verification
+' >&2
+    return 0
+  fi
   if [[ ! -f "$source" || ! -f "$installed" || ! -f "$initrd" || ! -f "$rootfs" ]]; then
     redacted_error "Mac source-home Browser helper verification failed: artifacts unavailable"
     return 1
@@ -791,7 +807,7 @@ import stat
 import sys
 
 keys = [
-    "schema", "ok", "dry_run", "generated_at", "repo", "test_home",
+    "schema", "ok", "dry_run", "admission_mode", "generated_at", "repo", "test_home",
     "data_dir", "addr", "home_url", "gateway_bin", "gateway_bin_sha256",
     "installation_receipt_sha256", "installed_runtime_sha256",
     "installed_components_sha256", "source_home_capsule_metadata_receipt_sha256",
@@ -933,6 +949,7 @@ PY
 receipt_environment() {
   SCHEMA="elastos.mac-source-home-restart/v1" \
   OK="$receipt_ok" DRY_RUN="$dry_run" \
+  ADMISSION_MODE="$([[ "$init_mode" -eq 1 ]] && printf init || printf existing)" \
   GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   REPO="$repo_root" TEST_HOME="$test_home" DATA_DIR="$data_dir" ADDR="$addr" \
   HOME_URL="$home_url" GATEWAY_BIN="$gateway_bin" \
@@ -955,11 +972,13 @@ receipt_environment() {
   emit_json "$1"
 }
 
-test_home="${MAC_TEST_HOME:-${HOME}/elastos-mac-test-home}"
+test_home="${MAC_TEST_HOME:-${HOME}}"
 addr="${MAC_GATEWAY_ADDR:-localhost:61180}"
 log_dir=""
 wait_seconds=40
 dry_run=0
+init_mode=0
+down_mode=0
 json_out=""
 
 while [[ $# -gt 0 ]]; do
@@ -986,6 +1005,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dry-run)
       dry_run=1
+      shift
+      ;;
+    --init)
+      init_mode=1
+      shift
+      ;;
+    --down)
+      down_mode=1
       shift
       ;;
     --json-out)
@@ -1041,6 +1068,55 @@ planned_rollback_relative_identity="backups/${principal_root_backup_dir##*/}"
 rollback_relative_identity=""
 principal_root_upgrade_log="${log_dir}/principal-root-upgrade-$(date -u +%Y%m%dT%H%M%SZ)-$$.json"
 
+if [[ "$down_mode" -eq 1 ]]; then
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    redacted_error "this restart owner requires macOS"
+    exit 2
+  fi
+  down_status=0
+  # Shutdown is install-scoped, not addr-scoped: adopt the addr the owned
+  # PID file records so --down works without remembering the bind address.
+  if [[ -e "$pid_file" && ! -L "$pid_file" ]]; then
+    pid_file_addr="$(python3 - "$pid_file" <<'PY' 2>/dev/null
+import json, sys
+value = json.load(open(sys.argv[1]))
+addr = value.get("addr", "")
+if isinstance(addr, str) and addr:
+    print(addr)
+PY
+)" || pid_file_addr=""
+    [[ -n "$pid_file_addr" ]] && addr="$pid_file_addr"
+  fi
+  if pid_values="$(read_owned_pid_file)"; then
+    read -r down_pid down_start down_runtime_sha down_payload_sha <<<"$pid_values"
+    if process_is_running "$down_pid"; then
+      if stop_verified_gateway "$down_pid" "$down_start"; then
+        printf 'mac-source-home-restart: gateway stopped
+' >&2
+      else
+        redacted_error "gateway stop failed; PID file retained"
+        down_status=1
+      fi
+    fi
+    if [[ "$down_status" -eq 0 ]]; then
+      remove_owned_pid_file "$down_pid" "$down_start" "$down_runtime_sha" "$down_payload_sha" 2>/dev/null ||
+        redacted_error "gateway PID file changed during shutdown"
+    fi
+  elif [[ $? -ne 3 ]]; then
+    redacted_error "gateway PID file is unsafe or malformed"
+    down_status=1
+  fi
+  # Relatives: helper processes launched from this installation's bin tree.
+  while IFS= read -r relative_pid; do
+    [[ -n "$relative_pid" ]] || continue
+    kill -TERM "$relative_pid" 2>/dev/null || true
+  done < <(pgrep -f "${data_dir}/bin/" 2>/dev/null || true)
+  if command -v lsof >/dev/null 2>&1 && [[ -n "$(listener_pids_for_port)" ]]; then
+    redacted_error "an unrelated listener still owns the selected address; not touched"
+  fi
+  exit "$down_status"
+fi
+
 validate_stable_gateway
 if ! installation_values="$(validate_installation_receipt)"; then
   exit 1
@@ -1079,19 +1155,21 @@ if ! command -v lsof >/dev/null 2>&1; then
   exit 2
 fi
 
-verify_browser_helper_freshness
-home_cli_renderer_source_sha="$(tree_sha256 "${repo_root}/capsules/home-cli/browser")"
-home_cli_renderer_installed_sha="$(tree_sha256 "${data_dir}/capsules/home-cli/browser")"
-if [[ "$home_cli_renderer_source_sha" != "$home_cli_renderer_installed_sha" ]]; then
-  redacted_error "Home CLI renderer parity failed"
-  exit 1
+if [[ "$init_mode" -eq 1 ]]; then
+  verify_browser_helper_freshness
+  home_cli_renderer_source_sha="$(tree_sha256 "${repo_root}/capsules/home-cli/browser")"
+  home_cli_renderer_installed_sha="$(tree_sha256 "${data_dir}/capsules/home-cli/browser")"
+  if [[ "$home_cli_renderer_source_sha" != "$home_cli_renderer_installed_sha" ]]; then
+    redacted_error "Home CLI renderer parity failed"
+    exit 1
+  fi
+  source_hash="$(sha256_file "${repo_root}/capsules/home/browser/index.html")"
+  if [[ "$source_hash" != "$(sha256_file "${data_dir}/capsules/home/browser/index.html")" ]]; then
+    redacted_error "Home source and installed parity failed"
+    exit 1
+  fi
 fi
-source_hash="$(sha256_file "${repo_root}/capsules/home/browser/index.html")"
 installed_hash="$(sha256_file "${data_dir}/capsules/home/browser/index.html")"
-if [[ "$source_hash" != "$installed_hash" ]]; then
-  redacted_error "Home source and installed parity failed"
-  exit 1
-fi
 
 check_no_existing_rollback
 prepare_owner_directory "$log_dir"
@@ -1233,7 +1311,13 @@ if ! "$gateway_bin" principal-root-upgrade \
   redacted_error "principal-root upgrade failed; rollback retained for reconciliation"
   exit 1
 fi
-rollback_size_bytes="$(rollback_size)"
+if [[ -d "$principal_root_backup_dir" && ! -L "$principal_root_backup_dir" ]]; then
+  rollback_size_bytes="$(rollback_size)"
+else
+  # A successful upgrade with nothing to migrate creates no backup.
+  rollback_relative_identity=""
+  rollback_size_bytes="0"
+fi
 
 if ! gateway_pid="$(start_gateway_process 2>/dev/null)"; then
   redacted_error "gateway process start failed"
@@ -1284,8 +1368,12 @@ fi
 
 http_code="$(curl -fsS -o /dev/null -w '%{http_code}' "$home_url" 2>/dev/null || true)"
 served_hash="$(curl -fsS "$home_url" 2>/dev/null | shasum -a 256 | awk '{print $1}')"
-if [[ "$http_code" != "200" || "$served_hash" != "$installed_hash" || "$served_hash" != "$source_hash" ]]; then
+if [[ "$http_code" != "200" || "$served_hash" != "$installed_hash" ]]; then
   redacted_error "Home readiness parity failed"
+  exit 1
+fi
+if [[ "$init_mode" -eq 1 && "$served_hash" != "$source_hash" ]]; then
+  redacted_error "Home readiness source parity failed"
   exit 1
 fi
 

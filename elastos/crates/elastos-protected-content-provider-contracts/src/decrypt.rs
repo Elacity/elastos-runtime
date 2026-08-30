@@ -595,7 +595,7 @@ impl DecryptProviderRequestV1 {
                 }
                 Ok(ValidatedDecryptProviderRequestV1(
                     ValidatedDecryptProviderRequestKindV1::PrepareRecipient {
-                        protected_content_binding: protected_content_binding.decode()?,
+                        protected_content_binding: Box::new(protected_content_binding.decode()?),
                         audit_request_id: RuntimeReleaseAuditIdV1::new(
                             elastos_protected_content_contracts::Digest32::new(audit_request_id),
                         )?,
@@ -740,7 +740,7 @@ impl Serialize for DecryptProviderRequestV1 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ValidatedDecryptProviderRequestKindV1 {
     PrepareRecipient {
-        protected_content_binding: ProtectedContentBindingV1,
+        protected_content_binding: Box<ProtectedContentBindingV1>,
         audit_request_id: RuntimeReleaseAuditIdV1,
         action: RightsActionV1,
         runtime_operation_issuer: RuntimeOperationIssuerKeyV1,

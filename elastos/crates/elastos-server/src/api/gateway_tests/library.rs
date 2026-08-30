@@ -6469,9 +6469,11 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
             .unwrap()
             .unwrap();
     assert_eq!(replayed_listing, listing);
-    let publish_requests = mock_content_publish_requests().lock().unwrap();
-    assert_eq!(publish_requests.len(), 4);
-    assert_eq!(publish_requests[2], publish_requests[3]);
+    {
+        let publish_requests = mock_content_publish_requests().lock().unwrap();
+        assert_eq!(publish_requests.len(), 4);
+        assert_eq!(publish_requests[2], publish_requests[3]);
+    }
     assert_eq!(
         wallet_provider
             .provider
@@ -9657,9 +9659,38 @@ async fn test_library_provider_runtime_custody_publish_rejects_invalid_input_lay
 
 #[tokio::test]
 async fn test_library_provider_runtime_custody_publish_passes_one_file_to_runtime_media_boundary() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    // The creator wallet/chain binding gate runs ahead of the media gate, so
+    // the state must carry wallet + chain providers plus a seeded managed
+    // default account for this test to reach the media preparation boundary
+    // its name claims. No media provider is registered on purpose.
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider(
+            "object",
+            std::sync::Arc::new(crate::library::ObjectProvider::new(
+                dir.path().to_path_buf(),
+                std::sync::Arc::downgrade(&registry),
+            )),
+        )
+        .await
+        .unwrap();
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &wallet_account_id,
+        10,
+    )
+    .await;
+    let app = gateway_router(state);
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
     crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
     let root = crate::auth::principal_localhost_root(&authority.principal_id);

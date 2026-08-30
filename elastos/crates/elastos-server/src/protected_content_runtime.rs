@@ -143,6 +143,8 @@ pub(crate) const RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody purchase is unavailable";
 pub(crate) const RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE: &str =
     "Runtime custody open is denied before purchase";
+pub(crate) const RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE: &str =
+    "Runtime custody content availability is unavailable";
 pub(crate) const RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody decrypt provider is unavailable";
 pub(crate) const RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE: &str =
@@ -3893,7 +3895,7 @@ pub(crate) async fn publish_runtime_custody_library_object(
         crate::auth::now_ts(),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))?;
     match coordinator
         .record_content_availability(&mint_draft, &requirement, evidence.clone())
         .map_err(|_| anyhow::anyhow!("Runtime custody availability record failed"))?
@@ -5275,7 +5277,8 @@ pub(crate) fn list_runtime_custody_listings(
     let mut listings = Vec::with_capacity(listing_paths.len());
     for path in listing_paths {
         let bytes = fs::read(path)?;
-        let record: RuntimeCustodyListingRecord = serde_json::from_slice(&bytes)?;
+        let record: RuntimeCustodyListingRecord = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("Runtime custody listing is invalid"))?;
         record.validate()?;
         listings.push(runtime_custody_listing_summary(
             data_dir,
@@ -5492,7 +5495,7 @@ pub(crate) async fn verify_fresh_runtime_custody_availability(
         now_unix_seconds,
     )
     .await
-    .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))
 }
 
 pub(crate) async fn open_runtime_custody_viewer(
@@ -5564,7 +5567,7 @@ pub(crate) async fn open_runtime_custody_viewer(
                     && !record.is_expired(viewer_now) =>
             {
                 let session =
-                    record.to_runtime_viewer_session(&asset.media_identity.encrypted_content())?;
+                    record.to_runtime_viewer_session(asset.media_identity.encrypted_content())?;
                 return runtime_custody_viewer_public_response(
                     &asset.media_identity,
                     mint_id,
@@ -5610,7 +5613,7 @@ pub(crate) async fn open_runtime_custody_viewer(
     )
     .await?;
     if fresh_availability.content_cid() != purchase.cid {
-        anyhow::bail!("Runtime custody content availability is unavailable");
+        anyhow::bail!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE);
     }
     let buy = reconstructed_buy_receipt(&draft, &fresh_availability, &purchase, &profile_did)?;
     let composition = load_runtime_custody_composition(data_dir, registry.clone())?
@@ -5960,6 +5963,7 @@ pub(crate) async fn open_runtime_custody_viewer(
     runtime_custody_viewer_public_response(draft.media_identity(), mint_id, &handle, expires_at)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_runtime_custody_viewer(
     data_dir: &Path,
     registry: Arc<ProviderRegistry>,
@@ -6051,9 +6055,7 @@ pub(crate) async fn read_runtime_custody_viewer(
         let encrypted =
             crate::content::fetch_bytes_via_provider(registry.as_ref(), &purchase.cid, Some(&path))
                 .await
-                .map_err(|_| {
-                    anyhow::anyhow!("Runtime custody content availability is unavailable")
-                })?;
+                .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))?;
         ViewerMediaPartSelectorV1::segment(segment_index, encrypted)
             .map_err(|_| anyhow::anyhow!("Runtime custody viewer media part is invalid"))?
     } else {
@@ -6089,6 +6091,7 @@ pub(crate) async fn read_runtime_custody_viewer(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn close_runtime_custody_viewer(
     data_dir: &Path,
     registry: Arc<ProviderRegistry>,
@@ -6226,7 +6229,8 @@ pub(crate) fn load_runtime_custody_listing(
     if !path.exists() {
         return Ok(None);
     }
-    let record: RuntimeCustodyListingRecord = serde_json::from_slice(&fs::read(path)?)?;
+    let record: RuntimeCustodyListingRecord = serde_json::from_slice(&fs::read(path)?)
+        .map_err(|_| anyhow::anyhow!("Runtime custody listing is invalid"))?;
     record.validate()?;
     Ok(Some(record))
 }
@@ -6962,16 +6966,16 @@ async fn fetch_runtime_custody_open_media(
         Some(PROTECTED_CONTENT_IDENTITY_PATH),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))?;
     let media = CencFmp4MediaIdentityV1::from_canonical_bytes(&identity_bytes)
-        .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))?;
     if &media != expected {
-        anyhow::bail!("Runtime custody content availability is unavailable");
+        anyhow::bail!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE);
     }
     let init =
         crate::content::fetch_bytes_via_provider(registry, cid, Some(PROTECTED_CONTENT_INIT_PATH))
             .await
-            .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
+            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))?;
     Ok((media, init))
 }
 
@@ -7086,6 +7090,7 @@ fn derive_runtime_custody_session_binding(
         .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn require_runtime_custody_session_binding(
     principal_id: &str,
     profile_did: &str,

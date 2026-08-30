@@ -10,10 +10,15 @@ Install the host tools first:
 
 ```bash
 xcode-select --install
-brew install node e2fsprogs coturn
+brew install node e2fsprogs coturn ffmpeg
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup target add wasm32-unknown-unknown
 ```
+
+Setup imports `ffmpeg`/`ffprobe` for the media-provider prerequisite and
+fail-closed rejects any group-writable ancestor of the resolved binaries. If
+setup stops with `ffmpeg prerequisite parent is unsafe`, tighten the Homebrew
+directory on that path (commonly `chmod g-w /opt/homebrew/Cellar`) and rerun.
 
 Then get the repo and build/install the source-home runtime into an isolated
 Mac test home:

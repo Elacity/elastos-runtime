@@ -8862,7 +8862,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_did_route_without_runtime_endpoint_is_unavailable_before_provider_effect() {
-        let fixture = peer_did_route_fixture(62, 63).await;
+        let fixture = peer_did_route_fixture(76, 77).await;
         // Rebind the registry to an invoker that owns no Carrier endpoint, so
         // Runtime has no verified route to any peer.
         fixture

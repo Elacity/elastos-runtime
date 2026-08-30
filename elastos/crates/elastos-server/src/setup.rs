@@ -177,8 +177,19 @@ pub async fn run(
     list: bool,
     prerequisites_only: bool,
 ) -> anyhow::Result<()> {
-    let manifest = load_manifest()?;
     let data_dir = data_dir()?;
+    run_with_data_dir(data_dir, profile, with, without, list, prerequisites_only).await
+}
+
+async fn run_with_data_dir(
+    data_dir: PathBuf,
+    profile: Option<String>,
+    with: Vec<String>,
+    without: Vec<String>,
+    list: bool,
+    prerequisites_only: bool,
+) -> anyhow::Result<()> {
+    let manifest = load_manifest()?;
     let platform = detect_platform();
 
     eprintln!(
@@ -2171,9 +2182,10 @@ mod tests {
     use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
     use elastos_common::{CapsuleManifest, CapsuleRole};
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // tokio Mutex so the async prerequisite test can hold the guard across
+    // its await without blocking the runtime; sync tests use blocking_lock.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn test_detect_platform() {
@@ -2204,10 +2216,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn test_missing_media_prerequisite_fails_before_first_component_install_effect() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let xdg_data_home = temp.path().join("xdg-data");
-        let data_dir = xdg_data_home.join("elastos");
         let manifest_path = temp.path().join("components.json");
         let source = temp.path().join("effect-source");
         fs::write(&source, b"install-effect").unwrap();
@@ -2240,14 +2251,17 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        // The data dir is injected rather than resolved from HOME/XDG env so
+        // this test can never write into the live user installation and never
+        // poisons concurrently running tests through process-global env.
+        let data_dir = xdg_data_home.join("elastos");
         let original_manifest = std::env::var_os(COMPONENTS_MANIFEST_ENV);
-        let original_xdg = std::env::var_os("XDG_DATA_HOME");
         let original_path = std::env::var_os("PATH");
         std::env::set_var(COMPONENTS_MANIFEST_ENV, &manifest_path);
-        std::env::set_var("XDG_DATA_HOME", &xdg_data_home);
         std::env::set_var("PATH", "");
 
-        let result = run(
+        let result = run_with_data_dir(
+            data_dir.clone(),
             Some("media-preflight".to_string()),
             vec![],
             vec![],
@@ -2260,10 +2274,6 @@ mod tests {
             Some(value) => std::env::set_var(COMPONENTS_MANIFEST_ENV, value),
             None => std::env::remove_var(COMPONENTS_MANIFEST_ENV),
         }
-        match original_xdg {
-            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
-            None => std::env::remove_var("XDG_DATA_HOME"),
-        }
         match original_path {
             Some(value) => std::env::set_var("PATH", value),
             None => std::env::remove_var("PATH"),
@@ -2275,7 +2285,7 @@ mod tests {
 
     #[test]
     fn test_load_manifest_finds_current_manifest() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.blocking_lock();
         let temp = tempfile::tempdir().unwrap();
         let xdg_data_home = temp.path().join("xdg-data");
         let data_dir = xdg_data_home.join("elastos");
@@ -2429,7 +2439,7 @@ mod tests {
 
     #[test]
     fn test_load_manifest_uses_explicit_manifest_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.blocking_lock();
         let temp = tempfile::tempdir().unwrap();
         let source_manifest =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../components.json");

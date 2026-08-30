@@ -184,19 +184,28 @@ pub struct ProviderBridge {
     /// protocol shutdown was delivered on a childless bridge). Later
     /// shutdown() calls are idempotent no-ops.
     shutdown_completed: std::sync::atomic::AtomicBool,
+    /// Timeout applied to each shutdown settle stage (protocol request,
+    /// child wait, force reap). Tests inject a short value.
+    shutdown_timeout: std::time::Duration,
 }
 
 impl ProviderBridge {
-    async fn force_child_reap(child: &mut Child) -> Result<(), BridgeError> {
+    async fn force_child_reap(
+        child: &mut Child,
+        shutdown_timeout: std::time::Duration,
+    ) -> Result<(), BridgeError> {
         child.start_kill().map_err(BridgeError::Io)?;
-        match tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
+        match tokio::time::timeout(shutdown_timeout, child.wait()).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(error)) => Err(BridgeError::Io(error)),
             Err(_) => Err(BridgeError::Timeout),
         }
     }
 
-    async fn terminate_child_for_init_failure(child_mutex: &Mutex<Option<Child>>) {
+    async fn terminate_child_for_init_failure(
+        child_mutex: &Mutex<Option<Child>>,
+        shutdown_timeout: std::time::Duration,
+    ) {
         let mut child_guard = child_mutex.lock().await;
         let Some(mut child) = child_guard.take() else {
             return;
@@ -205,7 +214,7 @@ impl ProviderBridge {
         match child.try_wait() {
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => {
-                let _ = Self::force_child_reap(&mut child).await;
+                let _ = Self::force_child_reap(&mut child, shutdown_timeout).await;
             }
         }
     }
@@ -215,6 +224,15 @@ impl ProviderBridge {
     /// Starts the binary, sends Init with the given config, and waits
     /// for the init response.
     pub async fn spawn(binary_path: &Path, config: ProviderConfig) -> Result<Self, BridgeError> {
+        Self::spawn_with_timeouts(binary_path, config, INIT_TIMEOUT, SHUTDOWN_TIMEOUT).await
+    }
+
+    async fn spawn_with_timeouts(
+        binary_path: &Path,
+        config: ProviderConfig,
+        init_timeout: std::time::Duration,
+        shutdown_timeout: std::time::Duration,
+    ) -> Result<Self, BridgeError> {
         let mut child = Command::new(binary_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -227,7 +245,7 @@ impl ProviderBridge {
             Some(stdin) => stdin,
             None => {
                 let child = Mutex::new(Some(child));
-                Self::terminate_child_for_init_failure(&child).await;
+                Self::terminate_child_for_init_failure(&child, shutdown_timeout).await;
                 return Err(BridgeError::InitFailed(
                     "spawned provider missing piped stdin".to_string(),
                 ));
@@ -237,7 +255,7 @@ impl ProviderBridge {
             Some(stdout) => stdout,
             None => {
                 let child = Mutex::new(Some(child));
-                Self::terminate_child_for_init_failure(&child).await;
+                Self::terminate_child_for_init_failure(&child, shutdown_timeout).await;
                 return Err(BridgeError::InitFailed(
                     "spawned provider missing piped stdout".to_string(),
                 ));
@@ -251,11 +269,12 @@ impl ProviderBridge {
             })),
             child: Mutex::new(Some(child)),
             shutdown_completed: std::sync::atomic::AtomicBool::new(false),
+            shutdown_timeout,
         };
 
         // Send Init request
         let init_req = ProviderRequest::Init { config };
-        let response = match tokio::time::timeout(INIT_TIMEOUT, bridge.request_raw(init_req)).await
+        let response = match tokio::time::timeout(init_timeout, bridge.request_raw(init_req)).await
         {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
@@ -309,6 +328,7 @@ impl ProviderBridge {
             })),
             child: Mutex::new(None),
             shutdown_completed: std::sync::atomic::AtomicBool::new(false),
+            shutdown_timeout: SHUTDOWN_TIMEOUT,
         }
     }
 
@@ -392,7 +412,7 @@ impl ProviderBridge {
             // the provider, so the protocol shutdown must still be delivered
             // for an attached provider to stop cleanly.
             let result = tokio::time::timeout(
-                SHUTDOWN_TIMEOUT,
+                self.shutdown_timeout,
                 self.request_raw(ProviderRequest::Shutdown),
             )
             .await
@@ -410,7 +430,7 @@ impl ProviderBridge {
         };
 
         let shutdown_result = tokio::time::timeout(
-            SHUTDOWN_TIMEOUT,
+            self.shutdown_timeout,
             self.request_raw(ProviderRequest::Shutdown),
         )
         .await
@@ -424,7 +444,7 @@ impl ProviderBridge {
         });
 
         let protocol_error = shutdown_result.err();
-        match tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
+        match tokio::time::timeout(self.shutdown_timeout, child.wait()).await {
             Ok(Ok(status)) => {
                 child_guard.take();
                 self.shutdown_completed
@@ -437,7 +457,7 @@ impl ProviderBridge {
                     Err(BridgeError::ProcessExited)
                 }
             }
-            Ok(Err(error)) => match Self::force_child_reap(child).await {
+            Ok(Err(error)) => match Self::force_child_reap(child, self.shutdown_timeout).await {
                 Ok(()) => {
                     child_guard.take();
                     self.shutdown_completed
@@ -446,7 +466,7 @@ impl ProviderBridge {
                 }
                 Err(reap_error) => Err(reap_error),
             },
-            Err(_) => match Self::force_child_reap(child).await {
+            Err(_) => match Self::force_child_reap(child, self.shutdown_timeout).await {
                 Ok(()) => {
                     child_guard.take();
                     self.shutdown_completed
@@ -703,7 +723,9 @@ mod tests {
 
     #[cfg(unix)]
     fn wait_for_file(path: &std::path::Path) {
-        for _ in 0..50 {
+        // Generous real-time budget: the marker is written by a freshly
+        // spawned child process, which can be slow under machine load.
+        for _ in 0..250 {
             if path.is_file() {
                 return;
             }
@@ -1131,18 +1153,34 @@ mod tests {
     async fn test_spawn_reaps_provider_that_never_answers_init() {
         let tempdir = TempDir::new().unwrap();
         let pid_path = tempdir.path().join("hang.pid");
+        // Consumes stdin without ever answering, so init times out and the
+        // settle path must force-kill and reap the child. The detached
+        // request task keeps the io lock, so the protocol shutdown can never
+        // be delivered to a never-answering provider.
         let script = format!(
-            "#!/bin/sh\nprintf '%s' $$ > '{}'\nIFS= read -r _line || exit 0\nwhile :; do :; done\n",
+            "#!/bin/sh\nprintf '%s' $$ > '{}'\nwhile IFS= read -r _line; do :; done\n",
             pid_path.display()
         );
         let script_path = write_provider_script(&tempdir, "hung-provider.sh", &script);
 
+        // The paused clock freezes the init timer, so the marker wait below
+        // cannot race the init timeout no matter how loaded the machine is.
         let task = tokio::spawn(async move {
-            ProviderBridge::spawn(&script_path, ProviderConfig::default()).await
+            ProviderBridge::spawn_with_timeouts(
+                &script_path,
+                ProviderConfig::default(),
+                INIT_TIMEOUT,
+                std::time::Duration::from_secs(1),
+            )
+            .await
         });
         tokio::task::yield_now().await;
         wait_for_file(&pid_path);
+        // Fire the init timeout deterministically, then resume real time so
+        // the settle stages race real child events (SIGKILL + reap) instead
+        // of the auto-advancing paused clock.
         tokio::time::advance(INIT_TIMEOUT).await;
+        tokio::time::resume();
         let error = match task.await.unwrap() {
             Ok(_) => panic!("init timeout should not return a usable bridge"),
             Err(error) => error,
@@ -1150,10 +1188,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            BridgeError::InitFailed(ref detail)
-                if detail.starts_with(
-                    "provider init timed out; failed to settle provider child:"
-                )
+            BridgeError::InitFailed(ref detail) if detail.starts_with("provider init timed out")
         ));
         let pid = std::fs::read_to_string(&pid_path).unwrap();
         assert_process_absent(pid.trim());

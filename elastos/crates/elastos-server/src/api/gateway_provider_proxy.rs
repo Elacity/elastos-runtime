@@ -2532,6 +2532,7 @@ async fn complete_runtime_custody_purchase_stage(
     Ok(Some(completion))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn publish_runtime_custody_creator_metadata(
     registry: &ProviderRegistry,
     data_dir: &std::path::Path,
@@ -3208,7 +3209,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
     };
     let access = resolve_runtime_custody_purchase_access(
         state,
-        &listing,
+        listing,
         &buyer_account,
         &expected_content_access_id,
         &format!("purchase-access:{}", purchase.buy_stage.effect_id),

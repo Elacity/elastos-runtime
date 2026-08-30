@@ -79,7 +79,8 @@ use super::{
     PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS, PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION,
     PROTECTED_CONTENT_PROVIDER_STATUS_TIMEOUT, PROTECT_PROVIDER_ID, PROTECT_PROVIDER_OPERATIONS,
     PROTECT_PROVIDER_PROCESS_ID, PROTECT_PROVIDER_VERSION,
-    RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE, RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE,
+    RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE, RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE,
+    RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE,
     RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE,
     RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE, RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE,
     RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE, RUNTIME_PROVIDER_ID,
@@ -140,6 +141,7 @@ struct SequencedProvider {
 }
 
 struct PrepareOnlyCleanupDecryptProvider {
+    expected_issuer_seed: u8,
     requests: Mutex<Vec<Value>>,
 }
 
@@ -521,7 +523,12 @@ impl SequencedProvider {
 
 impl PrepareOnlyCleanupDecryptProvider {
     fn new() -> Arc<Self> {
+        Self::with_expected_issuer_seed(0x21)
+    }
+
+    fn with_expected_issuer_seed(seed: u8) -> Arc<Self> {
         Arc::new(Self {
+            expected_issuer_seed: seed,
             requests: Mutex::new(Vec::new()),
         })
     }
@@ -571,7 +578,7 @@ impl Provider for PrepareOnlyCleanupDecryptProvider {
         let validated = ValidatedDecryptProviderRequestV1::decode_and_validate_at(
             &serde_json::to_vec(&inner_request)
                 .map_err(|_| ProviderError::Provider("invalid decrypt request".to_string()))?,
-            derived_device_runtime_issuer(0x21),
+            derived_device_runtime_issuer(self.expected_issuer_seed),
             crate::auth::now_ts(),
         )
         .map_err(|_| ProviderError::Provider("invalid decrypt request".to_string()))?;
@@ -1469,8 +1476,8 @@ fn runtime_custody_listing_selection_is_stable_and_truncated_by_mint_filename() 
         super::select_runtime_custody_listing_paths(&listings_root).unwrap();
     let (second_paths, second_truncated) =
         super::select_runtime_custody_listing_paths(&listings_root).unwrap();
-    assert_eq!(first_truncated, true);
-    assert_eq!(second_truncated, true);
+    assert!(first_truncated);
+    assert!(second_truncated);
     assert_eq!(first_paths, second_paths);
     assert_eq!(first_paths.len(), super::MAX_RUNTIME_CUSTODY_LISTINGS);
     let selected = first_paths
@@ -1512,8 +1519,7 @@ fn runtime_custody_listings_reject_malformed_record() {
     .unwrap();
 
     let error = super::list_runtime_custody_listings(&data_dir, "person:local:creator")
-        .err()
-        .expect("expected malformed record rejection");
+        .expect_err("expected malformed record rejection");
     assert_eq!(error.to_string(), "Runtime custody listing is invalid");
 }
 
@@ -8551,7 +8557,7 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
         .await
         .unwrap();
     registry
-        .register_sub_provider(
+        .register_runtime_provider_target(
             CUSTODY_PROVIDER_ID,
             Arc::new(LibraryMintCustodyProvider {
                 expected_issuer: derived_device_runtime_issuer(0x21),
@@ -8574,6 +8580,10 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
         .register_sub_provider(CHAIN_PROVIDER_ID, Arc::new(LibraryMintChainPolicyProvider))
         .await
         .unwrap();
+    install_profile_authority_keeping_device_key(
+        &data_dir,
+        "person:local:runtime-custody-pre-dispatch-retry",
+    );
     let (device_key, _) = derived_device_key_for_seed(0x21);
     let content = ContentAvailabilityTestProvider::with_signing_key(
         device_key,
@@ -8755,7 +8765,10 @@ async fn runtime_custody_library_publish_blocks_exact_retry_after_ambiguous_prot
         ],
     );
     let registry = Arc::new(ProviderRegistry::new());
-    registry.register(protect.clone()).await;
+    registry
+        .register_runtime_provider_target(PROTECT_PROVIDER_ID, protect.clone())
+        .await
+        .unwrap();
     let input = library_publish_test_input("person:local:runtime-custody-ambiguous-dispatch");
     let request_id = library_publish_request_id(&input);
     let first = publish_runtime_custody_library_object(&data_dir, registry.clone(), input)
@@ -8817,7 +8830,10 @@ async fn runtime_custody_library_publish_rejects_creator_source_drift_during_ope
         ))],
     );
     let registry = Arc::new(ProviderRegistry::new());
-    registry.register(protect.clone()).await;
+    registry
+        .register_runtime_provider_target(PROTECT_PROVIDER_ID, protect.clone())
+        .await
+        .unwrap();
     let input = library_publish_test_input("person:local:runtime-custody-source-drift");
     let request_id = library_publish_request_id(&input);
     let first = publish_runtime_custody_library_object(&data_dir, registry.clone(), input.clone())
@@ -8881,7 +8897,10 @@ async fn runtime_custody_library_publish_settles_cancelled_session_before_failin
         ],
     );
     let registry = Arc::new(ProviderRegistry::new());
-    registry.register(protect.clone()).await;
+    registry
+        .register_runtime_provider_target(PROTECT_PROVIDER_ID, protect.clone())
+        .await
+        .unwrap();
     let input = library_publish_test_input("person:local:runtime-custody-cancel-settlement");
     let request_id = library_publish_request_id(&input);
     let first = publish_runtime_custody_library_object(&data_dir, registry.clone(), input)
@@ -8965,7 +8984,10 @@ async fn runtime_custody_library_publish_recovers_open_handle_by_cancelling_befo
             ProtectProviderResponseV1::new_cancelled(handle).unwrap(),
         ))],
     );
-    registry.register(protect.clone()).await;
+    registry
+        .register_runtime_provider_target(PROTECT_PROVIDER_ID, protect.clone())
+        .await
+        .unwrap();
 
     let error = publish_runtime_custody_library_object(&data_dir, registry, input)
         .await
@@ -9076,7 +9098,10 @@ async fn runtime_custody_library_publish_retains_cleanup_obligation_when_close_f
             )),
         ],
     );
-    registry.register(protect.clone()).await;
+    registry
+        .register_runtime_provider_target(PROTECT_PROVIDER_ID, protect.clone())
+        .await
+        .unwrap();
 
     let first = publish_runtime_custody_library_object(&data_dir, registry.clone(), input)
         .await
@@ -11441,6 +11466,12 @@ async fn runtime_custody_viewer_expired_old_binding_allows_cleanup_before_fresh_
     )
     .await;
     let principal_id = "person:local:runtime-custody-viewer-expired-old-binding";
+    // The prebuy harness writes a custody composition; this scenario proves
+    // the expired-binding cleanup runs and the FRESH open then fails closed
+    // at the first missing prerequisite. Availability verification is the
+    // first gate that requires the composition, so removing it makes the
+    // fresh open fail closed there.
+    fs::remove_file(custody_composition_config_path(&harness.data_dir)).unwrap();
     let (proof_binding_id, _) =
         install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
     let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
@@ -11510,9 +11541,12 @@ async fn runtime_custody_viewer_expired_old_binding_allows_cleanup_before_fresh_
     .await
     .unwrap_err();
 
-    assert!(error
-        .to_string()
-        .contains(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE));
+    assert!(
+        error
+            .to_string()
+            .contains(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE),
+        "{error}"
+    );
     assert_eq!(close_provider.requests().await.len(), 1);
     assert_exact_runtime_decrypt_invocation(
         &close_provider.requests().await[0],
@@ -12277,14 +12311,14 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wal
     )
     .await;
     let principal_id = "person:local:runtime-custody-open-no-release-wallet";
-    write_device_key(&harness.data_dir, 0x21);
+    write_device_key(&harness.data_dir, 0x61);
     let (_epoch, _composition_now) = write_library_publish_test_composition(&harness.data_dir);
     let (proof_binding_id, _) =
         install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
     let mint = runtime_mint_journal(&harness.data_dir)
         .load(harness.mint_id)
         .unwrap();
-    let decrypt = PrepareOnlyCleanupDecryptProvider::new();
+    let decrypt = PrepareOnlyCleanupDecryptProvider::with_expected_issuer_seed(0x61);
     harness
         .registry
         .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt.clone())

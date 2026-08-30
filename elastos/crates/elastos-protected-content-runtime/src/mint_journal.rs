@@ -437,6 +437,7 @@ impl fmt::Debug for RuntimeMediaPreparationRecord {
 }
 
 impl RuntimeMediaPreparationRecord {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         principal_id: &str,
         object_uri: &str,

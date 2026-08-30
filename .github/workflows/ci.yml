@@ -100,7 +100,7 @@ jobs:
       - name: install host prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y coturn e2fsprogs
+          sudo apt-get install -y coturn e2fsprogs ffmpeg
       - name: source-home into isolated HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
@@ -153,7 +153,19 @@ jobs:
           df -Pk .
           df -Pk . | awk 'NR == 2 { if ($4 * 100 < $2 * 10) exit 1 }'
       - name: install host prerequisites
-        run: brew install e2fsprogs coturn
+        run: |
+          brew install e2fsprogs coturn ffmpeg
+          # setup-source-home's media prerequisite imports ffmpeg/ffprobe and
+          # fail-closed rejects any group-writable ancestor of the resolved
+          # binaries (Homebrew's Cellar defaults to 775). Tighten the
+          # user-owned ancestors so the import chain passes admission.
+          for tool in ffmpeg ffprobe; do
+            p="$(python3 -c "import os,shutil;print(os.path.realpath(shutil.which('$tool')))")"
+            while [ "$p" != "/" ]; do
+              p="$(dirname "$p")"
+              { [ -O "$p" ] && chmod g-w "$p"; } || true
+            done
+          done
       - name: source-home into isolated MAC_TEST_HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
