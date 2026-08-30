@@ -6,7 +6,29 @@ const moduleVersion = "home-20260813a";
 const savedStatePatches = [];
 const requests = [];
 const windowEventListeners = new Map();
+const documentEventListeners = new Map();
 let randomUuidSerial = 0;
+
+function matchesSelector(node, selector) {
+  if (!node || typeof selector !== "string" || !selector) {
+    return false;
+  }
+  if (selector.includes(",")) {
+    return selector.split(",").some((part) => matchesSelector(node, part.trim()));
+  }
+  if (selector.startsWith("#")) {
+    return node.id === selector.slice(1);
+  }
+  if (selector.startsWith(".")) {
+    const token = selector.slice(1);
+    return node.classList.contains(token)
+      || String(node.className || "").split(/\s+/).includes(token);
+  }
+  if (selector === "[contenteditable='true']") {
+    return node.contenteditable === "true" || node.contentEditable === "true";
+  }
+  return String(node.tagName || "").toLowerCase() === selector.toLowerCase();
+}
 
 class FakeClassList {
   constructor() {
@@ -39,6 +61,7 @@ class FakeElement {
     this.children = [];
     this.parentElement = null;
     this.queries = new Map();
+    this.listeners = new Map();
     this.dataset = {};
     this.style = {};
     this.hidden = false;
@@ -46,6 +69,9 @@ class FakeElement {
     this.disabled = false;
     this.textContent = "";
     this.innerHTML = "";
+    this.className = "";
+    this.id = "";
+    this.tagName = selector.startsWith("#") ? "DIV" : selector.toUpperCase();
     this.classList = new FakeClassList();
     this.content = withTemplateContent
       ? {
@@ -61,29 +87,82 @@ class FakeElement {
     return child;
   }
 
+  append(...children) {
+    for (const child of children) {
+      this.appendChild(child);
+    }
+  }
+
   cloneNode() {
     return new FakeElement(`${this.selector}:clone`, false);
   }
 
-  addEventListener() {}
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) || [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
 
-  removeEventListener() {}
+  removeEventListener(type, listener) {
+    const listeners = this.listeners.get(type) || [];
+    this.listeners.set(
+      type,
+      listeners.filter((candidate) => candidate !== listener),
+    );
+  }
+
+  dispatch(type, event = {}) {
+    const payload = {
+      target: this,
+      currentTarget: this,
+      preventDefault() {
+        this.defaultPrevented = true;
+      },
+      stopPropagation() {
+        this.propagationStopped = true;
+      },
+      ...event,
+    };
+    for (const listener of this.listeners.get(type) || []) {
+      listener(payload);
+    }
+    return payload;
+  }
 
   replaceChildren(...children) {
     this.children = children;
+    for (const child of children) {
+      child.parentElement = this;
+    }
   }
 
   querySelector(selector) {
     if (!this.queries.has(selector)) {
       const child = new FakeElement(`${this.selector} ${selector}`);
+      if (selector.startsWith("#")) {
+        child.id = selector.slice(1);
+      }
+      if (selector.startsWith(".")) {
+        child.className = selector.slice(1);
+        child.classList.add(selector.slice(1));
+      }
       child.parentElement = this;
       this.queries.set(selector, child);
     }
     return this.queries.get(selector);
   }
 
-  querySelectorAll() {
-    return [];
+  querySelectorAll(selector) {
+    const matches = [];
+    const stack = [...this.children];
+    while (stack.length > 0) {
+      const child = stack.shift();
+      if (matchesSelector(child, selector)) {
+        matches.push(child);
+      }
+      stack.unshift(...child.children);
+    }
+    return matches;
   }
 
   setAttribute(name, value) {
@@ -107,7 +186,14 @@ class FakeElement {
     this.parentElement = null;
   }
 
-  closest() {
+  closest(selector) {
+    let current = this;
+    while (current) {
+      if (matchesSelector(current, selector)) {
+        return current;
+      }
+      current = current.parentElement || null;
+    }
     return null;
   }
 
@@ -125,6 +211,8 @@ class FakeElement {
   focus() {
     document.activeElement = this;
   }
+
+  scrollIntoView() {}
 
   getBoundingClientRect() {
     if (this.selector === "#desktop") {
@@ -159,10 +247,36 @@ globalThis.HTMLElement = FakeElement;
 globalThis.document = {
   activeElement: null,
   body: elementForSelector("body"),
-  addEventListener() {},
-  removeEventListener() {},
+  addEventListener(type, listener) {
+    const listeners = documentEventListeners.get(type) || [];
+    listeners.push(listener);
+    documentEventListeners.set(type, listeners);
+  },
+  removeEventListener(type, listener) {
+    const listeners = documentEventListeners.get(type) || [];
+    documentEventListeners.set(
+      type,
+      listeners.filter((candidate) => candidate !== listener),
+    );
+  },
   querySelector: elementForSelector,
   createElement: (tag) => new FakeElement(tag),
+  getElementById(id) {
+    const stack = [...elementCache.values()];
+    const seen = new Set();
+    while (stack.length > 0) {
+      const node = stack.shift();
+      if (!node || seen.has(node)) {
+        continue;
+      }
+      seen.add(node);
+      if (node.id === id) {
+        return node;
+      }
+      stack.unshift(...node.children, ...node.queries.values());
+    }
+    return null;
+  },
 };
 globalThis.window = {
   crypto: {
@@ -187,6 +301,22 @@ function sendWindowEvent(type, event) {
   for (const listener of windowEventListeners.get(type) || []) {
     listener(event);
   }
+}
+
+function sendDocumentEvent(type, event = {}) {
+  const payload = {
+    preventDefault() {
+      this.defaultPrevented = true;
+    },
+    stopPropagation() {
+      this.propagationStopped = true;
+    },
+    ...event,
+  };
+  for (const listener of documentEventListeners.get(type) || []) {
+    listener(payload);
+  }
+  return payload;
 }
 globalThis.fetch = async (_url, init = {}) => {
   requests.push({
@@ -253,6 +383,8 @@ const shellWindows = await import(`../capsules/home-gui/browser/shell-windows.js
 const shellSurface = await import(`../capsules/home-gui/browser/shell-surface.js?v=${moduleVersion}`);
 const shellWalletRail = await import(`../capsules/home-gui/browser/shell-wallet-rail.js?v=${moduleVersion}`);
 const shellConnectorSheet = await import(`../capsules/home-gui/browser/shell-connector-sheet.js?v=${moduleVersion}`);
+const shellSpotlight = await import(`../capsules/home-gui/browser/shell-spotlight.js?v=${moduleVersion}`);
+const shellKeyboard = await import(`../capsules/home-gui/browser/shell-keyboard.js?v=${moduleVersion}`);
 
 function sourceBlock(source, needle, label) {
   const start = source.indexOf(needle);
@@ -541,8 +673,31 @@ assert(
   homeGuiTemplate.includes('id="control-centre-quick-open"') &&
     homeGuiTemplate.includes('id="control-centre-spotlight"') &&
     homeGuiTemplate.includes('id="control-centre-inbox-detail"') &&
-    homeGuiTemplate.includes('id="control-centre-quick-wallet"'),
-  "Home GUI template is missing the mobile quick-open controls",
+    homeGuiTemplate.includes('id="control-centre-quick-wallet"') &&
+    (homeGuiTemplate.match(/id="wallet-rail"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="wallet-rail-frame"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="wallet-rail-close"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="wallet-rail-open-window"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="wallet-rail-approvals"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="wallet-rail-privacy"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="wallet-rail-settings"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="wallet-rail-retry"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="inbox-rail"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="inbox-rail-frame"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="inbox-rail-close"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="inbox-rail-open-window"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="inbox-rail-refresh"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="inbox-rail-retry"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="spotlight"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="spotlight-input"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="spotlight-results"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="shortcuts-overlay"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="shortcuts-close"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="about-overlay"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="about-close"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="about-version"/g) || []).length === 1 &&
+    (homeGuiTemplate.match(/id="about-update"/g) || []).length === 1,
+  "Home GUI template is missing the Spotlight search surface",
 );
 assert(
   shellChromeScript.includes("export function summaryDisplayName(summary)") &&
@@ -561,6 +716,14 @@ assert(
     shellControlCentreScript.includes('quickWalletRow?.addEventListener("click"') &&
     shellControlCentreScript.includes("showWalletRail();"),
   "Home Control Centre quick-open rows must use the existing Spotlight, Inbox, and Wallet openers",
+);
+assert(
+  homeGuiScript.includes('document.querySelector("#toolbar-spotlight")?.addEventListener("click", () => {') &&
+    homeGuiScript.includes("showSpotlight();") &&
+    /event\.code === "Space"[\s\S]*toggleSpotlight\(\);/.test(
+      readFileSync(new URL("../capsules/home-gui/browser/shell-keyboard.js", import.meta.url), "utf8"),
+    ),
+  "Home search must stay wired from both the toolbar button and the keyboard shortcut",
 );
 assert(
   homeGuiStyle.includes(".control-centre-quick-open {\n  display: none;\n}") &&
@@ -968,6 +1131,116 @@ shellWindows.configureWindowHooks({
     };
   },
 });
+
+{
+  const spotlight = elementForSelector("#spotlight");
+  const spotlightPanel = spotlight.querySelector(".spotlight-panel");
+  const spotlightInput = elementForSelector("#spotlight-input");
+  const spotlightResults = elementForSelector("#spotlight-results");
+  const spotlightInvoker = elementForSelector("#toolbar-spotlight");
+  const previousSummary = shellCore.shellState.currentSummary;
+  const previousMounted = shellCore.shellState.homeGuiMounted;
+  const previousRecents = shellCore.shellState.recentTargetIds;
+  spotlight.hidden = true;
+  spotlight.inert = true;
+  spotlight.setAttribute("aria-hidden", "true");
+  spotlightPanel.hidden = true;
+  spotlightPanel.className = "spotlight-panel";
+  spotlightPanel.classList.add("spotlight-panel");
+  spotlightInput.tagName = "INPUT";
+  spotlightResults.hidden = true;
+  shellCore.shellState.currentSummary = {
+    authority: { signed_in: true },
+    targets: [
+      { target: "system", title: "System", route: "/apps/system/" },
+      { target: "browser", title: "Browser", route: "/apps/browser/" },
+    ],
+    documents: [],
+  };
+  shellCore.shellState.recentTargetIds = ["system", "browser"];
+  shellCore.shellState.homeGuiMounted = true;
+  shellSpotlight.bindSpotlight();
+  shellKeyboard.bindShellKeyboard();
+  spotlightInvoker.focus();
+  const openEvent = sendDocumentEvent("keydown", {
+    target: spotlightInvoker,
+    currentTarget: document,
+    code: "Space",
+    key: " ",
+    metaKey: true,
+    ctrlKey: false,
+    altKey: false,
+    shiftKey: false,
+  });
+  assert(openEvent.defaultPrevented === true, "Home keyboard search shortcut did not consume the event");
+  assert(
+    shellSpotlight.spotlightOpen() === true &&
+      spotlight.hidden === false &&
+      spotlightInput === document.activeElement &&
+      spotlight.getAttribute("aria-hidden") === "false",
+    "Home Spotlight did not open and focus the search field",
+    {
+      hidden: spotlight.hidden,
+      activeElement: document.activeElement?.selector || null,
+      ariaHidden: spotlight.getAttribute("aria-hidden"),
+    },
+  );
+  spotlightInput.value = "system";
+  spotlightInput.dispatch("input");
+  assert(
+    spotlightResults.children.length >= 2 &&
+      spotlightResults.children[1].children[1]?.textContent === "System",
+    "Home Spotlight did not show the known app search result",
+    spotlightResults.children.map((child) => ({
+      className: child.className,
+      textContent: child.textContent,
+      title: child.children[1]?.textContent || null,
+    })),
+  );
+  const launchesBefore = restoredBrowserLaunches.length;
+  spotlight.dispatch("keydown", { key: "Enter" });
+  spotlightPanel.dispatch("animationend", { target: spotlightPanel });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert(
+    restoredBrowserLaunches.length === launchesBefore + 1 &&
+      restoredBrowserLaunches.at(-1)?.target === "system" &&
+      shellSpotlight.spotlightOpen() === false,
+    "Home Spotlight did not open the selected app and close",
+    restoredBrowserLaunches.slice(launchesBefore),
+  );
+  spotlightInvoker.focus();
+  shellSpotlight.showSpotlight();
+  spotlightInput.value = "no-match-query";
+  spotlightInput.dispatch("input");
+  assert(
+    spotlightResults.hidden === false &&
+      spotlightResults.children.length === 1 &&
+      spotlightResults.children[0].className === "spotlight-empty" &&
+      spotlightResults.children[0].textContent.includes("No results for"),
+    "Home Spotlight did not render the unmatched query state",
+    spotlightResults.children.map((child) => ({
+      className: child.className,
+      textContent: child.textContent,
+    })),
+  );
+  spotlight.dispatch("keydown", { key: "Escape" });
+  spotlightPanel.dispatch("animationend", { target: spotlightPanel });
+  assert(
+    shellSpotlight.spotlightOpen() === false &&
+      document.activeElement === spotlightInvoker,
+    "Home Spotlight did not close on Escape and restore focus",
+    {
+      hidden: spotlight.hidden,
+      activeElement: document.activeElement?.selector || null,
+    },
+  );
+  shellCore.shellState.windows.clear();
+  shellCore.shellState.activeWindowId = null;
+  shellCore.shellState.currentSummary = previousSummary;
+  shellCore.shellState.homeGuiMounted = previousMounted;
+  shellCore.shellState.recentTargetIds = previousRecents;
+}
 for (const launch of [
   { target: "people", title: "People", route: "/apps/people/", attach_kind: "iframe", launch_status: "launched" },
   { target: "chat", title: "Chat", route: "/apps/chat/", attach_kind: "iframe", launch_status: "launched" },

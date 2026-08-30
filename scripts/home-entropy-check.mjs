@@ -1958,6 +1958,15 @@ assert(
   "Shell chords live in the keyboard layer alone — a second binding in home-gui.js would toggle surfaces straight back closed",
 );
 assert(
+  (homeGuiTemplateHtml.match(/id="wallet-rail"/g) || []).length === 1 &&
+    (homeGuiTemplateHtml.match(/id="wallet-rail-frame"/g) || []).length === 1 &&
+    (homeGuiTemplateHtml.match(/id="inbox-rail"/g) || []).length === 1 &&
+    (homeGuiTemplateHtml.match(/id="inbox-rail-frame"/g) || []).length === 1 &&
+    homeGuiTemplateHtml.includes('aria-controls="wallet-rail"') &&
+    homeGuiTemplateHtml.includes('aria-controls="inbox-rail"'),
+  "Home GUI toolbar and notifications must point at real Wallet and Inbox rails, not missing template surfaces",
+);
+assert(
   homeGuiTemplateHtml.includes('id="wallet-rail"') ||
     !/shortcuts-row"><dt>Wallet<\/dt>/.test(homeGuiTemplateHtml),
   "The shortcuts overlay documents only surfaces that exist: no Wallet row until the wallet rail lands",
