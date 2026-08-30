@@ -58,6 +58,21 @@ jobs:
       - name: cargo check
         working-directory: elastos
         run: cargo check --workspace
+
+  test-elastos:
+    name: test-elastos
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: source-gate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: elastos
+          prefix-key: ${{ runner.os }}-elastos-test
       - name: build provider process binaries for tests
         run: |
           cargo build --release --manifest-path capsules/protected-content-protect-provider/Cargo.toml --target-dir capsules/protected-content-protect-provider/target
@@ -73,10 +88,37 @@ jobs:
         # Network-sensitive tests are #[ignore] and won't run.
         # Run them explicitly with: cargo test --workspace -- --ignored
 
+  test-capsules:
+    name: test-capsules
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: source-gate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ runner.os }}-capsules
+      # The elastos workspace suite never builds or tests own-workspace
+      # capsules; this mirrors `just test-capsules`.
+      - name: test own-workspace capsules
+        run: |
+          set -euo pipefail
+          for lock in capsules/*/Cargo.lock; do
+              capsule="$(dirname "$lock")"
+              echo "== testing $capsule =="
+              (cd "$capsule" && cargo test --target-dir target)
+          done
+
   source-home-linux:
     name: source-home-linux (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    needs: [test-elastos, test-capsules]
     strategy:
       fail-fast: false
       matrix:
@@ -136,6 +178,7 @@ jobs:
     name: source-home-macos
     runs-on: macos-14
     timeout-minutes: 90
+    needs: [test-elastos, test-capsules]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -194,6 +237,7 @@ jobs:
   build-release:
     name: Build Release (x86_64)
     runs-on: ubuntu-latest
+    needs: [source-home-linux, source-home-macos]
     steps:
       - uses: actions/checkout@v4
         with:
