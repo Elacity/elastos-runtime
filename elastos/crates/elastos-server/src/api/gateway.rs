@@ -107,6 +107,7 @@ pub(crate) fn principal_root_protected_object_inventory(
     inventory
 }
 
+pub(in crate::api) use gateway_home_runtime::capsule_icon_variants;
 pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_object_shell_title};
 pub(in crate::api) use gateway_home_system::profile_readiness_for_principal;
 use gateway_home_system::*;

@@ -846,9 +846,9 @@ struct HomeState {
 /// The route is a plain capsule asset route, so the shell fetches the icon
 /// from the capsule that owns it instead of from a central shell icon table.
 #[derive(Clone, Serialize)]
-pub(in crate::api::gateway) struct CapsuleIconVariant {
-    pub(in crate::api::gateway) size: u32,
-    pub(in crate::api::gateway) route: String,
+pub(in crate::api) struct CapsuleIconVariant {
+    pub(in crate::api) size: u32,
+    pub(in crate::api) route: String,
 }
 
 #[derive(Clone, Serialize)]

@@ -191,7 +191,7 @@ const CAPSULE_ICON_SIZES: [u32; 4] = [32, 64, 128, 256];
 /// the declared directory must sit under the entrypoint's directory, and the
 /// route carries the remainder. An icon outside the serving root has no
 /// servable route, and pretending otherwise would hand the shell a 404.
-pub(super) fn capsule_icon_variants(
+pub(in crate::api) fn capsule_icon_variants(
     name: &str,
     entrypoint: &str,
     icon: Option<&str>,

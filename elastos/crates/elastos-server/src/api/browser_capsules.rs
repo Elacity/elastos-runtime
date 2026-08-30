@@ -11,8 +11,8 @@ use super::capsule_inventory::{
     load_capsule_manifest,
 };
 use super::gateway::{
-    content_type, ensure_wallet_connector_configured, request_uses_tls, validate_file_path,
-    GatewayState,
+    capsule_icon_variants, content_type, ensure_wallet_connector_configured, request_uses_tls,
+    validate_file_path, GatewayState,
 };
 
 const BROWSER_CAPSULE_CACHE_CONTROL: &str = "no-store";
@@ -21,7 +21,6 @@ const BROWSER_CAPSULE_COEP: &str = "require-corp";
 const BROWSER_CAPSULE_DOCUMENT_CORP: &str = "cross-origin";
 const BROWSER_CAPSULE_ASSET_CORP: &str = "cross-origin";
 const BROWSER_CAPSULE_OPAQUE_ORIGIN: &str = "null";
-
 pub(super) fn is_allowed_capsule_origin(origin: &axum::http::HeaderValue) -> bool {
     let Ok(origin) = origin.to_str() else {
         return false;
@@ -114,6 +113,12 @@ async fn serve_browser_capsule_path(
 
     let capsule = match resolve_browser_capsule(data_dir, app) {
         Ok(capsule) => capsule,
+        Err(_) if requested_path.is_some() => {
+            match resolve_declared_asset_capsule(data_dir, app, requested_path.unwrap()) {
+                Ok(capsule) => capsule,
+                Err(status) => return (status, "Browser capsule not found").into_response(),
+            }
+        }
         Err(status) => return (status, "Browser capsule not found").into_response(),
     };
 
@@ -130,6 +135,14 @@ async fn serve_browser_capsule_path(
         Ok(path) if path.starts_with(&installed_root) => path,
         _ => return (StatusCode::NOT_FOUND, "File not found").into_response(),
     };
+    if is_declared_content_icon_path(&capsule, app, relative_path)
+        && strict_declared_content_icon_path(&capsule_root, relative_path)
+            .await
+            .is_err()
+    {
+        return (StatusCode::NOT_FOUND, "File not found").into_response();
+    }
+
     let asset_path = match tokio::fs::canonicalize(capsule_root.join(relative_path)).await {
         Ok(path) if path.starts_with(&capsule_root) => path,
         _ => return (StatusCode::NOT_FOUND, "File not found").into_response(),
@@ -335,6 +348,85 @@ fn resolve_browser_capsule(data_dir: &Path, app: &str) -> Result<BrowserCapsule,
     load_browser_capsule(&candidate, app).ok_or(StatusCode::NOT_FOUND)
 }
 
+fn resolve_declared_asset_capsule(
+    data_dir: &Path,
+    app: &str,
+    requested_path: &str,
+) -> Result<BrowserCapsule, StatusCode> {
+    let candidate = installed_active_capsule_dir(data_dir, app).ok_or(StatusCode::NOT_FOUND)?;
+    let manifest = load_capsule_manifest(&candidate, app).ok_or(StatusCode::NOT_FOUND)?;
+    let requested_relative = requested_path.trim();
+    if !declared_content_icon_paths(&manifest)
+        .into_iter()
+        .any(|relative| relative == requested_relative)
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let root = asset_serving_root(&candidate, &manifest.entrypoint);
+    Ok(BrowserCapsule {
+        root,
+        entrypoint: manifest.entrypoint.clone(),
+        manifest,
+    })
+}
+
+fn asset_serving_root(capsule_dir: &Path, entrypoint: &str) -> PathBuf {
+    match entrypoint.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => capsule_dir.join(parent),
+        _ => capsule_dir.to_path_buf(),
+    }
+}
+
+fn declared_content_icon_paths(manifest: &CapsuleManifest) -> Vec<String> {
+    if manifest.role != CapsuleRole::Content || manifest.capsule_type != CapsuleType::Data {
+        return Vec::new();
+    }
+    let prefix = format!("/apps/{}/", manifest.name);
+    capsule_icon_variants(
+        &manifest.name,
+        &manifest.entrypoint,
+        manifest.icon.as_deref(),
+    )
+    .iter()
+    .filter_map(|variant| variant.route.strip_prefix(&prefix).map(str::to_string))
+    .collect()
+}
+
+fn is_declared_content_icon_path(
+    capsule: &BrowserCapsule,
+    _app: &str,
+    relative_path: &str,
+) -> bool {
+    declared_content_icon_paths(&capsule.manifest)
+        .into_iter()
+        .any(|path| path == relative_path)
+}
+
+async fn strict_declared_content_icon_path(
+    capsule_root: &Path,
+    relative_path: &str,
+) -> Result<(), ()> {
+    let mut current = capsule_root.to_path_buf();
+    for component in Path::new(relative_path).components() {
+        match component {
+            std::path::Component::Normal(part) => current.push(part),
+            _ => return Err(()),
+        }
+        let metadata = tokio::fs::symlink_metadata(&current)
+            .await
+            .map_err(|_| ())?;
+        if metadata.file_type().is_symlink() {
+            return Err(());
+        }
+    }
+    let metadata = tokio::fs::metadata(&current).await.map_err(|_| ())?;
+    if metadata.is_file() {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
 fn is_launchable_viewer_capsule(data_dir: &Path, viewer: &str) -> bool {
     matches!(
         resolve_browser_capsule(data_dir, viewer),
@@ -474,7 +566,50 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        if let Some(parent) = capsule_dir.join(entrypoint).parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
         fs::write(capsule_dir.join(entrypoint), "rom-data").unwrap();
+    }
+
+    fn write_test_icon_content_capsule(
+        data_dir: &Path,
+        name: &str,
+        viewer: &str,
+        entrypoint: &str,
+        icon: &str,
+    ) {
+        write_test_viewer_capsule(data_dir, name, viewer, entrypoint, "Content with icons");
+        let capsule_dir = data_dir.join("capsules").join(name);
+        let manifest = serde_json::json!({
+            "schema": "elastos.capsule/v1",
+            "name": name,
+            "version": "0.1.0",
+            "description": "Content with icons",
+            "author": "elastos",
+            "role": "content",
+            "type": "data",
+            "entrypoint": entrypoint,
+            "viewer": viewer,
+            "icon": icon,
+            "permissions": {
+                "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/test/*"]
+            }
+        });
+        fs::write(
+            capsule_dir.join("capsule.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let icon_dir = capsule_dir.join(icon);
+        fs::create_dir_all(&icon_dir).unwrap();
+        for size in [32_u32, 64, 128, 256] {
+            fs::write(
+                icon_dir.join(format!("icon-{size}.png")),
+                format!("icon-{size}"),
+            )
+            .unwrap();
+        }
     }
 
     fn write_test_components_manifest(data_dir: &Path, names: &[&str]) {
@@ -733,6 +868,153 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(BROWSER_CAPSULE_OPAQUE_ORIGIN)
         );
+    }
+
+    #[tokio::test]
+    async fn declared_content_icons_are_servable_without_launching_the_content_capsule() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(data_dir.path(), "gba-emulator", "Viewer", "viewer");
+        write_test_icon_content_capsule(
+            data_dir.path(),
+            "gba-ucity",
+            "gba-emulator",
+            "games/game.gba",
+            "games/icons",
+        );
+
+        for size in [32_u32, 64, 128, 256] {
+            let response = serve_browser_capsule_path(
+                data_dir.path(),
+                &test_request_headers(),
+                "gba-ucity",
+                Some(&format!("icons/icon-{size}.png")),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), format!("icon-{size}").as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn content_capsule_rejects_missing_or_undeclared_icon_assets() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(data_dir.path(), "gba-emulator", "Viewer", "viewer");
+        write_test_icon_content_capsule(
+            data_dir.path(),
+            "gba-ucity",
+            "gba-emulator",
+            "game.gba",
+            "icons",
+        );
+
+        fs::remove_file(data_dir.path().join("capsules/gba-ucity/icons/icon-64.png")).unwrap();
+
+        let missing_size = serve_browser_capsule_path(
+            data_dir.path(),
+            &test_request_headers(),
+            "gba-ucity",
+            Some("icons/icon-64.png"),
+        )
+        .await;
+        assert_eq!(missing_size.status(), StatusCode::NOT_FOUND);
+
+        let stray_asset = serve_browser_capsule_path(
+            data_dir.path(),
+            &test_request_headers(),
+            "gba-ucity",
+            Some("icons/rom.gba"),
+        )
+        .await;
+        assert_eq!(stray_asset.status(), StatusCode::NOT_FOUND);
+
+        let rom = serve_browser_capsule_path(
+            data_dir.path(),
+            &test_request_headers(),
+            "gba-ucity",
+            Some("game.gba"),
+        )
+        .await;
+        assert_eq!(rom.status(), StatusCode::NOT_FOUND);
+
+        let traversal = serve_browser_capsule_path(
+            data_dir.path(),
+            &test_request_headers(),
+            "gba-ucity",
+            Some("icons/../game.gba"),
+        )
+        .await;
+        assert_eq!(traversal.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn declared_content_icons_reject_symlink_file_and_symlink_directory_paths() {
+        use std::os::unix::fs::symlink;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(data_dir.path(), "gba-emulator", "Viewer", "viewer");
+        write_test_icon_content_capsule(
+            data_dir.path(),
+            "gba-ucity",
+            "gba-emulator",
+            "game.gba",
+            "icons",
+        );
+        let capsule_dir = data_dir.path().join("capsules/gba-ucity");
+        let icons_dir = capsule_dir.join("icons");
+
+        fs::remove_file(icons_dir.join("icon-128.png")).unwrap();
+        symlink("../game.gba", icons_dir.join("icon-128.png")).unwrap();
+        let rom_link = serve_browser_capsule_path(
+            data_dir.path(),
+            &test_request_headers(),
+            "gba-ucity",
+            Some("icons/icon-128.png"),
+        )
+        .await;
+        assert_eq!(rom_link.status(), StatusCode::NOT_FOUND);
+
+        fs::remove_file(icons_dir.join("icon-128.png")).unwrap();
+        let outside = data_dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("icon-128.png"), "outside-icon").unwrap();
+        fs::remove_file(icons_dir.join("icon-32.png")).unwrap();
+        fs::remove_file(icons_dir.join("icon-64.png")).unwrap();
+        fs::remove_file(icons_dir.join("icon-256.png")).unwrap();
+        fs::remove_dir(&icons_dir).unwrap();
+        symlink(&outside, capsule_dir.join("icons")).unwrap();
+        let escape_dir = serve_browser_capsule_path(
+            data_dir.path(),
+            &test_request_headers(),
+            "gba-ucity",
+            Some("icons/icon-128.png"),
+        )
+        .await;
+        assert_eq!(escape_dir.status(), StatusCode::NOT_FOUND);
+
+        let icons_dir = capsule_dir.join("icons");
+        fs::remove_file(&icons_dir).unwrap();
+        fs::remove_file(outside.join("icon-128.png")).unwrap();
+        fs::create_dir_all(&icons_dir).unwrap();
+        fs::write(icons_dir.join("icon-32.png"), "icon-32").unwrap();
+        fs::write(icons_dir.join("icon-64.png"), "icon-64").unwrap();
+        fs::write(icons_dir.join("icon-128.png"), "icon-128").unwrap();
+        fs::write(icons_dir.join("icon-256.png"), "icon-256").unwrap();
+        fs::remove_file(icons_dir.join("icon-256.png")).unwrap();
+        fs::write(outside.join("icon-256.png"), "outside-icon-256").unwrap();
+        symlink(outside.join("icon-256.png"), icons_dir.join("icon-256.png")).unwrap();
+        let escape_file_response = serve_browser_capsule_path(
+            data_dir.path(),
+            &test_request_headers(),
+            "gba-ucity",
+            Some("icons/icon-256.png"),
+        )
+        .await;
+        assert_eq!(escape_file_response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
