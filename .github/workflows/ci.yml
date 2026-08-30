@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@1.91.0
@@ -65,7 +65,7 @@ jobs:
     timeout-minutes: 45
     needs: source-gate
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@1.91.0
@@ -94,7 +94,7 @@ jobs:
     timeout-minutes: 45
     needs: source-gate
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@1.91.0
@@ -102,6 +102,10 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
+          # The capsule workspaces cannot be enumerated here; key the shared
+          # registry cache off the elastos workspace, whose dependency set
+          # overlaps the capsules almost entirely.
+          workspaces: elastos
           prefix-key: ${{ runner.os }}-capsules
       # The elastos workspace suite never builds or tests own-workspace
       # capsules; this mirrors `just test-capsules`.
@@ -124,7 +128,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@1.91.0
@@ -167,7 +171,7 @@ jobs:
           scripts/local-carrier-setup-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/local-carrier-setup-smoke.log"
       - name: upload source-home logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: source-home-linux-${{ matrix.os }}-logs
           path: ${{ runner.temp }}/source-home-logs/
@@ -180,7 +184,7 @@ jobs:
     timeout-minutes: 90
     needs: [test-elastos, test-capsules]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@1.91.0
@@ -227,7 +231,7 @@ jobs:
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
       - name: upload source-home logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: source-home-macos-logs
           path: ${{ runner.temp }}/source-home-logs/
@@ -239,7 +243,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [source-home-linux, source-home-macos]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@1.91.0
