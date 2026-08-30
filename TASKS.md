@@ -17,11 +17,17 @@ section if a higher section is incoherent, unverified, or too large to review.
 
 Active priority index:
 
-- current priority: install the exact reviewed tree on localhost, the seed,
-  and the third custody node with matching stable receipts
+- current priority: finish and retest the exact reviewed tree on the isolated
+  localhost install with matching stable receipts
+- separately authorized after localhost: install the same reviewed tree on the
+  seed and the third custody node with matching stable receipts
 - integrated UIUX source evidence: published
   `origin/feat/0.7-uiux-candidate` at `8b547590`; this ref is donor evidence,
   not installed, live, or release truth
+- current protected-content integration source line: published
+  `origin/feat/protected-content-uiux-reconstruction` at `7e4b0dd4`; PR39 CI
+  covers that prefix. The separate local audit tail retains fixes with mixed
+  source and installed evidence. Each remaining GUI gate needs its own verdict
 - all other work remains queued below
 
 ### Integrated UIUX and protected-content proof
@@ -31,32 +37,60 @@ gates are the remaining path to installation and cutover.
 
 Open gates, in order:
 
-1. [ ] Install the exact reviewed tree on localhost, the seed, and the third
-   custody node with matching stable Runtime, component, capsule metadata,
-   provider, static audit, installation, and platform restart receipts.
-2. [ ] Provision one real signed owner-only 2-of-3 custody composition across
+1. [ ] Install and retest the exact reviewed tree on isolated localhost with
+   matching stable Runtime, component, capsule metadata, provider, static
+   audit, installation, and platform restart receipts.
+2. [ ] After separate authorization, install the same reviewed tree on the
+   seed and the third custody node with matching stable Runtime, component,
+   capsule metadata, provider, static audit, installation, and platform
+   restart receipts.
+3. [ ] Provision one real signed owner-only 2-of-3 custody composition across
    three distinct operators and failure domains.
-3. [ ] Install the private multi-RPC Chain configuration and verify the exact
+4. [ ] Install the private multi-RPC Chain configuration and verify the exact
    deployed Base network, contract, token, emitter, and finality authority.
-4. [ ] Prove exactly three protected-content replicas and repair after one
+5. [ ] Prove exactly three protected-content replicas and repair after one
    replica is lost.
-5. [ ] Fund the creator and buyer Base accounts, then run the Brave two-Runtime
+6. [ ] Fund the creator and buyer Base accounts, then run the Brave two-Runtime
    journey: mint, list, and share on localhost; import, deny, buy, open, play,
    and close on the seed. Prove one bound KID with allowed, denied, and unbound
    reads, the CentralStorage binding, the exact `AuthorityGateway.buyAccess`
    receipt and event, restart, replay, tamper rejection, settlement, cleanup,
    and zero unresolved state.
-6. [ ] Complete the installed manual UIUX matrix for Home windows, focus,
+7. [ ] Complete the installed manual UIUX matrix for Home windows, focus,
     fullscreen, and launcher; People, Chat, Inbox, and Clipboard; Wallet and
     connectors; Library, Marketplace, and `elacity-player`; Assistant
     model-offer states; GBA; and Browser.
-7. [ ] Make one atomic cutover that selects the Runtime-owned protected-content
+8. [ ] Make one atomic cutover that selects the Runtime-owned protected-content
    path and removes the provisional `drm`, `rights`, `key`, and `decrypt`
    authority surfaces from startup, registration, resources, packaging, tests,
    and docs.
 
 The operator-owned model-provider configuration remains a separate installed
 Assistant proof item. Missing configuration is an honest zero-offer state.
+
+### Home audit follow-up
+
+- [ ] Diagnose and prove direct Desktop/Terminal switching on the installed
+  Home. Host-authority and startup-replay repairs have source coverage, but
+  an installed transition can still leave a blank shell. Verify the exact
+  Inbox handoff through that transition and native Terminal Chat separately.
+- [ ] Prove recovery coverage when a Profile is created after the first
+  recovery-kit download, plus clean first-run Profile and window placement.
+- [ ] Complete Browser input ordering, lifecycle and accepted media proof on
+  the target installation. Source checks cover only their stated contracts.
+- [ ] Finish document-dialog keyboard focus and the remaining app-by-app
+  acceptance matrix. Preserve failed, partial and prerequisite-blocked results
+  as separate outcomes; a visible control alone is a partial observation.
+- [ ] Review and integrate Irzhy's ELACITY-2307 mint-intent adoption repair when
+  its branch is published. His PR39 comment names
+  `fix/protected-content-mint-intent-adoption`; retain one owner for that fix.
+- [ ] Review Irzhy's PR15 follow-up on pinning the canonical
+  `has_access_by_content_id` selector (`0x54d42821`). Current configuration
+  validates its shape. Use a gated channel for deny proofs; a permissive
+  token-threshold configuration is a separate operator choice.
+- [ ] Verify cleanup of the temporary source-home install stage after an
+  installation failure. The published staging change removes it on success;
+  the failure path needs a bounded cleanup check.
 
 ## Later
 
@@ -365,6 +399,7 @@ evidence, while installed and live truth requires separate target evidence.
 - [ ] Enforce the blockchain quadrant contract in code before UI: runtime principal, verified proof bindings, short-lived session grants, scoped capabilities, provider-mediated effects, signed audit, and fail-closed behavior.
 - [ ] Keep `scripts/wallet-product-safety-smoke.sh` green before release publish. It is the product-level Wallet safety gate for MetaMask multi-account link/remove, passkey-gated built-in account delete and recovery-key export/import, WalletConnect disabled without pinned operator config, Ledger hidden until implemented, and no hosted Browser UniSat injection path.
 - [ ] Make recovery semantics impossible to misunderstand before release publish: System's `Download Recovery Kit` must export one password-protectable full bundle containing the principal-owned Home/user data root plus every recoverable built-in Wallet key for that principal. Individual `elastos.wallet.recovery-key/v1` export/import remains an advanced per-account escape hatch. External wallets such as MetaMask, WalletConnect, Ledger, Essentials, and UniSat can only restore links/metadata because their private keys live outside ElastOS. Deleting a built-in wallet must warn when no full bundle or individual Wallet key has been saved, and the main Wallet view must offer both `Create account` and `Import Wallet key` without sending users to Settings.
+- [ ] Keep first-run recovery honest across both states: a fresh Recovery Kit can unlock a surviving root immediately, but empty-machine recovery for a kit created before the later random Profile key exists still needs a separate source repair.
 - [ ] Keep the capsule boundary canonical: capsules invoke typed ElastOS Bus
   resources for Wallet, DID, Chain, and other effects. Carrier is an optional
   authenticated transport adapter behind those resources, not the capsule API.

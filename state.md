@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-08-28 UTC
+Last updated: 2026-08-31 UTC
 
 This file records public-safe current truth for released 0.6.0 and active
 unpublished work. Private operator paths, credentials, target identities, and
@@ -12,6 +12,7 @@ volatile proof logs remain outside the repository.
   `origin/upstream/0.7-dev` at `90bbe15b` as the current 0.7 integration line.
 - Published feature evidence is
   `origin/feat/protected-content-runtime-lifecycle@854d9dc9`,
+  `origin/feat/protected-content-uiux-reconstruction@7e4b0dd4`,
   `origin/feat/0.7-uiux-candidate@8b547590`,
   `origin/feat/dkms-esp-port@27d85c6f`, and
   `origin/feat/0.7-product-documentation@74cd4e42`.
@@ -21,20 +22,26 @@ volatile proof logs remain outside the repository.
   ancestor of the published lifecycle and is already present in the active
   integration. The latest published protected-branch repairs need no new
   extraction.
-- The active unpublished `feat/protected-content-uiux-reconstruction` branch
-  contains the implementation prefix through `84569da5`, tree
-  `ffc3501c251bd5152ecd45cf07bc63ec6a336e0f`. The source worktree was clean at
-  that prefix before this document update. The branch has no upstream and
-  contains both published lifecycle and UIUX candidate tips.
-- Relative to `origin/upstream/0.7-dev@90bbe15b`, the `84569da5` implementation
-  prefix is 0 commits behind and 107 commits ahead. The upstream tip is an
-  ancestor of the active branch.
+- The published `feat/protected-content-uiux-reconstruction` line is
+  `origin/feat/protected-content-uiux-reconstruction@7e4b0dd4`. All seven
+  PR39 checks pass on that commit. The local audit fixes are a separate,
+  unpublished tail; that CI result covers the published prefix only.
+- The local tail groups Home and Terminal repairs, create-only Library writes,
+  document close protection, Assistant and model-init repairs, declared-content
+  icons, private diagnostics, socket-root protection, and Mac restart safety.
+  The history review preserved the product tree and incorporated the published
+  CI/setup changes. Installed acceptance still belongs to exact artifact
+  receipts and recorded GUI outcomes.
 - Upstream `90bbe15b` records Irzhy's verified Base 8453 evidence and changes
   `TASKS.md`, Chain provider source and tests, `docs/CHAIN_PROVIDER.md`,
   `docs/PROTECTED_CONTENT.md`, and
-  `docs/PROTECTED_CONTENT_EXTRACTION.md`. This merge preserves the published
-  protected-content repairs and integrates that evidence once. It also retains
+  `docs/PROTECTED_CONTENT_EXTRACTION.md`. The branch preserves the published
+  protected-content repairs and includes that evidence once. It also retains
   upstream collaboration and Browser local-exit orphan cleanup.
+- Irzhy's PR39 comment assigns the ELACITY-2307 mint crash-window repair to
+  `fix/protected-content-mint-intent-adoption`. That repair was announced but
+  had no published branch at this review. The Home audit tail leaves it with
+  that owner; installed mint/restart acceptance remains open.
 - The protected-content source path remains inactive. Installed proof and one
   atomic cutover remain open.
 - Commits `3026992b`, `ed7a8bfc`, and `7f6e47f9` provide portable listing
@@ -122,10 +129,12 @@ The integrated source includes these durable facts:
   receipt binds source commit/tree/clean state and exact artifact hashes.
 - `scripts/mac-source-home-restart.sh` and
   `scripts/linux-source-home-restart.sh` select only that stable Runtime.
-  Each validates current clean source identity and installation receipt before
-  stop or migration, owns one exact PID file, stops only the identity-bound
-  prior Runtime, retains at most one bounded principal-root rollback, and writes
-  one owner-only restart receipt. Runtime owns provider shutdown.
+  Each owns one exact PID file, stops only the identity-bound prior Runtime,
+  retains at most one bounded principal-root rollback, and writes an owner-only
+  restart receipt. Mac default mode uses the existing installation; `--init`
+  also requires current clean source and artifact parity. Mac dry-run validates
+  without stopping the Runtime, including with `--down`. Runtime owns provider
+  shutdown.
 - The macOS replacement-restart path is proven in its fixture on this host,
   including a live prior Runtime after atomic binary replacement. Linux dry-run
   and fixture proof is source evidence; active `/proc`, listener, and binary
@@ -145,8 +154,8 @@ The active local branch preserves the verified deployed read behavior:
 - An unknown KID reverts with `UnboundContentId(bytes16)`; a bound KID without
   access returns `false`.
 
-`origin/upstream/0.7-dev@90bbe15b` adds verified deployed Base 8453 evidence
-that this merge integrates into the local branch:
+`origin/upstream/0.7-dev@90bbe15b` records Irzhy's deployed Base 8453 probe
+evidence, already included in this branch:
 
 - `CentralStorage.bindIP(bytes16,address,uint256)` accepts acknowledged
   contracts only and is called by `AssetFactory.registerNewAsset`.
@@ -374,6 +383,10 @@ complete. Installed proof and the atomic authority cutover remain open.
 - Missing model-provider config is an honest zero-offer state: Runtime may
   start/register the provider with no offers, writes no config file, and
   Assistant shows that no model offers are available.
+- `model-provider` now accepts the Runtime Init envelope fields
+  `base_path`, `allowed_paths`, `read_only`, `encryption_key`, and `extra`
+  without weakening strict unknown-field handling. The zero-offer stdio Init
+  test passes with the Runtime envelope in source tests.
 - Assistant is a standalone first-party capsule. Chat, Build, and Studio use
   only typed Runtime model resources and the protected Assistant workspace;
   transcript copy goes only through the trusted Home Clipboard path.
@@ -514,6 +527,30 @@ complete. Installed proof and the atomic authority cutover remain open.
   audit. Manual evidence is commit-bound and intentionally not stored in the
   repository; any later Home shell behavior change requires a new or re-reviewed
   report against the exact reviewed commit.
+- Home first-run onboarding now honors the existing `settings=security`
+  deep-link, focuses the recovery action when verified readiness becomes
+  available, and refreshes Home summary state after Recovery Kit export. People
+  setup prefills the suggested first Profile name as editable text, preserves
+  unfocused edits across refresh, and still requires explicit create or
+  confirm.
+- Declared content icons stay capsule-owned and serve only manifest-declared
+  icon variants. Nested content entrypoints resolve icons from their matching
+  serving root, and declared icon requests reject ROM bytes, traversal, and
+  symlinked targets.
+- Fresh desktop placement seeds only visible targets on first run. Saved hidden
+  target positions remain intact after later reloads.
+- Current source proof for the onboarding slice is focused and local:
+  `recovery_readiness_change_emits_home_summary_event_only`,
+  `test_recovery_readiness_and_first_profile_gate_share_one_recovery_rule`,
+  `scripts/people-discovery-smoke.mjs`, and
+  `scripts/home-shell-regression-smoke.mjs` pass. Browser-backed GUI fixture
+  runs remain open in this worktree because Playwright is unavailable here. The
+  empty-machine recovery coverage test for a first kit that predates the later
+  random Profile key also remains open. Manual GUI acceptance remains a
+  separate installed proof step.
+- A fresh Recovery Kit export is now truthful about included People identity.
+  Source still needs a separate repair for empty-machine recovery when the first
+  kit predates the later random Profile key.
 
 ## Collaboration Truth
 
