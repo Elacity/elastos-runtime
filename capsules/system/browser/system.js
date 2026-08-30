@@ -142,6 +142,9 @@ const SETTINGS_SEARCH_KEYWORDS = Object.freeze({
   catalog: ["catalog", "apps", "services", "capsules"],
   about: ["about", "device", "version", "source", "network", "did"],
 });
+const ALLOWED_SETTINGS_TABS = new Set(Object.keys(SETTINGS_SEARCH_KEYWORDS));
+const requestedSettingsTab = normalizedRequestedSettingsTab(readQueryParam("settings"));
+let requestedSettingsActionFocused = false;
 const homeClipboard = createHomeClipboardClient({
   targetId: "system",
   homeOrigin: homeParentOrigin,
@@ -162,6 +165,7 @@ async function boot() {
   homeClipboard.start();
   configureSettingsTabs();
   configureSettingsSearch();
+  activateSettingsTab(requestedSettingsTab || "account");
   configureAppearanceEditor();
   configureAppearancePreferences();
   configureGuestAccess();
@@ -217,6 +221,30 @@ function activateSettingsTab(settings) {
     container.scrollTop = 0;
   }
   syncSearchHit(tab);
+}
+
+function normalizedRequestedSettingsTab(settings) {
+  const tab = readText(settings);
+  return ALLOWED_SETTINGS_TABS.has(tab) ? tab : "";
+}
+
+function focusRequestedSettingsAction() {
+  if (
+    requestedSettingsActionFocused
+    || requestedSettingsTab !== "security"
+    || !recoveryDownloadButton
+    || recoveryDownloadButton.disabled
+  ) {
+    return;
+  }
+  const activeTab = readText(
+    document.querySelector(".settings-sidebar-item.active")?.dataset.settings,
+  );
+  if (activeTab !== "security") {
+    return;
+  }
+  requestedSettingsActionFocused = true;
+  recoveryDownloadButton.focus();
 }
 
 function hasShellAccess() {
@@ -2174,6 +2202,7 @@ async function refreshRecoveryStatus() {
       headers: shellHeaders(),
     });
     setRecoveryStatus(status);
+    focusRequestedSettingsAction();
   } catch (error) {
     showRecoveryStatus("Unavailable", "error");
     showRecoveryNote(String(error.message || error), "error");
@@ -2225,8 +2254,15 @@ async function onRecoveryDownload() {
       recoveryPasswordInput.value = "";
     }
     showRecoveryStatus("", "success");
-    showRecoveryNote("Recovery Kit downloaded. Store it offline; it can recover Home data, included built-in Wallet accounts, and your signed People identity with its contacts.", "success");
+    const peopleIdentity = bundle && bundle.included && bundle.included.people_identity;
+    showRecoveryNote(
+      peopleIdentity
+        ? "Recovery Kit downloaded. Store it offline; it includes your signed People identity."
+        : "Recovery Kit downloaded. Store it offline.",
+      "success"
+    );
     setRecoveryButton("Download Recovery Kit", false);
+    notifyHomeSummaryChanged();
   } catch (error) {
     showRecoveryStatus("Not set", "error");
     showRecoveryNote(String(error.message || error), "error");

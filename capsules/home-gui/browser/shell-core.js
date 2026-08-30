@@ -517,7 +517,12 @@ export function initializeShellLayout(summary) {
     ? stored.desktop
     : {};
   const occupiedPositions = [];
-  for (const [index, entry] of desktopLayoutEntries(summary).entries()) {
+  const layoutEntries = (
+    stored
+      ? desktopLayoutEntries(summary)
+      : desktopLayoutEntries(summary).filter((entry) => desktopEntryExists(summary, entry.id))
+  );
+  for (const [index, entry] of layoutEntries.entries()) {
     const defaultPosition = defaultDesktopPosition(index);
     const storedPosition = storedDesktop[entry.id];
     let position = clampDesktopPosition(normalizeDesktopPosition(storedPosition, defaultPosition));

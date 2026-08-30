@@ -548,8 +548,8 @@ async function assertFirstRunScenario(frame, width) {
     "first run explanation is wrong",
     state,
   );
-  assert(state.value === "", "first run should not prefill the profile input", state);
-  assert(state.placeholder === "Suggested Profile Name", "first run should keep the setup suggestion as placeholder", state);
+  assert(state.value === "Suggested Profile Name", "first run should prefill the suggested profile name", state);
+  assert(state.placeholder === "Your name", "first run should keep a stable editable placeholder", state);
   assert(state.submit === "Create Profile", "first run should offer explicit Profile creation", state);
   await assertNoIdentityLeak(frame, `first run at ${width}px`);
 }

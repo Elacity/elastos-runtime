@@ -370,6 +370,13 @@ assert(
   "fresh layout left an app target on the desktop",
   shellCore.shellState.shellLayoutState.desktopHidden,
 );
+assert(
+  JSON.stringify(shellCore.shellState.shellLayoutState.desktop) === JSON.stringify({
+    "object-target": { x: 12, y: 12 },
+  }),
+  "fresh layout did not seed only the visible desktop entry positions",
+  shellCore.shellState.shellLayoutState.desktop,
+);
 
 const storedEmptyTaskbarSummary = {
   authority: { signed_in: true },
@@ -377,7 +384,10 @@ const storedEmptyTaskbarSummary = {
   browser_state: {
     principal_id: "principal:stored-empty-taskbar",
     layout: {
-      desktop: {},
+      desktop: {
+        wallet: { x: 128, y: 64 },
+        browser: { x: 240, y: 64 },
+      },
       taskbar: [],
       desktopHidden: ["wallet", "browser"],
       desktopIconsVisible: true,
@@ -396,6 +406,17 @@ assert(
   JSON.stringify(shellCore.shellState.shellLayoutState.desktopHidden) === JSON.stringify(["wallet", "browser"]),
   "stored desktopHidden changed without required normalization",
   shellCore.shellState.shellLayoutState.desktopHidden,
+);
+assert(
+  JSON.stringify({
+    wallet: shellCore.shellState.shellLayoutState.desktop.wallet,
+    browser: shellCore.shellState.shellLayoutState.desktop.browser,
+  }) === JSON.stringify({
+    wallet: { x: 128, y: 64 },
+    browser: { x: 240, y: 64 },
+  }),
+  "stored desktop positions were not preserved for saved hidden targets",
+  shellCore.shellState.shellLayoutState.desktop,
 );
 
 const peopleStyle = readFileSync(

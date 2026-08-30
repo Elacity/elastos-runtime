@@ -43,6 +43,7 @@ const BEHAVIOR_HOST_SCRIPT = `
           appReadyMessages: [],
           refreshMessages: [],
           clipboardRequests: [],
+          passkeyRequests: [],
         };
         let clipboardMode = "auto-success";
         let pendingClipboard = null;
@@ -136,6 +137,18 @@ const BEHAVIOR_HOST_SCRIPT = `
             } else if (clipboardMode === "auto-fail") {
               replyClipboard(false, "denied");
             }
+            return;
+          }
+          if (
+            data.type === "elastos.home.passkey-step-up.request/v1"
+            && data.homeToken === "system-token"
+          ) {
+            trace.passkeyRequests.push(data);
+            event.source.postMessage({
+              type: "elastos.home.passkey-step-up.result/v1",
+              requestId: data.requestId,
+              stepUpToken: "step-up-token-1",
+            }, "*");
           }
         });
       })();
@@ -260,6 +273,10 @@ async function main() {
   const requestFailures = [];
   const appearanceRequests = [];
   const appearancePlans = [];
+  const requestOrder = [];
+  let heldRecoveryStatus = null;
+  let heldChainNetworks = null;
+  let heldCapsuleCatalog = null;
   summaryAppearance = appearanceRecord();
   let appearanceInFlight = 0;
   let maxAppearanceInFlight = 0;
@@ -300,6 +317,7 @@ async function main() {
         return;
       }
       const url = new URL(request.url());
+      requestOrder.push(url.pathname);
       if (url.pathname === "/api/apps/system/summary") {
         summaryTrace.push({
           count: summaryTrace.length + 1,
@@ -311,6 +329,64 @@ async function main() {
           contentType: "application/json",
           headers: CORS_HEADERS,
           body: JSON.stringify(systemSummary(summaryAppearance)),
+        });
+        return;
+      }
+      if (url.pathname === "/api/auth/recovery/status") {
+        if (heldRecoveryStatus) {
+          await heldRecoveryStatus.promise;
+        }
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          headers: CORS_HEADERS,
+          body: JSON.stringify({
+            principal_id: "person:local:system-smoke",
+            localhost_root: "localhost://system",
+            recovery_configured: true,
+            recovery_download_available: true,
+            protection_configured: true,
+          }),
+        });
+        return;
+      }
+      if (url.pathname === "/api/auth/recovery/full-export") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          headers: CORS_HEADERS,
+          body: JSON.stringify({
+            schema: "elastos.full-recovery-bundle/v1",
+            principal_id: "person:local:system-smoke",
+            localhost_root: "localhost://system",
+            exported_at: 1_726_000_000,
+            bundle: { schema: "elastos.recovery.bundle/v1", items: [] },
+            package: null,
+          }),
+        });
+        return;
+      }
+      if (url.pathname === "/api/provider/chain/networks") {
+        if (heldChainNetworks) {
+          await heldChainNetworks.promise;
+        }
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          headers: CORS_HEADERS,
+          body: JSON.stringify({ status: "ok", data: { networks: [] } }),
+        });
+        return;
+      }
+      if (url.pathname === "/api/capsules/catalog") {
+        if (heldCapsuleCatalog) {
+          await heldCapsuleCatalog.promise;
+        }
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          headers: CORS_HEADERS,
+          body: JSON.stringify({ capsules: [] }),
         });
         return;
       }
@@ -370,8 +446,84 @@ async function main() {
       });
     });
 
+    heldChainNetworks = deferred();
+    heldCapsuleCatalog = deferred();
+    requestOrder.length = 0;
+    await page.goto(`${server.baseUrl}/fixture?settings=security`, {
+      waitUntil: "domcontentloaded",
+    });
+    let frame = await waitForSystemFrame(page);
+    await frame.waitForFunction(
+      () =>
+        document.querySelector(".settings-sidebar-item.active")?.dataset.settings === "security"
+        && document.activeElement?.id === "recovery-download",
+    );
+    const securityFocusOrder = [...requestOrder];
+    assert(
+      securityFocusOrder.indexOf("/api/auth/recovery/status") >= 0
+        && securityFocusOrder.indexOf("/api/provider/chain/networks") >= 0
+        && securityFocusOrder.indexOf("/api/auth/recovery/status")
+          < securityFocusOrder.indexOf("/api/provider/chain/networks")
+        && securityFocusOrder.indexOf("/api/capsules/catalog") === -1,
+      "System should focus Recovery after recovery readiness resolves and before later reads",
+      { requestOrder: securityFocusOrder },
+    );
+    const catalogRequested = page.waitForRequest("**/api/capsules/catalog");
+    heldChainNetworks.resolve();
+    await catalogRequested;
+    heldCapsuleCatalog.resolve();
+    heldChainNetworks = null;
+    heldCapsuleCatalog = null;
+
+    heldRecoveryStatus = deferred();
+    requestOrder.length = 0;
+    await page.goto(`${server.baseUrl}/fixture?settings=security`, {
+      waitUntil: "domcontentloaded",
+    });
+    frame = await waitForSystemFrame(page);
+    await activateTab(frame, "about");
+    const chainNetworksRequested = page.waitForRequest("**/api/provider/chain/networks");
+    heldRecoveryStatus.resolve();
+    heldRecoveryStatus = null;
+    await chainNetworksRequested;
+    await frame.waitForFunction(
+      () =>
+        document.querySelector(".settings-sidebar-item.active")?.dataset.settings === "about"
+        && document.activeElement?.id !== "recovery-download",
+    );
+
+    requestOrder.length = 0;
+    await page.goto(`${server.baseUrl}/fixture?settings=security`, { waitUntil: "networkidle" });
+    frame = await waitForSystemFrame(page);
+    const recoveryRefreshBefore = await page.evaluate(
+      () => window.__systemHost.trace.refreshMessages.length,
+    );
+    const passkeyBefore = await page.evaluate(
+      () => window.__systemHost.trace.passkeyRequests.length,
+    );
+    await frame.click("#recovery-download");
+    await page.waitForFunction(
+      (expectedCount) => window.__systemHost.trace.passkeyRequests.length === expectedCount,
+      passkeyBefore + 1,
+    );
+    await page.waitForFunction(
+      (expectedCount) => window.__systemHost.trace.refreshMessages.length === expectedCount,
+      recoveryRefreshBefore + 1,
+    );
+
+    requestOrder.length = 0;
+    summaryTrace.length = 0;
+    pageErrors.length = 0;
+    consoleErrors.length = 0;
+    requestFailures.length = 0;
+    await page.goto(`${server.baseUrl}/fixture?settings=unknown-setting`, { waitUntil: "networkidle" });
+    frame = await waitForSystemFrame(page);
+    await frame.waitForFunction(
+      () => document.querySelector(".settings-sidebar-item.active")?.dataset.settings === "account",
+    );
+
     await page.goto(`${server.baseUrl}/fixture`, { waitUntil: "networkidle" });
-    const frame = await waitForSystemFrame(page);
+    frame = await waitForSystemFrame(page);
     const startup = await collectStartupDiagnostics(
       frame,
       page,
@@ -474,6 +626,9 @@ async function main() {
         document.querySelector("#accent-custom-popover")?.hidden === false,
     );
 
+    const refreshCountBeforeCustom = await page.evaluate(
+      () => window.__systemHost.trace.refreshMessages.length,
+    );
     nextAppearancePlan(appearancePlans, {
       expectBody: { accent_custom: "#336699" },
       response: appearanceRecord({
@@ -489,6 +644,10 @@ async function main() {
     await waitForAppearance(
       frame,
       () => document.querySelector("#accent-custom-hex")?.value === "#336699",
+    );
+    await page.waitForFunction(
+      (expectedCount) => window.__systemHost.trace.refreshMessages.length === expectedCount,
+      refreshCountBeforeCustom + 1,
     );
 
     const refreshCountBeforeStale = await page.evaluate(

@@ -260,6 +260,13 @@ async function triggerProfileSubmit(environment) {
   await settle();
 }
 
+async function triggerProfileInput(environment, value) {
+  const input = environment.nodes.get("profile-name");
+  input.value = value;
+  input.listeners.get("input")?.({ target: input });
+  await settle();
+}
+
 async function triggerMenuCommand(environment, cmd, {
   origin = "null",
   source = environment.parentFrame,
@@ -361,8 +368,8 @@ async function runScenario(name) {
     assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/summary").length, 1);
     assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/discovery/refresh").length, 0);
     assert.equal(environment.timers.size, 0, "People must not own Discovery transport polling");
-    assert.equal(environment.nodes.get("profile-name").value, "");
-    assert.equal(environment.nodes.get("profile-name").placeholder, "Suggested Profile Name");
+    assert.equal(environment.nodes.get("profile-name").value, "Suggested Profile Name");
+    assert.equal(environment.nodes.get("profile-name").placeholder, "Your name");
     assert.equal(environment.nodes.get("profile-title").textContent, "Create your Profile");
     assert.equal(environment.nodes.get("profile-submit").textContent, "Create Profile");
     assert.equal(
@@ -390,14 +397,32 @@ async function runScenario(name) {
     assert.match(environment.nodes.get("discovery-status").textContent, /same time/);
     assertNoRawIdentityLeak(environment.nodes.get("discovery-status").textContent, "configured discovery status");
 
-    environment.nodes.get("profile-name").value = "Typing My Name";
+    await triggerProfileInput(environment, "Typing My Name");
+    globalThis.document.activeElement = null;
+    environment.replies.unshift(summary(null, initialDiscovery, {
+      profile_setup_display_name: "Replacement Suggestion",
+    }));
+    await triggerMenuCommand(environment, "refresh");
+    assert.equal(environment.nodes.get("profile-name").value, "Typing My Name");
+    assert.equal(environment.nodes.get("profile-name").placeholder, "Your name");
+
+    await triggerProfileInput(environment, "");
+    globalThis.document.activeElement = null;
+    environment.replies.unshift(summary(null, initialDiscovery, {
+      profile_setup_display_name: "Another Suggestion",
+    }));
+    await triggerMenuCommand(environment, "refresh");
+    assert.equal(environment.nodes.get("profile-name").value, "");
+    assert.equal(environment.nodes.get("profile-name").placeholder, "Your name");
+
+    await triggerProfileInput(environment, "Typing My Name");
     globalThis.document.activeElement = environment.nodes.get("profile-name");
     await triggerAction(environment, "discovery-refresh");
     assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/discovery/refresh").length, 1);
-    assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/summary").length, 2);
+    assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/summary").length, 4);
     assert.equal(environment.timers.size, 0, "manual Refresh must only wake Runtime sync");
     assert.equal(environment.nodes.get("profile-name").value, "Typing My Name");
-    assert.equal(environment.nodes.get("profile-name").placeholder, "Suggested Profile Name");
+    assert.equal(environment.nodes.get("profile-name").placeholder, "Your name");
     assert.equal(environment.nodes.get("profile-title").textContent, "My Profile");
     assert.equal(environment.nodes.get("profile-submit").textContent, "Save");
     assert.match(environment.nodes.get("profile-description").textContent, /Shown to people/);
@@ -487,7 +512,7 @@ async function runScenario(name) {
 
     assert.equal(environment.clearCount(), 0);
     assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/discovery/refresh").length, 1);
-    assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/summary").length, 6);
+    assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/summary").length, 8);
     assert.equal(environment.replies.length, 0);
     assertRequestAuthority(environment);
     return;
@@ -508,6 +533,34 @@ async function runScenario(name) {
     assert.equal(environment.nodes.get("profile-submit").disabled, true);
     assert.match(environment.nodes.get("profile-description").textContent, /System Recovery/);
     assert.equal(environment.calls.length, 1);
+    assertRequestAuthority(environment);
+    return;
+  }
+
+  if (name === "setup_suggestion_confirmed") {
+    const environment = setupEnvironment(name, [
+      summary(null, discoverySummary(), {
+        profile_setup_display_name: "Suggested Profile Name",
+      }),
+      response(200, {}),
+      summary("Runtime Name", discoverySummary(), {
+        profile: { display_name: "Suggested Profile Name" },
+      }, "ready"),
+    ]);
+    await import("../capsules/people/browser/people.js");
+    await settle();
+    assert.equal(environment.nodes.get("profile-name").value, "Suggested Profile Name");
+    assert.equal(environment.nodes.get("profile-name").placeholder, "Your name");
+    await triggerProfileSubmit(environment);
+    const createCall = environment.calls.find(({ path }) => path === "/api/apps/people/profile");
+    assert(createCall, "profile create call missing");
+    assert.equal(
+      JSON.parse(createCall.options.body).display_name,
+      "Suggested Profile Name",
+    );
+    assert.equal(environment.nodes.get("profile-form").dataset.profileState, "saved");
+    assert.equal(environment.nodes.get("profile-name").value, "Suggested Profile Name");
+    assert.equal(environment.nodes.get("profile-submit").textContent, "Save");
     assertRequestAuthority(environment);
     return;
   }
@@ -733,6 +786,7 @@ if (!scenario) {
   assert.match(peopleHtml, /id="profile-submit" type="submit">Create Profile/);
   for (const childScenario of [
     "configured",
+    "setup_suggestion_confirmed",
     "unavailable",
     "recovery_required",
     "isolated",

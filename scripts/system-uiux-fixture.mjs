@@ -145,7 +145,7 @@ export function inertSystemApiResponse(pathname) {
   return null;
 }
 
-function fixtureHtml({ title, origin, background, hostScript }) {
+function fixtureHtml({ title, origin, background, hostScript, frameQuery = "" }) {
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -165,25 +165,30 @@ ${hostScript}
       id="system-frame"
       title="System"
       sandbox="allow-forms allow-modals allow-scripts"
-      src="/apps/system/?home_origin=${encodeURIComponent(origin)}#home_token=system-token"
+      src="/apps/system/?home_origin=${encodeURIComponent(origin)}${frameQuery}#home_token=system-token"
     ></iframe>
   </body>
 </html>`;
 }
 
-async function serveStaticAsset(response, pathname, host, fixtureOptions) {
+async function serveStaticAsset(response, url, host, fixtureOptions) {
+  const pathname = url.pathname;
   if (pathname === "/favicon.ico") {
     response.writeHead(204);
     response.end();
     return;
   }
   if (pathname === "/fixture") {
+    const requestedSettings = url.searchParams.get("settings") || "";
     const body = Buffer.from(
       fixtureHtml({
         title: fixtureOptions.title,
         origin: `http://${host}`,
         background: fixtureOptions.background,
         hostScript: fixtureOptions.hostScript,
+        frameQuery: requestedSettings
+          ? `&settings=${encodeURIComponent(requestedSettings)}`
+          : "",
       }),
     );
     response.writeHead(200, {
@@ -266,7 +271,7 @@ export async function startSystemFixtureServer({
       }
       await serveStaticAsset(
         response,
-        url.pathname,
+        url,
         request.headers.host || "127.0.0.1",
         { title, background, hostScript },
       );

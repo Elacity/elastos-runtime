@@ -26,6 +26,8 @@ const SECTION_TITLES = {
 };
 
 let refreshGeneration = 0;
+let profileDraftDirty = false;
+let profileDraftValue = "";
 
 announceReady();
 
@@ -102,6 +104,10 @@ function bindActions() {
   profileForm?.addEventListener("submit", (event) => {
     event.preventDefault();
     saveProfile().catch((error) => showStatus(profileSaveFailureMessage(error), "error"));
+  });
+  profileInput?.addEventListener("input", () => {
+    profileDraftDirty = true;
+    profileDraftValue = profileInput.value;
   });
   window.addEventListener("message", (event) => {
     if (event.origin !== "null" || event.source !== window.parent) {
@@ -225,11 +231,16 @@ function renderProfile(identity) {
   const hasProfile = readinessStatus === "ready" && Boolean(displayName);
   const unavailable = readinessStatus === "unavailable"
     || (readinessStatus === "ready" && !displayName);
+  const createState = !hasProfile && !unavailable;
+  if (hasProfile) {
+    profileDraftDirty = false;
+    profileDraftValue = displayName;
+  } else if (!profileDraftDirty) {
+    profileDraftValue = createState ? setupSuggestion : "";
+  }
   if (document.activeElement !== profileInput) {
-    profileInput.value = hasProfile ? displayName : "";
-    profileInput.placeholder = readinessStatus === "setup_required" && setupSuggestion
-      ? setupSuggestion
-      : "Your name";
+    profileInput.value = hasProfile ? displayName : profileDraftValue;
+    profileInput.placeholder = "Your name";
   }
   if (profileTitle) {
     profileTitle.textContent = hasProfile

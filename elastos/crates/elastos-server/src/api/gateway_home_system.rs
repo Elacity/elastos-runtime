@@ -135,6 +135,7 @@ struct HomeRealtimeEvent {
 #[derive(Debug, Serialize)]
 struct HomeRealtimeSnapshot {
     principal_id: String,
+    recovery_readiness: RecoveryReadinessSummary,
     notification_signature: Vec<String>,
     wallet_request_signature: Vec<String>,
     capability_request_count: usize,
@@ -3329,11 +3330,13 @@ async fn home_realtime_snapshot(
         None,
     )
     .await;
+    let recovery_readiness = recovery_readiness_for_context(&state.data_dir, context);
     let desktop_signature = home_desktop_events_signature(state, context).await;
     let people_signature = home_people_realtime_signature(&home_state.people);
     let services_signature = home_services_realtime_signature(&home_state.services);
     HomeRealtimeSnapshot {
         principal_id: context.principal_id.clone(),
+        recovery_readiness,
         notification_signature,
         wallet_request_signature,
         capability_request_count,
@@ -3373,7 +3376,7 @@ struct HomeRealtimeCursorParts {
 
 fn home_realtime_cursor_parts(snapshot: &HomeRealtimeSnapshot) -> HomeRealtimeCursorParts {
     HomeRealtimeCursorParts {
-        home: stable_cursor_hash(&snapshot.principal_id),
+        home: stable_cursor_hash(&(&snapshot.principal_id, &snapshot.recovery_readiness)),
         inbox: stable_cursor_hash(&(
             &snapshot.notification_signature,
             &snapshot.wallet_request_signature,
@@ -5933,6 +5936,7 @@ mod home_realtime_tests {
     fn scoped_realtime_change_does_not_emit_home_summary_event() {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
+            recovery_readiness: RecoveryReadinessSummary::unavailable(),
             notification_signature: Vec::new(),
             wallet_request_signature: Vec::new(),
             capability_request_count: 0,
@@ -5971,6 +5975,7 @@ mod home_realtime_tests {
     fn people_realtime_change_emits_people_scoped_event_only() {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
+            recovery_readiness: RecoveryReadinessSummary::unavailable(),
             notification_signature: Vec::new(),
             wallet_request_signature: Vec::new(),
             capability_request_count: 0,
@@ -6005,6 +6010,44 @@ mod home_realtime_tests {
                 .iter()
                 .any(|event| event.kind == "home.summary.changed"),
             "People changes must not force a generic Home summary event"
+        );
+    }
+
+    #[test]
+    fn recovery_readiness_change_emits_home_summary_event_only() {
+        let snapshot = HomeRealtimeSnapshot {
+            principal_id: "person:local:test".to_string(),
+            recovery_readiness: RecoveryReadinessSummary::setup_required(),
+            notification_signature: Vec::new(),
+            wallet_request_signature: Vec::new(),
+            capability_request_count: 0,
+            desktop_signature: Vec::new(),
+            room_signature: String::new(),
+            people_signature: Vec::new(),
+            services_signature: Vec::new(),
+            browser_sessions: serde_json::json!({
+                "schema": "elastos.browser.session-capacity/v1",
+                "total_sessions": 0
+            }),
+        };
+        let cursor = home_realtime_cursor(&snapshot);
+        let changed = HomeRealtimeSnapshot {
+            recovery_readiness: RecoveryReadinessSummary::ready(),
+            ..snapshot
+        };
+
+        let events = home_realtime_events(&cursor, &changed);
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "home.summary.changed" && event.scope == "home"),
+            "recovery readiness changes should refresh the Home summary"
+        );
+        assert_eq!(
+            events.len(),
+            1,
+            "recovery readiness should stay a Home summary change"
         );
     }
 }
