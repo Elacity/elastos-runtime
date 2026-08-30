@@ -115,9 +115,21 @@ def stop_pid(pid):
         time.sleep(0.05)
 
 
+def start_argument_process(*arguments):
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)", *arguments],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    tracked_pids.add(process.pid)
+    return process
+
+
 def static_contract():
     source = RESTART.read_text(encoding="utf-8")
     required = (
+        'test_home="${MAC_TEST_HOME:-${HOME}/elastos-mac-test-home}"',
         'gateway_bin="${data_dir}/bin/elastos"',
         'installation_receipt="${data_dir}/receipts/source-home-installation.json"',
         "validate_installation_receipt",
@@ -195,6 +207,10 @@ def value_after(flag):
 
 
 if len(sys.argv) >= 2 and sys.argv[1] == "principal-root-upgrade":
+    empty_upgrade = os.environ.get("ELASTOS_SMOKE_EMPTY_UPGRADE_RECEIPT")
+    if empty_upgrade is not None:
+        print(empty_upgrade)
+        raise SystemExit(0)
     backup = pathlib.Path(value_after("--backup-dir"))
     backup.mkdir(mode=0o700, parents=True, exist_ok=False)
     proof = backup / "rollback.json"
@@ -399,8 +415,8 @@ def snapshot(root):
     return result
 
 
-def assert_rejected(fixture, needle, *, env=None):
-    result = fixture.run(env=env, ok=False)
+def assert_rejected(fixture, needle, *extra, env=None):
+    result = fixture.run(*extra, env=env, ok=False)
     if needle not in result.stderr:
         raise AssertionError(f"missing rejection {needle!r}: {result.stderr!r}")
     private_values = (str(fixture.home), str(fixture.data), str(fixture.runtime))
@@ -411,6 +427,51 @@ def assert_rejected(fixture, needle, *, env=None):
 
 def run_smoke(temp_root):
     static_contract()
+    empty_receipt = {
+        "schema": "elastos.principal-root.upgrade-receipt/v1",
+        "status": "already_ready",
+        "root_count": 0,
+        "object_count": 0,
+        "roots": [],
+    }
+    empty = Fixture(temp_root, "empty-install")
+    try:
+        empty.run(env=empty.environment(ELASTOS_SMOKE_EMPTY_UPGRADE_RECEIPT=json.dumps(empty_receipt)))
+        receipt = json.loads(empty.restart_receipt.read_text())
+        if receipt.get("ok") is not True or receipt.get("http_code") != 200:
+            raise AssertionError("empty installation did not reach readiness")
+        if "principal_root_rollback" in receipt or list((empty.data / "backups").iterdir()):
+            raise AssertionError("empty installation manufactured or claimed a rollback")
+    finally:
+        empty.cleanup()
+
+    invalid_receipts = [
+        "", "{", "[]",
+        json.dumps(list(empty_receipt.items())),
+        json.dumps({**empty_receipt, "schema": "wrong"}),
+        json.dumps({**empty_receipt, "status": "upgraded"}),
+        json.dumps({**empty_receipt, "root_count": 1}),
+        json.dumps({**empty_receipt, "object_count": 1}),
+        json.dumps({**empty_receipt, "roots": ["root"]}),
+        json.dumps({**empty_receipt, "roots": {}}),
+        json.dumps({**empty_receipt, "root_count": False}),
+        json.dumps({**empty_receipt, "extra": True}),
+        json.dumps(empty_receipt)[:-1] + ',"root_count":0}',
+        " " * 4096 + json.dumps(empty_receipt),
+    ]
+    # Exercise the same receipt validator without starting a gateway per denial.
+    function = RESTART.read_text().split("rollback_size() {", 1)[1].split("\nemit_json()", 1)[0]
+    log = empty.home / "logs/invalid-upgrade.json"
+    for payload in invalid_receipts:
+        write(log, payload.encode())
+        result = subprocess.run(
+            ["bash", "-c", "rollback_size() {" + function + "\nrollback_size"],
+            env={**os.environ, "principal_root_backup_dir": str(empty.data / "backups/missing"),
+                 "principal_root_upgrade_log": str(log)},
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 or "without a verified empty upgrade" not in result.stderr:
+            raise AssertionError("missing rollback accepted an invalid empty-upgrade receipt")
     invalid_addr = subprocess.run(
         [str(RESTART), "--dry-run", "--addr", "not-an-address"],
         stdin=subprocess.DEVNULL,
@@ -442,7 +503,7 @@ def run_smoke(temp_root):
     source_dirt = ROOT / f".mac-source-home-restart-smoke-dirt-{os.getpid()}"
     try:
         source_dirt.write_text("untracked source dirt\n", encoding="utf-8")
-        assert_rejected(main, "source_dirty")
+        assert_rejected(main, "source_dirty", "--init")
     finally:
         source_dirt.unlink(missing_ok=True)
 
@@ -451,10 +512,59 @@ def run_smoke(temp_root):
     tracked_mode = stat.S_IMODE(tracked_source.stat().st_mode)
     try:
         tracked_source.write_bytes(tracked_bytes + b"\n")
-        assert_rejected(main, "source_dirty")
+        assert_rejected(main, "source_dirty", "--init")
     finally:
         tracked_source.write_bytes(tracked_bytes)
         tracked_source.chmod(tracked_mode)
+
+    down_dry = Fixture(temp_root, "down-dry")
+    down_dry_gateway = down_dry.start_gateway()
+    down_dry.write_pid(down_dry_gateway.pid)
+    down_dry.processes.append(down_dry_gateway.pid)
+    dry_probe = start_argument_process(str(down_dry.data / "bin" / "browser-selkies-control-service.mjs"))
+    down_dry.processes.append(dry_probe.pid)
+    before_down = snapshot(down_dry.root)
+    pid_before_down = down_dry.pid_file.read_text(encoding="utf-8")
+    for args in (("--down", "--dry-run"), ("--dry-run", "--down")):
+        dry_down = down_dry.run(*args)
+        plan = json.loads(dry_down.stdout)
+        if plan.get("schema") != RESTART_SCHEMA or plan.get("dry_run") is not True:
+            raise AssertionError("dry-run down admission did not emit the restart plan")
+        if not process_alive(down_dry_gateway.pid) or not process_alive(dry_probe.pid):
+            raise AssertionError("dry-run down signaled an existing process")
+        if down_dry.pid_file.read_text(encoding="utf-8") != pid_before_down:
+            raise AssertionError("dry-run down mutated the owned PID file")
+        if snapshot(down_dry.root) != before_down:
+            raise AssertionError("dry-run down mutated the installation")
+
+    malformed_down = Fixture(temp_root, "malformed-down")
+    malformed_gateway = malformed_down.start_gateway()
+    malformed_down.processes.append(malformed_gateway.pid)
+    malformed_down.write_pid(malformed_gateway.pid)
+    malformed_down.pid_file.write_text("not-json\n", encoding="utf-8")
+    malformed_down.pid_file.chmod(0o600)
+    malformed_probe = start_argument_process(str(malformed_down.data / "bin" / "browser-selkies-control-service.mjs"))
+    malformed_down.processes.append(malformed_probe.pid)
+    malformed_before = snapshot(malformed_down.root)
+    assert_rejected(malformed_down, "unsafe or malformed", "--down")
+    if not process_alive(malformed_gateway.pid) or not process_alive(malformed_probe.pid):
+        raise AssertionError("malformed down admission signaled a process")
+    if snapshot(malformed_down.root) != malformed_before:
+        raise AssertionError("malformed down admission mutated the installation")
+
+    exact_down = Fixture(temp_root, "exact-down")
+    exact_gateway = exact_down.start_gateway()
+    exact_down.processes.append(exact_gateway.pid)
+    exact_down.write_pid(exact_gateway.pid)
+    exact_probe = start_argument_process(str(exact_down.data / "bin" / "browser-selkies-control-service.mjs"))
+    exact_down.processes.append(exact_probe.pid)
+    exact_down.run("--down")
+    if process_alive(exact_gateway.pid):
+        raise AssertionError("down did not stop the owned gateway")
+    if not process_alive(exact_probe.pid):
+        raise AssertionError("down disturbed an argument-only sibling process")
+    if exact_down.pid_file.exists() or exact_down.pid_file.is_symlink():
+        raise AssertionError("down retained the owned PID file")
 
     dead_stale = Fixture(temp_root, "dead-stale-pid")
     dead_stale.write_pid(
@@ -484,7 +594,7 @@ def run_smoke(temp_root):
 
     original_receipt = main.install_receipt.read_bytes()
     main.write_install_receipt(commit="0" * 40)
-    assert_rejected(main, "source_identity")
+    assert_rejected(main, "source_identity", "--init")
     if not process_alive(old.pid):
         raise AssertionError("stale source receipt stopped the old gateway")
     main.install_receipt.write_bytes(original_receipt)
@@ -560,12 +670,12 @@ def run_smoke(temp_root):
         raise AssertionError("success receipt installed Runtime hash mismatch")
     if receipt.get("installation_receipt_sha256") != sha256(main.install_receipt):
         raise AssertionError("success receipt installation receipt hash mismatch")
-    if not (
-        receipt.get("served_index_sha256")
-        == receipt.get("installed_index_sha256")
-        == receipt.get("source_index_sha256")
-    ):
-        raise AssertionError("successful Home hash parity mismatch")
+    if receipt.get("admission_mode") != "existing":
+        raise AssertionError("successful restart did not record existing-install admission")
+    if receipt.get("served_index_sha256") != receipt.get("installed_index_sha256"):
+        raise AssertionError("successful Home installed parity mismatch")
+    if "source_index_sha256" in receipt:
+        raise AssertionError("existing-install restart leaked source Home parity into the receipt")
     if not (
         receipt.get("browser_helper_source_sha256")
         == receipt.get("browser_helper_installed_sha256")
@@ -652,6 +762,9 @@ def run_smoke(temp_root):
         shutil.rmtree(disposable_root)
 
     main.cleanup()
+    down_dry.cleanup()
+    malformed_down.cleanup()
+    exact_down.cleanup()
     dead_stale.cleanup()
     unrelated.cleanup()
     failed.cleanup()

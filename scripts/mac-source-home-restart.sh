@@ -10,7 +10,7 @@ Usage:
   scripts/mac-source-home-restart.sh [options]
 
 Options:
-  --test-home <path>      Source-home root. Default: $MAC_TEST_HOME or ~/
+  --test-home <path>      Source-home root. Default: $MAC_TEST_HOME or ~/elastos-mac-test-home.
   --init                  First-provision admission: require exact clean-source
                           receipt parity (the strict validation path). Without
                           it, the helper starts an existing installation and
@@ -18,9 +18,9 @@ Options:
   --addr <host:port>      Gateway bind address. Default: $MAC_GATEWAY_ADDR or localhost:61180.
   --log-dir <path>        Restart log directory. Default: <test-home>/logs.
   --dry-run               Validate and print the restart plan without file or process effects.
-  --down                  Safe shutdown only: stop the owned gateway and this
-                          installation's helper processes, then exit. No
-                          upgrade, validation, or start is performed.
+  --down                  Safe shutdown only: stop the owned gateway for this
+                          installation, then exit. No upgrade, validation, or
+                          start is performed.
   --json-out <path>       Active receipt. Default: <data-dir>/receipts/mac-source-home-restart.json.
   --wait-seconds <n>      Seconds to wait for Home after start. Default: 40.
 
@@ -755,15 +755,53 @@ PY
 }
 
 rollback_size() {
-  python3 - "$principal_root_backup_dir" <<'PY'
+  python3 - "$principal_root_backup_dir" "$principal_root_upgrade_log" <<'PY'
+import json
 import os
 import pathlib
 import stat
 import sys
 
 root = pathlib.Path(sys.argv[1])
-if not root.exists():
-    raise SystemExit("principal-root rollback is missing")
+if not os.path.lexists(root):
+    # Only the Runtime's exact empty-install receipt permits no rollback.
+    def unique_object(pairs):
+        value = dict(pairs)
+        if len(value) != len(pairs):
+            raise ValueError
+        return value
+
+    try:
+        descriptor = os.open(sys.argv[2], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as receipt_file:
+            metadata = os.fstat(receipt_file.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & 0o077
+                or metadata.st_nlink != 1
+                or not 0 < metadata.st_size <= 4096
+            ):
+                raise ValueError
+            receipt = json.loads(receipt_file.read(4097), object_pairs_hook=unique_object)
+        expected = {
+            "schema": "elastos.principal-root.upgrade-receipt/v1",
+            "status": "already_ready",
+            "root_count": 0,
+            "object_count": 0,
+            "roots": [],
+        }
+        if (
+            not isinstance(receipt, dict)
+            or receipt != expected
+            or type(receipt["root_count"]) is not int
+            or type(receipt["object_count"]) is not int
+        ):
+            raise ValueError
+    except (OSError, ValueError, TypeError, KeyError):
+        raise SystemExit("principal-root rollback is missing without a verified empty upgrade")
+    print(0)
+    raise SystemExit(0)
 total = 0
 for base, directories, files in os.walk(root, followlinks=False):
     base_path = pathlib.Path(base)
@@ -820,7 +858,7 @@ keys = [
 data = {}
 for key in keys:
     value = os.environ.get(key.upper())
-    if value is None or (key in {"gateway_pid", "http_code"} and not value):
+    if value is None or value == "" or (key in {"gateway_pid", "http_code"} and not value):
         continue
     if key in {"ok", "dry_run"}:
         data[key] = value == "1"
@@ -972,7 +1010,7 @@ receipt_environment() {
   emit_json "$1"
 }
 
-test_home="${MAC_TEST_HOME:-${HOME}}"
+test_home="${MAC_TEST_HOME:-${HOME}/elastos-mac-test-home}"
 addr="${MAC_GATEWAY_ADDR:-localhost:61180}"
 log_dir=""
 wait_seconds=40
@@ -1068,6 +1106,33 @@ planned_rollback_relative_identity="backups/${principal_root_backup_dir##*/}"
 rollback_relative_identity=""
 principal_root_upgrade_log="${log_dir}/principal-root-upgrade-$(date -u +%Y%m%dT%H%M%SZ)-$$.json"
 
+if [[ "$dry_run" -eq 1 ]]; then
+  validate_stable_gateway
+  if ! installation_values="$(validate_installation_receipt)"; then
+    exit 1
+  fi
+  read -r installation_receipt_sha installed_runtime_sha installed_components_sha \
+    capsule_metadata_receipt_sha <<<"$installation_values"
+  gateway_pid=""
+  gateway_start_identity=""
+  gateway_pid_runtime_sha="$installed_runtime_sha"
+  gateway_pid_payload_sha=""
+  http_code=""
+  served_hash=""
+  installed_hash=""
+  source_hash=""
+  browser_helper_source_sha=""
+  browser_helper_installed_sha=""
+  browser_helper_initrd_sha=""
+  browser_helper_rootfs_sha=""
+  home_cli_renderer_source_sha=""
+  home_cli_renderer_installed_sha=""
+  rollback_size_bytes="0"
+  receipt_ok=1
+  receipt_environment ""
+  exit 0
+fi
+
 if [[ "$down_mode" -eq 1 ]]; then
   if [[ "$(uname -s)" != "Darwin" ]]; then
     redacted_error "this restart owner requires macOS"
@@ -1099,20 +1164,18 @@ PY
       fi
     fi
     if [[ "$down_status" -eq 0 ]]; then
-      remove_owned_pid_file "$down_pid" "$down_start" "$down_runtime_sha" "$down_payload_sha" 2>/dev/null ||
+      remove_owned_pid_file "$down_pid" "$down_start" "$down_runtime_sha" "$down_payload_sha" 2>/dev/null || {
         redacted_error "gateway PID file changed during shutdown"
+        down_status=1
+      }
     fi
   elif [[ $? -ne 3 ]]; then
     redacted_error "gateway PID file is unsafe or malformed"
     down_status=1
   fi
-  # Relatives: helper processes launched from this installation's bin tree.
-  while IFS= read -r relative_pid; do
-    [[ -n "$relative_pid" ]] || continue
-    kill -TERM "$relative_pid" 2>/dev/null || true
-  done < <(pgrep -f "${data_dir}/bin/" 2>/dev/null || true)
   if command -v lsof >/dev/null 2>&1 && [[ -n "$(listener_pids_for_port)" ]]; then
     redacted_error "an unrelated listener still owns the selected address; not touched"
+    down_status=1
   fi
   exit "$down_status"
 fi
@@ -1141,10 +1204,6 @@ home_cli_renderer_installed_sha=""
 rollback_size_bytes="0"
 receipt_ok=1
 
-if [[ "$dry_run" -eq 1 ]]; then
-  receipt_environment ""
-  exit 0
-fi
 rollback_relative_identity="$planned_rollback_relative_identity"
 if [[ "$(uname -s)" != "Darwin" ]]; then
   redacted_error "this restart owner requires macOS"
@@ -1311,12 +1370,9 @@ if ! "$gateway_bin" principal-root-upgrade \
   redacted_error "principal-root upgrade failed; rollback retained for reconciliation"
   exit 1
 fi
-if [[ -d "$principal_root_backup_dir" && ! -L "$principal_root_backup_dir" ]]; then
-  rollback_size_bytes="$(rollback_size)"
-else
-  # A successful upgrade with nothing to migrate creates no backup.
+rollback_size_bytes="$(rollback_size)"
+if [[ ! -e "$principal_root_backup_dir" && ! -L "$principal_root_backup_dir" ]]; then
   rollback_relative_identity=""
-  rollback_size_bytes="0"
 fi
 
 if ! gateway_pid="$(start_gateway_process 2>/dev/null)"; then
