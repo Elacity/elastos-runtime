@@ -367,9 +367,22 @@ fn signed_release_operation_with_runtime_seed_and_epoch(
     runtime_seed: u8,
     epoch: SignedCustodyEpochV1,
 ) -> SignedRuntimeReleaseOperationV1 {
+    signed_release_operation_with_runtime_seed_epoch_and_issued_at(
+        record,
+        runtime_seed,
+        epoch,
+        issued_unix_seconds(),
+    )
+}
+
+fn signed_release_operation_with_runtime_seed_epoch_and_issued_at(
+    record: &CustodyNodeProvisioningRecordV1,
+    runtime_seed: u8,
+    epoch: SignedCustodyEpochV1,
+    issued_at: u64,
+) -> SignedRuntimeReleaseOperationV1 {
     let runtime_key = node_signing_key(runtime_seed);
     let policy = policy_body();
-    let issued_at = issued_unix_seconds();
     let expires_at = issued_at + PROCESS_TEST_VALID_RELEASE_LIFETIME_SECS;
     let binding = ProtectedContentBindingV1::new(
         record.manifest().encrypted_content().clone(),
@@ -944,11 +957,16 @@ fn custody_provider_process_rejects_wrong_issuer_node_conflict_and_redacts_diagn
     let allowed_replay = provider.request(request_value(&allowed_after_denial));
     assert_eq!(allowed_replay["data"], allowed["data"]);
 
+    // Issue the mismatched operation in a guaranteed-different second so its
+    // release request hash can never coincide with the original operation's
+    // (the request is otherwise identical when minted in the same second,
+    // making the "wrong" decision legitimately verifiable).
     let wrong_decision = signed_decision_with_provider(
-        &signed_release_operation_with_runtime_seed_and_epoch(
+        &signed_release_operation_with_runtime_seed_epoch_and_issued_at(
             &record,
             0x44,
             signed_epoch_with_provider(&provider_node),
+            issued_unix_seconds().saturating_sub(7),
         ),
         &provider_node,
         RightsDecisionV1::Allowed,
@@ -959,8 +977,8 @@ fn custody_provider_process_rejects_wrong_issuer_node_conflict_and_redacts_diagn
     )
     .unwrap();
     let rejected = serde_json::to_string(&provider.request(request_value(&bad_release))).unwrap();
-    assert!(rejected.contains("invalid_request"));
-    assert!(!rejected.contains("runtime"));
+    assert!(rejected.contains("invalid_request"), "{rejected}");
+    assert!(!rejected.contains("runtime"), "{rejected}");
     provider.stop();
 }
 

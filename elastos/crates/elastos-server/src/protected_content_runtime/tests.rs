@@ -3724,6 +3724,21 @@ fn write_chain_provider_config(data_dir: &Path, config: &Value) {
 }
 
 #[cfg(unix)]
+fn safe_ancestor_tempdir() -> tempfile::TempDir {
+    // The media prerequisite import walks every ancestor of the source tool
+    // path and rejects group/world-writable directories. std temp lives under
+    // /tmp (mode 1777) on Linux, so fixtures built there are structurally
+    // unsafe; anchor them under the build target dir, whose ancestors are
+    // developer- or runner-owned.
+    let root = option_env!("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target")));
+    let base = root.join("media-prereq-test-fixtures");
+    fs::create_dir_all(&base).unwrap();
+    tempfile::tempdir_in(&base).unwrap()
+}
+
+#[cfg(unix)]
 fn write_media_prerequisite(path: &Path, bytes: &[u8], mode: u32) {
     fs::write(path, bytes).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
@@ -3745,7 +3760,7 @@ fn prepare_test_media_prerequisite(data_dir: &Path, root: &Path) {
 #[cfg(unix)]
 #[test]
 fn media_prerequisite_import_is_bounded_private_idempotent_and_never_executes_tools() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = safe_ancestor_tempdir();
     let data_dir = temp.path().join("data");
     let source = temp.path().join("source");
     let marker = temp.path().join("executed");
@@ -3819,7 +3834,7 @@ fn media_prerequisite_import_is_bounded_private_idempotent_and_never_executes_to
 #[cfg(unix)]
 #[test]
 fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = safe_ancestor_tempdir();
     let missing_data = temp.path().join("missing-data");
     let missing = temp.path().join("missing-tools");
     owner_only_dir(&missing);
@@ -3913,7 +3928,7 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
 #[cfg(unix)]
 #[test]
 fn media_prerequisite_rejects_links_modes_paths_and_unknown_config_fields_without_overwrite() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = safe_ancestor_tempdir();
     let source = temp.path().join("source");
     let data_dir = temp.path().join("data");
     prepare_test_media_prerequisite(&data_dir, &source);
@@ -3969,7 +3984,7 @@ fn media_prerequisite_rejects_links_modes_paths_and_unknown_config_fields_withou
 #[cfg(unix)]
 #[test]
 fn media_prerequisite_conflict_cleans_only_files_created_by_that_attempt() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = safe_ancestor_tempdir();
     let data_dir = temp.path().join("data");
     let source = temp.path().join("source");
     owner_only_dir(&source);

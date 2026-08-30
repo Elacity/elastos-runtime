@@ -987,9 +987,26 @@ mod tests {
         binary: &std::path::Path,
         config: ProviderConfig,
     ) -> Result<ProviderBridge, BridgeError> {
+        spawn_test_bridge_with_timeouts(binary, config, INIT_TIMEOUT, SHUTDOWN_TIMEOUT).await
+    }
+
+    #[cfg(unix)]
+    async fn spawn_test_bridge_with_timeouts(
+        binary: &std::path::Path,
+        config: ProviderConfig,
+        init_timeout: std::time::Duration,
+        shutdown_timeout: std::time::Duration,
+    ) -> Result<ProviderBridge, BridgeError> {
         let mut attempts = 0u32;
         loop {
-            match ProviderBridge::spawn(binary, config.clone()).await {
+            match ProviderBridge::spawn_with_timeouts(
+                binary,
+                config.clone(),
+                init_timeout,
+                shutdown_timeout,
+            )
+            .await
+            {
                 Err(BridgeError::Spawn(error))
                     if error.kind() == std::io::ErrorKind::ExecutableFileBusy =>
                 {
@@ -997,7 +1014,13 @@ mod tests {
                     if attempts >= 40 {
                         return Err(BridgeError::Spawn(error));
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    // Blocking sleep on purpose: the spawn syscall fails
+                    // synchronously on the first poll, so the whole retry
+                    // loop resolves within a single poll and stays correct
+                    // under start_paused tests, where an async sleep could
+                    // never fire while the test body blocks the runtime
+                    // thread in wait_for_file.
+                    std::thread::sleep(std::time::Duration::from_millis(25));
                 }
                 result => return result,
             }
@@ -1072,7 +1095,7 @@ mod tests {
             .unwrap();
         assert!(status.success());
         let script = format!(
-            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" > '{}'\nIFS= read -r _init || exit 1\nprintf '%s\\n' '{}'\nIFS= read -r _shutdown || exit 0\ncat '{}' >/dev/null\n",
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" > '{}'\nIFS= read -r _init || exit 1\nprintf '%s\\n' '{}'\nIFS= read -r _shutdown || exit 0\nexec cat '{}'\n",
             pid_file.display(),
             r#"{"status":"ok"}"#,
             gate.display(),
@@ -1123,7 +1146,7 @@ mod tests {
             Ok(_) => panic!("expected init failure"),
             Err(error) => error,
         };
-        assert!(matches!(error, BridgeError::InitFailed(_)));
+        assert!(matches!(error, BridgeError::InitFailed(_)), "{error}");
         let pid = read_pid(&pid_file);
         assert!(!process_is_running(pid));
     }
@@ -1138,12 +1161,12 @@ mod tests {
         );
         let script_path = write_provider_script(&tempdir, "reject-provider.sh", &script);
 
-        let error = match ProviderBridge::spawn(&script_path, ProviderConfig::default()).await {
+        let error = match spawn_test_bridge(&script_path, ProviderConfig::default()).await {
             Ok(_) => panic!("init rejection should not return a usable bridge"),
             Err(error) => error,
         };
 
-        assert!(matches!(error, BridgeError::InitFailed(_)));
+        assert!(matches!(error, BridgeError::InitFailed(_)), "{error}");
         let pid = std::fs::read_to_string(&pid_path).unwrap();
         assert_process_absent(pid.trim());
     }
@@ -1166,7 +1189,7 @@ mod tests {
         // The paused clock freezes the init timer, so the marker wait below
         // cannot race the init timeout no matter how loaded the machine is.
         let task = tokio::spawn(async move {
-            ProviderBridge::spawn_with_timeouts(
+            spawn_test_bridge_with_timeouts(
                 &script_path,
                 ProviderConfig::default(),
                 INIT_TIMEOUT,
@@ -1205,7 +1228,7 @@ mod tests {
         );
         let script_path = write_provider_script(&tempdir, "ok-provider.sh", &script);
 
-        let bridge = ProviderBridge::spawn(&script_path, ProviderConfig::default())
+        let bridge = spawn_test_bridge(&script_path, ProviderConfig::default())
             .await
             .unwrap();
         let response = bridge
