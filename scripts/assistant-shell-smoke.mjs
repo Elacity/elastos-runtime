@@ -29,7 +29,7 @@ const source = `${originalSource
     '"./vendor/katex/katex.mjs"',
     JSON.stringify(katexModuleUrl),
   )}
-export { renderMarkdown, renderMessageBody };
+export { renderMarkdown, renderMessageBody, readHashParam, readQueryParam, readLaunchContext };
 `;
 const assistantModule = await import(
   `data:text/javascript,${encodeURIComponent(source)}`,
@@ -139,7 +139,7 @@ function createFetchFixture({
         },
       };
     }
-    if (url === "/api/apps/assistant/workspace" && init.method === "POST") {
+    if (url === "/api/apps/assistant/workspace" && init.method === "PUT") {
       const parsed = JSON.parse(init.body);
       savedBodies.push(parsed);
       const status = putStatuses[putIndex++] ?? 200;
@@ -252,9 +252,10 @@ async function buildApp(options = {}) {
       return true;
     },
   };
+  const homeOrigin = options.homeOrigin ?? "https://home.example";
   const app = assistantModule.createAssistantApp({
     homeToken: "token-1",
-    homeOrigin: "null",
+    homeOrigin,
     fetchFn: fetch.fetchFn,
     cryptoRef: {
       randomUUID() {
@@ -501,14 +502,46 @@ async function buildApp(options = {}) {
 }
 
 {
+  const previousWindow = globalThis.window;
+  globalThis.window = {
+    location: {
+      search: "?home_origin=https%3A%2F%2Flocalhost%3A61380",
+      hash: "#home_token=token-1&home_origin=ignored",
+    },
+  };
+  assert.deepEqual(assistantModule.readLaunchContext(), {
+    homeToken: "token-1",
+    homeOrigin: "https://localhost:61380",
+  });
+  globalThis.window = previousWindow;
+}
+
+{
+  const previousWindow = globalThis.window;
+  globalThis.window = {
+    location: {
+      search: "",
+      hash: "#home_token=token-1",
+    },
+  };
+  assert.equal(assistantModule.readLaunchContext().homeOrigin, "");
+  globalThis.window = previousWindow;
+}
+
+{
   const { app, posts, fetch } = await buildApp({ offers: [] });
   assert.equal(posts.length, 1);
-  assert.equal(posts[0].origin, "null");
+  assert.equal(posts[0].origin, "https://home.example");
   assert.equal(posts[0].message.type, "home:app-ready");
   assert.equal(posts[0].message.homeToken, "token-1");
   assert.equal(fetch.fetchCalls[0][0], "/api/provider/model/offers_list");
   assert.equal(fetch.fetchCalls[1][0], "/api/apps/assistant/workspace");
   assert.equal(app.snapshot().statusMessage, "No model offers available.");
+  app.setSessionMode("build");
+  assert.equal(app.snapshot().currentMode, "build");
+  app.setSessionMode("studio");
+  assert.equal(app.snapshot().currentMode, "studio");
+  assert.equal(app.snapshot().sendDisabled, true);
 }
 
 {
@@ -1005,7 +1038,7 @@ async function buildApp(options = {}) {
           },
         });
       }
-      if (url === "/api/apps/assistant/workspace" && init.method === "POST") {
+      if (url === "/api/apps/assistant/workspace" && init.method === "PUT") {
         const parsed = JSON.parse(init.body);
         savedBodies.push(parsed);
         if (savedBodies.length === 1) {
@@ -1188,6 +1221,13 @@ async function buildApp(options = {}) {
   });
   app.togglePinSession("session-2");
   await flushTimers();
+  const saveCall = fetch.fetchCalls.find(
+    ([url, init]) => url === "/api/apps/assistant/workspace" && init.method === "PUT",
+  );
+  assert.ok(saveCall);
+  assert.equal(saveCall[1].headers["content-type"], "application/json");
+  assert.equal(saveCall[1].headers["x-elastos-home-token"], "token-1");
+  assert.equal(typeof saveCall[1].body, "string");
   assert.equal(fetch.savedBodies[0].sessions[1].pinned, true);
   app.setSearchQuery("beta");
   assert.equal(app.snapshot().filteredSessions.length, 1);

@@ -522,13 +522,14 @@ export function createAssistantApp({
     if (!homeToken) {
       throw new Error("Assistant requires a Home launch token.");
     }
+    const sendsJsonBody = method !== "GET" && body !== undefined && body !== null;
     const response = await fetchFn(url, {
       method,
       headers: {
-        ...(method === "POST" ? { "content-type": "application/json" } : {}),
+        ...(sendsJsonBody ? { "content-type": "application/json" } : {}),
         "x-elastos-home-token": homeToken,
       },
-      ...(method === "POST" ? { body: JSON.stringify(body ?? {}) } : {}),
+      ...(sendsJsonBody ? { body: JSON.stringify(body) } : {}),
     });
     let payload = null;
     try {
@@ -670,6 +671,7 @@ export function createAssistantApp({
     const { response, payload } = await requestJson(
       "/api/apps/assistant/workspace",
       requestBody,
+      "PUT",
     );
     if (response.status === 409) {
       state.saving = false;
@@ -1850,15 +1852,28 @@ function readHashParam(name) {
   return hashParams.get(name) || "";
 }
 
+function readQueryParam(name) {
+  const queryParams = new URLSearchParams(window.location.search);
+  return queryParams.get(name) || "";
+}
+
+function readLaunchContext() {
+  return {
+    homeToken: readHashParam("home_token"),
+    homeOrigin: readQueryParam("home_origin"),
+  };
+}
+
 async function bootAssistantBrowser() {
   const root = document.getElementById("assistant-app");
   if (!root) {
     return;
   }
+  const launchContext = readLaunchContext();
   let mounted = null;
   const app = createAssistantApp({
-    homeToken: readHashParam("home_token"),
-    homeOrigin: readHashParam("home_origin") || "null",
+    homeToken: launchContext.homeToken,
+    homeOrigin: launchContext.homeOrigin,
     onStateChange() {
       mounted?.render();
     },
