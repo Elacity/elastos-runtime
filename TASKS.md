@@ -90,6 +90,11 @@ Assistant proof item. Missing configuration is an honest zero-offer state.
 - [ ] Verify completed-mint adoption after a restart on the installed path.
   Reconcile partial settled mint records and their custody cleanup obligations;
   the source adoption repair only rolls forward fully completed records.
+- [ ] Turn the journey audit register into an automated pre-release gate:
+  extract Journey Matrix rows with complete verdicts into scripted checks that
+  run before every release, following the existing smoke-script pattern.
+  Journeys whose proof needs installed evidence stay manual and keep their
+  register verdicts authoritative.
 - [ ] Review Irzhy's PR15 follow-up on pinning the canonical
   `has_access_by_content_id` selector (`0x54d42821`). Current configuration
   validates its shape. Use a gated channel for deny proofs; a permissive

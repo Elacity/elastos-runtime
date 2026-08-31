@@ -230,6 +230,18 @@ path, installed artifact path, SHA-256 of the built and installed artifact,
 restart or stale-process cleanup performed, and the live localhost proof command
 and result.
 
+## Journey Register Gate
+
+Product-behavior changes and releases are measured against the journey audit
+register [docs/audits/ElastOS-Home-Journey-Audit.xlsx](docs/audits/ElastOS-Home-Journey-Audit.xlsx),
+the standing reference for stability and correctness for any PR or release.
+Before declaring product work done or a release ready, load the
+[e2e-audit skill](.claude/skills/e2e-audit/SKILL.md) and apply its
+invariant: read the touched areas' journeys and findings, keep Pass journeys
+stable, update rows a change intentionally alters in the same PR, add rows for
+new surface, and close findings only with their recorded proof. Live verdicts
+come from installed evidence on the exact revision, never from source reading.
+
 ## Public Live Deployment
 
 The public live host must preserve its data root, signing key, passkey state, and

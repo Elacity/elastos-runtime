@@ -1,5 +1,10 @@
 # Home journey audit
 
+This workbook is the standing stability and correctness reference for any PR
+or release. The working rules and a dependency-free reader live in the
+[e2e-audit skill](../../.claude/skills/e2e-audit/SKILL.md); the
+standing gate is in [AGENTS.md](../../AGENTS.md).
+
 [ElastOS-Home-Journey-Audit.xlsx](ElastOS-Home-Journey-Audit.xlsx) contains the
 Home audit snapshot reviewed on 31 August 2026: 61 findings, the journey and
 control registers, evidence summaries, and a finding-by-finding principles
