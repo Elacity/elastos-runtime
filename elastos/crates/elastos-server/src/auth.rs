@@ -1961,8 +1961,10 @@ pub fn write_principal_root_object(
         object_uri,
         path,
         plaintext,
-        false,
-        false,
+        PrincipalRootObjectWriteOptions {
+            require_protection: false,
+            create_only: false,
+        },
     )
 }
 
@@ -1981,8 +1983,10 @@ pub(crate) fn create_principal_root_object(
         object_uri,
         path,
         plaintext,
-        false,
-        true,
+        PrincipalRootObjectWriteOptions {
+            require_protection: false,
+            create_only: true,
+        },
     )
 }
 
@@ -2001,9 +2005,16 @@ pub(crate) fn write_protected_principal_root_object(
         object_uri,
         path,
         plaintext,
-        true,
-        false,
+        PrincipalRootObjectWriteOptions {
+            require_protection: true,
+            create_only: false,
+        },
     )
+}
+
+struct PrincipalRootObjectWriteOptions {
+    require_protection: bool,
+    create_only: bool,
 }
 
 fn write_principal_root_object_inner(
@@ -2013,8 +2024,7 @@ fn write_principal_root_object_inner(
     object_uri: &str,
     path: &Path,
     plaintext: &[u8],
-    require_protection: bool,
-    create_only: bool,
+    options: PrincipalRootObjectWriteOptions,
 ) -> anyhow::Result<()> {
     validate_principal_root_object_binding(principal_id, localhost_root, object_uri)?;
     validate_principal_root_object_path(data_dir, object_uri, path)?;
@@ -2022,7 +2032,7 @@ fn write_principal_root_object_inner(
         .lock()
         .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
     let protection = load_principal_root_protection(data_dir, principal_id, localhost_root)?;
-    if require_protection && protection.is_none() {
+    if options.require_protection && protection.is_none() {
         anyhow::bail!("protected principal-root object requires active principal-root protection");
     }
     let bytes = if let Some(protection) = protection {
@@ -2049,10 +2059,10 @@ fn write_principal_root_object_inner(
     } else {
         plaintext.to_vec()
     };
-    if require_protection {
+    if options.require_protection {
         ensure_protected_principal_root_object_parent(data_dir, path)?;
     }
-    if create_only {
+    if options.create_only {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -6092,8 +6102,10 @@ mod tests {
             &object_uri,
             &path,
             br#"{"profile":"first"}"#,
-            true,
-            true,
+            PrincipalRootObjectWriteOptions {
+                require_protection: true,
+                create_only: true,
+            },
         )
         .unwrap();
 
@@ -6132,8 +6144,10 @@ mod tests {
             &object_uri,
             &path,
             br#"{"profile":"second"}"#,
-            true,
-            true,
+            PrincipalRootObjectWriteOptions {
+                require_protection: true,
+                create_only: true,
+            },
         )
         .unwrap_err();
         assert_eq!(
