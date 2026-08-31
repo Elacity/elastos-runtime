@@ -386,7 +386,14 @@ assert(fallbackActions.hidden === false, "home-cli hid recovery actions after a 
 assert(fallbackRefresh.hidden === false, "home-cli hid refresh after a denied Desktop switch");
 assert(fallbackDesktop.hidden === false, "home-cli hid Desktop recovery after a denied Desktop switch");
 assert(document.activeElement === fallbackDesktop, "home-cli lost Desktop recovery focus after a denied switch");
-assert(parentMessages.length === 0, "home-cli reported a shell change after a denied Desktop switch");
+assert(
+  !parentMessages.some(({ message }) => (
+    message?.type === "home:active-shell-applied" ||
+      message?.type === "home:close-self"
+  )),
+  "home-cli reported a shell change after a denied Desktop switch",
+  parentMessages,
+);
 
 for (const listener of fallbackDesktop.listeners.get("click") || []) {
   await listener();

@@ -369,7 +369,7 @@ assert(activeShellRoot.hidden === true, "auth gate left the active shell root vi
 assert(activeShellRoot.dataset.target === "", "auth gate kept a stale active shell target", activeShellRoot.dataset);
 assert(activeShellFrame.hidden === true, "auth gate left the active shell frame visible");
 assert(!activeShellFrame.dataset.route, "auth gate kept a stale active shell route", activeShellFrame.dataset);
-assert(!activeShellFrame.getAttribute("src"), "auth gate kept a stale shell iframe src", activeShellFrame.getAttribute("src"));
+assert(activeShellFrame.src === "about:blank", "auth gate did not unload the stale shell iframe", activeShellFrame.src);
 assert(!requests.some((request) => request.url === "/api/apps/home/active-shell"), "auth gate tried to switch shells without a token", requests);
 assert(!requests.some((request) => request.url === "/api/apps/home/launch"), "auth gate tried to launch a shell while locked", requests);
 

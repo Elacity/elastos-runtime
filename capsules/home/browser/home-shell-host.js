@@ -13,6 +13,7 @@ import {
   HOME_SHELL_HOST_ID,
   SYSTEM_APP_ID,
   homeActiveShellName,
+  hasHomeAuthorityToken,
   shellState,
   fetchJson,
   targetById,
@@ -48,6 +49,7 @@ const HOME_EVENTS_STREAM_URL = "/api/apps/home/events/stream";
 const SESSION_REFRESH_MS = 10 * 60 * 1000;
 const PRESENCE_HEARTBEAT_MS = 15_000;
 const ACTIVE_SHELL_HINT_KEY = "elastos.home.active-shell-hint";
+const ACTIVE_SHELL_READY_TIMEOUT_MS = 5_000;
 const HOME_CLI_SHELL_ID = "home-cli";
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -91,6 +93,15 @@ const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
 const PASSKEY_STEP_UP_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"]);
 const launchedAppContexts = new Map();
 const pendingBrowserAuthorityRenewals = new Map();
+const pendingActiveShellReady = {
+  target: "",
+  route: "",
+  timer: 0,
+};
+const stalledActiveShellReady = {
+  target: "",
+  route: "",
+};
 const homeClipboardPrompt = createHomeClipboardPrompt({
   root: document.querySelector("#home-clipboard-prompt"),
   title: document.querySelector("#home-clipboard-title"),
@@ -110,6 +121,15 @@ function hideHostBootMask() {
   homeShellBootMask.setAttribute("aria-hidden", "true");
 }
 
+function clearActiveShellFrameSource() {
+  if (!activeShellFrame) {
+    return;
+  }
+  activeShellFrame.hidden = true;
+  activeShellFrame.src = "about:blank";
+  activeShellFrame.dataset.route = "";
+}
+
 function showHostBootMask() {
   if (!homeShellBootMask) {
     return;
@@ -119,7 +139,7 @@ function showHostBootMask() {
 }
 
 async function switchToHomeGuiAndOpenTarget(context, target, options = {}) {
-  await activateDesktopShell(context.homeToken);
+  await activateDesktopShell();
   await openTargetFromHomeGui(target, options);
 }
 
@@ -166,8 +186,11 @@ function clearLaunchedAppContexts() {
 function enterHostAuthGate() {
   stopHomePresenceHeartbeat();
   shellState.activeShellRootLaunchSeq += 1;
+  resetActiveShellReadyState();
+  shellState.pendingAppliedShellTarget = "";
   shellState.activeShellRootTarget = "";
   shellState.activeShellRootRoute = "";
+  shellState.activeShellRootHomeToken = "";
   rememberActiveShellHint(HOME_GUI_SHELL_ID);
   document.body.dataset.homeShell = "resolving";
   document.body.dataset.homeGui = "dormant";
@@ -176,10 +199,8 @@ function enterHostAuthGate() {
     activeShellRoot.hidden = true;
     activeShellRoot.dataset.target = "";
   }
+  clearActiveShellFrameSource();
   if (activeShellFrame) {
-    activeShellFrame.hidden = true;
-    activeShellFrame.removeAttribute("src");
-    activeShellFrame.dataset.route = "";
     activeShellFrame.title = "Active Home shell";
   }
   hideShellHostRecovery();
@@ -374,7 +395,7 @@ async function showHostAuthGate(options = {}) {
     await boot();
     const profileActionTarget = profileReadinessActionTarget(response);
     if (profileActionTarget) {
-      await activateDesktopShell(response.home_token);
+      await activateDesktopShell();
       await openTargetFromHomeGui(profileActionTarget);
     }
   }, {
@@ -792,6 +813,30 @@ function activeShellCandidate(summary, target) {
   return candidates.find((candidate) => candidate?.name === target) || null;
 }
 
+function pendingAppliedShellTarget(summary) {
+  const target = normalizedActiveShellName(shellState.pendingAppliedShellTarget);
+  if (!target) {
+    return null;
+  }
+  if (activeShellTarget(summary) === target) {
+    shellState.pendingAppliedShellTarget = "";
+  }
+  return target;
+}
+
+function resolvedActiveShellTarget(summary) {
+  const pendingTarget = pendingAppliedShellTarget(summary);
+  if (pendingTarget) {
+    return pendingTarget;
+  }
+  return activeShellTarget(summary);
+}
+
+function activeShellRecoveryVisible(target) {
+  return shellHostRecovery?.hidden === false &&
+    shellHostRecovery?.dataset?.target === target;
+}
+
 function readActiveShellHint() {
   try {
     const value = window.localStorage.getItem(ACTIVE_SHELL_HINT_KEY);
@@ -830,6 +875,7 @@ function preclaimActiveShellSwitch(active) {
   if (!target) {
     return false;
   }
+  shellState.activeShellRootHomeToken = activeShellRootHomeToken();
   clearLaunchedAppContexts();
   shellState.activeShellRootLaunchSeq += 1;
   showHostBootMask();
@@ -841,12 +887,13 @@ function preclaimActiveShellSwitch(active) {
     activeShellRoot.hidden = false;
     activeShellRoot.dataset.target = target;
   }
+  resetActiveShellReadyState();
+  pendingActiveShellReady.target = target;
+  shellState.pendingAppliedShellTarget = target;
   shellState.activeShellRootTarget = target;
   shellState.activeShellRootRoute = "";
   if (activeShellFrame) {
-    activeShellFrame.hidden = true;
-    activeShellFrame.removeAttribute("src");
-    activeShellFrame.dataset.route = "";
+    clearActiveShellFrameSource();
     activeShellFrame.title = target;
   }
   requestShellSummaryRefresh({ reason: "active-shell-applied", delay: 0 });
@@ -868,17 +915,22 @@ function applyActiveShellBootHint() {
     activeShellRoot.dataset.target = target;
   }
   if (activeShellFrame) {
-    activeShellFrame.hidden = true;
-    activeShellFrame.removeAttribute("src");
-    activeShellFrame.dataset.route = "";
+    clearActiveShellFrameSource();
   }
 }
 
-async function activateDesktopShell(homeToken = "") {
-  if (activeShellTarget(shellState.currentSummary) !== HOME_GUI_SHELL_ID) {
+async function activateDesktopShell() {
+  const activeTarget = normalizedActiveShellName(
+    shellState.pendingAppliedShellTarget || shellState.activeShellRootTarget,
+  ) || (
+    homeSummarySignedIn(shellState.currentSummary)
+      ? activeShellTarget(shellState.currentSummary)
+      : ""
+  );
+  if (activeTarget !== HOME_GUI_SHELL_ID) {
+    shellState.pendingAppliedShellTarget = "";
     await fetchJson("/api/apps/home/active-shell", {
       method: "POST",
-      headers: homeToken ? { "x-elastos-home-token": homeToken } : {},
       body: JSON.stringify({ active: HOME_GUI_SHELL_ID }),
     });
     await refreshShellSummary();
@@ -913,7 +965,7 @@ function shellHostRecoveryDetailText(error) {
 }
 
 function activeShellRootHomeToken() {
-  return homeLaunchTokenFromRoute(
+  return shellState.activeShellRootHomeToken || homeLaunchTokenFromRoute(
     shellState.activeShellRootRoute ||
       activeShellFrame?.dataset?.route ||
       activeShellFrame?.getAttribute("src") ||
@@ -941,9 +993,80 @@ function hideShellHostRecovery() {
   }
 }
 
+function clearPendingActiveShellReady() {
+  if (pendingActiveShellReady.timer) {
+    window.clearTimeout(pendingActiveShellReady.timer);
+  }
+  pendingActiveShellReady.target = "";
+  pendingActiveShellReady.route = "";
+  pendingActiveShellReady.timer = 0;
+}
+
+function clearStalledActiveShellReady() {
+  stalledActiveShellReady.target = "";
+  stalledActiveShellReady.route = "";
+}
+
+function resetActiveShellReadyState() {
+  clearPendingActiveShellReady();
+  clearStalledActiveShellReady();
+}
+
+function armPendingActiveShellReady(target, route, launchSeq) {
+  resetActiveShellReadyState();
+  pendingActiveShellReady.target = target;
+  pendingActiveShellReady.route = route;
+  pendingActiveShellReady.timer = window.setTimeout(() => {
+    if (
+      shellState.activeShellRootLaunchSeq !== launchSeq ||
+      shellState.activeShellRootTarget !== target ||
+      shellState.activeShellRootRoute !== route ||
+      pendingActiveShellReady.target !== target ||
+      pendingActiveShellReady.route !== route
+    ) {
+      return;
+    }
+    clearPendingActiveShellReady();
+    stalledActiveShellReady.target = target;
+    stalledActiveShellReady.route = route;
+    showActiveShellError(target, "shell ready timeout");
+  }, ACTIVE_SHELL_READY_TIMEOUT_MS);
+}
+
+function pendingActiveShellReadyMatches(target, route) {
+  return pendingActiveShellReady.target === target &&
+    pendingActiveShellReady.route === route;
+}
+
+function stalledActiveShellReadyMatches(target, route) {
+  return stalledActiveShellReady.target === target &&
+    stalledActiveShellReady.route === route;
+}
+
+function settleActiveShellReady(context) {
+  const route = shellState.activeShellRootRoute || activeShellFrame?.dataset?.route || "";
+  if (
+    context.kind !== "shell-frame" ||
+    context.targetId !== shellState.activeShellRootTarget ||
+    !(
+      pendingActiveShellReadyMatches(context.targetId, route) ||
+      stalledActiveShellReadyMatches(context.targetId, route)
+    )
+  ) {
+    return false;
+  }
+  resetActiveShellReadyState();
+  if (activeShellFrame) {
+    activeShellFrame.hidden = false;
+  }
+  hideShellHostRecovery();
+  hideHostBootMask();
+  return true;
+}
+
 function showShellHostRecovery(target, error, options = {}) {
   const detail = shellHostRecoveryDetailText(error);
-  const tokenAvailable = Boolean(activeShellRootHomeToken());
+  const tokenAvailable = hasHomeAuthorityToken();
   document.body.dataset.homeGui = "dormant";
   hideHostBootMask();
   if (activeShellRoot) {
@@ -989,9 +1112,8 @@ function reloadHomeShellHost() {
 }
 
 async function recoverToHomeGui() {
-  const homeToken = activeShellRootHomeToken();
-  if (!homeToken) {
-    showShellHostRecovery(shellState.activeShellRootTarget, "No shell launch token is available.", {
+  if (!hasHomeAuthorityToken()) {
+    showShellHostRecovery(shellState.activeShellRootTarget, "No Home launch token is available.", {
       title: "Desktop is unavailable",
       copy: "Reload to try again. Your data is unchanged.",
     });
@@ -1001,7 +1123,7 @@ async function recoverToHomeGui() {
     shellHostRecoveryHomeButton.disabled = true;
   }
   try {
-    await activateDesktopShell(homeToken);
+    await activateDesktopShell();
   } catch (error) {
     console.error("home-gui recovery failed", error);
     showShellHostRecovery(shellState.activeShellRootTarget, error, {
@@ -1023,7 +1145,7 @@ async function settleRootShellClose(context, data) {
       console.warn("home shell close refresh failed", error);
     }
   }
-  await activateDesktopShell(context.homeToken);
+  await activateDesktopShell();
 }
 
 async function signOutFromShellHostRecovery() {
@@ -1064,20 +1186,22 @@ async function signOutFromRootShell() {
 
 function clearActiveShellRoot({ resetHint = false } = {}) {
   clearLaunchedAppContexts();
+  resetActiveShellReadyState();
   if (resetHint) {
     rememberActiveShellHint(HOME_GUI_SHELL_ID);
   }
   document.body.dataset.homeShell = "resolving";
   document.body.dataset.homeGui = "dormant";
+  shellState.pendingAppliedShellTarget = "";
   shellState.activeShellRootTarget = "";
   shellState.activeShellRootRoute = "";
+  shellState.activeShellRootHomeToken = "";
   if (activeShellRoot) {
     activeShellRoot.hidden = true;
     activeShellRoot.dataset.target = "";
   }
+  clearActiveShellFrameSource();
   if (activeShellFrame) {
-    activeShellFrame.removeAttribute("src");
-    activeShellFrame.dataset.route = "";
     activeShellFrame.title = "Active Home shell";
   }
   hideShellHostRecovery();
@@ -1099,7 +1223,7 @@ function shouldDeferHomeGuiForBootHint(summary, options = {}) {
 }
 
 async function syncActiveShellRoot(summary, options = {}) {
-  const target = activeShellTarget(summary);
+  const target = resolvedActiveShellTarget(summary);
   if (!homeSummarySignedIn(summary)) {
     clearActiveShellRoot({ resetHint: true });
     return "locked";
@@ -1115,6 +1239,28 @@ async function syncActiveShellRoot(summary, options = {}) {
     clearActiveShellRoot();
     showActiveShellError(target, "The selected Home shell is not launchable");
     return "locked";
+  }
+
+  if (
+    shellState.activeShellRootTarget === target &&
+    activeShellRecoveryVisible(target)
+  ) {
+    if (
+      shellState.activeShellRootRoute &&
+      !stalledActiveShellReadyMatches(target, shellState.activeShellRootRoute)
+    ) {
+      hideShellHostRecovery();
+    } else {
+      return target === HOME_GUI_SHELL_ID ? "desktop" : "alternate";
+    }
+  }
+
+  if (
+    shellState.activeShellRootTarget === target &&
+    !shellState.activeShellRootRoute &&
+    activeShellRecoveryVisible(target)
+  ) {
+    return target === HOME_GUI_SHELL_ID ? "desktop" : "alternate";
   }
 
   rememberActiveShellHint(target);
@@ -1134,8 +1280,22 @@ async function syncActiveShellRoot(summary, options = {}) {
     shellState.activeShellRootRoute &&
     activeShellFrame?.dataset.route === shellState.activeShellRootRoute
   ) {
-    activeShellFrame.hidden = false;
-    hideHostBootMask();
+    shellState.activeShellRootHomeToken = activeShellRootHomeToken();
+    if (
+      pendingActiveShellReadyMatches(target, shellState.activeShellRootRoute) ||
+      stalledActiveShellReadyMatches(target, shellState.activeShellRootRoute)
+    ) {
+      activeShellFrame.hidden = true;
+      if (stalledActiveShellReadyMatches(target, shellState.activeShellRootRoute)) {
+        hideHostBootMask();
+        showShellHostRecovery(target, "shell ready timeout");
+      } else {
+        showHostBootMask();
+      }
+    } else {
+      activeShellFrame.hidden = false;
+      hideHostBootMask();
+    }
     return target === HOME_GUI_SHELL_ID ? "desktop" : "alternate";
   }
 
@@ -1145,8 +1305,7 @@ async function syncActiveShellRoot(summary, options = {}) {
   shellState.activeShellRootRoute = "";
   clearLaunchedAppContexts();
   if (activeShellFrame) {
-    activeShellFrame.removeAttribute("src");
-    activeShellFrame.dataset.route = "";
+    clearActiveShellFrameSource();
   }
   try {
     const launched = await launchHomeTarget(target, { shell_mode: "root" });
@@ -1161,13 +1320,25 @@ async function syncActiveShellRoot(summary, options = {}) {
     }
     shellState.activeShellRootTarget = target;
     shellState.activeShellRootRoute = launched.route;
+    shellState.activeShellRootHomeToken = homeLaunchTokenFromRoute(launched.route || "");
+    if (pendingActiveShellReady.target !== target) {
+      clearStalledActiveShellReady();
+    }
     if (activeShellFrame && activeShellFrame.dataset.route !== launched.route) {
-      activeShellFrame.hidden = false;
+      activeShellFrame.hidden = pendingActiveShellReady.target === target;
       activeShellFrame.src = launched.route;
       activeShellFrame.dataset.route = launched.route;
     }
-    hideHostBootMask();
+    if (pendingActiveShellReady.target === target) {
+      armPendingActiveShellReady(target, launched.route, launchSeq);
+    } else {
+      hideHostBootMask();
+    }
   } catch (error) {
+    if (shellState.activeShellRootLaunchSeq !== launchSeq) {
+      return target === HOME_GUI_SHELL_ID ? "desktop" : "alternate";
+    }
+    resetActiveShellReadyState();
     console.error("active shell root launch failed", error);
     showActiveShellError(target, error);
   }
@@ -1228,6 +1399,7 @@ window.addEventListener("message", (event) => {
   }
   if (data.type === "home:shell-ready") {
     if (context.kind === "shell-frame") {
+      settleActiveShellReady(context);
       if (context.targetId === HOME_GUI_SHELL_ID) {
         let browserContextId = "";
         try {

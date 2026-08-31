@@ -141,6 +141,7 @@ async function startRuntimeTerminal() {
       console.warn("Home CLI terminal stream interrupted; waiting for EventSource reconnect");
     };
 
+    notifyHomeShellReady();
     xtermInstance?.focus?.();
   })();
   runtimeTerminalStartPromise = startPromise;
@@ -151,6 +152,16 @@ async function startRuntimeTerminal() {
       runtimeTerminalStartPromise = null;
     }
   }
+}
+
+function notifyHomeShellReady() {
+  if (!homeToken || !homeParentOrigin || !window.parent || window.parent === window) {
+    return;
+  }
+  window.parent.postMessage({
+    type: "home:shell-ready",
+    homeToken,
+  }, homeParentOrigin);
 }
 
 async function attachXtermTerminal(size) {

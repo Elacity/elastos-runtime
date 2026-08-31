@@ -380,6 +380,15 @@ assert(
   "home-cli did not enter attached Runtime terminal mode",
   { body: body.dataset, panel: terminalPanel.dataset },
 );
+assert(
+  parentMessages.some(({ message, origin }) => (
+    message?.type === "home:shell-ready" &&
+      message?.homeToken === "cli-token" &&
+      origin === "http://localhost:61180"
+  )),
+  "home-cli did not tell Home when the real shell became ready",
+  parentMessages,
+);
 
 const activeEventSource = eventSources[0];
 const activeInputSocket = webSockets[0];

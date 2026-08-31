@@ -452,8 +452,8 @@ globalThis.fetch = async (url, init = {}) => {
   if (url === "/api/apps/home/active-shell") {
     assert(body?.active === "home-gui", "root shell app-open must switch back to home-gui", body);
     assert(
-      init.headers?.["x-elastos-home-token"] === "root-token",
-      "home-gui switchback did not use the shell launch token",
+      init.headers?.["x-elastos-home-token"] === "host-token",
+      "home-gui switchback did not use the trusted Home host token",
       init.headers,
     );
     activeShellName = "home-gui";
@@ -907,7 +907,7 @@ assert(
 );
 assert(
   requests.some((request) => request.url === "/api/apps/home/active-shell"),
-  "explicit graphical action did not switch active shell with the shell token",
+  "explicit graphical action did not switch active shell with the trusted Home host token",
   requests,
 );
 assert(
