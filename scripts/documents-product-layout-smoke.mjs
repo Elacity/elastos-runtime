@@ -4,10 +4,13 @@ import { stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
-const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
-const { chromium } = require("playwright");
+const playwrightModule = process.env.ELASTOS_PLAYWRIGHT_MODULE
+  ? await import(pathToFileURL(process.env.ELASTOS_PLAYWRIGHT_MODULE).href)
+  : createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url))("playwright");
+const { chromium } = playwrightModule.chromium ? playwrightModule : playwrightModule.default;
 
 const capsuleRoot = path.resolve("capsules/documents/browser");
 const homeClipboardClientPath = path.resolve("capsules/home/browser/home-clipboard-client.js");
@@ -102,6 +105,47 @@ function contentType(filePath) {
   if (filePath.endsWith(".js")) return "text/javascript; charset=utf-8";
   if (filePath.endsWith(".woff2")) return "font/woff2";
   return "application/octet-stream";
+}
+
+function trackPage(page, consoleErrors, pageErrors, failedRequests, errorResponses) {
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push({
+        text: message.text(),
+        location: message.location(),
+      });
+    }
+  });
+  page.on("pageerror", (error) => {
+    pageErrors.push(error?.stack || String(error));
+  });
+  page.on("requestfailed", (request) => {
+    failedRequests.push({
+      url: request.url(),
+      method: request.method(),
+      error: request.failure()?.errorText || "request failed",
+    });
+  });
+  page.on("response", (response) => {
+    if (response.status() >= 400) {
+      errorResponses.push({
+        url: response.url(),
+        status: response.status(),
+      });
+    }
+  });
+}
+
+async function fillMarkdownCase(page, source, predicate, label) {
+  await page.locator("#editor").fill(source);
+  await page.waitForFunction(predicate);
+  const preview = await page.evaluate(() => ({
+    html: document.getElementById("preview")?.innerHTML || "",
+    text: document.getElementById("preview")?.textContent || "",
+    outlineCount: document.querySelectorAll("#outline-list button").length,
+  }));
+  assert(preview.html.length > 0, `Documents parser made no progress for ${label}.`);
+  return preview;
 }
 
 function json(res, data) {
@@ -318,37 +362,12 @@ async function run() {
   const { port } = server.address();
   const browser = await chromium.launch({ headless: true, executablePath: brave });
   try {
-    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
     const consoleErrors = [];
     const pageErrors = [];
     const failedRequests = [];
     const errorResponses = [];
-    page.on("console", (message) => {
-      if (message.type() === "error") {
-        consoleErrors.push({
-          text: message.text(),
-          location: message.location(),
-        });
-      }
-    });
-    page.on("pageerror", (error) => {
-      pageErrors.push(error?.stack || String(error));
-    });
-    page.on("requestfailed", (request) => {
-      failedRequests.push({
-        url: request.url(),
-        method: request.method(),
-        error: request.failure()?.errorText || "request failed",
-      });
-    });
-    page.on("response", (response) => {
-      if (response.status() >= 400) {
-        errorResponses.push({
-          url: response.url(),
-          status: response.status(),
-        });
-      }
-    });
+    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    trackPage(page, consoleErrors, pageErrors, failedRequests, errorResponses);
     await page.goto(`http://127.0.0.1:${port}/apps/documents/?home_origin=${encodeURIComponent("https://home.example")}#home_token=documents-layout-token`);
     await page.locator(".document-list-item").first().waitFor();
 
@@ -511,8 +530,54 @@ async function run() {
 
     await page.close();
     resetDocumentsFixture();
+    const parserPage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    trackPage(parserPage, consoleErrors, pageErrors, failedRequests, errorResponses);
+    try {
+      await parserPage.goto(`http://127.0.0.1:${port}/apps/documents/?home_origin=${encodeURIComponent("https://home.example")}#home_token=documents-layout-token`);
+      await parserPage.locator(".document-list-item").first().waitFor();
+      await parserPage.locator('.document-list-item[data-doc-did="doc-beta"]').click();
+      await parserPage.waitForFunction(() => document.getElementById("title-input")?.value === "Beta");
+      const parserCases = [
+        { label: "h1-open", source: "# ", predicate: () => (document.getElementById("preview")?.textContent || "").includes("# "), check: (preview) => preview.text.includes("# ") && preview.outlineCount === 0 },
+        { label: "h2-open", source: "## ", predicate: () => (document.getElementById("preview")?.textContent || "").includes("## "), check: (preview) => preview.text.includes("## ") && preview.outlineCount === 0 },
+        { label: "h3-open", source: "### ", predicate: () => (document.getElementById("preview")?.textContent || "").includes("### "), check: (preview) => preview.text.includes("### ") && preview.outlineCount === 0 },
+        { label: "h4-open", source: "#### ", predicate: () => (document.getElementById("preview")?.textContent || "").includes("#### "), check: (preview) => preview.text.includes("#### ") && preview.outlineCount === 0 },
+        { label: "h5-open", source: "##### ", predicate: () => (document.getElementById("preview")?.textContent || "").includes("##### "), check: (preview) => preview.text.includes("##### ") && preview.outlineCount === 0 },
+        { label: "h6-open", source: "###### ", predicate: () => (document.getElementById("preview")?.textContent || "").includes("###### "), check: (preview) => preview.text.includes("###### ") && preview.outlineCount === 0 },
+        { label: "unordered-open", source: "- ", predicate: () => (document.getElementById("preview")?.innerHTML || "").includes("<ul><li></li></ul>"), check: (preview) => preview.html.includes("<ul><li></li></ul>") },
+        { label: "ordered-open", source: "1. ", predicate: () => (document.getElementById("preview")?.innerHTML || "").includes("<ol><li></li></ol>"), check: (preview) => preview.html.includes("<ol><li></li></ol>") },
+        { label: "task-open", source: "- [ ]", predicate: () => (document.getElementById("preview")?.textContent || "").includes("[ ]"), check: (preview) => preview.text.includes("[ ]") },
+        { label: "fence-open", source: "```", predicate: () => (document.getElementById("preview")?.innerHTML || "").includes("<pre><code"), check: (preview) => preview.html.includes("<pre><code") },
+        { label: "table-open", source: "| head |\n| ", predicate: () => (document.getElementById("preview")?.textContent || "").includes("| head |"), check: (preview) => preview.text.includes("| head |") },
+      ];
+      for (const item of parserCases) {
+        const preview = await fillMarkdownCase(parserPage, item.source, item.predicate, item.label);
+        assert(item.check(preview), `Documents parser did not preserve ${item.label}. Got ${JSON.stringify({ item, preview })}`);
+      }
+
+      await parserPage.locator("#editor").fill("# ");
+      await parserPage.waitForFunction(() => (document.getElementById("preview")?.textContent || "").includes("# "));
+
+      const incrementalBody = "# Typed heading\n\nBody after incremental edit.";
+      await parserPage.locator("#editor").fill(incrementalBody);
+      await parserPage.waitForFunction(() => document.querySelector("#preview h1")?.textContent === "Typed heading");
+      await waitForCondition(
+        () => saveCalls.some((call) => call.docDid === "doc-beta" && call.body === incrementalBody),
+        4000,
+        `Documents incremental autosave did not persist the final markdown. Got ${JSON.stringify(saveCalls)}`,
+      );
+      assert(
+        documents.get("doc-beta")?.body === incrementalBody,
+        `Documents incremental autosave must preserve the final markdown body. Got ${JSON.stringify(documents.get("doc-beta"))}`,
+      );
+    } finally {
+      await parserPage.close();
+    }
+
+    resetDocumentsFixture();
     const delayedSave = armDelayedSave();
     const racePage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    trackPage(racePage, consoleErrors, pageErrors, failedRequests, errorResponses);
     try {
       await racePage.goto(`http://127.0.0.1:${port}/apps/documents/?home_origin=${encodeURIComponent("https://home.example")}#home_token=documents-layout-token`);
       await racePage.locator(".document-list-item").first().waitFor();

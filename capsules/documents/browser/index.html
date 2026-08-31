@@ -1537,6 +1537,11 @@ function renderMarkdownDocument(source, options) {
       paragraph.push(renderInlineMarkdown(lines[index]));
       index += 1;
     }
+    if (!paragraph.length) {
+      blocks.push("<p>" + renderInlineMarkdown(line) + "</p>");
+      index += 1;
+      continue;
+    }
     blocks.push("<p>" + paragraph.join("<br>") + "</p>");
   }
 
