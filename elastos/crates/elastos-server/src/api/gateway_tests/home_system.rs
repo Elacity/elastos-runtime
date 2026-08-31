@@ -2,6 +2,7 @@ use super::*;
 use elastos_runtime::signature::{generate_keypair, SigningKey};
 
 const HOME_CLI_CAPSULE_ID_FOR_TEST: &str = "home-cli";
+static HOME_GATEWAY_TEST_ENV_LOCK: TokioMutex<()> = TokioMutex::const_new(());
 
 struct EnvRestore {
     key: &'static str,
@@ -36,6 +37,31 @@ async fn home_test_get_json(
         .oneshot(
             test_browser_request("localhost:61180", origin)
                 .uri(uri)
+                .header("x-elastos-home-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload = serde_json::from_slice(&body).unwrap();
+    (status, payload)
+}
+
+async fn home_test_get_json_without_origin(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
                 .unwrap(),
@@ -787,6 +813,167 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
         .await
         .unwrap();
     assert_eq!(closed.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn home_summary_accepts_gateway_owned_home_cli_token_under_home_owned_grant() {
+    let _guard = HOME_GATEWAY_TEST_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let now = now_ts();
+    let _auth = set_test_home_launch_auth_data_dir(dir.path());
+    let context = HomeLaunchTokenContext {
+        principal_id: "person:home-cli-test".to_string(),
+        session_id: "auth:home-cli-test".to_string(),
+        proof_binding_id: Some("proof:passkey:home-cli-test".to_string()),
+        grant_id: "grant:home-cli-test".to_string(),
+    };
+    crate::auth::store_session_grant(
+        dir.path(),
+        AuthSessionGrantV1 {
+            schema: AuthSessionGrantV1::SCHEMA.to_string(),
+            grant_id: context.grant_id.clone(),
+            session_id: context.session_id.clone(),
+            principal_id: context.principal_id.clone(),
+            proof_binding_id: context.proof_binding_id.clone().unwrap(),
+            issued_at: now,
+            expires_at: now + 300,
+            apps: vec![HOME_CAPSULE_ID.to_string()],
+        },
+    )
+    .unwrap();
+
+    let _owned = EnvRestore::set(
+        crate::runtime_control::GATEWAY_OWNED_HOME_TERMINAL_ENV,
+        "1".to_string(),
+    );
+    let _principal = EnvRestore::set(
+        HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV,
+        context.principal_id.clone(),
+    );
+    let _session = EnvRestore::set(
+        HOME_CLI_AUTH_CONTEXT_SESSION_ID_ENV,
+        context.session_id.clone(),
+    );
+    let _proof = EnvRestore::set(
+        HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID_ENV,
+        context.proof_binding_id.clone().unwrap(),
+    );
+    let _grant = EnvRestore::set(HOME_CLI_AUTH_CONTEXT_GRANT_ID_ENV, context.grant_id.clone());
+
+    let token = issue_gateway_owned_home_cli_launch_token(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST)
+        .unwrap()
+        .unwrap();
+    let (status, payload) =
+        home_test_get_json_without_origin(&app, "/api/apps/home/summary", &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["authority"]["signed_in"], true);
+    assert_eq!(payload["authority"]["principal_id"], context.principal_id);
+}
+
+#[tokio::test]
+async fn direct_home_cli_token_rejects_home_owned_grant_authority() {
+    let _guard = HOME_GATEWAY_TEST_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let now = now_ts();
+    let _auth = set_test_home_launch_auth_data_dir(dir.path());
+    let context = HomeLaunchTokenContext {
+        principal_id: "person:home-cli-test".to_string(),
+        session_id: "auth:home-cli-test".to_string(),
+        proof_binding_id: Some("proof:passkey:home-cli-test".to_string()),
+        grant_id: "grant:home-cli-test".to_string(),
+    };
+    crate::auth::store_session_grant(
+        dir.path(),
+        AuthSessionGrantV1 {
+            schema: AuthSessionGrantV1::SCHEMA.to_string(),
+            grant_id: context.grant_id.clone(),
+            session_id: context.session_id.clone(),
+            principal_id: context.principal_id.clone(),
+            proof_binding_id: context.proof_binding_id.clone().unwrap(),
+            issued_at: now,
+            expires_at: now + 300,
+            apps: vec![HOME_CAPSULE_ID.to_string()],
+        },
+    )
+    .unwrap();
+
+    let token =
+        issue_home_launch_token_with_context(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST, &context)
+            .unwrap();
+    let err =
+        require_carried_home_launch_token(dir.path(), &token, &[HOME_CLI_CAPSULE_ID_FOR_TEST])
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("home launch token authority context mismatch"));
+}
+
+#[tokio::test]
+async fn gateway_owned_home_cli_issuer_projects_non_cli_capsules_under_home_authority() {
+    let _guard = HOME_GATEWAY_TEST_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let now = now_ts();
+    let _auth = set_test_home_launch_auth_data_dir(dir.path());
+    let context = HomeLaunchTokenContext {
+        principal_id: "person:home-cli-test".to_string(),
+        session_id: "auth:home-cli-test".to_string(),
+        proof_binding_id: Some("proof:passkey:home-cli-test".to_string()),
+        grant_id: "grant:home-cli-test".to_string(),
+    };
+    crate::auth::store_session_grant(
+        dir.path(),
+        AuthSessionGrantV1 {
+            schema: AuthSessionGrantV1::SCHEMA.to_string(),
+            grant_id: context.grant_id.clone(),
+            session_id: context.session_id.clone(),
+            principal_id: context.principal_id.clone(),
+            proof_binding_id: context.proof_binding_id.clone().unwrap(),
+            issued_at: now,
+            expires_at: now + 300,
+            apps: vec![HOME_CAPSULE_ID.to_string()],
+        },
+    )
+    .unwrap();
+
+    let _owned = EnvRestore::set(
+        crate::runtime_control::GATEWAY_OWNED_HOME_TERMINAL_ENV,
+        "1".to_string(),
+    );
+    let _principal = EnvRestore::set(
+        HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV,
+        context.principal_id.clone(),
+    );
+    let _session = EnvRestore::set(
+        HOME_CLI_AUTH_CONTEXT_SESSION_ID_ENV,
+        context.session_id.clone(),
+    );
+    let _proof = EnvRestore::set(
+        HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID_ENV,
+        context.proof_binding_id.clone().unwrap(),
+    );
+    let _grant = EnvRestore::set(HOME_CLI_AUTH_CONTEXT_GRANT_ID_ENV, context.grant_id.clone());
+
+    let token = issue_gateway_owned_home_cli_launch_token(dir.path(), "people")
+        .unwrap()
+        .unwrap();
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(
+        payload["payload"]["launch_context"]["selected_resource"],
+        "people"
+    );
+    assert_eq!(
+        payload["payload"]["launch_context"]["executable_actor"],
+        "people"
+    );
+    assert_eq!(
+        payload["payload"]["launch_context"]["authority_actor"],
+        HOME_CAPSULE_ID
+    );
 }
 
 #[tokio::test]
@@ -4763,28 +4950,34 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let home_cli_token = launch_token_from_route(payload["route"].as_str().unwrap()).unwrap();
 
-    let shell_summary = app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .uri("/api/apps/home/summary")
-                .header("x-elastos-home-token", home_cli_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(shell_summary.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(shell_summary.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let (status, payload) =
+        home_test_get_json(&app, "/api/apps/home/summary", &home_cli_token, "null").await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["authority"]["signed_in"], true);
     assert!(payload["targets"]
         .as_array()
         .unwrap()
         .iter()
         .any(|target| target["target"] == "regular-app"));
+
+    let (status, native_shell_summary) =
+        home_test_get_json_without_origin(&app, "/api/apps/home/summary", &home_cli_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(native_shell_summary["authority"]["signed_in"], true);
+    assert_eq!(
+        native_shell_summary["authority"]["principal_id"],
+        authority.principal_id
+    );
+
+    let (status, wrong_origin_shell_summary) = home_test_get_json(
+        &app,
+        "/api/apps/home/summary",
+        &home_cli_token,
+        "http://localhost:61180",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(wrong_origin_shell_summary["authority"]["signed_in"], false);
 
     let catalog = app
         .clone()
@@ -4856,6 +5049,10 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let regular_token = launch_token_from_route(payload["route"].as_str().unwrap()).unwrap();
+    let (status, native_regular_summary) =
+        home_test_get_json_without_origin(&app, "/api/apps/home/summary", &regular_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(native_regular_summary["authority"]["signed_in"], false);
     let catalog_rejected = app
         .clone()
         .oneshot(

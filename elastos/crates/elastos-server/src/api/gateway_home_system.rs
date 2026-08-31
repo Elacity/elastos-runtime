@@ -3684,7 +3684,10 @@ fn require_home_active_shell_wallet_authority(
         HOME_CLI_SHELL_ID.to_string(),
     ]);
     let allowed_refs = allowed.iter().map(String::as_str).collect::<Vec<_>>();
-    require_runtime_wallet_authority(data_dir, headers, &allowed_refs)
+    if let Ok(authority) = require_runtime_wallet_authority(data_dir, headers, &allowed_refs) {
+        return Ok(authority);
+    }
+    require_internal_shell_runtime_wallet_authority(data_dir, headers, &[HOME_CLI_SHELL_ID])
 }
 
 fn require_home_shell_state_token_context(

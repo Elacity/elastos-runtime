@@ -422,6 +422,21 @@ pub(in crate::api) fn require_runtime_wallet_authority(
     runtime_wallet_authority(&required)
 }
 
+pub(in crate::api) fn require_internal_shell_runtime_wallet_authority(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+    allowed_apps: &[&str],
+) -> anyhow::Result<RuntimeWalletAuthority> {
+    let required = require_home_launch_token_for_any_from_with_origin(
+        data_dir,
+        headers,
+        allowed_apps,
+        None,
+        HomeLaunchOriginPolicy::InternalShell,
+    )?;
+    runtime_wallet_authority(&required)
+}
+
 pub(in crate::api) fn require_home_runtime_wallet_authority(
     data_dir: &std::path::Path,
     headers: &HeaderMap,
@@ -1565,5 +1580,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parent_auth_result.context.session_id, "auth:alice");
+    }
+
+    #[test]
+    fn internal_shell_runtime_wallet_authority_accepts_only_home_cli_without_browser_provenance() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let context = local_home_launch_token_context(data_dir.path()).unwrap();
+        let token =
+            issue_home_launch_token_with_context(data_dir.path(), HOME_CLI_SHELL_ID, &context)
+                .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-elastos-home-token", token.parse().unwrap());
+
+        let authority = require_internal_shell_runtime_wallet_authority(
+            data_dir.path(),
+            &headers,
+            &[HOME_CLI_SHELL_ID],
+        )
+        .unwrap();
+        assert_eq!(
+            authority.home_launch_context().principal_id,
+            context.principal_id
+        );
+
+        headers.insert(axum::http::header::ORIGIN, "null".parse().unwrap());
+        assert!(require_internal_shell_runtime_wallet_authority(
+            data_dir.path(),
+            &headers,
+            &[HOME_CLI_SHELL_ID],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("must not carry browser provenance"));
+
+        let regular_token =
+            issue_home_launch_token_with_context(data_dir.path(), "regular-app", &context).unwrap();
+        let mut regular_headers = HeaderMap::new();
+        regular_headers.insert("x-elastos-home-token", regular_token.parse().unwrap());
+        assert!(require_internal_shell_runtime_wallet_authority(
+            data_dir.path(),
+            &regular_headers,
+            &[HOME_CLI_SHELL_ID],
+        )
+        .is_err());
     }
 }

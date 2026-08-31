@@ -400,6 +400,10 @@ struct HomeSummaryFactsProjection {
     #[serde(default)]
     runtime: Option<RuntimeStatus>,
     #[serde(default)]
+    identity: Option<HomeIdentityProjection>,
+    #[serde(default)]
+    authority: Option<HomeAuthorityProjection>,
+    #[serde(default)]
     active_shell: Option<serde_json::Value>,
     #[serde(default)]
     people: PeopleStatus,
@@ -413,6 +417,30 @@ struct HomeSummaryFactsProjection {
     capsule_interfaces: Option<serde_json::Value>,
     #[serde(default)]
     targets: Vec<HomeTargetStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct HomeIdentityProjection {
+    #[serde(default)]
+    profile_setup_display_name: Option<String>,
+    #[serde(default)]
+    profile: Option<HomeProfileProjection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct HomeProfileProjection {
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    handle: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct HomeAuthorityProjection {
+    #[serde(default)]
+    signed_in: bool,
+    #[serde(default)]
+    principal_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1145,11 +1173,31 @@ async fn gather_snapshot_with_site_preview(
     site_local_url: Option<&str>,
 ) -> anyhow::Result<HomeSnapshot> {
     let data_dir = default_data_dir();
-    let did = load_existing_did(&data_dir);
+    let gateway_owned = gateway_owned_home_terminal();
     let source = load_default_source(&data_dir)?;
     let local_runtime = gather_runtime_status(&data_dir).await;
     let home_summary_projection =
         gather_home_summary_projection(&data_dir, local_runtime.api_url.as_deref()).await?;
+    gather_snapshot_from_parts(
+        &data_dir,
+        gateway_owned,
+        source,
+        local_runtime,
+        home_summary_projection,
+        site_local_url,
+    )
+    .await
+}
+
+async fn gather_snapshot_from_parts(
+    data_dir: &Path,
+    gateway_owned: bool,
+    source: Option<SourceStatus>,
+    local_runtime: RuntimeStatus,
+    home_summary_projection: Option<HomeSummaryFactsProjection>,
+    site_local_url: Option<&str>,
+) -> anyhow::Result<HomeSnapshot> {
+    let session = gather_home_cli_session_status();
     let runtime = home_summary_projection
         .as_ref()
         .and_then(|projection| projection.runtime.clone())
@@ -1157,42 +1205,77 @@ async fn gather_snapshot_with_site_preview(
     let capsule_catalog = home_summary_projection
         .as_ref()
         .and_then(|projection| projection.capsule_catalog.clone())
-        .unwrap_or_else(|| elastos_server::api::gateway::capsule_catalog_snapshot(&data_dir));
+        .unwrap_or_else(|| elastos_server::api::gateway::capsule_catalog_snapshot(data_dir));
     let capsule_interfaces = if let Some(interfaces) = home_summary_projection
         .as_ref()
         .and_then(|projection| projection.capsule_interfaces.clone())
     {
         interfaces
     } else {
-        gather_capsule_interface_snapshot(&data_dir, runtime.api_url.as_deref()).await?
+        gather_capsule_interface_snapshot(data_dir, runtime.api_url.as_deref()).await?
     };
     let people = home_summary_projection
         .as_ref()
         .map(|projection| projection.people.clone())
         .unwrap_or_default();
-    let active_shell = if let Some(active_shell) = home_summary_projection
+    if gateway_owned {
+        require_gateway_owned_home_summary_authority(home_summary_projection.as_ref())?;
+    }
+    let active_shell = if gateway_owned {
+        if let Some(active_shell) = home_summary_projection
+            .as_ref()
+            .and_then(|projection| projection.active_shell.clone())
+        {
+            active_shell
+        } else {
+            gather_active_shell_snapshot(data_dir)?
+        }
+    } else if let Some(active_shell) = home_summary_projection
         .as_ref()
         .and_then(|projection| projection.active_shell.clone())
     {
         active_shell
     } else {
-        gather_active_shell_snapshot(&data_dir)?
+        gather_active_shell_snapshot(data_dir)?
     };
-    let site_root = my_website_root_path(&data_dir);
-    let site_head = load_site_head_summary(&data_dir);
-    let release_count = count_site_releases(&data_dir);
-    let nickname = load_runtime_nickname(&data_dir).await;
-    let room_summary = elastos_server::room_service::load_summary(&data_dir).unwrap_or_default();
-    let _ = elastos_server::notifications::sync_room_notifications(&data_dir, &room_summary);
-    let notification_summary =
-        elastos_server::notifications::load_summary(&data_dir).unwrap_or_default();
+    let site_root = my_website_root_path(data_dir);
+    let site_head = load_site_head_summary(data_dir);
+    let release_count = count_site_releases(data_dir);
+    let room_summary = elastos_server::room_service::load_summary(data_dir).unwrap_or_default();
+    let native_notification_summary = if home_summary_projection.is_some() {
+        None
+    } else {
+        let _ = elastos_server::notifications::sync_room_notifications(data_dir, &room_summary);
+        Some(elastos_server::notifications::load_summary(data_dir).unwrap_or_default())
+    };
+    let nickname = if gateway_owned {
+        required_projected_home_display_name(home_summary_projection.as_ref())?
+    } else if let Some(display_name) = projected_home_display_name(home_summary_projection.as_ref())
+    {
+        Some(display_name)
+    } else {
+        load_runtime_nickname(data_dir).await
+    };
+    let did = if gateway_owned {
+        Some(required_projected_home_identity(
+            home_summary_projection.as_ref(),
+        )?)
+    } else {
+        projected_home_identity(home_summary_projection.as_ref())
+            .or_else(|| load_existing_did(data_dir))
+    };
+    let user = if gateway_owned {
+        required_projected_home_user_label(home_summary_projection.as_ref())?
+    } else {
+        projected_home_user_label(home_summary_projection.as_ref()).unwrap_or_else(current_user)
+    };
 
     let mut snapshot = HomeSnapshot {
         version: LOBBY_VERSION.to_string(),
-        user: current_user(),
+        user,
         nickname,
         did,
-        session: gather_home_cli_session_status(),
+        session,
         data_dir: data_dir.display().to_string(),
         source,
         runtime,
@@ -1203,7 +1286,7 @@ async fn gather_snapshot_with_site_preview(
             .and_then(|projection| projection.services.clone())
             .or_else(|| {
                 Some(elastos_server::api::gateway::home_services_snapshot(
-                    &data_dir,
+                    data_dir,
                 ))
             }),
         active_shell,
@@ -1213,7 +1296,7 @@ async fn gather_snapshot_with_site_preview(
             .filter(|targets| !targets.is_empty())
             .unwrap_or_else(|| {
                 serde_json::from_value(elastos_server::api::gateway::home_targets_snapshot(
-                    &data_dir,
+                    data_dir,
                 ))
                 .unwrap_or_default()
             }),
@@ -1326,10 +1409,12 @@ async fn gather_snapshot_with_site_preview(
         notifications: home_summary_projection
             .as_ref()
             .map(|projection| projection.notifications.clone())
-            .unwrap_or_else(|| notification_status_from_summary(notification_summary)),
-        roots: gather_roots(&data_dir),
-        components: gather_components(&data_dir),
-        cached_capsules: gather_cached_capsules(&data_dir),
+            .unwrap_or_else(|| {
+                notification_status_from_summary(native_notification_summary.unwrap_or_default())
+            }),
+        roots: gather_roots(data_dir),
+        components: gather_components(data_dir),
+        cached_capsules: gather_cached_capsules(data_dir),
         capsule_catalog: Some(capsule_catalog),
         capsule_interfaces: Some(capsule_interfaces),
         command_groups: COMMAND_GROUPS
@@ -1344,13 +1429,10 @@ async fn gather_snapshot_with_site_preview(
     };
 
     snapshot.system_services = gather_system_services(&snapshot.components);
-
-    // Core + site actions from the hardcoded list.
     snapshot.actions = CORE_ACTIONS
         .iter()
         .filter_map(|action| {
             let readiness = action_readiness(action.id, &snapshot);
-            // Hide non-core actions when their prerequisites are not installed.
             if !action.core && matches!(readiness, ActionReadiness::Blocked(_)) {
                 return None;
             }
@@ -1368,7 +1450,6 @@ async fn gather_snapshot_with_site_preview(
         })
         .collect();
 
-    // The catalog projection is the only source for dynamic Home CLI actions.
     if let Some(catalog) = snapshot.capsule_catalog.as_ref() {
         snapshot.actions.extend(gather_capsule_actions(catalog));
     }
@@ -1378,6 +1459,127 @@ async fn gather_snapshot_with_site_preview(
         .extend(gather_notification_host_actions(&snapshot));
 
     Ok(snapshot)
+}
+
+fn projected_home_display_name(projection: Option<&HomeSummaryFactsProjection>) -> Option<String> {
+    projection
+        .and_then(|projection| projection.identity.as_ref())
+        .and_then(|identity| {
+            identity
+                .profile
+                .as_ref()
+                .map(|profile| profile.display_name.trim())
+                .filter(|display_name| !display_name.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    identity
+                        .profile_setup_display_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|display_name| !display_name.is_empty())
+                        .map(str::to_string)
+                })
+        })
+}
+
+fn projected_home_identity(projection: Option<&HomeSummaryFactsProjection>) -> Option<String> {
+    projection.and_then(|projection| {
+        projection
+            .identity
+            .as_ref()
+            .and_then(|identity| {
+                identity
+                    .profile
+                    .as_ref()
+                    .and_then(|profile| profile.handle.as_deref())
+                    .map(str::trim)
+                    .filter(|handle| !handle.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                projection
+                    .authority
+                    .as_ref()
+                    .map(|authority| authority.principal_id.trim())
+                    .filter(|principal_id| !principal_id.is_empty())
+                    .map(str::to_string)
+            })
+    })
+}
+
+fn projected_home_user_label(projection: Option<&HomeSummaryFactsProjection>) -> Option<String> {
+    projected_home_display_name(projection).or_else(|| {
+        projection.and_then(|projection| {
+            projection
+                .authority
+                .as_ref()
+                .map(|authority| authority.principal_id.trim())
+                .filter(|principal_id| !principal_id.is_empty())
+                .map(str::to_string)
+        })
+    })
+}
+
+fn required_projected_home_display_name(
+    projection: Option<&HomeSummaryFactsProjection>,
+) -> anyhow::Result<Option<String>> {
+    let Some(projection) = projection else {
+        anyhow::bail!("gateway-owned Home CLI summary unavailable: missing Home summary facts");
+    };
+    if let Some(display_name) = projected_home_display_name(Some(projection)) {
+        return Ok(Some(display_name));
+    }
+    if projection.identity.is_some() || projection.authority.is_some() {
+        return Ok(None);
+    }
+    anyhow::bail!("gateway-owned Home CLI summary unavailable: missing identity projection");
+}
+
+fn required_projected_home_identity(
+    projection: Option<&HomeSummaryFactsProjection>,
+) -> anyhow::Result<String> {
+    let Some(projection) = projection else {
+        anyhow::bail!("gateway-owned Home CLI summary unavailable: missing Home summary facts");
+    };
+    projected_home_identity(Some(projection)).ok_or_else(|| {
+        anyhow::anyhow!("gateway-owned Home CLI summary unavailable: missing identity projection")
+    })
+}
+
+fn required_projected_home_user_label(
+    projection: Option<&HomeSummaryFactsProjection>,
+) -> anyhow::Result<String> {
+    let Some(projection) = projection else {
+        anyhow::bail!("gateway-owned Home CLI summary unavailable: missing Home summary facts");
+    };
+    projected_home_user_label(Some(projection)).ok_or_else(|| {
+        anyhow::anyhow!("gateway-owned Home CLI summary unavailable: missing identity projection")
+    })
+}
+
+fn require_gateway_owned_home_summary_authority(
+    projection: Option<&HomeSummaryFactsProjection>,
+) -> anyhow::Result<()> {
+    let Some(projection) = projection else {
+        anyhow::bail!("gateway-owned Home CLI summary unavailable: missing Home summary facts");
+    };
+    let expected_principal =
+        std::env::var(elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .context("gateway-owned Home CLI summary unavailable: missing principal context")?;
+    let actual_principal = projection
+        .authority
+        .as_ref()
+        .filter(|authority| authority.signed_in)
+        .map(|authority| authority.principal_id.trim())
+        .filter(|principal_id| !principal_id.is_empty())
+        .context("gateway-owned Home CLI summary unavailable: missing admitted authority")?;
+    if actual_principal != expected_principal {
+        anyhow::bail!("gateway-owned Home CLI summary unavailable: admitted principal mismatch");
+    }
+    Ok(())
 }
 
 fn notification_status_from_summary(
@@ -3655,7 +3857,9 @@ mod tests {
 
         let _guard = HOME_CMD_ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -3716,6 +3920,239 @@ mod tests {
             .unwrap();
 
         assert!(projection.is_none());
+    }
+
+    #[tokio::test]
+    async fn gateway_owned_home_snapshot_uses_admitted_summary_shared_facts() {
+        let _guard = HOME_CMD_ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let _owned =
+            ScopedEnvVar::set(crate::runtime_control::GATEWAY_OWNED_HOME_TERMINAL_ENV, "1");
+        let _principal = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV,
+            "person:v07-admin",
+        );
+        let _session = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_SESSION_ID_ENV,
+            "session-v07-admin",
+        );
+        let _proof = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID_ENV,
+            "",
+        );
+        let _grant = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_GRANT_ID_ENV,
+            "grant-v07-admin",
+        );
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        write_home_cmd_test_capsule(&data_dir, "home-gui", "shell", Vec::new());
+        write_home_cmd_test_capsule(&data_dir, "home-cli", "shell", Vec::new());
+        write_home_cmd_active_shell_state(&data_dir, "person:v07-admin", "home-gui");
+
+        let projection: HomeSummaryFactsProjection = serde_json::from_value(serde_json::json!({
+            "runtime": {
+                "running": true,
+                "kind": "managed-home",
+                "version": "0.7.0-dev",
+                "api_url": "http://127.0.0.1:65123",
+                "pid": 42,
+                "running_capsules": ["home-cli"],
+                "note": "ready"
+            },
+            "identity": {
+                "profile": {
+                    "display_name": "v0.7 Admin",
+                    "handle": "person:v07-admin"
+                }
+            },
+            "authority": {
+                "signed_in": true,
+                "principal_id": "person:v07-admin"
+            },
+            "active_shell": {
+                "schema": "elastos.home.active-shell/v1",
+                "active": "home-cli"
+            },
+            "notifications": {
+                "unread_count": 1,
+                "attention_count": 1,
+                "entries": [{
+                    "id": "notice-a",
+                    "source_app": "inbox",
+                    "kind": "inbox.pending",
+                    "title": "Pending request",
+                    "body": "One pending request needs review",
+                    "severity": "attention",
+                    "read": false,
+                    "created_at": 1
+                }]
+            },
+            "capsule_catalog": {
+                "schema": "elastos.capsules.catalog/v1",
+                "capsules": [{"name": "home-gui"}, {"name": "home-cli"}]
+            },
+            "capsule_interfaces": {
+                "schema": "elastos.capsules.interfaces/v1",
+                "interfaces": []
+            },
+            "targets": []
+        }))
+        .unwrap();
+        let snapshot = gather_snapshot_from_parts(
+            &data_dir,
+            true,
+            None,
+            RuntimeStatus::default(),
+            Some(projection),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(snapshot.user, "v0.7 Admin");
+        assert_eq!(snapshot.nickname.as_deref(), Some("v0.7 Admin"));
+        assert_eq!(snapshot.did.as_deref(), Some("person:v07-admin"));
+        assert!(snapshot.runtime.running);
+        assert_eq!(
+            snapshot.runtime.api_url.as_deref(),
+            Some("http://127.0.0.1:65123")
+        );
+        assert_eq!(snapshot.notifications.unread_count, 1);
+        assert_eq!(snapshot.notifications.attention_count, 1);
+        assert_eq!(snapshot.active_shell["active"], "home-cli");
+    }
+
+    #[tokio::test]
+    async fn gateway_owned_home_snapshot_rejects_unsigned_summary_authority() {
+        let _guard = HOME_CMD_ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let _owned =
+            ScopedEnvVar::set(crate::runtime_control::GATEWAY_OWNED_HOME_TERMINAL_ENV, "1");
+        let _principal = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV,
+            "person:v07-admin",
+        );
+        let _session = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_SESSION_ID_ENV,
+            "session-v07-admin",
+        );
+        let _proof = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID_ENV,
+            "",
+        );
+        let _grant = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_GRANT_ID_ENV,
+            "grant-v07-admin",
+        );
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let projection: HomeSummaryFactsProjection = serde_json::from_value(serde_json::json!({
+            "authority": {
+                "signed_in": false,
+                "principal_id": "person:v07-admin"
+            },
+            "active_shell": {
+                "schema": "elastos.home.active-shell/v1",
+                "active": "home-cli"
+            },
+            "notifications": {
+                "unread_count": 0,
+                "attention_count": 0,
+                "entries": []
+            },
+            "capsule_catalog": {
+                "schema": "elastos.capsules.catalog/v1",
+                "capsules": []
+            },
+            "capsule_interfaces": {
+                "schema": "elastos.capsules.interfaces/v1",
+                "interfaces": []
+            },
+            "targets": []
+        }))
+        .unwrap();
+
+        let err = gather_snapshot_from_parts(
+            &data_dir,
+            true,
+            None,
+            RuntimeStatus::default(),
+            Some(projection),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("gateway-owned Home CLI summary unavailable"));
+        assert!(err.contains("missing admitted authority"));
+    }
+
+    #[tokio::test]
+    async fn gateway_owned_home_snapshot_rejects_mismatched_summary_authority() {
+        let _guard = HOME_CMD_ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let _owned =
+            ScopedEnvVar::set(crate::runtime_control::GATEWAY_OWNED_HOME_TERMINAL_ENV, "1");
+        let _principal = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV,
+            "person:v07-admin",
+        );
+        let _session = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_SESSION_ID_ENV,
+            "session-v07-admin",
+        );
+        let _proof = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID_ENV,
+            "",
+        );
+        let _grant = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_GRANT_ID_ENV,
+            "grant-v07-admin",
+        );
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let projection: HomeSummaryFactsProjection = serde_json::from_value(serde_json::json!({
+            "authority": {
+                "signed_in": true,
+                "principal_id": "person:other"
+            },
+            "active_shell": {
+                "schema": "elastos.home.active-shell/v1",
+                "active": "home-cli"
+            },
+            "notifications": {
+                "unread_count": 0,
+                "attention_count": 0,
+                "entries": []
+            },
+            "capsule_catalog": {
+                "schema": "elastos.capsules.catalog/v1",
+                "capsules": []
+            },
+            "capsule_interfaces": {
+                "schema": "elastos.capsules.interfaces/v1",
+                "interfaces": []
+            },
+            "targets": []
+        }))
+        .unwrap();
+
+        let err = gather_snapshot_from_parts(
+            &data_dir,
+            true,
+            None,
+            RuntimeStatus::default(),
+            Some(projection),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("gateway-owned Home CLI summary unavailable"));
+        assert!(err.contains("admitted principal mismatch"));
     }
 
     fn sample_snapshot_with_components(names: &[&str]) -> HomeSnapshot {
@@ -3955,6 +4392,16 @@ mod tests {
                 "running_capsules": [],
                 "note": null
             },
+            "identity": {
+                "profile": {
+                    "display_name": "Anders",
+                    "handle": "person:anders"
+                }
+            },
+            "authority": {
+                "signed_in": true,
+                "principal_id": "person:anders"
+            },
             "active_shell": {
                 "schema": "elastos.home.active-shell/v1",
                 "active": "home-cli"
@@ -4017,6 +4464,22 @@ mod tests {
         assert_eq!(projection.people.contact_count, 1);
         assert_eq!(projection.people.service_offers.len(), 2);
         assert!(projection.runtime.as_ref().unwrap().running);
+        assert_eq!(
+            projection
+                .identity
+                .as_ref()
+                .unwrap()
+                .profile
+                .as_ref()
+                .unwrap()
+                .display_name,
+            "Anders"
+        );
+        assert_eq!(
+            projection.authority.as_ref().unwrap().principal_id,
+            "person:anders"
+        );
+        assert!(projection.authority.as_ref().unwrap().signed_in);
         assert_eq!(
             projection.active_shell.as_ref().unwrap()["active"],
             "home-cli"

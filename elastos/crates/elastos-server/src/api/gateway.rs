@@ -124,8 +124,8 @@ pub(super) use gateway_home_token::{
     require_home_launch_token_for_any_context, require_home_projection_launch_token_context,
     require_home_runtime_wallet_authority, require_home_token, require_home_token_context,
     require_home_viewer_launch_token_context, require_internal_shell_launch_grant_for_any_context,
-    require_runtime_wallet_authority, runtime_wallet_authority, HomeLaunchContext,
-    RequiredHomeLaunchToken,
+    require_internal_shell_runtime_wallet_authority, require_runtime_wallet_authority,
+    runtime_wallet_authority, HomeLaunchContext, RequiredHomeLaunchToken,
 };
 #[cfg(test)]
 pub(in crate::api) use gateway_home_token::{
@@ -326,7 +326,9 @@ pub fn issue_gateway_owned_home_cli_launch_token(
         anyhow::bail!("home launch token context is incomplete");
     }
     Ok(Some(
-        gateway_home_token::issue_home_launch_token_with_context(data_dir, app, &context)?,
+        gateway_home_token::issue_home_projection_launch_token_with_context(
+            data_dir, app, app, &context,
+        )?,
     ))
 }
 
