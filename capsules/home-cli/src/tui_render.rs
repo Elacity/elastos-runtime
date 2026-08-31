@@ -202,7 +202,13 @@ fn render_inbox_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState,
                 "ActionUse  {}",
                 if action.ready { "ready" } else { "blocked" }
             ));
-            details.push("Enter      run this inbox action and return here".to_string());
+            details.push(
+                if action.id.starts_with(INBOX_NOTIFICATION_HANDOFF_ACTION_PREFIX) {
+                    "Enter      open Desktop Inbox for review".to_string()
+                } else {
+                    "Enter      run this inbox action and return here".to_string()
+                },
+            );
             if let Some(reason) = &action.reason {
                 details.extend(wrap_with_label("Setup", reason, column_width));
             }

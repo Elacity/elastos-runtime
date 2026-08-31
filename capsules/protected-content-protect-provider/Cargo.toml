@@ -26,3 +26,10 @@ opt-level = "s"
 lto = true
 
 [workspace]
+
+# Process tests exercise the full PQ protected-content stack; at debug
+# opt-level the crypto is slow enough to breach contract-maximum windows on
+# cold CI runners. Optimize dependencies only; this crate keeps fast debug
+# builds.
+[profile.dev.package."*"]
+opt-level = 2

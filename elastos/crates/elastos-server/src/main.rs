@@ -37,7 +37,8 @@ use elastos_runtime::{bootstrap, provider, session};
 #[cfg(test)]
 pub(crate) use elastos_server::binaries::verify_component_binary_with_data_dir;
 pub(crate) use elastos_server::binaries::{
-    find_installed_provider_binary, resolve_verified_provider_binary, verify_component_binary,
+    find_installed_provider_binary, resolve_verified_native_provider_binary,
+    resolve_verified_provider_binary, verify_component_binary,
 };
 use elastos_server::{api, runtime, setup};
 pub(crate) use elastos_server::{runtime_control, shell_cmd, sources};
@@ -438,6 +439,10 @@ enum Commands {
         /// List available components and profiles
         #[arg(long)]
         list: bool,
+
+        /// Prepare selected component prerequisites without installing components
+        #[arg(long, hide = true)]
+        prerequisites_only: bool,
     },
 
     /// Manage trusted release sources
@@ -1410,8 +1415,9 @@ async fn main() -> anyhow::Result<()> {
             with,
             without,
             list,
+            prerequisites_only,
         } => {
-            setup::run(profile, with, without, list).await?;
+            setup::run(profile, with, without, list, prerequisites_only).await?;
         }
 
         Commands::Source(cmd) => {
@@ -1592,15 +1598,9 @@ async fn get_content_registry_with_local_ipfs_backend(
 }
 
 fn verified_ipfs_provider_binary() -> anyhow::Result<PathBuf> {
-    let binary = find_installed_provider_binary("ipfs-provider").ok_or_else(|| {
+    let binary = resolve_verified_native_provider_binary("ipfs-provider")?.ok_or_else(|| {
         anyhow::anyhow!(
             "ipfs-provider not found. Run: elastos setup --with kubo --with ipfs-provider"
-        )
-    })?;
-    verify_component_binary("ipfs-provider", &binary).map_err(|err| {
-        anyhow::anyhow!(
-            "ipfs-provider not ready. Run:\n\n  elastos setup --with kubo --with ipfs-provider\n\nDetails: {}",
-            err
         )
     })?;
     Ok(binary)

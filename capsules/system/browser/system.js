@@ -3,6 +3,7 @@ import {
   inspectActionRequestValidation,
   provenanceView,
 } from "./esp-projections.mjs";
+import { createHomeClipboardClient } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
 
 const errorNode = document.querySelector(".system-error");
 const backgroundInput = document.querySelector("#background-input");
@@ -14,8 +15,16 @@ const backgroundOverlayRange = document.querySelector("#background-overlay-range
 const backgroundOverlayOpacityInput = document.querySelector("#background-overlay-opacity");
 const backgroundOverlayOpacityValue = document.querySelector("#background-overlay-opacity-value");
 const overlayStatusNode = document.querySelector('[data-field="overlay-status"]');
+const settingsSearchInput = document.querySelector("#settings-search");
 const guestRegistrationInput = document.querySelector("#guest-registration");
 const guestRegistrationStatusNode = document.querySelector('[data-field="guest-registration-status"]');
+const themeSegment = document.querySelector("#theme-segment");
+const accentPickerNode = document.querySelector("#accent-picker");
+const accentCustomPopover = document.querySelector("#accent-custom-popover");
+const accentCustomPickerRoot = document.querySelector("#accent-custom-picker");
+const accentCustomHexInput = document.querySelector("#accent-custom-hex");
+const dockAutoHideInput = document.querySelector("#dock-autohide");
+const uiSoundsInput = document.querySelector("#ui-sounds");
 const passkeyStatusNode = document.querySelector('[data-field="passkey-status"]');
 const accountListNode = document.querySelector("#account-list");
 const recoveryDownloadButton = document.querySelector("#recovery-download");
@@ -38,10 +47,42 @@ const technicalInspectListNode = document.querySelector("#technical-inspect-list
 const technicalInspectDetailNode = document.querySelector("#technical-inspect-detail");
 const technicalInspectStatusNode = document.querySelector("#technical-inspect-status");
 const technicalInspectRefreshButton = document.querySelector("#technical-inspect-refresh");
+const deviceDidCopyButton = document.querySelector("#device-did-copy");
 const frameHomeToken = readLaunchToken();
 const homeParentOrigin = readQueryParam("home_origin");
 const HOME_HOST_ID = "home";
 const HOME_GUI_SHELL_ID = "home-gui";
+const HOME_APPEARANCE_SCHEMA = "elastos.home.appearance/v1";
+const HOME_APPEARANCE_REVISION_MAX = 9_007_199_254_740_991;
+const HOME_APPEARANCE_RESPONSE_KEYS = [
+  "schema",
+  "revision",
+  "theme",
+  "accent",
+  "accent_custom",
+  "dock_auto_hide",
+  "sounds",
+  "focus_mode",
+  "background_image_url",
+  "background_overlay_enabled",
+  "background_overlay_opacity",
+];
+const THEME_VALUES = new Set(["auto", "light", "dark"]);
+const ACCENT_VALUES = new Set([
+  ...(Array.isArray(window.elastosTheme?.accents) ? window.elastosTheme.accents : [
+    "blue",
+    "purple",
+    "pink",
+    "red",
+    "orange",
+    "yellow",
+    "green",
+    "graphite",
+  ]),
+  "custom",
+]);
+const DEFAULT_COPY_LABEL = "Copy";
+const COPIED_LABEL = "Copied";
 if (frameHomeToken && homeParentOrigin && window.top !== window) {
   window.top.postMessage({ type: "home:app-ready", homeToken: frameHomeToken }, homeParentOrigin);
 }
@@ -57,6 +98,13 @@ let passkeyAuthorityActive = false;
 let pendingRecoveryImport = null;
 let activeShellName = "";
 let activeShellBusy = false;
+let currentAppearance = null;
+let appearanceWriteQueue = Promise.resolve();
+let appearanceControlsBusy = false;
+let accentCustomPicker = null;
+let accentCustomWriteTimer = 0;
+let deviceDidValue = "";
+let deviceDidCopyTimer = 0;
 const DEFAULT_BACKGROUND_IMAGE_URL = "/apps/home-gui/wallpaper.webp";
 const BACKGROUND_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const BACKGROUND_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -86,6 +134,22 @@ const CATALOG_GROUPS = [
   { role: "provider", label: "Background services" },
   { role: "shell", label: "Home views" },
 ];
+const SETTINGS_SEARCH_KEYWORDS = Object.freeze({
+  account: ["account", "passkey", "accounts", "credential", "signin", "sign in"],
+  personalization: ["appearance", "theme", "accent", "background", "wallpaper", "dock", "sound"],
+  shell: ["shell", "desktop", "terminal", "home gui", "home cli"],
+  security: ["security", "recovery", "access", "guest", "inspection", "technical"],
+  catalog: ["catalog", "apps", "services", "capsules"],
+  about: ["about", "device", "version", "source", "network", "did"],
+});
+const ALLOWED_SETTINGS_TABS = new Set(Object.keys(SETTINGS_SEARCH_KEYWORDS));
+const requestedSettingsTab = normalizedRequestedSettingsTab(readQueryParam("settings"));
+let requestedSettingsActionFocused = false;
+const homeClipboard = createHomeClipboardClient({
+  targetId: "system",
+  homeOrigin: homeParentOrigin,
+  homeToken: frameHomeToken,
+});
 
 boot().catch((error) => {
   console.error("system boot failed", error);
@@ -98,8 +162,12 @@ async function boot() {
     document.querySelector("#system-locked").hidden = false;
     return;
   }
+  homeClipboard.start();
   configureSettingsTabs();
+  configureSettingsSearch();
+  activateSettingsTab(requestedSettingsTab || "account");
   configureAppearanceEditor();
+  configureAppearancePreferences();
   configureGuestAccess();
   configurePasskeyAccess();
   configureRecoveryAccess();
@@ -107,6 +175,7 @@ async function boot() {
   configureActiveShell();
   configureCapsuleCatalog();
   configureTechnicalDetails();
+  configureDeviceDidCopy();
   await refreshSystemSummary();
   await refreshActiveShell().catch((error) => showActiveShellStatus(String(error.message || error), "error"));
   await refreshAccountList().catch(() => {});
@@ -151,6 +220,31 @@ function activateSettingsTab(settings) {
   if (container) {
     container.scrollTop = 0;
   }
+  syncSearchHit(tab);
+}
+
+function normalizedRequestedSettingsTab(settings) {
+  const tab = readText(settings);
+  return ALLOWED_SETTINGS_TABS.has(tab) ? tab : "";
+}
+
+function focusRequestedSettingsAction() {
+  if (
+    requestedSettingsActionFocused
+    || requestedSettingsTab !== "security"
+    || !recoveryDownloadButton
+    || recoveryDownloadButton.disabled
+  ) {
+    return;
+  }
+  const activeTab = readText(
+    document.querySelector(".settings-sidebar-item.active")?.dataset.settings,
+  );
+  if (activeTab !== "security") {
+    return;
+  }
+  requestedSettingsActionFocused = true;
+  recoveryDownloadButton.focus();
 }
 
 function hasShellAccess() {
@@ -176,16 +270,17 @@ async function fetchJson(url, init) {
 
 function renderSystemSummary(systemSummary) {
   const identity = systemSummary.identity || {};
-  const appearance = systemSummary.appearance || {};
+  const appearance = parseAppearance(systemSummary.appearance);
   const authority = systemSummary.authority || {};
   const access = systemSummary.access || {};
   const runtime = systemSummary.runtime || {};
   const source = systemSummary.source || {};
 
   setField("device-did", shortDid(identity.device_did), "", identity.device_did);
+  syncDeviceDidCopy(identity.device_did);
   setAccessPolicy(access);
   setPasskeyAuthority(authority);
-  setAppearance(appearance);
+  acceptAppearance(appearance);
   setRuntimeState(runtime);
   setSourceState(source);
 }
@@ -213,6 +308,59 @@ function setHiddenFields(field, hidden) {
   for (const node of document.querySelectorAll(`[data-field="${field}"]`)) {
     node.hidden = hidden;
   }
+}
+
+function configureSettingsSearch() {
+  if (!settingsSearchInput) {
+    return;
+  }
+  settingsSearchInput.addEventListener("input", () => {
+    const query = readText(settingsSearchInput.value).toLowerCase();
+    let firstVisible = "";
+    for (const item of document.querySelectorAll(".settings-sidebar-item")) {
+      const section = readText(item.dataset.settings);
+      const visible = settingsSectionMatches(section, query);
+      item.classList.toggle("search-hidden", !visible);
+      if (!firstVisible && visible) {
+        firstVisible = section;
+      }
+    }
+    const active = readText(document.querySelector(".settings-sidebar-item.active")?.dataset.settings);
+    if (query && active && !settingsSectionMatches(active, query) && firstVisible) {
+      activateSettingsTab(firstVisible);
+      return;
+    }
+    syncSearchHit(active || firstVisible);
+  });
+}
+
+function settingsSectionMatches(section, query) {
+  if (!section) {
+    return false;
+  }
+  if (!query) {
+    return true;
+  }
+  const item = document.querySelector(`.settings-sidebar-item[data-settings="${section}"]`);
+  const content = document.querySelector(`.settings-content[data-settings="${section}"]`);
+  const keywords = SETTINGS_SEARCH_KEYWORDS[section] || [];
+  const haystack = [
+    readText(item?.textContent),
+    readText(content?.textContent),
+    ...keywords,
+  ].join(" ").toLowerCase();
+  return haystack.includes(query);
+}
+
+function syncSearchHit(section) {
+  for (const content of document.querySelectorAll(".settings-content")) {
+    content.classList.remove("settings-search-hit");
+  }
+  const query = readText(settingsSearchInput?.value).toLowerCase();
+  if (!query || !section) {
+    return;
+  }
+  document.querySelector(`.settings-content[data-settings="${section}"]`)?.classList.add("settings-search-hit");
 }
 
 function configureAppearanceEditor() {
@@ -244,6 +392,145 @@ function configureAppearanceEditor() {
       backgroundOverlayOpacityInput.addEventListener("change", onBackgroundOverlayChange);
     }
   }
+}
+
+function configureAppearancePreferences() {
+  configureThemeSegment();
+  configureAccentPicker();
+  configureDockAutoHide();
+  configureUiSounds();
+}
+
+function configureThemeSegment() {
+  if (!themeSegment || !hasShellAccess()) {
+    return;
+  }
+  themeSegment.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-theme-option]");
+    if (!button || !themeSegment.contains(button) || appearanceControlsBusy) {
+      return;
+    }
+    const theme = button.dataset.themeOption;
+    if (!THEME_VALUES.has(theme) || theme === currentAppearance?.theme) {
+      return;
+    }
+    writeAppearancePreference({ theme });
+  });
+}
+
+function configureAccentPicker() {
+  if (!accentPickerNode || !hasShellAccess()) {
+    return;
+  }
+  accentCustomPicker = window.elastosAccentPicker?.mount?.(accentCustomPickerRoot, {
+    getHex: () => currentAppearance?.accent_custom || "#4f7fff",
+    onChange: (hex) => {
+      if (document.activeElement !== accentCustomHexInput) {
+        accentCustomHexInput.value = hex;
+      }
+      scheduleAccentCustomWrite(hex);
+    },
+  }) || null;
+  accentPickerNode.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-accent-option]");
+    if (!button || !accentPickerNode.contains(button) || appearanceControlsBusy) {
+      return;
+    }
+    const accent = button.dataset.accentOption;
+    if (!ACCENT_VALUES.has(accent) || accent === currentAppearance?.accent) {
+      return;
+    }
+    cancelAccentCustomWrite();
+    writeAppearancePreference({ accent });
+  });
+  accentCustomHexInput?.addEventListener("change", commitAccentCustomHexInput);
+  accentCustomHexInput?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") {
+      return;
+    }
+    event.preventDefault();
+    commitAccentCustomHexInput();
+  });
+}
+
+function scheduleAccentCustomWrite(value) {
+  const accentCustom = normalizeAppearanceHex(value);
+  if (
+    !accentCustom
+    || appearanceControlsBusy
+    || currentAppearance?.accent !== "custom"
+    || accentCustom === currentAppearance?.accent_custom
+  ) {
+    return;
+  }
+  if (accentCustomWriteTimer) {
+    window.clearTimeout(accentCustomWriteTimer);
+  }
+  accentCustomWriteTimer = window.setTimeout(() => {
+    accentCustomWriteTimer = 0;
+    if (
+      appearanceControlsBusy
+      || currentAppearance?.accent !== "custom"
+      || accentCustom === currentAppearance?.accent_custom
+    ) {
+      return;
+    }
+    writeAppearancePreference({ accent_custom: accentCustom });
+  }, 120);
+}
+
+function cancelAccentCustomWrite() {
+  if (!accentCustomWriteTimer) {
+    return;
+  }
+  window.clearTimeout(accentCustomWriteTimer);
+  accentCustomWriteTimer = 0;
+}
+
+function commitAccentCustomHexInput() {
+  if (!accentCustomHexInput) {
+    return;
+  }
+  cancelAccentCustomWrite();
+  const accentCustom = normalizeAppearanceHex(accentCustomHexInput.value);
+  if (!accentCustom || accentCustom === currentAppearance?.accent_custom || appearanceControlsBusy) {
+    restoreAppearanceControls();
+    return;
+  }
+  accentCustomHexInput.value = accentCustom;
+  writeAppearancePreference({ accent_custom: accentCustom });
+}
+
+function configureDockAutoHide() {
+  if (!dockAutoHideInput || !hasShellAccess()) {
+    return;
+  }
+  dockAutoHideInput.addEventListener("change", () => {
+    if (!currentAppearance || appearanceControlsBusy) {
+      restoreAppearanceControls();
+      return;
+    }
+    if (dockAutoHideInput.checked === currentAppearance.dock_auto_hide) {
+      return;
+    }
+    writeAppearancePreference({ dock_auto_hide: dockAutoHideInput.checked });
+  });
+}
+
+function configureUiSounds() {
+  if (!uiSoundsInput || !hasShellAccess()) {
+    return;
+  }
+  uiSoundsInput.addEventListener("change", () => {
+    if (!currentAppearance || appearanceControlsBusy) {
+      restoreAppearanceControls();
+      return;
+    }
+    if (uiSoundsInput.checked === currentAppearance.sounds) {
+      return;
+    }
+    writeAppearancePreference({ sounds: uiSoundsInput.checked });
+  });
 }
 
 function configureGuestAccess() {
@@ -399,24 +686,25 @@ async function onBackgroundInputChange() {
     backgroundInput.value = "";
     return;
   }
-  setAppearanceControlsDisabled(true);
+  setAllAppearanceControlsDisabled(true);
   try {
-    const appearance = await fetchJson("/api/apps/system/appearance/background-image", {
+    const appearance = parseAppearance(await fetchJson("/api/apps/system/appearance/background-image", {
       method: "POST",
       headers: {
         "content-type": file.type,
         "x-elastos-home-token": apiHomeToken,
       },
       body: file,
-    });
-    setAppearance(appearance);
+    }));
+    acceptAppearance(appearance);
     showBackgroundStatus("Updated.", "success");
     notifyHomeSummaryChanged();
   } catch (error) {
+    restoreAppearanceControls();
     showBackgroundStatus(String(error.message || error), "error");
   } finally {
     backgroundInput.value = "";
-    setAppearanceControlsDisabled(false);
+    setAllAppearanceControlsDisabled(false);
   }
 }
 
@@ -425,21 +713,22 @@ async function onBackgroundReset() {
     return;
   }
   clearBackgroundStatus();
-  setAppearanceControlsDisabled(true);
+  setAllAppearanceControlsDisabled(true);
   try {
-    const appearance = await fetchJson("/api/apps/system/appearance/background-image", {
+    const appearance = parseAppearance(await fetchJson("/api/apps/system/appearance/background-image", {
       method: "DELETE",
       headers: {
         "x-elastos-home-token": apiHomeToken,
       },
-    });
-    setAppearance(appearance);
+    }));
+    acceptAppearance(appearance);
     showBackgroundStatus("Reset.", "success");
     notifyHomeSummaryChanged();
   } catch (error) {
+    restoreAppearanceControls();
     showBackgroundStatus(String(error.message || error), "error");
   } finally {
-    setAppearanceControlsDisabled(false);
+    setAllAppearanceControlsDisabled(false);
   }
 }
 
@@ -449,9 +738,9 @@ async function onBackgroundOverlayChange() {
   }
   clearOverlayStatus();
   setOverlayRangeVisible(backgroundOverlayInput.checked);
-  setAppearanceControlsDisabled(true);
+  setAllAppearanceControlsDisabled(true);
   try {
-    const appearance = await fetchJson("/api/apps/system/appearance/background-overlay", {
+    const appearance = parseAppearance(await fetchJson("/api/apps/system/appearance/background-overlay", {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -461,21 +750,108 @@ async function onBackgroundOverlayChange() {
         enabled: backgroundOverlayInput.checked,
         opacity: readOverlayOpacityInput(),
       }),
-    });
-    setAppearance(appearance);
+    }));
+    acceptAppearance(appearance);
     showOverlayStatus("Saved.", "success");
     notifyHomeSummaryChanged();
   } catch (error) {
+    restoreAppearanceControls();
     showOverlayStatus(String(error.message || error), "error");
   } finally {
-    setAppearanceControlsDisabled(false);
+    setAllAppearanceControlsDisabled(false);
   }
 }
 
-function setAppearance(appearance) {
-  const imageUrl = readText(appearance && appearance.background_image_url);
-  const overlayEnabled = appearance && appearance.background_overlay_enabled === true;
-  const overlayOpacity = clampOverlayOpacity(Number(appearance && appearance.background_overlay_opacity));
+function parseAppearance(appearance) {
+  const record = appearance && typeof appearance === "object" && !Array.isArray(appearance)
+    ? appearance
+    : null;
+  if (!record || !hasExactKeys(record, HOME_APPEARANCE_RESPONSE_KEYS) || record.schema !== HOME_APPEARANCE_SCHEMA) {
+    throw new Error("invalid appearance preference schema");
+  }
+  const revision = record.revision;
+  if (
+    typeof revision !== "number"
+    || Number.isNaN(revision)
+    || !Number.isSafeInteger(revision)
+    || revision < 0
+    || revision > HOME_APPEARANCE_REVISION_MAX
+  ) {
+    throw new Error("invalid appearance preference revision");
+  }
+  const theme = record.theme;
+  const accent = record.accent;
+  const accentCustom = normalizeAppearanceHex(record.accent_custom);
+  const backgroundImageUrl = record.background_image_url;
+  const backgroundOverlayOpacity = record.background_overlay_opacity;
+  const backgroundImageValid = backgroundImageUrl === null || (
+    typeof backgroundImageUrl === "string"
+    && backgroundImageUrl.trim().length > 0
+    && backgroundImageUrl.length <= 16_384
+  );
+  if (!THEME_VALUES.has(theme)) {
+    throw new Error("invalid appearance preference theme");
+  }
+  if (!ACCENT_VALUES.has(accent)) {
+    throw new Error("invalid appearance preference accent");
+  }
+  if (!accentCustom || accentCustom !== record.accent_custom) {
+    throw new Error("invalid appearance preference accent_custom");
+  }
+  if (
+    typeof record.dock_auto_hide !== "boolean"
+    || typeof record.sounds !== "boolean"
+    || typeof record.focus_mode !== "boolean"
+    || typeof record.background_overlay_enabled !== "boolean"
+  ) {
+    throw new Error("invalid appearance preference boolean");
+  }
+  if (!backgroundImageValid) {
+    throw new Error("invalid appearance background_image_url");
+  }
+  if (
+    typeof backgroundOverlayOpacity !== "number"
+    || !Number.isFinite(backgroundOverlayOpacity)
+    || backgroundOverlayOpacity < 0
+    || backgroundOverlayOpacity > BACKGROUND_OVERLAY_OPACITY_MAX
+  ) {
+    throw new Error("invalid appearance background_overlay_opacity");
+  }
+  return {
+    schema: HOME_APPEARANCE_SCHEMA,
+    revision,
+    theme,
+    accent,
+    accent_custom: accentCustom,
+    dock_auto_hide: record.dock_auto_hide,
+    sounds: record.sounds,
+    focus_mode: record.focus_mode,
+    background_image_url: backgroundImageUrl || "",
+    background_overlay_enabled: record.background_overlay_enabled,
+    background_overlay_opacity: backgroundOverlayOpacity,
+  };
+}
+
+function acceptAppearance(appearance) {
+  if (currentAppearance && appearance.revision < currentAppearance.revision) {
+    restoreAppearanceControls();
+    return false;
+  }
+  currentAppearance = appearance;
+  applyAppearance(appearance);
+  return true;
+}
+
+function applyAppearance(appearance) {
+  if (!appearance) {
+    return;
+  }
+  const imageUrl = readText(appearance.background_image_url);
+  const overlayEnabled = appearance.background_overlay_enabled === true;
+  const overlayOpacity = clampOverlayOpacity(Number(appearance.background_overlay_opacity));
+  window.elastosTheme?.set?.(appearance.theme);
+  window.elastosTheme?.setAccentCustom?.(appearance.accent_custom);
+  window.elastosTheme?.setAccent?.(appearance.accent);
   if (backgroundPreview) {
     backgroundPreview.style.backgroundImage = `url("${imageUrl || DEFAULT_BACKGROUND_IMAGE_URL}")`;
     backgroundPreview.dataset.empty = imageUrl ? "false" : "true";
@@ -492,6 +868,40 @@ function setAppearance(appearance) {
   } else {
     setOverlayOpacity(readOverlayOpacityInput());
   }
+  syncAppearanceControls(appearance);
+}
+
+function syncAppearanceControls(appearance) {
+  if (!appearance) {
+    return;
+  }
+  for (const button of themeSegment?.querySelectorAll("[data-theme-option]") || []) {
+    const checked = button.dataset.themeOption === appearance.theme;
+    button.classList.toggle("active", checked);
+    button.setAttribute("aria-checked", checked ? "true" : "false");
+  }
+  for (const button of accentPickerNode?.querySelectorAll("[data-accent-option]") || []) {
+    const checked = button.dataset.accentOption === appearance.accent;
+    button.classList.toggle("active", checked);
+    button.setAttribute("aria-checked", checked ? "true" : "false");
+  }
+  if (dockAutoHideInput && document.activeElement !== dockAutoHideInput) {
+    dockAutoHideInput.checked = appearance.dock_auto_hide;
+  }
+  if (uiSoundsInput && document.activeElement !== uiSoundsInput) {
+    uiSoundsInput.checked = appearance.sounds;
+  }
+  if (accentCustomHexInput && document.activeElement !== accentCustomHexInput) {
+    accentCustomHexInput.value = appearance.accent_custom;
+  }
+  if (accentCustomPopover) {
+    accentCustomPopover.hidden = appearance.accent !== "custom";
+  }
+  accentCustomPicker?.setHex?.(appearance.accent_custom);
+}
+
+function restoreAppearanceControls() {
+  applyAppearance(currentAppearance);
 }
 
 function setAppearanceControlsDisabled(disabled) {
@@ -507,6 +917,63 @@ function setAppearanceControlsDisabled(disabled) {
   if (backgroundOverlayOpacityInput) {
     backgroundOverlayOpacityInput.disabled = disabled || !hasShellAccess();
   }
+}
+
+function setAllAppearanceControlsDisabled(disabled) {
+  setAppearanceControlsDisabled(disabled);
+  setAppearancePreferenceControlsDisabled(disabled);
+}
+
+function setAppearancePreferenceControlsDisabled(disabled) {
+  appearanceControlsBusy = disabled;
+  for (const button of themeSegment?.querySelectorAll("[data-theme-option]") || []) {
+    button.disabled = disabled || !hasShellAccess();
+  }
+  for (const button of accentPickerNode?.querySelectorAll("[data-accent-option]") || []) {
+    button.disabled = disabled || !hasShellAccess();
+  }
+  if (accentCustomHexInput) {
+    accentCustomHexInput.disabled = disabled || !hasShellAccess() || currentAppearance?.accent !== "custom";
+  }
+  const accentCustomDisabled = disabled || !hasShellAccess() || currentAppearance?.accent !== "custom";
+  if (accentCustomPickerRoot) {
+    accentCustomPickerRoot.inert = accentCustomDisabled;
+    accentCustomPickerRoot.setAttribute("aria-disabled", accentCustomDisabled ? "true" : "false");
+  }
+  for (const control of accentCustomPickerRoot?.querySelectorAll("button, input") || []) {
+    control.disabled = accentCustomDisabled;
+  }
+  if (dockAutoHideInput) {
+    dockAutoHideInput.disabled = disabled || !hasShellAccess();
+  }
+  if (uiSoundsInput) {
+    uiSoundsInput.disabled = disabled || !hasShellAccess();
+  }
+}
+
+function writeAppearancePreference(update) {
+  appearanceWriteQueue = appearanceWriteQueue
+    .catch(() => {})
+    .then(async () => {
+      setAllAppearanceControlsDisabled(true);
+      clearError();
+      try {
+        const next = parseAppearance(await fetchJson("/api/apps/system/appearance/preferences", {
+          method: "POST",
+          headers: shellHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify(update),
+        }));
+        if (acceptAppearance(next)) {
+          notifyHomeSummaryChanged();
+        }
+      } catch (error) {
+        restoreAppearanceControls();
+        showError(error);
+      } finally {
+        setAllAppearanceControlsDisabled(false);
+      }
+    });
+  return appearanceWriteQueue;
 }
 
 function setOverlayRangeVisible(visible) {
@@ -578,6 +1045,60 @@ function clearOverlayStatus() {
   overlayStatusNode.hidden = true;
   overlayStatusNode.textContent = "";
   overlayStatusNode.dataset.tone = "";
+}
+
+function configureDeviceDidCopy() {
+  if (!deviceDidCopyButton) {
+    return;
+  }
+  deviceDidCopyButton.addEventListener("click", async () => {
+    if (!deviceDidValue) {
+      return;
+    }
+    clearError();
+    try {
+      await homeClipboard.writeText(deviceDidValue, { purpose: "identity.did" });
+      pulseDeviceDidCopyButton();
+    } catch (error) {
+      showError(error);
+      syncDeviceDidCopy(deviceDidValue);
+    }
+  });
+}
+
+function syncDeviceDidCopy(value) {
+  deviceDidValue = readText(value);
+  if (!deviceDidCopyButton) {
+    return;
+  }
+  if (deviceDidCopyTimer) {
+    window.clearTimeout(deviceDidCopyTimer);
+    deviceDidCopyTimer = 0;
+  }
+  deviceDidCopyButton.dataset.copied = "false";
+  deviceDidCopyButton.querySelector(".el-copy-icon")?.removeAttribute("hidden");
+  deviceDidCopyButton.querySelector(".el-copy-check")?.setAttribute("hidden", "");
+  deviceDidCopyButton.disabled = deviceDidValue.length === 0;
+  deviceDidCopyButton.title = deviceDidValue.length > 0 ? DEFAULT_COPY_LABEL : "";
+  deviceDidCopyButton.setAttribute("aria-label", deviceDidValue.length > 0 ? "Copy device identity" : "Device identity unavailable");
+}
+
+function pulseDeviceDidCopyButton() {
+  if (!deviceDidCopyButton) {
+    return;
+  }
+  if (deviceDidCopyTimer) {
+    window.clearTimeout(deviceDidCopyTimer);
+  }
+  deviceDidCopyButton.dataset.copied = "true";
+  deviceDidCopyButton.querySelector(".el-copy-icon")?.setAttribute("hidden", "");
+  deviceDidCopyButton.querySelector(".el-copy-check")?.removeAttribute("hidden");
+  deviceDidCopyButton.title = COPIED_LABEL;
+  deviceDidCopyButton.setAttribute("aria-label", "Copied device identity");
+  deviceDidCopyTimer = window.setTimeout(() => {
+    deviceDidCopyTimer = 0;
+    syncDeviceDidCopy(deviceDidValue);
+  }, 1200);
 }
 
 function openCapsuleTarget(target) {
@@ -1681,6 +2202,7 @@ async function refreshRecoveryStatus() {
       headers: shellHeaders(),
     });
     setRecoveryStatus(status);
+    focusRequestedSettingsAction();
   } catch (error) {
     showRecoveryStatus("Unavailable", "error");
     showRecoveryNote(String(error.message || error), "error");
@@ -1732,8 +2254,15 @@ async function onRecoveryDownload() {
       recoveryPasswordInput.value = "";
     }
     showRecoveryStatus("", "success");
-    showRecoveryNote("Recovery Kit downloaded. Store it offline; it can recover Home data, included built-in Wallet accounts, and your signed People identity with its contacts.", "success");
+    const peopleIdentity = bundle && bundle.included && bundle.included.people_identity;
+    showRecoveryNote(
+      peopleIdentity
+        ? "Recovery Kit downloaded. Store it offline; it includes your signed People identity."
+        : "Recovery Kit downloaded. Store it offline.",
+      "success"
+    );
     setRecoveryButton("Download Recovery Kit", false);
+    notifyHomeSummaryChanged();
   } catch (error) {
     showRecoveryStatus("Not set", "error");
     showRecoveryNote(String(error.message || error), "error");
@@ -2608,6 +3137,12 @@ function shellHeaders(extra) {
   );
 }
 
+function normalizeAppearanceHex(value) {
+  return typeof window.elastosTheme?.normalizeHex === "function"
+    ? window.elastosTheme.normalizeHex(value)
+    : "";
+}
+
 function hasExactKeys(value, expectedKeys) {
   const actual = Object.keys(value).sort();
   const expected = [...expectedKeys].sort();
@@ -2633,4 +3168,12 @@ function showError(error) {
   }
   errorNode.hidden = false;
   errorNode.textContent = publicSystemError(error, "System could not be loaded.");
+}
+
+function clearError() {
+  if (!errorNode) {
+    return;
+  }
+  errorNode.hidden = true;
+  errorNode.textContent = "";
 }

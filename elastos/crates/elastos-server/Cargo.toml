@@ -23,6 +23,7 @@ elastos-protected-content-runtime = { path = "../elastos-protected-content-runti
 elastos-protected-content-rights = { path = "../elastos-protected-content-rights" }
 elastos-protected-content-provider-contracts = { path = "../elastos-protected-content-provider-contracts" }
 elastos-protected-content-contracts = { path = "../elastos-protected-content-contracts" }
+elastos-model-contract = { path = "../elastos-model-contract" }
 
 # HTTP server
 axum = { version = "0.7", features = ["ws"] }

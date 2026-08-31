@@ -245,6 +245,16 @@ export function createHomeClipboardPrompt({
       "Continue to copy this resource URI to this device clipboard.",
       "Copy",
     ],
+    "assistant:transcript.markdown:write": [
+      "Copy Assistant transcript?",
+      "Continue to copy this Assistant conversation as Markdown to this device clipboard.",
+      "Copy",
+    ],
+    "system:identity.did:write": [
+      "Copy device DID?",
+      "Continue to copy this bounded technical device identifier to this device clipboard.",
+      "Copy identifier",
+    ],
     "chat-room:conversation.invite:write": [
       "Copy conversation invite?",
       "Continue to copy this short-lived conversation invite to this device clipboard.",

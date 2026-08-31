@@ -1,0 +1,58 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "elacity-player",
+  "version": "0.1.0",
+  "description": "Protected video viewer through the Runtime object-provider boundary",
+  "role": "viewer",
+  "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
+  "author": "elastos",
+  "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
+  "interfaces": [
+    {
+      "id": "elastos.protected-content.viewer",
+      "version": "0.1.0",
+      "description": "Protected video playback through Runtime-scoped object-provider viewer operations",
+      "methods": [
+        {
+          "id": "viewer.open",
+          "description": "Open a protected viewer session through Runtime-scoped object-provider access.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://object/*",
+          "operation": "open_viewer"
+        },
+        {
+          "id": "viewer.read",
+          "description": "Read one protected viewer media part through Runtime-scoped object-provider access.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://object/*",
+          "operation": "read_viewer"
+        },
+        {
+          "id": "viewer.close",
+          "description": "Close a protected viewer session through Runtime-scoped object-provider access.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://object/*",
+          "operation": "close_viewer"
+        }
+      ]
+    }
+  ],
+  "requires": [
+    { "name": "object-provider", "kind": "capsule" }
+  ],
+  "resources": {
+    "memory_mb": 32,
+    "gpu": false
+  }
+}

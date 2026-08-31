@@ -42,6 +42,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use url::form_urlencoded;
 
+#[path = "gateway_assistant.rs"]
+mod gateway_assistant;
 #[path = "gateway_browser.rs"]
 mod gateway_browser;
 #[path = "gateway_capsule_catalog.rs"]
@@ -96,13 +98,16 @@ pub(crate) fn principal_root_protected_object_inventory(
     localhost_root: &str,
 ) -> Vec<crate::auth::PrincipalRootProtectedObjectDeclarationV1> {
     let mut inventory =
-        gateway_home_system::principal_root_protected_object_inventory(localhost_root);
+        gateway_assistant::principal_root_protected_object_inventory(localhost_root);
+    inventory
+        .extend(gateway_home_system::principal_root_protected_object_inventory(localhost_root));
     inventory.extend(
         gateway_transaction_effects::principal_root_protected_object_inventory(localhost_root),
     );
     inventory
 }
 
+pub(in crate::api) use gateway_home_runtime::capsule_icon_variants;
 pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_object_shell_title};
 pub(in crate::api) use gateway_home_system::profile_readiness_for_principal;
 use gateway_home_system::*;
@@ -119,9 +124,10 @@ pub(super) use gateway_home_token::{
     require_home_launch_token_for_any_context, require_home_projection_launch_token_context,
     require_home_runtime_wallet_authority, require_home_token, require_home_token_context,
     require_home_viewer_launch_token_context, require_internal_shell_launch_grant_for_any_context,
-    require_runtime_wallet_authority, runtime_wallet_authority, HomeLaunchContext,
-    RequiredHomeLaunchToken,
+    require_internal_shell_runtime_wallet_authority, require_runtime_wallet_authority,
+    runtime_wallet_authority, HomeLaunchContext, RequiredHomeLaunchToken,
 };
+
 #[cfg(test)]
 pub(in crate::api) use gateway_home_token::{
     issue_expired_home_launch_token_with_context, issue_home_launch_token,
@@ -141,11 +147,14 @@ pub(super) use gateway_passkey_step_up::{
 pub(crate) use gateway_passkey_step_up::{
     issue_passkey_step_up_token_at_for_test, issue_passkey_step_up_token_for_test,
 };
-pub(crate) use gateway_provider_proxy::runtime_custody_buy_via_gateway;
 #[cfg(test)]
 pub(crate) use gateway_provider_proxy::runtime_custody_publish_creator_tail_for_test;
-pub(crate) use gateway_provider_proxy::runtime_custody_publish_via_gateway;
 use gateway_provider_proxy::*;
+pub(crate) use gateway_provider_proxy::{
+    resolve_runtime_custody_creator_publish_binding, runtime_custody_buy_via_gateway,
+    runtime_custody_publish_via_gateway, ResolvedProtectedContentMintReceipt,
+    ResolvedProtectedContentVerifiedListing,
+};
 use gateway_room::*;
 pub(crate) use gateway_room::{
     cookie_value_from_headers, request_uses_tls, set_browser_session_cookie_header,
@@ -318,7 +327,9 @@ pub fn issue_gateway_owned_home_cli_launch_token(
         anyhow::bail!("home launch token context is incomplete");
     }
     Ok(Some(
-        gateway_home_token::issue_home_launch_token_with_context(data_dir, app, &context)?,
+        gateway_home_token::issue_home_projection_launch_token_with_context(
+            data_dir, app, app, &context,
+        )?,
     ))
 }
 
@@ -679,7 +690,19 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         )
         .route("/api/carrier/bootstrap", get(gateway_carrier_bootstrap))
         .route("/artifacts/*path", get(serve_artifact_file))
+        .route(
+            "/api/apps/assistant/workspace",
+            get(gateway_assistant::assistant_workspace_get)
+                .put(gateway_assistant::assistant_workspace_put)
+                .layer(DefaultBodyLimit::max(
+                    gateway_assistant::ASSISTANT_WORKSPACE_MAX_BYTES,
+                )),
+        )
         .route("/api/apps/system/summary", get(system_summary))
+        .route(
+            "/api/apps/system/appearance/preferences",
+            post(system_appearance_preferences_update),
+        )
         .route(
             "/api/apps/system/appearance/background-image",
             post(system_background_image_update)
@@ -878,6 +901,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/:wallet_connector/wallet/approvals/:request_id/complete",
             post(wallet_connector_approval_complete),
+        )
+        .route(
+            "/api/apps/home/appearance/preferences",
+            post(home_appearance_preferences_update),
         )
         .route("/api/apps/home/summary", get(home_summary))
         .route("/api/apps/home/events", get(home_events))
@@ -1354,6 +1381,9 @@ fn inbox_error_response(err: anyhow::Error) -> Response {
 }
 
 fn system_error_response(err: anyhow::Error) -> Response {
+    if let Some(text) = gateway_home_system::home_appearance_preference_request_message(&err) {
+        return (StatusCode::BAD_REQUEST, text.to_string()).into_response();
+    }
     let text = err.to_string();
     let status = if text.contains("home launch token")
         || text.contains("admin passkey required")
@@ -1379,14 +1409,21 @@ fn system_error_response(err: anyhow::Error) -> Response {
 
 fn home_error_response(err: anyhow::Error) -> Response {
     let profile_required = gateway_home_system::profile_required_message(&err);
+    let appearance_request = gateway_home_system::home_appearance_preference_request_message(&err);
     let text = profile_required
         .map(str::to_string)
+        .or_else(|| appearance_request.map(str::to_string))
         .unwrap_or_else(|| err.to_string());
-    let status = if text.contains("home launch token") || text.contains("gateway identity") {
-        StatusCode::FORBIDDEN
-    } else if profile_required.is_some() {
-        StatusCode::CONFLICT
-    } else if text.contains("service access request delivery failed: service offer")
+    if text.contains("home launch token") || text.contains("gateway identity") {
+        return (StatusCode::FORBIDDEN, text).into_response();
+    }
+    if profile_required.is_some() {
+        return (StatusCode::CONFLICT, text).into_response();
+    }
+    if appearance_request.is_some() {
+        return (StatusCode::BAD_REQUEST, text).into_response();
+    }
+    let status = if text.contains("service access request delivery failed: service offer")
         || text.contains("service access request delivery failed: only Browser Exit")
     {
         StatusCode::BAD_REQUEST

@@ -14,6 +14,7 @@ Each top-level ledger has one job:
 - [Getting started](GETTING_STARTED.md): user installation and source development
 - [Local source Home setup](HOME_LOCAL_SETUP.md): source-home browser Home on one machine
 - [Installing ElastOS](INSTALL.md): Linux setup, update, and trust
+- [Windows strategy](WINDOWS.md): WSL-first host direction and later native adapters
 - [Glossary](GLOSSARY.md): canonical terminology
 - [ElastOS system map](system-map/README.md): layered C4 and code paths for
   people and agents
@@ -32,6 +33,8 @@ Each top-level ledger has one job:
 - [Consequence-aware effects](CONSEQUENCE_AWARE_EFFECTS.md): shared observation,
   actuation, settlement, and local-safety rules
 - [Content availability](CONTENT_AVAILABILITY.md): CID, IPLD, availability, and replication
+- [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md): games,
+  models, Get, bootstrap sources, and external gateways
 - [People and conversations](PEOPLE_CONVERSATIONS.md): profiles, contacts,
   discovery, and current Chat integration
 - [Design system](DESIGN_SYSTEM.md): first-party visual and interaction contract
@@ -67,11 +70,8 @@ Each top-level ledger has one job:
 - [Chain provider](CHAIN_PROVIDER.md): typed chain reads, proofs, and transactions
 - [Wallet provider](WALLET_PROVIDER.md): account, proof, approval, and signing authority
 - [Protected content](PROTECTED_CONTENT.md): sealed object access sequence
-- [Protected-content integration plan](PROTECTED_CONTENT_EXTRACTION.md):
-  architecture, exact source stack, open installed prerequisites, atomic
-  cutover, and acceptance
 - [Protected-content v1 contracts](PROTECTED_CONTENT_CONTRACTS_V1.md): canonical
-  source-only review candidate
+  identity, rights, custody and release schemas
 - [Rights provider](RIGHTS_PROVIDER.md): canonical role and provisional capsule
   retirement state
 - [Key provider](KEY_PROVIDER.md): provisional provider retirement notice
@@ -88,8 +88,10 @@ Each top-level ledger has one job:
 
 ## Operations and verification
 
-- [0.6.0 release acceptance](RUNTIME_REPO_USER_STORY_CHECKLIST.md): source,
+- [Source integration and release acceptance](RUNTIME_REPO_USER_STORY_CHECKLIST.md): source,
   installed-product, and release decision checklist
+- [Home journey audit](audits/README.md): privacy-reviewed workbook with
+  findings, coverage and the limits of its installed test evidence
 - [Mac source-home staging](MAC.md): Apple silicon staging and Browser acceptance
 - [Inspector testing](INSPECTOR_TESTING.md): local Inspector checks
 - [Sites](SITES.md): local site roots and public exposure

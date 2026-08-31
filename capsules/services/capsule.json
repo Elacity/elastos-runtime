@@ -11,6 +11,7 @@
   "execution": "web-projection",
   "projections": ["web", "facts", "affordances", "gates"],
   "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
   "interfaces": [
     {
       "id": "elastos.services.offers",

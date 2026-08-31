@@ -179,10 +179,9 @@ propose an actuation; it cannot approve or authorize its own proposal.
 ## Current implementation boundary
 
 The dated implementation facts and open proof belong in
-[state.md](../state.md#consequence-aware-effect-truth). As of 2026-08-16, this
-branch does not ship a general physical-effect provider or a universal effect
-state machine. This contract does not turn its target semantics into product
-claims.
+[state.md](../state.md#consequence-aware-effect-truth). This contract defines
+acceptance requirements; implementation and target evidence establish product
+support.
 
 Do not call the first physical provider ready until a stranger can verify all
 of the following on the installed target:

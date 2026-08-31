@@ -293,10 +293,11 @@ does not implement encryption. The companion source-only
 recipient-sealed contributions and threshold reconstruction, including a
 manifest-bound reconstructed-key commitment check that detects a wrong
 reconstructed key. It strictly validates the embedded X25519 component. It
-does not identify the malicious node, it is not verifiable secret sharing, it
-is not yet wired into Runtime/provider/product flows, and it has not received
-an external cryptographic audit. No production confidentiality claim follows
-from this contract type alone.
+does not identify the malicious node and is not verifiable secret sharing.
+The Runtime and private providers use it in the inactive source path, including
+the process-backed two-Runtime proof. Installed activation and external
+cryptographic review remain open; this contract alone is not production
+confidentiality evidence.
 
 ## Terminal result
 
@@ -335,8 +336,8 @@ exact recipient-encrypted contribution, and replays only that result. They do
 not solve malicious custody nodes, rights-policy correctness, Runtime durable
 replay storage, full operational custody state, recovery from a durable claim
 without a result, issuer-key lifecycle, node admission/rotation/recovery,
-Library list/open/play, rendering, or product workflow safety. Share wrap on
-this current review tree is `elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1`:
+Library list/open/play, rendering, or product workflow safety. The share-wrap
+suite is `elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1`:
 X-Wing draft-06 with X25519 + ML-KEM-768, HKDF-SHA256, and AES-256-GCM.
 This is PQ-hybrid confidentiality only; authority signatures remain
 Ed25519/classical and full PQ authorization is a pre-activation decision. The

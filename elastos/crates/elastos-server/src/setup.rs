@@ -47,7 +47,45 @@ pub struct Component {
     pub size_mb: Option<u64>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_runtime: Option<ProviderRuntime>,
     pub platforms: HashMap<String, PlatformInfo>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRuntime {
+    pub role: ProviderRuntimeRole,
+    pub substrate: ProviderRuntimeSubstrate,
+    pub runtime_abi: ProviderRuntimeAbi,
+    pub execution: ProviderRuntimeExecution,
+    pub provides: String,
+    #[serde(default)]
+    pub runtime_only: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderRuntimeRole {
+    Provider,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderRuntimeSubstrate {
+    Native,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub enum ProviderRuntimeAbi {
+    #[serde(rename = "elastos.provider-stdio/v1")]
+    ProviderStdioV1,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderRuntimeExecution {
+    NativeProvider,
 }
 
 /// A capsule registry entry (CID-based, resolved via IPFS gateways).
@@ -89,6 +127,47 @@ pub struct Profile {
     pub components: Vec<String>,
 }
 
+pub fn validate_provider_runtime<'a>(
+    name: &str,
+    component: &'a Component,
+) -> anyhow::Result<&'a ProviderRuntime> {
+    let runtime = component.provider_runtime.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("component '{}' is missing provider runtime metadata", name)
+    })?;
+    let provides = runtime.provides.trim();
+    if provides.is_empty() {
+        anyhow::bail!(
+            "component '{}' provider runtime provides must not be empty",
+            name
+        );
+    }
+    if provides != runtime.provides {
+        anyhow::bail!(
+            "component '{}' provider runtime provides must not contain surrounding whitespace",
+            name
+        );
+    }
+    if runtime.runtime_only {
+        if provides.starts_with('-')
+            || provides.ends_with('-')
+            || !provides
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            anyhow::bail!(
+                "component '{}' Runtime-only provider target is invalid",
+                name
+            );
+        }
+    } else if !(provides.starts_with("elastos://") || provides.starts_with("localhost://")) {
+        anyhow::bail!(
+            "component '{}' provider runtime provides must use elastos:// or localhost://",
+            name
+        );
+    }
+    Ok(runtime)
+}
+
 // ── Entry point ─────────────────────────────────────────────────────
 
 pub async fn run(
@@ -96,9 +175,21 @@ pub async fn run(
     with: Vec<String>,
     without: Vec<String>,
     list: bool,
+    prerequisites_only: bool,
+) -> anyhow::Result<()> {
+    let data_dir = data_dir()?;
+    run_with_data_dir(data_dir, profile, with, without, list, prerequisites_only).await
+}
+
+async fn run_with_data_dir(
+    data_dir: PathBuf,
+    profile: Option<String>,
+    with: Vec<String>,
+    without: Vec<String>,
+    list: bool,
+    prerequisites_only: bool,
 ) -> anyhow::Result<()> {
     let manifest = load_manifest()?;
-    let data_dir = data_dir()?;
     let platform = detect_platform();
 
     eprintln!(
@@ -161,6 +252,12 @@ pub async fn run(
     if components.is_empty() {
         println!("No components selected.");
         println!("Use --with <component> to add components, or --list to see available profiles/components.");
+        return Ok(());
+    }
+
+    prepare_selected_component_prerequisites(&data_dir, &components)?;
+    if prerequisites_only {
+        println!("Selected component prerequisites are ready.");
         return Ok(());
     }
 
@@ -1410,6 +1507,16 @@ fn normalize_profile_name(name: &str) -> &str {
     name
 }
 
+fn prepare_selected_component_prerequisites(
+    data_dir: &Path,
+    components: &[String],
+) -> anyhow::Result<()> {
+    if components.iter().any(|name| name == "media-provider") {
+        crate::protected_content_runtime::prepare_runtime_media_provider_prerequisite(data_dir)?;
+    }
+    Ok(())
+}
+
 // ── Elastos fetch-path resolution ──────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2073,9 +2180,12 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
-    use std::sync::Mutex;
+    use elastos_common::{CapsuleManifest, CapsuleRole};
+    use std::collections::{BTreeMap, BTreeSet};
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // tokio Mutex so the async prerequisite test can hold the guard across
+    // its await without blocking the runtime; sync tests use blocking_lock.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn test_detect_platform() {
@@ -2092,23 +2202,92 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn test_load_manifest_finds_current_manifest() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn test_non_media_selection_has_no_media_prerequisite_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        prepare_selected_component_prerequisites(temp.path(), &["shell".to_string()]).unwrap();
+        assert!(!temp
+            .path()
+            .join("protected-content/media-provider/config.json")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_missing_media_prerequisite_fails_before_first_component_install_effect() {
+        let _guard = ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let xdg_data_home = temp.path().join("xdg-data");
-        let data_dir = xdg_data_home.join("elastos");
-        fs::create_dir_all(&data_dir).unwrap();
-        fs::copy(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../components.json"),
-            data_dir.join("components.json"),
+        let manifest_path = temp.path().join("components.json");
+        let source = temp.path().join("effect-source");
+        fs::write(&source, b"install-effect").unwrap();
+        let platform = detect_platform();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&serde_json::json!({
+                "external": {
+                    "effect": {
+                        "install_path": "bin/effect",
+                        "platforms": {
+                            platform.clone(): {
+                                "strategy": "local-copy",
+                                "source": source,
+                                "install_path": "bin/effect"
+                            }
+                        }
+                    },
+                    "media-provider": {
+                        "install_path": "bin/media-provider",
+                        "platforms": {}
+                    }
+                },
+                "profiles": {
+                    "media-preflight": {
+                        "components": ["effect", "media-provider"]
+                    }
+                }
+            }))
+            .unwrap(),
         )
         .unwrap();
+        // The data dir is injected rather than resolved from HOME/XDG env so
+        // this test can never write into the live user installation and never
+        // poisons concurrently running tests through process-global env.
+        let data_dir = xdg_data_home.join("elastos");
+        let original_manifest = std::env::var_os(COMPONENTS_MANIFEST_ENV);
+        let original_path = std::env::var_os("PATH");
+        std::env::set_var(COMPONENTS_MANIFEST_ENV, &manifest_path);
+        std::env::set_var("PATH", "");
 
-        std::env::remove_var(COMPONENTS_MANIFEST_ENV);
-        std::env::set_var("XDG_DATA_HOME", &xdg_data_home);
-        let manifest = load_manifest().unwrap();
-        std::env::remove_var("XDG_DATA_HOME");
+        let result = run_with_data_dir(
+            data_dir.clone(),
+            Some("media-preflight".to_string()),
+            vec![],
+            vec![],
+            false,
+            false,
+        )
+        .await;
+
+        match original_manifest {
+            Some(value) => std::env::set_var(COMPONENTS_MANIFEST_ENV, value),
+            None => std::env::remove_var(COMPONENTS_MANIFEST_ENV),
+        }
+        match original_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert!(result.unwrap_err().to_string().contains("ffmpeg"));
+        assert!(!data_dir.join("bin/effect").exists());
+    }
+
+    #[test]
+    fn test_current_checkout_manifest_content_matches_expected_profiles() {
+        let manifest_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../components.json");
+        let manifest = load_manifest_from_path(&manifest_path).unwrap();
 
         assert!(manifest.external.contains_key("kubo"));
         assert!(manifest.external.contains_key("archive-manager"));
@@ -2159,6 +2338,87 @@ mod tests {
                 }
             }
         }
+        let protected_home_dependencies = [
+            "chain-provider",
+            "wallet-provider",
+            "kubo",
+            "ipfs-provider",
+            "protected-content-protect-provider",
+            "media-provider",
+            "protected-content-decrypt-provider",
+            "library",
+            "marketplace",
+            "elacity-player",
+        ];
+        for profile_name in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
+            let profile = &manifest.profiles[profile_name];
+            for dependency in protected_home_dependencies {
+                assert_eq!(
+                    profile
+                        .components
+                        .iter()
+                        .filter(|component| component.as_str() == dependency)
+                        .count(),
+                    1,
+                    "{profile_name} protected-content Home profile must include {dependency} exactly once"
+                );
+            }
+        }
+        let private_providers = [
+            "protected-content-protect-provider",
+            "media-provider",
+            "custody-provider",
+            "protected-content-decrypt-provider",
+        ];
+        let provisional_providers = [
+            "drm-provider",
+            "rights-provider",
+            "key-provider",
+            "decrypt-provider",
+        ];
+        for profile_name in ["blockchain", "full"] {
+            let profile = &manifest.profiles[profile_name];
+            for provider in private_providers.into_iter().chain(provisional_providers) {
+                assert_eq!(
+                    profile
+                        .components
+                        .iter()
+                        .filter(|component| component.as_str() == provider)
+                        .count(),
+                    1,
+                    "{profile_name} profile must include {provider} exactly once"
+                );
+            }
+        }
+        let custody_profiles = manifest
+            .profiles
+            .iter()
+            .filter_map(|(name, profile)| {
+                profile
+                    .components
+                    .iter()
+                    .any(|component| component == "custody-provider")
+                    .then_some(name.as_str())
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(custody_profiles, BTreeSet::from(["blockchain", "full"]));
+        let operator_with_custody = resolve_components(
+            &manifest,
+            Some("operator"),
+            &["chain-provider".to_string(), "custody-provider".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            operator_with_custody,
+            [
+                "shell",
+                "localhost-provider",
+                "did-provider",
+                "chain-provider",
+                "custody-provider",
+            ]
+        );
         assert!(!manifest.profiles.contains_key("chat"));
         assert!(manifest.profiles.contains_key("blockchain"));
         assert!(manifest.profiles.contains_key("operator"));
@@ -2167,7 +2427,7 @@ mod tests {
 
     #[test]
     fn test_load_manifest_uses_explicit_manifest_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.blocking_lock();
         let temp = tempfile::tempdir().unwrap();
         let source_manifest =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../components.json");
@@ -2190,6 +2450,229 @@ mod tests {
 
         assert!(!manifest.external.contains_key("kubo"));
         assert!(manifest.external.contains_key("archive-manager"));
+    }
+
+    fn first_party_provider_manifest_path(root: &Path, name: &str) -> Option<PathBuf> {
+        [
+            root.join("capsules").join(name).join("capsule.json"),
+            root.join("elastos")
+                .join("capsules")
+                .join(name)
+                .join("capsule.json"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+    }
+
+    #[test]
+    fn provider_runtime_contract_covers_exact_active_provider_set() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
+        let components: ComponentsManifest =
+            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
+        let expected = BTreeMap::from([
+            (
+                "browser-engine-adapter".to_string(),
+                "elastos://browser-engine/*".to_string(),
+            ),
+            (
+                "chain-provider".to_string(),
+                "elastos://chain/*".to_string(),
+            ),
+            (
+                "content-block-graph-provider".to_string(),
+                "elastos://block-graph/*".to_string(),
+            ),
+            ("custody-provider".to_string(), "custody".to_string()),
+            ("did-provider".to_string(), "elastos://did/*".to_string()),
+            ("exit-provider".to_string(), "elastos://exit/*".to_string()),
+            ("ipfs-provider".to_string(), "elastos://ipfs/*".to_string()),
+            (
+                "localhost-provider".to_string(),
+                "localhost://*".to_string(),
+            ),
+            (
+                "model-provider".to_string(),
+                "elastos://model/*".to_string(),
+            ),
+            ("media-provider".to_string(), "media".to_string()),
+            ("net-provider".to_string(), "elastos://net/*".to_string()),
+            (
+                "object-provider".to_string(),
+                "elastos://object/*".to_string(),
+            ),
+            (
+                "protected-content-decrypt-provider".to_string(),
+                "protected-content-decrypt".to_string(),
+            ),
+            (
+                "protected-content-protect-provider".to_string(),
+                "protect".to_string(),
+            ),
+            (
+                "wallet-provider".to_string(),
+                "elastos://wallet/meta/status".to_string(),
+            ),
+            (
+                "webspace-provider".to_string(),
+                "localhost://WebSpaces/*".to_string(),
+            ),
+        ]);
+        let actual = components
+            .external
+            .iter()
+            .filter_map(|(name, component)| {
+                component
+                    .provider_runtime
+                    .as_ref()
+                    .map(|runtime| (name.clone(), runtime.provides.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(actual, expected);
+
+        for helper in [
+            "browser-engine-supervisor",
+            "browser-local-exit",
+            "browser-native-proxy-engine",
+            "browser-stream-bridge",
+        ] {
+            let component = components.external.get(helper).unwrap();
+            assert!(component.provider_runtime.is_none(), "{helper}");
+        }
+
+        for (name, provides) in expected {
+            let component = components.external.get(&name).unwrap();
+            let runtime = validate_provider_runtime(&name, component).unwrap();
+            let expected_install_path = format!("bin/{name}");
+            assert_eq!(
+                component.install_path.as_deref(),
+                Some(expected_install_path.as_str())
+            );
+            assert_eq!(runtime.provides, provides);
+            assert_eq!(
+                runtime.runtime_only,
+                matches!(
+                    name.as_str(),
+                    "custody-provider"
+                        | "media-provider"
+                        | "protected-content-decrypt-provider"
+                        | "protected-content-protect-provider"
+                )
+            );
+            if runtime.runtime_only {
+                assert!(first_party_provider_manifest_path(&root, &name).is_none());
+                continue;
+            }
+            let path = first_party_provider_manifest_path(&root, &name).unwrap();
+            let manifest: CapsuleManifest =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(manifest.role, CapsuleRole::Provider);
+            assert_eq!(
+                manifest.provides.as_deref(),
+                Some(runtime.provides.as_str())
+            );
+        }
+
+        for profile in ["agent-local-ai", "full"] {
+            assert!(
+                components
+                    .profiles
+                    .get(profile)
+                    .unwrap()
+                    .components
+                    .iter()
+                    .any(|value| value == "model-provider"),
+                "profile {profile} must install model-provider"
+            );
+        }
+        assert!(
+            !components
+                .profiles
+                .get("public-gateway")
+                .unwrap()
+                .components
+                .iter()
+                .any(|value| value == "model-provider"),
+            "public-gateway must not install model-provider"
+        );
+    }
+
+    #[test]
+    fn assistant_capsule_is_packaged_with_a_capsule_owned_icon() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("capsules/assistant/capsule.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["schema"], "elastos.capsule/v1");
+        assert_eq!(manifest["name"], "assistant");
+        assert_eq!(manifest["icon"], "browser/icons");
+        assert_eq!(manifest["entrypoint"], "browser/index.html");
+
+        for file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"] {
+            assert!(
+                root.join("capsules/assistant/browser/icons")
+                    .join(file)
+                    .is_file(),
+                "missing Assistant icon asset {file}"
+            );
+        }
+
+        let components: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
+        assert_eq!(
+            components["external"]["assistant"]["install_path"],
+            "capsules/assistant"
+        );
+        for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
+            assert!(
+                components["profiles"][profile]["components"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == "assistant"),
+                "profile {profile} must include the Assistant capsule"
+            );
+        }
+    }
+
+    #[test]
+    fn elacity_player_capsule_is_packaged_with_a_capsule_owned_icon() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("capsules/elacity-player/capsule.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["schema"], "elastos.capsule/v1");
+        assert_eq!(manifest["name"], "elacity-player");
+        assert_eq!(manifest["icon"], "browser/icons");
+        assert_eq!(manifest["entrypoint"], "browser/index.html");
+
+        for file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"] {
+            assert!(
+                root.join("capsules/elacity-player/browser/icons")
+                    .join(file)
+                    .is_file(),
+                "missing Elacity Player icon asset {file}"
+            );
+        }
+
+        let components: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
+        assert_eq!(
+            components["external"]["elacity-player"]["install_path"],
+            "capsules/elacity-player"
+        );
+        for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
+            assert!(
+                components["profiles"][profile]["components"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == "elacity-player"),
+                "profile {profile} must include the Elacity Player capsule"
+            );
+        }
     }
 
     #[test]
@@ -2328,6 +2811,7 @@ mod tests {
             repository: None,
             size_mb: None,
             description: None,
+            provider_runtime: None,
             platforms: HashMap::new(),
         };
 
@@ -2378,6 +2862,7 @@ mod tests {
             repository: None,
             size_mb: None,
             description: None,
+            provider_runtime: None,
             platforms,
         };
 
@@ -2424,6 +2909,7 @@ mod tests {
             repository: None,
             size_mb: None,
             description: None,
+            provider_runtime: None,
             platforms,
         };
         let manifest: ComponentsManifest = serde_json::from_value(serde_json::json!({
@@ -2667,6 +3153,7 @@ mod tests {
             repository: None,
             size_mb: None,
             description: None,
+            provider_runtime: None,
             platforms,
         };
         let manifest = ComponentsManifest {
@@ -3011,6 +3498,7 @@ mod tests {
             repository: None,
             size_mb: None,
             description: None,
+            provider_runtime: None,
             platforms,
         };
 

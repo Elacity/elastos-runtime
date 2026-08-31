@@ -42,10 +42,10 @@ NC='\033[0m'
 # Wallet/Browser surfaces require chain-provider and wallet-provider authority.
 # Demo-only capsules such as chat-room and GBA are published by passing an
 # explicit --capsules list or through the Rust `demo` publish profile.
-# ipfs-provider, availability-provider, drm-provider, rights-provider,
-# key-provider, decrypt-provider, and tunnel-provider are supported direct
-# command assets. They are not part of the default managed user runtime, but
-# fresh installs must provision them for share/open/public-share where needed.
+# availability-provider, drm-provider, rights-provider, key-provider,
+# decrypt-provider, and tunnel-provider are supported direct command assets
+# outside the default managed Home. Runtime-only protected providers are
+# support assets selected by the component profile rather than capsule publish.
 DEFAULT_CAPSULES=(
     shell
     localhost-provider
@@ -58,6 +58,7 @@ DEFAULT_CAPSULES=(
     wallet-provider
     object-provider
     content-block-graph-provider
+    ipfs-provider
     home-cli
     home-gui
     home
@@ -74,6 +75,8 @@ DEFAULT_CAPSULES=(
     marketplace
     archive-manager
     inbox
+    assistant
+    elacity-player
 )
 CAPSULES=("${DEFAULT_CAPSULES[@]}")
 REQUIRED_SUPPORTED_CAPSULES=(
@@ -88,6 +91,7 @@ REQUIRED_SUPPORTED_CAPSULES=(
     wallet-provider
     object-provider
     content-block-graph-provider
+    ipfs-provider
     home-cli
     home-gui
     home
@@ -104,6 +108,8 @@ REQUIRED_SUPPORTED_CAPSULES=(
     marketplace
     archive-manager
     inbox
+    assistant
+    elacity-player
 )
 SUPPORT_BINARY_ASSETS=(
     shell
@@ -126,6 +132,10 @@ SUPPORT_BINARY_ASSETS=(
     rights-provider
     key-provider
     decrypt-provider
+    protected-content-protect-provider
+    media-provider
+    custody-provider
+    protected-content-decrypt-provider
     ipfs-provider
     availability-provider
     operator-drive-adapter

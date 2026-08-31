@@ -993,7 +993,10 @@ async fn test_browser_open_launches_engine_with_attached_stream_receipt() {
     let runtime_stream_path = browser_runtime_stream_socket_path(dir.path(), stream_id).unwrap();
     #[cfg(unix)]
     {
-        assert!(runtime_stream_path.starts_with("/tmp/elastos-browser-streams"));
+        let expected_root = format!("/tmp/elastos-browser-streams-{}/", unsafe {
+            libc::geteuid()
+        });
+        assert!(runtime_stream_path.starts_with(expected_root));
         assert!(
             runtime_stream_path.to_string_lossy().len() < 100,
             "runtime stream socket path must fit conservative Unix sun_path budget: {}",
@@ -3148,11 +3151,14 @@ async fn verify_browser_wallet_read_timeout_boundary(delay_wallet_refresh: bool)
     let app =
         gateway_router(browser_wallet_read_timeout_test_state(dir.path(), wallet, chain).await);
 
-    let started = std::time::Instant::now();
+    // Virtual-clock elapsed proves the route gave up at its own read timeout
+    // instead of waiting out the delayed provider. A real-clock bound here can
+    // flake under full-suite CPU load.
+    let started = tokio::time::Instant::now();
     let (first_status, first_body) = browser_eth_call(app.clone(), &browser_token, address).await;
     assert_eq!(first_status, StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(first_body, "Browser wallet read timed out");
-    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(started.elapsed(), std::time::Duration::from_millis(100));
 
     let (second_status, second_body) = browser_eth_call(app.clone(), &browser_token, address).await;
     assert_eq!(second_status, StatusCode::OK, "{second_body}");
@@ -3167,13 +3173,22 @@ async fn verify_browser_wallet_read_timeout_boundary(delay_wallet_refresh: bool)
         "the second read waited for the first provider result"
     );
 
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while !late_result_observed.load(std::sync::atomic::Ordering::SeqCst) {
-            tokio::task::yield_now().await;
+    // The delayed provider result is discarded, not cancelled. Under a paused
+    // clock we need to advance time past the delayed task's sleep, then settle
+    // it with bounded yields.
+    tokio::time::advance(std::time::Duration::from_millis(500)).await;
+    let mut late_observed = false;
+    for _ in 0..1_000_000 {
+        if late_result_observed.load(std::sync::atomic::Ordering::SeqCst) {
+            late_observed = true;
+            break;
         }
-    })
-    .await
-    .unwrap();
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        late_observed,
+        "the discarded delayed provider result should still resolve in the background"
+    );
 
     let auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
     let events = auth_state
@@ -3193,12 +3208,12 @@ async fn verify_browser_wallet_read_timeout_boundary(delay_wallet_refresh: bool)
     assert_ne!(events[0].challenge_id, events[2].challenge_id);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_browser_wallet_read_timeout_does_not_poison_wallet_refresh() {
     verify_browser_wallet_read_timeout_boundary(true).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_browser_wallet_read_timeout_does_not_poison_chain_dispatch() {
     verify_browser_wallet_read_timeout_boundary(false).await;
 }

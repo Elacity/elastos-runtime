@@ -159,6 +159,36 @@ export function canPreviewObject(object) {
   return !!previewKind(object);
 }
 
+export function isRuntimeCustodyProtectableVideo(object) {
+  const capabilities = Array.isArray(object?.capabilities) ? object.capabilities : null;
+  return !!(
+    object &&
+    !isDirectory(object) &&
+    !inTrash(object) &&
+    !isWebSpaceUri(object.uri) &&
+    !object.published &&
+    !object?.metadata?.readonly &&
+    !object?.metadata?.protected_content &&
+    String(object.mime || "").startsWith("video/") &&
+    capabilities?.includes("publish")
+  );
+}
+
+const MAX_UINT256 = (1n << 256n) - 1n;
+const POSITIVE_DECIMAL_INTEGER_RE = /^[0-9]+$/;
+
+export function decimalIntegerToHexQuantity(value) {
+  const text = String(value ?? "").trim();
+  if (!POSITIVE_DECIMAL_INTEGER_RE.test(text)) {
+    throw new Error("Enter a positive whole number.");
+  }
+  const parsed = BigInt(text);
+  if (parsed <= 0n || parsed > MAX_UINT256) {
+    throw new Error("Enter a whole number from 1 to 2^256-1.");
+  }
+  return `0x${parsed.toString(16)}`;
+}
+
 export function iconFor(object) {
   if (inTrash(object)) return "icons/trash.svg";
   if (isDirectory(object)) return "icons/folder.svg";

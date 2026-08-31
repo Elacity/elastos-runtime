@@ -459,28 +459,13 @@ The YouTube stress gate is intentionally stricter than controlled media. A
 candidate that fails YouTube may still be useful research, but it is not the
 default product browser.
 
-On 2026-05-13, a patched Selkies bake-off with explicit display coordinates and
-click/keyboard activation still failed the YouTube stress gate: candidate gates
-passed, the page loaded, audio/video bytes decoded, and media time advanced to
-2.750s, but playback ended paused before stable audible playback. The rejected
-artifact is `/tmp/elastos-browser-bakeoff/selkies-patched-hosted-bakeoff.json`.
-Treat that as evidence against more Selkies tuning as the default branch task,
-not as evidence that the Browser ABI is wrong.
+Record each bake-off result with its artifact identity in a dated evidence
+record. Current accepted and rejected results belong in [state.md](../state.md).
 
-The live Selkies target also failed the dedicated resize proof on 2026-05-13:
-`scripts/browser-hosted-product-webrtc-smoke.mjs --resize-width 1000
---resize-height 700` timed out waiting for the remote video stream to adopt the
-requested compositor size. The target wrapper now defaults Selkies to dynamic
-resolution instead of manual fixed-size mode, enables remote resize explicitly,
-and keeps manual mode available only through operator opt-in. A follow-up live
-test still failed to observe a resized video stream. A 1280x720 Selkies
-surface then produced zero decoded WebRTC frames, so the live operator baseline
-returned to the known-rendering 1920x1080 stream. A later live check
-proved arbitrary CDP viewport resize can leave blank right/bottom capture
-regions inside the fixed Selkies stream. The 0.6 policy therefore fixes the
-guest compositor, capture, and page raster at 1920x1080 with DPR 1. Home uses
-contained viewer scaling and decoded-video input coordinates; dynamic guest
-viewport resize is no longer an acceptance requirement.
+The display contract fixes the guest compositor, capture and page raster at
+1920x1080 with DPR 1. Home uses contained viewer scaling and decoded-video input
+coordinates. Resize acceptance checks frame progress, input alignment and
+clipping; it does not require a dynamically resized guest viewport.
 
 ## Manual UX Gate
 

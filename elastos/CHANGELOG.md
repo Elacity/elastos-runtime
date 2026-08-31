@@ -5,27 +5,57 @@ All notable changes to the public ElastOS Runtime repository.
 ## [Unreleased]
 
 ### Added
-- Protected-content source-only foundation across the stacked review chain:
-  canonical contracts (identities, wallet-signed rights, custody envelopes,
-  epochs, pool policy), threshold custody with durable replay stores, the
-  custody/protect/decrypt provider processes and wire contracts, the Runtime
-  release coordinator and mint journal, chain rights evidence, and the runtime
-  lifecycle (mint, buy, play, purchase closeout). Source-only: the provisional
-  drm/rights/key/decrypt capsules remain the registered product path until the
-  atomic cutover.
+- The 0.7 source candidate integrates the reviewed protected-content
+  lifecycle with collaboration, Home/platform, Wallet, GBA, model-provider,
+  Assistant, Library, Marketplace, and player UIUX. The Runtime-owned
+  protected-content path remains inactive until installed proof and cutover.
+- Protected-content creators publish one canonical Chain-bound listing package
+  through content addressing. A buyer Runtime imports the shared listing,
+  verifies it, and uses the same immutable projection for purchase and playback.
+- The source proof now covers two distinct Runtimes and real process-backed
+  2-of-3 custody nodes. The creator Runtime provisions the nodes; the buyer
+  Runtime completes import, deny-before-buy, purchase, open, read, and close
+  through its own Profile, Wallet, device identity, and signed release.
+- A bounded read-only protected-content audit verifies source and installed
+  artifact parity, private provider declarations, profile and role facts, and
+  operator prerequisites. Its redacted receipt reports readiness for active
+  proof separately from product readiness.
+- Full source-home setup installs one stable Runtime under the platform data
+  root and writes an owner-only receipt that binds source identity, Runtime,
+  components, capsule metadata, platform, and installation time.
+- macOS and Linux source-home restart helpers validate the stable installation
+  receipt and exact prior process before replacement. They own one PID file,
+  one bounded principal-root rollback, and one atomic restart receipt.
 - People now reports Profile readiness explicitly. Passkey registration and
   Profile setup are separate: a valid passkey remains valid when Profile setup
   is not ready, and People directs the person to System Recovery rather than
   hiding protection or Recovery changes behind a profile save.
+- The privacy-reviewed Home journey audit is available under `docs/audits`.
+  It records findings and test coverage; prerequisite-blocked and partial
+  observations remain separate from completed tests.
 
 ### Fixed
-- Bound `browser-local-exit` to the lifetime of the Runtime that launched it via
-  a held-open stdin pipe, so it no longer survives as an orphan when the Runtime
-  is SIGKILLed, aborts on panic, or leaves through `std::process::exit` (the
-  installed-binary supersession watch takes that path on every rebuild). Helper
-  teardown is now scoped by inode identity to the relay socket it bound, and the
-  Runtime refuses to replace a relay socket a live helper is still serving
-  instead of stranding it on an unlinked socket.
+- Runtime's executable watcher skips whole-binary hashing while the file's
+  metadata is unchanged. Startup and changed-file checks still verify the hash.
+- A mint retry adopts a fully completed durable record after a crash loses its
+  intent completion mark. It verifies the complete custody selection and
+  availability evidence. Partial or ambiguous records require reconciliation.
+- Home audit repairs cover Terminal startup and Inbox handoff, Recovery status,
+  window placement, create-only Library writes, document close protection,
+  Assistant output/clipboard handling and model-provider initialization.
+- Source-home setup removes its private install stage after success or a
+  controlled copy/installer failure. Setup checks source and data volumes for
+  at least 10% free capacity. Setup and Browser refresh retain one default VM
+  backup set; a refused restart preserves existing recovery data.
+- Runtime diagnostics omit private VM initialization payloads and provider
+  responses. Log-capture tests cover the privacy boundary.
+- CI and local test recipes cover the own-workspace capsule suites and required
+  provider processes. Fixtures isolate Carrier routing from public relay
+  availability, retry transient executable-busy errors and reap their children.
+- Bound `browser-local-exit` to its launching Runtime through a held-open stdin
+  pipe. Cleanup now checks the relay socket inode, and Runtime refuses to
+  replace a socket still owned by a live helper. Runtime abort, exit, rebuild,
+  and supersession paths no longer leave the helper orphaned.
 - Renaming yourself no longer looks like becoming someone else. A person's
   identity is their Profile DID and a rename only advances the revision, but
   the context check compared whole signed Profile documents, so editing your
@@ -113,9 +143,13 @@ All notable changes to the public ElastOS Runtime repository.
 ### Changed
 - Product inventory exposes one Chat app. The Runtime-backed `chat-room` app is
   the only Chat entry in manifests and supported release profiles. The
-  obsolete terminal Chat and Agent implementations are no longer packaged as
-  apps; their retained source is only pending explicit operator-CLI extraction
-  or removal and is not a compatibility path.
+  obsolete terminal Chat and Agent capsule source trees are retired. Explicit
+  operator CLI commands remain under their own contract; Git history preserves
+  the old implementations.
+- Runtime keeps `tracing`; the replacement `elastos-logger` is postponed.
+  Advanced Assistant workflows, broader Carrier reconciliation and the legacy
+  audit migration remain deferred. Installed protected-content acceptance and
+  the atomic activation/removal of provisional providers remain open.
 - Collaboration messages now identify people as Profiles and recipients as
   Profiles or conversations. Runtime derives routing from the currently signed
   Profile instead of putting endpoint identity in the product message. Endpoint
@@ -346,6 +380,13 @@ continuation. These changes are not part of the 0.5.0 release history.
   and one `eth_requestAccounts` call creating one pending account-access request.
 
 ### Fixed
+- Bound `browser-local-exit` to the lifetime of the Runtime that launched it via
+  a held-open stdin pipe, so it no longer survives as an orphan when the Runtime
+  is SIGKILLed, aborts on panic, or leaves through `std::process::exit` (the
+  installed-binary supersession watch takes that path on every rebuild). Helper
+  teardown is now scoped by inode identity to the relay socket it bound, and the
+  Runtime refuses to replace a relay socket a live helper is still serving
+  instead of stranding it on an unlinked socket.
 - Fixed Home launch classification so browser projections are attached as
   authorized web surfaces instead of being sent to a WASM compute provider.
 - Bound fresh passkey authority to one app, operation, and request payload;

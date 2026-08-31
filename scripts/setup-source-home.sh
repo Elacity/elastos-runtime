@@ -21,7 +21,7 @@ Configure tool paths with:
   ELASTOS_BROWSER_VM_RUNTIME_RELAY_BIN
   ELASTOS_BROWSER_VM_GUEST_CONTROL_BRIDGE_BIN
   ELASTOS_BROWSER_VM_ARTIFACT_DATA_DIR
-  ELASTOS_BROWSER_VM_BACKUP_RETENTION (default: 2, range: 1..10)
+  ELASTOS_BROWSER_VM_BACKUP_RETENTION (must be 1)
 
 To target a non-default runtime root, set HOME or XDG_DATA_HOME before running.
 ELASTOS_DATA_DIR is intentionally not accepted as a gateway data-root override.
@@ -72,7 +72,7 @@ cargo_target_root_for_manifest() {
         else
             printf '%s\n' "${ROOT}/${CARGO_TARGET_DIR}"
         fi
-    elif [[ "${manifest_dir}" == "${ROOT}/elastos"* ]]; then
+    elif [[ "${manifest_dir}" == "${ROOT}/elastos"* ]] && ! grep -q '^\[workspace\]' "${manifest_path}"; then
         printf '%s\n' "${ROOT}/elastos/target"
     else
         printf '%s\n' "${manifest_dir}/target"
@@ -349,6 +349,7 @@ build_browser_vm_guest_helpers() {
         echo "Browser VM guest helper build is unsupported on ${target_platform:-this platform}" >&2
         exit 1
     fi
+    ensure_rust_target_installed "$rust_target"
 
     echo "[setup-source-home] build Browser VM guest relay helpers"
     build_browser_vm_guest_helper \
@@ -454,14 +455,9 @@ clone_or_copy_file() {
 }
 
 browser_vm_backup_retention() {
-    local retention="${ELASTOS_BROWSER_VM_BACKUP_RETENTION:-2}"
-    if [[ ! "$retention" =~ ^[1-9][0-9]*$ ]]; then
-        echo "ELASTOS_BROWSER_VM_BACKUP_RETENTION must be from 1 to 10" >&2
-        exit 2
-    fi
-    retention=$((10#$retention))
-    if (( retention > 10 )); then
-        echo "ELASTOS_BROWSER_VM_BACKUP_RETENTION must be from 1 to 10" >&2
+    local retention="${ELASTOS_BROWSER_VM_BACKUP_RETENTION:-1}"
+    if [[ "$retention" != "1" ]]; then
+        echo "ELASTOS_BROWSER_VM_BACKUP_RETENTION must be 1" >&2
         exit 2
     fi
     printf '%s\n' "$retention"
@@ -508,6 +504,31 @@ prune_file_backups() {
     done
 }
 
+require_minimum_free_space() {
+    local path="$1"
+    local minimum_percent=10
+    local blocks
+    local available
+    local free_percent
+
+    read -r blocks available < <(df -Pk "$path" | awk 'NR == 2 {print $2, $4}')
+    if [[ ! "$blocks" =~ ^[0-9]+$ || ! "$available" =~ ^[0-9]+$ ]]; then
+        echo "Could not determine free space for source-home volume: ${path}" >&2
+        exit 1
+    fi
+    if (( blocks == 0 )); then
+        echo "Source-home volume reported zero usable blocks: ${path}" >&2
+        exit 1
+    fi
+    free_percent=$((available * 100 / blocks))
+    if (( available * 100 < blocks * minimum_percent )); then
+        echo "Source-home setup requires at least ${minimum_percent}% free space; ${path} has ${free_percent}%." >&2
+        echo "Reconcile worktrees, Cargo targets, VM state, and rollback artifacts before building." >&2
+        exit 1
+    fi
+    echo "[setup-source-home] free-space gate: ${free_percent}% available"
+}
+
 DEFAULT_DATA_DIR="$(default_data_dir)"
 if [[ -n "${ELASTOS_DATA_DIR:-}" && "${ELASTOS_DATA_DIR}" != "${DEFAULT_DATA_DIR}" ]]; then
     echo "ELASTOS_DATA_DIR is not a gateway data-root override." >&2
@@ -520,36 +541,62 @@ PLATFORM="$(detect_platform)"
 CARGO_BIN="$(find_cargo)"
 NODE_BIN="$(find_node)"
 BROWSER_VM_ROOTFS_BACKUP=""
+SOURCE_HOME_KUBO_INSTALLED="0"
 configure_rust_toolchain_env "$CARGO_BIN"
 export PATH="$(dirname "$CARGO_BIN"):$(dirname "$NODE_BIN"):${PATH}"
 require_supported_rust "$(command -v rustc)"
 
-provider_names() {
-    printf '%s\n' \
-        did-provider \
-        net-provider \
-        exit-provider \
-        browser-engine-adapter \
-        browser-local-exit \
-        wallet-provider \
-        chain-provider
+provider_runtime_names() {
+    COMPONENTS_SRC="${ROOT}/components.json" python3 - <<'PY'
+import json
+import os
+import pathlib
+
+manifest = json.loads(pathlib.Path(os.environ["COMPONENTS_SRC"]).read_text())
+for name, component in manifest.get("external", {}).items():
+    runtime = component.get("provider_runtime")
+    if not isinstance(runtime, dict):
+        continue
+    if runtime.get("role") != "provider":
+        raise SystemExit(f"{name} provider_runtime.role must be provider")
+    if runtime.get("substrate") != "native":
+        raise SystemExit(f"{name} provider_runtime.substrate must be native")
+    if runtime.get("runtime_abi") != "elastos.provider-stdio/v1":
+        raise SystemExit(f"{name} provider_runtime.runtime_abi must be elastos.provider-stdio/v1")
+    if runtime.get("execution") != "native-provider":
+        raise SystemExit(f"{name} provider_runtime.execution must be native-provider")
+    provides = runtime.get("provides")
+    if not isinstance(provides, str) or not provides:
+        raise SystemExit(f"{name} provider_runtime.provides must be a non-empty string")
+    runtime_only = runtime.get("runtime_only", False)
+    if not isinstance(runtime_only, bool):
+        raise SystemExit(f"{name} provider_runtime.runtime_only must be a boolean")
+    if runtime_only and (
+        provides.startswith("-")
+        or provides.endswith("-")
+        or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789-" for ch in provides)
+    ):
+        raise SystemExit(f"{name} provider_runtime.provides must be a lowercase Runtime target")
+    print(name)
+PY
+}
+
+source_home_helper_binary_names() {
+    printf '%s\n' "browser-local-exit"
     if [[ "$(uname -s)" == "Linux" ]]; then
         printf '%s\n' \
             browser-engine-supervisor \
             browser-native-proxy-engine \
             browser-stream-bridge
     fi
-    printf '%s\n' \
-        webspace-provider \
-        object-provider \
-        content-block-graph-provider \
-        ipfs-provider \
-        custody-provider \
-        protected-content-protect-provider \
-        protected-content-decrypt-provider
 }
 
-PROVIDER_NAMES_JSON="$(provider_names | python3 -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))')"
+source_home_binary_names() {
+    provider_runtime_names
+    source_home_helper_binary_names
+}
+
+SOURCE_HOME_BINARY_NAMES_JSON="$(source_home_binary_names | python3 -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))')"
 
 APP_CAPSULES=(
     home-cli
@@ -561,15 +608,18 @@ APP_CAPSULES=(
     browser
     documents
     library
+    elacity-player
     marketplace
     archive-manager
     inbox
+    assistant
     wallet
     wallet-metamask
     wallet-unisat
     wallet-walletconnect
     gba-emulator
     gba-ucity
+    gba-nonogram
     chat-room
 )
 
@@ -584,6 +634,8 @@ RETIRED_SOURCE_HOME_CAPSULES=(
 
 RETIRED_SOURCE_HOME_PROVIDER_BINARIES=(
     gba-engine-provider
+    ai-provider
+    llama-provider
 )
 
 collaboration_startup_config_destination() {
@@ -1580,8 +1632,9 @@ stamp_source_home_components_manifest() {
     COMPONENTS_DEST="${DATA_DIR}/components.json" \
     DATA_DIR="${DATA_DIR}" \
     SETUP_PLATFORM="${PLATFORM}" \
-    PROVIDER_NAMES_JSON="${PROVIDER_NAMES_JSON}" \
+    SOURCE_HOME_BINARY_NAMES_JSON="${SOURCE_HOME_BINARY_NAMES_JSON}" \
     APP_CAPSULES_JSON="${APP_CAPSULES_JSON}" \
+    SOURCE_HOME_KUBO_INSTALLED="${SOURCE_HOME_KUBO_INSTALLED}" \
     python3 - <<'PY'
 import hashlib
 import json
@@ -1596,12 +1649,16 @@ platform = os.environ["SETUP_PLATFORM"]
 manifest = json.loads(components_src.read_text())
 host_components = [
     "shell",
-    "localhost-provider",
-    *json.loads(os.environ["PROVIDER_NAMES_JSON"]),
+    *json.loads(os.environ["SOURCE_HOME_BINARY_NAMES_JSON"]),
 ]
 source_home_components = list(
     dict.fromkeys([*host_components, *json.loads(os.environ["APP_CAPSULES_JSON"])])
 )
+if os.environ["SOURCE_HOME_KUBO_INSTALLED"] == "1":
+    kubo = data_dir / "bin" / "kubo"
+    if not kubo.is_file():
+        raise SystemExit("successful Kubo setup did not install bin/kubo")
+    source_home_components.append("kubo")
 
 for name in host_components:
     platforms = manifest["external"][name].setdefault("platforms", {})
@@ -1638,7 +1695,7 @@ stamp_source_home_capsule_artifacts_manifest() {
         if [[ -f "${ROOT}/capsules/${capsule}/capsule.json" ]]; then
             args+=(--capsule "$capsule")
         fi
-    done < <(provider_names)
+    done < <(provider_runtime_names)
     python3 "${ROOT}/scripts/stamp-source-home-capsule-metadata.py" \
         --components "${DATA_DIR}/components.json" \
         --data-dir "${DATA_DIR}" \
@@ -1646,6 +1703,14 @@ stamp_source_home_capsule_artifacts_manifest() {
         --platform "${PLATFORM}" \
         --managed-state "${DATA_DIR}/receipts/source-home-capsules.json" \
         "${args[@]}"
+}
+
+prepare_media_provider_prerequisite() {
+    echo "[setup-source-home] prepare media-provider prerequisite"
+    HOME="${HOME}" \
+    ELASTOS_COMPONENTS_MANIFEST="${ROOT}/components.json" \
+        "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)" \
+        setup --with media-provider --prerequisites-only
 }
 
 install_content_publish_backend() {
@@ -1663,6 +1728,11 @@ install_content_publish_backend() {
     HOME="${HOME}" \
     ELASTOS_COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
         "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)" setup --with kubo
+    if [[ ! -f "${DATA_DIR}/bin/kubo" || ! -x "${DATA_DIR}/bin/kubo" ]]; then
+        echo "Kubo setup succeeded without an installed executable: ${DATA_DIR}/bin/kubo" >&2
+        exit 1
+    fi
+    SOURCE_HOME_KUBO_INSTALLED="1"
 }
 
 echo "[setup-source-home] repo: ${ROOT}"
@@ -1685,6 +1755,10 @@ if [[ "${SETUP_SOURCE_HOME_CONFIG_ONLY:-0}" == "1" ]]; then
     exit 0
 fi
 
+browser_vm_backup_retention >/dev/null
+require_minimum_free_space "${ROOT}"
+require_minimum_free_space "${DATA_DIR}"
+
 CONFIG_TOML="${DATA_DIR}/config.toml"
 touch "${CONFIG_TOML}"
 if ! grep -Eq '^[[:space:]]*dev_mode[[:space:]]*=' "${CONFIG_TOML}"; then
@@ -1703,15 +1777,27 @@ if [[ "$PLATFORM" == "darwin-arm64" ]]; then
 fi
 build_browser_vm_guest_helpers
 
+source_home_binary_manifest_path() {
+    local name="$1"
+    local candidate
+    for candidate in \
+        "${ROOT}/capsules/${name}/Cargo.toml" \
+        "${ROOT}/elastos/capsules/${name}/Cargo.toml" \
+        "${ROOT}/elastos/tools/${name}/Cargo.toml"
+    do
+        if [[ -f "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    echo "source-home binary manifest not found for ${name}" >&2
+    exit 1
+}
+
 echo "[setup-source-home] build native provider binaries"
 "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/capsules/shell/Cargo.toml" --release
-"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/capsules/localhost-provider/Cargo.toml" --release
-provider_names | while IFS= read -r provider; do
-    if [[ -f "${ROOT}/capsules/${provider}/Cargo.toml" ]]; then
-        "$CARGO_BIN" build --manifest-path "${ROOT}/capsules/${provider}/Cargo.toml" --release
-    else
-        "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/tools/${provider}/Cargo.toml" --release
-    fi
+source_home_binary_names | while IFS= read -r provider; do
+    "$CARGO_BIN" build --manifest-path "$(source_home_binary_manifest_path "${provider}")" --release
 done
 
 echo "[setup-source-home] build Home CLI native renderer"
@@ -1739,22 +1825,22 @@ for capsule in "${APP_CAPSULES[@]}"; do
     fi
 done
 
+prepare_media_provider_prerequisite
+
 echo "[setup-source-home] install native providers and stamp manifest"
 mkdir -p "${DATA_DIR}/bin"
 install -m 755 "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release shell)" "${DATA_DIR}/bin/shell"
-install -m 755 "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release localhost-provider)" "${DATA_DIR}/bin/localhost-provider"
 install -m 755 "$(cargo_built_binary_path "${ROOT}/capsules/home-cli/Cargo.toml" release home-cli)" "${DATA_DIR}/bin/home-cli"
-provider_names | while IFS= read -r provider; do
-    if [[ -f "${ROOT}/capsules/${provider}/Cargo.toml" ]]; then
-        install -m 755 "$(cargo_built_binary_path "${ROOT}/capsules/${provider}/Cargo.toml" release "${provider}")" "${DATA_DIR}/bin/${provider}"
-    else
-        install -m 755 "$(cargo_built_binary_path "${ROOT}/elastos/tools/${provider}/Cargo.toml" release "${provider}")" "${DATA_DIR}/bin/${provider}"
-    fi
+source_home_binary_names | while IFS= read -r provider; do
+    install -m 755 "$(cargo_built_binary_path "$(source_home_binary_manifest_path "${provider}")" release "${provider}")" "${DATA_DIR}/bin/${provider}"
 done
 stamp_source_home_components_manifest
 
 echo "[setup-source-home] install content publish backend before final manifest stamp"
 install_content_publish_backend
+
+echo "[setup-source-home] finalize source-home component selection"
+stamp_source_home_components_manifest
 
 echo "[setup-source-home] install app capsules and manifest entrypoints"
 install_app_capsules
@@ -1772,6 +1858,21 @@ install_browser_runtime_helpers
 start_browser_runtime_turn
 install_browser_source_home_config
 install_collaboration_startup_config
+# On Linux cargo hardlinks target/release/elastos to its deps/ twin, and the
+# installer's artifact gate rejects any multi-link source (hardlink-swap
+# defense, st_nlink must be 1). Hand it a private single-link copy staged
+# next to the built binary instead of relaxing the gate.
+built_runtime="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)"
+(
+    runtime_stage_dir="$(mktemp -d "$(dirname "${built_runtime}")/install-stage.XXXXXX")"
+    trap 'rm -rf "${runtime_stage_dir}"' EXIT
+    install -m 0700 "${built_runtime}" "${runtime_stage_dir}/elastos"
+    python3 "${ROOT}/scripts/install-source-home-runtime.py" \
+        --source-root "${ROOT}" \
+        --data-dir "${DATA_DIR}" \
+        --built-runtime "${runtime_stage_dir}/elastos" \
+        --platform "${PLATFORM}"
+)
 
 cat <<EOF
 [setup-source-home] artifacts installed; offline principal-root upgrade and restart are required before readiness

@@ -233,7 +233,7 @@ impl CustodyProviderRequestV1 {
 
     fn into_validated_at(
         self,
-        expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
+        expected_provisioning_runtime_issuer: RuntimeOperationIssuerKeyV1,
         expected_local_node_public_key: NodePublicKey,
         now_unix_seconds: u64,
     ) -> Result<ValidatedCustodyProviderRequestV1, CustodyProviderRequestValidationErrorV1> {
@@ -242,7 +242,11 @@ impl CustodyProviderRequestV1 {
                 let record = self.custody_node_provisioning_record()?;
                 let signed_provisioning = self.signed_runtime_custody_provisioning()?;
                 let authenticated_runtime_custody_provisioning = signed_provisioning
-                    .verify_for_record(&record, expected_runtime_issuer, now_unix_seconds)
+                    .verify_for_record(
+                        &record,
+                        expected_provisioning_runtime_issuer,
+                        now_unix_seconds,
+                    )
                     .map_err(|_| CustodyProviderRequestValidationErrorV1::Contract)?;
                 if record.selected_node_public_key() != expected_local_node_public_key {
                     return Err(CustodyProviderRequestValidationErrorV1::Contract);
@@ -260,9 +264,12 @@ impl CustodyProviderRequestV1 {
             }
             CustodyProviderRequestKindV1::ReleaseContribution { .. } => {
                 let signed_node_rights_decision = self.signed_node_rights_decision()?;
-                let authenticated_runtime_release_operation = self
-                    .signed_runtime_release_operation()?
-                    .verify(expected_runtime_issuer, now_unix_seconds)
+                let signed_runtime_release_operation = self.signed_runtime_release_operation()?;
+                let declared_runtime_issuer = signed_runtime_release_operation
+                    .statement()
+                    .runtime_operation_issuer();
+                let authenticated_runtime_release_operation = signed_runtime_release_operation
+                    .verify(declared_runtime_issuer, now_unix_seconds)
                     .map_err(|_| CustodyProviderRequestValidationErrorV1::Contract)?;
                 let node_set = authenticated_runtime_release_operation
                     .statement()
@@ -353,12 +360,12 @@ pub struct ValidatedCustodyReleaseContributionRequestV1 {
 impl ValidatedCustodyProviderRequestV1 {
     pub fn decode_and_validate_at(
         bytes: &[u8],
-        expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
+        expected_provisioning_runtime_issuer: RuntimeOperationIssuerKeyV1,
         expected_local_node_public_key: NodePublicKey,
         now_unix_seconds: u64,
     ) -> Result<Self, CustodyProviderRequestValidationErrorV1> {
         CustodyProviderRequestV1::decode_wire(bytes)?.into_validated_at(
-            expected_runtime_issuer,
+            expected_provisioning_runtime_issuer,
             expected_local_node_public_key,
             now_unix_seconds,
         )
@@ -678,7 +685,7 @@ impl CustodyProviderResponseV1 {
     pub fn validate_against_request_at(
         &self,
         request: &CustodyProviderRequestV1,
-        expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
+        expected_provisioning_runtime_issuer: RuntimeOperationIssuerKeyV1,
         expected_local_node_public_key: NodePublicKey,
         now_unix_seconds: u64,
     ) -> Result<(), ContractError> {
@@ -687,7 +694,7 @@ impl CustodyProviderResponseV1 {
                 let validated = request
                     .clone()
                     .into_validated_at(
-                        expected_runtime_issuer,
+                        expected_provisioning_runtime_issuer,
                         expected_local_node_public_key,
                         now_unix_seconds,
                     )
@@ -718,7 +725,7 @@ impl CustodyProviderResponseV1 {
                 let validated = request
                     .clone()
                     .into_validated_at(
-                        expected_runtime_issuer,
+                        expected_provisioning_runtime_issuer,
                         expected_local_node_public_key,
                         now_unix_seconds,
                     )
@@ -746,7 +753,7 @@ impl CustodyProviderResponseV1 {
                 let validated = request
                     .clone()
                     .into_validated_at(
-                        expected_runtime_issuer,
+                        expected_provisioning_runtime_issuer,
                         expected_local_node_public_key,
                         now_unix_seconds,
                     )
@@ -842,6 +849,7 @@ mod tests {
         CanonicalContract, CustodyNodeProvisioningRecordV1, RightsDecisionV1,
         RuntimeCustodyProvisioningIdV1, RuntimeCustodyProvisioningStatementV1,
         RuntimeOperationIssuerKeyV1, SignedRuntimeCustodyProvisioningV1,
+        SignedRuntimeReleaseOperationV1,
     };
 
     use crate::{
@@ -972,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn custody_request_requires_expected_runtime_issuer_and_local_node() {
+    fn custody_provision_requires_expected_runtime_issuer_and_local_node() {
         let record = provisioning_record(0x11, 1);
         let signed = signed_provisioning(&record, 0x71);
         let provision_request =
@@ -991,18 +999,56 @@ mod tests {
             crate::test_support::NOW + 10,
         )
         .is_err());
+    }
 
-        let operation = make_signed_runtime_release_operation();
+    #[test]
+    fn custody_release_authenticates_the_declared_runtime_issuer_and_local_node() {
+        let operation = make_signed_runtime_release_operation_for_envelope_and_seed(
+            0x43,
+            &custody_envelope_for_seed(0x43),
+        );
         let decision = make_signed_node_rights_decision(&operation, 1, RightsDecisionV1::Allowed);
         let release_request =
             CustodyProviderRequestV1::new_release_contribution(&operation, &decision).unwrap();
-        assert!(ValidatedCustodyProviderRequestV1::decode_and_validate_at(
+        let validated = ValidatedCustodyProviderRequestV1::decode_and_validate_at(
             &release_request.to_json_vec().unwrap(),
-            runtime_operation_issuer_for_seed(0x43),
+            runtime_operation_issuer_for_seed(0x42),
+            node_public_key(1),
+            crate::test_support::NOW + 10,
+        )
+        .unwrap();
+        assert_eq!(
+            validated
+                .release_contribution()
+                .unwrap()
+                .authenticated_runtime_release_operation()
+                .statement()
+                .runtime_operation_issuer(),
+            runtime_operation_issuer_for_seed(0x43)
+        );
+
+        let wrong_runtime_key = SigningKey::from_bytes(&[0x44; 32]);
+        let invalid_signature_operation = SignedRuntimeReleaseOperationV1::new(
+            operation.statement().clone(),
+            wrong_runtime_key
+                .sign(&operation.statement().canonical_bytes().unwrap())
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let invalid_signature_request = CustodyProviderRequestV1::new_release_contribution(
+            &invalid_signature_operation,
+            &decision,
+        )
+        .unwrap();
+        assert!(ValidatedCustodyProviderRequestV1::decode_and_validate_at(
+            &invalid_signature_request.to_json_vec().unwrap(),
+            runtime_operation_issuer_for_seed(0x42),
             node_public_key(1),
             crate::test_support::NOW + 10,
         )
         .is_err());
+
         assert!(ValidatedCustodyProviderRequestV1::decode_and_validate_at(
             &release_request.to_json_vec().unwrap(),
             runtime_operation_issuer_for_seed(0x42),

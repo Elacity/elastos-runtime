@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="elastos-c4-sha256" content="04bd61999cc22c674f6df5cf424dde46080d8c6d2078ee5493c5270ef0ca0460">
+  <meta name="elastos-c4-sha256" content="59b46bfcfbdc1a1d9ceeb4e601d7c0e04046d20bd26eef3b632d562de39cacf8">
   <title>ElastOS C4 model</title>
   <style>
     :root {
@@ -418,7 +418,7 @@
         {
           id: "collaboration", group: "Level 3", number: "05", level: "C4 · Level 3 · Candidate",
           title: "Collaboration", question: "How do People, Inbox, and Chat share Profile and delivery authority without seeing Carrier topology?",
-          note: "Profile DID represents the person in collaboration; Device DID identifies a delivery endpoint. Same-endpoint direct delivery now uses authenticated Carrier loopback with the signed envelope and signed receipt.",
+          note: "Profile DID represents the person in collaboration; Device DID identifies a delivery endpoint. Same-endpoint direct delivery uses authenticated Carrier loopback with the signed envelope and signed receipt.",
           groups: [G(250, 25, 720, 670, "elastos host · Collaboration candidate")],
           nodes: [
             N("people", 15, 80, "People", "container", "External projection", "Profile, discovery, and contacts."),
@@ -630,10 +630,10 @@
         {
           id: "deployment", group: "Deployment", number: "14", level: "C4 · Deployment",
           title: "One node and one peer", question: "Where do the Level 2 containers run on a local installation?",
-          note: "This is generic, not the public seed topology. Verified 2026-08-16: the seed has no /dev/kvm and is not Home or a local crosvm/KVM Browser target.",
+          note: "This is a generic deployment view. Assign target roles from verified host capabilities recorded in state.md.",
           groups: [G(15, 25, 215, 670, "Person device · Deployment node"), G(250, 25, 720, 670, "ElastOS host machine · Deployment node")],
           nodes: [
-            N("browser", 35, 90, "Browser / installed PWA", "external", "Execution environment", "Loads Home. Browser projection still chooses display_mode; Runtime selection is the target.", null, 175, 125),
+            N("browser", 35, 90, "Browser / installed PWA", "external", "Execution environment", "Loads Home. Runtime owns Browser display and engine selection; state.md records implementation evidence.", null, 175, 125),
             N("home", 35, 285, "Home front door", "container", "Container instance", "Sign-in and shell lifecycle.", null, 175, 95),
             N("projections", 35, 490, "Shell + App projections", "container", "Container instances", "Product facts and narrow Runtime intents.", null, 175, 105),
             N("host", 300, 90, "elastos process", "container", "Container instance", "Gateway, Runtime, Carrier, and collaboration.", null, 220, 115),

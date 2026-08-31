@@ -20,13 +20,14 @@ Capsules receive no raw CEK, raw plaintext authority, custody shares, provider
 routes, endpoint DIDs, network locations, credentials, filesystem authority,
 Wallet RPC, Chain RPC, or backend SDK.
 
-## Current source state
+## Implementation and retirement
 
-The canonical Runtime-to-decrypt handoff is future integration work. The
-source-only contracts and custody crate do not claim decryption, rendering,
-installation, or playback.
+The canonical implementation is `protected-content-decrypt-provider`, called
+through the Runtime-owned protected-content coordinator. Its typed operations
+cover reconstruction, scoped media reads and terminal cleanup. Installation
+and activation evidence belongs in [state.md](../state.md).
 
-Released 0.6 contains an older provisional `decrypt-provider` capsule. It uses
+The provisional `decrypt-provider` capsule uses
 the old `elastos_common::protected_content` DTO, validates requests, and returns
 `not_configured`. It remains only as a fail-closed retirement surface and must
 be replaced atomically. It does not verify the canonical v1 path.

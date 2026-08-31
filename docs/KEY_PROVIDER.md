@@ -1,6 +1,6 @@
 # Key Provider
 
-`key-provider` is a provisional 0.6 capsule. It validates the old
+`key-provider` is a provisional capsule. It validates the old
 `elastos_common::protected_content` key-release request and remains fail closed
 when no backend is configured. It is not part of the canonical v1 architecture.
 

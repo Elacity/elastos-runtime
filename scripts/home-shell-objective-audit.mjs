@@ -388,7 +388,7 @@ function audit(args) {
         systemSwitchSmoke.includes("System shell switch did not retire Home GUI immediately") &&
         systemSwitchSmoke.includes("System shell switch did not cancel stale root-shell launches") &&
         regressionSmoke.includes("CLI-owned overlay session restored into Home GUI") &&
-        host.includes('activeShellFrame.removeAttribute("src")') &&
+        host.includes('activeShellFrame.src = "about:blank"') &&
         includesNormalized(contractDoc, "Changing shells retires the previous root frame before the next shell becomes active") &&
         contractDoc.includes("CSS hiding is not an accepted lifecycle model"),
       [

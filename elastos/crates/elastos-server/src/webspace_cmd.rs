@@ -1117,10 +1117,9 @@ async fn spawn_webspace_bridge() -> anyhow::Result<WebSpaceBridge> {
 }
 
 fn resolve_webspace_provider_binary() -> anyhow::Result<PathBuf> {
-    crate::resolve_verified_provider_binary(
-        "webspace-provider",
-        "webspace-provider not installed.\n\nRun first:\n\n  elastos setup",
-    )
+    crate::resolve_verified_native_provider_binary("webspace-provider")?.ok_or_else(|| {
+        anyhow::anyhow!("webspace-provider not installed.\n\nRun first:\n\n  elastos setup")
+    })
 }
 
 fn parse_webspace_handle_response(

@@ -4,6 +4,9 @@ const outputNode = document.querySelector("#terminal-output");
 const xtermNode = document.querySelector("#xterm-terminal");
 const terminalPanel = document.querySelector("#terminal-panel");
 const terminalScreen = document.querySelector(".terminal-screen");
+const fallbackActionsNode = document.querySelector("#terminal-fallback-actions");
+const fallbackRefreshButton = document.querySelector("#terminal-fallback-refresh");
+const fallbackDesktopButton = document.querySelector("#terminal-fallback-desktop");
 const homeToken = readLaunchToken();
 const homeParentOrigin = readQueryParam("home_origin");
 const HOST_INTENT_OSC_PREFIX = "\x1b]777;elastos-home-intent=";
@@ -11,6 +14,7 @@ const HOST_INTENT_OSC_SUFFIX = "\x07";
 const PTY_VISIBLE_ROW_GUARD = 2;
 const TERMINAL_INPUT_CHUNK_SIZE = 4096;
 const TERMINAL_INPUT_RECONNECT_MS = 250;
+const TERMINAL_OUTPUT_REPLAY_MAX_CHARS = 8192;
 
 let runtimeTerminal = null;
 let xtermModulePromise = null;
@@ -21,11 +25,30 @@ let pendingRuntimeTerminalInput = "";
 let hostIntentControlBuffer = "";
 let pendingHomeReturn = false;
 let signingOut = false;
+let runtimeTerminalStartPromise = null;
 let terminalRestartCount = 0;
+let retainedTerminalOutput = "";
+let retainedTerminalOutputSessionId = "";
 const TERMINAL_RESTART_LIMIT = 1;
 
 terminalPanel?.addEventListener("click", () => {
   xtermInstance?.focus?.();
+});
+
+fallbackRefreshButton?.addEventListener("click", () => {
+  retryHomeCliTerminalFromFallback();
+});
+
+fallbackDesktopButton?.addEventListener("click", () => {
+  requestHomeActiveShell("home-gui").catch((error) => {
+    console.error("Home CLI desktop recovery failed", error);
+    showFallback("Desktop did not open. Refresh Home CLI or try again from System.", {
+      allowDesktopRecovery: true,
+      allowRefresh: true,
+      focusDesktopRecovery: true,
+      includeRetainedTerminalOutput: true,
+    });
+  });
 });
 
 globalThis.addEventListener?.("pagehide", () => {
@@ -35,15 +58,20 @@ globalThis.addEventListener?.("pagehide", () => {
 setRuntimeTerminalMode(false);
 boot().catch((error) => {
   console.error("Home CLI terminal could not start", error);
-  showFallback("Home CLI could not start. Return to the Desktop and try again.");
+  showFallback("Home CLI could not start. Return to the Desktop and try again.", {
+    allowDesktopRecovery: true,
+    allowRefresh: true,
+    focusDesktopRecovery: true,
+    includeRetainedTerminalOutput: true,
+  });
 });
 
 async function boot() {
   if (!homeToken || !homeParentOrigin || window.parent === window) {
-    showFallback("Open Home CLI from Home.");
+    showFallback("Open Home CLI from Home.", { includeRetainedTerminalOutput: false });
     return;
   }
-  showFallback("Starting Home CLI terminal...");
+  showFallback("Starting Home CLI terminal...", { includeRetainedTerminalOutput: false });
   await startRuntimeTerminal();
 }
 
@@ -51,65 +79,89 @@ async function startRuntimeTerminal() {
   if (runtimeTerminal) {
     return;
   }
+  if (runtimeTerminalStartPromise) {
+    return runtimeTerminalStartPromise;
+  }
   if (!globalThis.EventSource || !globalThis.WebSocket) {
     throw new Error("This browser cannot open Home CLI.");
   }
 
-  const size = measureTerminalSize();
-  const session = await fetchJson("/api/apps/home-cli/terminal/sessions", {
-    method: "POST",
-    headers: homeHeaders({ "content-type": "application/json" }),
-    body: JSON.stringify({
-      schema: "elastos.home-cli.terminal-start/v1",
-      cols: size.cols,
-      rows: size.rows,
-    }),
-  });
-  if (session?.schema !== "elastos.home-cli.terminal-session/v1") {
-    throw new Error("Home CLI could not start.");
-  }
-
-  const stream = session.stream && typeof session.stream === "object" ? session.stream : {};
-  const eventsUrl = readText(stream.events_url);
-  const inputSocketUrl = readText(stream.input_socket_url);
-  const resizeUrl = readText(stream.resize_url);
-  const intentUrl = readText(stream.intent_url);
-  const closeUrl = readText(stream.close_url);
-  if (!eventsUrl || !inputSocketUrl || !resizeUrl || !intentUrl || !closeUrl) {
-    throw new Error("Home CLI could not start.");
-  }
-  if (eventsUrl.includes("home_token=")) {
-    throw new Error("Home CLI could not start securely.");
-  }
-
-  await attachXtermTerminal(size);
-  const source = new EventSource(eventsUrl);
-  runtimeTerminal = {
-    closeSent: false,
-    closeUrl,
-    eventsUrl,
-    inputSocket: null,
-    inputSocketUrl,
-    intentUrl,
-    resizeUrl,
-    sessionId: readText(session.session_id),
-    size,
-    source,
-  };
-  connectRuntimeTerminalInputSocket(runtimeTerminal);
-  setRuntimeTerminalMode(true);
-
-  source.addEventListener("terminal", (event) => {
-    handleRuntimeTerminalEvent(event);
-  });
-  source.onerror = () => {
-    if (runtimeTerminal?.source !== source) {
-      return;
+  const startPromise = (async () => {
+    const size = measureTerminalSize();
+    const session = await fetchJson("/api/apps/home-cli/terminal/sessions", {
+      method: "POST",
+      headers: homeHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({
+        schema: "elastos.home-cli.terminal-start/v1",
+        cols: size.cols,
+        rows: size.rows,
+      }),
+    });
+    if (session?.schema !== "elastos.home-cli.terminal-session/v1") {
+      throw new Error("Home CLI could not start.");
     }
-    console.warn("Home CLI terminal stream interrupted; waiting for EventSource reconnect");
-  };
 
-  xtermInstance?.focus?.();
+    const stream = session.stream && typeof session.stream === "object" ? session.stream : {};
+    const eventsUrl = readText(stream.events_url);
+    const inputSocketUrl = readText(stream.input_socket_url);
+    const resizeUrl = readText(stream.resize_url);
+    const intentUrl = readText(stream.intent_url);
+    const closeUrl = readText(stream.close_url);
+    if (!eventsUrl || !inputSocketUrl || !resizeUrl || !intentUrl || !closeUrl) {
+      throw new Error("Home CLI could not start.");
+    }
+    if (eventsUrl.includes("home_token=")) {
+      throw new Error("Home CLI could not start securely.");
+    }
+
+    await attachXtermTerminal(size);
+    const source = new EventSource(eventsUrl);
+    runtimeTerminal = {
+      closeSent: false,
+      closeUrl,
+      eventsUrl,
+      inputSocket: null,
+      inputSocketUrl,
+      intentUrl,
+      resizeUrl,
+      sessionId: readText(session.session_id),
+      size,
+      source,
+    };
+    connectRuntimeTerminalInputSocket(runtimeTerminal);
+    setRuntimeTerminalMode(true);
+
+    source.addEventListener("terminal", (event) => {
+      handleRuntimeTerminalEvent(event);
+    });
+    source.onerror = () => {
+      if (runtimeTerminal?.source !== source) {
+        return;
+      }
+      console.warn("Home CLI terminal stream interrupted; waiting for EventSource reconnect");
+    };
+
+    notifyHomeShellReady();
+    xtermInstance?.focus?.();
+  })();
+  runtimeTerminalStartPromise = startPromise;
+  try {
+    await startPromise;
+  } finally {
+    if (runtimeTerminalStartPromise === startPromise) {
+      runtimeTerminalStartPromise = null;
+    }
+  }
+}
+
+function notifyHomeShellReady() {
+  if (!homeToken || !homeParentOrigin || !window.parent || window.parent === window) {
+    return;
+  }
+  window.parent.postMessage({
+    type: "home:shell-ready",
+    homeToken,
+  }, homeParentOrigin);
 }
 
 async function attachXtermTerminal(size) {
@@ -207,6 +259,9 @@ function handleRuntimeTerminalEvent(event) {
     writeXtermStatus("Home CLI received an unreadable update.");
     return;
   }
+  if (readText(payload.session_id) !== readText(runtimeTerminal?.sessionId)) {
+    return;
+  }
 
   const stream = readText(payload.stream);
   if ((stream === "stdout" || stream === "stderr") && payload.data != null) {
@@ -238,6 +293,7 @@ function handleRuntimeTerminalEvent(event) {
 function writeRuntimeBytes(data) {
   const text = consumeHostIntentControls(String(data || ""));
   if (text) {
+    rememberRuntimeTerminalOutput(text);
     xtermInstance?.write?.(text);
   }
 }
@@ -341,7 +397,7 @@ function requestHomeSignOut() {
   signingOut = true;
   closeRuntimeTerminal({ fireAndForget: true });
   if (!window.parent || window.parent === window) {
-    showFallback("Open Home CLI from Home.");
+    showFallback("Open Home CLI from Home.", { includeRetainedTerminalOutput: false });
     return;
   }
   window.parent.postMessage({
@@ -372,22 +428,48 @@ async function requestHomeActiveShell(target) {
 
 function reattachHomeCliTerminal(message = "") {
   if (terminalRestartCount >= TERMINAL_RESTART_LIMIT) {
-    showFallback("Home CLI terminal stopped. Refresh Home CLI or switch shell explicitly from System.");
+    showFallback("Home CLI terminal stopped. Refresh Home CLI or return to the Desktop.", {
+      allowDesktopRecovery: true,
+      allowRefresh: true,
+      focusDesktopRecovery: true,
+      includeRetainedTerminalOutput: true,
+    });
     return;
   }
   terminalRestartCount += 1;
-  showFallback(message);
+  showFallback(message, { allowRefresh: true, includeRetainedTerminalOutput: true });
   globalThis.setTimeout?.(() => {
     startRuntimeTerminal().catch((error) => {
       console.error("Home CLI could not restart", error);
-      showFallback("Home CLI could not reconnect. Return to the Desktop and try again.");
+      showFallback("Home CLI could not reconnect. Return to the Desktop and try again.", {
+        allowDesktopRecovery: true,
+        allowRefresh: true,
+        focusDesktopRecovery: true,
+        includeRetainedTerminalOutput: true,
+      });
     });
   }, 0);
 }
 
+function retryHomeCliTerminalFromFallback() {
+  pendingHomeReturn = false;
+  signingOut = false;
+  terminalRestartCount = 0;
+  showFallback("Starting Home CLI terminal...", { includeRetainedTerminalOutput: false });
+  startRuntimeTerminal().catch((error) => {
+    console.error("Home CLI retry failed", error);
+    showFallback("Home CLI could not start. Return to the Desktop and try again.", {
+      allowDesktopRecovery: true,
+      allowRefresh: true,
+      focusDesktopRecovery: true,
+      includeRetainedTerminalOutput: true,
+    });
+  });
+}
+
 function requestHomeGuiTarget(target, query = {}) {
   if (!window.parent || window.parent === window) {
-    showFallback("Open Home CLI from Home.");
+    showFallback("Open Home CLI from Home.", { includeRetainedTerminalOutput: false });
     return;
   }
   window.parent.postMessage({
@@ -521,9 +603,12 @@ function setRuntimeTerminalMode(attached) {
   if (!attached) {
     detachXtermTerminal();
   }
+  if (fallbackActionsNode) {
+    fallbackActionsNode.hidden = attached;
+  }
 }
 
-function showFallback(message) {
+function showFallback(message, options = {}) {
   if (document.body?.dataset) {
     document.body.dataset.runtimeTerminal = "idle";
   }
@@ -531,7 +616,19 @@ function showFallback(message) {
     terminalPanel.dataset.runtimeTerminal = "idle";
   }
   if (outputNode) {
-    outputNode.textContent = `${String(message || "").trim()}\n`;
+    outputNode.textContent = formatFallbackText(message, options);
+  }
+  if (fallbackActionsNode) {
+    fallbackActionsNode.hidden = !options.allowDesktopRecovery && !options.allowRefresh;
+  }
+  if (fallbackRefreshButton) {
+    fallbackRefreshButton.hidden = options.allowRefresh !== true;
+  }
+  if (fallbackDesktopButton) {
+    fallbackDesktopButton.hidden = options.allowDesktopRecovery !== true;
+  }
+  if (options.focusDesktopRecovery === true) {
+    fallbackDesktopButton?.focus?.();
   }
 }
 
@@ -544,7 +641,46 @@ function writeXtermStatus(message) {
     xtermInstance.writeln?.(`\r\n${text}`);
     return;
   }
-  showFallback(text);
+  showFallback(text, { includeRetainedTerminalOutput: true });
+}
+
+function rememberRuntimeTerminalOutput(data) {
+  const sessionId = readText(runtimeTerminal?.sessionId);
+  if (!sessionId) {
+    return;
+  }
+  const text = stripAnsi(String(data || ""));
+  if (!text) {
+    return;
+  }
+  if (retainedTerminalOutputSessionId !== sessionId) {
+    retainedTerminalOutputSessionId = sessionId;
+    retainedTerminalOutput = "";
+  }
+  retainedTerminalOutput = trimRetainedTerminalOutput(`${retainedTerminalOutput}${text}`);
+}
+
+function formatFallbackText(message, options = {}) {
+  const lines = [String(message || "").trim()].filter(Boolean);
+  if (options.includeRetainedTerminalOutput !== false) {
+    const detail = retainedTerminalOutput.trim();
+    if (detail) {
+      lines.push(detail);
+    }
+  }
+  return `${lines.join("\n\n")}\n`;
+}
+
+function trimRetainedTerminalOutput(text) {
+  const value = String(text || "");
+  if (value.length <= TERMINAL_OUTPUT_REPLAY_MAX_CHARS) {
+    return value;
+  }
+  return value.slice(value.length - TERMINAL_OUTPUT_REPLAY_MAX_CHARS);
+}
+
+function stripAnsi(text) {
+  return String(text || "").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
 }
 
 async function fetchJson(url, init = {}) {

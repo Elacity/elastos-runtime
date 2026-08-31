@@ -10,10 +10,15 @@ Install the host tools first:
 
 ```bash
 xcode-select --install
-brew install node e2fsprogs
+brew install node e2fsprogs coturn ffmpeg
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup target add wasm32-unknown-unknown
 ```
+
+Setup imports `ffmpeg`/`ffprobe` for the media-provider prerequisite and
+fail-closed rejects any group-writable ancestor of the resolved binaries. If
+setup stops with `ffmpeg prerequisite parent is unsafe`, tighten the Homebrew
+directory on that path (commonly `chmod g-w /opt/homebrew/Cellar`) and rerun.
 
 Then get the repo and build/install the source-home runtime into an isolated
 Mac test home:
@@ -36,17 +41,18 @@ scripts/setup-source-home.sh
 `setup-source-home.sh` builds the runtime server, native providers,
 WASM Components, runtime-projection browser assets, Browser helper
 scripts, Browser source-home provider config, the macOS Browser VZ supervisor,
-and the local Kubo backend used by Library and Documents publish. It also signs
-the installed VZ supervisor on macOS.
+and the local Kubo backend used by Library and Documents publish. It installs
+the stable Runtime under the source-home data root at `bin/elastos`, writes the
+owner-only `receipts/source-home-installation.json` receipt, and signs the
+installed VZ supervisor on macOS.
 
-For Home/passkey use without Browser VM proof artifacts, start the gateway
-directly:
+For Home/passkey use without Browser VM proof artifacts, start the stable
+installed gateway through the restart helper:
 
 ```bash
-mkdir -p "$MAC_TEST_HOME/logs"
-HOME="$MAC_TEST_HOME" \
-  ./elastos/target/release/elastos gateway --addr localhost:61180 \
-  > "$MAC_TEST_HOME/logs/gateway.log" 2>&1 &
+scripts/mac-source-home-restart.sh \
+  --test-home "$MAC_TEST_HOME" \
+  --addr localhost:61180
 
 curl -fsS http://localhost:61180/api/health
 open http://localhost:61180/apps/home/
@@ -94,15 +100,15 @@ instead of hand-starting the gateway:
 ```bash
 scripts/mac-source-home-restart.sh \
   --test-home "$MAC_TEST_HOME" \
-  --addr localhost:61180 \
-  --json-out /tmp/elastos-mac-source-home-restart.json
+  --addr localhost:61180
 ```
 
 Do not set `HOME="$MAC_TEST_HOME"` when calling
 `scripts/mac-source-home-restart.sh`; pass `--test-home` or `MAC_TEST_HOME`
 instead. The restart helper verifies Home hash parity and Browser helper
 freshness across source, installed scripts, initrd, and rootfs before it starts
-the gateway.
+the gateway. By default, it writes the owner-only active receipt to the stable
+data-root `receipts/mac-source-home-restart.json` path.
 
 Mac Browser staging uses Apple Virtualization.framework for the Browser VM
 substrate. The installed `browser-vz-engine-supervisor` binary must be signed
@@ -125,8 +131,7 @@ VM helper freshness with:
 ```bash
 scripts/mac-source-home-restart.sh \
   --test-home "$MAC_TEST_HOME" \
-  --addr localhost:61180 \
-  --json-out /tmp/elastos-mac-source-home-restart.json
+  --addr localhost:61180
 ```
 
 Then collect a machine proof with:

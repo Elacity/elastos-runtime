@@ -12,7 +12,7 @@ This repo currently has three distinct version layers. They should not be read a
 
 1. **Core runtime release train**
    - the coordinated workspace line under [`elastos/Cargo.toml`](../elastos/Cargo.toml)
-   - examples: the `0.5.0` baseline and the current `0.6.0` release line
+   - read its version from the workspace manifest; release status belongs in `state.md`
    - this is the public release identity for the runtime/server crates
 
 2. **Stamped public release version**
@@ -48,13 +48,13 @@ MAJOR.MINOR.PATCH[-prerelease]
 Preferred examples:
 
 - `1.0.0`
-- `0.6.0-rc.1`
-- `0.6.0-beta.3`
+- `1.2.3-rc.1`
+- `1.2.3-beta.3`
 
 Rejected examples:
 
-- `0.6.0-rc31`
-- `0.6.0-beta3`
+- `1.2.3-rc31`
+- `1.2.3-beta3`
 
 Use dotted prerelease identifiers such as `-rc.31`, not `-rc31`.
 
@@ -86,7 +86,8 @@ Use dotted prerelease identifiers such as `-rc.31`, not `-rc31`.
 
 ## Pre-release Policy
 
-This repo is still pre-release. Public runtime lines may continue to use `-rc.N` while the product is not ready for a stable `1.0.0` contract.
+Use `-rc.N` for release candidates until the product meets the intended stable
+contract. Record the active release and its evidence in `state.md`.
 
 Current rule:
 
@@ -105,11 +106,11 @@ Do not invent ad hoc suffixes. If a new prerelease class is needed, update this 
 When reading logs, audits, or UI banners, use this interpretation:
 
 - **Published install**
-  - should show the stamped public release version, for example `0.6.0`
+  - should show the stamped public release version, for example `1.2.3`
 
 - **Source build without publish stamping**
   - may show the coordinated workspace version with `-dev`
-  - for the current release line, that is `0.6.0-dev`
+  - for example, workspace version `1.2.3` becomes `1.2.3-dev`
   - this means “current source build”, not “published release”
 
 - **Capsule manifest examples or local package metadata**

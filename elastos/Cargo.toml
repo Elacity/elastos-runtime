@@ -14,6 +14,7 @@ members = [
     "crates/elastos-identity",
     "crates/elastos-namespace",
     "crates/elastos-auth",
+    "crates/elastos-model-contract",
     "crates/elastos-wallet-contract",
     "crates/elastos-runtime",
     "crates/elastos-server",

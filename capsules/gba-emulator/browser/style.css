@@ -1,24 +1,24 @@
 :root {
-  --bg: #edf1fb;
-  --bg-strong: #e3e9fb;
-  --panel: rgba(255, 255, 255, 0.9);
-  --panel-strong: #ffffff;
-  --panel-soft: #eef2ff;
-  --line: rgba(83, 103, 164, 0.14);
-  --line-strong: rgba(83, 103, 164, 0.22);
-  --ink: #1d2438;
-  --muted: #66708a;
-  --brand: #f6921a;
-  --brand-soft: #fff1dc;
-  --accent: #5f76d8;
-  --accent-soft: #e8edff;
-  --accent-deep: #3c53a7;
-  --danger: #b14c5a;
-  --shadow: 0 24px 60px rgba(34, 49, 88, 0.12);
+  --bg: var(--el-surface-canvas);
+  --bg-strong: color-mix(in srgb, var(--el-surface-canvas) 78%, var(--el-accent-weak) 22%);
+  --panel: color-mix(in srgb, var(--el-surface-raised) 88%, transparent);
+  --panel-strong: var(--el-surface-raised);
+  --panel-soft: color-mix(in srgb, var(--el-surface-raised) 76%, var(--el-accent-weak) 24%);
+  --line: var(--el-hairline-soft);
+  --line-strong: color-mix(in srgb, var(--el-hairline) 84%, transparent);
+  --ink: var(--el-text-primary);
+  --muted: var(--el-text-muted);
+  --brand: var(--el-accent);
+  --brand-soft: color-mix(in srgb, var(--el-accent-weak) 64%, var(--el-surface-raised) 36%);
+  --accent: var(--el-accent);
+  --accent-soft: var(--el-accent-weak);
+  --accent-deep: var(--el-accent-strong);
+  --danger: var(--el-danger);
+  --shadow: var(--el-shadow-3);
   --control-size: 2.7rem;
   --action-size: 3.15rem;
   --control-gap: 0.75rem;
-  font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+  font-family: var(--el-font);
 }
 
 * {
@@ -38,9 +38,9 @@ body {
 
 body {
   background:
-    radial-gradient(circle at top left, rgba(95, 118, 216, 0.14), transparent 28%),
-    radial-gradient(circle at bottom right, rgba(126, 149, 226, 0.12), transparent 24%),
-    linear-gradient(180deg, #f7f9ff 0%, var(--bg) 100%);
+    radial-gradient(circle at top left, color-mix(in srgb, var(--el-accent) 14%, transparent), transparent 28%),
+    radial-gradient(circle at bottom right, color-mix(in srgb, var(--el-accent-strong) 12%, transparent), transparent 24%),
+    linear-gradient(180deg, color-mix(in srgb, var(--el-surface-canvas) 82%, white 18%) 0%, var(--bg) 100%);
   color: var(--ink);
   overflow: hidden;
   overscroll-behavior: none;
@@ -97,7 +97,7 @@ body[data-emulator-host-mode="embedded"] .shell {
 .utility-card {
   border: 1px solid var(--line);
   border-radius: 1.25rem;
-  background: rgba(255, 255, 255, 0.88);
+  background: var(--panel);
   box-shadow: var(--shadow);
   backdrop-filter: blur(12px);
 }

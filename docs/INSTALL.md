@@ -21,6 +21,11 @@ The current default Home exposes System, People, Services, Browser, Wallet,
 Documents, Library, Marketplace, Archive, and Inbox. People is installed as a
 separate app capsule; Home presents it but does not own its state or authority.
 
+Native Windows is not an accepted install target today. The current product
+direction is a local Linux Runtime inside WSL2 with a small Windows launcher.
+See [WINDOWS.md](WINDOWS.md) for the current Windows strategy and the later
+native-adapter boundary.
+
 The installer URL bootstraps trust once. Later first-party setup and update
 operations use the trusted Carrier source by default. Users do not manage a
 release-head CID or gateway on the normal path.
@@ -67,6 +72,24 @@ elastos setup --with site-provider --with tunnel-provider --with cloudflared
 # CID-backed site publication
 elastos setup --with kubo --with ipfs-provider
 ```
+
+## Setup and content Get are different operations
+
+`elastos setup` is an operator/bootstrap path for installing the selected
+Runtime profile from a trusted release. It is not the product contract for a
+Home content catalog.
+
+Downloadable games, GGUF models, and similar data should be published as signed
+content capsules identified by the CID of their complete bundle. Home `Get`
+will request a typed Runtime operation that verifies, fetches, pins, and admits
+that exact capsule through the content and availability providers. A service
+offer is needed only for a running provider capability, not for the content
+package itself.
+
+Until that Get contract is implemented and verified, raw `url` entries and
+setup-only model downloads remain operator provisioning details. They must not
+be projected as remotely installable Home catalog items. See
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
 
 ## Manual bootstrap
 

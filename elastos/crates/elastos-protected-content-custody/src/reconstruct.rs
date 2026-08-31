@@ -4,11 +4,14 @@ use vsss_rs::Gf256;
 use zeroize::Zeroizing;
 
 use elastos_protected_content_contracts::{
-    AuthenticatedRuntimeReleaseOperationV1, CustodyEnvelopeV1, CustodyNodeIdentityV1, Digest32,
-    KeyReleaseError, KeyReleaseOutcomeV1, NodeSetV1, ProtectedContentBindingV1,
-    RecipientKeyIdentityV1, SignedNodeContributionV1, SignedTerminalReceiptV1,
-    TerminalReceiptIssuerKey, VerifiedNodeContributionV1,
+    AuthenticatedRuntimeReleaseOperationV1, CustodyNodeIdentityV1, Digest32, KeyReleaseError,
+    KeyReleaseOutcomeV1, NodeSetV1, ProtectedContentBindingV1, RecipientKeyIdentityV1,
+    SignedNodeContributionV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
+    VerifiedNodeContributionV1,
 };
+
+#[cfg(test)]
+use elastos_protected_content_contracts::CustodyEnvelopeV1;
 
 use hpke::rand_core::{CryptoRng, RngCore};
 
@@ -43,7 +46,9 @@ fn reconstruct_content_key(
         binding: request.binding(),
         recipient: request.recipient(),
         request_hash: request.request_hash(),
-        envelope,
+        node_set: envelope.manifest().node_set()?,
+        nodes: envelope.manifest().nodes(),
+        content_key_commitment: envelope.manifest().content_key_commitment(),
         contributions,
         terminal_receipt,
         expected_terminal_issuer,
@@ -61,7 +66,7 @@ fn reconstruct_content_key(
 
 pub(crate) fn reconstruct_content_key_from_authenticated_operation(
     operation: &AuthenticatedRuntimeReleaseOperationV1,
-    envelope: &CustodyEnvelopeV1,
+    content_key_commitment: Digest32,
     contributions: &[SignedNodeContributionV1],
     terminal_receipt: &SignedTerminalReceiptV1,
     expected_terminal_issuer: TerminalReceiptIssuerKey,
@@ -74,11 +79,14 @@ pub(crate) fn reconstruct_content_key_from_authenticated_operation(
         operation.recipient(),
         operation.release_request_hash(),
     )?;
+    let custody_epoch = operation.statement().custody_epoch().statement();
     let context = ReconstructionContext {
         binding: operation.binding(),
         recipient: operation.recipient(),
         request_hash: operation.release_request_hash(),
-        envelope,
+        node_set: custody_epoch.node_set()?,
+        nodes: custody_epoch.nodes(),
+        content_key_commitment,
         contributions,
         terminal_receipt,
         expected_terminal_issuer,
@@ -103,7 +111,7 @@ pub(crate) fn reconstruct_content_key_from_authenticated_operation(
 
 pub struct DecryptSessionReconstructionInputsV1<'a> {
     pub operation: &'a AuthenticatedRuntimeReleaseOperationV1,
-    pub envelope: &'a CustodyEnvelopeV1,
+    pub content_key_commitment: Digest32,
     pub contributions: &'a [SignedNodeContributionV1],
     pub terminal_receipt: &'a SignedTerminalReceiptV1,
     pub expected_terminal_issuer: TerminalReceiptIssuerKey,
@@ -118,7 +126,7 @@ pub fn reconstruct_content_key_into_decrypt_session<R: CryptoRng + RngCore>(
 ) -> Result<DecryptSessionWrappedContentKeyV1, CustodyError> {
     let content_key = reconstruct_content_key_from_authenticated_operation(
         inputs.operation,
-        inputs.envelope,
+        inputs.content_key_commitment,
         inputs.contributions,
         inputs.terminal_receipt,
         inputs.expected_terminal_issuer,
@@ -144,7 +152,9 @@ struct ReconstructionContext<'a> {
     binding: &'a ProtectedContentBindingV1,
     recipient: &'a RecipientKeyIdentityV1,
     request_hash: Digest32,
-    envelope: &'a CustodyEnvelopeV1,
+    node_set: NodeSetV1,
+    nodes: &'a [CustodyNodeIdentityV1],
+    content_key_commitment: Digest32,
     contributions: &'a [SignedNodeContributionV1],
     terminal_receipt: &'a SignedTerminalReceiptV1,
     expected_terminal_issuer: TerminalReceiptIssuerKey,
@@ -170,12 +180,6 @@ where
         u64,
     ) -> Result<(), KeyReleaseError>,
 {
-    if !context
-        .envelope
-        .matches_key_envelope_identity(context.binding.key_envelope())?
-    {
-        return Err(CustodyError::BindingMismatch("key_envelope"));
-    }
     if context.recipient_secret.identity()? != *context.recipient {
         return Err(CustodyError::BindingMismatch("recipient_key_identity"));
     }
@@ -190,20 +194,19 @@ where
         return Err(CustodyError::BindingMismatch("release_threshold"));
     }
 
-    let node_set = context.envelope.manifest().node_set()?;
     let mut seen_nodes = HashSet::with_capacity(context.contributions.len());
     let mut verified_contributions = Vec::with_capacity(context.contributions.len());
     let mut ordered_contributions = Vec::with_capacity(context.contributions.len());
 
     for contribution in context.contributions {
-        let verified = verify_contribution(contribution, &node_set, context.now)?;
+        let verified = verify_contribution(contribution, &context.node_set, context.now)?;
         if !seen_nodes.insert(verified.node_public_key()) {
             return Err(CustodyError::BindingMismatch("duplicate_contribution_node"));
         }
         let node_entry = context
-            .envelope
-            .manifest()
-            .node(verified.node_public_key())
+            .nodes
+            .iter()
+            .find(|node| node.node_public_key() == verified.node_public_key())
             .ok_or(CustodyError::BindingMismatch("custody_node"))?
             .clone();
         verified_contributions.push(verified.clone());
@@ -254,7 +257,7 @@ where
     let mut content_key = Zeroizing::new([0u8; CONTENT_KEY_BYTES]);
     content_key.copy_from_slice(&reconstructed[..]);
     let content_key = ContentEncryptionKeyV1::from_guarded_bytes(content_key);
-    if !content_key.matches_commitment(context.envelope.manifest().content_key_commitment()) {
+    if !content_key.matches_commitment(context.content_key_commitment) {
         return Err(CustodyError::ContentKeyCommitmentMismatch);
     }
     Ok(content_key)
@@ -294,22 +297,20 @@ fn open_released_share(
 mod tests {
     use ed25519_dalek::{Signer as _, SigningKey};
     use rand09::{rngs::StdRng, SeedableRng as _};
-    use rand10::SeedableRng as _;
 
     use elastos_protected_content_contracts::{
-        CanonicalContract, EncryptedContentIdentityV1, KeyReleaseError, KeyReleaseOutcomeV1,
-        NodeContributionRefV1, NodeContributionStatementV1, RecipientSealedContributionV1,
-        SignedNodeContributionV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
-        TerminalReceiptStatementV1, VerifiedKeyReleaseRequestV1,
+        CanonicalContract, KeyReleaseError, KeyReleaseOutcomeV1, NodeContributionRefV1,
+        NodeContributionStatementV1, RecipientSealedContributionV1, SignedNodeContributionV1,
+        SignedTerminalReceiptV1, TerminalReceiptIssuerKey, TerminalReceiptStatementV1,
+        VerifiedKeyReleaseRequestV1,
     };
 
     use crate::{
-        provision::provision_custody_envelope_with_rng,
         release::produce_node_contribution_with_rng,
         share_wrap::{open_share, seal_share},
         test_support::{
             authenticated_runtime_release_operation_for_envelope_and_recipient_seed,
-            claimed_runtime_release_operation_for_envelope_and_node_seed, content_key, digest,
+            claimed_runtime_release_operation_for_envelope_and_node_seed, content_key,
             node_custody_secret, node_public_key, node_signing_key, provisioned_envelope,
             recipient_public_key, recipient_secret, signed_node_decision, verified_release_request,
             verified_release_request_for_envelope,
@@ -506,17 +507,6 @@ mod tests {
         SignedNodeContributionV1::new(statement, signature).unwrap()
     }
 
-    fn alternate_envelope() -> CustodyEnvelopeV1 {
-        provision_custody_envelope_with_rng(
-            EncryptedContentIdentityV1::new(digest(0x99), 4096).unwrap(),
-            &content_key(),
-            &crate::test_support::validated_custody_committee(),
-            &mut StdRng::from_seed([0x51; 32]),
-            &mut rand10::rngs::StdRng::from_seed([0x52; 32]),
-        )
-        .unwrap()
-    }
-
     #[test]
     fn reconstructs_threshold_content_key() {
         let request = verified_release_request();
@@ -571,7 +561,7 @@ mod tests {
 
         let recovered = reconstruct_content_key_from_authenticated_operation(
             &operation,
-            &envelope,
+            envelope.manifest().content_key_commitment(),
             &contributions,
             &terminal,
             terminal.statement().issuer(),
@@ -608,7 +598,7 @@ mod tests {
             crate::mint_decrypt_session_from_seed([0x51; 32]).unwrap();
         let inputs = DecryptSessionReconstructionInputsV1 {
             operation: &operation,
-            envelope: &envelope,
+            content_key_commitment: envelope.manifest().content_key_commitment(),
             contributions: &contributions,
             terminal_receipt: &terminal,
             expected_terminal_issuer: terminal.statement().issuer(),
@@ -655,7 +645,7 @@ mod tests {
 
         let err = reconstruct_content_key_from_authenticated_operation(
             &operation,
-            &envelope,
+            envelope.manifest().content_key_commitment(),
             &[contribution],
             &terminal,
             terminal.statement().issuer(),
@@ -692,7 +682,7 @@ mod tests {
 
         let err = reconstruct_content_key_from_authenticated_operation(
             &operation,
-            &envelope,
+            envelope.manifest().content_key_commitment(),
             &contributions,
             &terminal,
             terminal.statement().issuer(),
@@ -720,7 +710,7 @@ mod tests {
 
         let err = reconstruct_content_key_from_authenticated_operation(
             &operation,
-            &envelope,
+            envelope.manifest().content_key_commitment(),
             &[contribution.clone(), contribution],
             &terminal,
             terminal.statement().issuer(),
@@ -756,7 +746,7 @@ mod tests {
 
         let err = reconstruct_content_key_from_authenticated_operation(
             &operation,
-            &envelope,
+            envelope.manifest().content_key_commitment(),
             &contributions,
             &terminal,
             terminal.statement().issuer(),
@@ -944,7 +934,7 @@ mod tests {
 
         let err = reconstruct_content_key_from_authenticated_operation(
             &operation,
-            &envelope,
+            envelope.manifest().content_key_commitment(),
             &contributions,
             &terminal,
             terminal.statement().issuer(),
@@ -1007,7 +997,7 @@ mod tests {
 
         let err = reconstruct_content_key_from_authenticated_operation(
             &operation,
-            &envelope,
+            envelope.manifest().content_key_commitment(),
             &contributions,
             &terminal,
             terminal.statement().issuer(),
@@ -1043,7 +1033,7 @@ mod tests {
 
         let err = reconstruct_content_key_from_authenticated_operation(
             &operation,
-            &envelope,
+            envelope.manifest().content_key_commitment(),
             &contributions,
             &terminal,
             terminal.statement().issuer(),
@@ -1140,7 +1130,7 @@ mod tests {
 
         let err = reconstruct_content_key_from_authenticated_operation(
             &operation,
-            &envelope,
+            envelope.manifest().content_key_commitment(),
             &contributions,
             &terminal,
             terminal.statement().issuer(),
@@ -1179,7 +1169,7 @@ mod tests {
         .unwrap();
         let err = reconstruct_content_key_from_authenticated_operation(
             &operation,
-            &envelope,
+            envelope.manifest().content_key_commitment(),
             &contributions,
             &terminal,
             wrong_issuer,
@@ -1250,7 +1240,7 @@ mod tests {
 
         let err = reconstruct_content_key_from_authenticated_operation(
             &operation,
-            &envelope,
+            envelope.manifest().content_key_commitment(),
             &contributions,
             &terminal,
             terminal.statement().issuer(),
@@ -1268,9 +1258,12 @@ mod tests {
     }
 
     #[test]
-    fn contributions_are_sorted_by_manifest_coordinate() {
-        let request = verified_release_request();
+    fn authenticated_operation_contributions_are_sorted_by_signed_epoch_coordinate() {
         let envelope = provisioned_envelope();
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        let request = verified_release_request_for_envelope_and_recipient_seed(&envelope, 0x30);
         let contributions = vec![
             released_contribution(&request, &envelope, 2, 0x30, 0x72),
             released_contribution(&request, &envelope, 1, 0x30, 0x71),
@@ -1283,9 +1276,9 @@ mod tests {
             KeyReleaseOutcomeV1::Released,
         );
 
-        let recovered = reconstruct_content_key(
-            &request,
-            &envelope,
+        let recovered = reconstruct_content_key_from_authenticated_operation(
+            &operation,
+            envelope.manifest().content_key_commitment(),
             &contributions,
             &terminal,
             terminal.statement().issuer(),
@@ -1333,37 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_envelope_binding_is_rejected() {
-        let request = verified_release_request();
-        let envelope = provisioned_envelope();
-        let contributions = vec![
-            released_contribution(&request, &envelope, 1, 0x30, 0x71),
-            released_contribution(&request, &envelope, 2, 0x30, 0x72),
-        ];
-        let terminal = terminal_receipt(
-            &request,
-            &envelope,
-            &contributions,
-            0x21,
-            KeyReleaseOutcomeV1::Released,
-        );
-
-        let err = reconstruct_content_key(
-            &request,
-            &alternate_envelope(),
-            &contributions,
-            &terminal,
-            terminal.statement().issuer(),
-            &recipient_secret(0x30),
-            NOW + 8,
-        )
-        .unwrap_err();
-
-        assert!(matches!(err, CustodyError::BindingMismatch("key_envelope")));
-    }
-
-    #[test]
-    fn authenticated_operation_wrong_envelope_binding_is_rejected() {
+    fn authenticated_operation_wrong_content_key_commitment_is_rejected() {
         let envelope = provisioned_envelope();
         let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
             &envelope, 0x30,
@@ -1383,7 +1346,7 @@ mod tests {
 
         let err = reconstruct_content_key_from_authenticated_operation(
             &operation,
-            &alternate_envelope(),
+            Digest32::new([0xee; 32]),
             &contributions,
             &terminal,
             terminal.statement().issuer(),
@@ -1392,6 +1355,6 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, CustodyError::BindingMismatch("key_envelope")));
+        assert!(matches!(err, CustodyError::ContentKeyCommitmentMismatch));
     }
 }

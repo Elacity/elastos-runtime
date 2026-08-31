@@ -4,11 +4,8 @@ Agent Hosts and Apps request inference through a typed Runtime resource. They do
 not receive hosted-model credentials, provider endpoints, local model process
 access, or authority to choose a hidden alternate backend.
 
-This document defines the target contract needed by a durable Agent Host. The
-repository already includes `ai-provider` and `llama-provider`, but their
-presence does not prove the complete streaming, cancellation, recovery, and
-provider-selection behavior described here. Current implementation truth stays
-in [`state.md`](../state.md).
+This document defines the target contract needed by a durable Agent Host.
+Current implementation truth stays in [`state.md`](../state.md).
 
 ## Authority boundary
 
@@ -146,10 +143,7 @@ Hosted gateways such as OpenRouter and local engines such as llama.cpp or
 Ollama are provider implementations, not architecture. Their model identifiers
 and availability can change independently of ElastOS.
 
-OpenRouter currently exposes [`openrouter/auto`](https://openrouter.ai/docs/guides/routing/routers/auto-router)
-and returns the selected model in the response. An operator may use that
-provider-owned selector or pin a current catalog identifier such as
-[`moonshotai/kimi-k3`](https://openrouter.ai/moonshotai/kimi-k3-20260715).
+Operators select a model or routing policy from the provider's catalog.
 That configuration stays behind the provider boundary. Product UI should
 show the requested selector, resolved model when known, and whether explicit
 fallback was enabled. Canonical architecture documents do not freeze a

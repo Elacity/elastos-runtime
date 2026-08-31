@@ -274,6 +274,24 @@ Both shells can sign out. Browser `home-cli` sign-out is a launch-token-bound
 terminal host intent; `home-gui` uses the same host message contract. Neither
 shell owns or clears authentication state itself.
 
+## First-run recovery and Profile sequence
+
+For a new principal, Home presents Recovery Kit first and Profile second.
+Runtime-owned `recovery_readiness` and `profile_readiness` facts decide the
+state. System owns Recovery Kit creation and export; People owns the signed
+Profile. Home only coordinates the visible sequence.
+
+The first Profile must fail closed until Runtime reports that the principal root
+is protected and a Recovery Kit has been handed to the person. The setup UI has
+no skip authority. Closing or pressing Escape may leave a session reminder, but
+it cannot mint readiness or bypass the People gate. Existing Profiles are not
+retroactively treated as new first-run accounts.
+
+The readiness projection and the first-Profile mutation gate must derive from
+one recovery rule or be protected by an equivalence regression test. UI state,
+browser storage, a successful route, or a downloaded filename is not recovery
+authority.
+
 ## Recovery And Cleanup
 
 Changing shells retires the previous root frame before the next shell becomes

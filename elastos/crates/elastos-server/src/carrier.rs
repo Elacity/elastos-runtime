@@ -823,11 +823,62 @@ pub async fn start_carrier_node(
     start_carrier_node_with_registry(signing_key, did, data_dir, None).await
 }
 
+/// How a Carrier node attaches to the network.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CarrierNodeNetwork {
+    /// Production networking: N0 relay and public address discovery, mDNS
+    /// (unless disabled by env), and the well-known 4433 bind attempt.
+    Public,
+    /// Loopback-scope networking for tests: no relay, no public address
+    /// discovery, no mDNS, ephemeral bind. Peers are reachable only through
+    /// explicit `MemoryLookup` seeding, so nothing in a test depends on
+    /// public infrastructure, NAT behavior, or the shared 4433 port. A
+    /// connect between two public-preset in-process nodes races the relay
+    /// and NAT-observed paths against the local one and can fail with
+    /// CONNECTION_REFUSED under load.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Isolated,
+}
+
 pub async fn start_carrier_node_with_registry(
     signing_key: &ed25519_dalek::SigningKey,
     did: &str,
     data_dir: PathBuf,
     provider_registry: Option<Weak<ProviderRegistry>>,
+) -> Result<CarrierNode> {
+    start_carrier_node_with_network(
+        signing_key,
+        did,
+        data_dir,
+        provider_registry,
+        CarrierNodeNetwork::Public,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn start_isolated_carrier_node_with_registry(
+    signing_key: &ed25519_dalek::SigningKey,
+    did: &str,
+    data_dir: PathBuf,
+    provider_registry: Option<Weak<ProviderRegistry>>,
+) -> Result<CarrierNode> {
+    start_carrier_node_with_network(
+        signing_key,
+        did,
+        data_dir,
+        provider_registry,
+        CarrierNodeNetwork::Isolated,
+    )
+    .await
+}
+
+async fn start_carrier_node_with_network(
+    signing_key: &ed25519_dalek::SigningKey,
+    did: &str,
+    data_dir: PathBuf,
+    provider_registry: Option<Weak<ProviderRegistry>>,
+    network: CarrierNodeNetwork,
 ) -> Result<CarrierNode> {
     let expected_did = crate::crypto::encode_signing_key_did(signing_key);
     let decoded_did =
@@ -837,46 +888,61 @@ pub async fn start_carrier_node_with_registry(
     }
     let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
 
-    // Build an endpoint with Iroh's N0 DNS and relay services unless a custom
-    // relay is configured. Topic discovery remains the tracker's DHT layer.
-    let mut builder = Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret_key.clone());
-    if let Ok(relay_url) = std::env::var("ELASTOS_RELAY_URL") {
-        if let Ok(url) = relay_url.parse::<url::Url>() {
-            let config = iroh::RelayConfig::new(url.into(), Some(Default::default()));
-            builder =
-                builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from_iter([config])));
-            info!("carrier: using custom relay {}", relay_url);
+    let endpoint = match network {
+        CarrierNodeNetwork::Public => {
+            // Build an endpoint with Iroh's N0 DNS and relay services unless a
+            // custom relay is configured. Topic discovery remains the
+            // tracker's DHT layer.
+            let mut builder =
+                Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret_key.clone());
+            if let Ok(relay_url) = std::env::var("ELASTOS_RELAY_URL") {
+                if let Ok(url) = relay_url.parse::<url::Url>() {
+                    let config = iroh::RelayConfig::new(url.into(), Some(Default::default()));
+                    builder = builder
+                        .relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from_iter([config])));
+                    info!("carrier: using custom relay {}", relay_url);
+                }
+            }
+            match builder
+                .bind_addr("0.0.0.0:4433".parse::<std::net::SocketAddr>().unwrap())
+                .map_err(|e| anyhow::anyhow!("{}", e))
+            {
+                Ok(builder) => match builder.bind().await {
+                    Ok(ep) => ep,
+                    Err(_) => Endpoint::builder(iroh::endpoint::presets::N0)
+                        .secret_key(secret_key)
+                        .bind()
+                        .await
+                        .context("Failed to bind Carrier endpoint")?,
+                },
+                Err(_) => Endpoint::builder(iroh::endpoint::presets::N0)
+                    .secret_key(secret_key)
+                    .bind()
+                    .await
+                    .context("Failed to bind Carrier endpoint")?,
+            }
         }
-    }
-    let endpoint = match builder
-        .bind_addr("0.0.0.0:4433".parse::<std::net::SocketAddr>().unwrap())
-        .map_err(|e| anyhow::anyhow!("{}", e))
-    {
-        Ok(builder) => match builder.bind().await {
-            Ok(ep) => ep,
-            Err(_) => Endpoint::builder(iroh::endpoint::presets::N0)
-                .secret_key(secret_key)
-                .bind()
-                .await
-                .context("Failed to bind Carrier endpoint")?,
-        },
-        Err(_) => Endpoint::builder(iroh::endpoint::presets::N0)
+        CarrierNodeNetwork::Isolated => Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(secret_key)
             .bind()
             .await
-            .context("Failed to bind Carrier endpoint")?,
+            .context("Failed to bind isolated Carrier endpoint")?,
     };
 
     // Add mDNS for LAN discovery alongside the N0 preset lookup services.
-    if carrier_mdns_enabled() {
-        if let Ok(mdns) = MdnsAddressLookup::builder().build(endpoint.id()) {
-            endpoint
-                .address_lookup()
-                .context("Carrier endpoint closed before mDNS setup")?
-                .add(mdns);
+    match network {
+        CarrierNodeNetwork::Public if carrier_mdns_enabled() => {
+            if let Ok(mdns) = MdnsAddressLookup::builder().build(endpoint.id()) {
+                endpoint
+                    .address_lookup()
+                    .context("Carrier endpoint closed before mDNS setup")?
+                    .add(mdns);
+            }
         }
-    } else {
-        info!("carrier: mDNS discovery disabled by ELASTOS_CARRIER_MDNS");
+        CarrierNodeNetwork::Public => {
+            info!("carrier: mDNS discovery disabled by ELASTOS_CARRIER_MDNS");
+        }
+        CarrierNodeNetwork::Isolated => {}
     }
 
     // Add MemoryLookup for explicit peer addresses (--connect tickets)
@@ -920,28 +986,34 @@ pub async fn start_carrier_node_with_registry(
         .map(|s| s.port())
         .unwrap_or(0);
 
-    // Wait for relay connection (NAT traversal requires relay)
-    match tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await {
-        Ok(()) => {
-            let mut watcher = endpoint.watch_addr();
-            let addr = watcher.get();
-            let relay_count = addr
-                .addrs
-                .iter()
-                .filter(|a| matches!(a, iroh::TransportAddr::Relay(_)))
-                .count();
-            let ip_count = addr
-                .addrs
-                .iter()
-                .filter(|a| matches!(a, iroh::TransportAddr::Ip(_)))
-                .count();
-            info!(
-                "carrier: online {} (port {}, {} relay, {} direct)",
-                did, bound_port, relay_count, ip_count
-            );
-        }
-        Err(_) => {
-            info!("carrier: online {} (port {}, no relay)", did, bound_port);
+    // Wait for relay connection (NAT traversal requires relay). An isolated
+    // node has no relay to come online with, so the wait would only ever
+    // burn its full timeout.
+    if network == CarrierNodeNetwork::Isolated {
+        info!("carrier: isolated {} (port {})", did, bound_port);
+    } else {
+        match tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await {
+            Ok(()) => {
+                let mut watcher = endpoint.watch_addr();
+                let addr = watcher.get();
+                let relay_count = addr
+                    .addrs
+                    .iter()
+                    .filter(|a| matches!(a, iroh::TransportAddr::Relay(_)))
+                    .count();
+                let ip_count = addr
+                    .addrs
+                    .iter()
+                    .filter(|a| matches!(a, iroh::TransportAddr::Ip(_)))
+                    .count();
+                info!(
+                    "carrier: online {} (port {}, {} relay, {} direct)",
+                    did, bound_port, relay_count, ip_count
+                );
+            }
+            Err(_) => {
+                info!("carrier: online {} (port {}, no relay)", did, bound_port);
+            }
         }
     }
 
@@ -1653,7 +1725,14 @@ async fn carrier_provider_invoke_registry(
         }),
     );
 
-    match registry.send_raw(target, &request).await {
+    let result = if target == "custody" {
+        registry
+            .send_runtime_provider_target_raw(target, &request)
+            .await
+    } else {
+        registry.send_raw(target, &request).await
+    };
+    match result {
         Ok(result) => Ok(serde_json::json!({
             "ok": true,
             "result": result,
@@ -1671,6 +1750,7 @@ fn carrier_provider_target_allowed(target: &str) -> bool {
         target,
         "content"
             | "availability"
+            | "custody"
             | "rights"
             | "key"
             | "decrypt"
@@ -6245,6 +6325,24 @@ impl CarrierProviderInvoker {
     }
 }
 
+fn carrier_provider_public_connect_error(index: usize, err: &anyhow::Error) -> String {
+    tracing::debug!(
+        ticket_index = index,
+        error = %format_args!("{err:#}"),
+        "Carrier provider connect failed"
+    );
+    format!("ticket[{index}] connect failed")
+}
+
+fn carrier_provider_public_invoke_error(index: usize, err: &anyhow::Error) -> String {
+    tracing::debug!(
+        ticket_index = index,
+        error = %format_args!("{err:#}"),
+        "Carrier provider invocation failed"
+    );
+    format!("ticket[{index}] invoke failed")
+}
+
 #[async_trait::async_trait]
 impl ProviderCarrierInvoker for CarrierProviderInvoker {
     async fn invoke_carrier_provider(
@@ -6302,11 +6400,11 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                             match client.invoke_provider(invocation, request.clone()).await {
                                 Ok(response) => return Ok(response),
                                 Err(err) => {
-                                    errors.push(format!("ticket[{index}] invoke failed: {err}"))
+                                    errors.push(carrier_provider_public_invoke_error(index, &err))
                                 }
                             }
                         }
-                        Err(err) => errors.push(format!("ticket[{index}] connect failed: {err}")),
+                        Err(err) => errors.push(carrier_provider_public_connect_error(index, &err)),
                     }
                 }
 
@@ -6397,7 +6495,7 @@ pub async fn open_browser_carrier_stream(
                 }
                 Err(err) => errors.push(format!("ticket[{index}] stream open failed: {err}")),
             },
-            Err(err) => errors.push(format!("ticket[{index}] connect failed: {err}")),
+            Err(err) => errors.push(format!("ticket[{index}] connect failed: {err:#}")),
         }
     }
 
@@ -6782,7 +6880,7 @@ pub async fn fetch_file_from_trusted_source(
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => errors.push(format!("ticket[{index}] fetch failed: {err}")),
             },
-            Err(err) => errors.push(format!("ticket[{index}] connect failed: {err}")),
+            Err(err) => errors.push(format!("ticket[{index}] connect failed: {err:#}")),
         }
     }
 
@@ -7415,6 +7513,8 @@ mod tests {
         omit_admission_receipt: bool,
     }
 
+    struct RejectingCarrierProviderPlaneInvoker;
+
     #[async_trait::async_trait]
     impl ProviderCarrierInvoker for MockCarrierProviderPlaneInvoker {
         async fn invoke_carrier_provider(
@@ -7734,6 +7834,22 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl ProviderCarrierInvoker for RejectingCarrierProviderPlaneInvoker {
+        async fn invoke_carrier_provider(
+            &self,
+            _route: &ProviderCarrierRoute,
+            _invocation: &ProviderInvocation,
+            _request: serde_json::Value,
+        ) -> std::result::Result<serde_json::Value, ProviderError> {
+            let err = anyhow::anyhow!("outer carrier failure")
+                .context("dial [/ip4/127.0.0.1/tcp/4433] inner failure");
+            Err(ProviderError::Provider(
+                carrier_provider_public_connect_error(0, &err),
+            ))
+        }
+    }
+
     #[test]
     fn test_topic_hash_deterministic() {
         let h1 = topic_hash("#general");
@@ -7808,6 +7924,23 @@ mod tests {
         assert!(uri.ends_with("/availability"));
         assert!(!topic.contains(cid));
         assert!(!uri.contains(cid));
+    }
+
+    #[test]
+    fn test_carrier_provider_public_errors_redact_dial_details_and_cause_chains() {
+        let connect_err = anyhow::anyhow!("outer carrier failure")
+            .context("dial [/ip4/127.0.0.1/tcp/4433] inner failure");
+        let connect = carrier_provider_public_connect_error(2, &connect_err);
+        assert_eq!(connect, "ticket[2] connect failed");
+        assert!(!connect.contains("127.0.0.1"));
+        assert!(!connect.contains("inner failure"));
+
+        let invoke_err =
+            anyhow::anyhow!("invoke failed: provider route 10.0.0.8:4433").context("root cause");
+        let invoke = carrier_provider_public_invoke_error(3, &invoke_err);
+        assert_eq!(invoke, "ticket[3] invoke failed");
+        assert!(!invoke.contains("10.0.0.8"));
+        assert!(!invoke.contains("root cause"));
     }
 
     #[test]
@@ -8369,6 +8502,16 @@ mod tests {
         assert!(!response.to_string().contains("\"connect_ticket\":"));
     }
 
+    #[test]
+    fn test_carrier_provider_target_admission_keeps_protected_runtime_targets_narrow() {
+        assert!(carrier_provider_target_allowed("custody"));
+        assert!(!carrier_provider_target_allowed("protect"));
+        assert!(!carrier_provider_target_allowed("media"));
+        assert!(!carrier_provider_target_allowed(
+            "protected-content-decrypt"
+        ));
+    }
+
     struct PeerDidRouteFixture {
         local_registry: Arc<ProviderRegistry>,
         remote_requests: Arc<StdMutex<Vec<serde_json::Value>>>,
@@ -8379,6 +8522,27 @@ mod tests {
         _remote_registry: Arc<ProviderRegistry>,
         _local_dir: tempfile::TempDir,
         _remote_dir: tempfile::TempDir,
+    }
+
+    /// A freshly started endpoint publishes its direct socket addresses
+    /// asynchronously, so a bare `watch_addr().get()` snapshot can race that
+    /// publication under load and hand out an id with no dialable address.
+    /// Production waits for `endpoint.online()` before snapshotting; tests
+    /// only need a direct IP transport address, so wait for exactly that.
+    async fn wait_for_direct_endpoint_addr(endpoint: &Endpoint) -> iroh::EndpointAddr {
+        let mut watcher = endpoint.watch_addr();
+        for _ in 0..100 {
+            let addr = watcher.get();
+            if addr
+                .addrs
+                .iter()
+                .any(|transport| matches!(transport, iroh::TransportAddr::Ip(_)))
+            {
+                return addr;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("carrier test endpoint never published a direct address");
     }
 
     /// Deterministic peer-DID resolver setup.
@@ -8392,7 +8556,7 @@ mod tests {
         let local_dir = tempfile::tempdir().unwrap();
         let local_registry = Arc::new(ProviderRegistry::new());
         let (local_sk, local_did) = elastos_identity::derive_did(&[local_seed; 32]);
-        let local_node = start_carrier_node_with_registry(
+        let local_node = start_isolated_carrier_node_with_registry(
             &local_sk,
             &local_did,
             local_dir.path().to_path_buf(),
@@ -8420,9 +8584,18 @@ mod tests {
             )
             .await
             .unwrap();
+        remote_registry
+            .register_runtime_provider_target(
+                "custody",
+                Arc::new(RecordingCarrierContentProvider {
+                    requests: remote_requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
         let remote_dir = tempfile::tempdir().unwrap();
         let (remote_sk, remote_did) = elastos_identity::derive_did(&[remote_seed; 32]);
-        let remote_node = start_carrier_node_with_registry(
+        let remote_node = start_isolated_carrier_node_with_registry(
             &remote_sk,
             &remote_did,
             remote_dir.path().to_path_buf(),
@@ -8431,8 +8604,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mut remote_watch = remote_node.endpoint.watch_addr();
-        let remote_addr = remote_watch.get();
+        let remote_addr = wait_for_direct_endpoint_addr(&remote_node.endpoint).await;
         local_node
             .memory_lookup
             .add_endpoint_info(remote_addr.clone());
@@ -8456,6 +8628,22 @@ mod tests {
             target: "content".to_string(),
             op: "fetch".to_string(),
             request: serde_json::json!({ "op": "fetch" }),
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                peer_did: peer_did.to_string(),
+                timeout_ms: Some(5_000),
+            }),
+        }
+    }
+
+    fn peer_did_custody_invocation(peer_did: &str) -> ProviderInvocation {
+        ProviderInvocation {
+            source: "runtime".to_string(),
+            target: "custody".to_string(),
+            op: "evaluate".to_string(),
+            request: serde_json::json!({ "op": "evaluate" }),
             transfer: ProviderTransfer::Json,
             range: None,
             progress: None,
@@ -8524,6 +8712,48 @@ mod tests {
             "content-provider"
         );
         assert_eq!(requests[0]["_runtime_invocation"]["target"], "content");
+        drop(requests);
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn test_peer_did_route_reaches_runtime_only_custody_target() {
+        let fixture = peer_did_route_fixture(62, 63).await;
+
+        let response = fixture
+            .local_registry
+            .invoke_provider(peer_did_custody_invocation(&fixture.remote_did))
+            .await
+            .unwrap();
+
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["data"]["op"], "evaluate");
+        assert_eq!(
+            response["data"]["runtime_invocation"]["transport"],
+            "carrier-provider-plane"
+        );
+        assert_eq!(
+            response["data"]["runtime_invocation"]["carrier"],
+            serde_json::Value::Null
+        );
+        assert!(!response.to_string().contains("connect_ticket"));
+        assert!(!response.to_string().contains("127.0.0.1"));
+
+        let requests = fixture.remote_requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["_runtime_invocation"]["source"], "runtime");
+        assert_eq!(requests[0]["_runtime_invocation"]["target"], "custody");
+        assert_eq!(
+            requests[0]["_runtime_invocation"]["capability"],
+            "provider:runtime->custody:evaluate"
+        );
+        assert_eq!(
+            requests[0]["_runtime_invocation"]["carrier"]["source_endpoint_did"],
+            public_key_to_did(&fixture.local_node.endpoint.id())
+                .expect("test endpoint must encode as DID")
+        );
         drop(requests);
 
         shutdown_test_carrier_node(fixture.remote_node).await;
@@ -8777,7 +9007,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_did_route_without_runtime_endpoint_is_unavailable_before_provider_effect() {
-        let fixture = peer_did_route_fixture(62, 63).await;
+        let fixture = peer_did_route_fixture(76, 77).await;
         // Rebind the registry to an invoker that owns no Carrier endpoint, so
         // Runtime has no verified route to any peer.
         fixture
@@ -9237,6 +9467,33 @@ mod tests {
             requests[0]["request"]["_runtime_invocation"]["transfer"],
             "stream"
         );
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_fetch_public_error_stays_bounded() {
+        let registry = ProviderRegistry::new();
+        registry
+            .set_carrier_invoker(Arc::new(RejectingCarrierProviderPlaneInvoker))
+            .await;
+
+        let err = fetch_content_via_carrier_provider_invocation(
+            &registry,
+            "ticket:internal-secret",
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            "docs/readme.md",
+        )
+        .await
+        .expect_err("failing carrier invocation must stay bounded");
+
+        let rendered = err.to_string();
+        assert!(rendered.starts_with("Carrier provider invocation failed:"));
+        assert!(rendered.contains("ticket[0] connect failed"));
+        assert!(!rendered.contains("127.0.0.1"));
+        assert!(!rendered.contains("localhost"));
+        assert!(!rendered.contains("/ip4/"));
+        assert!(!rendered.contains("inner failure"));
+        assert!(!rendered.contains("connect to"));
+        assert!(!rendered.contains("ticket:internal-secret"));
     }
 
     #[tokio::test]
@@ -11050,8 +11307,7 @@ mod tests {
             .unwrap();
 
         // Add node1's address to node2's address book
-        let mut w1 = node1.endpoint.watch_addr();
-        let addr1 = w1.get();
+        let addr1 = wait_for_direct_endpoint_addr(&node1.endpoint).await;
         node2.memory_lookup.add_endpoint_info(addr1.clone());
 
         let topic = topic_hash("#test");
@@ -11445,8 +11701,8 @@ mod tests {
             .await
             .unwrap();
 
-        let mut watcher = node.endpoint.watch_addr();
-        let client = CarrierClient::connect_endpoint_addr(watcher.get(), 5)
+        let node_addr = wait_for_direct_endpoint_addr(&node.endpoint).await;
+        let client = CarrierClient::connect_endpoint_addr(node_addr, 5)
             .await
             .unwrap();
         let pulled = client.pull_gossip_messages(topic, 10, None).await.unwrap();

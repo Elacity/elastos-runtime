@@ -12,6 +12,9 @@ const discoveryRequestsList = document.getElementById("discovery-requests-list")
 const discoveryStatusNode = document.getElementById("discovery-status");
 const discoveryToggleButton = document.getElementById("discovery-toggle");
 const discoveryRefreshButton = document.getElementById("discovery-refresh");
+const peopleCountNode = document.getElementById("people-count");
+const discoveryVisibleCountNode = document.getElementById("discovery-visible-count");
+const discoveryRequestsCountNode = document.getElementById("discovery-requests-count");
 const pageTitle = document.querySelector(".people-page-title");
 const launchParams = new URLSearchParams(window.location.search);
 const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
@@ -23,6 +26,8 @@ const SECTION_TITLES = {
 };
 
 let refreshGeneration = 0;
+let profileDraftDirty = false;
+let profileDraftValue = "";
 
 announceReady();
 
@@ -46,6 +51,20 @@ async function boot() {
 function announceReady() {
   if (homeToken && homeParentOrigin && window.top !== window) {
     window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);
+    window.top.postMessage({
+      type: "home:menu-manifest",
+      homeToken,
+      menus: [
+        {
+          title: "File",
+          items: [{ label: "Close Window", cmd: "__close-window" }],
+        },
+        {
+          title: "View",
+          items: [{ label: "Refresh", cmd: "refresh" }],
+        },
+      ],
+    }, homeParentOrigin);
   }
 }
 
@@ -85,6 +104,22 @@ function bindActions() {
   profileForm?.addEventListener("submit", (event) => {
     event.preventDefault();
     saveProfile().catch((error) => showStatus(profileSaveFailureMessage(error), "error"));
+  });
+  profileInput?.addEventListener("input", () => {
+    profileDraftDirty = true;
+    profileDraftValue = profileInput.value;
+  });
+  window.addEventListener("message", (event) => {
+    if (event.origin !== "null" || event.source !== window.parent) {
+      return;
+    }
+    const message = event.data;
+    if (message?.type !== "elastos:menu-command" || readText(message.cmd) !== "refresh") {
+      return;
+    }
+    refreshPeople().catch((error) => {
+      showStatus(publicError(error, "People could not load."), "error");
+    });
   });
   document.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target.closest("[data-action]") : null;
@@ -196,11 +231,16 @@ function renderProfile(identity) {
   const hasProfile = readinessStatus === "ready" && Boolean(displayName);
   const unavailable = readinessStatus === "unavailable"
     || (readinessStatus === "ready" && !displayName);
+  const createState = !hasProfile && !unavailable;
+  if (hasProfile) {
+    profileDraftDirty = false;
+    profileDraftValue = displayName;
+  } else if (!profileDraftDirty) {
+    profileDraftValue = createState ? setupSuggestion : "";
+  }
   if (document.activeElement !== profileInput) {
-    profileInput.value = hasProfile ? displayName : "";
-    profileInput.placeholder = readinessStatus === "setup_required" && setupSuggestion
-      ? setupSuggestion
-      : "Your name";
+    profileInput.value = hasProfile ? displayName : profileDraftValue;
+    profileInput.placeholder = "Your name";
   }
   if (profileTitle) {
     profileTitle.textContent = hasProfile
@@ -226,6 +266,9 @@ function renderProfile(identity) {
 
 function renderPeople(people) {
   const contacts = arrayValue(people?.contacts).filter(isValidContact);
+  if (peopleCountNode) {
+    peopleCountNode.textContent = `${contacts.length} contact${contacts.length === 1 ? "" : "s"}`;
+  }
   peopleList.innerHTML = contacts.length
     ? contacts.map(contactMarkup).join("")
     : emptyMarkup("No contacts yet", "Accepted contacts appear here.");
@@ -235,6 +278,14 @@ function renderDiscovery(discovery) {
   const safeDiscovery = normalizeDiscoverySummary(discovery);
   const configured = safeDiscovery.configured;
   const enabled = safeDiscovery.enabled;
+  if (discoveryVisibleCountNode) {
+    discoveryVisibleCountNode.textContent =
+      `${safeDiscovery.discoveredPeers.length} visible`;
+  }
+  if (discoveryRequestsCountNode) {
+    discoveryRequestsCountNode.textContent =
+      `${safeDiscovery.pendingRequestCount} request${safeDiscovery.pendingRequestCount === 1 ? "" : "s"}`;
+  }
   if (discoveryStatusNode) {
     discoveryStatusNode.textContent = safeDiscovery.statusMessage;
   }
@@ -449,7 +500,7 @@ function personCard({ name, details, actions }) {
       <div class="person-avatar" aria-hidden="true">${escapeHtml(displayName.slice(0, 1).toUpperCase())}</div>
       <div class="person-copy">
         <h4>${escapeHtml(displayName)}</h4>
-        <p>${details}</p>
+        <p class="person-details">${details}</p>
       </div>
       <div class="person-actions">${actions}</div>
     </article>

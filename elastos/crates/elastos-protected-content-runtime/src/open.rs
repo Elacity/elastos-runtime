@@ -9,12 +9,11 @@
 use std::fmt;
 
 use elastos_protected_content_contracts::{
-    ContractError, CustodyEnvelopeV1, Digest32, EncryptedContentIdentityV1, KeyEnvelopeIdentityV1,
-    ProfileIdentityV1, ProtectedContentBindingV1, RecipientKeyIdentityV1,
-    RecipientPublicKeyBytesV1, RightsActionV1, RightsPolicyIdentityV1, RuntimeOperationIssuerKeyV1,
-    RuntimeReleaseAuditIdV1, RuntimeSessionBindingV1, SignedNodeContributionV1,
-    SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
-    WalletAddress,
+    ContractError, Digest32, EncryptedContentIdentityV1, KeyEnvelopeIdentityV1, ProfileIdentityV1,
+    ProtectedContentBindingV1, RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, RightsActionV1,
+    RightsPolicyIdentityV1, RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1,
+    RuntimeSessionBindingV1, SignedNodeContributionV1, SignedRuntimeReleaseOperationV1,
+    SignedTerminalReceiptV1, TerminalReceiptIssuerKey, WalletAddress,
 };
 use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, DecryptProviderRequestV1, DecryptProviderResponseStatusV1,
@@ -93,7 +92,7 @@ pub struct RuntimeOpenViewerSessionInput<'a> {
     pub prepared_recipient: &'a RuntimePreparedRecipient,
     pub signed_runtime_release_operation: &'a SignedRuntimeReleaseOperationV1,
     pub expected_terminal_issuer: TerminalReceiptIssuerKey,
-    pub custody_envelope: &'a CustodyEnvelopeV1,
+    pub content_key_commitment: Digest32,
     pub media_identity: &'a CencFmp4MediaIdentityV1,
     pub protected_init_segment: &'a [u8],
     pub signed_node_contributions: &'a [SignedNodeContributionV1],
@@ -626,32 +625,54 @@ pub fn bind_buy(
 ) -> Result<RuntimeBuyReceipt, RuntimeOpenError> {
     if custody_provisioned_mint.custody_terminal()
         != Some(crate::RuntimeCustodyTerminalKind::CustodyProvisioned)
-        || custody_provisioned_mint.content_availability().is_none()
     {
         return Err(RuntimeOpenError::MintSelection);
     }
-    if purchase_effect.authority().principal_id() != principal_id {
-        return Err(RuntimeOpenError::ChainEvidence);
-    }
-    if purchase_effect.intent().mint_id() != custody_provisioned_mint.draft().mint_id()
-        || purchase_effect.intent().encrypted_content()
-            != custody_provisioned_mint.draft().encrypted_content()
-        || purchase_effect.intent().key_envelope()
-            != custody_provisioned_mint.draft().key_envelope()
-        || purchase_effect.intent().rights_policy() != custody_provisioned_mint.draft().policy()
-    {
-        return Err(RuntimeOpenError::MintSelection);
-    }
-    Ok(RuntimeBuyReceipt {
-        mint_id: custody_provisioned_mint.draft().mint_id(),
-        encrypted_content: custody_provisioned_mint.draft().encrypted_content().clone(),
-        key_envelope: custody_provisioned_mint.draft().key_envelope().clone(),
-        rights_policy: custody_provisioned_mint.draft().policy().clone(),
+    let availability = custody_provisioned_mint
+        .content_availability()
+        .ok_or(RuntimeOpenError::MintSelection)?;
+    custody_provisioned_mint.draft().bind_verified_buy(
+        availability,
+        principal_id,
         profile,
-        wallet: purchase_effect.wallet_address(),
-        action: purchase_effect.intent().action(),
-        chain_transaction: purchase_effect.transaction_hash(),
-    })
+        purchase_effect,
+    )
+}
+
+impl crate::RuntimeMintDraft {
+    pub fn bind_verified_buy(
+        &self,
+        availability: &crate::RuntimeVerifiedContentAvailability,
+        principal_id: &str,
+        profile: ProfileIdentityV1,
+        purchase_effect: &RuntimeVerifiedPurchaseEffect,
+    ) -> Result<RuntimeBuyReceipt, RuntimeOpenError> {
+        if availability.encrypted_content() != self.encrypted_content()
+            || availability.media_manifest_root() != self.media_identity().media_manifest_root()
+        {
+            return Err(RuntimeOpenError::MintSelection);
+        }
+        if purchase_effect.authority().principal_id() != principal_id {
+            return Err(RuntimeOpenError::ChainEvidence);
+        }
+        if purchase_effect.intent().mint_id() != self.mint_id()
+            || purchase_effect.intent().encrypted_content() != self.encrypted_content()
+            || purchase_effect.intent().key_envelope() != self.key_envelope()
+            || purchase_effect.intent().rights_policy() != self.policy()
+        {
+            return Err(RuntimeOpenError::MintSelection);
+        }
+        Ok(RuntimeBuyReceipt {
+            mint_id: self.mint_id(),
+            encrypted_content: self.encrypted_content().clone(),
+            key_envelope: self.key_envelope().clone(),
+            rights_policy: self.policy().clone(),
+            profile,
+            wallet: purchase_effect.wallet_address(),
+            action: purchase_effect.intent().action(),
+            chain_transaction: purchase_effect.transaction_hash(),
+        })
+    }
 }
 
 pub async fn prepare_recipient(
@@ -770,7 +791,7 @@ pub async fn open_viewer_session(
         *input.prepared_recipient.prepared_recipient_handle(),
         input.signed_runtime_release_operation,
         input.expected_terminal_issuer,
-        input.custody_envelope,
+        input.content_key_commitment,
         input.media_identity,
         input.protected_init_segment,
         input.signed_node_contributions,
@@ -1626,6 +1647,47 @@ mod tests {
             receipt.encrypted_content(),
             available.draft().encrypted_content()
         );
+    }
+
+    #[test]
+    fn bind_verified_buy_rejects_mismatched_availability_identity() {
+        let (temp, provisioned) = persist_mint(true);
+        let available = persist_content_availability(&temp, &provisioned);
+        let effect = purchase_effect(&available, WALLET_ACCOUNT, 0xaa);
+        let requirement = availability_requirement();
+        for (encrypted_content, media_manifest_root) in [
+            (
+                EncryptedContentIdentityV1::new(
+                    digest(0x70),
+                    available.draft().encrypted_content().ciphertext_bytes(),
+                )
+                .unwrap(),
+                available.draft().media_identity().media_manifest_root(),
+            ),
+            (available.draft().encrypted_content().clone(), digest(0x7f)),
+        ] {
+            let mismatch = RuntimeVerifiedContentAvailability::new(
+                "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+                requirement.expected_object_identity(),
+                requirement.expected_publisher_did(),
+                &requirement,
+                3,
+                NOW,
+                digest(0x7e),
+                encrypted_content,
+                media_manifest_root,
+            )
+            .unwrap();
+            assert_eq!(
+                available.draft().bind_verified_buy(
+                    &mismatch,
+                    "profile:alpha",
+                    profile_identity(0x26),
+                    &effect,
+                ),
+                Err(RuntimeOpenError::MintSelection)
+            );
+        }
     }
 
     #[test]

@@ -367,9 +367,22 @@ fn signed_release_operation_with_runtime_seed_and_epoch(
     runtime_seed: u8,
     epoch: SignedCustodyEpochV1,
 ) -> SignedRuntimeReleaseOperationV1 {
+    signed_release_operation_with_runtime_seed_epoch_and_issued_at(
+        record,
+        runtime_seed,
+        epoch,
+        issued_unix_seconds(),
+    )
+}
+
+fn signed_release_operation_with_runtime_seed_epoch_and_issued_at(
+    record: &CustodyNodeProvisioningRecordV1,
+    runtime_seed: u8,
+    epoch: SignedCustodyEpochV1,
+    issued_at: u64,
+) -> SignedRuntimeReleaseOperationV1 {
     let runtime_key = node_signing_key(runtime_seed);
     let policy = policy_body();
-    let issued_at = issued_unix_seconds();
     let expires_at = issued_at + PROCESS_TEST_VALID_RELEASE_LIFETIME_SECS;
     let binding = ProtectedContentBindingV1::new(
         record.manifest().encrypted_content().clone(),
@@ -719,7 +732,7 @@ fn custody_provider_provision_command_is_idempotent_for_public_identities() {
 }
 
 #[test]
-fn custody_provider_process_provisions_releases_replays_after_restart_and_shuts_down() {
+fn custody_provider_process_keeps_provisioning_issuer_while_buyer_runtime_releases_and_replays() {
     let temp = tempfile::tempdir().unwrap();
     let init_request = prepare_config(temp.path());
     let base_path = Path::new(init_request["config"]["base_path"].as_str().unwrap());
@@ -750,7 +763,11 @@ fn custody_provider_process_provisions_releases_replays_after_restart_and_shuts_
     let duplicate = provider.request(request_value(&provision_request));
     assert_eq!(duplicate["data"], provisioned["data"]);
 
-    let release_operation = signed_release_operation_with_provider(&record, &provider_node);
+    let release_operation = signed_release_operation_with_runtime_seed_and_epoch(
+        &record,
+        0x43,
+        signed_epoch_with_provider(&provider_node),
+    );
     let decision = signed_decision_with_provider(
         &release_operation,
         &provider_node,
@@ -890,27 +907,6 @@ fn custody_provider_process_rejects_wrong_issuer_node_conflict_and_redacts_diagn
     assert!(!wrong_issuer.contains("0x43"));
 
     let wrong_runtime_operation = signed_release_operation_with_provider(&record, &provider_node);
-    let wrong_release_issuer_operation = signed_release_operation_with_runtime_seed_and_epoch(
-        &record,
-        0x43,
-        signed_epoch_with_provider(&provider_node),
-    );
-    let wrong_release_issuer_decision = signed_decision_with_provider(
-        &wrong_release_issuer_operation,
-        &provider_node,
-        RightsDecisionV1::Allowed,
-    );
-    let wrong_release_issuer_request = CustodyProviderRequestV1::new_release_contribution(
-        &wrong_release_issuer_operation,
-        &wrong_release_issuer_decision,
-    )
-    .unwrap();
-    let wrong_release_issuer =
-        serde_json::to_string(&provider.request(request_value(&wrong_release_issuer_request)))
-            .unwrap();
-    assert!(wrong_release_issuer.contains("invalid_request"));
-    assert!(!wrong_release_issuer.contains("issuer"));
-
     let wrong_node_decision =
         signed_decision_with(&wrong_runtime_operation, 2, RightsDecisionV1::Allowed);
     let wrong_node_request = CustodyProviderRequestV1::new_release_contribution(
@@ -961,11 +957,16 @@ fn custody_provider_process_rejects_wrong_issuer_node_conflict_and_redacts_diagn
     let allowed_replay = provider.request(request_value(&allowed_after_denial));
     assert_eq!(allowed_replay["data"], allowed["data"]);
 
+    // Issue the mismatched operation in a guaranteed-different second so its
+    // release request hash can never coincide with the original operation's
+    // (the request is otherwise identical when minted in the same second,
+    // making the "wrong" decision legitimately verifiable).
     let wrong_decision = signed_decision_with_provider(
-        &signed_release_operation_with_runtime_seed_and_epoch(
+        &signed_release_operation_with_runtime_seed_epoch_and_issued_at(
             &record,
             0x44,
             signed_epoch_with_provider(&provider_node),
+            issued_unix_seconds().saturating_sub(7),
         ),
         &provider_node,
         RightsDecisionV1::Allowed,
@@ -976,8 +977,8 @@ fn custody_provider_process_rejects_wrong_issuer_node_conflict_and_redacts_diagn
     )
     .unwrap();
     let rejected = serde_json::to_string(&provider.request(request_value(&bad_release))).unwrap();
-    assert!(rejected.contains("invalid_request"));
-    assert!(!rejected.contains("runtime"));
+    assert!(rejected.contains("invalid_request"), "{rejected}");
+    assert!(!rejected.contains("runtime"), "{rejected}");
     provider.stop();
 }
 

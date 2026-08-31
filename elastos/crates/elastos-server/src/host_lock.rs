@@ -159,11 +159,37 @@ impl From<HostProcessMeta> for HostProcessInfo {
 #[derive(Debug, Clone)]
 struct BinarySupersessionWatch {
     current_exe_path: PathBuf,
+    current_exe_stamp: BinaryFileStamp,
     current_binary_sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinaryFileStamp {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    device_id: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+trait BinarySnapshotReader {
+    fn current_exe_path_raw(&self) -> anyhow::Result<PathBuf>;
+    fn metadata_stamp(&self, path: &Path) -> anyhow::Result<BinaryFileStamp>;
+    fn digest_snapshot(&self, path: &Path) -> anyhow::Result<BinarySnapshot>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RealBinarySnapshotReader;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinarySnapshot {
+    stamp: BinaryFileStamp,
+    sha256: String,
+}
+
 pub fn spawn_installed_binary_supersession_watch(data_dir: &Path, role: &str) {
-    let Some(watch) = BinarySupersessionWatch::from_data_dir(data_dir) else {
+    let Some(mut watch) = BinarySupersessionWatch::from_data_dir(data_dir) else {
         return;
     };
     let role = role.to_string();
@@ -182,19 +208,43 @@ pub fn spawn_installed_binary_supersession_watch(data_dir: &Path, role: &str) {
 
 impl BinarySupersessionWatch {
     fn from_data_dir(data_dir: &Path) -> Option<Self> {
-        let current_exe = normalized_current_exe_path().ok()?;
-        let current_binary_sha256 = sha256_file(&current_exe).ok()?;
+        Self::from_reader(data_dir, &RealBinarySnapshotReader).ok()
+    }
+
+    fn from_reader(data_dir: &Path, reader: &impl BinarySnapshotReader) -> anyhow::Result<Self> {
+        let current_exe = normalize_deleted_exe_path(&reader.current_exe_path_raw()?);
+        let snapshot = reader.digest_snapshot(&current_exe)?;
         let _ = data_dir;
-        Some(Self {
+        Ok(Self {
             current_exe_path: current_exe,
-            current_binary_sha256,
+            current_exe_stamp: snapshot.stamp,
+            current_binary_sha256: snapshot.sha256,
         })
     }
 
-    fn superseded_reason(&self) -> Option<String> {
-        let current_exe_raw = current_exe_path_raw().ok()?;
+    fn superseded_reason(&mut self) -> Option<String> {
+        self.superseded_reason_with(&RealBinarySnapshotReader)
+    }
+
+    fn superseded_reason_with(&mut self, reader: &impl BinarySnapshotReader) -> Option<String> {
+        let current_exe_raw = match reader.current_exe_path_raw() {
+            Ok(path) => path,
+            Err(err) => {
+                return Some(format!(
+                    "host executable path could not be read for {}: {err:#}. Exiting stale host.",
+                    self.current_exe_path.display()
+                ));
+            }
+        };
         let raw_text = current_exe_raw.to_string_lossy();
         let current_exe = normalize_deleted_exe_path(&current_exe_raw);
+
+        if raw_text.ends_with(" (deleted)") {
+            return Some(format!(
+                "host executable {} was replaced on disk. Exiting stale host.",
+                self.current_exe_path.display()
+            ));
+        }
 
         if current_exe != self.current_exe_path {
             return Some(format!(
@@ -204,28 +254,37 @@ impl BinarySupersessionWatch {
             ));
         }
 
-        if raw_text.ends_with(" (deleted)") {
-            return Some(format!(
-                "host executable {} was replaced on disk. Exiting stale host.",
-                self.current_exe_path.display()
-            ));
+        let current_stamp = match reader.metadata_stamp(&self.current_exe_path) {
+            Ok(stamp) => stamp,
+            Err(err) => {
+                return Some(format!(
+                    "host executable {} could not be verified on disk: {err:#}. Exiting stale host.",
+                    self.current_exe_path.display()
+                ));
+            }
+        };
+
+        if current_stamp == self.current_exe_stamp {
+            return None;
         }
 
-        let current_sha = sha256_file(&self.current_exe_path).ok()?;
-        if current_sha != self.current_binary_sha256 {
+        let current_snapshot = match reader.digest_snapshot(&self.current_exe_path) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                return Some(format!(
+                    "host executable {} changed on disk and could not be re-verified: {err:#}. Exiting stale host.",
+                    self.current_exe_path.display()
+                ));
+            }
+        };
+        if current_snapshot.sha256 != self.current_binary_sha256 {
             return Some(format!(
                 "host binary {} changed on disk. Exiting stale host so the newer binary can take over.",
                 self.current_exe_path.display()
             ));
         }
 
-        if !self.current_exe_path.exists() {
-            return Some(format!(
-                "host executable {} no longer exists on disk. Exiting stale host.",
-                self.current_exe_path.display()
-            ));
-        }
-
+        self.current_exe_stamp = current_snapshot.stamp;
         None
     }
 }
@@ -244,10 +303,6 @@ fn current_exe_path_raw() -> anyhow::Result<PathBuf> {
     }
 }
 
-fn normalized_current_exe_path() -> anyhow::Result<PathBuf> {
-    Ok(normalize_deleted_exe_path(&current_exe_path_raw()?))
-}
-
 fn normalize_deleted_exe_path(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if let Some(stripped) = text.strip_suffix(" (deleted)") {
@@ -256,16 +311,130 @@ fn normalize_deleted_exe_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
+fn metadata_stamp(path: &Path) -> anyhow::Result<BinaryFileStamp> {
+    let metadata = fs::metadata(path)?;
+    binary_file_stamp_from_metadata(&metadata)
+}
+
+fn sha256_file_streaming(path: &Path) -> anyhow::Result<BinarySnapshot> {
     use sha2::Digest as _;
 
-    let bytes = fs::read(path)?;
-    Ok(hex::encode(sha2::Sha256::digest(&bytes)))
+    let mut file = fs::File::open(path)?;
+    let stamp = metadata_stamp_from_file(&file)?;
+    let mut sha = sha2::Sha256::new();
+    let mut buf = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        sha.update(&buf[..read]);
+    }
+    Ok(BinarySnapshot {
+        stamp,
+        sha256: hex::encode(sha.finalize()),
+    })
+}
+
+fn metadata_stamp_from_file(file: &fs::File) -> anyhow::Result<BinaryFileStamp> {
+    let metadata = file.metadata()?;
+    binary_file_stamp_from_metadata(&metadata)
+}
+
+fn binary_file_stamp_from_metadata(metadata: &fs::Metadata) -> anyhow::Result<BinaryFileStamp> {
+    Ok(BinaryFileStamp {
+        len: metadata.len(),
+        modified: metadata.modified()?,
+        #[cfg(unix)]
+        device_id: {
+            use std::os::unix::fs::MetadataExt as _;
+            metadata.dev()
+        },
+        #[cfg(unix)]
+        inode: {
+            use std::os::unix::fs::MetadataExt as _;
+            metadata.ino()
+        },
+    })
+}
+
+impl BinarySnapshotReader for RealBinarySnapshotReader {
+    fn current_exe_path_raw(&self) -> anyhow::Result<PathBuf> {
+        current_exe_path_raw()
+    }
+
+    fn metadata_stamp(&self, path: &Path) -> anyhow::Result<BinaryFileStamp> {
+        metadata_stamp(path)
+    }
+
+    fn digest_snapshot(&self, path: &Path) -> anyhow::Result<BinarySnapshot> {
+        sha256_file_streaming(path)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    #[derive(Debug, Clone)]
+    struct TestBinarySnapshotReader {
+        state: Rc<TestBinarySnapshotReaderState>,
+    }
+
+    #[derive(Debug)]
+    struct TestBinarySnapshotReaderState {
+        current_exe_raw: RefCell<PathBuf>,
+        digest_reads: Cell<usize>,
+    }
+
+    impl TestBinarySnapshotReader {
+        fn new(path: PathBuf) -> Self {
+            Self {
+                state: Rc::new(TestBinarySnapshotReaderState {
+                    current_exe_raw: RefCell::new(path),
+                    digest_reads: Cell::new(0),
+                }),
+            }
+        }
+
+        fn set_current_exe_raw(&self, path: PathBuf) {
+            *self.state.current_exe_raw.borrow_mut() = path;
+        }
+
+        fn digest_reads(&self) -> usize {
+            self.state.digest_reads.get()
+        }
+    }
+
+    impl BinarySnapshotReader for TestBinarySnapshotReader {
+        fn current_exe_path_raw(&self) -> anyhow::Result<PathBuf> {
+            Ok(self.state.current_exe_raw.borrow().clone())
+        }
+
+        fn metadata_stamp(&self, path: &Path) -> anyhow::Result<BinaryFileStamp> {
+            metadata_stamp(path)
+        }
+
+        fn digest_snapshot(&self, path: &Path) -> anyhow::Result<BinarySnapshot> {
+            self.state
+                .digest_reads
+                .set(self.state.digest_reads.get().saturating_add(1));
+            sha256_file_streaming(path)
+        }
+    }
+
+    fn write_file(path: &Path, bytes: &[u8]) {
+        fs::write(path, bytes).expect("write file");
+    }
+
+    fn test_watch(path: &Path) -> (BinarySupersessionWatch, TestBinarySnapshotReader) {
+        let reader = TestBinarySnapshotReader::new(path.to_path_buf());
+        let watch =
+            BinarySupersessionWatch::from_reader(Path::new("/unused"), &reader).expect("watch");
+        (watch, reader)
+    }
 
     #[test]
     fn second_host_lock_for_same_data_dir_is_rejected() {
@@ -300,5 +469,123 @@ mod tests {
             normalize_deleted_exe_path(&raw),
             PathBuf::from("/home/test/.local/bin/elastos")
         );
+    }
+
+    #[test]
+    fn supersession_watch_startup_reads_one_digest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = temp.path().join("elastos");
+        write_file(&exe, b"original");
+
+        let (_watch, reader) = test_watch(&exe);
+        assert_eq!(reader.digest_reads(), 1);
+    }
+
+    #[test]
+    fn supersession_watch_skips_digest_when_stamp_is_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = temp.path().join("elastos");
+        write_file(&exe, b"original");
+
+        let (mut watch, reader) = test_watch(&exe);
+        for _ in 0..100 {
+            assert_eq!(watch.superseded_reason_with(&reader), None);
+        }
+        assert_eq!(reader.digest_reads(), 1);
+    }
+
+    #[test]
+    fn supersession_watch_updates_stamp_after_identical_bytes_rewrite() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = temp.path().join("elastos");
+        write_file(&exe, b"same bytes");
+
+        let (mut watch, reader) = test_watch(&exe);
+        let initial_reads = reader.digest_reads();
+
+        let replacement = temp.path().join("replacement");
+        write_file(&replacement, b"same bytes");
+        fs::rename(&replacement, &exe).expect("replace file");
+
+        assert_eq!(watch.superseded_reason_with(&reader), None);
+        assert_eq!(reader.digest_reads(), initial_reads + 1);
+
+        for _ in 0..100 {
+            assert_eq!(watch.superseded_reason_with(&reader), None);
+        }
+        assert_eq!(reader.digest_reads(), initial_reads + 1);
+    }
+
+    #[test]
+    fn supersession_watch_detects_same_path_content_replacement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = temp.path().join("elastos");
+        write_file(&exe, b"original");
+
+        let (mut watch, reader) = test_watch(&exe);
+        let initial_reads = reader.digest_reads();
+        write_file(&exe, b"changed content with a different length");
+
+        let reason = watch.superseded_reason_with(&reader).expect("superseded");
+        assert!(reason.contains("changed on disk"), "{reason}");
+        assert_eq!(reader.digest_reads(), initial_reads + 1);
+    }
+
+    #[test]
+    fn supersession_watch_detects_atomic_inode_replacement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = temp.path().join("elastos");
+        write_file(&exe, b"original");
+
+        let (mut watch, reader) = test_watch(&exe);
+        let initial_reads = reader.digest_reads();
+        let replacement = temp.path().join("replacement");
+        write_file(&replacement, b"modified");
+        fs::rename(&replacement, &exe).expect("replace file");
+
+        let reason = watch.superseded_reason_with(&reader).expect("superseded");
+        assert!(reason.contains("changed on disk"), "{reason}");
+        assert_eq!(reader.digest_reads(), initial_reads + 1);
+    }
+
+    #[test]
+    fn supersession_watch_detects_moved_executable_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = temp.path().join("elastos");
+        write_file(&exe, b"original");
+
+        let (mut watch, reader) = test_watch(&exe);
+        let moved = temp.path().join("elastos-new");
+        reader.set_current_exe_raw(moved.clone());
+
+        let reason = watch.superseded_reason_with(&reader).expect("superseded");
+        assert!(reason.contains("moved"), "{reason}");
+        assert!(reason.contains(&moved.display().to_string()), "{reason}");
+    }
+
+    #[test]
+    fn supersession_watch_detects_deleted_executable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = temp.path().join("elastos");
+        write_file(&exe, b"original");
+
+        let (mut watch, reader) = test_watch(&exe);
+        fs::remove_file(&exe).expect("remove file");
+
+        let reason = watch.superseded_reason_with(&reader).expect("superseded");
+        assert!(reason.contains("could not be verified on disk"), "{reason}");
+    }
+
+    #[test]
+    fn supersession_watch_detects_linux_deleted_suffix() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = temp.path().join("elastos");
+        write_file(&exe, b"original");
+
+        let (mut watch, reader) = test_watch(&exe);
+        reader.set_current_exe_raw(PathBuf::from(format!("{} (deleted)", exe.display())));
+
+        let reason = watch.superseded_reason_with(&reader).expect("superseded");
+        assert!(reason.contains("replaced on disk"), "{reason}");
     }
 }

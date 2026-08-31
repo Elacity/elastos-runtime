@@ -1075,7 +1075,9 @@ mod tests {
         unsafe {
             let mut master_fd = -1;
             let mut slave_fd = -1;
-            let mut name = [0i8; 128];
+            // c_char is i8 on x86_64/macOS but u8 on Linux aarch64; the
+            // libc alias keeps the buffer portable across targets.
+            let mut name = [0 as libc::c_char; 128];
 
             // Newer libc expects mutable termios/winsize pointers here.
             let rc = libc::openpty(

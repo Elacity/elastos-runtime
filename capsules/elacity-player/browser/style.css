@@ -1,0 +1,87 @@
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  color-scheme: dark;
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #000;
+  color: #f4f7fb;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: #000;
+}
+
+.player-shell {
+  position: relative;
+  min-height: 100vh;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.player-status {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  margin: 0;
+  padding: 6px 10px;
+  min-height: 30px;
+  max-width: min(40ch, calc(100vw - 32px));
+  border-radius: 999px;
+  background: rgba(6, 10, 16, 0.72);
+  color: #d6def0;
+  text-align: right;
+  font-size: 0.875rem;
+  line-height: 1.3;
+  backdrop-filter: blur(12px);
+  z-index: 2;
+}
+
+.player-status[data-state="error"] {
+  color: #ffb0b7;
+}
+
+#player-video {
+  width: 100%;
+  height: 100%;
+  display: block;
+  background: #000;
+  object-fit: contain;
+}
+
+.player-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  text-align: center;
+  background: rgba(0, 0, 0, 0.52);
+  z-index: 1;
+}
+
+.player-overlay[hidden] {
+  display: none;
+}
+
+.player-overlay p {
+  margin: 0;
+  max-width: 36ch;
+  color: #f4f7fb;
+  font-size: 1rem;
+  line-height: 1.5;
+}
+
+@media (max-width: 720px) {
+  .player-status {
+    right: 12px;
+    bottom: 12px;
+    max-width: calc(100vw - 24px);
+    min-height: 28px;
+    font-size: 0.8125rem;
+  }
+}

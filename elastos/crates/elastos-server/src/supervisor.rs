@@ -1721,10 +1721,6 @@ mod tests {
             Some(ProviderRoute::SubProvider("did".to_string()))
         );
         assert_eq!(
-            Supervisor::parse_provider_route_from_provides("elastos://ai/chat"),
-            Some(ProviderRoute::SubProvider("ai".to_string()))
-        );
-        assert_eq!(
             Supervisor::parse_provider_route_from_provides("localhost://Users/*"),
             Some(ProviderRoute::Scheme("localhost".to_string()))
         );
@@ -1875,6 +1871,7 @@ mod tests {
             repository: None,
             size_mb: None,
             description: None,
+            provider_runtime: None,
             platforms,
         }
     }
@@ -1894,14 +1891,14 @@ mod tests {
     fn dead_vm_capsule(handle: &str, route: ProviderRoute) -> RunningCapsule {
         let capsule_dir = tempfile::tempdir().unwrap().keep();
         let socket_dir = tempfile::tempdir().unwrap().keep();
-        let manifest = test_capsule_manifest("custody-provider");
+        let manifest = test_capsule_manifest("storage-provider");
         let vm = RunningVm::new(
             VmConfig::from_manifest(&manifest, &capsule_dir, &capsule_dir.join("vmlinux")),
             manifest.clone(),
             socket_dir.join(format!("{handle}.sock")),
         );
         RunningCapsule {
-            name: "custody-provider".to_string(),
+            name: "storage-provider".to_string(),
             handle: handle.to_string(),
             vsock_cid: 0,
             started_at: std::time::Instant::now(),
@@ -1912,7 +1909,7 @@ mod tests {
 
     fn host_process_capsule(handle: &str, route: ProviderRoute) -> RunningCapsule {
         RunningCapsule {
-            name: "custody-provider".to_string(),
+            name: "storage-provider".to_string(),
             handle: handle.to_string(),
             vsock_cid: 0,
             started_at: std::time::Instant::now(),
@@ -1924,7 +1921,7 @@ mod tests {
     async fn supervisor_with_retrying_subprovider() -> (Supervisor, Arc<ProviderRegistry>) {
         let registry = Arc::new(ProviderRegistry::new());
         registry
-            .register_sub_provider("custody", Arc::new(RetryOnceShutdownProvider::default()))
+            .register_sub_provider("storage", Arc::new(RetryOnceShutdownProvider::default()))
             .await
             .unwrap();
         let mut supervisor = make_test_supervisor();
@@ -2244,12 +2241,12 @@ mod tests {
     #[tokio::test]
     async fn test_stop_capsule_retains_retry_ownership_until_unregister_succeeds() {
         let (supervisor, registry) = supervisor_with_retrying_subprovider().await;
-        let handle = "host-custody-stop";
+        let handle = "host-storage-stop";
         {
             let mut running = supervisor.running.write().await;
             running.insert(
                 handle.to_string(),
-                host_process_capsule(handle, ProviderRoute::SubProvider("custody".to_string())),
+                host_process_capsule(handle, ProviderRoute::SubProvider("storage".to_string())),
             );
         }
 
@@ -2257,14 +2254,14 @@ mod tests {
         assert!(first.to_string().contains("sub-provider unregister failed"));
         assert!(supervisor.running.read().await.contains_key(handle));
         assert!(registry
-            .register_sub_provider("custody", Arc::new(RetryOnceShutdownProvider::default()))
+            .register_sub_provider("storage", Arc::new(RetryOnceShutdownProvider::default()))
             .await
             .is_err());
 
         supervisor.stop_capsule(handle).await.unwrap();
         assert!(!supervisor.running.read().await.contains_key(handle));
         registry
-            .register_sub_provider("custody", Arc::new(RetryOnceShutdownProvider::default()))
+            .register_sub_provider("storage", Arc::new(RetryOnceShutdownProvider::default()))
             .await
             .unwrap();
     }
@@ -2272,12 +2269,12 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_exit_retains_retry_ownership_until_unregister_succeeds() {
         let (supervisor, registry) = supervisor_with_retrying_subprovider().await;
-        let handle = "host-custody-wait";
+        let handle = "host-storage-wait";
         {
             let mut running = supervisor.running.write().await;
             running.insert(
                 handle.to_string(),
-                host_process_capsule(handle, ProviderRoute::SubProvider("custody".to_string())),
+                host_process_capsule(handle, ProviderRoute::SubProvider("storage".to_string())),
             );
         }
 
@@ -2285,7 +2282,7 @@ mod tests {
         assert!(first.to_string().contains("sub-provider unregister failed"));
         assert!(supervisor.running.read().await.contains_key(handle));
         assert!(registry
-            .register_sub_provider("custody", Arc::new(RetryOnceShutdownProvider::default()))
+            .register_sub_provider("storage", Arc::new(RetryOnceShutdownProvider::default()))
             .await
             .is_err());
 
@@ -2296,12 +2293,12 @@ mod tests {
     #[tokio::test]
     async fn test_reap_dead_capsules_retains_retry_ownership_until_unregister_succeeds() {
         let (supervisor, registry) = supervisor_with_retrying_subprovider().await;
-        let handle = "vm-custody-reap";
+        let handle = "vm-storage-reap";
         {
             let mut running = supervisor.running.write().await;
             running.insert(
                 handle.to_string(),
-                dead_vm_capsule(handle, ProviderRoute::SubProvider("custody".to_string())),
+                dead_vm_capsule(handle, ProviderRoute::SubProvider("storage".to_string())),
             );
         }
 
@@ -2309,7 +2306,7 @@ mod tests {
         assert!(first.to_string().contains("sub-provider unregister failed"));
         assert!(supervisor.running.read().await.contains_key(handle));
         assert!(registry
-            .register_sub_provider("custody", Arc::new(RetryOnceShutdownProvider::default()))
+            .register_sub_provider("storage", Arc::new(RetryOnceShutdownProvider::default()))
             .await
             .is_err());
 

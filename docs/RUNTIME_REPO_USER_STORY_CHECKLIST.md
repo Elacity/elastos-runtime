@@ -1,4 +1,4 @@
-# 0.6.0 release acceptance
+# Source integration and release acceptance
 
 This checklist defines evidence to collect; it does not declare that a check
 passed.
@@ -30,16 +30,30 @@ Before review or installation:
 ```bash
 git fetch origin
 git status --short --branch
-git log --oneline origin/feat/elastos-shell-protocol..HEAD
-git diff --stat origin/feat/elastos-shell-protocol...HEAD
-git rev-list --left-right --count \
-  origin/feat/elastos-shell-protocol...HEAD
+: "${ELASTOS_REVIEW_BASE:?Set the fetched integration ref selected for review}"
+git log --oneline "${ELASTOS_REVIEW_BASE}..HEAD"
+git diff --stat "${ELASTOS_REVIEW_BASE}...HEAD"
+git rev-list --left-right --count "${ELASTOS_REVIEW_BASE}...HEAD"
 ```
 
-The 0.6 review line is
-`fix/elastos-shell-protocol-browser-wallet-consolidation`. It is not a release
-until the reviewed tree is merged to `main`, versioned, tagged, published, and
-verified through the public install path.
+Select the candidate and integration base from `state.md` and fetched refs.
+Set `ELASTOS_REVIEW_BASE` to that fetched base before running the comparison.
+Source integration does not publish release artifacts or activate the new
+protected-content path.
+
+## Source integration gate
+
+Before a separately approved merge to `main`:
+
+1. Account for the included work and the explicitly deferred scope in `TASKS.md`.
+2. Pass all CI jobs on the exact candidate, including both Linux architectures,
+   macOS source-home and the release build.
+3. Preserve reviewed ancestry and authorship. Integrate dependent work into its
+   parent, then the development line, then `main`. A merge commit retains the
+   original commits; it does not squash their history.
+4. Obtain approval for the exact merge target and retained limitations. Leave
+   installation, version/tag publication and protected-content cutover under
+   their own gates below.
 
 ## Source gate
 
@@ -64,8 +78,11 @@ just verify
 guard for the provisional provider capsules. It does not verify the canonical
 v1 Runtime, rights, custody, and decrypt architecture.
 
-`just verify` is the complete source gate in this tree. There is no separate
-`terminology-lint` recipe. Any unavailable command or accepted target-specific
+`just verify` is the combined source gate. It runs the Runtime workspace and
+the own-workspace capsules through `just test`, plus the separate
+`browser-local-exit` checks. `just test-elastos` and `just test-capsules` are
+the narrower test entrypoints; `just verify-ci` runs the container replicas.
+There is no separate `terminology-lint` recipe. Any unavailable command or accepted target-specific
 exception must be recorded explicitly rather than reported as a pass.
 
 ## Review order
@@ -78,11 +95,12 @@ Review the candidate in authority-owned slices:
 4. Home host, shell projections, Clipboard, and connector windows.
 5. Browser Runtime, Engine Adapter, host adapter, display, networking, Wallet
    bridge, and terminal cleanup.
-6. GBA/uCity and Library object behavior.
-7. Release metadata, manifests, checksums, documentation, and installer truth.
+6. GBA content, Library, Marketplace and typed protected-content lifecycle.
+7. Model/Assistant contracts and configured-offer behavior.
+8. Release metadata, manifests, checksums, documentation, and installer truth.
 
-Carrier reconciliation, the shell UI redesign, and extended AI UI work are not
-part of 0.6.0. Do not pull them into release review opportunistically.
+Use `TASKS.md` and `state.md` to identify the included and deferred scope for
+the candidate under review.
 
 ## Installed acceptance
 
@@ -106,17 +124,17 @@ provider evidence pass together.
 The bounded Browser claim and its restart, login-retention,
 profile-protection, and performance limitations are recorded in
 [state.md](../state.md). Do not advertise general-purpose, cross-platform, or
-arbitrary-dapp Browser reliability in 0.6.0.
+arbitrary-dapp Browser reliability without the matching acceptance evidence.
 
 ## Release gate
 
-Before merge and tag:
+Before publishing release artifacts and a tag:
 
 1. Confirm every reviewed commit is coherent and every correction is folded
    into the unpublished commit it fixes.
 2. Confirm the final tree matches the tree that passed source and installed
    acceptance.
-3. Verify `0.6.0` version metadata, `components.json`, provider manifests,
+3. Verify the approved release version, `components.json`, provider manifests,
    checksums, installer metadata, and [CHANGELOG.md](../elastos/CHANGELOG.md).
 4. Run `just verify` and the focused Wallet, Browser, Home, Recovery, GBA, and
    provider checks named by the changed slices.

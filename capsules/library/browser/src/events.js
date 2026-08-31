@@ -226,25 +226,28 @@ export function bindLibraryEvents({
       return;
     }
     const editable = event.target.closest?.("input, textarea, select, [contenteditable='true']");
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a" && !editable) {
+    const itemShortcutTarget = isItemShortcutTarget(event.target, elements);
+    const shortcutSurfaceReady = itemShortcutTarget && !editable && !isDialogOpen(elements) && !isMenuOpen(elements);
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a" && shortcutSurfaceReady) {
       event.preventDefault();
       selectAllVisible();
     }
     if (event.key === "F2" && !editable) {
+      if (!itemShortcutTarget || isDialogOpen(elements) || isMenuOpen(elements)) return;
       const objects = selectedObjects();
       if (objects.length === 1) {
         event.preventDefault();
         startRename(objects[0]);
       }
     }
-    if (event.key === "Enter" && !editable && !isDialogOpen(elements) && !isMenuOpen(elements)) {
+    if (event.key === "Enter" && shortcutSurfaceReady) {
       const objects = selectedObjects();
       if (objects.length) {
         event.preventDefault();
         openSelectedObjects(objects, openObject, showError);
       }
     }
-    if (event.key === "Delete" && !editable && !isDialogOpen(elements) && !isMenuOpen(elements)) {
+    if (event.key === "Delete" && shortcutSurfaceReady) {
       const objects = selectedObjects();
       if (objects.length) {
         event.preventDefault();
@@ -253,7 +256,7 @@ export function bindLibraryEvents({
         action().catch(showError);
       }
     }
-    if ((event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) && !editable && !isDialogOpen(elements)) {
+    if ((event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) && shortcutSurfaceReady) {
       event.preventDefault();
       const object = selectedObjects()[0];
       if (object) {
@@ -299,6 +302,10 @@ function clearPlaceDropTargets(elements) {
 
 function isNameEditorTarget(target) {
   return !!target?.closest?.(".rename-input");
+}
+
+function isItemShortcutTarget(target, elements) {
+  return !!(target && elements.content && (target === elements.content || elements.content.contains?.(target)));
 }
 
 function isDialogOpen(elements) {

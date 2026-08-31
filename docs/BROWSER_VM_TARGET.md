@@ -375,6 +375,12 @@ artifact paths for crosvm and VZ target maintenance.
 and `browser-local-exit`. It does not currently own the source-home Browser VM
 helper script wrappers or VM guest artifacts.
 
+Full source-home setup installs the Runtime at the stable platform data-root
+path `bin/elastos` and writes
+`receipts/source-home-installation.json`. Platform restart helpers validate
+that receipt, current source identity, and installed artifact parity before
+they stop or start a Runtime.
+
 For source-home runtimes, `scripts/setup-source-home.sh` is the canonical
 generator/stager for:
 
@@ -439,9 +445,11 @@ XDG_DATA_HOME=<target-xdg-data-home> \
 scripts/linux-source-home-restart.sh \
   --home <target-home> \
   --xdg-data-home <target-xdg-data-home> \
-  --addr <target-loopback-addr> \
-  --json-out <target-elastos-data-dir>/logs/gateway-restart.json
+  --addr <target-loopback-addr>
 ```
+
+The Linux helper writes its receipt to
+`<target-elastos-data-dir>/receipts/linux-source-home-restart.json`.
 
 After the target refresh, prove the target from the reconciliation host:
 
@@ -511,7 +519,7 @@ those ICE variables; Runtime issues a launch-scoped TURN authority instead.
 
 ## Apple VZ Launcher
 
-`elastos-vz` now includes a native `browser-vz-engine-supervisor` binary for the
+`elastos-vz` includes a native `browser-vz-engine-supervisor` binary for the
 Mac product path. It is not a browser implementation and it is not a container
 wrapper. It owns one Apple Virtualization.framework VM for the lifetime of one
 Browser page, then:
@@ -595,7 +603,7 @@ Runtime-owned operation: Browser calls `POST /api/apps/browser/profile/reset`
 with its app launch token, Runtime refuses while that principal has live Browser
 sessions, then removes only that principal's profile disk.
 
-Current H038 boundary: this ext4 disk is the working principal-owned Browser
+Profile storage boundary: this ext4 disk is the principal-owned Browser
 profile lane, not yet protected principal-root object storage and not yet
 Recovery Kit exported/imported state. Reset proof is required evidence for the
 current lane, but it is not a claim that Chromium cookies, localStorage,

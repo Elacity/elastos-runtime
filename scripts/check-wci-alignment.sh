@@ -636,7 +636,7 @@ check_forbidden_in_path 'darwin\)' scripts/install.sh 'public installer must sta
 check_required 'Current public install preview: Linux x86_64/aarch64' scripts/install.sh 'installer help must label public install as Linux preview'
 check_required 'Current public install preview is Linux-only' scripts/install.sh 'installer must fail cleanly on non-Linux hosts'
 check_required 'if \[\[ \$\{#GATEWAYS\[@\]\} -gt 0 \]\]; then' scripts/install.sh 'installer must safely prepend publisher gateway without expanding an empty Bash array'
-check_required 'current Linux `x86_64`/`aarch64` preview' README.md 'README install path must be scoped to Linux preview'
+check_required '## Install the Linux preview' README.md 'README binary-install commands must be scoped to Linux preview'
 check_required 'current Linux `x86_64`/`aarch64` preview' docs/INSTALL.md 'install docs must scope public installer to Linux preview'
 check_required 'current Linux `x86_64`/`aarch64`' docs/GETTING_STARTED.md 'getting started must scope binary install to Linux preview'
 check_required 'System, People, Services, Browser, Wallet' docs/INSTALL.md 'install docs must list the current default Home visible surfaces'
@@ -682,6 +682,7 @@ ordinary_capsules_with_privileged_authority_ui = {"home", "system", "wallet-meta
 system_only_elastos_backends = {
     "elacity",
     "elacity-sdk",
+    "elacity_sdk",
     "gateway",
     "chain",
     "wallet",
@@ -859,7 +860,7 @@ for path in manifest_paths:
             "/api/provider/wallet": "direct wallet provider route",
             "ipfs-cluster": "raw IPFS Cluster backend",
             "elacity-sdk": "raw Elacity SDK backend",
-            "elacity": "raw Elacity backend",
+            "elacity_sdk": "raw Elacity SDK backend",
             "/api/provider/ipfs": "direct IPFS provider route",
             "WalletConnect": "direct browser wallet adapter authority",
             "walletconnect": "direct browser wallet adapter authority",
@@ -907,10 +908,10 @@ def platform_info(component, platform):
     return platforms.get(platform) or platforms.get("*")
 
 home = components["profiles"]["home"]["components"]
-forbidden = {"kubo", "ipfs-provider", "availability-provider", "site-provider", "tunnel-provider", "cloudflared", "drm-provider", "rights-provider", "key-provider", "decrypt-provider"}
+forbidden = {"availability-provider", "site-provider", "tunnel-provider", "cloudflared", "drm-provider", "rights-provider", "key-provider", "decrypt-provider"}
 bad = sorted(forbidden.intersection(home))
 if bad:
-    print("[alignment] home profile includes non-default off-box/public-edge/protected-content components:", ", ".join(bad))
+    print("[alignment] home profile includes non-default public-edge or provisional protected components:", ", ".join(bad))
     sys.exit(1)
 wallet_browser_surfaces = {"wallet", "wallet-metamask", "wallet-unisat", "wallet-walletconnect", "browser", "inbox"}
 wallet_browser_providers = {"chain-provider", "wallet-provider"}
@@ -978,12 +979,15 @@ missing_demo = sorted(required_demo.difference(demo_components))
 if missing_demo:
     print("[alignment] demo profile missing required demo components:", ", ".join(missing_demo))
     sys.exit(1)
-def shell_array_items(text, name):
+def shell_array_entries(text, name):
     match = re.search(rf"^{re.escape(name)}=\((.*?)^\)", text, re.MULTILINE | re.DOTALL)
     if not match:
         print(f"[alignment] missing shell array {name}")
         sys.exit(1)
-    return set(re.findall(r"^\s*([A-Za-z0-9_-]+)\s*$", match.group(1), re.MULTILINE))
+    return re.findall(r"^\s*([A-Za-z0-9_-]+)\s*$", match.group(1), re.MULTILINE)
+
+def shell_array_items(text, name):
+    return set(shell_array_entries(text, name))
 
 def rust_const_items(text, name):
     match = re.search(rf"const\s+{re.escape(name)}:\s*&\[\&str\]\s*=\s*&\[(.*?)\];", text, re.DOTALL)
@@ -999,6 +1003,8 @@ if "components-release-integrity-check.py" not in publish_release or "validate_g
     sys.exit(1)
 publish_release_default = shell_array_items(publish_release, "DEFAULT_CAPSULES")
 publish_release_required = shell_array_items(publish_release, "REQUIRED_SUPPORTED_CAPSULES")
+publish_release_support_entries = shell_array_entries(publish_release, "SUPPORT_BINARY_ASSETS")
+publish_release_support = set(publish_release_support_entries)
 publish_rust_home = rust_const_items(publish_rs, "HOME_PUBLISH_CAPSULES")
 publish_rust_demo = rust_const_items(publish_rs, "DEMO_PUBLISH_CAPSULES")
 publish_rust_required = rust_const_items(publish_rs, "REQUIRED_SUPPORTED_PUBLISH_CAPSULES")
@@ -1026,7 +1032,7 @@ if publish_rust_home != home_profile_capsules or publish_rust_required != home_p
     print("[alignment] missing from Rust home:", ", ".join(sorted(home_profile_capsules - publish_rust_home)) or "(none)")
     print("[alignment] extra in Rust home:", ", ".join(sorted(publish_rust_home - home_profile_capsules)) or "(none)")
     sys.exit(1)
-for demo_capsule in ["gba-emulator", "gba-ucity", "chat-room", "ipfs-provider", "tunnel-provider"]:
+for demo_capsule in ["gba-emulator", "gba-ucity", "chat-room", "tunnel-provider"]:
     if demo_capsule not in publish_rust_demo:
         print(f"[alignment] Rust demo publish profile missing {demo_capsule}")
         sys.exit(1)
@@ -1043,12 +1049,59 @@ for provider in sorted(wallet_browser_providers):
     if provider not in publish_rust_required:
         print(f"[alignment] Rust required supported publish capsule set missing {provider}")
         sys.exit(1)
+protected_runtime_providers = {
+    "protected-content-protect-provider",
+    "media-provider",
+    "custody-provider",
+    "protected-content-decrypt-provider",
+}
+for provider in sorted(protected_runtime_providers):
+    if publish_release_support_entries.count(provider) != 1:
+        print(f"[alignment] publish-release support assets must include {provider} exactly once")
+        sys.exit(1)
+    if provider in components.get("capsules", {}):
+        print(f"[alignment] Runtime-only provider appears in capsule inventory: {provider}")
+        sys.exit(1)
+    for root in [Path("capsules"), Path("elastos/capsules")]:
+        if (root / provider / "capsule.json").exists():
+            print(f"[alignment] Runtime-only provider has a public capsule manifest: {provider}")
+            sys.exit(1)
+    runtime = (components.get("external", {}).get(provider) or {}).get("provider_runtime") or {}
+    if runtime.get("runtime_only") is not True:
+        print(f"[alignment] protected provider must remain Runtime-only: {provider}")
+        sys.exit(1)
+protected_home_dependencies = {
+    "chain-provider",
+    "wallet-provider",
+    "kubo",
+    "ipfs-provider",
+    "protected-content-protect-provider",
+    "media-provider",
+    "protected-content-decrypt-provider",
+}
+protected_home_surface = {"library", "marketplace", "elacity-player"}
+for profile_name, profile in sorted(components["profiles"].items()):
+    profile_list = profile.get("components") or []
+    profile_components = set(profile_list)
+    if protected_home_surface.issubset(profile_components):
+        for dependency in sorted(protected_home_dependencies):
+            if profile_list.count(dependency) != 1:
+                print(f"[alignment] {profile_name} protected-content Home profile must include {dependency} exactly once")
+                sys.exit(1)
+custody_profiles = {
+    profile_name
+    for profile_name, profile in components["profiles"].items()
+    if "custody-provider" in set(profile.get("components") or [])
+}
+if custody_profiles != {"blockchain", "full"}:
+    print("[alignment] custody-provider must stay in blockchain/full profiles only:", ", ".join(sorted(custody_profiles)) or "(none)")
+    sys.exit(1)
 blockchain = components["profiles"].get("blockchain")
 if not blockchain:
     print("[alignment] blockchain profile is missing")
     sys.exit(1)
 blockchain_components = set(blockchain["components"])
-required_blockchain = {"shell", "localhost-provider", "did-provider", "chain-provider", "wallet-provider", "drm-provider", "rights-provider", "key-provider", "decrypt-provider"}
+required_blockchain = {"shell", "localhost-provider", "did-provider", "chain-provider", "wallet-provider", "drm-provider", "rights-provider", "key-provider", "decrypt-provider", *protected_runtime_providers}
 missing_blockchain = sorted(required_blockchain.difference(blockchain_components))
 if missing_blockchain:
     print("[alignment] blockchain profile missing required components:", ", ".join(missing_blockchain))

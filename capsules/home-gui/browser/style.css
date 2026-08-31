@@ -803,6 +803,10 @@ img {
   margin-top: 2px;
 }
 
+.control-centre-quick-open {
+  display: none;
+}
+
 .control-centre-label {
   padding: 0.2rem 0.85rem 0.15rem;
   color: var(--muted);
@@ -1052,9 +1056,19 @@ img {
   display: none;
 }
 
+.control-centre-row-label {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .control-centre-row-detail {
+  min-width: 0;
   color: var(--muted);
   font-size: 0.8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
 }
 
 .control-centre-row-static {
@@ -1421,6 +1435,190 @@ img {
 
 .connector-sheet-frame[hidden] {
   display: none;
+}
+
+.setup-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 100140;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, #000 28%, transparent);
+  transition-property: background-color, padding;
+  transition-duration: var(--shell-motion-enter);
+  transition-timing-function: var(--shell-motion-enter-ease);
+}
+
+.setup-sheet[hidden] {
+  display: none;
+}
+
+.setup-sheet.is-yielded {
+  place-items: start end;
+  padding: calc(var(--stage-top) + 16px) 20px var(--stage-bottom);
+  background: transparent;
+  pointer-events: none;
+}
+
+.setup-sheet-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: min(92vw, 420px);
+  padding: 28px 24px 22px;
+  border-radius: 20px;
+  background: var(--menu-fill, var(--panel-strong));
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28), 0 2px 10px rgba(0, 0, 0, 0.16);
+  animation: setup-sheet-enter var(--shell-motion-enter) var(--shell-motion-enter-ease) both;
+}
+
+.setup-sheet.is-yielded .setup-sheet-card {
+  pointer-events: auto;
+  width: min(92vw, 360px);
+  cursor: grab;
+  user-select: none;
+}
+
+.setup-sheet.is-yielded .setup-sheet-card.is-dragging {
+  cursor: grabbing;
+}
+
+.setup-sheet.is-yielded .setup-sheet-card button {
+  cursor: pointer;
+}
+
+.setup-sheet-card > .wallet-rail-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+}
+
+.setup-sheet-title {
+  margin: 0 36px 0 0;
+  color: var(--text);
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-wrap: balance;
+}
+
+.setup-sheet-lead {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.45;
+  text-wrap: pretty;
+}
+
+.setup-sheet-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.setup-sheet-step {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  grid-template-rows: auto auto;
+  column-gap: 12px;
+  row-gap: 10px;
+  padding: 14px;
+  border-radius: 12px;
+  background: var(--panel-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, #fff 8%, transparent);
+}
+
+.setup-sheet-step-index {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--el-accent, var(--brand)) 18%, transparent);
+  color: var(--text);
+  font-size: 0.78rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.setup-sheet-step.is-current {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--el-accent, var(--brand)) 42%, transparent);
+}
+
+.setup-sheet-step.is-complete .setup-sheet-step-index {
+  position: relative;
+  background: color-mix(in srgb, var(--el-accent, var(--brand)) 28%, transparent);
+  font-size: 0;
+}
+
+.setup-sheet-step.is-complete .setup-sheet-step-index::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 5px;
+  height: 9px;
+  border-right: 2px solid var(--text);
+  border-bottom: 2px solid var(--text);
+  transform: translate(-50%, -58%) rotate(45deg);
+}
+
+.setup-sheet-step-copy {
+  min-width: 0;
+}
+
+.setup-sheet-step-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.95rem;
+  font-weight: 650;
+}
+
+.setup-sheet-step-body {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+  line-height: 1.4;
+  text-wrap: pretty;
+}
+
+.setup-sheet-step .el-button {
+  grid-column: 1 / -1;
+  min-height: 40px;
+}
+
+.setup-sheet-step .el-button:active {
+  transform: scale(0.96);
+}
+
+@keyframes setup-sheet-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .setup-sheet {
+    transition: none;
+  }
+
+  .setup-sheet-card {
+    animation: none;
+  }
+
+  .setup-sheet-step .el-button:active {
+    transform: none;
+  }
 }
 
 .nc-cal {
@@ -3108,7 +3306,10 @@ body.expose-active .expose-empty {
     0 0 0 0.5px rgba(0, 0, 0, 0.2),
     0 4px 16px rgba(0, 0, 0, 0.2);
   backdrop-filter: blur(10px);
-  transition: transform 220ms cubic-bezier(0.2, 0, 0, 1);
+  transition:
+    transform 220ms cubic-bezier(0.2, 0, 0, 1),
+    width 180ms cubic-bezier(0.2, 0, 0, 1),
+    max-width 180ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 /* Dock auto-hide: slides under the bottom edge; a thin reveal strip stays
@@ -3118,6 +3319,7 @@ body.dock-autohide .taskbar {
   transform: translateY(calc(100% + var(--taskbar-offset) + 8px));
 }
 
+body.dock-autohide .taskbar.is-launcher-face,
 body.dock-autohide.dock-revealed .taskbar,
 body.dock-autohide .taskbar:focus-within {
   transform: translateY(0);
@@ -3142,11 +3344,23 @@ body.dock-autohide::after {
 .taskbar-inner {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
+  align-items: stretch;
+  justify-content: flex-end;
+  gap: 0;
   min-width: 0;
   max-width: 100%;
+}
+
+.taskbar.is-launcher-face {
+  width: min(720px, calc(100vw - 32px));
+  max-width: min(720px, calc(100vw - 32px));
+  height: auto;
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.taskbar.is-launcher-face .taskbar-inner {
+  gap: 10px;
 }
 
 /* Coarse-pointer Space pager (fine pointer uses left-edge peek). */
@@ -3281,6 +3495,7 @@ body.dock-autohide::after {
   align-items: center;
   min-width: 0;
   max-width: 100%;
+  justify-content: center;
 }
 
 .taskbar-sortable {
@@ -3496,6 +3711,17 @@ body.dock-autohide::after {
   display: none;
 }
 
+.taskbar-item-icon[data-icon="bin"] {
+  background:
+    url("./icons/bin/icon-64.png?v=home-20260813a")
+      center / contain no-repeat;
+}
+
+.taskbar-item-icon[data-icon="bin"]::before {
+  content: none;
+  display: none;
+}
+
 /* Shelf running indicator — short capsule in the air under the tile (not glued,
    not sitting on the dock lip). Tracks the live system accent. */
 .active-taskbar-indicator {
@@ -3582,22 +3808,6 @@ body.dock-autohide::after {
 }
 
 .dock-tooltip[hidden] {
-  display: none;
-}
-
-.launcher {
-  position: fixed;
-  inset: 0;
-  z-index: 100110;
-  display: grid;
-  place-items: center;
-  padding: calc(56px + env(safe-area-inset-top, 0px)) 18px calc(88px + env(safe-area-inset-bottom, 0px));
-  /* Apps-panel surface (macOS style): the overlay only catches clicks; the
-     modal card below carries the one blurred material — no nested blurs. */
-  background: transparent;
-}
-
-.launcher[hidden] {
   display: none;
 }
 
@@ -3944,41 +4154,55 @@ body.dragging-target {
   background: var(--panel-soft);
 }
 
+.launcher {
+  position: static;
+  inset: auto;
+  z-index: auto;
+  display: block;
+  align-self: stretch;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+  transition:
+    max-height 180ms cubic-bezier(0.2, 0, 0, 1),
+    opacity 180ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.taskbar .launcher[hidden] {
+  display: block;
+}
+
+.taskbar.is-launcher-face .launcher {
+  max-height: min(56vh, 520px);
+  opacity: 1;
+  pointer-events: auto;
+}
+
 .launcher-popover {
   position: relative;
   display: flex;
   flex-direction: column;
-  width: min(680px, 100%);
-  /* Fixed panel size (macOS Apps panel): switching grid/list or filtering
-     changes what's inside, never the box itself. Sized so the icon grid
-     fills it (~4 ranks); longer content scrolls. */
-  height: min(64dvh, 512px);
+  width: 100%;
+  height: min(56vh, 520px);
   padding: 0;
   overflow: hidden;
   color: var(--text);
-  border-radius: 20px;
-  background: var(--menu-fill);
-  border: 0.5px solid var(--line);
-  box-shadow: var(--shadow);
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
-  animation: launcher-enter 160ms cubic-bezier(0.2, 0, 0, 1) both;
-}
-
-@keyframes launcher-enter {
-  0% {
-    opacity: 0;
-    transform: scale(0.97) translateY(6px);
-  }
-  100% {
-    opacity: 1;
-    transform: scale(1) translateY(0);
-  }
+  border-radius: 0;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .launcher-popover {
-    animation: none;
+  .launcher,
+  .taskbar {
+    transition: none;
   }
 }
 
@@ -4000,7 +4224,7 @@ body.dragging-target {
   color: var(--text);
   font-size: 13px;
   font-weight: 620;
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
 }
 
 .launcher-scroll {
@@ -5018,9 +5242,12 @@ body.dragging-target {
     display: none;
   }
 
+  .control-centre-quick-open {
+    display: block;
+  }
+
   .launcher-popover {
-    width: calc(100vw - 24px);
-    height: calc(100dvh - 92px);
+    height: min(48vh, 380px);
   }
 
   /* Windows fill the stage between bar and dock — apps read as full-screen. */
@@ -5046,6 +5273,11 @@ body.dragging-target {
     padding-right: 8px;
   }
 
+  .taskbar.is-launcher-face {
+    width: calc(100vw - 20px);
+    max-width: calc(100vw - 20px);
+  }
+
   .taskbar-inner {
     gap: 8px;
   }
@@ -5058,6 +5290,10 @@ body.dragging-target {
 
   .taskbar-sortable::-webkit-scrollbar {
     display: none;
+  }
+
+  .taskbar.is-launcher-face .launcher {
+    max-height: min(48vh, 380px);
   }
 
   .dock-tooltip {

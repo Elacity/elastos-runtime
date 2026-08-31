@@ -1,17 +1,14 @@
 # ESP v0 - ElastOS Shell Protocol
 
-ESP is the small shell-facing contract over the Runtime facts exposed by the
-0.6 development stack. A shell is a projection and consent surface. It does not mint
+ESP is the small shell-facing contract over Runtime facts.
+A shell is a projection and consent surface. It does not mint
 authority, hold keys, bypass capability checks, dispatch providers directly, or
 invent provenance.
 
 The shared capsule web/CLI/fact/affordance/gate/audit model is documented in
 [`CAPSULE_INTERFACE_CONTRACT.md`](CAPSULE_INTERFACE_CONTRACT.md).
 
-This document describes the ESP v0 slice implemented on the current 0.6
-development branch.
-
-The current terminal implementation is the `home-cli` shell. ESP is its
+The terminal implementation is the `home-cli` shell. ESP is its
 protocol contract, not a separate product shell.
 
 ## Non-Negotiables

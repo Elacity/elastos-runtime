@@ -138,6 +138,9 @@ function setupEnvironment(name, replies) {
     ["discovery-status", new FakeElement()],
     ["discovery-toggle", new FakeElement()],
     ["discovery-refresh", new FakeElement()],
+    ["people-count", new FakeElement()],
+    ["discovery-visible-count", new FakeElement()],
+    ["discovery-requests-count", new FakeElement()],
     ["people-page-title", new FakeElement()],
   ]);
   const listeners = new Map();
@@ -147,6 +150,11 @@ function setupEnvironment(name, replies) {
   const calls = [];
   let timerId = 0;
   let clearCount = 0;
+  const parentFrame = {
+    postMessage(message, origin) {
+      messages.push({ message, origin });
+    },
+  };
 
   globalThis.Element = FakeElement;
   globalThis.HTMLButtonElement = FakeElement;
@@ -174,7 +182,8 @@ function setupEnvironment(name, replies) {
     confirm() {
       return false;
     },
-    top: null,
+    top: parentFrame,
+    parent: parentFrame,
     addEventListener(type, callback) {
       listeners.set(type, callback);
     },
@@ -191,7 +200,6 @@ function setupEnvironment(name, replies) {
       messages.push(message);
     },
   };
-  globalThis.window.top = globalThis.window;
   globalThis.fetch = async (path, options = {}) => {
     calls.push({ path, options });
     const reply = replies.shift();
@@ -208,6 +216,7 @@ function setupEnvironment(name, replies) {
     timers,
     clearCount: () => clearCount,
     messages,
+    parentFrame,
   };
 }
 
@@ -248,6 +257,27 @@ async function triggerAction(environment, action, dataset = {}) {
 
 async function triggerProfileSubmit(environment) {
   environment.nodes.get("profile-form").listeners.get("submit")({ preventDefault() {} });
+  await settle();
+}
+
+async function triggerProfileInput(environment, value) {
+  const input = environment.nodes.get("profile-name");
+  input.value = value;
+  input.listeners.get("input")?.({ target: input });
+  await settle();
+}
+
+async function triggerMenuCommand(environment, cmd, {
+  origin = "null",
+  source = environment.parentFrame,
+} = {}) {
+  const listener = environment.listeners.get("message");
+  assert(listener, "menu command listener missing");
+  listener({
+    origin,
+    source,
+    data: { type: "elastos:menu-command", cmd },
+  });
   await settle();
 }
 
@@ -309,11 +339,37 @@ async function runScenario(name) {
     await import("../capsules/people/browser/people.js");
     await settle();
 
+    assert.deepEqual(environment.messages.slice(0, 2), [
+      {
+        message: {
+          type: "home:app-ready",
+          homeToken: "people-test-token",
+        },
+        origin: "http://localhost:61180",
+      },
+      {
+        message: {
+          type: "home:menu-manifest",
+          homeToken: "people-test-token",
+          menus: [
+            {
+              title: "File",
+              items: [{ label: "Close Window", cmd: "__close-window" }],
+            },
+            {
+              title: "View",
+              items: [{ label: "Refresh", cmd: "refresh" }],
+            },
+          ],
+        },
+        origin: "http://localhost:61180",
+      },
+    ]);
     assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/summary").length, 1);
     assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/discovery/refresh").length, 0);
     assert.equal(environment.timers.size, 0, "People must not own Discovery transport polling");
-    assert.equal(environment.nodes.get("profile-name").value, "");
-    assert.equal(environment.nodes.get("profile-name").placeholder, "Suggested Profile Name");
+    assert.equal(environment.nodes.get("profile-name").value, "Suggested Profile Name");
+    assert.equal(environment.nodes.get("profile-name").placeholder, "Your name");
     assert.equal(environment.nodes.get("profile-title").textContent, "Create your Profile");
     assert.equal(environment.nodes.get("profile-submit").textContent, "Create Profile");
     assert.equal(
@@ -341,14 +397,32 @@ async function runScenario(name) {
     assert.match(environment.nodes.get("discovery-status").textContent, /same time/);
     assertNoRawIdentityLeak(environment.nodes.get("discovery-status").textContent, "configured discovery status");
 
-    environment.nodes.get("profile-name").value = "Typing My Name";
+    await triggerProfileInput(environment, "Typing My Name");
+    globalThis.document.activeElement = null;
+    environment.replies.unshift(summary(null, initialDiscovery, {
+      profile_setup_display_name: "Replacement Suggestion",
+    }));
+    await triggerMenuCommand(environment, "refresh");
+    assert.equal(environment.nodes.get("profile-name").value, "Typing My Name");
+    assert.equal(environment.nodes.get("profile-name").placeholder, "Your name");
+
+    await triggerProfileInput(environment, "");
+    globalThis.document.activeElement = null;
+    environment.replies.unshift(summary(null, initialDiscovery, {
+      profile_setup_display_name: "Another Suggestion",
+    }));
+    await triggerMenuCommand(environment, "refresh");
+    assert.equal(environment.nodes.get("profile-name").value, "");
+    assert.equal(environment.nodes.get("profile-name").placeholder, "Your name");
+
+    await triggerProfileInput(environment, "Typing My Name");
     globalThis.document.activeElement = environment.nodes.get("profile-name");
     await triggerAction(environment, "discovery-refresh");
     assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/discovery/refresh").length, 1);
-    assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/summary").length, 2);
+    assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/summary").length, 4);
     assert.equal(environment.timers.size, 0, "manual Refresh must only wake Runtime sync");
     assert.equal(environment.nodes.get("profile-name").value, "Typing My Name");
-    assert.equal(environment.nodes.get("profile-name").placeholder, "Suggested Profile Name");
+    assert.equal(environment.nodes.get("profile-name").placeholder, "Your name");
     assert.equal(environment.nodes.get("profile-title").textContent, "My Profile");
     assert.equal(environment.nodes.get("profile-submit").textContent, "Save");
     assert.match(environment.nodes.get("profile-description").textContent, /Shown to people/);
@@ -368,6 +442,28 @@ async function runScenario(name) {
       "refreshed discovery requests",
     );
 
+    const summaryCallsBeforeMenuRefresh = environment.calls.filter(
+      ({ path }) => path === "/api/apps/people/summary",
+    ).length;
+    environment.replies.unshift(summary("Mac", refreshedDiscovery, {
+      profile: { display_name: "Mac Profile" },
+      profile_setup_display_name: "Do not use this suggestion",
+    }, "ready"));
+    await triggerMenuCommand(environment, "refresh");
+    assert.equal(
+      environment.calls.filter(({ path }) => path === "/api/apps/people/summary").length,
+      summaryCallsBeforeMenuRefresh + 1,
+    );
+    const summaryCallsAfterTrustedMenuRefresh = environment.calls.filter(
+      ({ path }) => path === "/api/apps/people/summary",
+    ).length;
+    await triggerMenuCommand(environment, "refresh", { origin: "http://localhost:61180" });
+    await triggerMenuCommand(environment, "refresh", { source: {} });
+    assert.equal(
+      environment.calls.filter(({ path }) => path === "/api/apps/people/summary").length,
+      summaryCallsAfterTrustedMenuRefresh,
+    );
+
     globalThis.document.activeElement = null;
     await triggerAction(environment, "discovery-request", { advertisementId: "ad-1" });
     assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/discovery/requests").length, 1);
@@ -381,18 +477,24 @@ async function runScenario(name) {
 
     await triggerAction(environment, "open-inbox");
     assert.deepEqual(environment.messages.at(-1), {
-      type: "home:open-target",
-      target: "inbox",
-      query: {},
-      homeToken: "people-test-token",
+      message: {
+        type: "home:open-target",
+        target: "inbox",
+        query: {},
+        homeToken: "people-test-token",
+      },
+      origin: "http://localhost:61180",
     });
 
     await triggerAction(environment, "chat", { conversationId: "direct:opaque:remote" });
     assert.deepEqual(environment.messages.at(-1), {
-      type: "home:open-target",
-      target: "chat-room",
-      query: { conversation_id: "direct:opaque:remote" },
-      homeToken: "people-test-token",
+      message: {
+        type: "home:open-target",
+        target: "chat-room",
+        query: { conversation_id: "direct:opaque:remote" },
+        homeToken: "people-test-token",
+      },
+      origin: "http://localhost:61180",
     });
 
     await triggerAction(environment, "discovery-toggle", { enabled: "true" });
@@ -410,7 +512,7 @@ async function runScenario(name) {
 
     assert.equal(environment.clearCount(), 0);
     assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/discovery/refresh").length, 1);
-    assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/summary").length, 5);
+    assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/summary").length, 8);
     assert.equal(environment.replies.length, 0);
     assertRequestAuthority(environment);
     return;
@@ -431,6 +533,34 @@ async function runScenario(name) {
     assert.equal(environment.nodes.get("profile-submit").disabled, true);
     assert.match(environment.nodes.get("profile-description").textContent, /System Recovery/);
     assert.equal(environment.calls.length, 1);
+    assertRequestAuthority(environment);
+    return;
+  }
+
+  if (name === "setup_suggestion_confirmed") {
+    const environment = setupEnvironment(name, [
+      summary(null, discoverySummary(), {
+        profile_setup_display_name: "Suggested Profile Name",
+      }),
+      response(200, {}),
+      summary("Runtime Name", discoverySummary(), {
+        profile: { display_name: "Suggested Profile Name" },
+      }, "ready"),
+    ]);
+    await import("../capsules/people/browser/people.js");
+    await settle();
+    assert.equal(environment.nodes.get("profile-name").value, "Suggested Profile Name");
+    assert.equal(environment.nodes.get("profile-name").placeholder, "Your name");
+    await triggerProfileSubmit(environment);
+    const createCall = environment.calls.find(({ path }) => path === "/api/apps/people/profile");
+    assert(createCall, "profile create call missing");
+    assert.equal(
+      JSON.parse(createCall.options.body).display_name,
+      "Suggested Profile Name",
+    );
+    assert.equal(environment.nodes.get("profile-form").dataset.profileState, "saved");
+    assert.equal(environment.nodes.get("profile-name").value, "Suggested Profile Name");
+    assert.equal(environment.nodes.get("profile-submit").textContent, "Save");
     assertRequestAuthority(environment);
     return;
   }
@@ -598,10 +728,13 @@ async function runScenario(name) {
 
     await triggerProfileSubmit(environment);
     assert.deepEqual(environment.messages.at(-1), {
-      type: "home:open-target",
-      target: "system",
-      query: {},
-      homeToken: "people-test-token",
+      message: {
+        type: "home:open-target",
+        target: "system",
+        query: {},
+        homeToken: "people-test-token",
+      },
+      origin: "http://localhost:61180",
     });
     assert.equal(environment.nodes.get("profile-form").dataset.profileState, "retry");
     assert.equal(environment.nodes.get("profile-submit").textContent, "Retry Create Profile");
@@ -653,6 +786,7 @@ if (!scenario) {
   assert.match(peopleHtml, /id="profile-submit" type="submit">Create Profile/);
   for (const childScenario of [
     "configured",
+    "setup_suggestion_confirmed",
     "unavailable",
     "recovery_required",
     "isolated",

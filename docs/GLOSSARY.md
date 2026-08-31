@@ -97,6 +97,16 @@ The per-capsule execution contract. This is the common runtime surface that make
 
 The immutable packaged form of a capsule: manifest, code or rootfs payload, and signature/provenance material.
 
+## Content Capsule
+
+A non-executable Digital Capsule with `role=content` and `type=data`. Games,
+GGUF models, sealed media, and other portable data use this role when packaged
+with a manifest and provenance. The CID of the complete immutable
+manifest-and-payload closure is its package identity. A viewer binding or
+compatible provider interface describes how Runtime may use it; neither grants
+authority. See
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
+
 ## Capsule Instance
 
 One running copy of a capsule, bound to a session, capability set, and execution substrate.
@@ -124,9 +134,10 @@ protocol, expansion, authority layer, or capsule ABI.
 
 A capsule or Runtime-owned service that implements a typed contract. Examples
 include `localhost-provider` for rooted local storage, `did-provider` for
-identity, `chain-provider` for typed chain reads and proofs, `wallet-provider`
-for Wallet proof and approval authority, `rights-provider` for protected-content
-rights evidence, `decrypt-provider` for scoped decrypt/render sessions,
+identity, `model-provider` for typed model offers and durable runs,
+`chain-provider` for typed chain reads and proofs, `wallet-provider` for Wallet
+proof and approval authority, `rights-provider` for protected-content rights
+evidence, `decrypt-provider` for scoped decrypt/render sessions,
 `availability-provider` for configured replication, and `ipfs-provider` for
 low-level local IPFS through Kubo. Runtime selects providers. Application
 capsules use typed Runtime resources instead of choosing providers or network
@@ -278,6 +289,14 @@ responsibility to keep that content reachable.
 A CID is also not a person, device, account, or global name claim. A stable
 object may later have a signed head or object DID that points to changing CID
 revisions, but each CID already identifies one immutable byte graph.
+
+## Service Offer
+
+A signed or Runtime-projected description of an available running provider
+capability and its grant policy, using `elastos.service.offer/v1` where that
+contract applies. It is not a content package, publisher signature, license,
+availability receipt, or install grant. A model provider may offer inference
+for an admitted GGUF content capsule; the GGUF itself is not a service offer.
 
 ## IPLD
 

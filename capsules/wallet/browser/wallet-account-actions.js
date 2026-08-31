@@ -1,4 +1,5 @@
 import {
+  chainLabel,
   defaultIntentForAccount,
   defaultIntentLabel,
   isPasskeyManagedAccount,
@@ -53,6 +54,7 @@ export function createWalletAccountActions({
     if (!account) {
       return;
     }
+    const grouped = groupedAccountRecords(account);
     const rows = [
       flowRow(
         getSelectedAccountId() === account.account_id ? "Show default wallet" : "Show in hero",
@@ -73,10 +75,20 @@ export function createWalletAccountActions({
         closeModal();
         showStatus("Address copied.", "success");
       }),
-      flowRow("Use by default", defaultIntentLabel(account), () => setDefaultAccount(account)),
+      flowRow(
+        "Use by default",
+        grouped.length > 1 ? "Choose the exact network" : defaultIntentLabel(account),
+        () => openDefaultAccountChoice(account),
+      ),
     ];
     if (isPasskeyManagedAccount(account)) {
-      rows.push(flowRow("Show recovery key", "Requires passkey", () => showRecoveryKey(account)));
+      rows.push(
+        flowRow(
+          "Show recovery key",
+          grouped.length > 1 ? "Choose the exact network" : "Requires passkey",
+          () => openRecoveryAccountChoice(account),
+        ),
+      );
     }
     rows.push(
       flowRow("Delete account", "Remove from this Wallet", () => confirmDeleteAccount(account)),
@@ -96,6 +108,15 @@ export function createWalletAccountActions({
     input.value = account.name;
     field.append(input);
     form.append(field);
+    if (groupedAccountRecords(account).length > 1) {
+      form.append(
+        textNode(
+          "p",
+          `This grouped card updates ${groupedAccountRecords(account).length} exact account records that share this address.`,
+          "wallet-flow-hint",
+        ),
+      );
+    }
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       renameAccountFromForm(account, form).catch((error) =>
@@ -140,9 +161,13 @@ export function createWalletAccountActions({
   }
 
   function confirmDeleteAccount(account) {
+    const grouped = groupedAccountRecords(account);
+    const warningText = grouped.length > 1
+      ? `Delete ${account.name} from this Wallet. This grouped card removes ${grouped.length} exact account records that share this address. Export the recovery key first if you may need them later. Passkey confirmation is required for each record.`
+      : `Delete ${account.name} from this Wallet. Export the recovery key first if this is a built-in account you may need later. Passkey confirmation is required.`;
     const warning = textNode(
       "p",
-      `Delete ${account.name} from this Wallet. Export the recovery key first if this is a built-in account you may need later. Passkey confirmation is required.`,
+      warningText,
       "wallet-flow-hint",
     );
     openFlowModal("Delete account", account.network, [warning], [
@@ -266,6 +291,55 @@ export function createWalletAccountActions({
     return Array.isArray(account.account_ids) && account.account_ids.length > 0
       ? account.account_ids
       : [account.account_id];
+  }
+
+  function groupedAccountRecords(account) {
+    if (Array.isArray(account.account_records) && account.account_records.length > 0) {
+      return account.account_records;
+    }
+    return [account];
+  }
+
+  function exactRecordLabel(record) {
+    return chainLabel(readText(record.chain_namespace));
+  }
+
+  function exactRecordDetail(record) {
+    return shortAddress(readText(record.address));
+  }
+
+  function openDefaultAccountChoice(account) {
+    const grouped = groupedAccountRecords(account);
+    if (grouped.length <= 1) {
+      return setDefaultAccount(account);
+    }
+    openFlowModal(
+      "Use by default",
+      "Choose the exact network",
+      grouped.map((record) =>
+        flowRow(
+          exactRecordLabel(record),
+          `${defaultIntentLabel(record)} · ${exactRecordDetail(record)}`,
+          () => setDefaultAccount(record),
+        )),
+    );
+  }
+
+  function openRecoveryAccountChoice(account) {
+    const grouped = groupedAccountRecords(account);
+    if (grouped.length <= 1) {
+      return showRecoveryKey(account);
+    }
+    openFlowModal(
+      "Recovery key",
+      "Choose the exact network",
+      grouped.map((record) =>
+        flowRow(
+          exactRecordLabel(record),
+          exactRecordDetail(record),
+          () => showRecoveryKey(record),
+        )),
+    );
   }
 
   function onDocumentClick(event) {

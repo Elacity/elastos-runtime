@@ -237,13 +237,57 @@ fn selected_notification_dismiss_action(
     Some(format!("notification-dismiss:{}", entry.id))
 }
 
-fn selected_notification_action(snapshot: &HomeSnapshot, selected: usize) -> Option<&ActionInfo> {
+fn selected_notification_action(snapshot: &HomeSnapshot, selected: usize) -> Option<ActionInfo> {
     let entry = selected_notification(snapshot, selected)?;
-    let action_id = entry
-        .action_ref
-        .as_ref()
-        .map(|action_ref| action_ref.action_id.as_str())?;
-    action_by_id(snapshot, action_id)
+    let action_ref = entry.action_ref.as_ref()?;
+    let action_id = action_ref.action_id.trim();
+    if let Some(action) = action_by_id(snapshot, action_id) {
+        return Some(action.clone());
+    }
+    inbox_review_handoff_action(snapshot, entry, action_ref)
+}
+
+fn inbox_review_handoff_action(
+    snapshot: &HomeSnapshot,
+    entry: &NotificationEntryStatus,
+    action_ref: &NotificationActionRefStatus,
+) -> Option<ActionInfo> {
+    if !notification_action_uses_inbox_review(action_ref.action_id.trim()) {
+        return None;
+    }
+    let notification_id = entry.id.trim();
+    if notification_id.is_empty() {
+        return None;
+    }
+    let ready = snapshot.session.mode.trim() == "browser_pty"
+        && active_shell_candidate_launchable(snapshot, "home-gui")
+        && snapshot
+            .targets
+            .iter()
+            .any(|target| target.target == INBOX_TARGET_ID && target.target_kind == "app");
+    Some(ActionInfo {
+        id: format!("{INBOX_NOTIFICATION_HANDOFF_ACTION_PREFIX}{notification_id}"),
+        label: "Open Inbox on Desktop".to_string(),
+        description: "Open Inbox on the Home Desktop to review this pending request.".to_string(),
+        command: "home: open Inbox".to_string(),
+        ready,
+        reason: (!ready).then(|| {
+            "Open Inbox from the Home Desktop to review this pending request.".to_string()
+        }),
+    })
+}
+
+fn notification_action_uses_inbox_review(action_id: &str) -> bool {
+    [
+        "contact-accept-request:",
+        "wallet-approve-request:",
+        "wallet-review-request:",
+        "capability-approve-request:",
+        "inspect-approve-request:",
+        "wallet-price-http-approve:",
+    ]
+    .iter()
+    .any(|prefix| action_id.starts_with(prefix))
 }
 
 fn selected_app_action(snapshot: &HomeSnapshot, selected: usize) -> Option<&ActionInfo> {

@@ -16,7 +16,9 @@ set -euo pipefail
 # unlink a successor's relay socket at the same path.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-tmp_dir="$(mktemp -d)"
+# macOS Unix-domain socket paths are short. Keep relay paths under /tmp rather
+# than the much longer per-user TMPDIR path.
+tmp_dir="$(mktemp -d /tmp/elastos-local-exit.XXXXXX)"
 
 cleanup() {
   local pid

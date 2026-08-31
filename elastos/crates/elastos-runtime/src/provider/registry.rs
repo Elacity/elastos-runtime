@@ -4,8 +4,8 @@
 //! Supports hierarchical `elastos://` sub-dispatch: `elastos://peer/alice`
 //! routes to the `peer` sub-provider with path `alice`.
 //!
-//! All first-party providers (did, peer, ai) use the `elastos://` namespace
-//! exclusively: `elastos://did/*`, `elastos://peer/*`, `elastos://ai/*`.
+//! All first-party providers (did, peer, model) use the `elastos://` namespace
+//! exclusively: `elastos://did/*`, `elastos://peer/*`, `elastos://model/*`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -480,8 +480,7 @@ pub trait Provider: Send + Sync {
 const RESERVED_SUB_NAMES: &[&str] = &[
     "peer",
     "did",
-    "ai",
-    "llama",
+    "model",
     "ipfs",
     "content",
     "tunnel",
@@ -498,15 +497,17 @@ const RESERVED_SUB_NAMES: &[&str] = &[
     "rights",
     "key",
     "decrypt",
-    "protect",
     "inspect",
     "availability",
     "block-graph",
     "object",
     "collaboration-direct",
     "collaboration-profile",
-    "custody",
 ];
+
+/// Reserved names for provider targets that only Runtime invocation can reach.
+const RESERVED_RUNTIME_PROVIDER_TARGETS: &[&str] =
+    &["protect", "media", "custody", "protected-content-decrypt"];
 
 /// Registry of providers
 pub struct ProviderRegistry {
@@ -519,20 +520,42 @@ pub struct ProviderRegistry {
 }
 
 enum SubProviderRegistration {
-    Ready(Arc<dyn Provider>),
-    Settling(SubProviderSettling),
+    Ready {
+        provider: Arc<dyn Provider>,
+        visibility: ProviderTargetVisibility,
+    },
+    Settling {
+        provider: Arc<dyn Provider>,
+        visibility: ProviderTargetVisibility,
+        shutdown_in_progress: bool,
+    },
 }
 
-struct SubProviderSettling {
-    provider: Arc<dyn Provider>,
-    shutdown_in_progress: bool,
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProviderTargetVisibility {
+    CapsuleResource,
+    RuntimeOnly,
 }
 
 impl SubProviderRegistration {
     fn ready_provider(&self) -> Option<Arc<dyn Provider>> {
         match self {
-            Self::Ready(provider) => Some(provider.clone()),
-            Self::Settling(_) => None,
+            Self::Ready { provider, .. } => Some(provider.clone()),
+            Self::Settling { .. } => None,
+        }
+    }
+
+    fn capsule_resource_provider(&self) -> Option<Arc<dyn Provider>> {
+        match self {
+            Self::Ready {
+                provider,
+                visibility: ProviderTargetVisibility::CapsuleResource,
+            } => Some(provider.clone()),
+            Self::Ready {
+                visibility: ProviderTargetVisibility::RuntimeOnly,
+                ..
+            }
+            | Self::Settling { .. } => None,
         }
     }
 }
@@ -599,19 +622,63 @@ impl ProviderRegistry {
                 name
             )));
         }
-        let mut sub_providers = self.sub_providers.write().await;
-        if sub_providers.contains_key(&name) {
+        self.register_provider_target(name, provider, ProviderTargetVisibility::CapsuleResource)
+            .await
+    }
+
+    /// Register a provider target that only Runtime provider invocation can reach.
+    pub async fn register_runtime_provider_target(
+        &self,
+        name: &str,
+        provider: Arc<dyn Provider>,
+    ) -> Result<(), ProviderError> {
+        let name = name.to_lowercase();
+        if !RESERVED_RUNTIME_PROVIDER_TARGETS.contains(&name.as_str()) {
             return Err(ProviderError::Provider(format!(
-                "sub-provider '{}' is already registered",
+                "runtime provider target '{}' is not a reserved name",
                 name
             )));
         }
-        tracing::info!(
-            "Registered sub-provider '{}' for elastos://{}/...",
-            provider.name(),
-            name
+        self.register_provider_target(name, provider, ProviderTargetVisibility::RuntimeOnly)
+            .await
+    }
+
+    async fn register_provider_target(
+        &self,
+        name: String,
+        provider: Arc<dyn Provider>,
+        visibility: ProviderTargetVisibility,
+    ) -> Result<(), ProviderError> {
+        let mut sub_providers = self.sub_providers.write().await;
+        if sub_providers.contains_key(&name) {
+            let label = match visibility {
+                ProviderTargetVisibility::CapsuleResource => "sub-provider",
+                ProviderTargetVisibility::RuntimeOnly => "runtime provider target",
+            };
+            return Err(ProviderError::Provider(format!(
+                "{} '{}' is already registered",
+                label, name
+            )));
+        }
+        match visibility {
+            ProviderTargetVisibility::CapsuleResource => tracing::info!(
+                "Registered sub-provider '{}' for elastos://{}/...",
+                provider.name(),
+                name
+            ),
+            ProviderTargetVisibility::RuntimeOnly => tracing::info!(
+                "Registered Runtime-only provider '{}' for target '{}'",
+                provider.name(),
+                name
+            ),
+        }
+        sub_providers.insert(
+            name,
+            SubProviderRegistration::Ready {
+                provider,
+                visibility,
+            },
         );
-        sub_providers.insert(name, SubProviderRegistration::Ready(provider));
         Ok(())
     }
 
@@ -620,29 +687,69 @@ impl ProviderRegistry {
     /// No-op if the name is not currently registered.
     pub async fn unregister_sub_provider(&self, name: &str) -> Result<(), ProviderError> {
         let key = name.to_lowercase();
-        let provider = {
+        if !RESERVED_SUB_NAMES.contains(&key.as_str()) {
+            return Err(ProviderError::Provider(format!(
+                "sub-provider '{}' is not a reserved name",
+                key
+            )));
+        }
+        self.unregister_provider_target(&key).await
+    }
+
+    /// Unregister and settle a Runtime-only provider target.
+    pub async fn unregister_runtime_provider_target(
+        &self,
+        name: &str,
+    ) -> Result<(), ProviderError> {
+        let key = name.to_lowercase();
+        if !RESERVED_RUNTIME_PROVIDER_TARGETS.contains(&key.as_str()) {
+            return Err(ProviderError::Provider(format!(
+                "runtime provider target '{}' is not a reserved name",
+                key
+            )));
+        }
+        self.unregister_provider_target(&key).await
+    }
+
+    async fn unregister_provider_target(&self, name: &str) -> Result<(), ProviderError> {
+        let key = name.to_lowercase();
+        let (provider, visibility) = {
             let mut sub_providers = self.sub_providers.write().await;
             let Some(entry) = sub_providers.get_mut(&key) else {
                 return Ok(());
             };
             match entry {
-                SubProviderRegistration::Ready(provider) => {
+                SubProviderRegistration::Ready {
+                    provider,
+                    visibility,
+                } => {
                     let provider = provider.clone();
-                    *entry = SubProviderRegistration::Settling(SubProviderSettling {
+                    let visibility = *visibility;
+                    *entry = SubProviderRegistration::Settling {
                         provider: provider.clone(),
+                        visibility,
                         shutdown_in_progress: true,
-                    });
-                    provider
+                    };
+                    (provider, visibility)
                 }
-                SubProviderRegistration::Settling(settling) => {
-                    if settling.shutdown_in_progress {
+                SubProviderRegistration::Settling {
+                    provider,
+                    visibility,
+                    shutdown_in_progress,
+                    ..
+                } => {
+                    if *shutdown_in_progress {
+                        let label = match visibility {
+                            ProviderTargetVisibility::CapsuleResource => "sub-provider",
+                            ProviderTargetVisibility::RuntimeOnly => "runtime provider target",
+                        };
                         return Err(ProviderError::Unavailable(format!(
-                            "sub-provider '{}' shutdown is already settling",
-                            key
+                            "{} '{}' shutdown is already settling",
+                            label, key
                         )));
                     }
-                    settling.shutdown_in_progress = true;
-                    settling.provider.clone()
+                    *shutdown_in_progress = true;
+                    (provider.clone(), *visibility)
                 }
             }
         };
@@ -654,7 +761,7 @@ impl ProviderRegistry {
                     .map(|entry| {
                         matches!(
                             entry,
-                            SubProviderRegistration::Settling(SubProviderSettling { provider: current, .. })
+                            SubProviderRegistration::Settling { provider: current, .. }
                                 if Arc::ptr_eq(current, &provider)
                         )
                     })
@@ -662,20 +769,30 @@ impl ProviderRegistry {
                 if remove {
                     sub_providers.remove(&key);
                 }
-                tracing::info!(
-                    "Unregistered sub-provider '{}' for elastos://{}/...",
-                    provider.name(),
-                    key
-                );
+                match visibility {
+                    ProviderTargetVisibility::CapsuleResource => tracing::info!(
+                        "Unregistered sub-provider '{}' for elastos://{}/...",
+                        provider.name(),
+                        key
+                    ),
+                    ProviderTargetVisibility::RuntimeOnly => tracing::info!(
+                        "Unregistered Runtime-only provider '{}' from target '{}'",
+                        provider.name(),
+                        key
+                    ),
+                }
                 Ok(())
             }
             Err(error) => {
                 let mut sub_providers = self.sub_providers.write().await;
-                if let Some(SubProviderRegistration::Settling(settling)) =
-                    sub_providers.get_mut(&key)
+                if let Some(SubProviderRegistration::Settling {
+                    provider: current,
+                    shutdown_in_progress,
+                    ..
+                }) = sub_providers.get_mut(&key)
                 {
-                    if Arc::ptr_eq(&settling.provider, &provider) {
-                        settling.shutdown_in_progress = false;
+                    if Arc::ptr_eq(current, &provider) {
+                        *shutdown_in_progress = false;
                     }
                 }
                 Err(error)
@@ -690,7 +807,7 @@ impl ProviderRegistry {
             .read()
             .await
             .get(&key)
-            .and_then(SubProviderRegistration::ready_provider)
+            .and_then(SubProviderRegistration::capsule_resource_provider)
     }
 
     /// Split an `elastos://` path into `(sub_name, remainder)`.
@@ -819,7 +936,7 @@ impl ProviderRegistry {
         let sub_providers = self.sub_providers.read().await;
         sub_providers
             .iter()
-            .filter_map(|(name, entry)| entry.ready_provider().map(|_| name.clone()))
+            .filter_map(|(name, entry)| entry.capsule_resource_provider().map(|_| name.clone()))
             .collect()
     }
 
@@ -827,6 +944,21 @@ impl ProviderRegistry {
     pub async fn has_provider(&self, scheme: &str) -> bool {
         let providers = self.providers.read().await;
         providers.contains_key(scheme)
+    }
+
+    /// Check whether a Runtime-only provider target is ready for invocation.
+    pub async fn has_ready_runtime_provider_target(&self, target: &str) -> bool {
+        let key = target.to_lowercase();
+        if !RESERVED_RUNTIME_PROVIDER_TARGETS.contains(&key.as_str()) {
+            return false;
+        }
+        matches!(
+            self.sub_providers.read().await.get(&key),
+            Some(SubProviderRegistration::Ready {
+                visibility: ProviderTargetVisibility::RuntimeOnly,
+                ..
+            })
+        )
     }
 
     /// Snapshot the routes actually registered in this Runtime process.
@@ -842,7 +974,7 @@ impl ProviderRegistry {
             })
             .chain(sub_providers.iter().filter_map(|(route, provider)| {
                 provider
-                    .ready_provider()
+                    .capsule_resource_provider()
                     .map(|provider| ProviderRegistration {
                         route_kind: "elastos-sub-provider".to_string(),
                         route: route.clone(),
@@ -914,6 +1046,46 @@ impl ProviderRegistry {
         scheme: &str,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
+        self.send_raw_with_target_visibility(scheme, request, false)
+            .await
+    }
+
+    /// Send an already validated Runtime envelope to one exact private target.
+    pub async fn send_runtime_provider_target_raw(
+        &self,
+        target: &str,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let key = target.to_lowercase();
+        if !RESERVED_RUNTIME_PROVIDER_TARGETS.contains(&key.as_str()) {
+            return Err(ProviderError::NoProvider(target.to_string()));
+        }
+        let provider = self
+            .sub_providers
+            .read()
+            .await
+            .get(&key)
+            .and_then(|entry| match entry {
+                SubProviderRegistration::Ready {
+                    provider,
+                    visibility: ProviderTargetVisibility::RuntimeOnly,
+                } => Some(provider.clone()),
+                SubProviderRegistration::Ready {
+                    visibility: ProviderTargetVisibility::CapsuleResource,
+                    ..
+                }
+                | SubProviderRegistration::Settling { .. } => None,
+            })
+            .ok_or_else(|| ProviderError::NoProvider(target.to_string()))?;
+        provider.send_raw(request).await
+    }
+
+    async fn send_raw_with_target_visibility(
+        &self,
+        scheme: &str,
+        request: &serde_json::Value,
+        include_runtime_only: bool,
+    ) -> Result<serde_json::Value, ProviderError> {
         if scheme == "localhost"
             && request
                 .get("path")
@@ -939,10 +1111,13 @@ impl ProviderRegistry {
         {
             let key = scheme.to_lowercase();
             let sub = self.sub_providers.read().await;
-            if let Some(provider) = sub
-                .get(&key)
-                .and_then(SubProviderRegistration::ready_provider)
-            {
+            if let Some(provider) = sub.get(&key).and_then(|entry| {
+                if include_runtime_only {
+                    entry.ready_provider()
+                } else {
+                    entry.capsule_resource_provider()
+                }
+            }) {
                 drop(sub);
                 return provider.send_raw(request).await;
             }
@@ -1001,7 +1176,10 @@ impl ProviderRegistry {
                     .invoke_carrier_provider(route, &invocation, request)
                     .await?
             }
-            None => self.send_raw(&invocation.target, &request).await?,
+            None => {
+                self.send_raw_with_target_visibility(&invocation.target, &request, true)
+                    .await?
+            }
         };
         apply_provider_transfer_response(&mut response, &invocation)?;
         attach_provider_transfer_receipt(&mut response, &invocation, "completed");
@@ -1585,7 +1763,10 @@ impl ProviderRegistry {
     async fn register_sub_provider_unchecked(&self, name: &str, provider: Arc<dyn Provider>) {
         self.sub_providers.write().await.insert(
             name.to_lowercase(),
-            SubProviderRegistration::Ready(provider),
+            SubProviderRegistration::Ready {
+                provider,
+                visibility: ProviderTargetVisibility::CapsuleResource,
+            },
         );
     }
 }
@@ -2575,13 +2756,12 @@ mod tests {
 
         for name in [
             "chain",
+            "model",
             "wallet",
             "drm",
             "rights",
             "key",
             "decrypt",
-            "protect",
-            "custody",
             "availability",
             "block-graph",
             "object",
@@ -2599,18 +2779,256 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unregister_sub_provider_keeps_name_reserved_until_shutdown_settles() {
+    async fn runtime_only_targets_coexist_without_capsule_resource_exposure() {
+        let registry = ProviderRegistry::new();
+        registry
+            .register_sub_provider("decrypt", Arc::new(RawMockProvider))
+            .await
+            .unwrap();
+        for target in ["protect", "media", "custody", "protected-content-decrypt"] {
+            registry
+                .register_runtime_provider_target(target, Arc::new(RawMockProvider))
+                .await
+                .unwrap();
+        }
+
+        let provisional = registry
+            .invoke_provider(ProviderInvocation {
+                source: "runtime".to_string(),
+                target: "decrypt".to_string(),
+                op: "status".to_string(),
+                request: serde_json::json!({"op":"status"}),
+                transfer: ProviderTransfer::Json,
+                range: None,
+                progress: None,
+                transport: ProviderInvocationTransport::Local,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            provisional["data"]["runtime_invocation"]["target"],
+            "decrypt"
+        );
+        assert_eq!(registry.sub_provider_schemes().await, vec!["decrypt"]);
+        assert!(!registry.has_ready_runtime_provider_target("decrypt").await);
+        let registrations = registry.registrations().await;
+        for target in ["protect", "media", "custody", "protected-content-decrypt"] {
+            let protected = registry
+                .invoke_provider(ProviderInvocation {
+                    source: "runtime".to_string(),
+                    target: target.to_string(),
+                    op: "status".to_string(),
+                    request: serde_json::json!({"op":"status"}),
+                    transfer: ProviderTransfer::Json,
+                    range: None,
+                    progress: None,
+                    transport: ProviderInvocationTransport::Local,
+                })
+                .await
+                .unwrap();
+            assert_eq!(protected["data"]["runtime_invocation"]["target"], target);
+            assert!(registry.has_ready_runtime_provider_target(target).await);
+            assert!(registry
+                .registration_for_uri(&format!("elastos://{target}/status"))
+                .await
+                .is_none());
+            assert!(!registrations
+                .iter()
+                .any(|registration| registration.route == target));
+            assert!(matches!(
+                registry
+                    .send_raw(target, &serde_json::json!({"op":"status"}))
+                    .await,
+                Err(ProviderError::NoProvider(hidden)) if hidden == target
+            ));
+            assert!(registry
+                .send_runtime_provider_target_raw(target, &serde_json::json!({"op":"status"}),)
+                .await
+                .is_ok());
+            assert!(matches!(
+                registry
+                    .route(
+                        &format!("elastos://{target}/status"),
+                        "capsule:test",
+                        ResourceAction::Read,
+                        None,
+                    )
+                    .await,
+                Err(ProviderError::NoProvider(scheme)) if scheme == "elastos"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn unregister_api_enforces_provider_target_class() {
+        let registry = ProviderRegistry::new();
+        registry
+            .register_sub_provider("decrypt", Arc::new(MockProvider::new()))
+            .await
+            .unwrap();
+        for target in ["protect", "media", "custody", "protected-content-decrypt"] {
+            registry
+                .register_runtime_provider_target(target, Arc::new(RawMockProvider))
+                .await
+                .unwrap();
+
+            let wrong_capsule_api = registry.unregister_sub_provider(target).await.unwrap_err();
+            assert!(wrong_capsule_api
+                .to_string()
+                .contains("not a reserved name"));
+            let protected = registry
+                .invoke_provider(ProviderInvocation {
+                    source: "runtime".to_string(),
+                    target: target.to_string(),
+                    op: "status".to_string(),
+                    request: serde_json::json!({"op":"status"}),
+                    transfer: ProviderTransfer::Json,
+                    range: None,
+                    progress: None,
+                    transport: ProviderInvocationTransport::Local,
+                })
+                .await
+                .unwrap();
+            assert_eq!(protected["data"]["runtime_invocation"]["target"], target);
+        }
+
+        let wrong_runtime_api = registry
+            .unregister_runtime_provider_target("decrypt")
+            .await
+            .unwrap_err();
+        assert!(wrong_runtime_api
+            .to_string()
+            .contains("not a reserved name"));
+        assert!(matches!(
+            registry
+                .route(
+                    "elastos://decrypt/probe",
+                    "capsule:test",
+                    ResourceAction::Write,
+                    Some(b"still-registered".to_vec()),
+                )
+                .await,
+            Ok(ResourceResponse::Written { bytes }) if bytes == 16
+        ));
+    }
+
+    #[tokio::test]
+    async fn runtime_only_target_restart_requires_exact_absence_before_replacement() {
         let registry = Arc::new(ProviderRegistry::new());
         let provider = Arc::new(BlockingShutdownProvider::new());
         registry
-            .register_sub_provider("custody", provider.clone())
+            .register_runtime_provider_target("protected-content-decrypt", provider.clone())
             .await
             .unwrap();
 
         let unregister_registry = registry.clone();
         let unregister_task = tokio::spawn(async move {
             unregister_registry
-                .unregister_sub_provider("custody")
+                .unregister_runtime_provider_target("protected-content-decrypt")
+                .await
+                .unwrap();
+        });
+        provider.entered_shutdown.notified().await;
+
+        assert!(
+            !registry
+                .has_ready_runtime_provider_target("protected-content-decrypt")
+                .await
+        );
+
+        let invocation = ProviderInvocation {
+            source: "runtime".to_string(),
+            target: "protected-content-decrypt".to_string(),
+            op: "status".to_string(),
+            request: serde_json::json!({"op":"status"}),
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Local,
+        };
+        assert!(matches!(
+            registry.invoke_provider(invocation.clone()).await,
+            Err(ProviderError::NoProvider(target)) if target == "protected-content-decrypt"
+        ));
+        let duplicate = registry
+            .register_runtime_provider_target(
+                "protected-content-decrypt",
+                Arc::new(RawMockProvider),
+            )
+            .await
+            .unwrap_err();
+        assert!(duplicate.to_string().contains("already registered"));
+
+        provider.release_shutdown.notify_waiters();
+        unregister_task.await.unwrap();
+        assert!(matches!(
+            registry.invoke_provider(invocation.clone()).await,
+            Err(ProviderError::NoProvider(target)) if target == "protected-content-decrypt"
+        ));
+
+        registry
+            .register_runtime_provider_target(
+                "protected-content-decrypt",
+                Arc::new(RawMockProvider),
+            )
+            .await
+            .unwrap();
+        assert!(registry.invoke_provider(invocation).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn runtime_only_target_retries_settlement_after_unclean_shutdown() {
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_runtime_provider_target(
+                "protected-content-decrypt",
+                Arc::new(RetryOnceShutdownProvider::new()),
+            )
+            .await
+            .unwrap();
+
+        let first_error = registry
+            .unregister_runtime_provider_target("protected-content-decrypt")
+            .await
+            .unwrap_err();
+        assert!(first_error
+            .to_string()
+            .contains("unclean shutdown receipt after child exit"));
+        let duplicate = registry
+            .register_runtime_provider_target(
+                "protected-content-decrypt",
+                Arc::new(RawMockProvider),
+            )
+            .await
+            .unwrap_err();
+        assert!(duplicate.to_string().contains("already registered"));
+
+        registry
+            .unregister_runtime_provider_target("protected-content-decrypt")
+            .await
+            .unwrap();
+        registry
+            .register_runtime_provider_target(
+                "protected-content-decrypt",
+                Arc::new(RawMockProvider),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_unregister_sub_provider_keeps_name_reserved_until_shutdown_settles() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = Arc::new(BlockingShutdownProvider::new());
+        registry
+            .register_sub_provider("storage", provider.clone())
+            .await
+            .unwrap();
+
+        let unregister_registry = registry.clone();
+        let unregister_task = tokio::spawn(async move {
+            unregister_registry
+                .unregister_sub_provider("storage")
                 .await
                 .unwrap();
         });
@@ -2621,10 +3039,10 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(100), registry.sub_provider_schemes())
                 .await
                 .expect("registry reads should not block on shutdown");
-        assert!(!schemes.iter().any(|scheme| scheme == "custody"));
-        assert!(registry.get_sub_provider("custody").await.is_none());
+        assert!(!schemes.iter().any(|scheme| scheme == "storage"));
+        assert!(registry.get_sub_provider("storage").await.is_none());
         let replacement = registry
-            .register_sub_provider("custody", Arc::new(MockProvider::new()))
+            .register_sub_provider("storage", Arc::new(MockProvider::new()))
             .await
             .unwrap_err();
         assert!(replacement.to_string().contains("already registered"));
@@ -2633,7 +3051,7 @@ mod tests {
         unregister_task.await.unwrap();
 
         registry
-            .register_sub_provider("custody", Arc::new(MockProvider::new()))
+            .register_sub_provider("storage", Arc::new(MockProvider::new()))
             .await
             .unwrap();
     }
@@ -2643,14 +3061,14 @@ mod tests {
         let registry = Arc::new(ProviderRegistry::new());
         let provider = Arc::new(BlockingShutdownProvider::failing());
         registry
-            .register_sub_provider("custody", provider.clone())
+            .register_sub_provider("storage", provider.clone())
             .await
             .unwrap();
 
         let unregister_registry = registry.clone();
         let unregister_task = tokio::spawn(async move {
             unregister_registry
-                .unregister_sub_provider("custody")
+                .unregister_sub_provider("storage")
                 .await
                 .unwrap_err()
         });
@@ -2662,11 +3080,11 @@ mod tests {
         assert!(error
             .to_string()
             .contains("blocking shutdown failed to settle"));
-        assert!(registry.get_sub_provider("custody").await.is_none());
+        assert!(registry.get_sub_provider("storage").await.is_none());
         let schemes = registry.sub_provider_schemes().await;
-        assert!(!schemes.iter().any(|scheme| scheme == "custody"));
+        assert!(!schemes.iter().any(|scheme| scheme == "storage"));
         let replacement = registry
-            .register_sub_provider("custody", Arc::new(MockProvider::new()))
+            .register_sub_provider("storage", Arc::new(MockProvider::new()))
             .await
             .unwrap_err();
         assert!(replacement.to_string().contains("already registered"));
@@ -2676,34 +3094,34 @@ mod tests {
     async fn test_unregister_sub_provider_retries_settling_provider_after_unclean_shutdown() {
         let registry = Arc::new(ProviderRegistry::new());
         registry
-            .register_sub_provider("custody", Arc::new(RetryOnceShutdownProvider::new()))
+            .register_sub_provider("storage", Arc::new(RetryOnceShutdownProvider::new()))
             .await
             .unwrap();
 
         let first_error = registry
-            .unregister_sub_provider("custody")
+            .unregister_sub_provider("storage")
             .await
             .unwrap_err();
         assert!(first_error
             .to_string()
             .contains("unclean shutdown receipt after child exit"));
-        assert!(registry.get_sub_provider("custody").await.is_none());
+        assert!(registry.get_sub_provider("storage").await.is_none());
         let replacement = registry
-            .register_sub_provider("custody", Arc::new(MockProvider::new()))
+            .register_sub_provider("storage", Arc::new(MockProvider::new()))
             .await
             .unwrap_err();
         assert!(replacement.to_string().contains("already registered"));
 
-        registry.unregister_sub_provider("custody").await.unwrap();
-        assert!(registry.get_sub_provider("custody").await.is_none());
+        registry.unregister_sub_provider("storage").await.unwrap();
+        assert!(registry.get_sub_provider("storage").await.is_none());
         assert!(!registry
             .sub_provider_schemes()
             .await
             .iter()
-            .any(|scheme| scheme == "custody"));
+            .any(|scheme| scheme == "storage"));
 
         registry
-            .register_sub_provider("custody", Arc::new(MockProvider::new()))
+            .register_sub_provider("storage", Arc::new(MockProvider::new()))
             .await
             .unwrap();
     }

@@ -657,7 +657,7 @@ fn exact_vz_did_not_act_settlement_survives_supervisor_failure() {
         "display_modes": ["webrtc_remote_display"],
         "supervisor": {
             "program": "/bin/sh",
-            "args": ["-c", "printf '%s\\n' \"$LAUNCH_ERROR\" >&2; exit 42"],
+            "args": ["-c", "IFS= read -r _request; printf '%s\\n' \"$LAUNCH_ERROR\" >&2; exit 42"],
             "timeout_ms": 2000,
             "env": {
                 "LAUNCH_ERROR": launch_error.to_string(),
@@ -711,7 +711,7 @@ fn mismatched_vz_settlement_is_not_preserved() {
         "display_modes": ["webrtc_remote_display"],
         "supervisor": {
             "program": "/bin/sh",
-            "args": ["-c", "printf '%s\\n' \"$LAUNCH_ERROR\" >&2; exit 42"],
+            "args": ["-c", "IFS= read -r _request; printf '%s\\n' \"$LAUNCH_ERROR\" >&2; exit 42"],
             "timeout_ms": 2000,
             "env": {
                 "LAUNCH_ERROR": launch_error.to_string(),

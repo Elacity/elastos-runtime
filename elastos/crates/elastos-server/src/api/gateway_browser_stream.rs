@@ -3,6 +3,7 @@
 use super::*;
 #[cfg(unix)]
 use crate::carrier::{open_browser_carrier_stream, BrowserCarrierStreamRequest};
+use anyhow::Context as _;
 #[cfg(unix)]
 use std::net::IpAddr;
 #[cfg(unix)]
@@ -1480,8 +1481,8 @@ fn browser_stream_socket_path(
     let socket_name = format!("{}.sock", hex::encode(&digest[..16]));
     // Unix socket paths have a small platform limit. Keep Browser stream sockets
     // in /tmp rather than platform temp roots like macOS /var/folders/.../T.
-    let stream_dir = browser_runtime_stream_root().join(directory);
-    std::fs::create_dir_all(&stream_dir)?;
+    let stream_dir = browser_runtime_stream_root().join(browser_stream_dir_name(directory));
+    ensure_private_stream_dir(&stream_dir)?;
     Ok(stream_dir.join(socket_name))
 }
 
@@ -1493,6 +1494,63 @@ fn browser_runtime_stream_root() -> PathBuf {
 #[cfg(not(unix))]
 fn browser_runtime_stream_root() -> PathBuf {
     std::env::temp_dir()
+}
+
+#[cfg(unix)]
+fn browser_stream_dir_name(directory: &str) -> String {
+    format!("{directory}-{}", unsafe { libc::geteuid() })
+}
+
+#[cfg(not(unix))]
+fn browser_stream_dir_name(directory: &str) -> String {
+    directory.to_string()
+}
+
+#[cfg(unix)]
+fn ensure_private_stream_dir(path: &FsPath) -> anyhow::Result<()> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{
+        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    };
+
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => return Ok(()),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to create Browser stream root {path:?}"));
+        }
+    }
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect Browser stream root {path:?}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("Browser stream root must be a real directory");
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let directory = options
+        .open(path)
+        .with_context(|| format!("failed to open Browser stream root {path:?}"))?;
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("failed to inspect opened Browser stream root {path:?}"))?;
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        anyhow::bail!("Browser stream root must be owned by the effective user");
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        anyhow::bail!("Browser stream root must use mode 0700");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_stream_dir(path: &FsPath) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("failed to create Browser stream root {path:?}"))
 }
 
 pub(in crate::api::gateway) fn validate_browser_stream_receipt(
@@ -1706,9 +1764,28 @@ mod tests {
             .unwrap();
         let runtime_stream_path = PathBuf::from(runtime_stream_path);
 
-        assert!(path.starts_with("/tmp/elastos-browser-adapter-ipc/"));
+        #[cfg(unix)]
+        let expected_adapter_root = format!("/tmp/elastos-browser-adapter-ipc-{}/", unsafe {
+            libc::geteuid()
+        });
+        #[cfg(not(unix))]
+        let expected_adapter_root = format!(
+            "{}/elastos-browser-adapter-ipc/",
+            std::env::temp_dir().display()
+        );
+        #[cfg(unix)]
+        let expected_runtime_root = format!("/tmp/elastos-browser-streams-{}/", unsafe {
+            libc::geteuid()
+        });
+        #[cfg(not(unix))]
+        let expected_runtime_root = format!(
+            "{}/elastos-browser-streams/",
+            std::env::temp_dir().display()
+        );
+
+        assert!(path.starts_with(&expected_adapter_root));
         assert!(path.ends_with(".sock"));
-        assert!(runtime_stream_path.starts_with("/tmp/elastos-browser-streams/"));
+        assert!(runtime_stream_path.starts_with(expected_runtime_root));
         assert_ne!(PathBuf::from(path), runtime_stream_path);
         #[cfg(unix)]
         assert_eq!(
@@ -1827,6 +1904,69 @@ mod tests {
         drop(connection);
         drop(foreign);
         std::fs::remove_file(first_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_stream_root_is_created_owner_only_and_reused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("browser-stream-root");
+        ensure_private_stream_dir(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        ensure_private_stream_dir(&path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_stream_root_rejects_group_readable_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("browser-stream-root");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = ensure_private_stream_dir(&path).unwrap_err();
+        assert!(err.to_string().contains("0700"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_stream_root_rejects_owner_writable_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("browser-stream-root");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o733)).unwrap();
+        let err = ensure_private_stream_dir(&path).unwrap_err();
+        assert!(err.to_string().contains("0700"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_stream_root_rejects_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("browser-stream-root");
+        std::fs::write(&path, b"not-a-directory").unwrap();
+        let err = ensure_private_stream_dir(&path).unwrap_err();
+        assert!(err.to_string().contains("real directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_stream_root_rejects_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real-root");
+        let path = dir.path().join("browser-stream-root");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let err = ensure_private_stream_dir(&path).unwrap_err();
+        assert!(err.to_string().contains("real directory"));
     }
 
     #[tokio::test]

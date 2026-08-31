@@ -135,6 +135,11 @@ ElastOS must distinguish user objects, software packages, and namespaces.
   separate decision made under each Runtime's trust policy
 - `app`, `viewer`, `provider`, and `shell` are executable roles, while
   `content` carries portable data under a data contract
+- downloadable games, models, and similar portable data are content capsules
+  named by their complete bundle CID; a web URL or Store row is not their
+  identity
+- service offers describe running provider capabilities and grants; they are
+  not package identity, license evidence, or install authority
 - source packages and development projections are build inputs, not complete
   signed Digital Capsules or evidence of portable installation
 - spaces are where objects and services resolve: `localhost://...`, `elastos://...`, WebSpaces
@@ -156,6 +161,8 @@ access policy.
 
 - use CIDs and hashes for content integrity, and verified DIDs and signatures
   for publisher identity
+- keep external repositories and gateways behind content-provider contracts;
+  importing bytes must end in the same verified content-capsule and CID path
 - use IPLD-compatible manifests for published objects, signed heads,
   provenance, and availability receipts when content graphs need traversal or
   synchronization

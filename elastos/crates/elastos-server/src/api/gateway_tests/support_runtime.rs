@@ -193,6 +193,7 @@ fn seed_test_browser_capsules(data_dir: &std::path::Path) {
     for (name, role, description) in [
         ("home-gui", "shell", "Test Home GUI capsule"),
         ("home-cli", "shell", "Test Home CLI capsule"),
+        ("assistant", "app", "Test Assistant capsule"),
         ("wallet", "app", "Test Wallet capsule"),
         ("browser", "app", "Test Browser capsule"),
         ("wallet-metamask", "app", "Test MetaMask connector"),

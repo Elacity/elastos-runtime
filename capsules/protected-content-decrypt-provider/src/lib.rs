@@ -24,6 +24,7 @@ use sha2::{Digest as _, Sha256};
 #[path = "../tests/support.rs"]
 mod support;
 
+pub const PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET: &str = "protected-content-decrypt";
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
@@ -182,7 +183,10 @@ impl DecryptProvider {
             Ok(value) => value,
             Err(_) => return (invalid_request(), false),
         };
-        let envelope = match strip_runtime_invocation_envelope(&mut value, "decrypt") {
+        let envelope = match strip_runtime_invocation_envelope(
+            &mut value,
+            PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
+        ) {
             Ok(state) => state,
             Err(()) => return (invalid_request(), false),
         };
@@ -243,7 +247,7 @@ impl DecryptProvider {
 
     fn status(&self) -> ProviderResponse {
         ProviderResponse::ok(json!({
-            "provider": "protected-content-decrypt",
+            "provider": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
             "version": PROVIDER_VERSION,
             "configured": self.state.is_some(),
             "supported_operations": [
@@ -478,7 +482,9 @@ impl DecryptProvider {
                 let wrapped_content_key = match reconstruct_content_key_into_decrypt_session(
                     &DecryptSessionReconstructionInputsV1 {
                         operation,
-                        envelope: request.custody_envelope().expect("validated envelope"),
+                        content_key_commitment: request
+                            .content_key_commitment()
+                            .expect("validated content key commitment"),
                         contributions: request
                             .signed_node_contributions()
                             .expect("validated contributions"),
@@ -1015,7 +1021,7 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use elastos_protected_content_contracts::{
-        CustodyEnvelopeV1, ProtectedContentBindingV1, RightsActionV1, RuntimeReleaseAuditIdV1,
+        Digest32, ProtectedContentBindingV1, RightsActionV1, RuntimeReleaseAuditIdV1,
         SignedNodeContributionV1, SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1,
         TerminalReceiptIssuerKey,
     };
@@ -1055,9 +1061,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": op,
-                "capability": format!("provider:runtime->decrypt:{op}"),
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:{op}"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": null,
                 "transfer": "json",
@@ -1112,7 +1120,7 @@ mod tests {
     struct OpenRequestInputs<'a> {
         prepared_handle: HandleBytes,
         operation: &'a SignedRuntimeReleaseOperationV1,
-        envelope: &'a CustodyEnvelopeV1,
+        content_key_commitment: Digest32,
         media_identity: &'a CencFmp4MediaIdentityV1,
         init_segment: &'a [u8],
         contributions: &'a [SignedNodeContributionV1],
@@ -1130,7 +1138,7 @@ mod tests {
                     .to_bytes(),
             )
             .unwrap(),
-            inputs.envelope,
+            inputs.content_key_commitment,
             inputs.media_identity,
             inputs.init_segment,
             inputs.contributions,
@@ -1210,10 +1218,27 @@ mod tests {
             make_signed_node_contribution(&operation, &envelope, runtime_seed, 2, NOW),
         ];
         let terminal = make_signed_terminal_receipt(&operation, &contributions, 0x61, NOW);
+        let wrong_commitment_open = open_request(OpenRequestInputs {
+            prepared_handle: *prepared.prepared_recipient_handle().unwrap(),
+            operation: &operation,
+            content_key_commitment: Digest32::new([0xee; 32]),
+            media_identity: &media_identity,
+            init_segment: &init_segment,
+            contributions: &contributions,
+            terminal_receipt: &terminal,
+            issuer_seed: 0x61,
+        });
+        let wrong_commitment = typed_response(
+            provider.handle_line_at(&wrap_request(request_json(&wrong_commitment_open)), NOW + 7),
+        );
+        assert_eq!(
+            wrong_commitment.failure_code().unwrap(),
+            ProviderFailureCodeV1::BindingMismatch
+        );
         let open = open_request(OpenRequestInputs {
             prepared_handle: *prepared.prepared_recipient_handle().unwrap(),
             operation: &operation,
-            envelope: &envelope,
+            content_key_commitment: envelope.manifest().content_key_commitment(),
             media_identity: &media_identity,
             init_segment: &init_segment,
             contributions: &contributions,
@@ -1388,7 +1413,7 @@ mod tests {
         let open = open_request(OpenRequestInputs {
             prepared_handle: *prepared_a.prepared_recipient_handle().unwrap(),
             operation: &operation,
-            envelope: &envelope,
+            content_key_commitment: envelope.manifest().content_key_commitment(),
             media_identity: &media_identity,
             init_segment: &init_segment,
             contributions: &contributions,
@@ -1407,7 +1432,7 @@ mod tests {
         let conflicting_open = open_request(OpenRequestInputs {
             prepared_handle: [0x11; 32],
             operation: &operation,
-            envelope: &envelope,
+            content_key_commitment: envelope.manifest().content_key_commitment(),
             media_identity: &media_identity,
             init_segment: &init_segment,
             contributions: &contributions,
@@ -1491,7 +1516,7 @@ mod tests {
             &wrap_request(request_json(&open_request(OpenRequestInputs {
                 prepared_handle: *prepared.prepared_recipient_handle().unwrap(),
                 operation: &operation,
-                envelope: &envelope,
+                content_key_commitment: envelope.manifest().content_key_commitment(),
                 media_identity: &media_identity,
                 init_segment: &init_segment,
                 contributions: &contributions,
@@ -1572,7 +1597,7 @@ mod tests {
         let mut tampered_json = request_json(&open_request(OpenRequestInputs {
             prepared_handle: *prepared.prepared_recipient_handle().unwrap(),
             operation: &operation,
-            envelope: &envelope,
+            content_key_commitment: envelope.manifest().content_key_commitment(),
             media_identity: &media_identity,
             init_segment: &init_segment,
             contributions: &contributions,
@@ -1606,7 +1631,7 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
                 "transport": "runtime-local-provider-plane",
                 "carrier": null
@@ -1621,9 +1646,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
-                "capability": "provider:runtime->decrypt:prepare_recipient",
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:prepare_recipient"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": null,
                 "transfer": "json",
@@ -1642,9 +1669,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
-                "capability": "provider:runtime->decrypt:open_viewer_session",
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:open_viewer_session"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": null,
                 "transfer": "json",
@@ -1662,9 +1691,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
-                "capability": "provider:runtime->decrypt:prepare_recipient",
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:prepare_recipient"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": null,
                 "transfer": "bytes",
@@ -1682,9 +1713,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
-                "capability": "provider:runtime->decrypt:prepare_recipient",
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:prepare_recipient"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": {},
                 "transfer": "json",
@@ -1702,9 +1735,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
-                "capability": "provider:runtime->decrypt:prepare_recipient",
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:prepare_recipient"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": null,
                 "transfer": "json",
@@ -1722,9 +1757,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
-                "capability": "provider:runtime->decrypt:prepare_recipient",
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:prepare_recipient"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": null,
                 "transfer": "json",
@@ -1742,9 +1779,11 @@ mod tests {
             json!({
                 "schema": "elastos.provider.invocation/v1",
                 "source": "runtime",
-                "target": "decrypt",
+                "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
                 "op": "prepare_recipient",
-                "capability": "provider:runtime->decrypt:prepare_recipient",
+                "capability": format!(
+                    "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:prepare_recipient"
+                ),
                 "transport": "runtime-local-provider-plane",
                 "carrier": null,
                 "transfer": "json",

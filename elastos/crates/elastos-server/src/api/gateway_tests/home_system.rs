@@ -2,6 +2,7 @@ use super::*;
 use elastos_runtime::signature::{generate_keypair, SigningKey};
 
 const HOME_CLI_CAPSULE_ID_FOR_TEST: &str = "home-cli";
+static HOME_GATEWAY_TEST_ENV_LOCK: TokioMutex<()> = TokioMutex::const_new(());
 
 struct EnvRestore {
     key: &'static str,
@@ -36,6 +37,31 @@ async fn home_test_get_json(
         .oneshot(
             test_browser_request("localhost:61180", origin)
                 .uri(uri)
+                .header("x-elastos-home-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload = serde_json::from_slice(&body).unwrap();
+    (status, payload)
+}
+
+async fn home_test_get_json_without_origin(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
                 .unwrap(),
@@ -787,6 +813,167 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
         .await
         .unwrap();
     assert_eq!(closed.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn home_summary_accepts_gateway_owned_home_cli_token_under_home_owned_grant() {
+    let _guard = HOME_GATEWAY_TEST_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let now = now_ts();
+    let _auth = set_test_home_launch_auth_data_dir(dir.path());
+    let context = HomeLaunchTokenContext {
+        principal_id: "person:home-cli-test".to_string(),
+        session_id: "auth:home-cli-test".to_string(),
+        proof_binding_id: Some("proof:passkey:home-cli-test".to_string()),
+        grant_id: "grant:home-cli-test".to_string(),
+    };
+    crate::auth::store_session_grant(
+        dir.path(),
+        AuthSessionGrantV1 {
+            schema: AuthSessionGrantV1::SCHEMA.to_string(),
+            grant_id: context.grant_id.clone(),
+            session_id: context.session_id.clone(),
+            principal_id: context.principal_id.clone(),
+            proof_binding_id: context.proof_binding_id.clone().unwrap(),
+            issued_at: now,
+            expires_at: now + 300,
+            apps: vec![HOME_CAPSULE_ID.to_string()],
+        },
+    )
+    .unwrap();
+
+    let _owned = EnvRestore::set(
+        crate::runtime_control::GATEWAY_OWNED_HOME_TERMINAL_ENV,
+        "1".to_string(),
+    );
+    let _principal = EnvRestore::set(
+        HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV,
+        context.principal_id.clone(),
+    );
+    let _session = EnvRestore::set(
+        HOME_CLI_AUTH_CONTEXT_SESSION_ID_ENV,
+        context.session_id.clone(),
+    );
+    let _proof = EnvRestore::set(
+        HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID_ENV,
+        context.proof_binding_id.clone().unwrap(),
+    );
+    let _grant = EnvRestore::set(HOME_CLI_AUTH_CONTEXT_GRANT_ID_ENV, context.grant_id.clone());
+
+    let token = issue_gateway_owned_home_cli_launch_token(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST)
+        .unwrap()
+        .unwrap();
+    let (status, payload) =
+        home_test_get_json_without_origin(&app, "/api/apps/home/summary", &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["authority"]["signed_in"], true);
+    assert_eq!(payload["authority"]["principal_id"], context.principal_id);
+}
+
+#[tokio::test]
+async fn direct_home_cli_token_rejects_home_owned_grant_authority() {
+    let _guard = HOME_GATEWAY_TEST_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let now = now_ts();
+    let _auth = set_test_home_launch_auth_data_dir(dir.path());
+    let context = HomeLaunchTokenContext {
+        principal_id: "person:home-cli-test".to_string(),
+        session_id: "auth:home-cli-test".to_string(),
+        proof_binding_id: Some("proof:passkey:home-cli-test".to_string()),
+        grant_id: "grant:home-cli-test".to_string(),
+    };
+    crate::auth::store_session_grant(
+        dir.path(),
+        AuthSessionGrantV1 {
+            schema: AuthSessionGrantV1::SCHEMA.to_string(),
+            grant_id: context.grant_id.clone(),
+            session_id: context.session_id.clone(),
+            principal_id: context.principal_id.clone(),
+            proof_binding_id: context.proof_binding_id.clone().unwrap(),
+            issued_at: now,
+            expires_at: now + 300,
+            apps: vec![HOME_CAPSULE_ID.to_string()],
+        },
+    )
+    .unwrap();
+
+    let token =
+        issue_home_launch_token_with_context(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST, &context)
+            .unwrap();
+    let err =
+        require_carried_home_launch_token(dir.path(), &token, &[HOME_CLI_CAPSULE_ID_FOR_TEST])
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("home launch token authority context mismatch"));
+}
+
+#[tokio::test]
+async fn gateway_owned_home_cli_issuer_projects_non_cli_capsules_under_home_authority() {
+    let _guard = HOME_GATEWAY_TEST_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let now = now_ts();
+    let _auth = set_test_home_launch_auth_data_dir(dir.path());
+    let context = HomeLaunchTokenContext {
+        principal_id: "person:home-cli-test".to_string(),
+        session_id: "auth:home-cli-test".to_string(),
+        proof_binding_id: Some("proof:passkey:home-cli-test".to_string()),
+        grant_id: "grant:home-cli-test".to_string(),
+    };
+    crate::auth::store_session_grant(
+        dir.path(),
+        AuthSessionGrantV1 {
+            schema: AuthSessionGrantV1::SCHEMA.to_string(),
+            grant_id: context.grant_id.clone(),
+            session_id: context.session_id.clone(),
+            principal_id: context.principal_id.clone(),
+            proof_binding_id: context.proof_binding_id.clone().unwrap(),
+            issued_at: now,
+            expires_at: now + 300,
+            apps: vec![HOME_CAPSULE_ID.to_string()],
+        },
+    )
+    .unwrap();
+
+    let _owned = EnvRestore::set(
+        crate::runtime_control::GATEWAY_OWNED_HOME_TERMINAL_ENV,
+        "1".to_string(),
+    );
+    let _principal = EnvRestore::set(
+        HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV,
+        context.principal_id.clone(),
+    );
+    let _session = EnvRestore::set(
+        HOME_CLI_AUTH_CONTEXT_SESSION_ID_ENV,
+        context.session_id.clone(),
+    );
+    let _proof = EnvRestore::set(
+        HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID_ENV,
+        context.proof_binding_id.clone().unwrap(),
+    );
+    let _grant = EnvRestore::set(HOME_CLI_AUTH_CONTEXT_GRANT_ID_ENV, context.grant_id.clone());
+
+    let token = issue_gateway_owned_home_cli_launch_token(dir.path(), "people")
+        .unwrap()
+        .unwrap();
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(
+        payload["payload"]["launch_context"]["selected_resource"],
+        "people"
+    );
+    assert_eq!(
+        payload["payload"]["launch_context"]["executable_actor"],
+        "people"
+    );
+    assert_eq!(
+        payload["payload"]["launch_context"]["authority_actor"],
+        HOME_CAPSULE_ID
+    );
 }
 
 #[tokio::test]
@@ -2169,6 +2356,160 @@ async fn test_people_profile_creation_requires_completed_system_recovery_without
     let payload: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["identity"]["profile_readiness"]["status"], "ready");
     assert_eq!(payload["identity"]["profile"]["display_name"], "Anders");
+}
+
+fn assert_recovery_readiness_projection(payload: &Value, status: &str, path: &str) {
+    assert_eq!(
+        payload["identity"]["recovery_readiness"],
+        json!({
+            "schema": "elastos.recovery.readiness/v1",
+            "status": status,
+        }),
+        "{path}"
+    );
+}
+
+#[tokio::test]
+async fn test_recovery_readiness_and_first_profile_gate_share_one_recovery_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let before_summary = file_snapshot(dir.path());
+
+    for (path, token, origin) in [
+        (
+            "/api/apps/home/summary",
+            authority.home_token.as_str(),
+            "http://localhost:61180",
+        ),
+        (
+            "/api/apps/people/summary",
+            authority.people_token.as_str(),
+            "null",
+        ),
+    ] {
+        let (status, payload) = home_test_get_json(&app, path, token, origin).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_recovery_readiness_projection(&payload, "setup_required", path);
+    }
+    assert_eq!(file_snapshot(dir.path()), before_summary);
+
+    let (status, payload) = home_test_post_json(
+        &app,
+        "/api/apps/people/profile",
+        authority.people_token.as_str(),
+        "null",
+        json!({ "display_name": "Anders" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        payload,
+        json!({
+            "schema": "elastos.people.profile-protection-required/v1",
+            "status": "recovery_required",
+            "action_target": "system",
+            "message": "Open System, choose Security, and download Recovery. Then retry creating your Profile."
+        })
+    );
+
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+
+    let before_ready_summary = file_snapshot(dir.path());
+    for (path, token, origin) in [
+        (
+            "/api/apps/home/summary",
+            authority.home_token.as_str(),
+            "http://localhost:61180",
+        ),
+        (
+            "/api/apps/people/summary",
+            authority.people_token.as_str(),
+            "null",
+        ),
+    ] {
+        let (status, payload) = home_test_get_json(&app, path, token, origin).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_recovery_readiness_projection(&payload, "ready", path);
+    }
+    assert_eq!(file_snapshot(dir.path()), before_ready_summary);
+
+    let (status, payload) = home_test_post_json(
+        &app,
+        "/api/apps/people/profile",
+        authority.people_token.as_str(),
+        "null",
+        json!({ "display_name": "Anders" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["profile"]["display_name"], "Anders");
+    assert_eq!(payload["profile_readiness"]["status"], "ready");
+}
+
+#[tokio::test]
+async fn test_recovery_readiness_projects_unavailable_and_first_profile_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let mut protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    protection.protectors.clear();
+    let mut auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
+    auth_state.principal_root_protections.clear();
+    auth_state.principal_root_protections.push(protection);
+    crate::auth::save_auth_state(dir.path(), &auth_state).unwrap();
+    let before = file_snapshot(dir.path());
+
+    for (path, token, origin) in [
+        (
+            "/api/apps/home/summary",
+            authority.home_token.as_str(),
+            "http://localhost:61180",
+        ),
+        (
+            "/api/apps/people/summary",
+            authority.people_token.as_str(),
+            "null",
+        ),
+    ] {
+        let (status, payload) = home_test_get_json(&app, path, token, origin).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_recovery_readiness_projection(&payload, "unavailable", path);
+    }
+    assert_eq!(file_snapshot(dir.path()), before);
+
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/people/profile")
+                .header("x-elastos-home-token", authority.people_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"display_name":"Anders"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+    assert_eq!(file_snapshot(dir.path()), before);
+    assert!(
+        crate::collaboration_profile_authority::load_profile_authority(
+            dir.path(),
+            &authority.principal_id,
+            &crate::auth::principal_localhost_root(&authority.principal_id),
+        )
+        .unwrap()
+        .is_none()
+    );
 }
 
 #[tokio::test]
@@ -4609,28 +4950,34 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let home_cli_token = launch_token_from_route(payload["route"].as_str().unwrap()).unwrap();
 
-    let shell_summary = app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .uri("/api/apps/home/summary")
-                .header("x-elastos-home-token", home_cli_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(shell_summary.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(shell_summary.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let (status, payload) =
+        home_test_get_json(&app, "/api/apps/home/summary", &home_cli_token, "null").await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["authority"]["signed_in"], true);
     assert!(payload["targets"]
         .as_array()
         .unwrap()
         .iter()
         .any(|target| target["target"] == "regular-app"));
+
+    let (status, native_shell_summary) =
+        home_test_get_json_without_origin(&app, "/api/apps/home/summary", &home_cli_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(native_shell_summary["authority"]["signed_in"], true);
+    assert_eq!(
+        native_shell_summary["authority"]["principal_id"],
+        authority.principal_id
+    );
+
+    let (status, wrong_origin_shell_summary) = home_test_get_json(
+        &app,
+        "/api/apps/home/summary",
+        &home_cli_token,
+        "http://localhost:61180",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(wrong_origin_shell_summary["authority"]["signed_in"], false);
 
     let catalog = app
         .clone()
@@ -4702,6 +5049,10 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let regular_token = launch_token_from_route(payload["route"].as_str().unwrap()).unwrap();
+    let (status, native_regular_summary) =
+        home_test_get_json_without_origin(&app, "/api/apps/home/summary", &regular_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(native_regular_summary["authority"]["signed_in"], false);
     let catalog_rejected = app
         .clone()
         .oneshot(
@@ -6125,4 +6476,466 @@ fn test_chat_request_bodies_reject_hidden_identity_fields() {
         "size_bytes": 10,
         "ipfs_gateway": "https://example.invalid/ipfs"
     }));
+}
+
+#[tokio::test]
+async fn test_home_appearance_preferences_are_principal_scoped_and_exact_one_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
+    crate::auth::store_test_principal_root_protection(dir.path(), &guest.principal_id);
+
+    let (status, initial) = home_test_get_json(
+        &app,
+        "/api/apps/system/summary",
+        &admin.system_token,
+        "null",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        initial["appearance"]["schema"],
+        "elastos.home.appearance/v1"
+    );
+    assert_eq!(initial["appearance"]["revision"], 0);
+    assert_eq!(initial["appearance"]["theme"], "dark");
+    assert_eq!(initial["appearance"]["accent"], "blue");
+    assert_eq!(initial["appearance"]["accent_custom"], "#4f7fff");
+    assert_eq!(initial["appearance"]["dock_auto_hide"], false);
+    assert_eq!(initial["appearance"]["sounds"], false);
+    assert_eq!(initial["appearance"]["focus_mode"], false);
+
+    let (status, theme_updated) = home_test_post_json(
+        &app,
+        "/api/apps/system/appearance/preferences",
+        &admin.system_token,
+        "null",
+        json!({ "theme": "light" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(theme_updated["revision"], 1);
+    assert_eq!(theme_updated["theme"], "light");
+    assert_eq!(theme_updated["accent"], "blue");
+
+    let (status, custom_updated) = home_test_post_json(
+        &app,
+        "/api/apps/system/appearance/preferences",
+        &admin.system_token,
+        "null",
+        json!({ "accent_custom": "#ABCDEF" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(custom_updated["revision"], 2);
+    assert_eq!(custom_updated["accent_custom"], "#abcdef");
+    assert_eq!(custom_updated["accent"], "blue");
+
+    let (status, accent_updated) = home_test_post_json(
+        &app,
+        "/api/apps/system/appearance/preferences",
+        &admin.system_token,
+        "null",
+        json!({ "accent": "custom" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(accent_updated["revision"], 3);
+    assert_eq!(accent_updated["accent"], "custom");
+    assert_eq!(accent_updated["accent_custom"], "#abcdef");
+
+    let (status, dock_updated) = home_test_post_json(
+        &app,
+        "/api/apps/home/appearance/preferences",
+        &admin.home_token,
+        "http://localhost:61180",
+        json!({ "dock_auto_hide": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dock_updated["revision"], 4);
+    assert_eq!(dock_updated["dock_auto_hide"], true);
+    assert_eq!(dock_updated["theme"], "light");
+    assert_eq!(dock_updated["accent"], "custom");
+
+    let (status, sounds_updated) = home_test_post_json(
+        &app,
+        "/api/apps/home/appearance/preferences",
+        &admin.home_token,
+        "http://localhost:61180",
+        json!({ "sounds": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sounds_updated["revision"], 5);
+    assert_eq!(sounds_updated["sounds"], true);
+
+    let (status, focus_updated) = home_test_post_json(
+        &app,
+        "/api/apps/system/appearance/preferences",
+        &admin.system_token,
+        "null",
+        json!({ "focus_mode": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(focus_updated["revision"], 6);
+    assert_eq!(focus_updated["focus_mode"], true);
+    assert_eq!(focus_updated["theme"], "light");
+    assert_eq!(focus_updated["accent"], "custom");
+    assert_eq!(focus_updated["accent_custom"], "#abcdef");
+    assert_eq!(focus_updated["dock_auto_hide"], true);
+    assert_eq!(focus_updated["sounds"], true);
+
+    let (status, home_summary) = home_test_get_json(
+        &app,
+        "/api/apps/home/summary",
+        &admin.home_token,
+        "http://localhost:61180",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(home_summary["appearance"], focus_updated);
+
+    let (status, guest_summary) = home_test_get_json(
+        &app,
+        "/api/apps/system/summary",
+        &guest.system_token,
+        "null",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(guest_summary["appearance"]["revision"], 0);
+    assert_eq!(guest_summary["appearance"]["theme"], "dark");
+    assert_eq!(guest_summary["appearance"]["accent"], "blue");
+    assert_eq!(guest_summary["appearance"]["accent_custom"], "#4f7fff");
+    assert_eq!(guest_summary["appearance"]["dock_auto_hide"], false);
+    assert_eq!(guest_summary["appearance"]["sounds"], false);
+    assert_eq!(guest_summary["appearance"]["focus_mode"], false);
+
+    let (status, guest_updated) = home_test_post_json(
+        &app,
+        "/api/apps/system/appearance/preferences",
+        &guest.system_token,
+        "null",
+        json!({ "theme": "auto" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(guest_updated["revision"], 1);
+    assert_eq!(guest_updated["theme"], "auto");
+    assert_eq!(guest_updated["accent"], "blue");
+
+    let (status, admin_after_guest) = home_test_get_json(
+        &app,
+        "/api/apps/system/summary",
+        &admin.system_token,
+        "null",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(admin_after_guest["appearance"], focus_updated);
+
+    for payload in [
+        json!({}),
+        json!({ "theme": "dark", "sounds": false }),
+        json!({ "accent_custom": "blue" }),
+        json!({ "theme": "neon" }),
+        json!({ "accent": "teal" }),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/system/appearance/preferences")
+                    .header("x-elastos-home-token", &admin.system_token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let persisted_app = gateway_router(test_state(dir.path()));
+    let (status, reloaded_admin) = home_test_get_json(
+        &persisted_app,
+        "/api/apps/home/summary",
+        &admin.home_token,
+        "http://localhost:61180",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reloaded_admin["appearance"], focus_updated);
+
+    let (status, reloaded_guest) = home_test_get_json(
+        &persisted_app,
+        "/api/apps/system/summary",
+        &guest.system_token,
+        "null",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reloaded_guest["appearance"]["theme"], "auto");
+    assert_eq!(reloaded_guest["appearance"]["focus_mode"], false);
+}
+
+#[tokio::test]
+async fn test_home_appearance_preferences_fail_closed_and_signed_out_defaults_stay_fixed() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+
+    let unsigned = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .uri("/api/apps/home/summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unsigned.status(), StatusCode::OK);
+    let unsigned_body = axum::body::to_bytes(unsigned.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let unsigned_payload: serde_json::Value = serde_json::from_slice(&unsigned_body).unwrap();
+    assert_eq!(unsigned_payload["appearance"]["revision"], 0);
+    assert_eq!(unsigned_payload["appearance"]["theme"], "dark");
+    assert_eq!(unsigned_payload["appearance"]["accent"], "blue");
+    assert_eq!(unsigned_payload["appearance"]["accent_custom"], "#4f7fff");
+    assert_eq!(unsigned_payload["appearance"]["dock_auto_hide"], false);
+    assert_eq!(unsigned_payload["appearance"]["sounds"], false);
+    assert_eq!(unsigned_payload["appearance"]["focus_mode"], false);
+
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let object_uri = format!(
+        "{}/.AppData/ElastOS/Home/Appearance/preferences.json",
+        localhost_root
+    );
+    let path = rooted_localhost_fs_path(dir.path(), &object_uri).unwrap();
+    if let Some(parent) = path.parent() {
+        crate::auth::create_owner_only_dir_all(dir.path(), parent).unwrap();
+    }
+    crate::auth::write_principal_root_object(
+        dir.path(),
+        &authority.principal_id,
+        &localhost_root,
+        &object_uri,
+        &path,
+        b"not-json",
+    )
+    .unwrap();
+
+    let corrupt_summary = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/apps/system/summary")
+                .header("x-elastos-home-token", &authority.system_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(corrupt_summary.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let corrupt_write = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .method("POST")
+                .uri("/api/apps/home/appearance/preferences")
+                .header("x-elastos-home-token", &authority.home_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"theme":"light"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(corrupt_write.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    for invalid_preferences in [
+        json!({
+            "schema": "wrong.schema/v1",
+            "revision": 0,
+            "theme": "dark",
+            "accent": "blue",
+            "accent_custom": "#4f7fff",
+            "dock_auto_hide": false,
+            "sounds": false,
+            "focus_mode": false
+        }),
+        json!({
+            "schema": "elastos.home.appearance.preferences/v1",
+            "revision": 0,
+            "theme": "neon",
+            "accent": "blue",
+            "accent_custom": "#4f7fff",
+            "dock_auto_hide": false,
+            "sounds": false,
+            "focus_mode": false
+        }),
+        json!({
+            "schema": "elastos.home.appearance.preferences/v1",
+            "revision": 0,
+            "theme": "dark",
+            "accent": "teal",
+            "accent_custom": "#4f7fff",
+            "dock_auto_hide": false,
+            "sounds": false,
+            "focus_mode": false
+        }),
+        json!({
+            "schema": "elastos.home.appearance.preferences/v1",
+            "revision": 9_007_199_254_740_992u64,
+            "theme": "dark",
+            "accent": "blue",
+            "accent_custom": "#4f7fff",
+            "dock_auto_hide": false,
+            "sounds": false,
+            "focus_mode": false
+        }),
+        json!({
+            "schema": "elastos.home.appearance.preferences/v1",
+            "revision": 0,
+            "theme": "dark",
+            "accent": "blue",
+            "accent_custom": "#ABCDEF",
+            "dock_auto_hide": false,
+            "sounds": false,
+            "focus_mode": false
+        }),
+        json!({
+            "schema": "elastos.home.appearance.preferences/v1",
+            "revision": 0,
+            "theme": "dark",
+            "accent": "blue",
+            "accent_custom": " #abcdef ",
+            "dock_auto_hide": false,
+            "sounds": false,
+            "focus_mode": false
+        }),
+    ] {
+        crate::auth::write_principal_root_object(
+            dir.path(),
+            &authority.principal_id,
+            &localhost_root,
+            &object_uri,
+            &path,
+            invalid_preferences.to_string().as_bytes(),
+        )
+        .unwrap();
+
+        let stored_read = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .uri("/api/apps/system/summary")
+                    .header("x-elastos-home-token", &authority.system_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored_read.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let stored_write = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "http://localhost:61180")
+                    .method("POST")
+                    .uri("/api/apps/home/appearance/preferences")
+                    .header("x-elastos-home-token", &authority.home_token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"theme":"light"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored_write.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    crate::auth::write_principal_root_object(
+        dir.path(),
+        &authority.principal_id,
+        &localhost_root,
+        &object_uri,
+        &path,
+        json!({
+            "schema": "elastos.home.appearance.preferences/v1",
+            "revision": 9_007_199_254_740_991u64,
+            "theme": "dark",
+            "accent": "blue",
+            "accent_custom": "#4f7fff",
+            "dock_auto_hide": false,
+            "sounds": false,
+            "focus_mode": false
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+
+    let max_revision_write = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .method("POST")
+                .uri("/api/apps/home/appearance/preferences")
+                .header("x-elastos-home-token", &authority.home_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"theme":"light"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        max_revision_write.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+
+    let non_regular_read = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/apps/system/summary")
+                .header("x-elastos-home-token", &authority.system_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(non_regular_read.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let non_regular_write = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .method("POST")
+                .uri("/api/apps/home/appearance/preferences")
+                .header("x-elastos-home-token", &authority.home_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"theme":"light"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        non_regular_write.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
 }

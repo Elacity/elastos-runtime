@@ -8,6 +8,7 @@ use elastos_protected_content_provider_contracts::{
     DecryptProviderRequestV1, DecryptProviderResponseStatusV1, DecryptProviderResponseV1,
     ViewerMediaPartSelectorV1,
 };
+use protected_content_decrypt_provider::PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET;
 use serde_json::json;
 
 mod support;
@@ -129,9 +130,11 @@ fn wrap_runtime_request(request: &DecryptProviderRequestV1) -> serde_json::Value
         json!({
             "schema": "elastos.provider.invocation/v1",
             "source": "runtime",
-            "target": "decrypt",
+            "target": PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET,
             "op": op,
-            "capability": format!("provider:runtime->decrypt:{op}"),
+            "capability": format!(
+                "provider:runtime->{PROTECTED_CONTENT_DECRYPT_PROVIDER_TARGET}:{op}"
+            ),
             "transport": "runtime-local-provider-plane",
             "carrier": null,
             "transfer": "json",
@@ -282,7 +285,7 @@ fn process_prepare_open_read_close_replay_and_restart_absence_flow() {
                 .to_bytes(),
         )
         .unwrap(),
-        &envelope,
+        envelope.manifest().content_key_commitment(),
         &media_identity,
         &protected_init_segment,
         &contributions,

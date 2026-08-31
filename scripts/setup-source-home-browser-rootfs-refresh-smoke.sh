@@ -72,6 +72,7 @@ done
 functions_file="$tmp_dir/setup-source-home-functions.sh"
 awk '
   /^echo "\[setup-source-home\] repo:/ { exit }
+  /^SOURCE_HOME_BINARY_NAMES_JSON=/ { next }
   { print }
 ' "$repo_root/scripts/setup-source-home.sh" >"$functions_file"
 source "$functions_file"
@@ -116,6 +117,11 @@ default_guest_bridge="$(resolve_browser_vm_guest_helper_source \
   "linux-arm64")"
 [[ "$default_runtime_relay" == "$resolve_root/elastos/target/$rust_target/release/browser-vm-runtime-relay" ]]
 [[ "$default_guest_bridge" == "$resolve_root/elastos/target/$rust_target/release/browser-vm-guest-control-bridge" ]]
+
+workspace_manifest="$resolve_root/elastos/standalone-workspace/Cargo.toml"
+mkdir -p "$(dirname "$workspace_manifest")"
+printf '[workspace]\nmembers = []\n' >"$workspace_manifest"
+[[ "$(cargo_target_root_for_manifest "$workspace_manifest")" == "$resolve_root/elastos/standalone-workspace/target" ]]
 
 abs_target="$tmp_dir/absolute-target"
 mkdir -p "$abs_target/$rust_target/release"

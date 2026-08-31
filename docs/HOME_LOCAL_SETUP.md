@@ -61,8 +61,12 @@ See [COMMAND_MATRIX.md](COMMAND_MATRIX.md) for the full ownership rules.
 ## Preferred path: full source-home setup
 
 `scripts/setup-source-home.sh` is the canonical setup path for a source
-checkout. It builds the Runtime and providers, stages first-party capsules, and
-stamps the installed `components.json`.
+checkout. It builds the Runtime and providers, stages first-party capsules,
+stamps the installed `components.json`, installs the Runtime at
+`${DATA_DIR}/bin/elastos`, and writes the owner-only
+`${DATA_DIR}/receipts/source-home-installation.json` receipt. The receipt binds
+the current source identity to the Runtime, components, and source-home capsule
+metadata hashes.
 
 It does not complete readiness by itself. Current source says:
 
@@ -98,7 +102,9 @@ ELASTOS_COLLABORATION_STARTUP_MODE=isolated \
 scripts/setup-source-home.sh
 ```
 
-Then use the platform restart helper:
+Then use the platform restart helper. It validates the stable installation
+receipt and current clean source before it stops or migrates an existing
+Runtime:
 
 ```bash
 scripts/mac-source-home-restart.sh \
@@ -132,6 +138,10 @@ scripts/linux-source-home-restart.sh \
   --addr "$GATEWAY_ADDR"
 ```
 
+Linux writes its restart receipt to
+`${XDG_DATA_HOME}/elastos/receipts/linux-source-home-restart.json`. The command
+does not accept a separate receipt-output option.
+
 Then open:
 
 ```bash
@@ -140,9 +150,10 @@ xdg-open "$HOME_URL"
 
 ## Direct source launch
 
-If you need a direct source launch for diagnosis, use the built Runtime binary
-from this checkout with the same source-home environment. Keep the platform
-restart helpers above as the preferred readiness path.
+If you need a short direct source launch for diagnosis, use the built Runtime
+binary from this checkout with the same source-home environment. Long-lived
+source-home operation uses the stable installed Runtime through the platform
+restart helper.
 
 On macOS:
 

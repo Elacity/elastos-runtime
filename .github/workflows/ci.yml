@@ -1,27 +1,43 @@
 name: CI
 
 on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to check out and test"
+        required: false
+        default: ""
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  check:
-    name: Check + Clippy + Format
+  source-gate:
+    name: source-gate
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@1.91.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
+          prefix-key: ${{ runner.os }}-elastos
       - name: cargo fmt
         working-directory: elastos
         run: cargo fmt --all -- --check
@@ -43,15 +59,20 @@ jobs:
         working-directory: elastos
         run: cargo check --workspace
 
-  test:
-    name: Test
+  test-elastos:
+    name: test-elastos
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: source-gate
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
+          prefix-key: ${{ runner.os }}-elastos-test
       - name: build provider process binaries for tests
         run: |
           cargo build --release --manifest-path capsules/protected-content-protect-provider/Cargo.toml --target-dir capsules/protected-content-protect-provider/target
@@ -67,11 +88,180 @@ jobs:
         # Network-sensitive tests are #[ignore] and won't run.
         # Run them explicitly with: cargo test --workspace -- --ignored
 
+  test-capsules:
+    name: test-capsules
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: source-gate
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The capsule workspaces cannot be enumerated here; key the shared
+          # registry cache off the elastos workspace, whose dependency set
+          # overlaps the capsules almost entirely.
+          workspaces: elastos
+          prefix-key: ${{ runner.os }}-capsules
+      # The elastos workspace suite never builds or tests own-workspace
+      # capsules; this mirrors `just test-capsules`.
+      - name: test own-workspace capsules
+        run: |
+          set -euo pipefail
+          for lock in capsules/*/Cargo.lock; do
+              capsule="$(dirname "$lock")"
+              echo "== testing $capsule =="
+              (cd "$capsule" && cargo test --target-dir target)
+          done
+
+  source-home-linux:
+    name: source-home-linux (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    needs: [test-elastos, test-capsules]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: elastos
+          prefix-key: ${{ runner.os }}-${{ runner.arch }}-elastos
+      - name: require 10 percent free disk
+        run: |
+          set -euo pipefail
+          df -Pk .
+          df -Pk . | awk 'NR == 2 { if ($4 * 100 < $2 * 10) exit 1 }'
+      - name: install host prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y coturn e2fsprogs ffmpeg
+      - name: source-home into isolated HOME
+        env:
+          ELASTOS_COLLABORATION_STARTUP_MODE: isolated
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/source-home-logs"
+          USER_HOME="${HOME}"
+          SOURCE_HOME="${RUNNER_TEMP}/elastos-source-home"
+          mkdir -p "${SOURCE_HOME}"
+          export CARGO_HOME="${CARGO_HOME:-${USER_HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${USER_HOME}/.rustup}"
+          export HOME="${SOURCE_HOME}"
+          export XDG_DATA_HOME="${SOURCE_HOME}/.local/share"
+          export PATH="${CARGO_HOME}/bin:${PATH}"
+          scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
+          ELASTOS_DATA_DIR="${XDG_DATA_HOME}/elastos" \
+            scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
+      - name: local-carrier setup smoke
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/source-home-logs"
+          scripts/local-carrier-setup-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/local-carrier-setup-smoke.log"
+      - name: upload source-home logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: source-home-linux-${{ matrix.os }}-logs
+          path: ${{ runner.temp }}/source-home-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  source-home-macos:
+    name: source-home-macos
+    runs-on: macos-14
+    timeout-minutes: 90
+    needs: [test-elastos, test-capsules]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: elastos
+          prefix-key: ${{ runner.os }}-elastos
+      # dist.ipfs.tech is intermittently slow or unreachable from GitHub's
+      # macOS runners, and setup's downloader makes a single 600s attempt.
+      # Cache the verified release tarball and pre-seed bin/kubo so setup
+      # skips the download entirely (ELACITY-2308).
+      - name: cache kubo release
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/kubo-cache
+          key: kubo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('components.json') }}
+      - name: seed kubo into the test HOME
+        run: |
+          set -euo pipefail
+          scripts/seed-kubo-cache.sh \
+            "${RUNNER_TEMP}/kubo-cache" \
+            "${RUNNER_TEMP}/elastos-mac-test-home/Library/Application Support/elastos" \
+            darwin-arm64
+      - name: require 10 percent free disk
+        run: |
+          set -euo pipefail
+          df -Pk .
+          df -Pk . | awk 'NR == 2 { if ($4 * 100 < $2 * 10) exit 1 }'
+      - name: install host prerequisites
+        run: |
+          brew install e2fsprogs coturn ffmpeg
+          # setup-source-home's media prerequisite imports ffmpeg/ffprobe and
+          # fail-closed rejects any group-writable ancestor of the resolved
+          # binaries (Homebrew's Cellar defaults to 775). Tighten the
+          # user-owned ancestors so the import chain passes admission.
+          for tool in ffmpeg ffprobe; do
+            p="$(python3 -c "import os,shutil;print(os.path.realpath(shutil.which('$tool')))")"
+            while [ "$p" != "/" ]; do
+              p="$(dirname "$p")"
+              { [ -O "$p" ] && chmod g-w "$p"; } || true
+            done
+          done
+      - name: source-home into isolated MAC_TEST_HOME
+        env:
+          ELASTOS_COLLABORATION_STARTUP_MODE: isolated
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/source-home-logs"
+          USER_HOME="${HOME}"
+          MAC_TEST_HOME="${RUNNER_TEMP}/elastos-mac-test-home"
+          mkdir -p "${MAC_TEST_HOME}"
+          export CARGO_HOME="${CARGO_HOME:-${USER_HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${USER_HOME}/.rustup}"
+          export HOME="${MAC_TEST_HOME}"
+          export PATH="${CARGO_HOME}/bin:/opt/homebrew/bin:/opt/homebrew/opt/e2fsprogs/sbin:${PATH}"
+          scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
+          ELASTOS_DATA_DIR="${HOME}/Library/Application Support/elastos" \
+            scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
+      - name: upload source-home logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: source-home-macos-logs
+          path: ${{ runner.temp }}/source-home-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
   build-release:
     name: Build Release (x86_64)
     runs-on: ubuntu-latest
+    needs: [source-home-linux, source-home-macos]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
         with:

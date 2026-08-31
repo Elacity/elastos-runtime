@@ -1,39 +1,18 @@
 # People, Contacts, and Conversations
 
-This document describes the implemented collaboration candidate and the later
-work that is intentionally outside it.
+People, Chat and Inbox present typed Runtime resources. Runtime owns the
+principal-scoped signed Profile, contacts, conversations, collaboration workers,
+routing, lifecycle and audit. The apps receive product facts and opaque
+selectors rather than Carrier peers, routes or provider topology.
 
-Current branch state:
+A configured shared conversation is a bounded group, not a global room or a
+template for every group. A signed network profile selects the network;
+missing configuration selects isolation. The seed and profile signer own
+bootstrap configuration, while Profile and Runtime checks own person, contact
+and message authority.
 
-- Runtime owns the principal-scoped signed Profile, contact store, conversation
-  state, collaboration workers, routing, lifecycle, and audit;
-- signed discovery, Inbox-owned contact approval, direct Chat, Profile updates,
-  bilateral contact removal, re-add, shared-room Profile attribution, restart
-  continuity, and recovery are implemented;
-- People, Chat, and Inbox use typed Runtime resources and do not select Carrier
-  peers, routes, tickets, ports, or provider topology;
-- the configured shared conversation is the first group implementation. It is
-  not a global room or a template for every future group.
-
-Current acceptance gap:
-
-- the exact candidate is installed on localhost, but the normal localhost
-  one-Runtime product acceptance is not complete;
-- the public seed still needs the same exact candidate before the real
-  two-Runtime product journey can run;
-- an explicit alternate signed network profile selects a separate network, and
-  missing configuration selects isolation;
-- the seed/profile signer is bootstrap/config authority only, never
-  person/contact/message authority.
-
-Later work outside this candidate:
-
-- wider discovery rendezvous and abuse controls;
-- encrypted mailbox delivery for people who remain offline;
-- user-created groups with signed membership and durable catch-up;
-- multi-device pairing, silent block, and direct-message attachments;
-- isolation of the old Services remote-Exit social/contact path from People
-  identity and contact authority.
+Current implementation and installed acceptance are recorded in
+[state.md](../state.md). Open collaboration work belongs in [TASKS.md](../TASKS.md).
 
 ## Goal
 
@@ -229,9 +208,8 @@ Keep Chat familiar:
 - main pane: messages and attachments
 - right/details pane: participants, shared objects, conversation settings
 
-For the current branch, this can be visually simulated with the current
-single-room UI: rename the current room to a conversation, make participants
-readable, and keep advanced room controls out of the normal send/read path.
+Use conversation names and readable participants. Keep advanced room controls
+outside the normal send/read path.
 
 ### Mobile / Small Screen
 
@@ -294,8 +272,8 @@ invite. The receiver introduces its profile/device proof during accept.
 
 ## Implementation Slices
 
-The six source slices below are implemented on the unpublished collaboration
-branch. The normal localhost and public seed installation checks remain release
+The six source slices below define the implementation boundaries.
+The normal localhost and public seed installation checks remain release
 gates, not source behavior.
 
 ### Slice 1 - Copy and Mental Model Cleanup

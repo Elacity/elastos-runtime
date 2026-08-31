@@ -30,8 +30,13 @@ use thiserror::Error;
 
 const STORE_MAGIC: &[u8; 8] = b"epc-mj05";
 const STORE_DIGEST_DOMAIN: &[u8] = b"elastos/protected-content/runtime-mint-journal/v5";
-const INTENT_MAGIC: &[u8; 8] = b"epc-mi01";
-const INTENT_DIGEST_DOMAIN: &[u8] = b"elastos/protected-content/runtime-mint-intent/v1";
+const INTENT_MAGIC: &[u8; 8] = b"epc-mi02";
+const INTENT_DIGEST_DOMAIN: &[u8] = b"elastos/protected-content/runtime-mint-intent/v2";
+const MEDIA_PREPARATION_MAGIC: &[u8; 8] = b"epc-mp02";
+const MEDIA_PREPARATION_DIGEST_DOMAIN: &[u8] =
+    b"elastos/protected-content/runtime-media-preparation/v2";
+const MEDIA_PREPARATION_OPERATION_ID_DOMAIN: &[u8] =
+    b"elastos.protected-content.runtime-media-preparation-operation-id/v1";
 const STORE_LOCK_FILE: &str = "runtime-mint-journal.lock";
 const MINT_ID_DOMAIN: &[u8] = b"elastos.protected-content.runtime-mint-id/v4";
 const MINT_INTENT_REQUEST_ID_DOMAIN: &[u8] =
@@ -39,6 +44,9 @@ const MINT_INTENT_REQUEST_ID_DOMAIN: &[u8] =
 const MINT_INTENT_SOURCE_BINDING_DOMAIN: &[u8] =
     b"elastos.protected-content.runtime-mint-intent-source-binding/v1";
 const MAX_STORE_FILE_BYTES: usize = 64 * 1024;
+// Adoption lookups scan the store directory; refuse stores grown beyond any
+// plausible single-owner journal instead of walking them unbounded.
+const MAX_RECORD_SCAN_ENTRIES: usize = 65_536;
 const REQUIRED_NODES: usize = 3;
 const MAX_AVAILABILITY_TEXT_BYTES: usize = 256;
 
@@ -370,6 +378,9 @@ pub struct RuntimeMintIntent {
     request_id: Digest32,
     principal_id: String,
     source_binding_digest: Digest32,
+    creator_wallet_account_id: String,
+    creator_wallet_address: String,
+    creator_mint_source_digest: Digest32,
     mime_type: String,
     codecs: String,
     clear_init_sha256: Digest32,
@@ -380,6 +391,189 @@ pub struct RuntimeMintIntent {
     custody_epoch: CustodyEpochIdentityV1,
     custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
     nodes: Vec<RuntimeMintNodeBinding>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeMediaPreparationState {
+    Ready,
+    EffectPending,
+    Prepared,
+    Failed,
+    Consumed,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeMediaPreparationRecord {
+    request_id: Digest32,
+    source_binding_digest: Digest32,
+    source_object_digest: Digest32,
+    operation_id: Digest32,
+    provider_id: String,
+    creator_wallet_account_id: String,
+    creator_wallet_address: String,
+    creator_mint_source_digest: Digest32,
+    state: RuntimeMediaPreparationState,
+    output_receipt_digest: Option<Digest32>,
+    consumed_mint_id: Option<Digest32>,
+}
+
+impl fmt::Debug for RuntimeMediaPreparationRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeMediaPreparationRecord")
+            .field("request_id", &self.request_id)
+            .field("source_binding_digest", &self.source_binding_digest)
+            .field("source_object_digest", &self.source_object_digest)
+            .field("operation_id", &self.operation_id)
+            .field("provider_id", &self.provider_id)
+            .field("creator_wallet_account_id", &"[redacted]")
+            .field("creator_wallet_address", &"[redacted]")
+            .field(
+                "creator_mint_source_digest",
+                &self.creator_mint_source_digest,
+            )
+            .field("state", &self.state)
+            .field("output_receipt_digest", &self.output_receipt_digest)
+            .field("consumed_mint_id", &self.consumed_mint_id)
+            .finish()
+    }
+}
+
+impl RuntimeMediaPreparationRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        principal_id: &str,
+        object_uri: &str,
+        source_storage: &str,
+        source_object_digest: Digest32,
+        provider_id: impl Into<String>,
+        creator_wallet_account_id: impl Into<String>,
+        creator_wallet_address: impl Into<String>,
+        creator_mint_source_digest: Digest32,
+    ) -> Result<Self, RuntimeMintJournalError> {
+        validate_intent_text(principal_id)?;
+        let provider_id = provider_id.into();
+        let creator_wallet_account_id = creator_wallet_account_id.into();
+        let creator_wallet_address = creator_wallet_address.into();
+        validate_intent_text(&provider_id)?;
+        validate_intent_text(&creator_wallet_account_id)?;
+        validate_intent_evm_address(&creator_wallet_address)?;
+        if source_object_digest == Digest32::new([0; 32])
+            || creator_mint_source_digest == Digest32::new([0; 32])
+        {
+            return Err(RuntimeMintJournalError::InvalidSelection);
+        }
+        let source_binding_digest = compute_source_binding_digest(object_uri, source_storage);
+        let request_id = compute_mint_intent_request_id(principal_id, source_binding_digest);
+        let operation_id =
+            compute_media_preparation_operation_id(request_id, source_object_digest, &provider_id);
+        let value = Self {
+            request_id,
+            source_binding_digest,
+            source_object_digest,
+            operation_id,
+            provider_id,
+            creator_wallet_account_id,
+            creator_wallet_address,
+            creator_mint_source_digest,
+            state: RuntimeMediaPreparationState::Ready,
+            output_receipt_digest: None,
+            consumed_mint_id: None,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), RuntimeMintJournalError> {
+        validate_intent_text(&self.provider_id)?;
+        validate_intent_text(&self.creator_wallet_account_id)?;
+        validate_intent_evm_address(&self.creator_wallet_address)?;
+        if self.request_id == Digest32::new([0; 32])
+            || self.source_binding_digest == Digest32::new([0; 32])
+            || self.source_object_digest == Digest32::new([0; 32])
+            || self.operation_id == Digest32::new([0; 32])
+            || self.creator_mint_source_digest == Digest32::new([0; 32])
+            || self.operation_id
+                != compute_media_preparation_operation_id(
+                    self.request_id,
+                    self.source_object_digest,
+                    &self.provider_id,
+                )
+        {
+            return Err(RuntimeMintJournalError::InvalidSelection);
+        }
+        match self.state {
+            RuntimeMediaPreparationState::Ready
+            | RuntimeMediaPreparationState::EffectPending
+            | RuntimeMediaPreparationState::Failed
+                if self.output_receipt_digest.is_some() || self.consumed_mint_id.is_some() =>
+            {
+                Err(RuntimeMintJournalError::InvalidSelection)
+            }
+            RuntimeMediaPreparationState::Prepared
+                if self.output_receipt_digest.is_none() || self.consumed_mint_id.is_some() =>
+            {
+                Err(RuntimeMintJournalError::InvalidSelection)
+            }
+            RuntimeMediaPreparationState::Consumed
+                if self.output_receipt_digest.is_none() || self.consumed_mint_id.is_none() =>
+            {
+                Err(RuntimeMintJournalError::InvalidSelection)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub const fn request_id(&self) -> Digest32 {
+        self.request_id
+    }
+
+    pub const fn source_object_digest(&self) -> Digest32 {
+        self.source_object_digest
+    }
+
+    pub const fn operation_id(&self) -> Digest32 {
+        self.operation_id
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub fn creator_wallet_account_id(&self) -> &str {
+        &self.creator_wallet_account_id
+    }
+
+    pub fn creator_wallet_address(&self) -> &str {
+        &self.creator_wallet_address
+    }
+
+    pub const fn creator_mint_source_digest(&self) -> Digest32 {
+        self.creator_mint_source_digest
+    }
+
+    pub const fn state(&self) -> RuntimeMediaPreparationState {
+        self.state
+    }
+
+    pub const fn output_receipt_digest(&self) -> Option<Digest32> {
+        self.output_receipt_digest
+    }
+
+    pub const fn consumed_mint_id(&self) -> Option<Digest32> {
+        self.consumed_mint_id
+    }
+
+    pub fn same_authority_as(&self, other: &Self) -> bool {
+        self.request_id == other.request_id
+            && self.source_binding_digest == other.source_binding_digest
+            && self.source_object_digest == other.source_object_digest
+            && self.operation_id == other.operation_id
+            && self.provider_id == other.provider_id
+            && self.creator_wallet_account_id == other.creator_wallet_account_id
+            && self.creator_wallet_address == other.creator_wallet_address
+            && self.creator_mint_source_digest == other.creator_mint_source_digest
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -406,6 +600,12 @@ impl fmt::Debug for RuntimeMintIntent {
             .field("request_id", &self.request_id)
             .field("principal_id", &"[redacted]")
             .field("source_binding_digest", &self.source_binding_digest)
+            .field("creator_wallet_account_id", &"[redacted]")
+            .field("creator_wallet_address", &"[redacted]")
+            .field(
+                "creator_mint_source_digest",
+                &self.creator_mint_source_digest,
+            )
             .field("mime_type", &self.mime_type)
             .field("codecs", &self.codecs)
             .field("clear_init_sha256", &self.clear_init_sha256)
@@ -449,6 +649,9 @@ impl RuntimeMintIntent {
         principal_id: impl Into<String>,
         object_uri: &str,
         source_storage: &str,
+        creator_wallet_account_id: impl Into<String>,
+        creator_wallet_address: impl Into<String>,
+        creator_mint_source_digest: Digest32,
         mime_type: impl Into<String>,
         codecs: impl Into<String>,
         clear_init_segment: &[u8],
@@ -460,9 +663,13 @@ impl RuntimeMintIntent {
         nodes: Vec<RuntimeMintNodeBinding>,
     ) -> Result<Self, RuntimeMintJournalError> {
         let principal_id = principal_id.into();
+        let creator_wallet_account_id = creator_wallet_account_id.into();
+        let creator_wallet_address = creator_wallet_address.into();
         let mime_type = mime_type.into();
         let codecs = codecs.into();
         validate_intent_text(&principal_id)?;
+        validate_intent_text(&creator_wallet_account_id)?;
+        validate_intent_evm_address(&creator_wallet_address)?;
         validate_intent_text(&mime_type)?;
         validate_intent_text(&codecs)?;
         let source_binding_digest = compute_source_binding_digest(object_uri, source_storage);
@@ -476,6 +683,9 @@ impl RuntimeMintIntent {
             request_id,
             principal_id,
             source_binding_digest,
+            creator_wallet_account_id,
+            creator_wallet_address,
+            creator_mint_source_digest,
             mime_type,
             codecs,
             clear_init_sha256,
@@ -493,10 +703,13 @@ impl RuntimeMintIntent {
 
     fn validate(&self) -> Result<(), RuntimeMintJournalError> {
         validate_intent_text(&self.principal_id)?;
+        validate_intent_text(&self.creator_wallet_account_id)?;
+        validate_intent_evm_address(&self.creator_wallet_address)?;
         validate_intent_text(&self.mime_type)?;
         validate_intent_text(&self.codecs)?;
         if self.request_id == Digest32::new([0; 32])
             || self.source_binding_digest == Digest32::new([0; 32])
+            || self.creator_mint_source_digest == Digest32::new([0; 32])
             || self.clear_init_sha256 == Digest32::new([0; 32])
             || self.clear_segment_sha256.is_empty()
             || self.nodes.len() != REQUIRED_NODES
@@ -559,10 +772,25 @@ impl RuntimeMintIntent {
         self.source_binding_digest
     }
 
+    pub fn creator_wallet_account_id(&self) -> &str {
+        &self.creator_wallet_account_id
+    }
+
+    pub fn creator_wallet_address(&self) -> &str {
+        &self.creator_wallet_address
+    }
+
+    pub const fn creator_mint_source_digest(&self) -> Digest32 {
+        self.creator_mint_source_digest
+    }
+
     pub fn same_authority_as(&self, other: &Self) -> bool {
         self.request_id == other.request_id
             && self.principal_id == other.principal_id
             && self.source_binding_digest == other.source_binding_digest
+            && self.creator_wallet_account_id == other.creator_wallet_account_id
+            && self.creator_wallet_address == other.creator_wallet_address
+            && self.creator_mint_source_digest == other.creator_mint_source_digest
             && self.mime_type == other.mime_type
             && self.codecs == other.codecs
             && self.clear_init_sha256 == other.clear_init_sha256
@@ -610,6 +838,15 @@ impl RuntimeMintIntent {
         matches!(
             self.protect_state,
             RuntimeMintIntentProtectState::SettledBeforeDraft(_)
+        )
+    }
+
+    pub const fn protect_settled_closed_before_draft(&self) -> bool {
+        matches!(
+            self.protect_state,
+            RuntimeMintIntentProtectState::SettledBeforeDraft(
+                RuntimeMintIntentProtectSettlement::Closed
+            )
         )
     }
 
@@ -1085,10 +1322,12 @@ pub struct RuntimeMintCreatorTerminalEvidence {
     ledger: String,
     token_id: String,
     operative: String,
+    quantity: String,
     price: String,
     pay_token: String,
     payment_processor: Option<String>,
     transaction_hash: String,
+    published_at: u64,
 }
 
 impl RuntimeMintCreatorTerminalEvidence {
@@ -1102,10 +1341,12 @@ impl RuntimeMintCreatorTerminalEvidence {
         ledger: impl Into<String>,
         token_id: impl Into<String>,
         operative: impl Into<String>,
+        quantity: impl Into<String>,
         price: impl Into<String>,
         pay_token: impl Into<String>,
         payment_processor: Option<String>,
         transaction_hash: impl Into<String>,
+        published_at: u64,
     ) -> Result<Self, RuntimeMintJournalError> {
         let value = Self {
             metadata_cid: metadata_cid.into(),
@@ -1116,10 +1357,12 @@ impl RuntimeMintCreatorTerminalEvidence {
             ledger: ledger.into(),
             token_id: token_id.into(),
             operative: operative.into(),
+            quantity: quantity.into(),
             price: price.into(),
             pay_token: pay_token.into(),
             payment_processor,
             transaction_hash: transaction_hash.into(),
+            published_at,
         };
         value.validate()?;
         Ok(value)
@@ -1134,11 +1377,15 @@ impl RuntimeMintCreatorTerminalEvidence {
         validate_intent_text(&self.ledger)?;
         validate_intent_text(&self.token_id)?;
         validate_intent_text(&self.operative)?;
+        validate_canonical_intent_hex_quantity(&self.quantity)?;
         validate_intent_text(&self.price)?;
         validate_intent_text(&self.pay_token)?;
         validate_intent_text(&self.transaction_hash)?;
         if let Some(payment_processor) = &self.payment_processor {
             validate_intent_text(payment_processor)?;
+        }
+        if self.published_at == 0 {
+            return Err(RuntimeMintJournalError::InvalidSelection);
         }
         Ok(())
     }
@@ -1175,6 +1422,10 @@ impl RuntimeMintCreatorTerminalEvidence {
         &self.operative
     }
 
+    pub fn quantity(&self) -> &str {
+        &self.quantity
+    }
+
     pub fn price(&self) -> &str {
         &self.price
     }
@@ -1189,6 +1440,10 @@ impl RuntimeMintCreatorTerminalEvidence {
 
     pub fn transaction_hash(&self) -> &str {
         &self.transaction_hash
+    }
+
+    pub const fn published_at(&self) -> u64 {
+        self.published_at
     }
 }
 
@@ -1425,6 +1680,157 @@ impl RuntimeMintJournal {
         let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
         self.ensure_root_dir()?;
         self.read_intent(request_id)
+    }
+
+    /// Locate the persisted mint record that belongs to `request_id`'s intent
+    /// through their shared content-access identity and custody selection.
+    ///
+    /// The intent never records a mint id before completion (the mint id is
+    /// content-derived and only exists once a draft is bound), so a crash
+    /// between draft persistence and `mark_intent_completed` leaves a finished
+    /// record the intent cannot name. This scan re-establishes that link.
+    /// Ambiguity and unreadable records fail closed.
+    pub fn find_mint_record_for_intent(
+        &self,
+        request_id: Digest32,
+    ) -> Result<Option<PersistedRuntimeMint>, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let intent = self.read_intent(request_id)?;
+        let entries =
+            fs::read_dir(&self.root_dir).map_err(|_| RuntimeMintJournalError::Unavailable)?;
+        let mut matched: Option<PersistedRuntimeMint> = None;
+        let mut scanned = 0usize;
+        for entry in entries {
+            let entry = entry.map_err(|_| RuntimeMintJournalError::Unavailable)?;
+            let Some(mint_id) = mint_id_from_record_file_name(&entry.file_name()) else {
+                continue;
+            };
+            scanned += 1;
+            if scanned > MAX_RECORD_SCAN_ENTRIES {
+                return Err(RuntimeMintJournalError::Unavailable);
+            }
+            let record = self.read_record(mint_id)?;
+            if !record_matches_intent(&record, &intent) {
+                continue;
+            }
+            if matched.is_some() {
+                return Err(RuntimeMintJournalError::Conflict);
+            }
+            matched = Some(record);
+        }
+        Ok(matched)
+    }
+
+    pub fn persist_media_preparation(
+        &self,
+        preparation: &RuntimeMediaPreparationRecord,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        self.write_or_replay_media_preparation(preparation)
+    }
+
+    pub fn load_media_preparation(
+        &self,
+        request_id: Digest32,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        self.read_media_preparation(request_id)
+    }
+
+    pub fn mark_media_preparation_effect_started(
+        &self,
+        request_id: Digest32,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut preparation = self.read_media_preparation(request_id)?;
+        match preparation.state {
+            RuntimeMediaPreparationState::Ready => {
+                preparation.state = RuntimeMediaPreparationState::EffectPending;
+                self.write_replace_media_preparation(&preparation)?;
+                Ok(preparation)
+            }
+            _ => Err(RuntimeMintJournalError::Conflict),
+        }
+    }
+
+    pub fn mark_media_preparation_prepared(
+        &self,
+        request_id: Digest32,
+        output_receipt_digest: Digest32,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        if output_receipt_digest == Digest32::new([0; 32]) {
+            return Err(RuntimeMintJournalError::InvalidSelection);
+        }
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut preparation = self.read_media_preparation(request_id)?;
+        match preparation.state {
+            RuntimeMediaPreparationState::EffectPending => {
+                preparation.state = RuntimeMediaPreparationState::Prepared;
+                preparation.output_receipt_digest = Some(output_receipt_digest);
+                self.write_replace_media_preparation(&preparation)?;
+                Ok(preparation)
+            }
+            RuntimeMediaPreparationState::Prepared
+                if preparation.output_receipt_digest == Some(output_receipt_digest) =>
+            {
+                Ok(preparation)
+            }
+            _ => Err(RuntimeMintJournalError::Conflict),
+        }
+    }
+
+    pub fn mark_media_preparation_failed(
+        &self,
+        request_id: Digest32,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut preparation = self.read_media_preparation(request_id)?;
+        match preparation.state {
+            RuntimeMediaPreparationState::EffectPending => {
+                preparation.state = RuntimeMediaPreparationState::Failed;
+                self.write_replace_media_preparation(&preparation)?;
+                Ok(preparation)
+            }
+            RuntimeMediaPreparationState::Failed => Ok(preparation),
+            _ => Err(RuntimeMintJournalError::Conflict),
+        }
+    }
+
+    pub fn mark_media_preparation_consumed(
+        &self,
+        request_id: Digest32,
+        output_receipt_digest: Digest32,
+        mint_id: Digest32,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        if output_receipt_digest == Digest32::new([0; 32]) || mint_id == Digest32::new([0; 32]) {
+            return Err(RuntimeMintJournalError::InvalidSelection);
+        }
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut preparation = self.read_media_preparation(request_id)?;
+        match preparation.state {
+            RuntimeMediaPreparationState::Prepared
+                if preparation.output_receipt_digest == Some(output_receipt_digest) =>
+            {
+                preparation.state = RuntimeMediaPreparationState::Consumed;
+                preparation.consumed_mint_id = Some(mint_id);
+                self.write_replace_media_preparation(&preparation)?;
+                Ok(preparation)
+            }
+            RuntimeMediaPreparationState::Consumed
+                if preparation.output_receipt_digest == Some(output_receipt_digest)
+                    && preparation.consumed_mint_id == Some(mint_id) =>
+            {
+                Ok(preparation)
+            }
+            _ => Err(RuntimeMintJournalError::Conflict),
+        }
     }
 
     pub fn mark_intent_protect_effect_started(
@@ -1775,6 +2181,18 @@ impl RuntimeMintJournal {
             .join(format!("intent-{}.tmp", hex::encode(request_id.as_bytes())))
     }
 
+    fn media_preparation_path(&self, request_id: Digest32) -> PathBuf {
+        self.root_dir
+            .join(format!("prepare-{}", hex::encode(request_id.as_bytes())))
+    }
+
+    fn media_preparation_temp_path(&self, request_id: Digest32) -> PathBuf {
+        self.root_dir.join(format!(
+            "prepare-{}.tmp",
+            hex::encode(request_id.as_bytes())
+        ))
+    }
+
     fn write_or_replay(
         &self,
         record: &PersistedRuntimeMint,
@@ -1842,6 +2260,45 @@ impl RuntimeMintJournal {
         sync_directory(&self.root_dir)
     }
 
+    fn write_or_replay_media_preparation(
+        &self,
+        preparation: &RuntimeMediaPreparationRecord,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        let path = self.media_preparation_path(preparation.request_id);
+        if path.exists() {
+            let existing = self.read_media_preparation(preparation.request_id)?;
+            if existing != *preparation {
+                return Err(RuntimeMintJournalError::Conflict);
+            }
+            return Ok(existing);
+        }
+        self.write_replace_media_preparation(preparation)?;
+        Ok(preparation.clone())
+    }
+
+    fn write_replace_media_preparation(
+        &self,
+        preparation: &RuntimeMediaPreparationRecord,
+    ) -> Result<(), RuntimeMintJournalError> {
+        preparation.validate()?;
+        let bytes = encode_media_preparation(preparation)?;
+        let temp_path = self.media_preparation_temp_path(preparation.request_id);
+        let _ = fs::remove_file(&temp_path);
+        let mut temp_file = open_owner_only_temp_file_for_write(&temp_path)?;
+        temp_file
+            .write_all(&bytes)
+            .map_err(|_| RuntimeMintJournalError::Unavailable)?;
+        temp_file
+            .sync_all()
+            .map_err(|_| RuntimeMintJournalError::Unavailable)?;
+        fs::rename(
+            &temp_path,
+            self.media_preparation_path(preparation.request_id),
+        )
+        .map_err(|_| RuntimeMintJournalError::Unavailable)?;
+        sync_directory(&self.root_dir)
+    }
+
     fn read_record(
         &self,
         mint_id: Digest32,
@@ -1890,6 +2347,31 @@ impl RuntimeMintJournal {
             return Err(RuntimeMintJournalError::Corrupt);
         }
         Ok(intent)
+    }
+
+    fn read_media_preparation(
+        &self,
+        request_id: Digest32,
+    ) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+        let path = self.media_preparation_path(request_id);
+        let mut file = open_owner_only_file_for_read(&path).map_err(|error| {
+            if !path.exists() {
+                RuntimeMintJournalError::NotFound
+            } else {
+                error
+            }
+        })?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|_| RuntimeMintJournalError::Unavailable)?;
+        if bytes.len() > MAX_STORE_FILE_BYTES {
+            return Err(RuntimeMintJournalError::Corrupt);
+        }
+        let preparation = decode_media_preparation(&bytes)?;
+        if preparation.request_id != request_id {
+            return Err(RuntimeMintJournalError::Corrupt);
+        }
+        Ok(preparation)
     }
 }
 
@@ -1991,6 +2473,30 @@ fn encode_record(record: &PersistedRuntimeMint) -> Result<Vec<u8>, RuntimeMintJo
     out.extend_from_slice(&digest);
     out.extend_from_slice(&payload);
     Ok(out)
+}
+
+fn mint_id_from_record_file_name(name: &std::ffi::OsStr) -> Option<Digest32> {
+    // Record files are exactly the canonical lowercase hex of the mint id;
+    // intent-/prepare-/tmp/lock files never match this shape.
+    let name = name.to_str()?;
+    if name.len() != 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let bytes: [u8; 32] = hex::decode(name).ok()?.try_into().ok()?;
+    Some(Digest32::new(bytes))
+}
+
+fn record_matches_intent(record: &PersistedRuntimeMint, intent: &RuntimeMintIntent) -> bool {
+    let draft = &record.draft;
+    draft.content_access_id == intent.content_access_id
+        && draft.nodes == intent.nodes
+        && draft.pool() == intent.custody_pool
+        && draft.epoch() == intent.custody_epoch
+        && draft.committee() == intent.custody_committee_authorization
 }
 
 fn decode_record(bytes: &[u8]) -> Result<PersistedRuntimeMint, RuntimeMintJournalError> {
@@ -2145,6 +2651,9 @@ fn encode_intent(intent: &RuntimeMintIntent) -> Result<Vec<u8>, RuntimeMintJourn
     push_digest(&mut payload, intent.request_id);
     push_availability_text(&mut payload, &intent.principal_id)?;
     push_digest(&mut payload, intent.source_binding_digest);
+    push_availability_text(&mut payload, &intent.creator_wallet_account_id)?;
+    push_availability_text(&mut payload, &intent.creator_wallet_address)?;
+    push_digest(&mut payload, intent.creator_mint_source_digest);
     push_availability_text(&mut payload, &intent.mime_type)?;
     push_availability_text(&mut payload, &intent.codecs)?;
     push_digest(&mut payload, intent.clear_init_sha256);
@@ -2242,6 +2751,9 @@ fn decode_intent(bytes: &[u8]) -> Result<RuntimeMintIntent, RuntimeMintJournalEr
     let request_id = read_digest(payload, &mut off)?;
     let principal_id = read_availability_text(payload, &mut off)?;
     let source_binding_digest = read_digest(payload, &mut off)?;
+    let creator_wallet_account_id = read_availability_text(payload, &mut off)?;
+    let creator_wallet_address = read_availability_text(payload, &mut off)?;
+    let creator_mint_source_digest = read_digest(payload, &mut off)?;
     let mime_type = read_availability_text(payload, &mut off)?;
     let codecs = read_availability_text(payload, &mut off)?;
     let clear_init_sha256 = read_digest(payload, &mut off)?;
@@ -2301,6 +2813,9 @@ fn decode_intent(bytes: &[u8]) -> Result<RuntimeMintIntent, RuntimeMintJournalEr
         request_id,
         principal_id,
         source_binding_digest,
+        creator_wallet_account_id,
+        creator_wallet_address,
+        creator_mint_source_digest,
         mime_type,
         codecs,
         clear_init_sha256,
@@ -2314,6 +2829,108 @@ fn decode_intent(bytes: &[u8]) -> Result<RuntimeMintIntent, RuntimeMintJournalEr
     };
     intent.validate()?;
     Ok(intent)
+}
+
+fn encode_media_preparation(
+    preparation: &RuntimeMediaPreparationRecord,
+) -> Result<Vec<u8>, RuntimeMintJournalError> {
+    preparation.validate()?;
+    let mut payload = Vec::new();
+    push_digest(&mut payload, preparation.request_id);
+    push_digest(&mut payload, preparation.source_binding_digest);
+    push_digest(&mut payload, preparation.source_object_digest);
+    push_digest(&mut payload, preparation.operation_id);
+    push_availability_text(&mut payload, &preparation.provider_id)?;
+    push_availability_text(&mut payload, &preparation.creator_wallet_account_id)?;
+    push_availability_text(&mut payload, &preparation.creator_wallet_address)?;
+    push_digest(&mut payload, preparation.creator_mint_source_digest);
+    payload.push(match preparation.state {
+        RuntimeMediaPreparationState::Ready => 0,
+        RuntimeMediaPreparationState::EffectPending => 1,
+        RuntimeMediaPreparationState::Prepared => 2,
+        RuntimeMediaPreparationState::Failed => 3,
+        RuntimeMediaPreparationState::Consumed => 4,
+    });
+    if let Some(digest) = preparation.output_receipt_digest {
+        push_digest(&mut payload, digest);
+    }
+    if let Some(mint_id) = preparation.consumed_mint_id {
+        push_digest(&mut payload, mint_id);
+    }
+    let digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(MEDIA_PREPARATION_DIGEST_DOMAIN);
+        hasher.update(&payload);
+        hasher.finalize()
+    };
+    let mut out = Vec::with_capacity(8 + 32 + payload.len());
+    out.extend_from_slice(MEDIA_PREPARATION_MAGIC);
+    out.extend_from_slice(&digest);
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+fn decode_media_preparation(
+    bytes: &[u8],
+) -> Result<RuntimeMediaPreparationRecord, RuntimeMintJournalError> {
+    if bytes.len() < 8 + 32 || &bytes[..8] != MEDIA_PREPARATION_MAGIC {
+        return Err(RuntimeMintJournalError::Corrupt);
+    }
+    let expected = &bytes[8..40];
+    let payload = &bytes[40..];
+    let mut hasher = Sha256::new();
+    hasher.update(MEDIA_PREPARATION_DIGEST_DOMAIN);
+    hasher.update(payload);
+    if hasher.finalize().as_slice() != expected {
+        return Err(RuntimeMintJournalError::Corrupt);
+    }
+    let mut off = 0;
+    let request_id = read_digest(payload, &mut off)?;
+    let source_binding_digest = read_digest(payload, &mut off)?;
+    let source_object_digest = read_digest(payload, &mut off)?;
+    let operation_id = read_digest(payload, &mut off)?;
+    let provider_id = read_availability_text(payload, &mut off)?;
+    let creator_wallet_account_id = read_availability_text(payload, &mut off)?;
+    let creator_wallet_address = read_availability_text(payload, &mut off)?;
+    let creator_mint_source_digest = read_digest(payload, &mut off)?;
+    let state = match read_u8(payload, &mut off)? {
+        0 => RuntimeMediaPreparationState::Ready,
+        1 => RuntimeMediaPreparationState::EffectPending,
+        2 => RuntimeMediaPreparationState::Prepared,
+        3 => RuntimeMediaPreparationState::Failed,
+        4 => RuntimeMediaPreparationState::Consumed,
+        _ => return Err(RuntimeMintJournalError::Corrupt),
+    };
+    let output_receipt_digest = match state {
+        RuntimeMediaPreparationState::Prepared | RuntimeMediaPreparationState::Consumed => {
+            Some(read_digest(payload, &mut off)?)
+        }
+        _ => None,
+    };
+    let consumed_mint_id = match state {
+        RuntimeMediaPreparationState::Consumed => Some(read_digest(payload, &mut off)?),
+        _ => None,
+    };
+    if off != payload.len() {
+        return Err(RuntimeMintJournalError::Corrupt);
+    }
+    let preparation = RuntimeMediaPreparationRecord {
+        request_id,
+        source_binding_digest,
+        source_object_digest,
+        operation_id,
+        provider_id,
+        creator_wallet_account_id,
+        creator_wallet_address,
+        creator_mint_source_digest,
+        state,
+        output_receipt_digest,
+        consumed_mint_id,
+    };
+    preparation
+        .validate()
+        .map_err(|_| RuntimeMintJournalError::Corrupt)?;
+    Ok(preparation)
 }
 
 fn read_handle(
@@ -2420,6 +3037,21 @@ fn validate_intent_text(value: &str) -> Result<(), RuntimeMintJournalError> {
     validate_availability_text(value)
 }
 
+fn validate_intent_evm_address(value: &str) -> Result<(), RuntimeMintJournalError> {
+    validate_intent_text(value)?;
+    let raw = value
+        .strip_prefix("0x")
+        .ok_or(RuntimeMintJournalError::InvalidSelection)?;
+    if raw.len() != 40
+        || raw
+            .bytes()
+            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(RuntimeMintJournalError::InvalidSelection);
+    }
+    Ok(())
+}
+
 fn validate_canonical_intent_hex_quantity(value: &str) -> Result<(), RuntimeMintJournalError> {
     if normalize_intent_hex_quantity(value)? != value {
         return Err(RuntimeMintJournalError::InvalidSelection);
@@ -2493,6 +3125,19 @@ fn compute_mint_intent_request_id(principal_id: &str, source_binding_digest: Dig
     hasher.update(principal_id.as_bytes());
     hasher.update([0u8]);
     hasher.update(source_binding_digest.as_bytes());
+    Digest32::new(hasher.finalize().into())
+}
+
+fn compute_media_preparation_operation_id(
+    request_id: Digest32,
+    source_object_digest: Digest32,
+    provider_id: &str,
+) -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(MEDIA_PREPARATION_OPERATION_ID_DOMAIN);
+    hasher.update(request_id.as_bytes());
+    hasher.update(source_object_digest.as_bytes());
+    hasher.update(provider_id.as_bytes());
     Digest32::new(hasher.finalize().into())
 }
 
@@ -2736,6 +3381,9 @@ mod tests {
             "person:local:runtime-mint-intent-test",
             "localhost://Users/test/Documents/protected-clear-media",
             "plain_localhost_root",
+            "wallet-account-1",
+            "0x1111111111111111111111111111111111111111",
+            digest(0x53),
             mime_type,
             codecs,
             &init_segment,
@@ -2823,10 +3471,12 @@ mod tests {
             "elacity",
             "0x0a",
             "0x2222222222222222222222222222222222222222",
+            "0x2",
             "0x5",
             "0x3333333333333333333333333333333333333333",
             Some("0x4444444444444444444444444444444444444444".to_string()),
             "0x5555555555555555555555555555555555555555555555555555555555555555",
+            123,
         )
         .unwrap()
     }
@@ -3120,6 +3770,139 @@ mod tests {
             .load_intent(request_id)
             .unwrap();
         assert_eq!(reloaded, completed);
+    }
+
+    fn draft_with(media_seed: u8, access_seed: u8, pool_seed: u8) -> RuntimeMintDraft {
+        let nodes = nodes();
+        let threshold = ThresholdV1::new(2, 3).unwrap();
+        let media = test_media::media_identity(media_seed);
+        let (init_segment, encrypted_segments, mime_type, codecs) =
+            test_media::media_components(media_seed);
+        let node_set = NodeSetV1::new(
+            threshold,
+            nodes.iter().map(|node| node.node_public_key()).collect(),
+        )
+        .unwrap();
+        let key_envelope = KeyEnvelopeIdentityV1::new(
+            media.encrypted_content().clone(),
+            digest(0x22),
+            512,
+            node_set.node_set_id().unwrap(),
+            threshold,
+            CustodyPoolIdentityV1::new(digest(pool_seed), 512).unwrap(),
+            CustodyEpochIdentityV1::new(digest(0x33), 512).unwrap(),
+            CustodyCommitteeAuthorizationIdentityV1::new(digest(0x36), 512).unwrap(),
+        )
+        .unwrap();
+        RuntimeMintDraft::new(
+            &init_segment,
+            &encrypted_segments,
+            mime_type,
+            codecs,
+            content_access_id(access_seed),
+            key_envelope,
+            RightsPolicyIdentityV1::new(digest(0x44), 384).unwrap(),
+            digest(0x19),
+            threshold,
+            nodes,
+        )
+        .unwrap()
+    }
+
+    fn settled_closed_intent(journal: &RuntimeMintJournal) -> RuntimeMintIntent {
+        let intent = intent();
+        journal.persist_intent(&intent).unwrap();
+        journal
+            .mark_intent_protect_effect_started(intent.request_id())
+            .unwrap();
+        journal
+            .mark_intent_protect_closed_before_draft(intent.request_id())
+            .unwrap()
+    }
+
+    #[test]
+    fn find_mint_record_for_intent_links_settled_intent_to_its_record() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let settled = settled_closed_intent(&journal);
+        assert!(settled.protect_settled_closed_before_draft());
+        // Decoy record for unrelated content in the same store.
+        custody_provision_all(&journal, &draft());
+        // The intent fixture's content-access id is 0x52; this record shares it
+        // along with the custody selection.
+        let matching = draft_with(0x21, 0x52, 0x35);
+        custody_provision_all(&journal, &matching);
+
+        let found = journal
+            .find_mint_record_for_intent(settled.request_id())
+            .unwrap()
+            .expect("record sharing access id and custody selection must be found");
+        assert_eq!(found.draft().mint_id(), matching.mint_id());
+        assert_eq!(
+            found.custody_terminal(),
+            Some(RuntimeCustodyTerminalKind::CustodyProvisioned)
+        );
+    }
+
+    #[test]
+    fn find_mint_record_for_intent_ignores_foreign_custody_selection() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let settled = settled_closed_intent(&journal);
+        // Same content-access id, different custody pool identity.
+        custody_provision_all(&journal, &draft_with(0x21, 0x52, 0x75));
+
+        assert_eq!(
+            journal
+                .find_mint_record_for_intent(settled.request_id())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn find_mint_record_for_intent_fails_closed_on_ambiguity() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let settled = settled_closed_intent(&journal);
+        custody_provision_all(&journal, &draft_with(0x21, 0x52, 0x35));
+        custody_provision_all(&journal, &draft_with(0x27, 0x52, 0x35));
+
+        assert_eq!(
+            journal.find_mint_record_for_intent(settled.request_id()),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_mint_record_for_intent_fails_closed_on_unreadable_record() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let root = owner_only_journal_root(&temp);
+        let journal = RuntimeMintJournal::new(&root);
+        let settled = settled_closed_intent(&journal);
+        let bogus = root.join(hex::encode([0x5a; 32]));
+        fs::write(&bogus, b"not a journal record").unwrap();
+        fs::set_permissions(&bogus, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(
+            journal.find_mint_record_for_intent(settled.request_id()),
+            Err(RuntimeMintJournalError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn find_mint_record_for_intent_requires_the_intent() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        custody_provision_all(&journal, &draft());
+
+        assert_eq!(
+            journal.find_mint_record_for_intent(digest(0x5b)),
+            Err(RuntimeMintJournalError::NotFound)
+        );
     }
 
     #[test]
@@ -3426,6 +4209,98 @@ mod tests {
                 &availability_requirement(),
                 wrong_publisher,
             ),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+    }
+
+    #[test]
+    fn media_preparation_journal_binds_source_provider_and_exact_settlement() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let preparation = RuntimeMediaPreparationRecord::new(
+            "person:local:media-preparation",
+            "localhost://Users/test/Documents/video.mp4",
+            "protected_principal_root",
+            digest(0x81),
+            "media",
+            "wallet-account-1",
+            "0x1111111111111111111111111111111111111111",
+            digest(0x85),
+        )
+        .unwrap();
+        let persisted = journal.persist_media_preparation(&preparation).unwrap();
+        assert_eq!(persisted.state(), RuntimeMediaPreparationState::Ready);
+        assert_eq!(persisted.provider_id(), "media");
+
+        let pending = journal
+            .mark_media_preparation_effect_started(preparation.request_id())
+            .unwrap();
+        assert_eq!(pending.state(), RuntimeMediaPreparationState::EffectPending);
+        assert_eq!(
+            journal.mark_media_preparation_effect_started(preparation.request_id()),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+        let receipt = digest(0x82);
+        let prepared = journal
+            .mark_media_preparation_prepared(preparation.request_id(), receipt)
+            .unwrap();
+        assert_eq!(prepared.state(), RuntimeMediaPreparationState::Prepared);
+        assert_eq!(prepared.output_receipt_digest(), Some(receipt));
+        let consumed = journal
+            .mark_media_preparation_consumed(preparation.request_id(), receipt, digest(0x83))
+            .unwrap();
+        assert_eq!(consumed.state(), RuntimeMediaPreparationState::Consumed);
+        assert_eq!(consumed.consumed_mint_id(), Some(digest(0x83)));
+
+        let changed_source = RuntimeMediaPreparationRecord::new(
+            "person:local:media-preparation",
+            "localhost://Users/test/Documents/video.mp4",
+            "protected_principal_root",
+            digest(0x84),
+            "media",
+            "wallet-account-1",
+            "0x1111111111111111111111111111111111111111",
+            digest(0x85),
+        )
+        .unwrap();
+        assert_eq!(changed_source.request_id(), preparation.request_id());
+        assert!(!changed_source.same_authority_as(&preparation));
+        assert_eq!(
+            journal.persist_media_preparation(&changed_source),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+        let changed_provider = RuntimeMediaPreparationRecord::new(
+            "person:local:media-preparation",
+            "localhost://Users/test/Documents/video.mp4",
+            "protected_principal_root",
+            digest(0x81),
+            "other-media",
+            "wallet-account-1",
+            "0x1111111111111111111111111111111111111111",
+            digest(0x85),
+        )
+        .unwrap();
+        assert_eq!(changed_provider.request_id(), preparation.request_id());
+        assert!(!changed_provider.same_authority_as(&preparation));
+        assert_eq!(
+            journal.persist_media_preparation(&changed_provider),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+        let changed_creator = RuntimeMediaPreparationRecord::new(
+            "person:local:media-preparation",
+            "localhost://Users/test/Documents/video.mp4",
+            "protected_principal_root",
+            digest(0x81),
+            "media",
+            "wallet-account-2",
+            "0x2222222222222222222222222222222222222222",
+            digest(0x86),
+        )
+        .unwrap();
+        assert_eq!(changed_creator.request_id(), preparation.request_id());
+        assert!(!changed_creator.same_authority_as(&preparation));
+        assert_eq!(
+            journal.persist_media_preparation(&changed_creator),
             Err(RuntimeMintJournalError::Conflict)
         );
     }

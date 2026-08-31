@@ -30,11 +30,23 @@ PICKER_JS_HEADER="/* GENERATED from ${SOURCE_PICKER_JS} — do not edit. Run \`j
 # storage, so it is safe in an opaque capsule; only the host installs a
 # persistence adapter, in its own non-vendored file.
 TARGETS=(
+  browser/browser
   home/browser
   home-gui/browser
+  system/browser
+  services/browser
   people/browser
   inbox/browser
   chat-room/browser
+  library/browser
+  marketplace/browser
+  documents/browser
+  archive-manager/browser
+  wallet/browser
+  wallet-metamask/browser
+  wallet-unisat/browser
+  wallet-walletconnect/browser
+  gba-emulator/browser
 )
 
 MODE="${1:-sync}"

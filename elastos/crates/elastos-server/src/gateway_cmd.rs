@@ -6,11 +6,8 @@ use base64::Engine as _;
 use elastos_runtime::provider;
 
 use crate::{
-    api,
-    binaries::{find_installed_provider_binary, verify_component_binary_with_data_dir},
-    setup,
-    sources::default_data_dir,
-    supervisor,
+    api, binaries::resolve_verified_native_provider_binary_with_data_dir, setup,
+    sources::default_data_dir, supervisor,
 };
 
 const ELASTOS_VERSION: &str = env!("ELASTOS_VERSION");
@@ -342,12 +339,15 @@ async fn register_installed_ipfs_provider(
     data_dir: &Path,
     registry: &Arc<provider::ProviderRegistry>,
 ) -> anyhow::Result<()> {
-    let ipfs_binary = find_installed_provider_binary("ipfs-provider").ok_or_else(|| {
+    let ipfs_binary = resolve_verified_native_provider_binary_with_data_dir(
+        data_dir,
+        "ipfs-provider",
+    )?
+    .ok_or_else(|| {
         anyhow::anyhow!(
             "ipfs-provider not found. Install with:\n\n  elastos setup --with kubo --with ipfs-provider"
         )
     })?;
-    verify_component_binary_with_data_dir(data_dir, "ipfs-provider", &ipfs_binary)?;
 
     let bridge = provider::ProviderBridge::spawn(&ipfs_binary, Default::default())
         .await

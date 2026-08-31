@@ -7,7 +7,7 @@ description: Use when creating a new branch or git worktree for a feature, bugfi
 
 ## Overview
 
-New work branches start from an `upstream/XX-dev` integration branch (e.g. `upstream/0.6-dev`) — never silently from `main` or from whatever happens to be checked out. **The user chooses the base; you never pick it yourself.**
+New work branches start from a user-selected `upstream/XX-dev` integration branch. The current checkout and `main` are not implicit bases. Resolve available lines from fetched refs; the user chooses the base.
 
 `main` is the release line. `upstream/XX-dev` branches are the versioned dev/integration lines where feature and bugfix work lands.
 

@@ -248,6 +248,9 @@ function startServer(scenario) {
       }
       if (url.pathname === "/api/apps/chat-room/direct/conversations") {
         trace.directConversations += 1;
+        if (scenario === "single-conversation") {
+          return json(response, { conversations: [] });
+        }
         directConversationResponses += 1;
         const hold = directConversationResponses === 1
           ? holds["initial-conversations"]
@@ -580,11 +583,52 @@ async function runScenario(scenario) {
     assert(authoritySurface.origin === "null", "Chat fixture is not opaque", authoritySurface);
     assert(!authoritySurface.storageAvailable && !authoritySurface.leaked, "room credential reached a client truth surface", authoritySurface);
 
-    await frame.waitForSelector('[data-conversation-choice="direct:sha256:fixture-conversation"]');
+    if (scenario !== "single-conversation") {
+      await frame.waitForSelector('[data-conversation-choice="direct:sha256:fixture-conversation"]');
+    }
 
-    for (const width of [375, 1280]) {
+    for (const width of scenario === "single-conversation" ? [640] : [375, 640, 1280]) {
       await page.setViewportSize({ width, height: 900 });
-      const state = await frame.evaluate(() => {
+      try {
+        await frame.waitForFunction(
+          ({ expectedWidth, singleConversation }) => {
+            const sidebar = document.querySelector(".chat-sidebar");
+            const sidebarHidden = !sidebar
+              || sidebar.hidden
+              || getComputedStyle(sidebar).display === "none";
+            const frameWidth = window.innerWidth;
+            const compact = window.matchMedia("(max-width: 760px)").matches;
+            if (frameWidth !== expectedWidth || compact !== (expectedWidth <= 760)) {
+              return false;
+            }
+            if (singleConversation) {
+              return document.body.dataset.roomCompactRail === "hidden" && sidebarHidden;
+            }
+            const sidebarWidth = sidebar?.getBoundingClientRect().width || 0;
+            const expectedSidebarWidth = expectedWidth <= 760 ? 72 : 220;
+            return Math.abs(sidebarWidth - expectedSidebarWidth) <= 1;
+          },
+          { expectedWidth: width, singleConversation: scenario === "single-conversation" },
+        );
+      } catch {
+        const failureState = await frame.evaluate((expectedLoopWidth) => {
+          const sidebar = document.querySelector(".chat-sidebar");
+          return {
+            expectedLoopWidth,
+            frameWidth: window.innerWidth,
+            compact: window.matchMedia("(max-width: 760px)").matches,
+            sidebarWidth: sidebar?.getBoundingClientRect().width || 0,
+            sidebarHidden: !sidebar
+              || sidebar.hidden
+              || getComputedStyle(sidebar).display === "none",
+            compactRail: document.body.dataset.roomCompactRail || "",
+          };
+        }, width);
+        const topWidth = await page.evaluate(() => window.innerWidth);
+        throw new Error(`responsive layout did not settle\n${JSON.stringify({ topWidth, ...failureState }, null, 2)}`);
+      }
+      const topWidth = await page.evaluate(() => window.innerWidth);
+      const state = await frame.evaluate((expectedLoopWidth) => {
             const hidden = (selector) => {
               const node = document.querySelector(selector);
               return !node || node.hidden || getComputedStyle(node).display === "none" || getComputedStyle(node).visibility === "hidden";
@@ -598,7 +642,10 @@ async function runScenario(scenario) {
             const sidebarRect = sidebar?.getBoundingClientRect();
             const threadRect = thread?.getBoundingClientRect();
             return {
+              expectedLoopWidth,
+              topWidth: 0,
               width: innerWidth,
+              compact: window.matchMedia("(max-width: 760px)").matches,
               active: document.body.dataset.roomSessionActive,
               attachHidden: hidden("#attach-button"),
               browserStageHidden: hidden("#browser-access-stage"),
@@ -609,8 +656,10 @@ async function runScenario(scenario) {
               messageInputTag: input?.tagName || "",
               shellDisplay: shell ? getComputedStyle(shell).display : "",
               sidebarWidth: sidebarRect?.width || 0,
+              sidebarHidden: !sidebar || sidebar.hidden || getComputedStyle(sidebar).display === "none",
               sidebarBeforeThread: !!sidebarRect && !!threadRect && sidebarRect.right <= threadRect.left + 1,
               selectorDirection: selector ? getComputedStyle(selector).flexDirection : "",
+              compactRail: document.body.dataset.roomCompactRail || "",
               choices: [...document.querySelectorAll("[data-conversation-choice]")].map((node) => ({
                 id: node.dataset.conversationChoice || "",
                 active: node.classList.contains("active"),
@@ -622,7 +671,8 @@ async function runScenario(scenario) {
               emojiCount: document.querySelectorAll("#emoji-popover .emoji-chip").length,
               overflow: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) - document.documentElement.clientWidth,
             };
-          });
+          }, width);
+      state.topWidth = topWidth;
       assert(state.active === "true", "configured Chat session did not open", state);
       assert(state.attachHidden, "configured Chat exposed Attach", state);
       assert(state.browserStageHidden && state.browserRequestsHidden, "configured Chat exposed browser join controls", state);
@@ -632,29 +682,46 @@ async function runScenario(scenario) {
       assert(state.messageInputTag === "TEXTAREA", "published Chat composer was not retained", state);
       assert(state.shellDisplay === "grid" && state.sidebarBeforeThread, "Chat is not a split conversation shell", state);
       assert(state.selectorDirection === "column", "conversation choices are not a vertical list", state);
-      assert(
-        state.choices.length === 2
-          && state.choices[0]?.id === "shared"
-          && state.choices[0]?.name === "Community"
-          && state.choices[0]?.detail === "Shared room"
-          && state.choices[0]?.active
-          && state.choices[1]?.id === "direct:sha256:fixture-conversation"
-          && state.choices[1]?.name === "Fixture Friend"
-          && state.choices[1]?.detail === "Direct message",
-        "conversation list does not project the current Runtime conversations",
-        state,
-      );
+      if (scenario === "single-conversation") {
+        assert(
+          state.choices.length === 1
+            && state.choices[0]?.id === "shared"
+            && state.choices[0]?.name === "Community"
+            && state.choices[0]?.detail === "Shared room"
+            && state.choices[0]?.active,
+          "single-conversation Chat projected an unexpected conversation set",
+          state,
+        );
+        assert(
+          state.compactRail === "hidden" && state.sidebarHidden,
+          "single-conversation compact Chat kept the switcher rail visible",
+          state,
+        );
+      } else {
+        assert(
+          state.choices.length === 2
+            && state.choices[0]?.id === "shared"
+            && state.choices[0]?.name === "Community"
+            && state.choices[0]?.detail === "Shared room"
+            && state.choices[0]?.active
+            && state.choices[1]?.id === "direct:sha256:fixture-conversation"
+            && state.choices[1]?.name === "Fixture Friend"
+            && state.choices[1]?.detail === "Direct message",
+          "conversation list does not project the current Runtime conversations",
+          state,
+        );
+        assert(
+          Math.abs(state.sidebarWidth - (width <= 760 ? 72 : 220)) <= 1,
+          "conversation sidebar width is not responsive",
+          state,
+        );
+      }
       assert(
         state.conversationTitle === "Community" && state.conversationDetail === "Shared room",
         "active conversation header does not match the selected conversation",
         state,
       );
       assert(state.emojiCount === 12, "published emoji menu is incomplete", state);
-      assert(
-        Math.abs(state.sidebarWidth - (width <= 760 ? 72 : 220)) <= 1,
-        "conversation sidebar width is not responsive",
-        state,
-      );
       assert(state.overflow <= 1, "configured Chat has horizontal overflow", state);
       if (process.env.CHAT_LAYOUT_SCREENSHOT_DIR) {
         await mkdir(process.env.CHAT_LAYOUT_SCREENSHOT_DIR, { recursive: true });
@@ -663,6 +730,43 @@ async function runScenario(scenario) {
         });
       }
     }
+
+    const multilineState = await frame.evaluate(() => {
+      const input = document.querySelector("#message-input");
+      const field = document.querySelector(".composer-field");
+      if (!(input instanceof HTMLTextAreaElement) || !(field instanceof HTMLElement)) {
+        return null;
+      }
+      Object.defineProperty(input, "scrollHeight", {
+        configurable: true,
+        get() {
+          return this.value.includes("\n") ? 88 : 34;
+        },
+      });
+      input.value = "line one\nline two\nline three";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      const tallHeight = input.style.height;
+      const tallMultiline = field.dataset.multiline || "";
+      input.value = "line one";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      return {
+        tallHeight,
+        tallMultiline,
+        shortHeight: input.style.height,
+        shortMultiline: field.dataset.multiline || "",
+      };
+    });
+    assert(multilineState, "configured Chat composer state is unavailable");
+    assert(
+      multilineState.tallHeight === "88px" && multilineState.tallMultiline === "true",
+      "configured Chat did not present a multiline composer",
+      multilineState,
+    );
+    assert(
+      multilineState.shortHeight === "34px" && multilineState.shortMultiline === "false",
+      "configured Chat did not reset multiline composer presentation",
+      multilineState,
+    );
 
     await frame.locator("#emoji-toggle").click();
     assert(
@@ -708,6 +812,7 @@ async function runScenario(scenario) {
 async function main() {
   const scenarios = process.env.CHAT_LAYOUT_SCENARIOS?.split(",").map((value) => value.trim()).filter(Boolean) || [
     "success",
+    "single-conversation",
     "session-failure",
     "summary-failure",
     "direct-switch",

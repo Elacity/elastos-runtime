@@ -27,8 +27,8 @@ Options:
 
 The script preserves initrd/rootfs symlinks by updating their resolved targets.
 It creates timestamped backups before changed installed helpers or VM artifacts
-and retains the newest two default backup sets. Override the bounded retention
-with ELASTOS_BROWSER_VM_BACKUP_RETENTION=1..10. Finish target closeout by running:
+and retains one default backup set. ELASTOS_BROWSER_VM_BACKUP_RETENTION must
+be 1. Finish target closeout by running:
 
   scripts/jetson-browser-runtime-audit.mjs \
     --host <target-host> \
@@ -119,14 +119,9 @@ backup_file() {
 }
 
 backup_retention() {
-    local retention="${ELASTOS_BROWSER_VM_BACKUP_RETENTION:-2}"
-    if [[ ! "$retention" =~ ^[1-9][0-9]*$ ]]; then
-        echo "ELASTOS_BROWSER_VM_BACKUP_RETENTION must be from 1 to 10" >&2
-        exit 2
-    fi
-    retention=$((10#$retention))
-    if (( retention > 10 )); then
-        echo "ELASTOS_BROWSER_VM_BACKUP_RETENTION must be from 1 to 10" >&2
+    local retention="${ELASTOS_BROWSER_VM_BACKUP_RETENTION:-1}"
+    if [[ "$retention" != "1" ]]; then
+        echo "ELASTOS_BROWSER_VM_BACKUP_RETENTION must be 1" >&2
         exit 2
     fi
     printf '%s\n' "$retention"
@@ -545,6 +540,7 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd -P)"
+backup_retention >/dev/null
 if [[ -z "$BACKUP_DIR" ]]; then
     BACKUP_DIR="$DATA_DIR/backups/browser-vm-target-refresh-$(date -u +%Y%m%dT%H%M%SZ)-$$"
     DEFAULT_BACKUP_DIR=1

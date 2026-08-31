@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Cursor, Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
@@ -12,10 +12,6 @@ use elastos_common::protected_content::{
     DecryptSessionRequestV1, KeyReleaseRequestV1, ReleaseReceiptV1, RightsDecisionReceiptV1,
     SealedObjectV1, DECRYPT_SESSION_REQUEST_SCHEMA, DECRYPT_SESSION_SCHEMA,
     KEY_RELEASE_REQUEST_SCHEMA, RELEASE_RECEIPT_SCHEMA, RIGHTS_DECISION_RECEIPT_SCHEMA,
-};
-use elastos_protected_content_provider_contracts::{
-    ValidatedClearFmp4MediaSessionLayoutV1, MAX_PROTECT_MEDIA_PART_BYTES_V1,
-    MAX_PROTECT_MEDIA_SEGMENTS_V1,
 };
 use elastos_runtime::provider::{
     Provider, ProviderError, ProviderInvocation, ProviderInvocationTransport, ProviderRegistry,
@@ -38,7 +34,6 @@ const LIBRARY_TRASH_RECORD_SCHEMA: &str = "elastos.library.trash-record/v1";
 const MAX_LIBRARY_EVENTS: usize = 256;
 const MAX_ARCHIVE_LIST_ENTRIES: usize = 512;
 const MAX_ARCHIVE_PREVIEW_BYTES: usize = 64 * 1024;
-const MAX_LIBRARY_PROTECTED_MEDIA_DECLARATION_BYTES: usize = 255;
 const RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE: &str = "Runtime custody publish input invalid";
 const RUNTIME_CUSTODY_SHARE_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody sharing is not available yet";
@@ -119,6 +114,8 @@ struct LibraryPublishRecord {
     content_security: Value,
     receipt: Value,
     availability: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    listing_uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +221,8 @@ enum ObjectProviderRequest {
         mime: Option<String>,
         #[serde(default)]
         if_revision: Option<String>,
+        #[serde(default)]
+        create_only: bool,
     },
     Mkdir {
         principal_id: String,
@@ -329,14 +328,19 @@ enum ObjectProviderRequest {
     ListRuntimeCustody {
         principal_id: String,
     },
+    ImportRuntimeCustody {
+        principal_id: String,
+        listing_uri: String,
+    },
     Buy {
         principal_id: String,
         mint_id: String,
-        account_id: String,
     },
     OpenViewer {
         principal_id: String,
         mint_id: String,
+        #[serde(default)]
+        launch_id: Option<String>,
         #[serde(default)]
         proof_binding_id: Option<String>,
         #[serde(default)]
@@ -349,35 +353,40 @@ enum ObjectProviderRequest {
         mint_id: String,
         viewer_session_handle: String,
         #[serde(default)]
+        launch_id: Option<String>,
+        #[serde(default)]
+        proof_binding_id: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        grant_id: Option<String>,
+        #[serde(default)]
         segment_index: Option<u32>,
     },
     CloseViewer {
         principal_id: String,
         mint_id: String,
         viewer_session_handle: String,
+        #[serde(default)]
+        launch_id: Option<String>,
+        #[serde(default)]
+        proof_binding_id: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        grant_id: Option<String>,
     },
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 enum LibraryPublishProtectionRequest {
-    RuntimeCustody {
-        mime_type: String,
-        codecs: String,
-        wallet_account_id: String,
-        copies: String,
-        price: String,
-    },
+    RuntimeCustody { copies: String, price: String },
 }
 
 struct LoadedRuntimeCustodyPublishInput {
-    mime_type: String,
-    codecs: String,
-    wallet_account_id: String,
     copies: String,
     price: String,
-    clear_init_segment: Vec<u8>,
-    clear_segments: Vec<Vec<u8>>,
 }
 
 pub struct ObjectProvider {
@@ -478,6 +487,7 @@ impl Provider for ObjectProvider {
                 .await
             }
             request @ (ObjectProviderRequest::ListRuntimeCustody { .. }
+            | ObjectProviderRequest::ImportRuntimeCustody { .. }
             | ObjectProviderRequest::Buy { .. }
             | ObjectProviderRequest::OpenViewer { .. }
             | ObjectProviderRequest::ReadViewer { .. }
@@ -522,6 +532,7 @@ pub fn handle_object_provider_raw_request(data_dir: &Path, request: &Value) -> V
         | ObjectProviderRequest::Unpublish { .. }
         | ObjectProviderRequest::Repair { .. }
         | ObjectProviderRequest::ListRuntimeCustody { .. }
+        | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::Buy { .. }
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
@@ -545,7 +556,8 @@ pub fn handle_library_upload_bytes(
     if_revision: Option<&str>,
     bytes: &[u8],
 ) -> anyhow::Result<Value> {
-    let object = write_library_file_bytes(data_dir, principal_id, uri, mime, if_revision, bytes)?;
+    let object =
+        write_library_file_bytes(data_dir, principal_id, uri, mime, if_revision, false, bytes)?;
     Ok(provider_ok(json!({
         "object": object,
         "transport": "raw-body",
@@ -747,6 +759,7 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
             library_repair(&data_dir, registry, &principal_id, &uri).await
         }
         request @ (ObjectProviderRequest::ListRuntimeCustody { .. }
+        | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::Buy { .. }
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
@@ -1368,6 +1381,7 @@ fn handle_library_request(
             data,
             mime,
             if_revision,
+            create_only,
         } => {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(data.trim())
@@ -1382,6 +1396,7 @@ fn handle_library_request(
                 &target.uri,
                 mime.as_deref(),
                 if_revision.as_deref(),
+                create_only,
                 &bytes,
             )?;
             Ok(json!({ "object": object }))
@@ -1840,6 +1855,7 @@ fn handle_library_request(
         | ObjectProviderRequest::Unpublish { .. }
         | ObjectProviderRequest::Repair { .. }
         | ObjectProviderRequest::ListRuntimeCustody { .. }
+        | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::Buy { .. }
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
@@ -1865,10 +1881,21 @@ async fn handle_runtime_custody_library_request(
                 &principal_id,
             )
         }
+        ObjectProviderRequest::ImportRuntimeCustody {
+            principal_id,
+            listing_uri,
+        } => {
+            crate::protected_content_runtime::import_runtime_custody_listing(
+                &data_dir,
+                registry,
+                &principal_id,
+                &listing_uri,
+            )
+            .await
+        }
         ObjectProviderRequest::Buy {
             principal_id,
             mint_id,
-            account_id,
         } => {
             let Some((state, authority)) = gateway_authority else {
                 anyhow::bail!(
@@ -1882,7 +1909,6 @@ async fn handle_runtime_custody_library_request(
                 crate::protected_content_runtime::RuntimeCustodyBuyInput {
                     principal_id,
                     mint_id,
-                    account_id,
                 },
             )
             .await
@@ -1890,6 +1916,7 @@ async fn handle_runtime_custody_library_request(
         ObjectProviderRequest::OpenViewer {
             principal_id,
             mint_id,
+            launch_id,
             proof_binding_id,
             session_id,
             grant_id,
@@ -1900,6 +1927,7 @@ async fn handle_runtime_custody_library_request(
                 crate::protected_content_runtime::RuntimeCustodyViewerOpenInput {
                     principal_id,
                     mint_id,
+                    launch_id,
                     proof_binding_id,
                     session_id,
                     grant_id,
@@ -1911,6 +1939,10 @@ async fn handle_runtime_custody_library_request(
             principal_id,
             mint_id,
             viewer_session_handle,
+            launch_id,
+            proof_binding_id,
+            session_id,
+            grant_id,
             segment_index,
         } => {
             crate::protected_content_runtime::read_runtime_custody_viewer(
@@ -1919,6 +1951,10 @@ async fn handle_runtime_custody_library_request(
                 &principal_id,
                 &mint_id,
                 &viewer_session_handle,
+                launch_id.as_deref(),
+                proof_binding_id.as_deref(),
+                session_id.as_deref(),
+                grant_id.as_deref(),
                 segment_index,
             )
             .await
@@ -1927,6 +1963,10 @@ async fn handle_runtime_custody_library_request(
             principal_id,
             mint_id,
             viewer_session_handle,
+            launch_id,
+            proof_binding_id,
+            session_id,
+            grant_id,
         } => {
             crate::protected_content_runtime::close_runtime_custody_viewer(
                 &data_dir,
@@ -1934,6 +1974,10 @@ async fn handle_runtime_custody_library_request(
                 &principal_id,
                 &mint_id,
                 &viewer_session_handle,
+                launch_id.as_deref(),
+                proof_binding_id.as_deref(),
+                session_id.as_deref(),
+                grant_id.as_deref(),
             )
             .await
         }
@@ -1958,22 +2002,30 @@ async fn library_publish(
     if let Some(protection) = protection {
         let loaded =
             validate_runtime_custody_publish_input(data_dir, principal_id, &target, protection)?;
-        let runtime_input = crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput {
-            object_uri: target.uri.clone(),
-            principal_id: principal_id.to_string(),
-            mime_type: loaded.mime_type,
-            codecs: loaded.codecs,
-            wallet_account_id: loaded.wallet_account_id,
-            copies: loaded.copies,
-            price: loaded.price,
-            clear_init_segment: loaded.clear_init_segment,
-            clear_segments: loaded.clear_segments,
-            source_storage: published_source_storage(data_dir, principal_id, &target)?.to_string(),
-        };
+        let source_storage = published_source_storage(data_dir, principal_id, &target)?.to_string();
         let Some((state, authority)) = gateway_authority else {
             anyhow::bail!(
                 "Runtime custody creator mint requires verified gateway Wallet authority"
             );
+        };
+        let creator_binding = crate::api::gateway::resolve_runtime_custody_creator_publish_binding(
+            state,
+            authority,
+            principal_id,
+            &target.uri,
+            &source_storage,
+        )
+        .await?;
+        let runtime_input = crate::protected_content_runtime::RuntimeCustodyLibrarySourceInput {
+            object_uri: target.uri.clone(),
+            principal_id: principal_id.to_string(),
+            source_file_path: target.path.clone(),
+            wallet_account_id: creator_binding.account_id,
+            wallet_account_address: creator_binding.address,
+            creator_mint_source_digest: creator_binding.source_digest,
+            copies: loaded.copies,
+            price: loaded.price,
+            source_storage,
         };
         let facts = crate::api::gateway::runtime_custody_publish_via_gateway(
             state,
@@ -1994,6 +2046,7 @@ async fn library_publish(
             content_security: facts.content_security,
             receipt: facts.receipt,
             availability: facts.availability,
+            listing_uri: facts.listing_uri,
         };
         write_publish_record(data_dir, principal_id, &record)?;
         let object = library_object(data_dir, principal_id, &target.uri)?;
@@ -2006,6 +2059,7 @@ async fn library_publish(
                 "cid": facts.content_cid,
                 "content_id": facts.content_id,
                 "mint_id": hex::encode(facts.mint_id.as_bytes()),
+                "listing_uri": record.listing_uri,
                 "availability": record.availability,
                 "object": object,
             }),
@@ -2017,6 +2071,7 @@ async fn library_publish(
             "receipt": record.receipt,
             "availability": record.availability,
             "content_security": record.content_security,
+            "listing_uri": record.listing_uri,
             "published_at": record.published_at,
         }));
     }
@@ -2082,6 +2137,7 @@ async fn library_publish(
         content_security,
         receipt,
         availability,
+        listing_uri: None,
     };
     write_publish_record(data_dir, principal_id, &record)?;
     let object = library_object(data_dir, principal_id, &target.uri)?;
@@ -3319,6 +3375,7 @@ fn library_request_touches_webspace(request: &ObjectProviderRequest) -> bool {
         | ObjectProviderRequest::EmptyTrash { .. }
         | ObjectProviderRequest::Events { .. }
         | ObjectProviderRequest::ListRuntimeCustody { .. }
+        | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::Buy { .. }
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
@@ -3604,24 +3661,51 @@ fn write_library_file_bytes(
     uri: &str,
     _mime: Option<&str>,
     if_revision: Option<&str>,
+    create_only: bool,
     bytes: &[u8],
 ) -> anyhow::Result<LibraryObject> {
     let target = library_target(data_dir, principal_id, uri)?;
     if is_trash_uri(&target.localhost_root, &target.uri) {
         bail!("library Trash accepts objects only through delete");
     }
+    if create_only && if_revision.is_some_and(|value| !value.trim().is_empty()) {
+        bail!("library create-only write does not accept if_revision");
+    }
     check_revision(data_dir, principal_id, &target.uri, if_revision)?;
     if let Some(parent) = target.path.parent() {
         fs::create_dir_all(parent)?;
     }
-    crate::auth::write_principal_root_object(
-        data_dir,
-        principal_id,
-        &target.localhost_root,
-        &target.uri,
-        &target.path,
-        bytes,
-    )?;
+    let write = if create_only {
+        crate::auth::create_principal_root_object(
+            data_dir,
+            principal_id,
+            &target.localhost_root,
+            &target.uri,
+            &target.path,
+            bytes,
+        )
+    } else {
+        crate::auth::write_principal_root_object(
+            data_dir,
+            principal_id,
+            &target.localhost_root,
+            &target.uri,
+            &target.path,
+            bytes,
+        )
+    };
+    match write {
+        Ok(()) => {}
+        Err(err)
+            if create_only
+                && err
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) =>
+        {
+            bail!("library destination already exists");
+        }
+        Err(err) => return Err(err),
+    }
     let object = library_object(data_dir, principal_id, &target.uri)?;
     append_library_event(
         data_dir,
@@ -3688,6 +3772,7 @@ fn compress_library_archive(
             &archive_uri,
             Some(LibraryArchiveFormat::Zip.mime()),
             None,
+            false,
             &bytes,
         )?;
         append_library_event(
@@ -3726,6 +3811,7 @@ fn compress_library_archive(
         &archive_uri,
         Some(LibraryArchiveFormat::Zip.mime()),
         None,
+        false,
         &bytes,
     )?;
     append_library_event(
@@ -5944,163 +6030,14 @@ fn validate_runtime_custody_publish_input(
     target: &LibraryTarget,
     protection: LibraryPublishProtectionRequest,
 ) -> anyhow::Result<LoadedRuntimeCustodyPublishInput> {
-    let LibraryPublishProtectionRequest::RuntimeCustody {
-        mime_type,
-        codecs,
-        wallet_account_id,
-        copies,
-        price,
-    } = protection;
-    validate_runtime_custody_media_declaration(&mime_type, "mime_type")?;
-    validate_runtime_custody_media_declaration(&codecs, "codecs")?;
-
+    let LibraryPublishProtectionRequest::RuntimeCustody { copies, price } = protection;
     let target_metadata = fs::symlink_metadata(&target.path)
         .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-    if target_metadata.file_type().is_symlink() || !target_metadata.is_dir() {
+    if target_metadata.file_type().is_symlink() || !target_metadata.is_file() {
         bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
     }
-
-    let mut saw_init = false;
-    let mut saw_segments = false;
-    for entry in fs::read_dir(&target.path)
-        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?
-    {
-        let entry = entry.map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-        let metadata = fs::symlink_metadata(entry.path())
-            .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-        if metadata.file_type().is_symlink() {
-            bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-        }
-        match name.as_str() {
-            "init.mp4" if metadata.is_file() => saw_init = true,
-            "segments" if metadata.is_dir() => saw_segments = true,
-            _ => bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE),
-        }
-    }
-    if !saw_init || !saw_segments {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-
-    let init_target = library_target(data_dir, principal_id, &format!("{}/init.mp4", target.uri))?;
-    let clear_init =
-        read_runtime_custody_publish_part(data_dir, principal_id, &init_target, false)?;
-    let session = ValidatedClearFmp4MediaSessionLayoutV1::new(&clear_init)
-        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-
-    let segments_target =
-        library_target(data_dir, principal_id, &format!("{}/segments", target.uri))?;
-    let segments_metadata = fs::symlink_metadata(&segments_target.path)
-        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-    if segments_metadata.file_type().is_symlink() || !segments_metadata.is_dir() {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-
-    let mut segment_bytes = BTreeMap::new();
-    for entry in fs::read_dir(&segments_target.path)
-        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?
-    {
-        let entry = entry.map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-        let metadata = fs::symlink_metadata(entry.path())
-            .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-        }
-        let index = parse_runtime_custody_segment_name(&name)?;
-        let segment_target = library_target(
-            data_dir,
-            principal_id,
-            &format!("{}/segments/{name}", target.uri),
-        )?;
-        let clear_segment =
-            read_runtime_custody_publish_part(data_dir, principal_id, &segment_target, true)?;
-        session
-            .validate_segment(&clear_segment)
-            .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-        if segment_bytes.insert(index, clear_segment).is_some() {
-            bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-        }
-    }
-    if segment_bytes.is_empty() || segment_bytes.len() > MAX_PROTECT_MEDIA_SEGMENTS_V1 as usize {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-    let mut clear_segments = Vec::with_capacity(segment_bytes.len());
-    for (expected, (actual, bytes)) in segment_bytes.into_iter().enumerate() {
-        if actual != expected as u32 {
-            bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-        }
-        clear_segments.push(bytes);
-    }
-    Ok(LoadedRuntimeCustodyPublishInput {
-        mime_type,
-        codecs,
-        wallet_account_id,
-        copies,
-        price,
-        clear_init_segment: clear_init,
-        clear_segments,
-    })
-}
-
-fn validate_runtime_custody_media_declaration(
-    value: &str,
-    field: &'static str,
-) -> anyhow::Result<()> {
-    let valid = !value.is_empty()
-        && value.len() <= MAX_LIBRARY_PROTECTED_MEDIA_DECLARATION_BYTES
-        && value
-            .as_bytes()
-            .iter()
-            .all(|byte| matches!(*byte, 0x21..=0x7e));
-    if !valid {
-        bail!("invalid protected publish {field}");
-    }
-    Ok(())
-}
-
-fn read_runtime_custody_publish_part(
-    data_dir: &Path,
-    principal_id: &str,
-    target: &LibraryTarget,
-    require_non_empty: bool,
-) -> anyhow::Result<Vec<u8>> {
-    let metadata = fs::metadata(&target.path)
-        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-    if metadata.len() > MAX_PROTECT_MEDIA_PART_BYTES_V1 as u64
-        || (require_non_empty && metadata.len() == 0)
-    {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-    let bytes = read_library_file_bytes(data_dir, principal_id, target)
-        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-    if bytes.len() > MAX_PROTECT_MEDIA_PART_BYTES_V1 || (require_non_empty && bytes.is_empty()) {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-    Ok(bytes)
-}
-
-fn parse_runtime_custody_segment_name(name: &str) -> anyhow::Result<u32> {
-    if name.len() != "00000000.m4s".len() || !name.ends_with(".m4s") {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-    let digits = &name[..8];
-    if !digits.as_bytes().iter().all(u8::is_ascii_digit) {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-    let index = digits
-        .parse::<u32>()
-        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
-    if index >= MAX_PROTECT_MEDIA_SEGMENTS_V1 {
-        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
-    }
-    Ok(index)
+    let _ = (data_dir, principal_id);
+    Ok(LoadedRuntimeCustodyPublishInput { copies, price })
 }
 
 fn protected_content_sealed_object_from_security(
@@ -7359,5 +7296,256 @@ mod tests {
             .await
             .expect("shutdown live ipfs-provider");
         println!("library live IPFS provider route cid={cid}");
+    }
+
+    #[tokio::test]
+    async fn create_only_write_preserves_existing_file_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let principal_id = "did:key:z6MkCreateOnlyExisting";
+        let file_uri = format!(
+            "{}/Documents/Notes.txt",
+            crate::auth::principal_localhost_root(principal_id)
+        );
+        let original = b"original bytes";
+        let replacement = b"replacement bytes";
+
+        let write = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "write",
+                "principal_id": principal_id,
+                "uri": file_uri,
+                "mime": "text/plain",
+                "data": base64::engine::general_purpose::STANDARD.encode(original),
+            }),
+        )
+        .await;
+        assert_eq!(write["status"], "ok", "{write}");
+
+        let create_only = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "write",
+                "principal_id": principal_id,
+                "uri": file_uri,
+                "mime": "text/plain",
+                "create_only": true,
+                "data": base64::engine::general_purpose::STANDARD.encode(replacement),
+            }),
+        )
+        .await;
+        assert_eq!(create_only["status"], "error", "{create_only}");
+        assert_eq!(
+            create_only["message"], "library destination already exists",
+            "{create_only}"
+        );
+
+        let read = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "read",
+                "principal_id": principal_id,
+                "uri": file_uri,
+            }),
+        )
+        .await;
+        assert_eq!(read["status"], "ok", "{read}");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(read["data"]["data"].as_str().unwrap())
+                .unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_only_write_is_atomic_for_concurrent_new_file_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let principal_id = "did:key:z6MkCreateOnlyConcurrent";
+        let file_uri = format!(
+            "{}/Documents/Concurrent.txt",
+            crate::auth::principal_localhost_root(principal_id)
+        );
+        let first_payload = base64::engine::general_purpose::STANDARD.encode(b"first");
+        let second_payload = base64::engine::general_purpose::STANDARD.encode(b"second");
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let first_request = json!({
+            "op": "write",
+            "principal_id": principal_id,
+            "uri": file_uri,
+            "mime": "text/plain",
+            "create_only": true,
+            "data": first_payload,
+        });
+        let second_request = json!({
+            "op": "write",
+            "principal_id": principal_id,
+            "uri": file_uri,
+            "mime": "text/plain",
+            "create_only": true,
+            "data": second_payload,
+        });
+        let first_task = tokio::spawn({
+            let barrier = Arc::clone(&barrier);
+            let registry = Arc::clone(&registry);
+            let data_dir = dir.path().to_path_buf();
+            async move {
+                barrier.wait().await;
+                handle_object_provider_runtime_request(&data_dir, registry, &first_request).await
+            }
+        });
+        let second_task = tokio::spawn({
+            let barrier = Arc::clone(&barrier);
+            let registry = Arc::clone(&registry);
+            let data_dir = dir.path().to_path_buf();
+            async move {
+                barrier.wait().await;
+                handle_object_provider_runtime_request(&data_dir, registry, &second_request).await
+            }
+        });
+        barrier.wait().await;
+
+        let (first, second) = tokio::join!(async { first_task.await.unwrap() }, async {
+            second_task.await.unwrap()
+        },);
+        let outcomes = [first, second];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|value| value["status"] == "ok")
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|value| value["message"] == "library destination already exists")
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        let winning_bytes = if outcomes[0]["status"] == "ok" {
+            b"first".as_slice()
+        } else if outcomes[1]["status"] == "ok" {
+            b"second".as_slice()
+        } else {
+            panic!("missing successful create_only write: {outcomes:?}");
+        };
+
+        let read = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "read",
+                "principal_id": principal_id,
+                "uri": file_uri,
+            }),
+        )
+        .await;
+        assert_eq!(read["status"], "ok", "{read}");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(read["data"]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(bytes, winning_bytes);
+    }
+
+    #[tokio::test]
+    async fn create_only_write_rejects_if_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let principal_id = "did:key:z6MkCreateOnlyIfRevision";
+        let file_uri = format!(
+            "{}/Documents/Notes.txt",
+            crate::auth::principal_localhost_root(principal_id)
+        );
+
+        let write = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "write",
+                "principal_id": principal_id,
+                "uri": file_uri,
+                "mime": "text/plain",
+                "if_revision": "rev:existing",
+                "create_only": true,
+                "data": base64::engine::general_purpose::STANDARD.encode(b"blocked"),
+            }),
+        )
+        .await;
+        assert_eq!(write["status"], "error", "{write}");
+        assert_eq!(
+            write["message"], "library create-only write does not accept if_revision",
+            "{write}"
+        );
+        assert!(!library_target(dir.path(), principal_id, &file_uri)
+            .unwrap()
+            .path
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn revisioned_write_still_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let principal_id = "did:key:z6MkRevisionedWrite";
+        let file_uri = format!(
+            "{}/Documents/Notes.txt",
+            crate::auth::principal_localhost_root(principal_id)
+        );
+
+        let write = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "write",
+                "principal_id": principal_id,
+                "uri": file_uri,
+                "mime": "text/plain",
+                "data": base64::engine::general_purpose::STANDARD.encode(b"original"),
+            }),
+        )
+        .await;
+        assert_eq!(write["status"], "ok", "{write}");
+        let revision = write["data"]["object"]["revision"].as_str().unwrap();
+
+        let replacement = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "write",
+                "principal_id": principal_id,
+                "uri": file_uri,
+                "mime": "text/plain",
+                "if_revision": revision,
+                "data": base64::engine::general_purpose::STANDARD.encode(b"updated"),
+            }),
+        )
+        .await;
+        assert_eq!(replacement["status"], "ok", "{replacement}");
+
+        let read = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "read",
+                "principal_id": principal_id,
+                "uri": file_uri,
+            }),
+        )
+        .await;
+        assert_eq!(read["status"], "ok", "{read}");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(read["data"]["data"].as_str().unwrap())
+                .unwrap(),
+            b"updated"
+        );
     }
 }

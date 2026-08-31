@@ -102,7 +102,17 @@ fn chain_provider_rejects_hidden_node_lifecycle_fields() {
 }
 
 fn provider_with_rights_rpc(rpc_url: String, selector: &str) -> ChainProvider {
-    provider_with_rights_rpc_and_policies(rpc_url, selector, json!([]))
+    provider_with_rights_rpc_and_policies(
+        rpc_url,
+        selector,
+        protected_content_policy_sources(
+            "view",
+            vec![
+                "https://rights-a.example.invalid".to_string(),
+                "https://rights-b.example.invalid".to_string(),
+            ],
+        ),
+    )
 }
 
 fn protected_content_policy_sources(
@@ -134,7 +144,29 @@ fn provider_with_rights_rpc_policies_and_purchase(
     protected_content_policies: Value,
     protected_content_market: Value,
 ) -> ChainProvider {
-    let networks = vec![json!({
+    let protected_content_policies = if protected_content_policies
+        .as_array()
+        .is_some_and(Vec::is_empty)
+    {
+        protected_content_policy_sources(
+            "view",
+            vec![
+                "https://rights-a.example.invalid".to_string(),
+                "https://rights-b.example.invalid".to_string(),
+            ],
+        )
+    } else {
+        protected_content_policies
+    };
+    let protected_content_market = if protected_content_market.is_null() {
+        protected_content_market_source(vec![
+            "https://market-a.example.invalid".to_string(),
+            "https://market-b.example.invalid".to_string(),
+        ])
+    } else {
+        protected_content_market
+    };
+    let protected_content_network = json!({
         "id": "esc-local",
         "display_name": "ESC Local",
         "kind": "evm_json_rpc",
@@ -151,14 +183,20 @@ fn provider_with_rights_rpc_policies_and_purchase(
             "selector": selector,
             "protected_content_policies": protected_content_policies
         }],
+        "protected_content_creator_mint": {
+            "ledger": "0x0000000000000000000000000000000000000022",
+            "pay_token": "0x0000000000000000000000000000000000000033",
+            "asset_created_emitter": "0x0000000000000000000000000000000000000044",
+            "abi": "elacity_mint_v1"
+        },
         "protected_content_market": protected_content_market
-    })];
+    });
     let mut provider = ChainProvider::new();
     let init = provider.handle(Request::Init {
         config: json!({
             "extra": {
                 "protected_content_runtime_issuer": runtime_issuer_hex(0x42),
-                "networks": networks
+                "protected_content_network": protected_content_network
             }
         }),
     });
@@ -172,6 +210,270 @@ fn protected_content_market_source(evidence_rpc_urls: Vec<String>) -> Value {
         "authority_gateway_contract": "0x00000000000000000000000000000000000000aa",
         "evidence_rpc_urls": evidence_rpc_urls
     })
+}
+
+fn complete_protected_content_network(id: &str) -> Value {
+    json!({
+        "id": id,
+        "display_name": "Protected ESC",
+        "kind": "evm_json_rpc",
+        "chain_id": 20,
+        "native_symbol": "ELA",
+        "provider": "operator",
+        "mainnet": true,
+        "explorer_url": null,
+        "rpc_url": "https://primary.example.invalid",
+        "rights_methods": [{
+            "id": "has_access_by_content_id",
+            "contract": "0x0000000000000000000000000000000000000001",
+            "abi": "has_access_by_content_id_address_bytes16",
+            "selector": "0x12345678",
+            "protected_content_policies": [{
+                "action": "view",
+                "evidence_rpc_urls": [
+                    "https://rights-a.example.invalid",
+                    "https://rights-b.example.invalid"
+                ]
+            }]
+        }],
+        "protected_content_creator_mint": {
+            "ledger": "0x0000000000000000000000000000000000000022",
+            "pay_token": "0x0000000000000000000000000000000000000033",
+            "asset_created_emitter": "0x0000000000000000000000000000000000000044",
+            "abi": "elacity_mint_v1"
+        },
+        "protected_content_market": {
+            "authority_gateway_contract": "0x00000000000000000000000000000000000000aa",
+            "evidence_rpc_urls": [
+                "https://market-a.example.invalid",
+                "https://market-b.example.invalid"
+            ]
+        }
+    })
+}
+
+#[test]
+fn protected_content_network_init_replaces_only_matching_default() {
+    let mut provider = ChainProvider::new();
+    let original_base = provider
+        .networks
+        .iter()
+        .find(|network| network.id == "base-mainnet")
+        .unwrap()
+        .rpc_url
+        .clone();
+
+    let response = provider.handle(Request::Init {
+        config: json!({
+            "extra": {
+                "protected_content_runtime_issuer": runtime_issuer_hex(0x42),
+                "protected_content_network": complete_protected_content_network("esc-mainnet")
+            }
+        }),
+    });
+
+    assert!(matches!(response, Response::Ok { .. }));
+    assert_eq!(provider.networks.len(), 4);
+    let protected = provider
+        .networks
+        .iter()
+        .find(|network| network.id == "esc-mainnet")
+        .unwrap();
+    assert_eq!(protected.rpc_url, "https://primary.example.invalid");
+    assert!(protected.protected_content_creator_mint.is_some());
+    assert!(protected.protected_content_market.is_some());
+    assert_eq!(
+        provider
+            .networks
+            .iter()
+            .find(|network| network.id == "base-mainnet")
+            .unwrap()
+            .rpc_url,
+        original_base
+    );
+}
+
+#[test]
+fn protected_content_network_init_rejects_invalid_or_ambiguous_authority() {
+    let mut provider = ChainProvider::new();
+    let mut incomplete = complete_protected_content_network("esc-mainnet");
+    incomplete
+        .as_object_mut()
+        .unwrap()
+        .remove("protected_content_market");
+    assert_eq!(
+        error_code(provider.handle(Request::Init {
+            config: json!({
+                "extra": {
+                    "protected_content_runtime_issuer": runtime_issuer_hex(0x42),
+                    "protected_content_network": incomplete
+                }
+            }),
+        })),
+        "invalid_config"
+    );
+
+    let mut unknown = complete_protected_content_network("esc-mainnet");
+    unknown["rights_methods"][0]["unexpected_endpoint"] = json!("private");
+    assert_eq!(
+        error_code(provider.handle(Request::Init {
+            config: json!({
+                "extra": {
+                    "protected_content_runtime_issuer": runtime_issuer_hex(0x42),
+                    "protected_content_network": unknown
+                }
+            }),
+        })),
+        "invalid_config"
+    );
+
+    assert_eq!(
+        error_code(provider.handle(Request::Init {
+            config: json!({
+                "extra": {
+                    "protected_content_runtime_issuer": runtime_issuer_hex(0x42),
+                    "protected_content_network": complete_protected_content_network("esc-mainnet"),
+                    "networks": [complete_protected_content_network("esc-mainnet")]
+                }
+            }),
+        })),
+        "invalid_config"
+    );
+
+    assert!(matches!(
+        provider.handle(Request::Init {
+            config: json!({
+                "extra": {
+                    "protected_content_runtime_issuer": runtime_issuer_hex(0x42),
+                    "protected_content_network": complete_protected_content_network("esc-mainnet")
+                }
+            }),
+        }),
+        Response::Ok { .. }
+    ));
+    assert_eq!(
+        error_code(provider.handle(Request::Init {
+            config: json!({
+                "extra": {
+                    "protected_content_runtime_issuer": runtime_issuer_hex(0x42),
+                    "protected_content_network": complete_protected_content_network("esc-mainnet")
+                }
+            }),
+        })),
+        "invalid_config"
+    );
+}
+
+#[test]
+fn protected_content_network_init_rejects_shared_rpc_origins() {
+    for source in ["rights", "market"] {
+        let mut network = complete_protected_content_network("esc-mainnet");
+        let shared_origin_sources = json!([
+            "https://shared-rpc.example.invalid/source-a",
+            "https://shared-rpc.example.invalid/source-b"
+        ]);
+        if source == "rights" {
+            network["rights_methods"][0]["protected_content_policies"][0]["evidence_rpc_urls"] =
+                shared_origin_sources;
+        } else {
+            network["protected_content_market"]["evidence_rpc_urls"] = shared_origin_sources;
+        }
+        let mut provider = ChainProvider::new();
+        let generic_init = provider.handle(Request::Init {
+            config: json!({
+                "extra": {
+                    "protected_content_runtime_issuer": runtime_issuer_hex(0x42)
+                }
+            }),
+        });
+        assert!(matches!(generic_init, Response::Ok { .. }));
+        let generic_networks = ok_data(provider.handle(Request::Networks));
+
+        let response = provider.handle(Request::Init {
+            config: json!({
+                "extra": {
+                    "protected_content_runtime_issuer": runtime_issuer_hex(0x42),
+                    "protected_content_network": network
+                }
+            }),
+        });
+
+        assert_eq!(error_code(response), "invalid_config", "source={source}");
+        assert_eq!(
+            ok_data(provider.handle(Request::Networks)),
+            generic_networks,
+            "source={source}"
+        );
+    }
+}
+
+#[test]
+fn full_networks_init_rejects_every_protected_content_source_kind() {
+    let complete = complete_protected_content_network("esc-local");
+    let mut source_networks = Vec::new();
+
+    let mut rights = complete.clone();
+    rights
+        .as_object_mut()
+        .unwrap()
+        .remove("protected_content_creator_mint");
+    rights
+        .as_object_mut()
+        .unwrap()
+        .remove("protected_content_market");
+    source_networks.push(rights);
+
+    let mut mint = complete.clone();
+    mint.as_object_mut().unwrap().remove("rights_methods");
+    mint.as_object_mut()
+        .unwrap()
+        .remove("protected_content_market");
+    source_networks.push(mint);
+
+    let mut market = complete;
+    market.as_object_mut().unwrap().remove("rights_methods");
+    market
+        .as_object_mut()
+        .unwrap()
+        .remove("protected_content_creator_mint");
+    source_networks.push(market);
+
+    for network in source_networks {
+        let mut provider = ChainProvider::new();
+        assert_eq!(
+            error_code(provider.handle(Request::Init {
+                config: json!({"networks": [network]}),
+            })),
+            "invalid_config"
+        );
+        assert!(provider
+            .networks
+            .iter()
+            .all(|network| !network_has_protected_content_source(network)));
+    }
+}
+
+#[test]
+fn protected_content_network_public_responses_omit_private_topology_and_issuer() {
+    let issuer = runtime_issuer_hex(0x42);
+    let mut provider = ChainProvider::new();
+    let init = provider.handle(Request::Init {
+        config: json!({
+            "extra": {
+                "protected_content_runtime_issuer": issuer,
+                "protected_content_network": complete_protected_content_network("esc-mainnet")
+            }
+        }),
+    });
+    let networks = provider.handle(Request::Networks);
+
+    for response in [init, networks] {
+        let value = serde_json::to_value(response).unwrap();
+        assert_json_strings_do_not_contain(&value, &issuer);
+        assert_json_strings_do_not_contain(&value, "primary.example.invalid");
+        assert_json_strings_do_not_contain(&value, "rights-a.example.invalid");
+        assert_json_strings_do_not_contain(&value, "market-a.example.invalid");
+    }
 }
 
 fn mutated_asset_created_log_data(mut log: Value, mutate: impl FnOnce(&mut Vec<u8>)) -> Value {
@@ -204,7 +506,7 @@ fn provider_with_creator_mint_rpc_and_market_sources(
         config: json!({
             "extra": {
                 "protected_content_runtime_issuer": runtime_issuer_hex(0x42),
-                "networks": [{
+                "protected_content_network": {
                     "id": "base-local",
                     "display_name": "Base Local",
                     "kind": "evm_json_rpc",
@@ -214,7 +516,19 @@ fn provider_with_creator_mint_rpc_and_market_sources(
                     "mainnet": true,
                     "explorer_url": null,
                     "rpc_url": rpc_url,
-                    "rights_methods": [],
+                    "rights_methods": [{
+                        "id": "has_access_by_content_id",
+                        "contract": "0x0000000000000000000000000000000000000001",
+                        "abi": "has_access_by_content_id_address_bytes16",
+                        "selector": "0x12345678",
+                        "protected_content_policies": [{
+                            "action": "view",
+                            "evidence_rpc_urls": [
+                                "https://rights-a.example.invalid",
+                                "https://rights-b.example.invalid"
+                            ]
+                        }]
+                    }],
                     "protected_content_creator_mint": {
                         "ledger": "0x0000000000000000000000000000000000000022",
                         "pay_token": "0x0000000000000000000000000000000000000033",
@@ -225,7 +539,7 @@ fn provider_with_creator_mint_rpc_and_market_sources(
                         "authority_gateway_contract": "0x00000000000000000000000000000000000000aa",
                         "evidence_rpc_urls": evidence_rpc_urls
                     }
-                }]
+                }
             }
         }),
     });
@@ -242,15 +556,11 @@ fn resolved_policy_body_from_data(data: &Value) -> RightsPolicyBodyV1 {
     RightsPolicyBodyV1::from_canonical_bytes(&bytes).unwrap()
 }
 
-fn provider_with_rights_rpc_without_runtime_issuer(
-    rpc_url: String,
-    selector: &str,
-) -> ChainProvider {
+fn provider_with_ordinary_rights_rpc(rpc_url: String, selector: &str) -> ChainProvider {
     let mut provider = ChainProvider::new();
     let init = provider.handle(Request::Init {
         config: json!({
-            "extra": {
-                "networks": [{
+            "networks": [{
                     "id": "esc-local",
                     "display_name": "ESC Local",
                     "kind": "evm_json_rpc",
@@ -267,7 +577,6 @@ fn provider_with_rights_rpc_without_runtime_issuer(
                         "selector": selector
                     }]
                 }]
-            }
         }),
     });
     assert!(matches!(init, Response::Ok { .. }));
@@ -1597,18 +1906,25 @@ fn bitcoin_sync_health_reports_initial_block_download() {
 }
 
 #[test]
-fn protected_content_rights_evidence_requires_configured_runtime_issuer_before_backend() {
-    let operation = protected_content_signed_operation();
-    let mut provider = provider_with_rights_rpc_without_runtime_issuer(
-        "http://127.0.0.1:9".to_string(),
-        "0x12345678",
-    );
+fn full_networks_init_accepts_ordinary_rights_methods_without_protected_source() {
+    let provider =
+        provider_with_ordinary_rights_rpc("http://127.0.0.1:9".to_string(), "0x12345678");
+    assert_eq!(provider.networks.len(), 1);
+    assert!(!network_has_protected_content_source(&provider.networks[0]));
+}
 
+#[test]
+fn protected_content_network_init_requires_runtime_issuer() {
+    let mut provider = ChainProvider::new();
     assert_eq!(
-        error_code(provider.handle(Request::ProtectedContentRightsEvidence {
-            signed_runtime_release_operation: contract_hex(&operation),
+        error_code(provider.handle(Request::Init {
+            config: json!({
+                "extra": {
+                    "protected_content_network": complete_protected_content_network("esc-mainnet")
+                }
+            }),
         })),
-        "runtime_issuer_not_configured"
+        "invalid_config"
     );
 }
 
@@ -2467,10 +2783,10 @@ fn resolve_protected_content_policy_returns_canonical_policy_and_evidence_accept
 }
 
 #[test]
-fn resolve_protected_content_policy_rejects_missing_or_ambiguous_sources() {
+fn resolve_protected_content_policy_rejects_missing_or_competing_sources() {
     let encrypted_content = encrypted_content(0x31);
     let access_id = content_access_id(0x51);
-    let mut provider = provider_with_rights_rpc("http://127.0.0.1:9".to_string(), "0x12345678");
+    let mut provider = ChainProvider::new();
     assert_eq!(
         error_code(provider.handle(Request::ResolveProtectedContentPolicy {
             encrypted_content: contract_hex(&encrypted_content),
@@ -2532,14 +2848,14 @@ fn resolve_protected_content_policy_rejects_missing_or_ambiguous_sources() {
             }
         }),
     });
-    assert!(matches!(init, Response::Ok { .. }));
+    assert_eq!(error_code(init), "invalid_config");
     assert_eq!(
         error_code(provider.handle(Request::ResolveProtectedContentPolicy {
             encrypted_content: contract_hex(&encrypted_content),
             content_access_id: format!("0x{}", encode_hex(access_id.as_bytes())),
             action: ProtectedContentPolicyAction::View,
         })),
-        "ambiguous_rights_policy_source"
+        "rights_policy_not_configured"
     );
 }
 
@@ -2629,7 +2945,26 @@ fn resolve_protected_content_creator_mint_returns_exact_call_and_content_access_
 }
 
 #[test]
-fn resolve_protected_content_creator_mint_rejects_missing_or_ambiguous_creator_network() {
+fn describe_protected_content_creator_mint_source_returns_exact_configured_facts() {
+    let mut provider = provider_with_creator_mint_rpc("http://127.0.0.1:9".to_string());
+    let data = ok_data(provider.handle(Request::DescribeProtectedContentCreatorMintSource));
+    assert_eq!(data["schema"], PROTECTED_CONTENT_CREATOR_MINT_SOURCE_SCHEMA);
+    assert_eq!(data["network"], "base-local");
+    assert_eq!(data["chain_namespace"], "eip155:8453");
+    assert_eq!(data["ledger"], "0x0000000000000000000000000000000000000022");
+    assert_eq!(
+        data["pay_token"],
+        "0x0000000000000000000000000000000000000033"
+    );
+    assert_eq!(data["abi"], "elacity_mint_v1");
+    assert_eq!(
+        data["function"],
+        ProtectedContentCreatorMintAbi::ElacityMintV1.function()
+    );
+}
+
+#[test]
+fn resolve_protected_content_creator_mint_rejects_missing_or_competing_creator_network() {
     let mut unconfigured = ChainProvider::new();
     let init = unconfigured.handle(Request::Init {
         config: json!({
@@ -2653,7 +2988,11 @@ fn resolve_protected_content_creator_mint_rejects_missing_or_ambiguous_creator_n
             }
         }),
     });
-    assert!(matches!(init, Response::Ok { .. }));
+    assert_eq!(error_code(init), "invalid_config");
+    assert_eq!(
+        error_code(unconfigured.handle(Request::DescribeProtectedContentCreatorMintSource)),
+        "protected_content_creator_mint_not_configured"
+    );
     assert_eq!(
         error_code(
             unconfigured.handle(Request::ResolveProtectedContentCreatorMint {
@@ -2712,7 +3051,11 @@ fn resolve_protected_content_creator_mint_rejects_missing_or_ambiguous_creator_n
             }
         }),
     });
-    assert!(matches!(init, Response::Ok { .. }));
+    assert_eq!(error_code(init), "invalid_config");
+    assert_eq!(
+        error_code(ambiguous.handle(Request::DescribeProtectedContentCreatorMintSource)),
+        "protected_content_creator_mint_not_configured"
+    );
     assert_eq!(
         error_code(
             ambiguous.handle(Request::ResolveProtectedContentCreatorMint {
@@ -2723,7 +3066,7 @@ fn resolve_protected_content_creator_mint_rejects_missing_or_ambiguous_creator_n
                 price: "0x5".to_string(),
             })
         ),
-        "ambiguous_protected_content_creator_mint_source"
+        "protected_content_creator_mint_not_configured"
     );
 }
 
@@ -4383,8 +4726,7 @@ fn protected_content_rights_evidence_rejects_unconfigured_selector_without_backe
 }
 
 #[test]
-fn protected_content_rights_evidence_rejects_ambiguous_configured_sources() {
-    let operation = protected_content_signed_operation();
+fn protected_content_rights_evidence_rejects_competing_full_network_sources() {
     let mut provider = ChainProvider::new();
     let init = provider.handle(Request::Init {
         config: json!({
@@ -4437,14 +4779,11 @@ fn protected_content_rights_evidence_rejects_ambiguous_configured_sources() {
             ]
         }),
     });
-    assert!(matches!(init, Response::Ok { .. }));
-    provider.now_unix_seconds = rights_evidence_now;
-    assert_eq!(
-        error_code(provider.handle(Request::ProtectedContentRightsEvidence {
-            signed_runtime_release_operation: contract_hex(&operation),
-        })),
-        "ambiguous_rights_evidence_source"
-    );
+    assert_eq!(error_code(init), "invalid_config");
+    assert!(provider
+        .networks
+        .iter()
+        .all(|network| !network_has_protected_content_source(network)));
 }
 
 #[test]

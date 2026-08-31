@@ -521,7 +521,6 @@ mod tests {
             RightsProviderRequestV1::new_evaluate(node_public_key(node_seed), operation).unwrap();
         ValidatedRightsProviderRequestV1::decode_and_validate_at(
             &request.to_json_vec().unwrap(),
-            operation.statement().runtime_operation_issuer(),
             NOW + 3,
         )
         .unwrap()
@@ -834,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn validated_request_rejects_signature_mutation_and_wrong_runtime_issuer() {
+    fn validated_request_rejects_signature_mutation() {
         let operation = signed_operation(0x42);
         let request =
             RightsProviderRequestV1::new_evaluate(node_public_key(1), &operation).unwrap();
@@ -847,23 +846,9 @@ mod tests {
             .rposition(|byte| byte.is_ascii_digit())
             .expect("request contains signature digits");
         bytes[pos] = if bytes[pos] == b'0' { b'1' } else { b'0' };
-        assert!(ValidatedRightsProviderRequestV1::decode_and_validate_at(
-            &bytes,
-            operation.statement().runtime_operation_issuer(),
-            NOW + 3,
-        )
-        .is_err());
-        assert!(ValidatedRightsProviderRequestV1::decode_and_validate_at(
-            &request.to_json_vec().unwrap(),
-            RuntimeOperationIssuerKeyV1::new(
-                SigningKey::from_bytes(&[0x24; 32])
-                    .verifying_key()
-                    .to_bytes()
-            )
-            .unwrap(),
-            NOW + 3,
-        )
-        .is_err());
+        assert!(
+            ValidatedRightsProviderRequestV1::decode_and_validate_at(&bytes, NOW + 3,).is_err()
+        );
     }
 
     fn rights_request(
@@ -995,13 +980,11 @@ mod tests {
         let operation = signed_operation(0x42);
         let request = rights_request(&operation, 1);
         let validated = validated_request(&operation, 1);
-        let issuer = operation.statement().runtime_operation_issuer();
         let allow_data = chain_data_for(&evidence_for(&validated, true));
         let deny_data = chain_data_for(&evidence_for(&validated, false));
 
         let allow = block_on(evaluate_rights_via_chain(
             node_signing_key(1),
-            issuer,
             &request,
             NOW + 4,
             |chain_request| async move {
@@ -1025,7 +1008,6 @@ mod tests {
 
         let deny = block_on(evaluate_rights_via_chain(
             node_signing_key(1),
-            issuer,
             &request,
             NOW + 4,
             |_| async move { Ok(deny_data) },
@@ -1041,39 +1023,15 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_rights_via_chain_does_not_invoke_on_invalid_request_or_wrong_node() {
-        let operation = signed_operation(0x42);
+    fn evaluate_rights_via_chain_accepts_declared_buyer_runtime_and_rejects_wrong_node() {
+        let operation = signed_operation(0x43);
         let request = rights_request(&operation, 1);
         let calls = Arc::new(AtomicUsize::new(0));
-
-        let wrong_issuer = RuntimeOperationIssuerKeyV1::new(
-            SigningKey::from_bytes(&[0x24; 32])
-                .verifying_key()
-                .to_bytes(),
-        )
-        .unwrap();
-        let issuer_calls = Arc::clone(&calls);
-        assert_eq!(
-            block_on(evaluate_rights_via_chain(
-                node_signing_key(1),
-                wrong_issuer,
-                &request,
-                NOW + 4,
-                move |_| {
-                    issuer_calls.fetch_add(1, Ordering::SeqCst);
-                    async { panic!("chain must not be invoked") }
-                },
-            ))
-            .unwrap_err(),
-            RightsEvaluationErrorV1::Contract
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         let node_calls = Arc::clone(&calls);
         assert_eq!(
             block_on(evaluate_rights_via_chain(
                 node_signing_key(2),
-                operation.statement().runtime_operation_issuer(),
                 &request,
                 NOW + 4,
                 move |_| {
@@ -1099,7 +1057,6 @@ mod tests {
         assert_eq!(
             block_on(evaluate_rights_via_chain(
                 node_signing_key(1),
-                operation.statement().runtime_operation_issuer(),
                 &request,
                 NOW + 4,
                 move |chain_request| {

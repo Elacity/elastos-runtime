@@ -37,6 +37,8 @@ const TUI_FOOTER_TEXT: &str =
     " Keys: Up/Down select  Left/Right/Tab sections  Enter open  r refresh  q/Esc Desktop  ? help";
 const TUI_HELP_FOOTER_TEXT: &str = " Keys: ? close help  q/Esc Desktop  Left/Right/Tab sections";
 const PEOPLE_TARGET_ID: &str = "people";
+const INBOX_TARGET_ID: &str = "inbox";
+const INBOX_NOTIFICATION_HANDOFF_ACTION_PREFIX: &str = "inbox-review-notification:";
 
 #[derive(Debug, Clone, Deserialize)]
 struct HomeSnapshot {

@@ -492,11 +492,14 @@ export function initializeShellLayout(summary) {
   syncHomeBrowserState(summary);
   const stored = shellState.homeBrowserState.layout;
   const normalizedDesktopHidden = normalizeDesktopHiddenTargets(
-    stored ? stored.desktopHidden : null,
+    stored ? stored.desktopHidden : defaultHiddenDesktopTargets(summary),
     summary,
   );
   shellState.shellLayoutState = {
-    taskbar: normalizeTaskbarLayout(stored ? stored.taskbar : null, summary),
+    taskbar: normalizeTaskbarLayout(
+      stored ? stored.taskbar : defaultTaskbarPins(summary),
+      summary,
+    ),
     desktop: {},
     desktopLabels: normalizeDesktopLabels(stored ? stored.desktopLabels : null, summary),
     desktopHidden: normalizedDesktopHidden,
@@ -514,7 +517,12 @@ export function initializeShellLayout(summary) {
     ? stored.desktop
     : {};
   const occupiedPositions = [];
-  for (const [index, entry] of desktopLayoutEntries(summary).entries()) {
+  const layoutEntries = (
+    stored
+      ? desktopLayoutEntries(summary)
+      : desktopLayoutEntries(summary).filter((entry) => desktopEntryExists(summary, entry.id))
+  );
+  for (const [index, entry] of layoutEntries.entries()) {
     const defaultPosition = defaultDesktopPosition(index);
     const storedPosition = storedDesktop[entry.id];
     let position = clampDesktopPosition(normalizeDesktopPosition(storedPosition, defaultPosition));
@@ -652,6 +660,13 @@ function normalizeTaskbarLayout(taskbar, summary) {
   return normalized;
 }
 
+const DEFAULT_TASKBAR_PINS = ["browser", "library", "wallet", "documents", "chat-room", "system"];
+
+function defaultTaskbarPins(summary) {
+  const knownTargets = new Set(allVisibleTargets(summary).map((target) => target.target));
+  return DEFAULT_TASKBAR_PINS.filter((targetId) => knownTargets.has(targetId));
+}
+
 function normalizeDesktopLabels(labels, summary) {
   const knownTargets = new Set(allVisibleTargets(summary).map((target) => target.target));
   const normalized = {};
@@ -666,6 +681,12 @@ function normalizeDesktopLabels(labels, summary) {
     normalized[targetId] = nextLabel;
   }
   return normalized;
+}
+
+function defaultHiddenDesktopTargets(summary) {
+  return allVisibleTargets(summary)
+    .filter((target) => target.target_kind !== "object")
+    .map((target) => target.target);
 }
 
 function normalizeDesktopHiddenTargets(targetIds, summary) {
@@ -951,6 +972,12 @@ export function trapTabWithin(container, event) {
 }
 
 export function mountGlyph(container, targetId, forcedTone) {
+  if (targetId === "trash" || targetId === "trash-full") {
+    container.dataset.tone = "raster";
+    container.dataset.icon = "bin";
+    container.innerHTML = "";
+    return;
+  }
   const tone = forcedTone || glyphTone(targetId);
   container.dataset.tone = tone;
   const capsuleIcon = capsuleIconMarkup(targetId);
