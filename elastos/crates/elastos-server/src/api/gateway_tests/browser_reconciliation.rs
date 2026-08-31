@@ -106,6 +106,24 @@ async fn finish_current_reconciliation_sweep() {
     }
 }
 
+async fn settle_sweep_without_virtual_time_autoadvance(
+    reconciler: &BrowserLifecycleReconciler,
+    expected_completed_sweeps: usize,
+) {
+    tokio::select! {
+        biased;
+        _ = reconciler.wait_for_completed_sweeps(expected_completed_sweeps) => {}
+        _ = async {
+            for _ in 0..5_000_000 {
+                tokio::task::yield_now().await;
+            }
+        } => panic!(
+            "reconciler sweep {expected_completed_sweeps} did not settle under a paused clock \
+             without a real-clock timeout"
+        ),
+    }
+}
+
 async fn advance_until_reconciliation_call_count(
     calls: &BrowserReconciliationCallRecorder,
     expected: usize,
@@ -416,7 +434,7 @@ async fn stale_stream_timeout_releases_exact_claim_for_retry_without_restart() {
     );
 
     let mut completed_sweeps = 2;
-    for _ in 0..4 {
+    for _ in 0..64 {
         if browser_engine_cleanup_obligation_count(&state.data_dir).await == 0
             && browser_stream_cleanup_obligation_count(&state.data_dir).await == 0
         {
@@ -425,8 +443,19 @@ async fn stale_stream_timeout_releases_exact_claim_for_retry_without_restart() {
         notify_browser_lifecycle_reconciler(&state.data_dir);
         reconciler.resume_sweeps();
         completed_sweeps += 1;
-        reconciler.wait_for_completed_sweeps(completed_sweeps).await;
+        settle_sweep_without_virtual_time_autoadvance(&reconciler, completed_sweeps).await;
     }
+    assert_eq!(
+        browser_engine_cleanup_obligation_count(&state.data_dir).await,
+        0,
+        "exact engine cleanup obligations must drain to 0 via retry sweeps"
+    );
+    assert_eq!(
+        browser_stream_cleanup_obligation_count(&state.data_dir).await,
+        0,
+        "exact stream cleanup obligations must drain to 0 via retry sweeps"
+    );
+    exit_close_calls.wait_for_count(2).await;
     let calls = exit_close_calls.snapshot().await;
     assert!(calls.len() >= 2);
     assert!(calls.iter().all(|call| {
@@ -519,7 +548,7 @@ async fn hanging_stream_timeout_releases_exact_claim_for_retry_without_restart()
     // committed close count directly before reading the calls.
     let mut completed_sweeps = 1;
     for _ in 0..64 {
-        if exit_close_calls.snapshot().await.len() >= 2
+        if exit_close_calls.count() >= 2
             && browser_stream_cleanup_obligation_count(&state.data_dir).await == 0
         {
             break;
@@ -527,8 +556,13 @@ async fn hanging_stream_timeout_releases_exact_claim_for_retry_without_restart()
         notify_browser_lifecycle_reconciler(&state.data_dir);
         reconciler.resume_sweeps();
         completed_sweeps += 1;
-        reconciler.wait_for_completed_sweeps(completed_sweeps).await;
+        settle_sweep_without_virtual_time_autoadvance(&reconciler, completed_sweeps).await;
     }
+    assert_eq!(
+        browser_stream_cleanup_obligation_count(&state.data_dir).await,
+        0,
+        "exact stream cleanup obligations must drain to 0 via retry sweeps"
+    );
     exit_close_calls.wait_for_count(2).await;
     let calls = exit_close_calls.snapshot().await;
     assert!(calls.len() >= 2);
