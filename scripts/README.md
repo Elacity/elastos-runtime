@@ -26,9 +26,10 @@ just verify-release
 
 `just verify` is the source gate. It runs documentation and product alignment,
 versioning, WIT and template checks, Home and Browser entropy checks, command
-audits, formatting, Clippy, and workspace tests. `just verify-release` adds the
-local Carrier setup and Home front-door proofs. Publishing trust and signer
-verification are separate release gates.
+audits, formatting, Clippy, Runtime workspace tests, own-workspace capsule
+tests, and the separate Browser local-exit checks. `just verify-release` adds
+browser-based UI source checks, local Carrier setup and Home front-door proofs.
+Publishing trust and signer verification are separate release gates.
 
 ## Public-install proof
 
@@ -53,7 +54,7 @@ Before a candidate gateway exists, use
 relay-health check.
 
 The full release order and manual target pass are in the
-[0.6.0 acceptance runbook](../docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md).
+[source integration and release checklist](../docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md).
 
 ## Focused proof
 
@@ -119,8 +120,9 @@ ports, and data roots belong in local operator notes.
 
 `mac-source-home-restart.sh` and `linux-source-home-restart.sh` restart only the
 stable source-home Runtime after they validate the installation receipt,
-current clean source identity, exact prior process, bounded rollback, and
-served artifact parity. Linux writes
+exact prior process, bounded rollback, and served artifact parity. Mac default
+mode uses the existing installation; `--init` also requires current clean
+source and artifact parity. Linux writes
 `receipts/linux-source-home-restart.json` under the stable data root and has no
 receipt-output argument.
 

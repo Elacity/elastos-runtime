@@ -4,10 +4,27 @@ This file is the durable working contract for people and agents changing this
 repo. Product principles live in [PRINCIPLES.md](PRINCIPLES.md), current truth
 lives in [state.md](state.md), and open work lives in [TASKS.md](TASKS.md).
 
+## User-Facing Communication
+
+- Use ASD-STE100 Simplified Technical English for user-facing communication.
+- Describe the intended behavior first, with clear actors and ownership.
+- Express security and architecture boundaries as positive ownership statements.
+  Example: "Runtime keeps provider routes private" instead of a list of places
+  where routes must not appear.
+- State a current gap once, then explain the desired behavior. Do not repeat the
+  same limitation in several forms.
+- Use connected, natural paragraphs. Avoid staccato status sentences, chains of
+  negation, and long prohibition lists.
+- Before sending a public comment, community update, handoff, or summary, apply
+  the humanizer skill and rewrite repeated uses of "not", "no", "never", and
+  "must not" as direct statements of behavior or ownership.
+- Keep technical precision without turning every sentence into a disclaimer.
+
 ## Branch Roles
 
-- `main` is the stable release line; it currently represents 0.6.0.
-- `upstream/0.7-dev` is the current development integration line.
+- `main` is the stable source line; it currently contains the 0.6 source.
+  Release status, exact refs, and remaining proof come from `state.md`.
+- `upstream/0.7-dev` is the current 0.7 development integration line.
 - Feature and fix branches remain unpublished working lines until they are
   explicitly pushed for review.
 - Do not assume a `review/*` or `live` ref exists. Identify the exact public
@@ -71,6 +88,57 @@ git diff --stat <target>...<branch>
 Avoid creating timestamped backup branches during normal work. If a backup is
 unavoidable, name the reason, keep a cleanup task with it, and remove it after
 the protected work is merged or proven duplicate.
+
+## Local Hygiene And Retention
+
+Local refs, worktrees, build outputs, proof directories, installed artifacts,
+and rollback copies are operational state with an explicit lifecycle. Creating
+them creates a cleanup obligation; "temporary" is not a lifecycle.
+
+- Keep a local, untracked operator ledger for every non-canonical branch,
+  worktree, detached HEAD, large proof directory, installed runtime, and
+  rollback set. Record its exact path or ref, commit and tree where applicable,
+  owner or purpose, dirty state, creation or observation date, protection
+  source, and one terminal decision: keep, review/merge, archive, or remove.
+  Never commit private paths or operator details from this ledger.
+- Keep local branches only for active development or valuable work that is not
+  protected by a fetched remote ref or intentional tag. Do not create
+  `backup/*`, `archive/*`, timestamped safety, or sync refs for clean or already
+  published commits. A temporary preservation ref must name the dirty or
+  unanchored state it protects, have a ledger cleanup condition, and be removed
+  as soon as that condition is met.
+- Do not leave an unanchored detached HEAD. Before ending the task that creates
+  one, either attach it to an intentional branch/tag, prove that another ref
+  contains it, or record it as an explicit preservation blocker in the local
+  ledger.
+- A temporary worktree must be removed before handoff unless its ledger entry
+  names the active task and cleanup condition. Keep at most one worktree for a
+  branch. A clean checkout is reproducible state, not a backup.
+- Before deleting a duplicate ref, prove exact commit identity. Same-tree but
+  different-history refs are not automatic deletion candidates: preserve or
+  explicitly waive the unique history first. Before deleting a worktree,
+  verify its status, untracked files, open files/processes, and protecting ref.
+- Build outputs, Cargo targets, dependency caches, VM hibernation state, and
+  proof scratch directories are rebuildable artifacts, not rollback copies.
+  Do not retain them merely because they were expensive to create.
+- Never run an installed or long-lived Runtime from `/tmp`, `/private/tmp`, a
+  Cargo `target` directory, or another disposable checkout. Install it to a
+  stable data path with a receipt binding source commit, source tree, binary
+  SHA-256, components manifest, capsule tree, and installation time.
+- Retain no rollback by default. A named risky deployment, migration, or
+  incident may temporarily keep at most one verified rollback for the affected
+  release/platform; it needs a receipt, size, reason, explicit expiry or cleanup
+  condition, and must be removed when that gate closes. Do not recursively copy
+  a live data root without an explicit size estimate and exclusion list for
+  existing backups, VM images, caches, identity state, and user data.
+- Maintain at least 10% free space on development and staging volumes. If free
+  space falls below that threshold, stop creating worktrees, builds, VM images,
+  and backups until the ledger is reconciled and safe reclaim has completed.
+- Before handoff, rerun the branch/worktree inventory, check every touched
+  worktree for dirt, report local/remote divergence, and update the local
+  ledger. Do not describe a cleanup as complete while an unexplained ref,
+  detached HEAD, worktree, active temporary binary, or unbounded rollback set
+  remains.
 
 ## Publishing Terms And Gates
 

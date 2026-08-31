@@ -184,6 +184,7 @@ function listMarkdownFiles(dir = repoRootPath) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".elastos" ||
       entry.name === ".superpowers" ||
       entry.name === "superpowers" ||
       entry.name === ".claude" ||
@@ -208,6 +209,7 @@ function listTextFiles(dir) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".elastos" ||
       entry.name === ".superpowers" ||
       entry.name === "superpowers" ||
       entry.name === ".claude" ||
@@ -1787,8 +1789,8 @@ assert(
     agentsContract.includes("## Public Live Deployment") &&
     agentsContract.includes("## Staging Machines") &&
     agentsContract.includes("## Browser Claim Discipline") &&
-    agentsContract.includes("`main` is the stable release line; it currently represents 0.6.0") &&
-    agentsContract.includes("`upstream/0.7-dev` is the current development integration line") &&
+    agentsContract.includes("`main` is the stable source line; it currently contains the 0.6 source") &&
+    agentsContract.includes("`upstream/0.7-dev` is the current 0.7 development integration line") &&
     agentsContract.includes("Do not assume a `review/*` or `live` ref exists") &&
     agentsContract.includes("reporting its exact branch, commit, tree id, dirty status") &&
     agentsContract.includes("Target proof must cite the exact source tree") &&
@@ -9227,8 +9229,10 @@ assert(
     currentState.includes(
       "Docker/Selkies is only `managed_baseline_not_final_product`",
     ) &&
-    currentState.includes(
-      "single-session; active pages are a serialization blocker",
+    currentState.includes("Hosted tooling supports per-launch targets") &&
+    includesNormalized(
+      currentState,
+      "concurrent product sessions require their own installed capacity and cleanup proof",
     ) &&
     currentState.includes("not a product native-browser proof target") &&
     currentState.includes(
@@ -11713,7 +11717,8 @@ assert(
     runtimeChecklist.includes("## Installed acceptance") &&
     runtimeChecklist.includes("## Release gate") &&
     runtimeChecklist.includes("source, installed-product behavior, and public deployment as separate") &&
-    runtimeChecklist.includes("fix/elastos-shell-protocol-browser-wallet-consolidation") &&
+    runtimeChecklist.includes("feat/protected-content-uiux-reconstruction") &&
+    runtimeChecklist.includes("## Source integration gate") &&
     runtimeChecklist.includes("just verify") &&
     runtimeChecklist.includes("scripts/public-install-identity-smoke.sh") &&
     runtimeChecklist.includes("scripts/public-install-home-frontdoor-smoke.sh") &&
@@ -11737,7 +11742,7 @@ assert(
     currentState.includes("lacks the current `home` setup profile") &&
     tasks.includes("Keep source/local Carrier setup proof green") &&
     tasks.includes("scripts/local-carrier-setup-smoke.sh") &&
-    tasks.includes("publish the 0.6.0 binary/artifact set so no-override public installed-path smokes use current code"),
+    tasks.includes("publish the approved version's binary/artifact set so no-override public installed-path smokes use current code"),
   "Install docs, release checklist, state, tasks, and executable smokes must preserve separate source, installed, and public-release proof boundaries",
 );
 assert(

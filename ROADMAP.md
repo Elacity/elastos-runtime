@@ -185,14 +185,13 @@ E. PQ-hybrid share wrap, recipient possession, decrypt-session wrap, and the
    now uses production rights wiring, three independently addressed
    custody-provider processes, one protect-provider process, and the
    decrypt-provider process, and already covers the combined wrong-object/media
-   binding and durable replay cases. This inactive source proof runs on one
-   Runtime with two principals. The requested localhost-to-seed journey first
-   needs a typed buyer Runtime import or resolution operation for the creator's
-   immutable listing, which is currently a local Runtime record, plus custody
-   release that authenticates a buyer Runtime
-   issuer distinct from the provisioning Runtime. A shared listing link is
-   sufficient for 0.7. Global listing discovery and public custody governance
-   remain later work.
+   binding and durable replay cases. The source proof also spans two distinct
+   Runtimes: the buyer imports and verifies the creator's immutable listing,
+   buys, opens, reads and closes with its own Profile, Wallet and device
+   identity. Release authenticates the buyer Runtime separately from the
+   provisioning Runtime. The corresponding funded installed journey remains
+   open. A shared listing link is sufficient for 0.7; global listing discovery
+   and public custody governance remain later work.
 
 After that source slice, the ordered gates are final source review, same-tree
 installation, signed 2-of-3 custody, private Chain and deployed proof, bound-KID
@@ -211,7 +210,7 @@ The published protected-content lifecycle source reaches
 `origin/feat/protected-content-runtime-lifecycle` at `854d9dc9`. The earlier
 published `origin/feat/protected-content-custody-provider` branch remains
 historical source-only evidence for the custody-provider introduction. Local
-integrated source through `b817e0fe` adds the inactive Runtime-owned
+integration in PR39 includes the inactive Runtime-owned
 mint/list/buy/open/release/decrypt/close path, stable installation receipts,
 the static installed audit, and exact platform restart ownership. It does not
 change the active installed protected-content path. The remaining-work plan is

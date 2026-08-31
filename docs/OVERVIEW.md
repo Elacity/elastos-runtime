@@ -26,5 +26,5 @@ Use these documents as the sources of truth:
 - [Documentation index](README.md): the complete active documentation map.
 
 Release readiness is tracked by the
-[0.6 acceptance checklist](RUNTIME_REPO_USER_STORY_CHECKLIST.md). This overview
+[source and release checklist](RUNTIME_REPO_USER_STORY_CHECKLIST.md). This overview
 does not declare a feature, target, or release accepted.

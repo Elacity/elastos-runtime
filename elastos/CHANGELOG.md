@@ -5,7 +5,7 @@ All notable changes to the public ElastOS Runtime repository.
 ## [Unreleased]
 
 ### Added
-- The unpublished 0.7 source integrates the reviewed protected-content
+- The 0.7 source candidate integrates the reviewed protected-content
   lifecycle with collaboration, Home/platform, Wallet, GBA, model-provider,
   Assistant, Library, Marketplace, and player UIUX. The Runtime-owned
   protected-content path remains inactive until installed proof and cutover.
@@ -30,8 +30,28 @@ All notable changes to the public ElastOS Runtime repository.
   Profile setup are separate: a valid passkey remains valid when Profile setup
   is not ready, and People directs the person to System Recovery rather than
   hiding protection or Recovery changes behind a profile save.
+- The privacy-reviewed Home journey audit is available under `docs/audits`.
+  It records findings and test coverage; prerequisite-blocked and partial
+  observations remain separate from completed tests.
 
 ### Fixed
+- Runtime's executable watcher skips whole-binary hashing while the file's
+  metadata is unchanged. Startup and changed-file checks still verify the hash.
+- A mint retry adopts a fully completed durable record after a crash loses its
+  intent completion mark. It verifies the complete custody selection and
+  availability evidence. Partial or ambiguous records require reconciliation.
+- Home audit repairs cover Terminal startup and Inbox handoff, Recovery status,
+  window placement, create-only Library writes, document close protection,
+  Assistant output/clipboard handling and model-provider initialization.
+- Source-home setup removes its private install stage after success or a
+  controlled copy/installer failure. Setup checks source and data volumes for
+  at least 10% free capacity. Setup and Browser refresh retain one default VM
+  backup set; a refused restart preserves existing recovery data.
+- Runtime diagnostics omit private VM initialization payloads and provider
+  responses. Log-capture tests cover the privacy boundary.
+- CI and local test recipes cover the own-workspace capsule suites and required
+  provider processes. Fixtures isolate Carrier routing from public relay
+  availability, retry transient executable-busy errors and reap their children.
 - Bound `browser-local-exit` to its launching Runtime through a held-open stdin
   pipe. Cleanup now checks the relay socket inode, and Runtime refuses to
   replace a socket still owned by a live helper. Runtime abort, exit, rebuild,
@@ -123,9 +143,13 @@ All notable changes to the public ElastOS Runtime repository.
 ### Changed
 - Product inventory exposes one Chat app. The Runtime-backed `chat-room` app is
   the only Chat entry in manifests and supported release profiles. The
-  obsolete terminal Chat and Agent implementations are no longer packaged as
-  apps; their retained source is only pending explicit operator-CLI extraction
-  or removal and is not a compatibility path.
+  obsolete terminal Chat and Agent capsule source trees are retired. Explicit
+  operator CLI commands remain under their own contract; Git history preserves
+  the old implementations.
+- Runtime keeps `tracing`; the replacement `elastos-logger` is postponed.
+  Advanced Assistant workflows, broader Carrier reconciliation and the legacy
+  audit migration remain deferred. Installed protected-content acceptance and
+  the atomic activation/removal of provisional providers remain open.
 - Collaboration messages now identify people as Profiles and recipients as
   Profiles or conversations. Runtime derives routing from the currently signed
   Profile instead of putting endpoint identity in the product message. Endpoint

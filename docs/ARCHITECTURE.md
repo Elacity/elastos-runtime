@@ -48,7 +48,7 @@ full boundary. See [CARRIER.md](CARRIER.md) and
 [BROWSER_CAPSULE.md](BROWSER_CAPSULE.md) for their concrete contracts.
 
 This is the implemented contract shape, not a claim that every product App has
-migrated substrates. In the 0.6 review tree, the Component runner is exercised
+migrated substrates. In the current source, the Component runner is exercised
 by a conformance fixture and authoring template; all shipped first-party UI Apps
 remain `elastos.runtime-projection/v1` web projections.
 

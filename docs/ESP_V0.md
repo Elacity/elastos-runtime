@@ -1,7 +1,7 @@
 # ESP v0 - ElastOS Shell Protocol
 
 ESP is the small shell-facing contract over the Runtime facts exposed by the
-0.6 development stack. A shell is a projection and consent surface. It does not mint
+current development stack. A shell is a projection and consent surface. It does not mint
 authority, hold keys, bypass capability checks, dispatch providers directly, or
 invent provenance.
 

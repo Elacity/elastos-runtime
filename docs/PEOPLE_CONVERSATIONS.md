@@ -17,10 +17,10 @@ Current branch state:
 
 Current acceptance gap:
 
-- the exact candidate is installed on localhost, but the normal localhost
-  one-Runtime product acceptance is not complete;
-- the public seed still needs the same exact candidate before the real
-  two-Runtime product journey can run;
+- localhost and the seed need matching installation receipts for the final
+  reviewed candidate before the real two-Runtime product journey;
+- the Home audit contains partial installed observations, while complete
+  Profile/People/Chat acceptance remains open;
 - an explicit alternate signed network profile selects a separate network, and
   missing configuration selects isolation;
 - the seed/profile signer is bootstrap/config authority only, never
@@ -294,8 +294,8 @@ invite. The receiver introduces its profile/device proof during accept.
 
 ## Implementation Slices
 
-The six source slices below are implemented on the unpublished collaboration
-branch. The normal localhost and public seed installation checks remain release
+The six source slices below are implemented in the integrated 0.7 candidate.
+The normal localhost and public seed installation checks remain release
 gates, not source behavior.
 
 ### Slice 1 - Copy and Mental Model Cleanup

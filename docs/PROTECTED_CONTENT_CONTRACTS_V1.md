@@ -293,10 +293,11 @@ does not implement encryption. The companion source-only
 recipient-sealed contributions and threshold reconstruction, including a
 manifest-bound reconstructed-key commitment check that detects a wrong
 reconstructed key. It strictly validates the embedded X25519 component. It
-does not identify the malicious node, it is not verifiable secret sharing, it
-is not yet wired into Runtime/provider/product flows, and it has not received
-an external cryptographic audit. No production confidentiality claim follows
-from this contract type alone.
+does not identify the malicious node and is not verifiable secret sharing.
+The Runtime and private providers use it in the inactive source path, including
+the process-backed two-Runtime proof. Installed activation and external
+cryptographic review remain open; this contract alone is not production
+confidentiality evidence.
 
 ## Terminal result
 

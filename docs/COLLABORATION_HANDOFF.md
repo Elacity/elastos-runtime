@@ -1,17 +1,16 @@
 # Collaboration handoff
 
-This document records the review boundary for the unpublished People and Chat
-work on `codex/post-0.6-consolidation`.
+This document records the People and Chat boundary integrated into the 0.7
+source candidate. Current refs and release scope live in [state.md](../state.md).
 
 ## Source status
 
-- Base: released `origin/main` at `d358dedb`.
-- Publication: local only.
-- Upstream: none.
-- Normal localhost installation: exact candidate installed with artifact parity
-  and HTTP 200; one-Runtime product acceptance is not complete.
-- Public seed installation: not done from this branch.
-- Source proof: passed on disposable, fixture-owned Runtimes.
+- Reviewed collaboration PR27/28 source is included in `upstream/0.7-dev` and
+  PR39. The older consolidation branch is retained donor evidence.
+- Source proof passed on disposable, fixture-owned Runtimes.
+- Normal localhost and seed acceptance requires matching receipts for the final
+  candidate. The existing Home audit records partial installed observations;
+  HTTP 200 and source fixtures do not establish full product acceptance.
 
 Use `git rev-parse HEAD HEAD^{tree}` and `git status --short --branch` for the
 exact reviewed commit, tree, and worktree status. Do not copy an old commit ID
@@ -39,8 +38,8 @@ from this document after a local history reconstruction.
     exact envelope. It does not claim that a person read the message.
 11. The signed network profile and seed signer provide bootstrap and
     configuration authority only.
-12. There is one unpublished schema for each new collaboration object. No
-    draft compatibility decoder or migration path is supported.
+12. Each collaboration object has one canonical signed schema. Earlier drafts
+    require an explicit migration decision rather than compatibility decoding.
 
 ## Implemented source boundary
 
@@ -73,8 +72,8 @@ from this document after a local history reconstruction.
 ### Chat
 
 - Chat opens direct conversations with an opaque conversation ID from People.
-- Runtime checks the current contact relationship for every direct read and
-  send.
+- Runtime enforces the current contact relationship and Chat's declared
+  history policy on every direct read and send.
 - Direct messages use the accepted Profile's current authorized endpoint.
 - Runtime stores the signed envelope before its first delivery attempt and
   retries within the declared lifetime.
@@ -113,9 +112,8 @@ roots. It covered:
 - narrow-window People and Chat checks;
 - final Profile-name and identity scans.
 
-`just verify` passed. `just verify-release` reached the Linux-only local Carrier
-setup check on macOS and stopped there. This is a target limit, not proof that
-the Linux check passed.
+Current source and platform CI checkpoints are recorded in [state.md](../state.md).
+Each final candidate requires its own checks and installed acceptance.
 
 The first normal cross-Runtime Chat send after this fixture proof aborted in
 the old Iroh 0.96.1 `iroh-quinn` transport. The source candidate now uses Iroh
@@ -125,13 +123,13 @@ localhost and public-seed product proof below.
 
 ## Next acceptance steps
 
-1. Review the reconstructed local commit series and verify a clean worktree.
+1. Complete final candidate review and CI, preserving the reviewed history.
 2. Complete one-Runtime Profile, People, Chat, Inbox, Clipboard, restart, and layout
    behavior with the existing local data preserved.
 3. If localhost passes, install the same exact commit on the public seed.
 4. Run the real two-Runtime journey between localhost and the public seed.
-5. Review evidence, select the 0.7 integration target, then publish only after
-   explicit approval.
+5. Record each target's source/artifact identity and product verdict before
+   making release or installed-acceptance claims.
 
 ## Later work
 

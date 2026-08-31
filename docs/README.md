@@ -91,8 +91,10 @@ Each top-level ledger has one job:
 
 ## Operations and verification
 
-- [0.6.0 release acceptance](RUNTIME_REPO_USER_STORY_CHECKLIST.md): source,
+- [Source integration and release acceptance](RUNTIME_REPO_USER_STORY_CHECKLIST.md): source,
   installed-product, and release decision checklist
+- [Home journey audit](audits/README.md): privacy-reviewed workbook with
+  findings, coverage and the limits of its installed test evidence
 - [Mac source-home staging](MAC.md): Apple silicon staging and Browser acceptance
 - [Inspector testing](INSPECTOR_TESTING.md): local Inspector checks
 - [Sites](SITES.md): local site roots and public exposure

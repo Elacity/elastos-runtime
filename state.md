@@ -12,7 +12,7 @@ volatile proof logs remain outside the repository.
   `origin/upstream/0.7-dev` at `90bbe15b` as the current 0.7 integration line.
 - Published feature evidence is
   `origin/feat/protected-content-runtime-lifecycle@854d9dc9`,
-  `origin/feat/protected-content-uiux-reconstruction@d06d64f3`,
+  `origin/feat/protected-content-uiux-reconstruction` (PR39),
   `origin/feat/0.7-uiux-candidate@8b547590`,
   `origin/feat/dkms-esp-port@27d85c6f`, and
   `origin/feat/0.7-product-documentation@74cd4e42`.
@@ -24,13 +24,19 @@ volatile proof logs remain outside the repository.
   extraction.
 - PR39 includes the Home audit fixes, the named principal-root write policy,
   checkout-bound test fixtures and the privacy-reviewed audit workbook at
-  `d06d64f3`. Source, workspace and capsule CI checks pass on that revision.
-  Platform installation and release-build proof remain separate gates; new
-  local inclusions require checks on their exact revision.
+  `d06d64f3`. All seven CI jobs pass on that revision, including macOS,
+  both Linux source-home targets and the release build. New local inclusions
+  require CI on their exact revision; installed product acceptance stays separate.
 - The local source includes the CPU watcher optimization from `e4d897f6`.
   Unchanged executable metadata skips binary hashing; a changed stamp triggers
   a streamed digest. Focused tests cover idle ticks, replacement and deletion.
   Installed CPU measurement remains open.
+- The source-merge scope preserves reviewed history and includes the exact
+  PR43 commit `58ebfb23`. PR39 then feeds `upstream/0.7-dev`, which feeds
+  `main`; fetching refs establishes the current heads before each step. A
+  merge commit preserves the original commits rather than squashing them.
+  Main integration, release publication and installed cutover are separate
+  actions. The deferred scope remains explicit in [TASKS.md](TASKS.md).
 - The published audit changes include Home and Terminal repairs, create-only
   Library writes, document close protection, Assistant and model-init repairs,
   declared-content icons, private diagnostics, socket-root protection, and Mac
@@ -78,26 +84,32 @@ volatile proof logs remain outside the repository.
   publication.
 - Local accepted protected-content labels whose tips are ancestors of the
   published lifecycle or upstream need no separate publication.
-- Keep the unique local donor
-  `feat/protected-content-runtime-lifecycle@e06837d4` and old parallel drafts
-  until the active integration is reviewed or published and retained behavior
-  is confirmed. These drafts are evidence, not publication candidates.
-- `feat/0.7-product-documentation` has a published prefix at `74cd4e42` and a
-  separate dirty local tail owned by another task. Keep that work separate.
-- `feat/home-urux-on-freeze` has a published remote tip at `5e546ef4` and a
-  dirty local donor that is behind that tip. Keep it separate for owner review.
-- `pc-review` is a clean local label and worktree at `main@d358dedb`. It is an
-  exact cleanup candidate after explicit user approval.
+- Retained donor branches and dirty worktrees remain under the operator
+  ledger's preservation rules. The August review carried useful content,
+  Recovery/Profile, Windows and operator documentation into this candidate.
+  Older Assistant and migration donors retain explicit deferred tasks.
+  Preserve unique history and original dirty files until their owners approve
+  cleanup; published source does not make every older hunk equivalent.
 
 ## Integrated Source Truth
 
-The candidate does not yet include all useful retained work. Logger PR25 needs
-reconciliation with newer Runtime code and bounded-file fixes. The older
-Carrier branch contains framing, deadline and protocol work that needs an
-adapted integration: the current incoming request handler still has an
-unbounded line read, while the donor's whole protocol would disable provider
-invocation used by the current protected-content path. These remain explicit
-source-integration decisions in [TASKS.md](TASKS.md).
+Runtime retains `tracing`. Irzhy postponed the replacement `elastos-logger`
+on August 30; its absence is an intentional decision, not an omitted release
+feature. Its useful VM-payload privacy repair is included independently in
+`74ed3bc9` and has a log-capture regression test.
+
+The older July Carrier branch contains framing, deadline and protocol work
+that needs an adapted integration: the current incoming request handler still
+has an unbounded line read, while the donor's whole protocol would disable
+provider invocation used by the current protected-content path. This remains
+an explicit source-integration decision in [TASKS.md](TASKS.md). Inclusion of
+all retained work requires a behavior-level comparison, not only commit counts.
+
+Older Assistant attachment, knowledge/search/citation and advanced Studio
+implementations remain retained donors for the open work in [TASKS.md](TASKS.md).
+The PR15 legacy-auth migration also remains separate because it replaces
+unchained audit history. Current signed-checkpoint policy owns compatibility;
+retaining those donors does not mean their behavior is in the candidate.
 
 The reviewed content-distribution, Recovery/Profile and WSL-first documents
 are included. The catalog currently projects installed capsules; signed network
@@ -148,6 +160,10 @@ The integrated source includes these durable facts:
   `receipts/source-home-installation.json` receipt after components, native
   providers, capsule trees, and source-home capsule metadata are final. The
   receipt binds source commit/tree/clean state and exact artifact hashes.
+  Setup requires at least 10% free space on both source and data volumes before
+  builds. Its private install stage is removed on success, copy failure and
+  installer failure, as verified by the isolated installation smoke. Source
+  setup and Browser target refresh each retain one default VM backup set.
 - `scripts/mac-source-home-restart.sh` and
   `scripts/linux-source-home-restart.sh` select only that stable Runtime.
   Each owns one exact PID file, stops only the identity-bound prior Runtime,
@@ -340,7 +356,9 @@ complete. Installed proof and the atomic authority cutover remain open.
   has Browser request a display capability while Runtime selects the display
   path and engine adapter.
 - Docker/Selkies is only `managed_baseline_not_final_product`; the hosted Selkies/GStreamer service is a managed baseline, not accepted as the final Browser.
-- The hosted baseline is single-session; active pages are a serialization blocker.
+- Hosted tooling supports per-launch targets. Each engine/control service keeps
+  its declared page capacity; concurrent product sessions require their own
+  installed capacity and cleanup proof.
 - This server is not a product native-browser proof target because it lacks a real host compositor/display, host audio service, and working network namespace support.
 - Verified on the public seed on 2026-08-16: `test -e /dev/kvm` returned 1. The
   seed is a bootstrap and gateway host and may consume a remote Browser Engine;
@@ -414,9 +432,9 @@ complete. Installed proof and the atomic authority cutover remain open.
 - Assistant model messages render a self-contained safe markdown subset with
   escaped HTML, inert links, headings/lists/blockquotes/tables, fenced and
   inline code, and inline/display math through vendored KaTeX 0.18.3. Focused
-  source proof lives in `scripts/assistant-shell-smoke.mjs`; no install,
-  localhost, or human acceptance claim is recorded yet for Assistant
-  workflows.
+  source proof lives in `scripts/assistant-shell-smoke.mjs`. The Home audit
+  records observed UI behavior separately; configured model-run and advanced
+  workflow acceptance remain open.
 
 ## System Truth
 
@@ -451,8 +469,8 @@ complete. Installed proof and the atomic authority cutover remain open.
   app, viewer, shell, connector, content, and provider surfaces. Home-facing
   descriptors cover `home` host facts, `home-gui`, `home-cli`, `browser`,
   `wallet`, wallet connectors, `inbox`, `services`, `system`, `library`, `documents`,
-  `archive-manager`, `chat-room`, `chat` terminal, `agent`,
-  `marketplace`, `gba-emulator`, and `gba-ucity`; provider-role capsules now
+  `archive-manager`, `chat-room`, `assistant`,
+  `marketplace`, `gba-emulator`, `gba-ucity`, and `gba-nonogram`; provider-role capsules now
   project authority metadata for service-plane inspection. These descriptors
   are projected as facts for shells and System; Runtime gates, approval, launch
   tokens, providers, and audit remain authoritative.
@@ -564,11 +582,10 @@ complete. Installed proof and the atomic authority cutover remain open.
   `recovery_readiness_change_emits_home_summary_event_only`,
   `test_recovery_readiness_and_first_profile_gate_share_one_recovery_rule`,
   `scripts/people-discovery-smoke.mjs`, and
-  `scripts/home-shell-regression-smoke.mjs` pass. Browser-backed GUI fixture
-  runs remain open in this worktree because Playwright is unavailable here. The
-  empty-machine recovery coverage test for a first kit that predates the later
-  random Profile key also remains open. Manual GUI acceptance remains a
-  separate installed proof step.
+  `scripts/home-shell-regression-smoke.mjs` pass. The Home audit keeps installed
+  outcomes separate from those source tests. Empty-machine recovery coverage
+  for a first kit that predates the later random Profile key remains open.
+  Manual GUI acceptance still requires the exact installed artifact.
 - A fresh Recovery Kit export is now truthful about included People identity.
   Source still needs a separate repair for empty-machine recovery when the first
   kit predates the later random Profile key.

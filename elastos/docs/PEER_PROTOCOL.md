@@ -217,4 +217,5 @@ A conforming provider MAY:
 - **Gossip:** iroh-gossip (ALPN-based)
 - **Dependencies:** ~470 unique crates (heavy crypto stack)
 - **Binary size:** ~16MB release
-- **Status:** Frozen for stability in the current unpublished branch.
+- **Status:** Frozen for stability in the current source contract. Release and
+  installed status are recorded in the repository's `state.md`.

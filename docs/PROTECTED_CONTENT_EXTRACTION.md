@@ -10,14 +10,16 @@ of truth. Historical branches and PRs are evidence only.
 |---|---|---|
 | `origin/feat/protected-content-runtime-lifecycle` | `854d9dc945b6ecd53731af7edb382847d92cbb76` | Published inactive lifecycle source. |
 | `origin/feat/0.7-uiux-candidate` | `8b547590335e25126aca726135976d415433cea6` | Published reviewed UIUX donor. |
-| Unpublished implementation prefix | `3ece9042df1193ec6873145971557103fdd4f45a` | Reconstructed source through cross-Runtime release admission and playback envelope removal; tree `a17c799d4ffd837a4c65888ec9601ee6216c52fa`. |
+| Last all-platform CI checkpoint | `d06d64f3dbcbf439bedf9e6466008794ec3db7ef` | PR39 includes the reconstructed source, two-Runtime fixture proof, CI repairs and privacy-reviewed Home audit. Fetch its branch for the current head; later source additions are recorded in `state.md` and need CI on their own revision. |
 
-The integrated prefix remains unpublished source evidence. It is not installed
-or live product proof. The active installed path still selects the provisional
+The candidate is published for review. Installed and live product acceptance
+remain separate gates. The active installed path still selects the provisional
 `drm`, `rights`, `key`, and `decrypt` surfaces.
 
-The current inactive proof runs on one Runtime with two principals. It does not
-prove mint on localhost followed by buy and play on the seed.
+The inactive source proof includes two Runtimes with separate principals,
+Wallets, device identities and state (`84569da5`). It uses process-backed
+custody providers and controlled Chain evidence. The corresponding funded,
+installed multi-host journey remains open.
 
 ## Extraction ownership
 
@@ -121,9 +123,9 @@ This proof uses focused source and fixture tests. It does not establish real
 operator custody, deployed Chain acceptance, live replication, or an active
 cutover. Custody release now authenticates the buyer Runtime issuer declared by
 the signed operation and bound by the buyer Profile, while provisioning stays
-pinned to the creator Runtime. A buyer Runtime still needs typed import and
-verified projection for the creator's immutable listing, which remains a local
-Runtime record bound to its content and Chain identity.
+pinned to the creator Runtime. Portable listing export, import and verified
+projection are included in `3026992b`, `ed7a8bfc` and `7f6e47f9`. The buyer
+Runtime opens its own verified listing without the creator's local mint state.
 
 A shared listing link is sufficient for 0.7. Global listing discovery and
 public custody governance remain later work. The public protected-content
@@ -182,24 +184,23 @@ fixture checks cover the `/proc` identity model. Active Linux
 
 Complete the sequence in [TASKS.md](../TASKS.md):
 
-1. repair the stale private-custody gateway fixture and restore the combined
-   one-Runtime proof;
-2. add portable listing export, import, and projection;
-3. prove the full two-Runtime source journey;
-4. review the integrated source and prepare the review branch;
-5. install the exact same tree on localhost, the seed, and the third custody
+The combined gateway fixture, portable listings, two-Runtime source proof and
+publication for review are complete. Remaining acceptance is:
+
+1. complete review of the final combined candidate;
+2. install the exact same tree on localhost, the seed, and the third custody
    node with matching stable
    receipts;
-6. supply a real signed owner-only 2-of-3 custody composition across distinct
+3. supply a real signed owner-only 2-of-3 custody composition across distinct
    operators;
-7. supply the private multi-source Chain config and prove deployed Base reads;
-8. prove one bound KID, allowed and denied Wallet accounts, CentralStorage
+4. supply the private multi-source Chain config and prove deployed Base reads;
+5. prove one bound KID, allowed and denied Wallet accounts, CentralStorage
    binding, and the exact `AuthorityGateway.buyAccess` effect;
-9. prove three replicas and repair after one loss;
-10. run the two-Runtime, two-principal mint-list-deny-buy-open-play-close path
+6. prove three replicas and repair after one loss;
+7. run the two-Runtime, two-principal mint-list-deny-buy-open-play-close path
    with restart, replay, tamper, settlement, and cleanup evidence;
-11. complete the named manual UIUX matrix in `TASKS.md`; and
-12. make one atomic cutover that removes every provisional authority surface.
+8. complete the named manual UIUX matrix in `TASKS.md`; and
+9. make one atomic cutover that removes every provisional authority surface.
 
 The atomic cutover updates startup, registration, resources, packaging, tests,
 and docs together. It leaves one Runtime coordinator, one ProviderRegistry,

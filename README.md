@@ -2,12 +2,12 @@
 
 ElastOS is a local-first runtime for Apps and services. Its authority model
 applies the same explicit rules to people and AI agents. First-class agent
-principals are still open 0.6 work; current agent commands use the operator
+principals remain open work; current agent commands use the operator
 lane. People sign in to Home with passkeys.
 
 This is pre-release software. Do not use it for important workloads. The public
 installer is the current Linux `x86_64`/`aarch64` preview. This repository also
-contains newer 0.6 development work, which may not match the public
+contains the 0.7 source candidate, which may not match the public
 installation. [state.md](state.md) records the evidence and gaps for this tree.
 
 ## Install the Linux preview
@@ -55,8 +55,8 @@ routing boundary. Runtime handles core operations directly and selects a
 provider for provider-backed effects. Carrier is the endpoint-authenticated
 off-box transport for routes that leave the node, not the capsule API.
 
-The 0.6 tree implements and conformance-tests the Component/Bus path. The 18
-shipped first-party UI Apps still use `elastos.runtime-projection/v1` web
+The source implements and conformance-tests the Component/Bus path. First-party
+UI Apps still use `elastos.runtime-projection/v1` web
 projections; the Component fixture and authoring template are not evidence that
 a first-party product App has migrated yet.
 
@@ -85,6 +85,13 @@ Use [state.md](state.md) as the authority for current behavior and known gaps.
 It distinguishes implemented behavior from source-only paths and unverified
 product claims. Browser source and proof tooling alone do not establish
 complete Browser product support.
+
+The 0.7 candidate includes the reviewed collaboration and protected-content
+source, Home and app repairs, the CPU watcher optimization, and the
+[Home journey audit](docs/audits/README.md). Protected-content activation and
+installed acceptance remain open. The replacement logger is postponed;
+Runtime keeps `tracing`. Deferred work is tracked in
+[TASKS.md](TASKS.md#deferred-source-integration).
 
 Use [TASKS.md](TASKS.md) for open work, [ROADMAP.md](ROADMAP.md) for future
 direction, and [elastos/CHANGELOG.md](elastos/CHANGELOG.md) for release history.

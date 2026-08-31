@@ -49,13 +49,13 @@ The source path has one operation sequence:
     CEK inside its process. It serves bounded ordered media reads to the exact
     viewer session and settles open, read, and close ownership.
 
-Current source runs this sequence inside one Runtime, and the creator listing is
-a local Runtime record. The localhost-to-seed journey still needs one portable
-immutable listing package and typed buyer Runtime import/projection. Custody
-release already authenticates the buyer Runtime issuer declared by the signed
-operation and bound by the buyer Profile, while the creator Runtime remains the
-provisioning authority. A shared listing link is sufficient for 0.7. Global
-listing discovery remains later work.
+Source tests cover this sequence across two Runtimes with separate principals,
+Wallets, device identities and state. The creator exports an immutable listing
+package; the buyer imports and verifies it before purchase and playback. Custody
+release authenticates the buyer Runtime issuer declared by the signed operation
+and bound by the buyer Profile. The creator Runtime retains provisioning
+authority. The funded installed localhost-to-seed journey remains open.
+A shared listing link is sufficient for 0.7; global discovery remains later work.
 
 Runtime journals identities, state, receipts, and settlement. Providers keep
 clear media, ciphertext staging, CEKs, shares, process details, and private
@@ -188,23 +188,17 @@ owner-only restart receipt.
 The ordered release proof is in [TASKS.md](../TASKS.md). The protected-content
 part requires:
 
-1. repair the stale private-custody gateway fixture and restore the combined
-   one-Runtime proof;
-2. add the portable listing export, import, and projection without changing the
-   frozen public contracts;
-3. prove the full two-Runtime source journey;
-4. run the final source review and prepare one review branch;
-5. exact same-tree localhost, seed, and third-node installation receipts;
-6. one real signed owner-only 2-of-3 custody composition across distinct
-   operators;
-7. private multi-source Chain configuration and deployed Base evidence;
-8. one bound KID with allowed and denied Wallet evidence, the CentralStorage
-   binding proof, and the exact `AuthorityGateway.buyAccess` receipt/event;
-9. three replicas plus repair after one replica is lost;
-10. the two-Runtime, two-principal mint-list-deny-buy-open-play-close journey,
-   including restart, replay, tamper, settlement, and cleanup;
-11. the named manual UIUX matrix in `TASKS.md`; and
-12. one atomic cutover that removes the provisional authority surfaces.
+1. final combined-source review and CI;
+2. matching localhost, seed and third-node installation receipts;
+3. one signed owner-only 2-of-3 custody composition across distinct operators;
+4. private multi-source Chain configuration and deployed Base evidence;
+5. bound-KID allow/deny/unbound reads, CentralStorage binding and the exact
+   funded `AuthorityGateway.buyAccess` receipt/event;
+6. three replicas plus repair after one replica is lost;
+7. the installed two-Runtime mint-list-deny-buy-open-play-close journey,
+   including restart, replay, tamper rejection, settlement and cleanup;
+8. the manual UIUX matrix in `TASKS.md`; and
+9. one atomic cutover that removes the provisional authority surfaces.
 
 The cutover activates the Runtime-owned path and removes provisional startup,
 registration, resources, packaging, tests, and docs in the same reviewable

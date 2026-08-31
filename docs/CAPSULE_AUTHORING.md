@@ -11,7 +11,7 @@ Start with `elastos init` for a small Component or content capsule. Use
 viewer/content pair, or provider contract.
 
 The Component path is implemented and conformance-tested, but no shipped
-first-party product App uses it yet. The 18 shipped first-party UI Apps are
+first-party product App uses it yet. First-party UI Apps are
 `elastos.runtime-projection/v1` web projections. Treat the Component scaffold
 as the supported authoring contract, not as evidence of product adoption.
 
