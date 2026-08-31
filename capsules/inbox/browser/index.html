@@ -588,6 +588,7 @@
     const INBOX_SAFETY_REFRESH_MS = 5 * 60 * 1000;
     const launchParams = new URLSearchParams(window.location.search);
     const homeParentOrigin = launchParams.get("home_origin") || "";
+    const requestedNotificationId = launchParams.get("notification_id") || "";
     const presentation = launchParams.get("presentation") === "rail" ? "rail" : "window";
     document.documentElement.dataset.inboxPresentation = presentation;
 
@@ -596,7 +597,8 @@
       entries: [],
       refreshInFlight: null,
       filter: "all",
-      selectedId: "",
+      requestedSelectionId: requestedNotificationId.trim(),
+      selectedId: requestedNotificationId.trim(),
     };
 
     const elements = {
@@ -874,8 +876,16 @@
       const attentionCount = state.entries.filter((entry) => entry && entry.severity === "attention").length;
       elements.pendingCount.textContent = String(state.entries.length);
       elements.reviewCount.textContent = String(attentionCount);
+      const requestedSelectionPresent = state.requestedSelectionId
+        && entries.some((entry) => entryId(entry) === state.requestedSelectionId);
+      const requestedSelectionMissing = state.requestedSelectionId
+        && !requestedSelectionPresent;
       if (!entries.some((entry) => entry.id === state.selectedId)) {
-        state.selectedId = entries.length ? entryId(entries[0]) : "";
+        state.selectedId = requestedSelectionPresent
+          ? state.requestedSelectionId
+          : requestedSelectionMissing
+          ? ""
+          : entries.length ? entryId(entries[0]) : "";
       }
       elements.entryRows.replaceChildren();
       if (presentation === "rail") {
@@ -887,7 +897,10 @@
         for (const entry of entries) {
           elements.entryRows.appendChild(createRow(entry));
         }
-        renderDetail(entries.find((entry) => entryId(entry) === state.selectedId) || null);
+        renderDetail(
+          entries.find((entry) => entryId(entry) === state.selectedId) || null,
+          requestedSelectionMissing,
+        );
       }
       const empty = entries.length === 0;
       elements.emptyState.classList.toggle("hidden", !empty);
@@ -929,6 +942,7 @@
 
       row.append(top, snippet);
       row.addEventListener("click", () => {
+        state.requestedSelectionId = "";
         state.selectedId = entryId(entry);
         renderInbox();
       });
@@ -1003,12 +1017,14 @@
       }
     }
 
-    function renderDetail(entry) {
+    function renderDetail(entry, requestedSelectionMissing = false) {
       elements.entryDetail.replaceChildren();
       if (!entry) {
         const placeholder = document.createElement("div");
         placeholder.className = "entry-detail-placeholder";
-        placeholder.textContent = "Select a request";
+        placeholder.textContent = requestedSelectionMissing
+          ? "That request is no longer available. Select another request."
+          : "Select a request";
         elements.entryDetail.appendChild(placeholder);
         return;
       }
@@ -1316,6 +1332,7 @@
         return;
       }
       event.preventDefault();
+      state.requestedSelectionId = "";
       state.selectedId = entryId(entries[next]);
       renderInbox();
       const rows = elements.entryRows.querySelectorAll(".entry-row");

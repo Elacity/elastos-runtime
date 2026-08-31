@@ -987,6 +987,36 @@ fn home_terminal_host_intent_for_action(
         }));
     }
 
+    if let Some(notification_id) = action_id
+        .strip_prefix("inbox-review-notification:")
+        .map(str::trim)
+    {
+        if notification_id.is_empty() || snapshot.session.mode != "browser_pty" {
+            return None;
+        }
+        let inbox_target_available = snapshot
+            .targets
+            .iter()
+            .any(|target| target.target == "inbox" && target.target_kind == "app");
+        let desktop_launchable = snapshot.active_shell["candidates"]
+            .as_array()
+            .map(|candidates| {
+                candidates.iter().any(|candidate| {
+                    candidate["name"] == "home-gui" && candidate["launchable"] == true
+                })
+            })
+            .unwrap_or(false);
+        if !inbox_target_available || !desktop_launchable {
+            return None;
+        }
+        return Some(serde_json::json!({
+            "schema": "elastos.home.terminal-host-intent/v1",
+            "action": "switch-shell-open-target",
+            "action_id": action_id,
+            "target": "inbox",
+        }));
+    }
+
     let target = action_id.strip_prefix("shell-switch:")?.trim();
     if target != "home-gui" {
         return None;
@@ -4774,6 +4804,11 @@ mod tests {
             );
         }
         assert!(home_terminal_host_intent_for_action("open-gui:home-cli", &snapshot).is_none());
+        assert!(home_terminal_host_intent_for_action(
+            "inbox-review-notification:wallet-approval-request:wallet-approval:test",
+            &snapshot
+        )
+        .is_none());
 
         let shell_intent =
             home_terminal_host_intent_for_action("shell-switch:home-gui", &snapshot).unwrap();
@@ -4805,6 +4840,42 @@ mod tests {
         let mut native_snapshot = browser_snapshot;
         native_snapshot.session.mode = "native_terminal".to_string();
         assert!(home_terminal_host_intent_for_action("auth-sign-out", &native_snapshot).is_none());
+    }
+
+    #[test]
+    fn unresolved_inbox_review_requests_become_desktop_inbox_handoffs() {
+        let mut snapshot = sample_snapshot_with_components(&[]);
+        snapshot.session.mode = "browser_pty".to_string();
+        snapshot.active_shell = serde_json::json!({
+            "schema": "elastos.home.active-shell/v1",
+            "active": "home-cli",
+            "candidates": [{
+                "name": "home-gui",
+                "launchable": true
+            }]
+        });
+        snapshot.targets.push(HomeTargetStatus {
+            target: "inbox".to_string(),
+            title: "Inbox".to_string(),
+            description: "Review pending requests.".to_string(),
+            role: "app".to_string(),
+            target_kind: "app".to_string(),
+            ..HomeTargetStatus::default()
+        });
+
+        assert_eq!(
+            home_terminal_host_intent_for_action(
+                "inbox-review-notification:wallet-approval-request:wallet-approval:test",
+                &snapshot
+            )
+            .unwrap(),
+            serde_json::json!({
+                "schema": "elastos.home.terminal-host-intent/v1",
+                "action": "switch-shell-open-target",
+                "action_id": "inbox-review-notification:wallet-approval-request:wallet-approval:test",
+                "target": "inbox",
+            })
+        );
     }
 
     #[test]

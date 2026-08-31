@@ -38,6 +38,7 @@ const HOME_TERMINAL_REPLAY_MAX_EVENTS: usize = 64;
 const HOME_TERMINAL_REPLAY_MAX_BYTES: usize = 64 * 1024;
 const HOME_TERMINAL_ARCHIVED_REPLAY_MAX_SESSIONS: usize = 8;
 const HOME_TERMINAL_ARCHIVED_REPLAY_MAX_BYTES: usize = HOME_TERMINAL_REPLAY_MAX_BYTES * 8;
+const HOME_TERMINAL_INBOX_REVIEW_ACTION_PREFIX: &str = "inbox-review-notification:";
 pub(super) const HOME_TERMINAL_INPUT_MAX_BYTES: usize = 16 * 1024;
 pub(super) const HOME_TERMINAL_INTENT_MAX_BYTES: usize = 8 * 1024;
 const HOME_TERMINAL_PROGRAM_ENV: &str = "ELASTOS_HOME_CLI_TERMINAL_PROGRAM";
@@ -1594,7 +1595,8 @@ fn authorize_home_terminal_host_intent(
         });
     }
 
-    if action != "open-target" {
+    let switch_shell_open_target = action == "switch-shell-open-target";
+    if action != "open-target" && !switch_shell_open_target {
         return Err("unsupported terminal host intent action");
     }
     if target == HOME_CLI_CAPSULE_ID || target == "home-gui" {
@@ -1617,6 +1619,37 @@ fn authorize_home_terminal_host_intent(
             contact_id: None,
             route: None,
             query: None,
+        });
+    }
+
+    if let Some(notification_id) = action_id
+        .strip_prefix(HOME_TERMINAL_INBOX_REVIEW_ACTION_PREFIX)
+        .map(str::trim)
+    {
+        let notification_id = notification_id.to_string();
+        if target != "inbox" {
+            return Err("terminal Inbox handoff target does not match action_id");
+        }
+        if notification_id.is_empty() {
+            return Err("terminal Inbox handoff is missing a notification id");
+        }
+        if intent.query.is_some() {
+            return Err("terminal Inbox handoff query is not authorized");
+        }
+        if intent.source.is_some() || intent.contact_id.is_some() || intent.route.is_some() {
+            return Err("terminal Inbox handoff has unsupported fields");
+        }
+        return Ok(HomeTerminalAuthorizedIntent {
+            schema: HOME_TERMINAL_HOST_INTENT_SCHEMA,
+            action,
+            target,
+            action_id,
+            source: None,
+            contact_id: None,
+            route: None,
+            query: Some(serde_json::json!({
+                "notification_id": notification_id
+            })),
         });
     }
 
@@ -1735,12 +1768,12 @@ mod tests {
         let open =
             authorize_home_terminal_host_intent(test_terminal_host_intent(serde_json::json!({
                 "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
-                "action": "open-target",
+                "action": "switch-shell-open-target",
                 "action_id": "open-gui:browser",
                 "target": "browser"
             })))
             .expect("explicit open-gui action should be authorized");
-        assert_eq!(open.action, "open-target");
+        assert_eq!(open.action, "switch-shell-open-target");
         assert_eq!(open.action_id, "open-gui:browser");
         assert_eq!(open.target, "browser");
         assert!(open.query.is_none());
@@ -1782,6 +1815,44 @@ mod tests {
         assert_eq!(people.action_id, "people-message:contact-alice");
         assert_eq!(people.source.as_deref(), Some("people-contact"));
         assert_eq!(people.contact_id.as_deref(), Some("contact-alice"));
+
+        let inbox =
+            authorize_home_terminal_host_intent(test_terminal_host_intent(serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "switch-shell-open-target",
+                "action_id": "inbox-review-notification:wallet-approval-request:wallet-approval:test",
+                "target": "inbox"
+            })))
+            .expect("Inbox review handoff should be authorized");
+        assert_eq!(inbox.action, "switch-shell-open-target");
+        assert_eq!(
+            inbox.query,
+            Some(serde_json::json!({
+                "notification_id": "wallet-approval-request:wallet-approval:test"
+            }))
+        );
+    }
+
+    #[test]
+    fn terminal_host_intent_accepts_captured_inbox_handoff_payload() {
+        let captured = r#"{
+            "schema":"elastos.home.terminal-host-intent/v1",
+            "action":"switch-shell-open-target",
+            "action_id":"inbox-review-notification:wallet-approval-request:wallet-approval:test",
+            "target":"inbox"
+        }"#;
+        let authorized = authorize_home_terminal_host_intent(
+            serde_json::from_str(captured).expect("captured payload should deserialize"),
+        )
+        .expect("gateway should accept the captured Home CLI Inbox handoff payload");
+        assert_eq!(authorized.action, "switch-shell-open-target");
+        assert_eq!(authorized.target, "inbox");
+        assert_eq!(
+            authorized.query,
+            Some(serde_json::json!({
+                "notification_id": "wallet-approval-request:wallet-approval:test"
+            }))
+        );
     }
 
     #[test]
@@ -1800,13 +1871,13 @@ mod tests {
             }),
             serde_json::json!({
                 "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
-                "action": "open-target",
+                "action": "switch-shell-open-target",
                 "action_id": "open-gui:wallet",
                 "target": "browser"
             }),
             serde_json::json!({
                 "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
-                "action": "open-target",
+                "action": "switch-shell-open-target",
                 "action_id": "open-gui:home-cli",
                 "target": "home-cli"
             }),
@@ -1824,7 +1895,7 @@ mod tests {
             }),
             serde_json::json!({
                 "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
-                "action": "open-target",
+                "action": "switch-shell-open-target",
                 "action_id": "people-message:contact-alice",
                 "target": "wallet",
                 "source": "people-contact",
@@ -1833,10 +1904,23 @@ mod tests {
             }),
             serde_json::json!({
                 "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
-                "action": "open-target",
+                "action": "switch-shell-open-target",
                 "action_id": "open-gui:browser",
                 "target": "browser",
                 "query": { "debug": "1" }
+            }),
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "switch-shell-open-target",
+                "action_id": "inbox-review-notification:wallet-approval-request:wallet-approval:test",
+                "target": "wallet"
+            }),
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "switch-shell-open-target",
+                "action_id": "inbox-review-notification:wallet-approval-request:wallet-approval:test",
+                "target": "inbox",
+                "query": { "notification_id": "other" }
             }),
         ];
 

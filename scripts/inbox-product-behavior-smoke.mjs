@@ -392,5 +392,387 @@ async function runInboxHomeChromeSmoke() {
   context.fetch = originalFetch;
 }
 
+async function runInboxLaunchSelectionSmoke() {
+  const inbox = fs.readFileSync(new URL("../capsules/inbox/browser/index.html", import.meta.url), "utf8");
+  const inboxScript = extractInboxScript(inbox);
+  const nodes = new Map([
+    ["locked-shell", new FakeElement("section")],
+    ["inbox-shell", new FakeElement("section")],
+    ["status-text", new FakeElement("p")],
+    ["pending-count", new FakeElement("strong")],
+    ["review-count", new FakeElement("strong")],
+    ["refresh", new FakeElement("button")],
+    ["entry-rows", new FakeElement("section")],
+    ["entry-detail", new FakeElement("section")],
+    ["entry-split", new FakeElement("div")],
+    ["empty-state", new FakeElement("section")],
+    ["empty-title", new FakeElement("h2")],
+    ["list-title", new FakeElement("h1")],
+  ]);
+  const filterAll = new FakeElement("button");
+  filterAll.className = "summary-card active";
+  filterAll.dataset.filter = "all";
+  const filterReview = new FakeElement("button");
+  filterReview.className = "summary-card";
+  filterReview.dataset.filter = "review";
+  const document = {
+    hidden: false,
+    documentElement: { dataset: {} },
+    getElementById(id) {
+      return nodes.get(id) || null;
+    },
+    querySelectorAll(selector) {
+      if (selector === ".summary-card[data-filter]") {
+        return [filterAll, filterReview];
+      }
+      return [];
+    },
+    addEventListener() {},
+    createElement(tagName) {
+      return new FakeElement(tagName);
+    },
+  };
+  const context = {
+    console,
+    document,
+    window: {
+      location: {
+        search: "?home_origin=http%3A%2F%2Flocalhost%3A61180&notification_id=entry-wallet",
+        hash: "#home_token=inbox-test-token",
+      },
+      top: { postMessage() {} },
+      parent: { postMessage() {} },
+      addEventListener() {},
+      removeEventListener() {},
+      setInterval() {
+        return 1;
+      },
+      setTimeout(callback) {
+        callback();
+        return 1;
+      },
+      clearTimeout() {},
+    },
+    URLSearchParams,
+    Intl,
+    Date,
+    Promise,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => jsonResponse(inboxSummary()),
+  };
+
+  vm.runInNewContext(inboxScript, context, {
+    filename: "capsules/inbox/browser/index.html:inline",
+  });
+  await settle();
+
+  assert.equal(nodes.get("entry-rows").children.length, 2);
+  assert.equal(nodes.get("entry-rows").children[1].getAttribute("aria-selected"), "true");
+  const detailText = descendants(nodes.get("entry-detail"))
+    .map((node) => node.textContent || "")
+    .join(" ");
+  assert(detailText.includes("Wallet request"), "Inbox did not keep the requested notification selected", detailText);
+}
+
+async function runInboxMissingLaunchSelectionSmoke() {
+  const inbox = fs.readFileSync(new URL("../capsules/inbox/browser/index.html", import.meta.url), "utf8");
+  const inboxScript = extractInboxScript(inbox);
+  const nodes = new Map([
+    ["locked-shell", new FakeElement("section")],
+    ["inbox-shell", new FakeElement("section")],
+    ["status-text", new FakeElement("p")],
+    ["pending-count", new FakeElement("strong")],
+    ["review-count", new FakeElement("strong")],
+    ["refresh", new FakeElement("button")],
+    ["entry-rows", new FakeElement("section")],
+    ["entry-detail", new FakeElement("section")],
+    ["entry-split", new FakeElement("div")],
+    ["empty-state", new FakeElement("section")],
+    ["empty-title", new FakeElement("h2")],
+    ["list-title", new FakeElement("h1")],
+  ]);
+  const filterAll = new FakeElement("button");
+  filterAll.className = "summary-card active";
+  filterAll.dataset.filter = "all";
+  const filterReview = new FakeElement("button");
+  filterReview.className = "summary-card";
+  filterReview.dataset.filter = "review";
+  const document = {
+    hidden: false,
+    documentElement: { dataset: {} },
+    getElementById(id) {
+      return nodes.get(id) || null;
+    },
+    querySelectorAll(selector) {
+      if (selector === ".summary-card[data-filter]") {
+        return [filterAll, filterReview];
+      }
+      return [];
+    },
+    addEventListener() {},
+    createElement(tagName) {
+      return new FakeElement(tagName);
+    },
+  };
+  const context = {
+    console,
+    document,
+    window: {
+      location: {
+        search: "?home_origin=http%3A%2F%2Flocalhost%3A61180&notification_id=missing-entry",
+        hash: "#home_token=inbox-test-token",
+      },
+      top: { postMessage() {} },
+      parent: { postMessage() {} },
+      addEventListener() {},
+      removeEventListener() {},
+      setInterval() {
+        return 1;
+      },
+      setTimeout(callback) {
+        callback();
+        return 1;
+      },
+      clearTimeout() {},
+    },
+    URLSearchParams,
+    Intl,
+    Date,
+    Promise,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => jsonResponse(inboxSummary()),
+  };
+
+  vm.runInNewContext(inboxScript, context, {
+    filename: "capsules/inbox/browser/index.html:inline",
+  });
+  await settle();
+
+  const selectedRows = nodes.get("entry-rows").children
+    .filter((row) => row.getAttribute("aria-selected") === "true");
+  assert.equal(selectedRows.length, 0, "Inbox selected a different request after an explicit missing launch id");
+  const detailText = descendants(nodes.get("entry-detail"))
+    .map((node) => node.textContent || "")
+    .join(" ");
+  assert(detailText.includes("no longer available"), "Inbox did not show the explicit request as unavailable", detailText);
+  assert.equal(
+    descendants(nodes.get("entry-detail")).filter((node) => node.tagName === "BUTTON").length,
+    0,
+    "Inbox exposed actions for a missing explicit launch id",
+  );
+}
+
+async function runInboxRemovedLaunchSelectionSmoke() {
+  const inbox = fs.readFileSync(new URL("../capsules/inbox/browser/index.html", import.meta.url), "utf8");
+  const inboxScript = extractInboxScript(inbox);
+  const nodes = new Map([
+    ["locked-shell", new FakeElement("section")],
+    ["inbox-shell", new FakeElement("section")],
+    ["status-text", new FakeElement("p")],
+    ["pending-count", new FakeElement("strong")],
+    ["review-count", new FakeElement("strong")],
+    ["refresh", new FakeElement("button")],
+    ["entry-rows", new FakeElement("section")],
+    ["entry-detail", new FakeElement("section")],
+    ["entry-split", new FakeElement("div")],
+    ["empty-state", new FakeElement("section")],
+    ["empty-title", new FakeElement("h2")],
+    ["list-title", new FakeElement("h1")],
+  ]);
+  const filterAll = new FakeElement("button");
+  filterAll.className = "summary-card active";
+  filterAll.dataset.filter = "all";
+  const filterReview = new FakeElement("button");
+  filterReview.className = "summary-card";
+  filterReview.dataset.filter = "review";
+  let fetchCount = 0;
+  const document = {
+    hidden: false,
+    documentElement: { dataset: {} },
+    getElementById(id) {
+      return nodes.get(id) || null;
+    },
+    querySelectorAll(selector) {
+      if (selector === ".summary-card[data-filter]") {
+        return [filterAll, filterReview];
+      }
+      return [];
+    },
+    addEventListener() {},
+    createElement(tagName) {
+      return new FakeElement(tagName);
+    },
+  };
+  const context = {
+    console,
+    document,
+    window: {
+      location: {
+        search: "?home_origin=http%3A%2F%2Flocalhost%3A61180&notification_id=entry-wallet",
+        hash: "#home_token=inbox-test-token",
+      },
+      top: { postMessage() {} },
+      parent: { postMessage() {} },
+      addEventListener() {},
+      removeEventListener() {},
+      setInterval() {
+        return 1;
+      },
+      setTimeout(callback) {
+        callback();
+        return 1;
+      },
+      clearTimeout() {},
+    },
+    URLSearchParams,
+    Intl,
+    Date,
+    Promise,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => {
+      fetchCount += 1;
+      if (fetchCount === 1) {
+        return jsonResponse(inboxSummary());
+      }
+      const summary = inboxSummary();
+      summary.notifications.entries = summary.notifications.entries.filter((entry) => entry.id !== "entry-wallet");
+      return jsonResponse(summary);
+    },
+  };
+
+  vm.runInNewContext(inboxScript, context, {
+    filename: "capsules/inbox/browser/index.html:inline",
+  });
+  await settle();
+  await nodes.get("refresh").listeners.get("click")[0]();
+  await settle();
+
+  const selectedRows = nodes.get("entry-rows").children
+    .filter((row) => row.getAttribute("aria-selected") === "true");
+  assert.equal(selectedRows.length, 0, "Inbox selected a different request after the explicit request disappeared");
+  const detailText = descendants(nodes.get("entry-detail"))
+    .map((node) => node.textContent || "")
+    .join(" ");
+  assert(detailText.includes("no longer available"), "Inbox did not keep the vanished explicit request unavailable", detailText);
+  assert.equal(
+    descendants(nodes.get("entry-detail")).filter((node) => node.tagName === "BUTTON").length,
+    0,
+    "Inbox exposed actions after the explicit request disappeared on refresh",
+  );
+}
+
+async function runInboxRequestedSelectionAppearsLaterSmoke() {
+  const inbox = fs.readFileSync(new URL("../capsules/inbox/browser/index.html", import.meta.url), "utf8");
+  const inboxScript = extractInboxScript(inbox);
+  const nodes = new Map([
+    ["locked-shell", new FakeElement("section")],
+    ["inbox-shell", new FakeElement("section")],
+    ["status-text", new FakeElement("p")],
+    ["pending-count", new FakeElement("strong")],
+    ["review-count", new FakeElement("strong")],
+    ["refresh", new FakeElement("button")],
+    ["entry-rows", new FakeElement("section")],
+    ["entry-detail", new FakeElement("section")],
+    ["entry-split", new FakeElement("div")],
+    ["empty-state", new FakeElement("section")],
+    ["empty-title", new FakeElement("h2")],
+    ["list-title", new FakeElement("h1")],
+  ]);
+  const filterAll = new FakeElement("button");
+  filterAll.className = "summary-card active";
+  filterAll.dataset.filter = "all";
+  const filterReview = new FakeElement("button");
+  filterReview.className = "summary-card";
+  filterReview.dataset.filter = "review";
+  let fetchCount = 0;
+  const document = {
+    hidden: false,
+    documentElement: { dataset: {} },
+    getElementById(id) {
+      return nodes.get(id) || null;
+    },
+    querySelectorAll(selector) {
+      if (selector === ".summary-card[data-filter]") {
+        return [filterAll, filterReview];
+      }
+      return [];
+    },
+    addEventListener() {},
+    createElement(tagName) {
+      return new FakeElement(tagName);
+    },
+  };
+  const context = {
+    console,
+    document,
+    window: {
+      location: {
+        search: "?home_origin=http%3A%2F%2Flocalhost%3A61180&notification_id=entry-wallet",
+        hash: "#home_token=inbox-test-token",
+      },
+      top: { postMessage() {} },
+      parent: { postMessage() {} },
+      addEventListener() {},
+      removeEventListener() {},
+      setInterval() {
+        return 1;
+      },
+      setTimeout(callback) {
+        callback();
+        return 1;
+      },
+      clearTimeout() {},
+    },
+    URLSearchParams,
+    Intl,
+    Date,
+    Promise,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => {
+      fetchCount += 1;
+      const summary = inboxSummary();
+      if (fetchCount === 1) {
+        summary.notifications.entries = [summary.notifications.entries[0]];
+      }
+      return jsonResponse(summary);
+    },
+  };
+
+  vm.runInNewContext(inboxScript, context, {
+    filename: "capsules/inbox/browser/index.html:inline",
+  });
+  await settle();
+
+  let selectedRows = nodes.get("entry-rows").children
+    .filter((row) => row.getAttribute("aria-selected") === "true");
+  assert.equal(selectedRows.length, 0, "Inbox selected the wrong request before the explicit request appeared");
+
+  await nodes.get("refresh").listeners.get("click")[0]();
+  await settle();
+
+  selectedRows = nodes.get("entry-rows").children
+    .filter((row) => row.getAttribute("aria-selected") === "true");
+  assert.equal(selectedRows.length, 1);
+  assert.equal(selectedRows[0], nodes.get("entry-rows").children[1], "Inbox did not reselect the requested request when it appeared");
+
+  const keydown = nodes.get("entry-rows").listeners.get("keydown")[0];
+  keydown({
+    key: "ArrowUp",
+    preventDefault() {},
+  });
+  await settle();
+  selectedRows = nodes.get("entry-rows").children
+    .filter((row) => row.getAttribute("aria-selected") === "true");
+  assert.equal(selectedRows[0], nodes.get("entry-rows").children[0], "Keyboard selection did not clear the pinned request");
+}
+
 await runInboxHomeChromeSmoke();
+await runInboxLaunchSelectionSmoke();
+await runInboxMissingLaunchSelectionSmoke();
+await runInboxRemovedLaunchSelectionSmoke();
+await runInboxRequestedSelectionAppearsLaterSmoke();
 console.log("inbox-product-behavior-smoke: PASS");

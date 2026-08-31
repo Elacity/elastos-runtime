@@ -2276,6 +2276,89 @@ fn inbox_selected_index_controls_mark_dismiss_and_open() {
 }
 
 #[test]
+fn unresolved_inbox_review_request_surfaces_desktop_handoff() {
+    let mut snapshot = sample_snapshot();
+    snapshot.notifications.unread_count = 1;
+    snapshot.notifications.attention_count = 1;
+    snapshot.targets.push(HomeTargetStatus {
+        target: "inbox".to_string(),
+        title: "Inbox".to_string(),
+        description: "Review pending requests.".to_string(),
+        role: "app".to_string(),
+        target_kind: "app".to_string(),
+        viewer: None,
+        viewer_title: None,
+    });
+    snapshot.notifications.entries = vec![NotificationEntryStatus {
+        id: "wallet-approval-request:wallet-approval:test".to_string(),
+        source_app: "wallet".to_string(),
+        kind: "wallet_approval_request".to_string(),
+        title: "Wallet approval requested".to_string(),
+        body: "Wallet needs a review in Inbox.".to_string(),
+        action_ref: Some(NotificationActionRefStatus {
+            app: "wallet".to_string(),
+            action_id: "wallet-review-request:wallet-approval:test".to_string(),
+        }),
+        read: false,
+        severity: "attention".to_string(),
+    }];
+
+    let action = selected_notification_action(&snapshot, 0).expect("Inbox handoff action");
+    assert_eq!(
+        action.id,
+        "inbox-review-notification:wallet-approval-request:wallet-approval:test"
+    );
+    assert_eq!(action.label, "Open Inbox on Desktop");
+    assert!(action.ready);
+
+    let state = TuiState {
+        tab: Tab::Inbox,
+        ..TuiState::default()
+    };
+    assert_eq!(
+        state.activate(&snapshot),
+        Some("inbox-review-notification:wallet-approval-request:wallet-approval:test".to_string())
+    );
+
+    let mut buf = String::new();
+    render_inbox_tab(&mut buf, &snapshot, &state, 120);
+    assert!(buf.contains("Action     Open Inbox on Desktop"));
+    assert!(buf.contains("ActionUse  ready"));
+    assert!(buf.contains("Enter      open Desktop Inbox for review"));
+}
+
+#[test]
+fn stale_direct_request_stays_unavailable_in_inbox() {
+    let mut snapshot = sample_snapshot();
+    snapshot.notifications.unread_count = 1;
+    snapshot.notifications.attention_count = 1;
+    snapshot.notifications.entries = vec![NotificationEntryStatus {
+        id: "room-pair-request:req-1".to_string(),
+        source_app: "chat-room".to_string(),
+        kind: "room_pair_request".to_string(),
+        title: "Alice wants to join Chat".to_string(),
+        body: "Alice on Phone wants to join Chat.".to_string(),
+        action_ref: Some(NotificationActionRefStatus {
+            app: "chat-room".to_string(),
+            action_id: "room-approve-request:req-1".to_string(),
+        }),
+        read: false,
+        severity: "attention".to_string(),
+    }];
+
+    let state = TuiState {
+        tab: Tab::Inbox,
+        ..TuiState::default()
+    };
+    assert!(selected_notification_action(&snapshot, 0).is_none());
+    assert_eq!(state.activate(&snapshot), None);
+
+    let mut buf = String::new();
+    render_inbox_tab(&mut buf, &snapshot, &state, 120);
+    assert!(buf.contains("Action     no longer available"));
+}
+
+#[test]
 fn tabs_keep_people_between_inbox_and_apps() {
     let mut state = TuiState::default();
     state.next_tab();

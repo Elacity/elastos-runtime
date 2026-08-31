@@ -127,6 +127,7 @@ pub(super) use gateway_home_token::{
     require_internal_shell_runtime_wallet_authority, require_runtime_wallet_authority,
     runtime_wallet_authority, HomeLaunchContext, RequiredHomeLaunchToken,
 };
+
 #[cfg(test)]
 pub(in crate::api) use gateway_home_token::{
     issue_expired_home_launch_token_with_context, issue_home_launch_token,
