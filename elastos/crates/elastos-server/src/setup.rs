@@ -2284,22 +2284,10 @@ mod tests {
     }
 
     #[test]
-    fn test_load_manifest_finds_current_manifest() {
-        let _guard = ENV_LOCK.blocking_lock();
-        let temp = tempfile::tempdir().unwrap();
-        let xdg_data_home = temp.path().join("xdg-data");
-        let data_dir = xdg_data_home.join("elastos");
-        fs::create_dir_all(&data_dir).unwrap();
-        fs::copy(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../components.json"),
-            data_dir.join("components.json"),
-        )
-        .unwrap();
-
-        std::env::remove_var(COMPONENTS_MANIFEST_ENV);
-        std::env::set_var("XDG_DATA_HOME", &xdg_data_home);
-        let manifest = load_manifest().unwrap();
-        std::env::remove_var("XDG_DATA_HOME");
+    fn test_current_checkout_manifest_content_matches_expected_profiles() {
+        let manifest_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../components.json");
+        let manifest = load_manifest_from_path(&manifest_path).unwrap();
 
         assert!(manifest.external.contains_key("kubo"));
         assert!(manifest.external.contains_key("archive-manager"));

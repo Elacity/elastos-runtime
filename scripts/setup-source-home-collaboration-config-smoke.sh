@@ -4,9 +4,18 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
+original_home="$HOME"
+export CARGO_HOME="${CARGO_HOME:-${original_home}/.cargo}"
+export RUSTUP_HOME="${RUSTUP_HOME:-${original_home}/.rustup}"
+export ELASTOS_CARGO_BIN="$(command -v cargo)"
+export ELASTOS_NODE_BIN="$(command -v node)"
 
 functions_file="$tmp_dir/setup-source-home-functions.sh"
 awk '
+  /^ROOT=/ {
+    print "ROOT=\"$repo_root\""
+    next
+  }
   /^echo "\[setup-source-home\] repo:/ { exit }
   { print }
 ' "$repo_root/scripts/setup-source-home.sh" >"$functions_file"

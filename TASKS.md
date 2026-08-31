@@ -17,17 +17,18 @@ section if a higher section is incoherent, unverified, or too large to review.
 
 Active priority index:
 
-- current priority: finish and retest the exact reviewed tree on the isolated
-  localhost install with matching stable receipts
+- current priority: pass full CI on the locally verified PR39 repair before
+  updating the audit installation
 - separately authorized after localhost: install the same reviewed tree on the
   seed and the third custody node with matching stable receipts
 - integrated UIUX source evidence: published
   `origin/feat/0.7-uiux-candidate` at `8b547590`; this ref is donor evidence,
   not installed, live, or release truth
 - current protected-content integration source line: published
-  `origin/feat/protected-content-uiux-reconstruction` at `7e4b0dd4`; PR39 CI
-  covers that prefix. The separate local audit tail retains fixes with mixed
-  source and installed evidence. Each remaining GUI gate needs its own verdict
+  `origin/feat/protected-content-uiux-reconstruction` at `6b3c648b`; its Clippy
+  failure has a locally verified repair approved for push and full CI.
+  The audit fixes retain mixed source and installed evidence. Each
+  remaining GUI gate needs its own verdict
 - all other work remains queued below
 
 ### Integrated UIUX and protected-content proof
@@ -37,30 +38,32 @@ gates are the remaining path to installation and cutover.
 
 Open gates, in order:
 
-1. [ ] Install and retest the exact reviewed tree on isolated localhost with
+1. [ ] Pass all CI jobs on the corrected PR39 revision. Include both Linux
+   architectures, the clean macOS installation and the x86_64 release build.
+2. [ ] Install and retest the exact reviewed tree on isolated localhost with
    matching stable Runtime, component, capsule metadata, provider, static
    audit, installation, and platform restart receipts.
-2. [ ] After separate authorization, install the same reviewed tree on the
+3. [ ] After separate authorization, install the same reviewed tree on the
    seed and the third custody node with matching stable Runtime, component,
    capsule metadata, provider, static audit, installation, and platform
    restart receipts.
-3. [ ] Provision one real signed owner-only 2-of-3 custody composition across
+4. [ ] Provision one real signed owner-only 2-of-3 custody composition across
    three distinct operators and failure domains.
-4. [ ] Install the private multi-RPC Chain configuration and verify the exact
+5. [ ] Install the private multi-RPC Chain configuration and verify the exact
    deployed Base network, contract, token, emitter, and finality authority.
-5. [ ] Prove exactly three protected-content replicas and repair after one
+6. [ ] Prove exactly three protected-content replicas and repair after one
    replica is lost.
-6. [ ] Fund the creator and buyer Base accounts, then run the Brave two-Runtime
+7. [ ] Fund the creator and buyer Base accounts, then run the Brave two-Runtime
    journey: mint, list, and share on localhost; import, deny, buy, open, play,
    and close on the seed. Prove one bound KID with allowed, denied, and unbound
    reads, the CentralStorage binding, the exact `AuthorityGateway.buyAccess`
    receipt and event, restart, replay, tamper rejection, settlement, cleanup,
    and zero unresolved state.
-7. [ ] Complete the installed manual UIUX matrix for Home windows, focus,
+8. [ ] Complete the installed manual UIUX matrix for Home windows, focus,
     fullscreen, and launcher; People, Chat, Inbox, and Clipboard; Wallet and
     connectors; Library, Marketplace, and `elacity-player`; Assistant
     model-offer states; GBA; and Browser.
-8. [ ] Make one atomic cutover that selects the Runtime-owned protected-content
+9. [ ] Make one atomic cutover that selects the Runtime-owned protected-content
    path and removes the provisional `drm`, `rights`, `key`, and `decrypt`
    authority surfaces from startup, registration, resources, packaging, tests,
    and docs.

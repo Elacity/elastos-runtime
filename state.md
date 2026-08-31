@@ -3,7 +3,7 @@
 Last updated: 2026-08-31 UTC
 
 This file records public-safe current truth for released 0.6.0 and active
-unpublished work. Private operator paths, credentials, target identities, and
+development work. Private operator paths, credentials, target identities, and
 volatile proof logs remain outside the repository.
 
 ## Release Posture
@@ -12,7 +12,7 @@ volatile proof logs remain outside the repository.
   `origin/upstream/0.7-dev` at `90bbe15b` as the current 0.7 integration line.
 - Published feature evidence is
   `origin/feat/protected-content-runtime-lifecycle@854d9dc9`,
-  `origin/feat/protected-content-uiux-reconstruction@7e4b0dd4`,
+  `origin/feat/protected-content-uiux-reconstruction@6b3c648b`,
   `origin/feat/0.7-uiux-candidate@8b547590`,
   `origin/feat/dkms-esp-port@27d85c6f`, and
   `origin/feat/0.7-product-documentation@74cd4e42`.
@@ -22,13 +22,18 @@ volatile proof logs remain outside the repository.
   ancestor of the published lifecycle and is already present in the active
   integration. The latest published protected-branch repairs need no new
   extraction.
-- The published `feat/protected-content-uiux-reconstruction` line is
-  `origin/feat/protected-content-uiux-reconstruction@7e4b0dd4`. All seven
-  PR39 checks pass on that commit. The local audit fixes are a separate,
-  unpublished tail; that CI result covers the published prefix only.
-- The local tail groups Home and Terminal repairs, create-only Library writes,
-  document close protection, Assistant and model-init repairs, declared-content
-  icons, private diagnostics, socket-root protection, and Mac restart safety.
+- PR39 includes the Home audit fixes at `6b3c648b`. Its source gate failed
+  because the principal-root write helper exceeded Clippy's argument limit;
+  the dependent test, installation and release-build jobs were skipped. A
+  local repair groups the write-policy flags without changing their behavior.
+  Full workspace Clippy, cargo check, workspace tests and all 25 capsule
+  workspace suites pass locally with CI's Rust version and warning settings.
+  The corrected revision still needs the full CI run, including clean
+  installations and the Linux release build.
+- The published audit changes include Home and Terminal repairs, create-only
+  Library writes, document close protection, Assistant and model-init repairs,
+  declared-content icons, private diagnostics, socket-root protection, and Mac
+  restart safety.
   The history review preserved the product tree and incorporated the published
   CI/setup changes. Installed acceptance still belongs to exact artifact
   receipts and recorded GUI outcomes.
