@@ -69,9 +69,12 @@ assert(
 );
 assert(
   source.includes('if (event.origin !== "null" || event.source !== window.parent) {') &&
+    source.includes('data.type === DOCUMENTS_WINDOW_CLOSE_REQUEST_TYPE') &&
+    source.includes('void handleHomeWindowCloseRequest(event);') &&
+    source.includes('type: DOCUMENTS_WINDOW_CLOSE_RESULT_TYPE') &&
     source.includes('data.type !== "elastos:menu-command"') &&
     source.includes('event.origin === homeOrigin && event.source === window.top'),
-  "Documents must keep exact outbound top-window and inbound trusted-parent menu boundaries.",
+  "Documents must keep exact outbound top-window and inbound trusted-parent menu and close boundaries.",
 );
 assert(
   source.includes('contextMenuDocDid = docDid || "";') &&

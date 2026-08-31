@@ -71,6 +71,11 @@ const BROWSER_WINDOW_CLOSE_REQUEST_TYPE =
   "elastos.browser.window-close.request/v1";
 const BROWSER_WINDOW_CLOSE_RESULT_TYPE =
   "elastos.browser.window-close.result/v1";
+const DOCUMENTS_WINDOW_CLOSE_TIMEOUT_MS = 15_000;
+const DOCUMENTS_WINDOW_CLOSE_REQUEST_TYPE =
+  "elastos.documents.window-close.request/v1";
+const DOCUMENTS_WINDOW_CLOSE_RESULT_TYPE =
+  "elastos.documents.window-close.result/v1";
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const MAX_SESSION_WINDOWS = 24;
 const SINGLE_SESSION_TARGETS = new Set(["people", "inbox", "wallet"]);
@@ -110,8 +115,10 @@ const SYSTEM_IFRAME_SANDBOX_EXTRAS = [
 const COMMON_IFRAME_ALLOW = ["autoplay", "fullscreen"];
 const pendingWindowLaunches = new Set();
 const pendingBrowserWindowCloses = new Map();
+const pendingDocumentsWindowCloses = new Map();
 
 window.addEventListener("message", handleBrowserWindowCloseResult);
+window.addEventListener("message", handleDocumentsWindowCloseResult);
 
 export function iframeSandboxForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_SANDBOX];
@@ -702,6 +709,32 @@ function browserWindowCloseRequestId() {
   throw new Error("Home GUI requires browser crypto for close isolation");
 }
 
+function documentsWindowCloseContext(entry) {
+  if (!entry || entry.targetId !== "documents") {
+    return null;
+  }
+  const frame = entry.node.querySelector(".window-frame");
+  let frameWindow = null;
+  try {
+    frameWindow = frame?.contentWindow || null;
+  } catch (_error) {
+    return null;
+  }
+  const route = frame?.dataset?.route || frame?.getAttribute("src") || "";
+  let homeToken = "";
+  try {
+    const url = new URL(route, window.location.href);
+    homeToken =
+      new URLSearchParams(url.hash.replace(/^#/, "")).get("home_token") || "";
+  } catch (_error) {
+    return null;
+  }
+  if (!frameWindow || !homeToken) {
+    return null;
+  }
+  return { frameWindow, homeToken };
+}
+
 function markBrowserWindowCloseState(entry, state) {
   if (!entry || !shellState.windows.has(entry.id)) {
     return;
@@ -821,6 +854,72 @@ function handleBrowserWindowCloseResult(event) {
   }
 }
 
+function settleDocumentsWindowClose(record, ok) {
+  window.clearTimeout(record.timeout);
+  pendingDocumentsWindowCloses.delete(record.requestId);
+  if (record.entry.documentsCloseRequest === record) {
+    delete record.entry.documentsCloseRequest;
+  }
+  const currentContext = documentsWindowCloseContext(record.entry);
+  const sameContext =
+    !!currentContext &&
+    currentContext.frameWindow === record.frameWindow &&
+    currentContext.homeToken === record.homeToken;
+  if (
+    ok &&
+    shellState.windows.get(record.entry.id) === record.entry &&
+    sameContext
+  ) {
+    removeWindowEntries([record.entry]);
+    record.resolve(true);
+    return;
+  }
+  record.resolve(false);
+}
+
+function handleDocumentsWindowCloseResult(event) {
+  const message = event.data;
+  if (
+    event.origin !== OPAQUE_CAPSULE_ORIGIN ||
+    !hasExactKeys(message, [
+      "type",
+      "requestId",
+      "homeToken",
+      "state",
+      "ok",
+      "reason",
+      "sessionId",
+    ]) ||
+    message.type !== DOCUMENTS_WINDOW_CLOSE_RESULT_TYPE
+  ) {
+    return;
+  }
+  const record = pendingDocumentsWindowCloses.get(message.requestId);
+  if (
+    !record ||
+    event.source !== record.frameWindow ||
+    message.homeToken !== record.homeToken ||
+    !["pending", "terminal"].includes(message.state) ||
+    typeof message.reason !== "string" ||
+    !Number.isSafeInteger(message.sessionId) ||
+    message.sessionId < 0
+  ) {
+    return;
+  }
+  if (message.state === "pending") {
+    window.clearTimeout(record.timeout);
+    record.timeout = 0;
+    if (record.sessionId == null) {
+      record.sessionId = message.sessionId;
+    }
+    return;
+  }
+  if (record.sessionId != null && message.sessionId !== record.sessionId) {
+    return;
+  }
+  settleDocumentsWindowClose(record, message.ok === true);
+}
+
 function requestBrowserWindowClose(entry) {
   if (entry.browserCloseRequest) {
     return entry.browserCloseRequest.promise;
@@ -855,6 +954,43 @@ function requestBrowserWindowClose(entry) {
       requestId,
       homeToken: context.homeToken,
       browserInstance: context.browserInstance,
+    },
+    "*",
+  );
+  return promise;
+}
+
+function requestDocumentsWindowClose(entry) {
+  if (entry.documentsCloseRequest) {
+    return entry.documentsCloseRequest.promise;
+  }
+  const context = documentsWindowCloseContext(entry);
+  if (!context) {
+    return Promise.resolve(false);
+  }
+  const requestId = browserWindowCloseRequestId();
+  let resolveRequest;
+  const promise = new Promise((resolve) => {
+    resolveRequest = resolve;
+  });
+  const record = {
+    ...context,
+    entry,
+    promise,
+    requestId,
+    resolve: resolveRequest,
+    timeout: 0,
+  };
+  record.timeout = window.setTimeout(() => {
+    settleDocumentsWindowClose(record, false);
+  }, DOCUMENTS_WINDOW_CLOSE_TIMEOUT_MS);
+  entry.documentsCloseRequest = record;
+  pendingDocumentsWindowCloses.set(requestId, record);
+  context.frameWindow.postMessage(
+    {
+      type: DOCUMENTS_WINDOW_CLOSE_REQUEST_TYPE,
+      requestId,
+      homeToken: context.homeToken,
     },
     "*",
   );
@@ -1535,6 +1671,9 @@ export function closeWindow(id) {
   }
   if (entry.targetId === "browser") {
     return requestBrowserWindowClose(entry);
+  }
+  if (entry.targetId === "documents") {
+    return requestDocumentsWindowClose(entry);
   }
   return removeWindowEntries([entry]);
 }

@@ -1286,6 +1286,7 @@ a {
     <p id="confirm-message"></p>
     <div class="modal-actions">
       <button id="confirm-cancel" class="action-secondary" type="button">Cancel</button>
+      <button id="confirm-secondary-action" class="action-secondary" type="button" hidden>Discard</button>
       <button id="confirm-action" class="action-primary" type="button">Continue</button>
     </div>
   </div>
@@ -1321,6 +1322,10 @@ const state = {
   pendingChatAttachmentId: "",
 };
 const homeOrigin = new URLSearchParams(window.location.search).get("home_origin") || "";
+const DOCUMENTS_WINDOW_CLOSE_REQUEST_TYPE =
+  "elastos.documents.window-close.request/v1";
+const DOCUMENTS_WINDOW_CLOSE_RESULT_TYPE =
+  "elastos.documents.window-close.result/v1";
 const homeClipboard = createHomeClipboardClient({
   targetId: "documents",
   homeOrigin,
@@ -1378,6 +1383,7 @@ const elements = {
   confirmTitle: document.getElementById("confirm-title"),
   confirmMessage: document.getElementById("confirm-message"),
   confirmCancel: document.getElementById("confirm-cancel"),
+  confirmSecondaryAction: document.getElementById("confirm-secondary-action"),
   confirmAction: document.getElementById("confirm-action"),
 };
 
@@ -1385,6 +1391,7 @@ let autosaveTimerId = 0;
 let statusClearTimerId = 0;
 let saveInFlight = null;
 let autosaveQueued = false;
+let pendingHomeWindowCloseTarget = null;
 let homeChromeReady = false;
 let lastHomeMenuManifestSignature = "";
 let findMatches = [];
@@ -1398,6 +1405,16 @@ function escapeHtml(value) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/\"/g, "&quot;");
+}
+
+function hasExactKeys(value, expectedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const actual = Object.keys(value).sort();
+  const expected = [...expectedKeys].sort();
+  return actual.length === expected.length &&
+    actual.every((key, index) => key === expected[index]);
 }
 
 function renderInlineMarkdown(text) {
@@ -1742,7 +1759,12 @@ function isCurrentDocumentTarget(target) {
 
 function scheduleAutosave() {
   clearAutosaveTimer();
-  if (!state.current || state.mode !== "shell" || !state.dirty) {
+  if (
+    !state.current ||
+    state.mode !== "shell" ||
+    !state.dirty ||
+    pendingHomeWindowCloseTarget?.sessionId === state.currentSessionId
+  ) {
     return;
   }
   autosaveTimerId = window.setTimeout(() => {
@@ -1811,6 +1833,47 @@ function announceHomeChrome() {
   window.top.postMessage({ type: "home:app-ready", homeToken: state.homeToken }, homeOrigin);
   homeChromeReady = true;
   syncHomeMenuManifest();
+}
+
+function chooseInCapsule(options) {
+  if (state.pendingConfirmation) {
+    closeConfirmModal("cancel");
+  }
+  const title = options && Object.prototype.hasOwnProperty.call(options, "title")
+    ? String(options.title || "")
+    : "Continue?";
+  const message = options && options.message ? options.message : "";
+  const confirmLabel = options && options.confirmLabel ? options.confirmLabel : "Continue";
+  const secondaryLabel = options && options.secondaryLabel ? String(options.secondaryLabel) : "";
+  const danger = !!(options && options.danger);
+  const hasTitle = title.length > 0;
+  const dialog = elements.confirmModal.querySelector(".modal-card");
+  elements.confirmTitle.textContent = title;
+  elements.confirmTitle.hidden = !hasTitle;
+  if (dialog) {
+    if (hasTitle) {
+      dialog.setAttribute("aria-labelledby", "confirm-title");
+      dialog.removeAttribute("aria-label");
+    } else {
+      dialog.removeAttribute("aria-labelledby");
+      dialog.setAttribute("aria-label", confirmLabel);
+    }
+  }
+  elements.confirmMessage.textContent = message;
+  elements.confirmAction.textContent = confirmLabel;
+  elements.confirmAction.classList.toggle("action-danger-solid", danger);
+  elements.confirmSecondaryAction.hidden = !secondaryLabel;
+  elements.confirmSecondaryAction.textContent = secondaryLabel || "Discard";
+  elements.confirmModal.classList.add("open");
+  elements.confirmModal.setAttribute("aria-hidden", "false");
+  const focusTarget =
+    options && options.defaultFocus === "cancel"
+      ? elements.confirmCancel
+      : elements.confirmAction;
+  window.setTimeout(() => focusTarget.focus(), 10);
+  return new Promise((resolve) => {
+    state.pendingConfirmation = { resolve };
+  });
 }
 
 function closeContextMenu() {
@@ -2725,7 +2788,10 @@ async function saveCurrent(options) {
     saveInFlight = null;
     if (autosaveQueued) {
       autosaveQueued = false;
-      if (state.dirty) {
+      if (
+        state.dirty &&
+        pendingHomeWindowCloseTarget?.sessionId !== state.currentSessionId
+      ) {
         void saveCurrent({ quiet: true, autosave: true }).catch((error) => {
           reportSaveFailure(error, "Autosave failed.");
         });
@@ -2751,48 +2817,173 @@ function closeSaveAsModal() {
 }
 
 function confirmInCapsule(options) {
-  if (state.pendingConfirmation) {
-    closeConfirmModal(false);
-  }
-  const title = options && Object.prototype.hasOwnProperty.call(options, "title")
-    ? String(options.title || "")
-    : "Continue?";
-  const message = options && options.message ? options.message : "";
-  const confirmLabel = options && options.confirmLabel ? options.confirmLabel : "Continue";
-  const danger = !!(options && options.danger);
-  const hasTitle = title.length > 0;
-  const dialog = elements.confirmModal.querySelector(".modal-card");
-  elements.confirmTitle.textContent = title;
-  elements.confirmTitle.hidden = !hasTitle;
-  if (dialog) {
-    if (hasTitle) {
-      dialog.setAttribute("aria-labelledby", "confirm-title");
-      dialog.removeAttribute("aria-label");
-    } else {
-      dialog.removeAttribute("aria-labelledby");
-      dialog.setAttribute("aria-label", confirmLabel);
-    }
-  }
-  elements.confirmMessage.textContent = message;
-  elements.confirmAction.textContent = confirmLabel;
-  elements.confirmAction.classList.toggle("action-danger-solid", danger);
-  elements.confirmModal.classList.add("open");
-  elements.confirmModal.setAttribute("aria-hidden", "false");
-  window.setTimeout(() => elements.confirmAction.focus(), 10);
-  return new Promise((resolve) => {
-    state.pendingConfirmation = resolve;
-  });
+  return chooseInCapsule(options).then((result) => result === "confirm");
 }
 
 function closeConfirmModal(result) {
-  const resolve = state.pendingConfirmation;
+  const pending = state.pendingConfirmation;
   state.pendingConfirmation = null;
   elements.confirmModal.classList.remove("open");
   elements.confirmModal.setAttribute("aria-hidden", "true");
   elements.confirmAction.classList.remove("action-danger-solid");
-  if (resolve) {
-    resolve(!!result);
+  elements.confirmSecondaryAction.hidden = true;
+  if (pending) {
+    pending.resolve(result || "cancel");
   }
+}
+
+function sameHomeWindowCloseTarget(target) {
+  return !!target && target.sessionId === state.currentSessionId;
+}
+
+function suspendAutosaveForHomeWindowClose(target) {
+  if (!sameHomeWindowCloseTarget(target)) {
+    return null;
+  }
+  const suspension = {
+    sessionId: target.sessionId,
+    queued: autosaveQueued,
+  };
+  pendingHomeWindowCloseTarget = { sessionId: target.sessionId };
+  clearAutosaveTimer();
+  autosaveQueued = false;
+  return suspension;
+}
+
+function resumeAutosaveForHomeWindowClose(suspension) {
+  if (
+    suspension &&
+    pendingHomeWindowCloseTarget?.sessionId === suspension.sessionId
+  ) {
+    pendingHomeWindowCloseTarget = null;
+  }
+  if (!suspension || !sameHomeWindowCloseTarget(suspension)) {
+    return;
+  }
+  autosaveQueued = autosaveQueued || suspension.queued;
+  if (!state.dirty) {
+    return;
+  }
+  if (!saveInFlight) {
+    scheduleAutosave();
+  }
+}
+
+async function requestHomeWindowCloseDecision(closeTarget) {
+  const autosaveSuspension = suspendAutosaveForHomeWindowClose(closeTarget);
+  if (saveInFlight) {
+    try {
+      await saveInFlight;
+    } catch (error) {
+      reportSaveFailure(error, "Save failed.");
+      resumeAutosaveForHomeWindowClose(autosaveSuspension);
+      return { ok: false, reason: "save_failed" };
+    }
+    if (!sameHomeWindowCloseTarget(closeTarget)) {
+      resumeAutosaveForHomeWindowClose(autosaveSuspension);
+      return { ok: false, reason: "stale_request" };
+    }
+    if (!state.dirty) {
+      resumeAutosaveForHomeWindowClose(autosaveSuspension);
+      return { ok: true, reason: "" };
+    }
+  }
+  if (!sameHomeWindowCloseTarget(closeTarget)) {
+    resumeAutosaveForHomeWindowClose(autosaveSuspension);
+    return { ok: false, reason: "stale_request" };
+  }
+  if (!state.dirty) {
+    resumeAutosaveForHomeWindowClose(autosaveSuspension);
+    return { ok: true, reason: "" };
+  }
+  if (!sameHomeWindowCloseTarget(closeTarget)) {
+    resumeAutosaveForHomeWindowClose(autosaveSuspension);
+    return { ok: false, reason: "stale_request" };
+  }
+  const decision = await chooseInCapsule({
+    title: "Save changes before closing?",
+    message: "Save this document, discard your edits, or keep the window open.",
+    confirmLabel: "Save",
+    secondaryLabel: "Discard",
+    defaultFocus: "cancel",
+  });
+  if (!sameHomeWindowCloseTarget(closeTarget)) {
+    resumeAutosaveForHomeWindowClose(autosaveSuspension);
+    return { ok: false, reason: "stale_request" };
+  }
+  if (decision === "secondary") {
+    return { ok: true, reason: "discarded" };
+  }
+  if (decision !== "confirm") {
+    resumeAutosaveForHomeWindowClose(autosaveSuspension);
+    return { ok: false, reason: "cancelled" };
+  }
+  try {
+    await saveCurrent();
+    if (!sameHomeWindowCloseTarget(closeTarget)) {
+      resumeAutosaveForHomeWindowClose(autosaveSuspension);
+      return { ok: false, reason: "stale_request" };
+    }
+    if (state.dirty) {
+      resumeAutosaveForHomeWindowClose(autosaveSuspension);
+      return { ok: false, reason: "save_incomplete" };
+    }
+    return { ok: true, reason: "" };
+  } catch (error) {
+    reportSaveFailure(error, "Save failed.");
+    resumeAutosaveForHomeWindowClose(autosaveSuspension);
+    return { ok: false, reason: "save_failed" };
+  }
+}
+
+function postHomeWindowCloseResult(requestId, ok, phase, reason, closeTarget) {
+  if (!state.homeToken || window.parent === window) {
+    return;
+  }
+  window.parent.postMessage(
+    {
+      type: DOCUMENTS_WINDOW_CLOSE_RESULT_TYPE,
+      requestId,
+      homeToken: state.homeToken,
+      state: phase,
+      ok: ok === true,
+      reason: typeof reason === "string" ? reason : "",
+      sessionId: closeTarget?.sessionId ?? state.currentSessionId,
+    },
+    "*",
+  );
+}
+
+async function handleHomeWindowCloseRequest(event) {
+  const data = event.data;
+  if (
+    event.origin !== "null" ||
+    event.source !== window.parent ||
+    !hasExactKeys(data, ["type", "requestId", "homeToken"]) ||
+    data.type !== DOCUMENTS_WINDOW_CLOSE_REQUEST_TYPE ||
+    typeof data.requestId !== "string" ||
+    !data.requestId ||
+    data.homeToken !== state.homeToken
+  ) {
+    return false;
+  }
+  const closeTarget = { sessionId: state.currentSessionId };
+  postHomeWindowCloseResult(
+    data.requestId,
+    false,
+    "pending",
+    "awaiting_decision",
+    closeTarget,
+  );
+  const outcome = await requestHomeWindowCloseDecision(closeTarget);
+  postHomeWindowCloseResult(
+    data.requestId,
+    outcome.ok,
+    "terminal",
+    outcome.reason,
+    closeTarget,
+  );
+  return true;
 }
 
 async function saveAsCurrent(title, fileName) {
@@ -3069,11 +3260,12 @@ function wireShellEvents() {
       closeSaveAsModal();
     }
   });
-  elements.confirmCancel.addEventListener("click", () => closeConfirmModal(false));
-  elements.confirmAction.addEventListener("click", () => closeConfirmModal(true));
+  elements.confirmCancel.addEventListener("click", () => closeConfirmModal("cancel"));
+  elements.confirmSecondaryAction.addEventListener("click", () => closeConfirmModal("secondary"));
+  elements.confirmAction.addEventListener("click", () => closeConfirmModal("confirm"));
   elements.confirmModal.addEventListener("click", (event) => {
     if (event.target === elements.confirmModal) {
-      closeConfirmModal(false);
+      closeConfirmModal("cancel");
     }
   });
   window.addEventListener("message", (event) => {
@@ -3107,6 +3299,10 @@ function wireShellEvents() {
       return;
     }
     if (event.origin !== "null" || event.source !== window.parent) {
+      return;
+    }
+    if (data && typeof data === "object" && data.type === DOCUMENTS_WINDOW_CLOSE_REQUEST_TYPE) {
+      void handleHomeWindowCloseRequest(event);
       return;
     }
     if (!data || typeof data !== "object" || data.type !== "elastos:menu-command" || typeof data.cmd !== "string") {
@@ -3154,7 +3350,7 @@ function wireShellEvents() {
       closeSaveAsModal();
     }
     if (event.key === "Escape" && elements.confirmModal.classList.contains("open")) {
-      closeConfirmModal(false);
+      closeConfirmModal("cancel");
     }
     if (event.key === "Escape" && !elements.findBar.classList.contains("hidden")) {
       closeFindBar();
