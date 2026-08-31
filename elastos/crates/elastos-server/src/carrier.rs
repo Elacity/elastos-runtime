@@ -6325,6 +6325,24 @@ impl CarrierProviderInvoker {
     }
 }
 
+fn carrier_provider_public_connect_error(index: usize, err: &anyhow::Error) -> String {
+    tracing::debug!(
+        ticket_index = index,
+        error = %format_args!("{err:#}"),
+        "Carrier provider connect failed"
+    );
+    format!("ticket[{index}] connect failed")
+}
+
+fn carrier_provider_public_invoke_error(index: usize, err: &anyhow::Error) -> String {
+    tracing::debug!(
+        ticket_index = index,
+        error = %format_args!("{err:#}"),
+        "Carrier provider invocation failed"
+    );
+    format!("ticket[{index}] invoke failed")
+}
+
 #[async_trait::async_trait]
 impl ProviderCarrierInvoker for CarrierProviderInvoker {
     async fn invoke_carrier_provider(
@@ -6371,7 +6389,6 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
 
                 let mut errors = Vec::new();
                 for (index, endpoint) in endpoints.into_iter().enumerate() {
-                    let dialed = format!("{:?}", endpoint.addrs);
                     match CarrierClient::connect_known_endpoint(
                         peer_endpoint,
                         endpoint,
@@ -6383,13 +6400,11 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                             match client.invoke_provider(invocation, request.clone()).await {
                                 Ok(response) => return Ok(response),
                                 Err(err) => {
-                                    errors.push(format!("ticket[{index}] invoke failed: {err}"))
+                                    errors.push(carrier_provider_public_invoke_error(index, &err))
                                 }
                             }
                         }
-                        Err(err) => errors.push(format!(
-                            "ticket[{index}] connect to {dialed} failed: {err:#}"
-                        )),
+                        Err(err) => errors.push(carrier_provider_public_connect_error(index, &err)),
                     }
                 }
 
@@ -7498,6 +7513,8 @@ mod tests {
         omit_admission_receipt: bool,
     }
 
+    struct RejectingCarrierProviderPlaneInvoker;
+
     #[async_trait::async_trait]
     impl ProviderCarrierInvoker for MockCarrierProviderPlaneInvoker {
         async fn invoke_carrier_provider(
@@ -7817,6 +7834,22 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl ProviderCarrierInvoker for RejectingCarrierProviderPlaneInvoker {
+        async fn invoke_carrier_provider(
+            &self,
+            _route: &ProviderCarrierRoute,
+            _invocation: &ProviderInvocation,
+            _request: serde_json::Value,
+        ) -> std::result::Result<serde_json::Value, ProviderError> {
+            let err = anyhow::anyhow!("outer carrier failure")
+                .context("dial [/ip4/127.0.0.1/tcp/4433] inner failure");
+            Err(ProviderError::Provider(
+                carrier_provider_public_connect_error(0, &err),
+            ))
+        }
+    }
+
     #[test]
     fn test_topic_hash_deterministic() {
         let h1 = topic_hash("#general");
@@ -7891,6 +7924,23 @@ mod tests {
         assert!(uri.ends_with("/availability"));
         assert!(!topic.contains(cid));
         assert!(!uri.contains(cid));
+    }
+
+    #[test]
+    fn test_carrier_provider_public_errors_redact_dial_details_and_cause_chains() {
+        let connect_err = anyhow::anyhow!("outer carrier failure")
+            .context("dial [/ip4/127.0.0.1/tcp/4433] inner failure");
+        let connect = carrier_provider_public_connect_error(2, &connect_err);
+        assert_eq!(connect, "ticket[2] connect failed");
+        assert!(!connect.contains("127.0.0.1"));
+        assert!(!connect.contains("inner failure"));
+
+        let invoke_err =
+            anyhow::anyhow!("invoke failed: provider route 10.0.0.8:4433").context("root cause");
+        let invoke = carrier_provider_public_invoke_error(3, &invoke_err);
+        assert_eq!(invoke, "ticket[3] invoke failed");
+        assert!(!invoke.contains("10.0.0.8"));
+        assert!(!invoke.contains("root cause"));
     }
 
     #[test]
@@ -9417,6 +9467,33 @@ mod tests {
             requests[0]["request"]["_runtime_invocation"]["transfer"],
             "stream"
         );
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_fetch_public_error_stays_bounded() {
+        let registry = ProviderRegistry::new();
+        registry
+            .set_carrier_invoker(Arc::new(RejectingCarrierProviderPlaneInvoker))
+            .await;
+
+        let err = fetch_content_via_carrier_provider_invocation(
+            &registry,
+            "ticket:internal-secret",
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            "docs/readme.md",
+        )
+        .await
+        .expect_err("failing carrier invocation must stay bounded");
+
+        let rendered = err.to_string();
+        assert!(rendered.starts_with("Carrier provider invocation failed:"));
+        assert!(rendered.contains("ticket[0] connect failed"));
+        assert!(!rendered.contains("127.0.0.1"));
+        assert!(!rendered.contains("localhost"));
+        assert!(!rendered.contains("/ip4/"));
+        assert!(!rendered.contains("inner failure"));
+        assert!(!rendered.contains("connect to"));
+        assert!(!rendered.contains("ticket:internal-secret"));
     }
 
     #[tokio::test]
