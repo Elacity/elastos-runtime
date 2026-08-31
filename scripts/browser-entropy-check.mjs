@@ -1693,12 +1693,12 @@ assert(
     browserVmTargetDoc.includes("media_transport=runtime_relay") &&
     browserVmTargetDoc.includes("active-principal `localhost://Users/<root>/BrowserProfiles/default/profile.ext4`") &&
     browserVmTargetDoc.includes("principal-owned persistent ext4") &&
-    browserVmTargetDoc.includes("Current H038 boundary") &&
+    browserVmTargetDoc.includes("Profile storage boundary") &&
     browserVmTargetDoc.includes("not yet protected principal-root object storage") &&
     browserVmTargetDoc.includes("not a claim that Chromium cookies") &&
     browserVmTargetDoc.includes("storage_posture=principal_owned_reset_scoped_unprotected") &&
     browserVmTargetDoc.includes("protected_storage=false") &&
-    browserCapsuleDoc.includes("0.6.0 truth boundary") &&
+    browserCapsuleDoc.includes("Profile storage boundary") &&
     browserCapsuleDoc.includes("not yet a protected principal-root") &&
     browserCapsuleDoc.includes("object envelope") &&
     browserCapsuleDoc.includes("not yet exported/imported by Recovery Kit") &&

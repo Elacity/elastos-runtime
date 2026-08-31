@@ -24,7 +24,7 @@ Runtime-owned `ProviderRegistry` invoke of `chain` /
 `protected_content_rights_evidence`. That adapter is source-only. It does not
 replace the installed provisional `rights-provider`.
 
-Released 0.6 also contains an older provisional `rights-provider` capsule. It
+The provisional `rights-provider` capsule
 uses the old `elastos_common::protected_content` DTO and supports a wider set of
 unwired operations. It remains fail closed and must be replaced atomically
 during Runtime integration. It is not a second supported contract.

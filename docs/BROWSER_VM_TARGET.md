@@ -519,7 +519,7 @@ those ICE variables; Runtime issues a launch-scoped TURN authority instead.
 
 ## Apple VZ Launcher
 
-`elastos-vz` now includes a native `browser-vz-engine-supervisor` binary for the
+`elastos-vz` includes a native `browser-vz-engine-supervisor` binary for the
 Mac product path. It is not a browser implementation and it is not a container
 wrapper. It owns one Apple Virtualization.framework VM for the lifetime of one
 Browser page, then:
@@ -603,7 +603,7 @@ Runtime-owned operation: Browser calls `POST /api/apps/browser/profile/reset`
 with its app launch token, Runtime refuses while that principal has live Browser
 sessions, then removes only that principal's profile disk.
 
-Current H038 boundary: this ext4 disk is the working principal-owned Browser
+Profile storage boundary: this ext4 disk is the principal-owned Browser
 profile lane, not yet protected principal-root object storage and not yet
 Recovery Kit exported/imported state. Reset proof is required evidence for the
 current lane, but it is not a claim that Chromium cookies, localStorage,

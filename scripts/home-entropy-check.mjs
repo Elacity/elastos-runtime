@@ -352,6 +352,25 @@ function assertMarkdownLocalLinksResolve() {
   assert(failures.length === 0, "Markdown local links must resolve", failures);
 }
 
+function assertStandingDocsHaveNoReleaseSnapshots() {
+  const records = new Set(["state.md", "TASKS.md", "elastos/CHANGELOG.md"]);
+  const failures = [];
+  const snapshot = /\bPR\s*#?\s*\d+\b|\bupstream\/\d[\w.-]*-dev\b|`(?:origin\/)?(?:feat|fix|review|codex)\/[a-z0-9][\w/-]*|`[a-f0-9]{7,40}`|\b\d+\.\d+(?:\.\d+)? (?:source candidate|release line|development branch|truth boundary)\b/i;
+  for (const file of listMarkdownFiles()) {
+    const path = relativeToRepo(file);
+    if (records.has(path) || path.startsWith("docs/audits/") ||
+        path.includes("/vendor/") || /\/(?:UPSTREAM|ATTRIBUTION)\.md$/.test(path)) {
+      continue;
+    }
+    readFileSync(file, "utf8").split("\n").forEach((line, index) => {
+      if (snapshot.test(line)) failures.push(`${path}:${index + 1}: ${line.trim()}`);
+    });
+  }
+  assert(failures.length === 0,
+    "Standing docs must keep release snapshots in state.md, TASKS.md, changelog or dated audit records",
+    failures);
+}
+
 function assertUsersSelfReferencesAreApproved() {
   const allowed = new Set([
     // Retained, unshipped operator-path evidence. Product packaging is rejected below.
@@ -1789,14 +1808,15 @@ assert(
     agentsContract.includes("## Public Live Deployment") &&
     agentsContract.includes("## Staging Machines") &&
     agentsContract.includes("## Browser Claim Discipline") &&
-    agentsContract.includes("`main` is the stable source line; it currently contains the 0.6 source") &&
-    agentsContract.includes("`upstream/0.7-dev` is the current 0.7 development integration line") &&
+    agentsContract.includes("`main` is the stable source line") &&
+    agentsContract.includes("`upstream/<version>-dev` branches are development integration lines") &&
+    includesNormalized(agentsContract, "the active line from `state.md` and fetched refs") &&
     agentsContract.includes("Do not assume a `review/*` or `live` ref exists") &&
     agentsContract.includes("reporting its exact branch, commit, tree id, dirty status") &&
     agentsContract.includes("Target proof must cite the exact source tree") &&
     agentsContract.includes("explicit user approval before the mutation") &&
     agentsContract.includes("WebRTC remote display"),
-  "Root AGENTS.md must preserve the operator contract headings, actual branch roles, target proof discipline, public-live approval rule, and Browser claim discipline",
+  "Root AGENTS.md must preserve standing branch roles, fetched-base selection, target proof, public-live approval and Browser claim discipline",
 );
 assert(
   linuxSourceHomeRestart.includes('gateway = data_dir / "bin" / "elastos"') &&
@@ -11705,6 +11725,7 @@ const publicInstallHomeFrontdoorSmoke = read("scripts/public-install-home-frontd
 const publicInstallIdentitySmoke = read("scripts/public-install-identity-smoke.sh");
 assertMarkdownLocalLinksResolve();
 assertMarkdownScriptReferencesResolve();
+assertStandingDocsHaveNoReleaseSnapshots();
 assertOrdinaryCapsulesDoNotReferenceRawBlockchainAuthority();
 assert(
     installDoc.includes("## Install from the publisher") &&
@@ -11717,7 +11738,8 @@ assert(
     runtimeChecklist.includes("## Installed acceptance") &&
     runtimeChecklist.includes("## Release gate") &&
     runtimeChecklist.includes("source, installed-product behavior, and public deployment as separate") &&
-    runtimeChecklist.includes("feat/protected-content-uiux-reconstruction") &&
+    runtimeChecklist.includes("ELASTOS_REVIEW_BASE") &&
+    runtimeChecklist.includes("from `state.md` and fetched refs") &&
     runtimeChecklist.includes("## Source integration gate") &&
     runtimeChecklist.includes("just verify") &&
     runtimeChecklist.includes("scripts/public-install-identity-smoke.sh") &&

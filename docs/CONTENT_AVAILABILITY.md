@@ -593,17 +593,17 @@ bounded byte-range slicing on the provider response, and returns the typed
 transport, range, and progress metadata in the fetch response. This is still a
 bounded JSON/base64 byte path, not the final streaming ABI.
 
-Carrier now has a typed internal
+Carrier has a typed internal
 `content_fetch` byte operation on its file ALPN: a connected Runtime peer can
 request a CID/path and the serving Runtime reads bytes through its local
 `ipfs-provider`. That operation is still Runtime-internal; normal capsules do
 not receive raw Carrier tickets, peer handles, or Kubo authority. It remains a
 narrow compatibility/bootstrap path.
 
-Internal `content-provider` calls now use the Runtime provider-to-provider
+Internal `content-provider` calls use the Runtime provider-to-provider
 invocation envelope for IPFS and availability effects. The envelope validates
 source, target, operation, transfer class, byte range, and progress receipt
-metadata. The provider plane now has explicit local and Carrier transports:
+metadata. The provider plane has explicit local and Carrier transports:
 Carrier `provider_invoke` runs over the Carrier ALPN with the same
 `elastos.provider.invocation/v1` envelope and hides raw connect tickets from
 receipts. Its current provider target allowlist includes `content`,
@@ -762,14 +762,13 @@ verifies/summarizes remote content availability receipts when present, and other
 `carrier_announced` or `repair_needed`; if Carrier is unavailable, publish
 remains honestly local or `repair_needed`. Public gateway
 installer publishing now also uses `elastos://content/publish` instead of
-direct IPFS. The protected-content source tree now adds canonical v1 contracts
-and custody helpers for typed rights evidence, signed recipient authorization,
-immutable custody epochs, recipient-encrypted node contributions,
-exact-threshold reconstruction, node-local durable claims, and exact encrypted
-result replay. It is source-only and does not provide Runtime orchestration,
-installed custody nodes, decryption, or playback. Released 0.6 also retains the
-provisional fail-closed DRM, rights, key, and decrypt capsules as a retirement
-surface; they do not prove the canonical v1 path. The content provider now validates
+direct IPFS. Protected content composes Runtime coordination, typed rights
+evidence, signed recipient authorization, immutable custody epochs,
+recipient-encrypted node contributions, threshold reconstruction, node-local
+claims and exact encrypted result replay. [Protected content](PROTECTED_CONTENT.md)
+owns that contract; [state.md](../state.md) owns source and installed proof.
+Provisional DRM, rights, key and decrypt capsules remain a separate retirement
+surface. The content provider validates
 `sealed` object publishes against the sealed descriptor, required graph links,
 and protected-content algorithm allowlists. The
 remaining work is:

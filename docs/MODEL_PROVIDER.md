@@ -143,10 +143,7 @@ Hosted gateways such as OpenRouter and local engines such as llama.cpp or
 Ollama are provider implementations, not architecture. Their model identifiers
 and availability can change independently of ElastOS.
 
-OpenRouter currently exposes [`openrouter/auto`](https://openrouter.ai/docs/guides/routing/routers/auto-router)
-and returns the selected model in the response. An operator may use that
-provider-owned selector or pin a current catalog identifier such as
-[`moonshotai/kimi-k3`](https://openrouter.ai/moonshotai/kimi-k3-20260715).
+Operators select a model or routing policy from the provider's catalog.
 That configuration stays behind the provider boundary. Product UI should
 show the requested selector, resolved model when known, and whether explicit
 fallback was enabled. Canonical architecture documents do not freeze a

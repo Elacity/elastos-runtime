@@ -22,9 +22,9 @@ lives in [state.md](state.md), and open work lives in [TASKS.md](TASKS.md).
 
 ## Branch Roles
 
-- `main` is the stable source line; it currently contains the 0.6 source.
-  Release status, exact refs, and remaining proof come from `state.md`.
-- `upstream/0.7-dev` is the current 0.7 development integration line.
+- `main` is the stable source line.
+- `upstream/<version>-dev` branches are development integration lines. Resolve
+  the active line from `state.md` and fetched refs before choosing a base.
 - Feature and fix branches remain unpublished working lines until they are
   explicitly pushed for review.
 - Do not assume a `review/*` or `live` ref exists. Identify the exact public
@@ -38,10 +38,8 @@ lives in [state.md](state.md), and open work lives in [TASKS.md](TASKS.md).
 
 ## Creating Work Branches
 
-New feature or bugfix branches start from an `upstream/XX-dev` integration
-branch (e.g. `upstream/0.6-dev`) — never silently from `main` or from whatever
-branch happens to be checked out. The user chooses the base; do not pick it
-yourself:
+New feature or bugfix branches start from a user-selected `upstream/XX-dev`
+integration branch. The current checkout and `main` are not implicit bases:
 
 - Run `git fetch origin --prune`, then list `upstream/*-dev` lines and active
   `feat/*`/`fix/*` branches before proposing bases.
@@ -148,8 +146,8 @@ target before acting.
 - prepare: make a local, reviewable commit or commit set; do not push or deploy.
 - publish for review: push the named local branch to the named remote only after
   reporting commits, divergence, and verification.
-- deploy live: update `https://elastos.elacitylabs.com/apps/home/` from a named
-  commit and verify the served artifact hashes before moving `live`.
+- deploy live: update the approved public Home target from a named commit and
+  verify the served artifact hashes before moving `live`.
 - release: merge to `main`, update release notes/version/tag, and push only
   after the release gate passes.
 
@@ -189,6 +187,11 @@ capsules, provider config, and `components.json`.
 - Avoid volatile proof logs in durable docs. Store open work in `TASKS.md`,
   verified current truth in `state.md`, and release history in
   `elastos/CHANGELOG.md`.
+- Keep standing instructions, READMEs, contracts and roadmaps independent of
+  the current release. Branch heads, PR numbers, commit IDs, CI results and
+  installation snapshots belong in `state.md` or a dated evidence record.
+  Contract versions, dependency pins and artifact provenance stay with the
+  contract or artifact they identify.
 
 ## Verification Gate
 
@@ -235,11 +238,12 @@ provider config while replacing only intentional release artifacts.
 Any public-live mutation requires explicit user approval before the mutation,
 even when a dry-run plan reports ready artifacts.
 
-Current public-live convention:
+Set the deployment inputs from the reviewed target configuration:
 
 - gateway root: `$ELASTOS_LIVE_HOME`
 - data root: `$ELASTOS_LIVE_XDG_DATA_HOME/elastos`
-- public URL: `https://elastos.elacitylabs.com/apps/home/`
+- local Home URL: `$ELASTOS_LIVE_LOCAL_URL`
+- public Home URL: `$ELASTOS_LIVE_PUBLIC_URL`
 
 For source-home rebuilds, keep `HOME` and `XDG_DATA_HOME` pointed at the live
 root, but pin Rust tooling to the real toolchain. Otherwise `rustup` can look in
@@ -267,9 +271,9 @@ capsules, installs app capsule trees with their root WASM entrypoints, stamps
 After restart, verify:
 
 ```bash
-curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/apps/home/
-curl -fsS -o /dev/null -w '%{http_code}\n' https://elastos.elacitylabs.com/apps/home/
-curl -fsS https://elastos.elacitylabs.com/apps/home/ | sha256sum
+curl -fsS -o /dev/null -w '%{http_code}\n' "$ELASTOS_LIVE_LOCAL_URL"
+curl -fsS -o /dev/null -w '%{http_code}\n' "$ELASTOS_LIVE_PUBLIC_URL"
+curl -fsS "$ELASTOS_LIVE_PUBLIC_URL" | sha256sum
 sha256sum \
   "$ELASTOS_LIVE_XDG_DATA_HOME/elastos/capsules/home/browser/index.html" \
   capsules/home/browser/index.html
@@ -304,15 +308,15 @@ active Browser page as a passing Browser product proof.
 
 ## Browser Claim Discipline
 
-The current 0.5.0 Browser product contract is WebRTC remote display through the
+The Browser product contract is WebRTC remote display through the
 Runtime Browser Engine Adapter with Runtime-only networking and explicit Browser
 Engine/Exit service selection. `runtime_frame`, `diagnostic_frame`, screenshot,
 and image-polling display paths are removed from the product path and must not be
 reintroduced as compatibility fallbacks.
 
 Mac VZ and Linux/crosvm Jetson are host adapters behind the same Browser/Net/
-Exit/Wallet contracts. This public server is a non-KVM gateway and remote-engine
-consumer, not a local product Browser VM provider. Host-specific launchers are
+Exit/Wallet contracts. A non-KVM server acts as a gateway and remote-engine
+consumer. Local Browser VM proof requires a suitable host. Host-specific launchers are
 implementation details behind Runtime contracts, not separate Browser products.
 
 Native Browser helpers and hosted/Selkies proof tooling may exist, but native,
@@ -322,7 +326,7 @@ requires target evidence for audio/video/input, frame continuity, heartbeat and
 reconnect behavior, explicit close/orphan cleanup, and wallet dapp flows, plus a
 hash-bound manual UX report where required.
 
-A macOS `.dmg` is a packaging goal, not current support. It requires a stable
+A macOS `.dmg` support claim requires a stable
 macOS source-home path, provider binaries, launch wrapper, passkey/origin policy,
 update story, and human Home/app/chat proof. Do not conflate `.dmg` packaging
 with Browser engine isolation or product media proof.

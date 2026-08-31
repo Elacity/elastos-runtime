@@ -1,14 +1,12 @@
 # ElastOS Runtime
 
-ElastOS is a local-first runtime for Apps and services. Its authority model
-applies the same explicit rules to people and AI agents. First-class agent
-principals remain open work; current agent commands use the operator
-lane. People sign in to Home with passkeys.
+ElastOS is a local-first runtime for Apps and services. Runtime checks the
+authority of each caller before allowing an effect. People sign in to Home
+with passkeys.
 
-This is pre-release software. Do not use it for important workloads. The public
-installer is the current Linux `x86_64`/`aarch64` preview. This repository also
-contains the 0.7 source candidate, which may not match the public
-installation. [state.md](state.md) records the evidence and gaps for this tree.
+For released versions, supported installation targets and known limitations,
+see [state.md](state.md). A source checkout and a published installation have
+separate artifact identities and verification records.
 
 ## Install the Linux preview
 
@@ -55,11 +53,6 @@ routing boundary. Runtime handles core operations directly and selects a
 provider for provider-backed effects. Carrier is the endpoint-authenticated
 off-box transport for routes that leave the node, not the capsule API.
 
-The source implements and conformance-tests the Component/Bus path. First-party
-UI Apps still use `elastos.runtime-projection/v1` web
-projections; the Component fixture and authoring template are not evidence that
-a first-party product App has migrated yet.
-
 Self-contained host commands and explicit operator commands use their
 documented paths inside the `elastos` binary. They are outside the capsule
 effect path. The [architecture](docs/ARCHITECTURE.md) defines the trust
@@ -79,19 +72,12 @@ admission is a separate, node-local verification decision. See the
 [principles](PRINCIPLES.md) and
 [architecture](docs/ARCHITECTURE.md) for the full model.
 
-## Current scope
+## Status and verification
 
 Use [state.md](state.md) as the authority for current behavior and known gaps.
 It distinguishes implemented behavior from source-only paths and unverified
 product claims. Browser source and proof tooling alone do not establish
 complete Browser product support.
-
-The 0.7 candidate includes the reviewed collaboration and protected-content
-source, Home and app repairs, the CPU watcher optimization, and the
-[Home journey audit](docs/audits/README.md). Protected-content activation and
-installed acceptance remain open. The replacement logger is postponed;
-Runtime keeps `tracing`. Deferred work is tracked in
-[TASKS.md](TASKS.md#deferred-source-integration).
 
 Use [TASKS.md](TASKS.md) for open work, [ROADMAP.md](ROADMAP.md) for future
 direction, and [elastos/CHANGELOG.md](elastos/CHANGELOG.md) for release history.

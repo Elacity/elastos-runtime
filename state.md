@@ -45,9 +45,8 @@ volatile proof logs remain outside the repository.
   CI/setup changes. Installed acceptance still belongs to exact artifact
   receipts and recorded GUI outcomes.
 - Upstream `90bbe15b` records Irzhy's verified Base 8453 evidence and changes
-  `TASKS.md`, Chain provider source and tests, `docs/CHAIN_PROVIDER.md`,
-  `docs/PROTECTED_CONTENT.md`, and
-  `docs/PROTECTED_CONTENT_EXTRACTION.md`. The branch preserves the published
+  Chain provider source, tests and protected-content documentation.
+  The branch preserves the published
   protected-content repairs and includes that evidence once. It also retains
   upstream collaboration and Browser local-exit orphan cleanup.
 - Irzhy's updated PR43 repair, `58ebfb23`, is included in the local source.

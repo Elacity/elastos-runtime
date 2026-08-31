@@ -1,16 +1,13 @@
 # Collaboration handoff
 
-This document records the People and Chat boundary integrated into the 0.7
-source candidate. Current refs and release scope live in [state.md](../state.md).
+This document defines the People and Chat boundary and its acceptance sequence.
+Current refs, source evidence and release scope live in [state.md](../state.md).
 
-## Source status
+## Evidence boundary
 
-- Reviewed collaboration PR27/28 source is included in `upstream/0.7-dev` and
-  PR39. The older consolidation branch is retained donor evidence.
-- Source proof passed on disposable, fixture-owned Runtimes.
-- Normal localhost and seed acceptance requires matching receipts for the final
-  candidate. The existing Home audit records partial installed observations;
-  HTTP 200 and source fixtures do not establish full product acceptance.
+Installed acceptance requires matching receipts for the reviewed candidate.
+HTTP 200 and source fixtures do not establish full product acceptance. Record
+each source or installed result in `state.md` or a dated audit record.
 
 Use `git rev-parse HEAD HEAD^{tree}` and `git status --short --branch` for the
 exact reviewed commit, tree, and worktree status. Do not copy an old commit ID
@@ -94,10 +91,10 @@ from this document after a local history reconstruction.
 - Shared UI assets and the selected Home shell work are included as separate
   review slices from the collaboration authority work.
 
-## Proven source behavior
+## Source acceptance coverage
 
-The strict fixture-owned two-Runtime journey passed on fresh disposable data
-roots. It covered:
+The fixture-owned two-Runtime journey must use fresh disposable data roots and
+cover:
 
 - Recovery and Profile creation;
 - overlapping opt-in discovery;
@@ -115,11 +112,9 @@ roots. It covered:
 Current source and platform CI checkpoints are recorded in [state.md](../state.md).
 Each final candidate requires its own checks and installed acceptance.
 
-The first normal cross-Runtime Chat send after this fixture proof aborted in
-the old Iroh 0.96.1 `iroh-quinn` transport. The source candidate now uses Iroh
-1.0.2 as one coordinated dependency generation and passes the focused Carrier,
-collaboration, and two-node network tests. This does not replace the installed
-localhost and public-seed product proof below.
+The Carrier dependency-generation check verifies a coordinated transport
+dependency graph. Source and fixture tests remain separate from the installed
+two-Runtime acceptance below.
 
 ## Next acceptance steps
 

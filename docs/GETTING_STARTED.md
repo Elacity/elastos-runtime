@@ -15,8 +15,8 @@ elastos
 After setup, `elastos` opens Home. The
 [installation guide](INSTALL.md#installed-files) explains how to inspect the
 selected signed manifest and installed component registry. A public install
-receives only the components in that manifest. Do not infer that it matches this
-0.7 source candidate. [state.md](../state.md) records whether exact
+receives only the components in that manifest. Source and installed artifacts
+have separate identities. [state.md](../state.md) records whether exact
 publication-parity evidence has been accepted. The normal Home path does not
 need a separate `elastos serve` process.
 

@@ -55,7 +55,7 @@ package; the buyer imports and verifies it before purchase and playback. Custody
 release authenticates the buyer Runtime issuer declared by the signed operation
 and bound by the buyer Profile. The creator Runtime retains provisioning
 authority. The funded installed localhost-to-seed journey remains open.
-A shared listing link is sufficient for 0.7; global discovery remains later work.
+Shared listing links work independently of global listing discovery.
 
 Runtime journals identities, state, receipts, and settlement. Providers keep
 clear media, ciphertext staging, CEKs, shares, process details, and private
@@ -98,7 +98,8 @@ Verified deployed read behavior is:
 - Unknown KIDs revert with `UnboundContentId(bytes16)`; a bound KID without
   access returns `false`.
 
-Verified Base 8453 contract facts from `origin/upstream/0.7-dev@90bbe15b` are:
+The configured Base 8453 contract uses these operations. Deployed verification
+evidence belongs in [state.md](../state.md):
 
 - `CentralStorage.bindIP(bytes16,address,uint256)` accepts acknowledged
   contracts only and is called by `AssetFactory.registerNewAsset`.

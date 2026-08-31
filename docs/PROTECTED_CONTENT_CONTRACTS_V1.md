@@ -336,8 +336,8 @@ exact recipient-encrypted contribution, and replays only that result. They do
 not solve malicious custody nodes, rights-policy correctness, Runtime durable
 replay storage, full operational custody state, recovery from a durable claim
 without a result, issuer-key lifecycle, node admission/rotation/recovery,
-Library list/open/play, rendering, or product workflow safety. Share wrap on
-this current review tree is `elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1`:
+Library list/open/play, rendering, or product workflow safety. The share-wrap
+suite is `elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1`:
 X-Wing draft-06 with X25519 + ML-KEM-768, HKDF-SHA256, and AES-256-GCM.
 This is PQ-hybrid confidentiality only; authority signatures remain
 Ed25519/classical and full PQ authorization is a pre-activation decision. The

@@ -125,19 +125,16 @@ for (const required of [
   "Person device · Deployment node",
   "not a C4 Level 4 diagram",
   "not the capsule contract",
-  "Browser projection still chooses display_mode",
-  "seed has no /dev/kvm",
+  "Runtime owns Browser display and engine selection",
+  "Assign target roles from verified host capabilities recorded in state.md",
   "Markdown is correct and this viewer is wrong",
 ]) {
   if (!viewer.includes(required)) failures.push(`viewer is missing: ${required}`);
 }
 
 for (const required of [
-  "Dated implementation snapshot",
-  "Browser projection code still chooses `display_mode`",
-  "`POST /api/provider/:scheme/:op` is still a live host adapter",
-  "Commit\n  `8dd54706`",
-  "public seed has no `/dev/kvm`",
+  "### Implementation evidence",
+  "Assign each target only the roles supported",
   "Exit is a typed egress service",
   "never enters Runtime, Carrier, or an ordinary App",
   "cannot select a host path",
@@ -148,17 +145,6 @@ for (const required of [
 
 if (!/^Last updated: \d{4}-\d{2}-\d{2} UTC$/m.test(state)) {
   failures.push("state.md is missing a valid UTC update date");
-}
-
-for (const required of [
-  "Capsules receive bounded read models and opaque selectors only.",
-  "`POST /api/provider/:scheme/:op` route remains a live host adapter",
-  "Browser projection code still selects",
-  "`test -e /dev/kvm` returned 1",
-  "implemented by `8dd54706`",
-  "No shipped capsule manifest declares `actuator`",
-]) {
-  if (!state.includes(required)) failures.push(`state.md is missing: ${required}`);
 }
 
 for (const required of [

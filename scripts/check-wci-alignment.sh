@@ -636,7 +636,7 @@ check_forbidden_in_path 'darwin\)' scripts/install.sh 'public installer must sta
 check_required 'Current public install preview: Linux x86_64/aarch64' scripts/install.sh 'installer help must label public install as Linux preview'
 check_required 'Current public install preview is Linux-only' scripts/install.sh 'installer must fail cleanly on non-Linux hosts'
 check_required 'if \[\[ \$\{#GATEWAYS\[@\]\} -gt 0 \]\]; then' scripts/install.sh 'installer must safely prepend publisher gateway without expanding an empty Bash array'
-check_required 'current Linux `x86_64`/`aarch64` preview' README.md 'README install path must be scoped to Linux preview'
+check_required '## Install the Linux preview' README.md 'README binary-install commands must be scoped to Linux preview'
 check_required 'current Linux `x86_64`/`aarch64` preview' docs/INSTALL.md 'install docs must scope public installer to Linux preview'
 check_required 'current Linux `x86_64`/`aarch64`' docs/GETTING_STARTED.md 'getting started must scope binary install to Linux preview'
 check_required 'System, People, Services, Browser, Wallet' docs/INSTALL.md 'install docs must list the current default Home visible surfaces'

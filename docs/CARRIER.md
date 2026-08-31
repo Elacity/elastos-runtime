@@ -286,7 +286,8 @@ copies candidates to a server-side staging directory before install, labels
 which commands run on the operator workstation versus the public server, rejects
 non-Linux or non-`x86_64` candidates such as local macOS Mach-O builds, and
 keeps `mutation_allowed=false` until an operator explicitly approves deployment.
-For the current public server, candidates must be Linux x86_64 ELF binaries:
+This planner targets Linux x86_64 ELF binaries. Verify the destination platform
+before using it:
 
 ```bash
 node scripts/remote-carrier-exit-public-live-plan.mjs \

@@ -30,15 +30,14 @@ Before review or installation:
 ```bash
 git fetch origin
 git status --short --branch
-git log --oneline origin/upstream/0.7-dev..HEAD
-git diff --stat origin/upstream/0.7-dev...HEAD
-git rev-list --left-right --count \
-  origin/upstream/0.7-dev...HEAD
+: "${ELASTOS_REVIEW_BASE:?Set the fetched integration ref selected for review}"
+git log --oneline "${ELASTOS_REVIEW_BASE}..HEAD"
+git diff --stat "${ELASTOS_REVIEW_BASE}...HEAD"
+git rev-list --left-right --count "${ELASTOS_REVIEW_BASE}...HEAD"
 ```
 
-The current 0.7 candidate is `feat/protected-content-uiux-reconstruction`
-(PR39), based on `upstream/0.7-dev` (PR38). It includes PR43's exact mint-adoption
-commit `58ebfb23`. Fetch both branches before deciding the next merge step.
+Select the candidate and integration base from `state.md` and fetched refs.
+Set `ELASTOS_REVIEW_BASE` to that fetched base before running the comparison.
 Source integration does not publish release artifacts or activate the new
 protected-content path.
 
@@ -49,9 +48,9 @@ Before a separately approved merge to `main`:
 1. Account for the included work and the explicitly deferred scope in `TASKS.md`.
 2. Pass all CI jobs on the exact candidate, including both Linux architectures,
    macOS source-home and the release build.
-3. Preserve reviewed ancestry and authorship. The integrated PR43 fix feeds
-   PR39, then `upstream/0.7-dev`, then `main`. A merge commit retains those
-   commits; it does not squash their history.
+3. Preserve reviewed ancestry and authorship. Integrate dependent work into its
+   parent, then the development line, then `main`. A merge commit retains the
+   original commits; it does not squash their history.
 4. Obtain approval for the exact merge target and retained limitations. Leave
    installation, version/tag publication and protected-content cutover under
    their own gates below.
@@ -100,10 +99,8 @@ Review the candidate in authority-owned slices:
 7. Model/Assistant contracts and configured-offer behavior.
 8. Release metadata, manifests, checksums, documentation, and installer truth.
 
-The reviewed shell/UIUX and Assistant foundation are included. Broader Carrier
-reconciliation, advanced Assistant workflows and the legacy audit migration
-remain in the explicitly deferred scope in `TASKS.md`; the replacement logger
-is postponed in favor of existing `tracing`.
+Use `TASKS.md` and `state.md` to identify the included and deferred scope for
+the candidate under review.
 
 ## Installed acceptance
 

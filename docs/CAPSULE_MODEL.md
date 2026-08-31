@@ -83,9 +83,8 @@ Web projections and other substrates use their own narrow Runtime
 adapters. They remain under the same authority model but do not inherit the
 Component WIT interface.
 
-The 0.6 tree implements and conformance-tests this Component path. Its shipped
-first-party UI Apps remain web projections, so the fixture and authoring
-template must not be presented as completed product migration.
+The Component fixture and authoring template test this contract. Product App
+migration requires its own evidence, recorded in [state.md](../state.md).
 
 The current Component ABI is checked against
 [`elastos-bus-v1.wit`](../elastos/wit/elastos-bus-v1.wit). Exact ABI fields,

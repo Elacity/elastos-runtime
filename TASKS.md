@@ -141,6 +141,10 @@ preserved; an older implementation is not evidence that it fits current contract
 
 ### Collaboration identity and Carrier boundary
 
+- [ ] Define and prove multi-device Profile pairing after installed
+  collaboration acceptance.
+- [ ] Add direct-message attachments through the typed Runtime contract after
+  installed text-message acceptance.
 - [ ] Define the wider-rollout rendezvous and abuse-control plan for People
   discovery without weakening the current source guarantees: discovery stays
   opt-in and bounded to `Visible now`, seeds remain configuration/rendezvous
@@ -623,8 +627,8 @@ behavior require separate evidence.
 
 ### Trusted content and access rights
 
-Current protected-content source status lives in [state.md](state.md) and
-[Protected-content integration plan](docs/PROTECTED_CONTENT_EXTRACTION.md).
+Current protected-content source status lives in [state.md](state.md).
+The contract is in [Protected content](docs/PROTECTED_CONTENT.md).
 The single acceptance sequence is
 [Integrated UIUX and protected-content proof](#integrated-uiux-and-protected-content-proof).
 External cryptographic review remains open before public dKMS or production
