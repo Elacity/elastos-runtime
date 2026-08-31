@@ -14,6 +14,7 @@ Each top-level ledger has one job:
 - [Getting started](GETTING_STARTED.md): user installation and source development
 - [Local source Home setup](HOME_LOCAL_SETUP.md): source-home browser Home on one machine
 - [Installing ElastOS](INSTALL.md): Linux setup, update, and trust
+- [Windows strategy](WINDOWS.md): WSL-first host direction and later native adapters
 - [Glossary](GLOSSARY.md): canonical terminology
 - [ElastOS system map](system-map/README.md): layered C4 and code paths for
   people and agents
@@ -32,6 +33,8 @@ Each top-level ledger has one job:
 - [Consequence-aware effects](CONSEQUENCE_AWARE_EFFECTS.md): shared observation,
   actuation, settlement, and local-safety rules
 - [Content availability](CONTENT_AVAILABILITY.md): CID, IPLD, availability, and replication
+- [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md): games,
+  models, Get, bootstrap sources, and external gateways
 - [People and conversations](PEOPLE_CONVERSATIONS.md): profiles, contacts,
   discovery, and current Chat integration
 - [Design system](DESIGN_SYSTEM.md): first-party visual and interaction contract

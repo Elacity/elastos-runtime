@@ -97,6 +97,16 @@ The per-capsule execution contract. This is the common runtime surface that make
 
 The immutable packaged form of a capsule: manifest, code or rootfs payload, and signature/provenance material.
 
+## Content Capsule
+
+A non-executable Digital Capsule with `role=content` and `type=data`. Games,
+GGUF models, sealed media, and other portable data use this role when packaged
+with a manifest and provenance. The CID of the complete immutable
+manifest-and-payload closure is its package identity. A viewer binding or
+compatible provider interface describes how Runtime may use it; neither grants
+authority. See
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
+
 ## Capsule Instance
 
 One running copy of a capsule, bound to a session, capability set, and execution substrate.
@@ -279,6 +289,14 @@ responsibility to keep that content reachable.
 A CID is also not a person, device, account, or global name claim. A stable
 object may later have a signed head or object DID that points to changing CID
 revisions, but each CID already identifies one immutable byte graph.
+
+## Service Offer
+
+A signed or Runtime-projected description of an available running provider
+capability and its grant policy, using `elastos.service.offer/v1` where that
+contract applies. It is not a content package, publisher signature, license,
+availability receipt, or install grant. A model provider may offer inference
+for an admitted GGUF content capsule; the GGUF itself is not a service offer.
 
 ## IPLD
 

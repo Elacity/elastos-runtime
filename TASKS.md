@@ -17,16 +17,18 @@ section if a higher section is incoherent, unverified, or too large to review.
 
 Active priority index:
 
-- current priority: pass full CI on the locally verified PR39 repair before
-  updating the audit installation
+- current priority: settle the remaining source-inclusion decisions and pass
+  full CI on the exact final candidate before merging or updating the audit
+  installation
 - separately authorized after localhost: install the same reviewed tree on the
   seed and the third custody node with matching stable receipts
 - integrated UIUX source evidence: published
   `origin/feat/0.7-uiux-candidate` at `8b547590`; this ref is donor evidence,
   not installed, live, or release truth
 - current protected-content integration source line: published
-  `origin/feat/protected-content-uiux-reconstruction` at `6b3c648b`; its Clippy
-  failure has a locally verified repair approved for push and full CI.
+  `origin/feat/protected-content-uiux-reconstruction` at `d06d64f3`; source,
+  workspace and capsule CI checks pass there. New local inclusions require
+  verification and CI on their own revision.
   The audit fixes retain mixed source and installed evidence. Each
   remaining GUI gate needs its own verdict
 - all other work remains queued below
@@ -84,9 +86,9 @@ Assistant proof item. Missing configuration is an honest zero-offer state.
 - [ ] Finish document-dialog keyboard focus and the remaining app-by-app
   acceptance matrix. Preserve failed, partial and prerequisite-blocked results
   as separate outcomes; a visible control alone is a partial observation.
-- [ ] Review and integrate Irzhy's ELACITY-2307 mint-intent adoption repair when
-  its branch is published. His PR39 comment names
-  `fix/protected-content-mint-intent-adoption`; retain one owner for that fix.
+- [ ] Verify completed-mint adoption after a restart on the installed path.
+  Reconcile partial settled mint records and their custody cleanup obligations;
+  the source adoption repair only rolls forward fully completed records.
 - [ ] Review Irzhy's PR15 follow-up on pinning the canonical
   `has_access_by_content_id` selector (`0x54d42821`). Current configuration
   validates its shape. Use a gated channel for deny proofs; a permissive
@@ -95,7 +97,31 @@ Assistant proof item. Missing configuration is an honest zero-offer state.
   installation failure. The published staging change removes it on success;
   the failure path needs a bounded cleanup check.
 
+### Remaining source-integration decisions
+
+- [ ] Adapt Carrier's incoming request size and deadline limits from the
+  retained Carrier work without changing current provider-invocation semantics.
+  Cover oversized, slow and incomplete frames plus valid protected-content
+  calls. Review the broader signed-protocol and peer-budget work separately.
+- [ ] Reconcile logger PR25 with current Runtime and provider code. Preserve
+  private diagnostics, convert the newer tracing call sites, repair failed
+  rotation and oversized-record bounds, and pass the combined workspace gates.
+- [ ] Review the retained native-component interoperability design as a
+  separate proposal. COMO adoption needs its own feasibility and isolation proof.
+
 ## Later
+
+### Content distribution and Windows
+
+- [ ] Implement the signed content-capsule catalog and typed Get contract in
+  [docs/CONTENT_CAPSULE_DISTRIBUTION.md](docs/CONTENT_CAPSULE_DISTRIBUTION.md).
+  Use the complete bundle CID, publisher verification, availability evidence,
+  atomic admission, install/removal receipts and partial-download cleanup.
+  Keep large model bytes outside Git and external repositories behind providers.
+- [ ] Prove the WSL-first strategy in [docs/WINDOWS.md](docs/WINDOWS.md) on a
+  fresh Windows machine, including stable localhost/passkey origin, Recovery
+  Kit, Profile, Wallet, People, Chat, restart, update and cleanup. Native Windows
+  remains later adapter work; preserve the known Unix portability gaps.
 
 ### Consequence-aware effects
 

@@ -191,6 +191,11 @@ shell selection, child-message routing, launch grants, and browser-session
 behavior. [CARRIER.md](CARRIER.md) owns peer admission and member/guest
 boundaries.
 
+The Windows plan runs the Linux Runtime inside WSL2 under the same Runtime and
+provider contracts. A planned Windows launcher would handle start, stop, update,
+and Home opening. Later native Windows adapters still belong
+behind the same Runtime and Browser contracts. See [WINDOWS.md](WINDOWS.md).
+
 ## The three layers
 
 ### Layer 1: Runtime (`elastos` binary)
@@ -227,6 +232,25 @@ Provider capsules are explicit service-plane exceptions with narrow declared
 authority. Package roles, types, execution ABIs, and checked authoring examples
 belong in [CAPSULE_AUTHORING.md](CAPSULE_AUTHORING.md). All capsule effects
 still cross Runtime authority checks.
+
+### Content capsule distribution contract
+
+Games, local model files, and similar downloadable data are content capsules.
+Their stable identity is the CID of the complete immutable bundle. Signed
+catalog entries point to that identity, availability receipts state who retains
+it, and Runtime records local admission. None of those projections is a service
+offer.
+
+The planned Get operation lets Home request an exact content capsule. Runtime
+will verify the caller and publisher, select content and availability providers,
+fetch and pin the CID, admit it atomically, and write a receipt. External
+repositories remain behind gateway provider capsules. They may import approved bytes into this
+normal content path but may not become ambient capsule networking or a second
+install rail. See
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
+
+The current catalog projects installed capsules. Network catalog discovery and
+Get admission remain implementation work.
 
 ### Boundary decisions
 

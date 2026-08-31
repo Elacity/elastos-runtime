@@ -144,6 +144,13 @@ messaging, relay, and peer/object transport. IPLD gives the traversable CID grap
 shape. In the target protected-content cutover, rights, custody, and decryption
 remain in Runtime-selected providers.
 
+Downloadable games and GGUF models follow that same path as content capsules.
+Their identity is the complete immutable capsule CID, not a publisher URL or an
+external repository URL. Carrier may transport the bytes locally or across the
+network, but it does not decide package identity, admission, licensing, or
+installation. Those boundaries and the bootstrap path are defined in
+[CONTENT_CAPSULE_DISTRIBUTION.md](CONTENT_CAPSULE_DISTRIBUTION.md).
+
 Provider-to-provider Carrier invocation follows the same boundary. Runtime adds
 an `elastos.provider.invocation/v1` envelope and selects
 `carrier-provider-plane`. The current Carrier provider target allowlist includes

@@ -5,10 +5,16 @@ and buyer experience, and `elacity-player` owns video presentation. Runtime
 owns authority, durable operations, provider selection, Wallet and Chain
 coordination, lifecycle, audit, and settlement.
 
-The canonical same-Runtime source path is implemented but inactive. Its proof
-uses one Runtime and two principals. The installed product still selects the
+The intended content-distribution contract gives free and protected content
+the same package identity and availability path. Protected content adds rights,
+key release, and decryption. See
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md) for the planned
+catalog and Get contract.
+
+The canonical source path is implemented but inactive. Source tests cover
+same-Runtime and two-Runtime journeys. The installed product still selects the
 provisional `drm`, `rights`, `key`, and `decrypt` authority surfaces until the
-cross-Runtime source boundary, installed proof, and atomic cutover are complete.
+installed proof and atomic cutover are complete.
 
 ## Canonical path
 

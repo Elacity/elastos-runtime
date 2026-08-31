@@ -111,6 +111,14 @@ A content capsule uses `role=content` and `type=data`. Its `entrypoint` names
 the data entry. It has no executable ABI. Add `viewer` only when one installed
 viewer is part of the content contract.
 
+The published CID should identify the complete immutable capsule closure, not
+only the entrypoint file. A game capsule declares its viewer and packages the
+licensed ROM, artwork, metadata, and notices. A model capsule packages the GGUF
+and declares its format, quantization, base model and provenance, resource
+requirements, license, and compatible provider interface. Do not put a mutable
+web URL in either manifest as the content identity. See
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
+
 ## Keep optional declarations honest
 
 `interfaces` defaults to an empty list. If an interface is declared, it needs

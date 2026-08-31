@@ -12,7 +12,7 @@ volatile proof logs remain outside the repository.
   `origin/upstream/0.7-dev` at `90bbe15b` as the current 0.7 integration line.
 - Published feature evidence is
   `origin/feat/protected-content-runtime-lifecycle@854d9dc9`,
-  `origin/feat/protected-content-uiux-reconstruction@6b3c648b`,
+  `origin/feat/protected-content-uiux-reconstruction@d06d64f3`,
   `origin/feat/0.7-uiux-candidate@8b547590`,
   `origin/feat/dkms-esp-port@27d85c6f`, and
   `origin/feat/0.7-product-documentation@74cd4e42`.
@@ -22,14 +22,15 @@ volatile proof logs remain outside the repository.
   ancestor of the published lifecycle and is already present in the active
   integration. The latest published protected-branch repairs need no new
   extraction.
-- PR39 includes the Home audit fixes at `6b3c648b`. Its source gate failed
-  because the principal-root write helper exceeded Clippy's argument limit;
-  the dependent test, installation and release-build jobs were skipped. A
-  local repair groups the write-policy flags without changing their behavior.
-  Full workspace Clippy, cargo check, workspace tests and all 25 capsule
-  workspace suites pass locally with CI's Rust version and warning settings.
-  The corrected revision still needs the full CI run, including clean
-  installations and the Linux release build.
+- PR39 includes the Home audit fixes, the named principal-root write policy,
+  checkout-bound test fixtures and the privacy-reviewed audit workbook at
+  `d06d64f3`. Source, workspace and capsule CI checks pass on that revision.
+  Platform installation and release-build proof remain separate gates; new
+  local inclusions require checks on their exact revision.
+- The local source includes the CPU watcher optimization from `e4d897f6`.
+  Unchanged executable metadata skips binary hashing; a changed stamp triggers
+  a streamed digest. Focused tests cover idle ticks, replacement and deletion.
+  Installed CPU measurement remains open.
 - The published audit changes include Home and Terminal repairs, create-only
   Library writes, document close protection, Assistant and model-init repairs,
   declared-content icons, private diagnostics, socket-root protection, and Mac
@@ -43,10 +44,12 @@ volatile proof logs remain outside the repository.
   `docs/PROTECTED_CONTENT_EXTRACTION.md`. The branch preserves the published
   protected-content repairs and includes that evidence once. It also retains
   upstream collaboration and Browser local-exit orphan cleanup.
-- Irzhy's PR39 comment assigns the ELACITY-2307 mint crash-window repair to
-  `fix/protected-content-mint-intent-adoption`. That repair was announced but
-  had no published branch at this review. The Home audit tail leaves it with
-  that owner; installed mint/restart acceptance remains open.
+- Irzhy's updated PR43 repair, `58ebfb23`, is included in the local source.
+  Runtime adopts fully completed mint records after a lost intent completion
+  mark. Ambiguous or partial records fail closed; partial custody cleanup and
+  installed mint/restart acceptance remain open. The current named-policy
+  helper already resolves the auth lint warning; the updated PR43 drops its
+  earlier lint suppression.
 - The protected-content source path remains inactive. Installed proof and one
   atomic cutover remain open.
 - Commits `3026992b`, `ed7a8bfc`, and `7f6e47f9` provide portable listing
@@ -87,6 +90,19 @@ volatile proof logs remain outside the repository.
   exact cleanup candidate after explicit user approval.
 
 ## Integrated Source Truth
+
+The candidate does not yet include all useful retained work. Logger PR25 needs
+reconciliation with newer Runtime code and bounded-file fixes. The older
+Carrier branch contains framing, deadline and protocol work that needs an
+adapted integration: the current incoming request handler still has an
+unbounded line read, while the donor's whole protocol would disable provider
+invocation used by the current protected-content path. These remain explicit
+source-integration decisions in [TASKS.md](TASKS.md).
+
+The reviewed content-distribution, Recovery/Profile and WSL-first documents
+are included. The catalog currently projects installed capsules; signed network
+discovery, Home Get and model-content packaging remain planned work. WSL
+packaging and native Windows support also remain unproved product targets.
 
 Runtime owns authenticated principal and session authority, capability
 admission, provider selection, lifecycle, durable operation identity, Wallet

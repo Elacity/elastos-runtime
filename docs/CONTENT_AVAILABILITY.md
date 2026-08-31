@@ -89,6 +89,15 @@ The content provider may use local Kubo, Elacity APIs, IPFS Cluster-like
 replication, volunteer nodes, or future paid storage networks underneath. The
 capsule contract stays the same.
 
+The planned content-distribution contract treats games and model files as
+content capsules. Home `Get` will resolve their signed bundle CID through
+Runtime and the content provider. A CID proves
+content identity but not current availability, so a normally Gettable entry
+also needs an honest availability basis. The trusted publisher may be the only
+bootstrap source while replication matures without changing the CID or creating
+an HTTP fallback identity. See
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
+
 `elastos://ipfs/*` remains only because current code already uses it as the
 low-level provider/backend surface for system services and explicit operator
 tooling. The IPFS backend is now system-only for ordinary capsule capability
