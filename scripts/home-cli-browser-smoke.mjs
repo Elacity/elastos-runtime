@@ -397,6 +397,19 @@ assert(
   activeInputSocket,
 );
 
+activeEventSource.emit("terminal", {
+  schema: "elastos.home-cli.terminal-event/v1",
+  session_id: "term-other",
+  stream: "stdout",
+  data: "stale terminal bytes\n",
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert(
+  !xtermMount.textContent.includes("stale terminal bytes"),
+  "home-cli accepted terminal output from another Runtime session",
+  xtermMount.textContent,
+);
+
 activeEventSource.emitError();
 await new Promise((resolve) => setTimeout(resolve, 0));
 assert(eventSources.length === 1, "home-cli replaced its PTY after a transient event-stream error", eventSources);

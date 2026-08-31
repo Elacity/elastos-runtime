@@ -37,6 +37,8 @@ body {
 }
 
 .terminal-screen {
+  display: flex;
+  flex-direction: column;
   overflow: auto;
 }
 
@@ -59,6 +61,7 @@ body {
 }
 
 #terminal-output {
+  flex: 1 1 auto;
   min-height: 100%;
   margin: 0;
   padding: 18px 20px 22px;
@@ -68,11 +71,62 @@ body {
   font: 0.92rem/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 }
 
+.terminal-fallback-actions {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 0 20px 22px;
+}
+
+.terminal-fallback-actions[hidden],
+.terminal-fallback-button[hidden] {
+  display: none !important;
+}
+
+.terminal-fallback-button {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: #121a24;
+  color: var(--ink);
+  border-radius: 999px;
+  padding: 0.65rem 1rem;
+  font: 0.88rem/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  cursor: pointer;
+}
+
+.terminal-fallback-button:hover {
+  background: #1a2533;
+}
+
+.terminal-fallback-button:focus-visible {
+  outline: 2px solid #f6921a;
+  outline-offset: 2px;
+}
+
+.terminal-fallback-button-primary {
+  background: #f6921a;
+  border-color: #f6921a;
+  color: #050608;
+}
+
+.terminal-fallback-button-primary:hover {
+  background: #ffac3b;
+}
+
 body[data-runtime-terminal="attached"] .terminal-screen {
   overflow: hidden;
 }
 
+body[data-runtime-terminal="idle"] #terminal-output {
+  min-height: 0;
+}
+
 body[data-runtime-terminal="attached"] #terminal-output {
+  display: none;
+}
+
+body[data-runtime-terminal="attached"] .terminal-fallback-actions {
   display: none;
 }
 
@@ -84,6 +138,15 @@ body[data-runtime-terminal="attached"] #xterm-terminal {
   #terminal-output {
     padding: 14px;
     font-size: 0.86rem;
+  }
+
+  .terminal-fallback-actions {
+    padding: 0 14px 16px;
+  }
+
+  .terminal-fallback-button {
+    width: 100%;
+    justify-content: center;
   }
 
   #xterm-terminal {
