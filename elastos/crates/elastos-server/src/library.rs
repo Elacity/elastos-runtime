@@ -221,6 +221,8 @@ enum ObjectProviderRequest {
         mime: Option<String>,
         #[serde(default)]
         if_revision: Option<String>,
+        #[serde(default)]
+        create_only: bool,
     },
     Mkdir {
         principal_id: String,
@@ -554,7 +556,8 @@ pub fn handle_library_upload_bytes(
     if_revision: Option<&str>,
     bytes: &[u8],
 ) -> anyhow::Result<Value> {
-    let object = write_library_file_bytes(data_dir, principal_id, uri, mime, if_revision, bytes)?;
+    let object =
+        write_library_file_bytes(data_dir, principal_id, uri, mime, if_revision, false, bytes)?;
     Ok(provider_ok(json!({
         "object": object,
         "transport": "raw-body",
@@ -1378,6 +1381,7 @@ fn handle_library_request(
             data,
             mime,
             if_revision,
+            create_only,
         } => {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(data.trim())
@@ -1392,6 +1396,7 @@ fn handle_library_request(
                 &target.uri,
                 mime.as_deref(),
                 if_revision.as_deref(),
+                create_only,
                 &bytes,
             )?;
             Ok(json!({ "object": object }))
@@ -3656,24 +3661,51 @@ fn write_library_file_bytes(
     uri: &str,
     _mime: Option<&str>,
     if_revision: Option<&str>,
+    create_only: bool,
     bytes: &[u8],
 ) -> anyhow::Result<LibraryObject> {
     let target = library_target(data_dir, principal_id, uri)?;
     if is_trash_uri(&target.localhost_root, &target.uri) {
         bail!("library Trash accepts objects only through delete");
     }
+    if create_only && if_revision.is_some_and(|value| !value.trim().is_empty()) {
+        bail!("library create-only write does not accept if_revision");
+    }
     check_revision(data_dir, principal_id, &target.uri, if_revision)?;
     if let Some(parent) = target.path.parent() {
         fs::create_dir_all(parent)?;
     }
-    crate::auth::write_principal_root_object(
-        data_dir,
-        principal_id,
-        &target.localhost_root,
-        &target.uri,
-        &target.path,
-        bytes,
-    )?;
+    let write = if create_only {
+        crate::auth::create_principal_root_object(
+            data_dir,
+            principal_id,
+            &target.localhost_root,
+            &target.uri,
+            &target.path,
+            bytes,
+        )
+    } else {
+        crate::auth::write_principal_root_object(
+            data_dir,
+            principal_id,
+            &target.localhost_root,
+            &target.uri,
+            &target.path,
+            bytes,
+        )
+    };
+    match write {
+        Ok(()) => {}
+        Err(err)
+            if create_only
+                && err
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) =>
+        {
+            bail!("library destination already exists");
+        }
+        Err(err) => return Err(err),
+    }
     let object = library_object(data_dir, principal_id, &target.uri)?;
     append_library_event(
         data_dir,
@@ -3740,6 +3772,7 @@ fn compress_library_archive(
             &archive_uri,
             Some(LibraryArchiveFormat::Zip.mime()),
             None,
+            false,
             &bytes,
         )?;
         append_library_event(
@@ -3778,6 +3811,7 @@ fn compress_library_archive(
         &archive_uri,
         Some(LibraryArchiveFormat::Zip.mime()),
         None,
+        false,
         &bytes,
     )?;
     append_library_event(
@@ -7262,5 +7296,256 @@ mod tests {
             .await
             .expect("shutdown live ipfs-provider");
         println!("library live IPFS provider route cid={cid}");
+    }
+
+    #[tokio::test]
+    async fn create_only_write_preserves_existing_file_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let principal_id = "did:key:z6MkCreateOnlyExisting";
+        let file_uri = format!(
+            "{}/Documents/Notes.txt",
+            crate::auth::principal_localhost_root(principal_id)
+        );
+        let original = b"original bytes";
+        let replacement = b"replacement bytes";
+
+        let write = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "write",
+                "principal_id": principal_id,
+                "uri": file_uri,
+                "mime": "text/plain",
+                "data": base64::engine::general_purpose::STANDARD.encode(original),
+            }),
+        )
+        .await;
+        assert_eq!(write["status"], "ok", "{write}");
+
+        let create_only = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "write",
+                "principal_id": principal_id,
+                "uri": file_uri,
+                "mime": "text/plain",
+                "create_only": true,
+                "data": base64::engine::general_purpose::STANDARD.encode(replacement),
+            }),
+        )
+        .await;
+        assert_eq!(create_only["status"], "error", "{create_only}");
+        assert_eq!(
+            create_only["message"], "library destination already exists",
+            "{create_only}"
+        );
+
+        let read = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "read",
+                "principal_id": principal_id,
+                "uri": file_uri,
+            }),
+        )
+        .await;
+        assert_eq!(read["status"], "ok", "{read}");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(read["data"]["data"].as_str().unwrap())
+                .unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_only_write_is_atomic_for_concurrent_new_file_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let principal_id = "did:key:z6MkCreateOnlyConcurrent";
+        let file_uri = format!(
+            "{}/Documents/Concurrent.txt",
+            crate::auth::principal_localhost_root(principal_id)
+        );
+        let first_payload = base64::engine::general_purpose::STANDARD.encode(b"first");
+        let second_payload = base64::engine::general_purpose::STANDARD.encode(b"second");
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let first_request = json!({
+            "op": "write",
+            "principal_id": principal_id,
+            "uri": file_uri,
+            "mime": "text/plain",
+            "create_only": true,
+            "data": first_payload,
+        });
+        let second_request = json!({
+            "op": "write",
+            "principal_id": principal_id,
+            "uri": file_uri,
+            "mime": "text/plain",
+            "create_only": true,
+            "data": second_payload,
+        });
+        let first_task = tokio::spawn({
+            let barrier = Arc::clone(&barrier);
+            let registry = Arc::clone(&registry);
+            let data_dir = dir.path().to_path_buf();
+            async move {
+                barrier.wait().await;
+                handle_object_provider_runtime_request(&data_dir, registry, &first_request).await
+            }
+        });
+        let second_task = tokio::spawn({
+            let barrier = Arc::clone(&barrier);
+            let registry = Arc::clone(&registry);
+            let data_dir = dir.path().to_path_buf();
+            async move {
+                barrier.wait().await;
+                handle_object_provider_runtime_request(&data_dir, registry, &second_request).await
+            }
+        });
+        barrier.wait().await;
+
+        let (first, second) = tokio::join!(async { first_task.await.unwrap() }, async {
+            second_task.await.unwrap()
+        },);
+        let outcomes = [first, second];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|value| value["status"] == "ok")
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|value| value["message"] == "library destination already exists")
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        let winning_bytes = if outcomes[0]["status"] == "ok" {
+            b"first".as_slice()
+        } else if outcomes[1]["status"] == "ok" {
+            b"second".as_slice()
+        } else {
+            panic!("missing successful create_only write: {outcomes:?}");
+        };
+
+        let read = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "read",
+                "principal_id": principal_id,
+                "uri": file_uri,
+            }),
+        )
+        .await;
+        assert_eq!(read["status"], "ok", "{read}");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(read["data"]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(bytes, winning_bytes);
+    }
+
+    #[tokio::test]
+    async fn create_only_write_rejects_if_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let principal_id = "did:key:z6MkCreateOnlyIfRevision";
+        let file_uri = format!(
+            "{}/Documents/Notes.txt",
+            crate::auth::principal_localhost_root(principal_id)
+        );
+
+        let write = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "write",
+                "principal_id": principal_id,
+                "uri": file_uri,
+                "mime": "text/plain",
+                "if_revision": "rev:existing",
+                "create_only": true,
+                "data": base64::engine::general_purpose::STANDARD.encode(b"blocked"),
+            }),
+        )
+        .await;
+        assert_eq!(write["status"], "error", "{write}");
+        assert_eq!(
+            write["message"], "library create-only write does not accept if_revision",
+            "{write}"
+        );
+        assert!(!library_target(dir.path(), principal_id, &file_uri)
+            .unwrap()
+            .path
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn revisioned_write_still_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let principal_id = "did:key:z6MkRevisionedWrite";
+        let file_uri = format!(
+            "{}/Documents/Notes.txt",
+            crate::auth::principal_localhost_root(principal_id)
+        );
+
+        let write = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "write",
+                "principal_id": principal_id,
+                "uri": file_uri,
+                "mime": "text/plain",
+                "data": base64::engine::general_purpose::STANDARD.encode(b"original"),
+            }),
+        )
+        .await;
+        assert_eq!(write["status"], "ok", "{write}");
+        let revision = write["data"]["object"]["revision"].as_str().unwrap();
+
+        let replacement = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "write",
+                "principal_id": principal_id,
+                "uri": file_uri,
+                "mime": "text/plain",
+                "if_revision": revision,
+                "data": base64::engine::general_purpose::STANDARD.encode(b"updated"),
+            }),
+        )
+        .await;
+        assert_eq!(replacement["status"], "ok", "{replacement}");
+
+        let read = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "read",
+                "principal_id": principal_id,
+                "uri": file_uri,
+            }),
+        )
+        .await;
+        assert_eq!(read["status"], "ok", "{read}");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(read["data"]["data"].as_str().unwrap())
+                .unwrap(),
+            b"updated"
+        );
     }
 }

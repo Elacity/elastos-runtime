@@ -2266,7 +2266,10 @@ async function run() {
     assert(ops.some((entry) => entry.op === "mkdir" && entry.payload.name === "Smoke Folder"), "New Folder must call mkdir");
 
     await createFromBackgroundMenu(page, "Text Document", "Notes.txt");
-    assert(ops.some((entry) => entry.op === "write" && entry.payload.uri.endsWith("/Notes.txt")), "Text Document must call write");
+    assert(
+      ops.some((entry) => entry.op === "write" && entry.payload.uri.endsWith("/Notes.txt") && entry.payload.create_only === true),
+      "Text Document must call create-only write",
+    );
     assert(await page.evaluate(() => window.__promptCalls) === 0, "Text Document must use inline naming, not window.prompt");
 
     await page.setInputFiles("#file-input", {

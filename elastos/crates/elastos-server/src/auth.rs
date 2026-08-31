@@ -1962,6 +1962,27 @@ pub fn write_principal_root_object(
         path,
         plaintext,
         false,
+        false,
+    )
+}
+
+pub(crate) fn create_principal_root_object(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &Path,
+    plaintext: &[u8],
+) -> anyhow::Result<()> {
+    write_principal_root_object_inner(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        path,
+        plaintext,
+        false,
+        true,
     )
 }
 
@@ -1981,6 +2002,7 @@ pub(crate) fn write_protected_principal_root_object(
         path,
         plaintext,
         true,
+        false,
     )
 }
 
@@ -1992,6 +2014,7 @@ fn write_principal_root_object_inner(
     path: &Path,
     plaintext: &[u8],
     require_protection: bool,
+    create_only: bool,
 ) -> anyhow::Result<()> {
     validate_principal_root_object_binding(principal_id, localhost_root, object_uri)?;
     validate_principal_root_object_path(data_dir, object_uri, path)?;
@@ -2028,6 +2051,14 @@ fn write_principal_root_object_inner(
     };
     if require_protection {
         ensure_protected_principal_root_object_parent(data_dir, path)?;
+    }
+    if create_only {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_owner_only_new_file(path, &bytes)?;
+        sync_parent_directory(path)?;
+        return Ok(());
     }
     atomic_write(path, &bytes)
 }
@@ -6033,6 +6064,97 @@ mod tests {
             )
             .unwrap(),
             b"# Secret\n"
+        );
+    }
+
+    #[test]
+    fn protected_principal_root_create_only_preserves_encrypted_bytes_on_collision() {
+        let data_dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(data_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let principal_id = "person:local:protected-create-only";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!(
+            "{}/.AppData/ElastOS/People/contact-state.json",
+            protection.localhost_root
+        );
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+
+        write_principal_root_object_inner(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &path,
+            br#"{"profile":"first"}"#,
+            true,
+            true,
+        )
+        .unwrap();
+
+        let stored_before = std::fs::read(&path).unwrap();
+        let envelope: PrincipalRootObjectEnvelopeV1 =
+            serde_json::from_slice(&stored_before).unwrap();
+        assert_eq!(envelope.schema, PRINCIPAL_ROOT_OBJECT_SCHEMA);
+        assert_eq!(envelope.principal_id, principal_id);
+        assert_eq!(envelope.object_uri, object_uri);
+        assert!(!String::from_utf8_lossy(&stored_before).contains("first"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            read_principal_root_object(
+                data_dir.path(),
+                principal_id,
+                &protection.localhost_root,
+                &object_uri,
+                &path,
+            )
+            .unwrap(),
+            br#"{"profile":"first"}"#
+        );
+
+        let error = write_principal_root_object_inner(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &path,
+            br#"{"profile":"second"}"#,
+            true,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(|value| value.kind()),
+            Some(ErrorKind::AlreadyExists)
+        );
+
+        let stored_after = std::fs::read(&path).unwrap();
+        assert_eq!(stored_after, stored_before);
+        assert_eq!(
+            read_principal_root_object(
+                data_dir.path(),
+                principal_id,
+                &protection.localhost_root,
+                &object_uri,
+                &path,
+            )
+            .unwrap(),
+            br#"{"profile":"first"}"#
         );
     }
 
