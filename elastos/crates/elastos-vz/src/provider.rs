@@ -22,12 +22,15 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+#[cfg(target_os = "macos")]
+use crate::config::{VmConfig, VmConfigLimits, VzConfig};
 use elastos_common::{
     CapsuleId, CapsuleManifest, CapsuleStatus, CapsuleType, ElastosError, Result,
 };
 use elastos_compute::{CapsuleHandle, CapsuleInfo, ComputeProvider};
 
-use crate::config::{VmConfig, VmConfigLimits, VzConfig};
+#[cfg(target_os = "macos")]
+use crate::logger;
 use crate::network::NetworkConfig;
 use crate::vm::RunningVm;
 // VZ_BACKEND_UNAVAILABLE_MESSAGE is referenced from the non-macOS branch
@@ -278,7 +281,7 @@ impl VzProvider {
 
             self.vms.write().await.insert(id.clone(), vm);
 
-            tracing::info!("Loaded MicroVM capsule '{}' with ID {}", manifest.name, id);
+            logger::info!("Loaded MicroVM capsule '{}' with ID {}", manifest.name, id);
 
             Ok(CapsuleHandle {
                 id,

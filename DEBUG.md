@@ -24,6 +24,28 @@ work log.
 - Keep historical transcripts out of active docs. Git history already preserves
   them.
 
+## Logging
+
+All Rust components log through the workspace's own
+[`elastos-logger`](elastos/crates/elastos-logger/README.md) (no `log`/`tracing`).
+Levels are `trace < info < warn < error < critical`; `debug` parses as an alias
+for `trace`.
+
+- Raise verbosity for one run: `elastos --log-level trace <command>` (global
+  flag, highest precedence) or `ELASTOS_LOG=trace elastos <command>`.
+- Default is `info`. Lines render as
+  `<ts> <LEVEL> <component>: <message>`, with the call-site module path
+  appended only at TRACE.
+- Components are dotted buckets (`gateway.*`, `cmd.*`, `vm.*`, `host.*`;
+  libraries use their crate name) — grep stderr by component to isolate a
+  surface.
+- Machine-readable stream for tooling/AI debugging: set
+  `ELASTOS_LOG_JSON_DIR=/path/to/dir` to also write per-component
+  `<component>.jsonl` ring files (5MB rotation, ≤10MB per component).
+  Observe-only; off by default.
+- TRACE is secret-free by contract: sensitive values appear as `fp:xxxxxxxx`
+  fingerprints, never raw. Keep it that way in new log lines.
+
 ## Where Notes Belong
 
 - Temporary debugging notes belong in the active issue, review thread, or an

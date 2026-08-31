@@ -1,13 +1,13 @@
 //! Content resolver for elastos:// URIs
 //!
 //! Handles fetching and verifying content-addressed resources.
-
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::logger;
 /// Maximum content size (100 MB)
 pub const MAX_CONTENT_SIZE: usize = 100 * 1024 * 1024;
 
@@ -388,21 +388,21 @@ impl ContentResolver {
                     let verified = if path_suffix.is_empty() {
                         match verify_cid_content(&uri.identifier, &content) {
                             CidVerification::Verified => {
-                                tracing::info!(
+                                logger::info!(
                                     "IPFS content verified against CID multihash: {}",
                                     uri.identifier
                                 );
                                 true
                             }
                             CidVerification::Unverifiable(reason) => {
-                                tracing::debug!(
+                                logger::trace!(
                                     "CID not directly verifiable ({}), proceeding unverified",
                                     reason
                                 );
                                 false
                             }
                             CidVerification::InvalidCid(err) => {
-                                tracing::warn!(
+                                logger::warn!(
                                     "CID syntax invalid for '{}': {}",
                                     uri.identifier,
                                     err
@@ -410,7 +410,7 @@ impl ContentResolver {
                                 false // Proceed unverified — URI was accepted upstream
                             }
                             CidVerification::Mismatch(err) => {
-                                tracing::warn!(
+                                logger::warn!(
                                     "Gateway {} failed CID verification: {}",
                                     gateway,
                                     err
@@ -440,7 +440,7 @@ impl ContentResolver {
                     });
                 }
                 Err(e) => {
-                    tracing::debug!("Failed to fetch from {}: {}", gateway, e);
+                    logger::trace!("Failed to fetch from {}: {}", gateway, e);
                     continue;
                 }
             }
@@ -534,13 +534,13 @@ impl ContentResolver {
         // Store in file cache
         if let Some(cache_dir) = &self.config.cache_dir {
             if let Err(e) = tokio::fs::create_dir_all(cache_dir).await {
-                tracing::warn!("Failed to create cache directory: {}", e);
+                logger::warn!("Failed to create cache directory: {}", e);
                 return;
             }
 
             let cache_path = cache_dir.join(Self::cache_filename(identifier));
             if let Err(e) = tokio::fs::write(&cache_path, &content).await {
-                tracing::warn!("Failed to write cache file: {}", e);
+                logger::warn!("Failed to write cache file: {}", e);
             }
         }
     }

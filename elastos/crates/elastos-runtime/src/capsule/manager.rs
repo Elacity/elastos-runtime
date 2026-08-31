@@ -17,6 +17,7 @@ use crate::capability::CapabilityManager;
 use crate::primitives::audit::{AuditLog, StopReason, TrustLevel};
 use crate::primitives::metrics::MetricsManager;
 
+use crate::logger;
 /// Unique identifier for a capsule instance
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CapsuleId(String);
@@ -206,7 +207,7 @@ impl CapsuleManager {
             trust_level,
         );
 
-        tracing::info!(
+        logger::info!(
             "Launched capsule '{}' with ID: {}",
             manifest.name,
             capsule_id
@@ -254,7 +255,7 @@ impl CapsuleManager {
         // Emit audit event
         self.audit_log.capsule_stop(capsule_id.as_str(), reason);
 
-        tracing::info!("Stopped capsule: {}", capsule_id);
+        logger::info!("Stopped capsule: {}", capsule_id);
 
         Ok(())
     }
@@ -319,7 +320,7 @@ impl CapsuleManager {
         let ids: Vec<CapsuleId> = self.list_running().await;
         for id in ids {
             if let Err(e) = self.stop(&id, reason.clone()).await {
-                tracing::error!("Failed to stop capsule {}: {}", id, e);
+                logger::error!("Failed to stop capsule {}: {}", id, e);
             }
         }
     }

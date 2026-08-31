@@ -3,9 +3,11 @@ use std::sync::Arc;
 
 use elastos_compute::ComputeProvider;
 use elastos_crosvm::{CrosvmConfig, CrosvmProvider};
+use elastos_logger::fp;
 use elastos_runtime::{bootstrap, session};
 use sha2::Digest as _;
 
+use crate::logger::cmd_serve as logger;
 pub async fn run_serve(
     addr: String,
     storage_path: PathBuf,
@@ -32,12 +34,12 @@ pub async fn run_serve(
         crate::print_first_run_welcome(&data_dir);
     }
 
-    eprintln!(
+    logger::info!(
         "ElastOS Runtime v{} starting on {}",
         crate::ELASTOS_VERSION,
         addr
     );
-    tracing::info!(
+    logger::info!(
         "Starting ElastOS Runtime server v{} on {}",
         crate::ELASTOS_VERSION,
         addr
@@ -46,7 +48,7 @@ pub async fn run_serve(
     let runtime = crate::create_runtime(&storage_path).await?;
 
     let capsule_dir = if let Some(ref cid_str) = cid {
-        tracing::info!("Loading capsule from CID: {}", cid_str);
+        logger::info!("Loading capsule from CID: {}", cid_str);
         let content_registry = crate::get_content_registry().await?;
         Some(
             elastos_server::content::prepare_capsule_from_content_provider(
@@ -69,7 +71,7 @@ pub async fn run_serve(
                 .map_err(|e| anyhow::anyhow!("Invalid manifest: {}", e))?;
 
             if manifest.capsule_type == elastos_common::CapsuleType::MicroVM {
-                tracing::info!("Launching MicroVM capsule: {}", manifest.name);
+                logger::info!("Launching MicroVM capsule: {}", manifest.name);
 
                 let vm_provider = CrosvmProvider::new(CrosvmConfig::default())
                     .map_err(|e| anyhow::anyhow!("Failed to create crosvm provider: {}", e))?;
@@ -133,10 +135,10 @@ pub async fn run_serve(
                             .map_err(|e| anyhow::anyhow!("Failed to set token: {}", e))?;
                     }
 
-                    tracing::info!(
+                    logger::info!(
                         "Created session for VM {}: token={}... tap={}",
                         vm_id,
-                        &shell_session.token[..8],
+                        fp(&shell_session.token),
                         needs_tap,
                     );
                 }
@@ -164,7 +166,7 @@ pub async fn run_serve(
                 runtime_arc.register_capsule(capsule_info).await;
 
                 if tls_config.is_some() {
-                    tracing::warn!(
+                    logger::warn!(
                         "TLS proxy not available on the current VM path. Using plain HTTP."
                     );
                 }
@@ -187,7 +189,7 @@ pub async fn run_serve(
                 } else {
                     addr.clone()
                 };
-                tracing::info!("API server will bind to {}", api_bind_addr);
+                logger::info!("API server will bind to {}", api_bind_addr);
 
                 let provider_registry = infra.provider_registry;
                 let namespace_store = infra.namespace_store;
@@ -230,7 +232,7 @@ pub async fn run_serve(
                         )
                         .await
                         {
-                            tracing::error!("API server error: {}", e);
+                            logger::error!("API server error: {}", e);
                         }
                     }
                 });
@@ -240,7 +242,7 @@ pub async fn run_serve(
                 api_handle.abort();
                 runtime_arc.unregister_capsule(&handle.id.0).await;
                 if let Err(e) = vm_provider.stop(&handle).await {
-                    tracing::warn!("Error stopping VM: {}", e);
+                    logger::warn!("Error stopping VM: {}", e);
                 }
                 if let Some(service) = collaboration_service.as_mut() {
                     service.shutdown().await?;
@@ -265,8 +267,8 @@ pub async fn run_serve(
                     )
                     .await;
 
-                eprintln!(
-                    "[serve] WASM capsule '{}' with resource bridge active",
+                logger::info!(
+                    "WASM capsule '{}' with resource bridge active",
                     manifest.name
                 );
 
@@ -280,12 +282,12 @@ pub async fn run_serve(
                 let handle =
                     run_result.map_err(|e| anyhow::anyhow!("WASM capsule failed: {}", e))?;
 
-                eprintln!("[serve] WASM capsule '{}' exited", handle.manifest.name);
+                logger::info!("WASM capsule '{}' exited", handle.manifest.name);
                 return Ok(());
             }
         }
 
-        tracing::info!("Serving web capsule from: {}", capsule_dir.display());
+        logger::info!("Serving web capsule from: {}", capsule_dir.display());
         return crate::serve_web_capsule(runtime, capsule_dir, &addr, false, None).await;
     }
 
@@ -323,7 +325,7 @@ pub async fn run_serve(
 
     let _shell_child = if let Some(shell_path) = crate::find_installed_provider_binary("shell") {
         if let Err(e) = crate::verify_component_binary("shell", &shell_path) {
-            tracing::warn!("Skipping shell capsule due to verification failure: {}", e);
+            logger::warn!("Skipping shell capsule due to verification failure: {}", e);
             None
         } else {
             let api_url = format!("http://{}", addr);
@@ -344,7 +346,7 @@ pub async fn run_serve(
                 .spawn()
             {
                 Ok(child) => {
-                    tracing::info!(
+                    logger::info!(
                         "Spawned shell capsule (PID {}, mode={})",
                         child.id().unwrap_or(0),
                         shell_mode
@@ -352,13 +354,13 @@ pub async fn run_serve(
                     Some(child)
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to spawn shell capsule: {}", e);
+                    logger::warn!("Failed to spawn shell capsule: {}", e);
                     None
                 }
             }
         }
     } else {
-        tracing::info!("Shell capsule not found, skipping spawn");
+        logger::info!("Shell capsule not found, skipping spawn");
         None
     };
 
@@ -431,11 +433,11 @@ pub async fn run_serve(
     };
     let coords_path = crate::runtime_control::runtime_coord_path(&data_dir);
     if let Err(e) = crate::runtime_control::write_runtime_coords(&coords_path, &coords) {
-        eprintln!("[serve] Warning: failed to write runtime coords: {}", e);
+        logger::warn!("failed to write runtime coords: {}", e);
     } else if runtime_kind == crate::runtime_control::RUNTIME_KIND_MANAGED_CHAT {
-        eprintln!("[serve] Managed chat runtime ready");
+        logger::info!("Managed chat runtime ready");
     } else {
-        eprintln!("[serve] Attach commands (elastos chat, elastos run) ready");
+        logger::info!("Attach commands (elastos chat, elastos run) ready");
     }
 
     {
@@ -446,7 +448,7 @@ pub async fn run_serve(
                 interval.tick().await;
                 let removed = registry.cleanup_stale_sessions(600).await;
                 if removed > 0 {
-                    tracing::debug!("Cleaned up {} idle attach sessions", removed);
+                    logger::trace!("Cleaned up {} idle attach sessions", removed);
                 }
             }
         });

@@ -29,6 +29,7 @@ use crate::{
     },
 };
 
+use crate::logger::host_operator as logger;
 pub const OPERATOR_ALPN: &[u8] = b"elastos/operator/1";
 pub const OPERATOR_ACTION_STATUS_READ: &str = "status.read";
 pub const OPERATOR_ACTION_UPDATE_CHECK: &str = "update.check";
@@ -1049,7 +1050,7 @@ async fn handle_operator_connection(
         let stream_ctx = ctx.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_operator_stream(&mut send, recv, &stream_ctx).await {
-                tracing::debug!("operator control stream error: {:#}", err);
+                logger::trace!("operator control stream error: {:#}", err);
             }
         });
     }

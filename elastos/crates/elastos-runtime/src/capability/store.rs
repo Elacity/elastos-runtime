@@ -4,7 +4,6 @@
 //! - Global revocation epoch (for mass revocation)
 //! - Per-token use counts (for use-limited tokens)
 //! - Revocation list (for individual token revocation)
-
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,6 +12,7 @@ use tokio::sync::RwLock;
 
 use super::token::TokenId;
 
+use crate::logger;
 /// Capability store - manages token state
 ///
 /// Owns the revocation epoch as an instance field (not process-global),
@@ -85,7 +85,7 @@ impl CapabilityStore {
             if let Err(e) = fs::write(&tmp_path, new_epoch.to_string())
                 .and_then(|_| fs::rename(&tmp_path, &epoch_path))
             {
-                tracing::error!(
+                logger::error!(
                     "CRITICAL: Failed to persist epoch to {}: {}. Epoch advance aborted.",
                     epoch_path.display(),
                     e
@@ -237,7 +237,7 @@ impl CapabilityStore {
             if let Err(e) =
                 fs::write(&tmp_path, &content).and_then(|_| fs::rename(&tmp_path, &revoked_path))
             {
-                tracing::error!(
+                logger::error!(
                     "CRITICAL: Failed to persist revoked tokens to {}: {}",
                     revoked_path.display(),
                     e

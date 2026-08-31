@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::store::{IdentityStore, StoredCredential};
 
+use crate::logger;
 /// Challenge expiry duration
 const CHALLENGE_EXPIRY: Duration = Duration::from_secs(300);
 const FLAG_USER_PRESENT: u8 = 0x01;
@@ -576,8 +577,7 @@ impl IdentityManager {
         // Clone detection: sign count should increase
         if stored.sign_count > 0 && sign_count <= stored.sign_count {
             if self.allow_clone {
-                tracing::warn!(
-                    "Possible credential clone detected (dev mode, allowing): stored={}, received={}",
+                logger::warn!("Possible credential clone detected (dev mode, allowing): stored={}, received={}",
                     stored.sign_count,
                     sign_count
                 );

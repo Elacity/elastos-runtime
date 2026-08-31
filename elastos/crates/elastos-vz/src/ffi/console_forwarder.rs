@@ -1,10 +1,10 @@
-//! Kernel-console → `tracing` forwarder.
+//! Kernel-console → logger forwarder.
 //!
 //! Apple's `VZVirtioConsoleDeviceSerialPortConfiguration`
 //! emits the guest's printk stream to whichever NSFileHandle we
 //! attached. [`ffi::console::build_kernel_console`] hands us the
 //! read end of a `pipe(2)`; this module drains that pipe and
-//! emits one `tracing::info!(target = "vm_console", ...)` per
+//! emits one `log_info!` line prefixed with `vm_console` per
 //! line of guest output, matching the contract crosvm uses on
 //! Linux so the supervisor's existing log routing keeps working.
 //!
@@ -24,9 +24,9 @@
 
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
-
 use tokio::task::JoinHandle;
 
+use crate::logger;
 /// **kernel-console line cap.**
 ///
 /// Maximum byte length of a single kernel-console line before
@@ -166,11 +166,11 @@ fn drain_to_newline_sync<R: BufRead>(reader: &mut R) -> std::io::Result<()> {
     }
 }
 
-/// Spawn a forwarder that drains `host_read` to `tracing`.
+/// Spawn a forwarder that drains `host_read` to the logger.
 ///
-/// `vm_id` is attached to every emitted event under the
-/// `vm_console.vm_id` field so multiple VMs can share a single
-/// tracing subscriber without log-line confusion.
+/// `vm_id` is attached to every emitted line as a
+/// `vm_console vm_id=...` prefix so multiple VMs can share a
+/// single process logger without log-line confusion.
 pub(crate) fn spawn_console_forwarder(host_read: std::fs::File, vm_id: String) -> ConsoleForwarder {
     let handle = tokio::task::spawn_blocking(move || {
         let mut reader = BufReader::new(host_read);
@@ -193,10 +193,8 @@ pub(crate) fn spawn_console_forwarder(host_read: std::fs::File, vm_id: String) -
                 Ok(0) => {
                     // EOF — Vz closed the write end. Normal
                     // shutdown path.
-                    tracing::debug!(
-                        target: "vm_console",
-                        vm_id = %vm_id,
-                        "kernel console EOF (vz closed write end)"
+                    logger::trace!(
+                        "vm_console vm_id={vm_id}: kernel console EOF (vz closed write end)"
                     );
                     return;
                 }
@@ -205,18 +203,12 @@ pub(crate) fn spawn_console_forwarder(host_read: std::fs::File, vm_id: String) -
                     // next newline, continue. No response
                     // channel back to the guest kernel — best
                     // we can do is log + drain.
-                    tracing::warn!(
-                        target: "vm_console",
-                        vm_id = %vm_id,
-                        bytes = n,
-                        cap = KERNEL_CONSOLE_MAX_LINE_BYTES,
-                        "kernel console line exceeded cap; dropping and resyncing"
+                    logger::warn!(
+                        "vm_console vm_id={vm_id}: kernel console line exceeded cap; \
+                         dropping and resyncing: bytes={n} cap={KERNEL_CONSOLE_MAX_LINE_BYTES}"
                     );
                     if let Err(e) = drain_to_newline_sync(&mut reader) {
-                        tracing::warn!(
-                            target: "vm_console",
-                            vm_id = %vm_id,
-                            "kernel console drain-after-overflow error: {e}"
+                        logger::warn!("vm_console vm_id={vm_id}: kernel console drain-after-overflow error: {e}"
                         );
                         return;
                     }
@@ -224,7 +216,7 @@ pub(crate) fn spawn_console_forwarder(host_read: std::fs::File, vm_id: String) -
                 }
                 Ok(_) => {
                     // Trim the trailing newline (if any) so the
-                    // tracing event reads cleanly in JSON
+                    // log line reads cleanly in JSON
                     // formatters. Convert via `String::from_utf8_lossy`
                     // rather than strict UTF-8 because guest
                     // kernel printk *can* contain non-UTF-8
@@ -236,11 +228,7 @@ pub(crate) fn spawn_console_forwarder(host_read: std::fs::File, vm_id: String) -
                     if line.is_empty() {
                         continue;
                     }
-                    tracing::info!(
-                        target: "vm_console",
-                        vm_id = %vm_id,
-                        "{line}"
-                    );
+                    logger::info!("vm_console vm_id={vm_id}: {line}");
                 }
                 Err(e)
                     if matches!(
@@ -255,11 +243,7 @@ pub(crate) fn spawn_console_forwarder(host_read: std::fs::File, vm_id: String) -
                     continue;
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        target: "vm_console",
-                        vm_id = %vm_id,
-                        "kernel console read error: {e}"
-                    );
+                    logger::warn!("vm_console vm_id={vm_id}: kernel console read error: {e}");
                     return;
                 }
             }
@@ -447,8 +431,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn forwarder_skips_empty_lines() {
-        // We can't easily intercept tracing events without
-        // pulling in `tracing-subscriber` as a dev-dep, but we
+        // We don't install a capturing sink here, but we
         // can at least confirm the forwarder exits cleanly when
         // fed only blank lines + an EOF.
         let (read, mut write) = pipe_pair();

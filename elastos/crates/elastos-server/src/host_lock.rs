@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context as _};
 use serde::{Deserialize, Serialize};
 
+use crate::logger::host_lock as logger;
 #[derive(Debug)]
 pub struct HostProcessGuard {
     _file: fs::File,
@@ -173,7 +174,7 @@ pub fn spawn_installed_binary_supersession_watch(data_dir: &Path, role: &str) {
         loop {
             interval.tick().await;
             if let Some(reason) = watch.superseded_reason() {
-                eprintln!("[{}] {}", role, reason);
+                logger::critical!("[{}] {}", role, reason);
                 std::process::exit(75);
             }
         }

@@ -6,9 +6,9 @@
 use std::sync::Arc;
 
 use base64::Engine;
-
 use elastos_runtime::provider;
 
+use crate::logger::cmd_ipfs as logger;
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct IpfsStatus {
     #[serde(default)]
@@ -311,7 +311,7 @@ pub async fn prepare_capsule_from_cid(
         .validate()
         .map_err(|e| anyhow::anyhow!("Invalid manifest from CID {}: {}", cid, e))?;
 
-    tracing::info!(
+    logger::info!(
         "Loading capsule '{}' ({:?}) from CID",
         manifest.name,
         manifest.capsule_type

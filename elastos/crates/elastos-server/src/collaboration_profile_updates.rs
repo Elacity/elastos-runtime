@@ -39,7 +39,7 @@ use crate::collaboration_protocol::{
     verify_collaboration_message,
 };
 use crate::crypto::{domain_separated_sign, encode_did_key};
-
+use crate::logger::collab as logger;
 pub(crate) const PROFILE_UPDATE_PROVIDER_SCHEME: &str = "collaboration-profile";
 pub(crate) const PROFILE_UPDATE_PROVIDER_OP: &str = "announce";
 pub(crate) const PROFILE_UPDATE_PAYLOAD_TYPE: &str = "elastos.people.profile-update/v1";
@@ -631,7 +631,7 @@ impl Provider for CollaborationProfileUpdateProvider {
                 now_ts(),
             )
             .map_err(|err| {
-                tracing::debug!(error = %err, "profile update rejected");
+                logger::trace!("profile update rejected: {err}");
                 ProviderError::Provider("profile update rejected".to_string())
             })?;
         let receipt = encode(&receipt);

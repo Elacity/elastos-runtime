@@ -392,3 +392,21 @@ interfaces. Runtime validates the caller and mints target-scoped grants;
 transport, route, and UI placement do not confer authority. The exact Home
 messages, browser-origin checks, and launch-token rules belong in
 [HOME_SHELL_HOST_CONTRACT.md](HOME_SHELL_HOST_CONTRACT.md).
+
+## Logging and observability
+
+All Rust components log through the purpose-built
+[`elastos-logger`](../elastos/crates/elastos-logger/README.md) crate — a
+five-level (`trace`–`critical`), multi-sink logger with no `log`/`tracing`
+dependency. Every record carries a flat dotted component (`gateway.auth`,
+`cmd.serve`, `vm.crosvm`, library crate names) declared once per crate in its
+`src/logger.rs`; the `elastos` binary installs the process-global logger at
+startup with `--log-level` > `ELASTOS_LOG` > `info` precedence.
+
+Sinks are the extension seam: stderr is the default (suppressed while an
+interactive VM owns the terminal), and setting `ELASTOS_LOG_JSON_DIR` adds an
+observe-only structured stream — one bounded JSON-lines ring file per
+component — for tooling and AI-assisted debugging. Logging is privacy-bound by
+contract: TRACE must be secret-free, with sensitive identifiers reduced to
+non-reversible `fp()` fingerprints that correlate a workflow without
+persisting the secret.

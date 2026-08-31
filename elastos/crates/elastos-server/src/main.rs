@@ -10,6 +10,7 @@ mod gateway_entry;
 mod home_cmd;
 mod identity_cmd;
 mod init_cmd;
+mod logger;
 mod node_cmd;
 mod publish;
 mod release_cmd;
@@ -33,6 +34,7 @@ use std::sync::Arc;
 use trust_cmd::KeysCommand;
 
 pub(crate) use chat_cmd::request_attached_capability;
+use elastos_logger::{log_info, log_warn};
 use elastos_runtime::{bootstrap, provider, session};
 #[cfg(test)]
 pub(crate) use elastos_server::binaries::verify_component_binary_with_data_dir;
@@ -77,8 +79,30 @@ fn should_isolate_process_group(argv: &[String]) -> bool {
     All resource access is capability-gated by the local control plane.")]
 #[command(version = ELASTOS_VERSION)]
 struct Cli {
+    /// Log verbosity: trace|debug|info|warn|error|critical (overrides ELASTOS_LOG)
+    #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_log_level)]
+    log_level: Option<elastos_logger::Level>,
+
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+fn parse_log_level(s: &str) -> Result<elastos_logger::Level, String> {
+    elastos_logger::Level::parse(s).ok_or_else(|| {
+        format!("unknown log level '{s}' (use trace|debug|info|warn|error|critical)")
+    })
+}
+
+#[cfg(test)]
+mod log_level_tests {
+    use super::parse_log_level;
+
+    #[test]
+    fn parses_known_levels_and_rejects_unknown() {
+        assert_eq!(parse_log_level("warn"), Ok(elastos_logger::Level::Warn));
+        assert_eq!(parse_log_level("DEBUG"), Ok(elastos_logger::Level::Trace));
+        assert!(parse_log_level("verbose").is_err());
+    }
 }
 
 #[derive(Subcommand)]
@@ -1108,46 +1132,25 @@ pub(crate) enum IdentityNicknameCommand {
 }
 
 // ---------------------------------------------------------------------------
-// Conditional tracing writer — suppresses stderr output during interactive VM
+// Conditional log sink — suppresses stderr output during interactive VM
 // ---------------------------------------------------------------------------
 
-/// When true, tracing output is silently discarded (interactive TUI active).
+/// When true, log output is silently discarded (interactive TUI active).
 static SUPPRESS_LOGGING: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn set_logging_suppressed(suppress: bool) -> bool {
     SUPPRESS_LOGGING.swap(suppress, Ordering::Relaxed)
 }
 
-struct ConditionalStderr;
+/// `elastos-logger` stderr sink honoring the interactive-TUI suppression flag:
+/// while a VM owns the terminal, records are dropped.
+struct SuppressableStderrSink;
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ConditionalStderr {
-    type Writer = ConditionalStderrWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        ConditionalStderrWriter {
-            suppress: SUPPRESS_LOGGING.load(Ordering::Relaxed),
-        }
-    }
-}
-
-struct ConditionalStderrWriter {
-    suppress: bool,
-}
-
-impl std::io::Write for ConditionalStderrWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.suppress {
-            Ok(buf.len())
-        } else {
-            std::io::stderr().write(buf)
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        if self.suppress {
-            Ok(())
-        } else {
-            std::io::stderr().flush()
+impl elastos_logger::LogSink for SuppressableStderrSink {
+    fn write(&self, rec: &elastos_logger::LogRecord) {
+        if !SUPPRESS_LOGGING.load(Ordering::Relaxed) {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "{}", rec.format_line());
         }
     }
 }
@@ -1197,16 +1200,35 @@ async fn main() -> anyhow::Result<()> {
     // Install rustls crypto provider (ring)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Initialize logging — uses ConditionalStderr so interactive VMs can suppress output.
-    tracing_subscriber::fmt()
-        .with_writer(ConditionalStderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("elastos=info".parse().expect("valid tracing directive")),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    // Install the process-global elastos-logger: threshold CLI > ELASTOS_LOG > Info, stderr sink
+    // sharing the interactive-TUI suppression flag. Surfaces stamp per-surface components via
+    // `log_*!(component: "...", ...)`.
+    let log_threshold =
+        elastos_logger::resolve_level(cli.log_level, &["ELASTOS_LOG"], elastos_logger::Level::Info);
+    let mut log_config = elastos_logger::LoggerConfig::new("elastos", log_threshold)
+        .with_sink(std::sync::Arc::new(SuppressableStderrSink));
+    // Observe-only AI insight sink: per-component JSON-lines ring files, off unless the
+    // operator sets ELASTOS_LOG_JSON_DIR.
+    let mut json_sink_error = None;
+    if let Ok(dir) = std::env::var("ELASTOS_LOG_JSON_DIR") {
+        if !dir.trim().is_empty() {
+            match elastos_logger::JsonRingSink::new(dir.trim()) {
+                Ok(sink) => log_config = log_config.with_sink(std::sync::Arc::new(sink)),
+                Err(e) => json_sink_error = Some((dir, e)),
+            }
+        }
+    }
+    elastos_logger::init(log_config.build());
+    if let Some((dir, e)) = json_sink_error {
+        log_warn!(
+            "ELASTOS_LOG_JSON_DIR '{}' unusable, JSON sink disabled: {}",
+            dir,
+            e
+        );
+    }
+
     let command = cli.command.unwrap_or(Commands::Home {
         status: false,
         json: false,
@@ -1666,8 +1688,8 @@ async fn serve_web_capsule(
             } else {
                 elastos_server::ipfs::find_viewer_dir(viewer_path)?
             };
-            tracing::info!("Viewer capsule: {}", viewer_dir.display());
-            tracing::info!("Data capsule: {}", capsule_dir.display());
+            log_info!("Viewer capsule: {}", viewer_dir.display());
+            log_info!("Data capsule: {}", capsule_dir.display());
             (viewer_dir, Some(capsule_dir.clone()))
         }
         None => (capsule_dir.clone(), None),
@@ -1718,7 +1740,7 @@ async fn serve_web_capsule(
             .spawn()
         {
             Ok(child) => {
-                tracing::info!(
+                log_info!(
                     "Spawned shell capsule (PID {}, mode={})",
                     child.id().unwrap_or(0),
                     shell_mode
@@ -1726,12 +1748,12 @@ async fn serve_web_capsule(
                 Some(child)
             }
             Err(e) => {
-                tracing::warn!("Failed to spawn shell capsule: {}", e);
+                log_warn!("Failed to spawn shell capsule: {}", e);
                 None
             }
         }
     } else {
-        tracing::info!("Shell capsule not found, skipping spawn");
+        log_info!("Shell capsule not found, skipping spawn");
         None
     };
 
@@ -2100,14 +2122,14 @@ pub(crate) async fn create_runtime(
         match CrosvmProvider::new(CrosvmConfig::default()) {
             Ok(provider) => {
                 if let Err(e) = provider.init().await {
-                    tracing::warn!("Failed to initialize crosvm provider: {}", e);
+                    log_warn!("Failed to initialize crosvm provider: {}", e);
                 } else {
-                    tracing::info!("crosvm provider enabled (KVM available)");
+                    log_info!("crosvm provider enabled (KVM available)");
                     compute_providers.push(Arc::new(provider));
                 }
             }
             Err(e) => {
-                tracing::warn!("crosvm provider not available: {}", e);
+                log_warn!("crosvm provider not available: {}", e);
             }
         }
     }

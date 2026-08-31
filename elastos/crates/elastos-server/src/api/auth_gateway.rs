@@ -39,6 +39,8 @@ use super::gateway::{
     GatewayState, RuntimeWalletAdapter, RuntimeWalletAuthority, HOME_CAPSULE_ID,
 };
 
+use crate::logger::gateway_auth as logger;
+use elastos_logger::fp;
 const AUTH_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 const RECOVERY_DESCRIPTOR_SCHEMA: &str = "elastos.principal.root-descriptor/v1";
 const FULL_RECOVERY_BUNDLE_SCHEMA: &str = "elastos.full-recovery-bundle/v1";
@@ -1076,10 +1078,9 @@ fn full_recovery_bundle_establish_kit(
                 ..AuditEventInput::default()
             }),
         );
-        tracing::info!(
-            principal_id = %principal.principal_id,
-            object_count = migrated.object_count,
-            "migrated declared plaintext principal-root objects during recovery activation"
+        logger::info!("migrated declared plaintext principal-root objects during recovery activation: principal_id={} object_count={}",
+            fp(&principal.principal_id),
+            migrated.object_count
         );
     }
     Ok(kit)

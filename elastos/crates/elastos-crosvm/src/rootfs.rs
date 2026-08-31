@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::logger;
 use elastos_common::{ElastosError, Result};
-
 /// Manages rootfs images and overlays
 pub struct RootfsManager {
     /// Directory for cached rootfs images
@@ -46,11 +46,11 @@ impl RootfsManager {
         let overlay_path = self.overlay_dir.join(format!("{}.ext4", vm_id));
 
         if overlay_path.exists() {
-            tracing::debug!("Using existing overlay: {}", overlay_path.display());
+            logger::trace!("Using existing overlay: {}", overlay_path.display());
             return Ok(overlay_path);
         }
 
-        tracing::info!(
+        logger::info!(
             "Creating rootfs overlay for VM '{}' from: {}",
             vm_id,
             base_rootfs.display()
@@ -102,7 +102,7 @@ impl RootfsManager {
         let disk_path = data_dir.join(format!("{}-data.ext4", capsule_name));
 
         if disk_path.exists() {
-            tracing::info!(
+            logger::info!(
                 "Reusing existing data disk: {} ({}MB)",
                 disk_path.display(),
                 size_mb
@@ -110,7 +110,7 @@ impl RootfsManager {
             return Ok(disk_path);
         }
 
-        tracing::info!(
+        logger::info!(
             "Creating data disk for '{}': {} ({}MB sparse)",
             capsule_name,
             disk_path.display(),

@@ -47,6 +47,7 @@ pub mod inspect_provider;
 pub mod ipfs;
 pub mod library;
 pub mod local_http;
+pub mod logger;
 pub mod notifications;
 pub mod operator_control;
 pub mod ownership;

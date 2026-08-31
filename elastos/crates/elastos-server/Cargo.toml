@@ -10,6 +10,7 @@ name = "elastos"
 path = "src/main.rs"
 
 [dependencies]
+elastos-logger = { path = "../elastos-logger" }
 elastos-runtime = { path = "../elastos-runtime" }
 elastos-namespace = { path = "../elastos-namespace" }
 elastos-common = { path = "../elastos-common" }
@@ -50,9 +51,6 @@ async-trait = "0.1"
 # Error handling
 anyhow = "1.0"
 
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Crypto (for content hashing in publish/sign commands)
 sha2 = "0.10"

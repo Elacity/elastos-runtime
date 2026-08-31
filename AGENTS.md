@@ -122,6 +122,24 @@ capsules, provider config, and `components.json`.
   verified current truth in `state.md`, and release history in
   `elastos/CHANGELOG.md`.
 
+## Logging Discipline
+
+- Rust diagnostics go through the workspace's
+  [`elastos-logger`](elastos/crates/elastos-logger/README.md), never `log`,
+  `tracing`, or ad-hoc `eprintln!`. `println!`/`eprintln!` are reserved for
+  user-facing CLI output (command results, prompts, interactive UX).
+- Call sites import their crate's logger module and log without naming the
+  component: `use crate::logger;` (single-component crates) or
+  `use crate::logger::gateway_auth as logger;` (the `elastos` binary), then
+  `logger::warn!("...")`. New components are declared once in that crate's
+  `src/logger.rs` via `elastos_logger::component!` / `component_mod!`.
+- Component names are flat dotted buckets: `gateway.*`, `cmd.*`, `vm.*`,
+  `host.*` for the binary's surfaces; library crates use their crate name
+  (`runtime`, `storage`, `tls`, `ns`, `identity`, `guest`, `carrier`,
+  `collab`).
+- TRACE must be secret-free: fingerprint keys, seeds, tokens, grants, and DIDs
+  with `elastos_logger::fp()` — never log the raw value at INFO or TRACE.
+
 ## Verification Gate
 
 Use the smallest checks that cover the touched surface, but do not skip the

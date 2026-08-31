@@ -23,17 +23,17 @@
 
 #![cfg(target_os = "macos")]
 
-use std::sync::{Arc, Mutex};
-
 use objc2::define_class;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{msg_send, AnyThread, DefinedClass};
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
 use objc2_virtualization::{VZVirtualMachine, VZVirtualMachineDelegate};
+use std::sync::{Arc, Mutex};
 
 use super::error::ns_error_to_string;
 
+use crate::logger;
 /// Terminal-state classification surfaced by the delegate and
 /// by `VzMachineHandle::stop`.
 ///
@@ -85,7 +85,7 @@ pub(crate) struct ElastosVzDelegateIvars {
     /// First-to-fire-wins sender. Shared with the handle so
     /// host-initiated stops can also resolve the channel.
     exit_tx: SharedExitSender,
-    /// VM identifier for tracing diagnostics.
+    /// VM identifier for log diagnostics.
     vm_id: String,
 }
 
@@ -120,10 +120,9 @@ define_class!(
             _network_device: &objc2_virtualization::VZNetworkDevice,
             error: &NSError,
         ) {
-            tracing::warn!(
-                target: "vz-delegate",
-                vm_id = %self.ivars().vm_id,
-                "network attachment disconnected: {}",
+            logger::warn!(
+                "vz-delegate vm_id={}: network attachment disconnected: {}",
+                self.ivars().vm_id,
                 ns_error_to_string(error)
             );
             // Non-terminal — do not consume the exit channel.
@@ -151,10 +150,9 @@ impl ElastosVzDelegate {
     /// and become no-ops at the channel level.
     fn signal_exit(&self, exit: DelegateExit) {
         let ivars = self.ivars();
-        tracing::info!(
-            target: "vz-delegate",
-            vm_id = %ivars.vm_id,
-            "delegate observed terminal state: {:?}",
+        logger::info!(
+            "vz-delegate vm_id={}: delegate observed terminal state: {:?}",
+            ivars.vm_id,
             exit
         );
         if let Some(tx) = ivars.exit_tx.lock().expect("delegate exit_tx mutex").take() {

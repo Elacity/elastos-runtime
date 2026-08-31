@@ -13,6 +13,7 @@ members = [
     "crates/elastos-runtime",
     "crates/elastos-server",
     "crates/elastos-guest",
+    "crates/elastos-logger",
     "capsules/shell",
     "capsules/localhost-provider",
 ]

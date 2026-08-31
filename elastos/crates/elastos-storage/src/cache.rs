@@ -7,9 +7,9 @@ use std::sync::Mutex;
 use lru::LruCache;
 use tokio::fs;
 
+use crate::logger;
 use crate::ContentId;
 use elastos_common::Result;
-
 /// Content cache with LRU eviction
 pub struct ContentCache {
     /// Directory for cached content
@@ -69,7 +69,7 @@ impl ContentCache {
         }
         *self.current_size.lock().unwrap() = total_size;
 
-        tracing::info!(
+        logger::info!(
             "Cache initialized: {} bytes in {} items",
             total_size,
             self.lru.lock().unwrap().len()
@@ -204,7 +204,7 @@ impl ContentCache {
                 let path = self.cache_dir.join(&name);
                 if path.exists() {
                     fs::remove_file(&path).await?;
-                    tracing::debug!("Evicted {} ({} bytes) from cache", name, size);
+                    logger::trace!("Evicted {} ({} bytes) from cache", name, size);
                 }
 
                 let mut current = self.current_size.lock().unwrap();

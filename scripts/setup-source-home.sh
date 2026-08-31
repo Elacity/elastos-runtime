@@ -72,6 +72,9 @@ cargo_target_root_for_manifest() {
         else
             printf '%s\n' "${ROOT}/${CARGO_TARGET_DIR}"
         fi
+    elif grep -q '^\[workspace\]' "${manifest_path}"; then
+        # standalone-workspace crate: cargo puts artifacts in its own target dir
+        printf '%s\n' "${manifest_dir}/target"
     elif [[ "${manifest_dir}" == "${ROOT}/elastos"* ]]; then
         printf '%s\n' "${ROOT}/elastos/target"
     else

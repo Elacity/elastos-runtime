@@ -14,7 +14,7 @@ use sha3::Keccak256;
 use tokio::sync::Mutex;
 
 use super::*;
-
+use crate::logger::gateway_effects as logger;
 const TRANSACTION_EFFECT_STORE_SCHEMA: &str = "elastos.runtime.transaction-effect-store/v1";
 const TRANSACTION_EFFECT_SCHEMA: &str = "elastos.runtime.transaction-effect/v1";
 const TRANSACTION_EFFECT_STORE_RELATIVE_PATH: &str =
@@ -927,10 +927,9 @@ pub(in crate::api::gateway) async fn complete_runtime_transaction_effect(
         externally_completed: effect.externally_completed(),
     };
     if let Err(err) = save_transaction_effect_store(state, &store) {
-        tracing::warn!(
-            effect_id = %completion.effect_id,
-            error = %err.1,
-            "transaction completion state remains retryable after persisted Chain receipt"
+        logger::warn!("transaction completion state remains retryable after persisted Chain receipt: effect_id={} error={}",
+            completion.effect_id,
+            err.1
         );
     }
     Ok(completion)

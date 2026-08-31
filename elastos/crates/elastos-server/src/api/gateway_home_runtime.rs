@@ -1,5 +1,5 @@
 use super::*;
-
+use crate::logger::gateway_home as logger;
 pub(super) async fn home_launch(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -68,10 +68,7 @@ pub(super) async fn home_launch(
     .map_err(gateway_internal_error)?
     .flatten();
     if let Some(error) = services_sync_error {
-        tracing::warn!(
-            error,
-            "Inbox launch could not sync Services access requests"
-        );
+        logger::warn!("Inbox launch could not sync Services access requests: error={error}");
     }
     if let Some(service) = state.collaboration_discovery_service.as_ref() {
         if let Some(authority) =

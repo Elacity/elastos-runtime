@@ -8,6 +8,7 @@ use elastos_runtime::signature;
 use sha2::Digest;
 use std::path::PathBuf;
 
+use crate::logger::cmd_share as logger;
 // --- Share catalog types ---
 
 #[derive(serde::Serialize, serde::Deserialize, Default, Clone, Debug, PartialEq)]
@@ -622,7 +623,7 @@ pub async fn publish_channel_head_via_provider(
     ) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("Warning: head creation failed: {}", e);
+            logger::warn!("head creation failed: {}", e);
             return None;
         }
     };
@@ -640,7 +641,7 @@ pub async fn publish_channel_head_via_provider(
             Some(hcid)
         }
         Err(e) => {
-            eprintln!("Warning: head publish failed: {}", e);
+            logger::warn!("head publish failed: {}", e);
             None
         }
     }

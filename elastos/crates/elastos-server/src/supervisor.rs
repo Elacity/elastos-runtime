@@ -23,6 +23,7 @@ use elastos_crosvm::{CrosvmConfig, NetworkConfig, RunningVm, VmConfig};
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::session::{SessionRegistry, SessionType};
 
+use crate::logger::vm_supervisor as logger;
 /// TCP port used by VM provider capsules for raw JSON request/response over the
 /// Carrier-managed control network.
 const VM_PROVIDER_PORT: u16 = 7000;
@@ -257,7 +258,7 @@ impl Supervisor {
                         path.display()
                     ))
                 })?;
-        tracing::info!(
+        logger::info!(
             "{} host artifact verified against installed manifest ({})",
             component,
             checksum
@@ -337,7 +338,7 @@ impl Supervisor {
                 }
             }
 
-            tracing::info!(
+            logger::info!(
                 "carrier service '{}' rooted in ensured capsule artifact {} ({})",
                 name,
                 entry.cid,
@@ -348,8 +349,7 @@ impl Supervisor {
                 }
             );
         } else {
-            tracing::warn!(
-                "carrier service '{}' launching from nested binary under capsule artifact root without direct artifact-binary match: {}",
+            logger::warn!("carrier service '{}' launching from nested binary under capsule artifact root without direct artifact-binary match: {}",
                 name,
                 binary.display()
             );
@@ -564,17 +564,16 @@ impl Supervisor {
             ProviderRoute::SubProvider(sub) => {
                 match registry.register_sub_provider(&sub, provider).await {
                     Ok(_) => {
-                        tracing::info!(
-                        "Registered VM sub-provider route elastos://{}/... -> capsule '{}' (guest={}, port={})",
-                        sub,
-                        capsule_name,
-                        guest_ip,
-                        VM_PROVIDER_PORT
-                    );
+                        logger::info!("Registered VM sub-provider route elastos://{}/... -> capsule '{}' (guest={}, port={})",
+                            sub,
+                            capsule_name,
+                            guest_ip,
+                            VM_PROVIDER_PORT
+                        );
                         Some(ProviderRoute::SubProvider(sub))
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        logger::warn!(
                             "Failed to register VM provider route for '{}' ({}): {}",
                             capsule_name,
                             provides,
@@ -586,7 +585,7 @@ impl Supervisor {
             }
             ProviderRoute::Scheme(scheme) => {
                 registry.register(provider).await;
-                tracing::info!(
+                logger::info!(
                     "Registered VM provider route {}://... -> capsule '{}' (guest={}, port={})",
                     scheme,
                     capsule_name,
@@ -629,7 +628,7 @@ impl Supervisor {
             ProviderRoute::SubProvider(sub) => {
                 match registry.register_sub_provider(&sub, provider).await {
                     Ok(_) => {
-                        tracing::info!(
+                        logger::info!(
                             "Registered carrier service route elastos://{}/... -> '{}' (binary={})",
                             sub,
                             capsule_name,
@@ -638,7 +637,7 @@ impl Supervisor {
                         Some(ProviderRoute::SubProvider(sub))
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        logger::warn!(
                             "Failed to register carrier service route for '{}' ({}): {}",
                             capsule_name,
                             provides,
@@ -650,7 +649,7 @@ impl Supervisor {
             }
             ProviderRoute::Scheme(scheme) => {
                 registry.register(provider).await;
-                tracing::info!(
+                logger::info!(
                     "Registered carrier service route {}://... -> '{}' (binary={})",
                     scheme,
                     capsule_name,
@@ -710,7 +709,7 @@ impl Supervisor {
                 .join("overlays")
                 .join(format!("{}.ext4", handle));
             let _ = tokio::fs::remove_file(&overlay_path).await;
-            tracing::warn!(
+            logger::warn!(
                 "Reaped exited capsule '{}' and unregistered provider route",
                 handle
             );
@@ -831,8 +830,7 @@ impl Supervisor {
                 return Ok(capsule_dir);
             }
 
-            eprintln!(
-                "  Refreshing cached capsule '{}' (registry CID changed or cache metadata missing)...",
+            logger::info!("Refreshing cached capsule '{}' (registry CID changed or cache metadata missing)...",
                 name
             );
             let _ = tokio::fs::remove_dir_all(&capsule_dir).await;
@@ -950,7 +948,7 @@ impl Supervisor {
         if manifest.permissions.host_process && manifest.provides.is_some() {
             // Skip if built-in Carrier already provides this (e.g., peer-provider → carrier-gossip)
             if name == "peer-provider" && self.provider_registry.is_some() {
-                tracing::debug!("peer-provider handled by built-in Carrier");
+                logger::trace!("peer-provider handled by built-in Carrier");
                 return Ok((String::new(), 0));
             }
             return self
@@ -1052,10 +1050,7 @@ impl Supervisor {
                         Some(session.token)
                     }
                     None => {
-                        eprintln!(
-                            "[supervisor] Warning: no session registry, capsule '{}' gets no token",
-                            name
-                        );
+                        logger::warn!("no session registry, capsule '{}' gets no token", name);
                         None
                     }
                 }
@@ -1158,7 +1153,7 @@ impl Supervisor {
             )
             .await
             {
-                tracing::warn!("resource bridge failed for '{}': {}", name, e);
+                logger::warn!("resource bridge failed for '{}': {}", name, e);
             }
         }
 
@@ -1168,9 +1163,11 @@ impl Supervisor {
             .await
             .map_err(|e| anyhow::anyhow!("VM boot failed for '{}': {}", name, e))?;
 
-        eprintln!(
-            "[supervisor] Launched VM '{}': handle={} vsock_cid={}",
-            name, handle, cid
+        logger::info!(
+            "Launched VM '{}': handle={} vsock_cid={}",
+            name,
+            handle,
+            cid
         );
 
         // Register provider route using guest IP (TCP bridge over TAP)
@@ -1250,8 +1247,8 @@ impl Supervisor {
             )
             .await;
 
-        eprintln!(
-            "[supervisor] Launched carrier service '{}': handle={} binary={}",
+        logger::info!(
+            "Launched carrier service '{}': handle={} binary={}",
             name,
             handle,
             binary_path.display()
@@ -1326,7 +1323,7 @@ impl Supervisor {
             }
         }
 
-        eprintln!("[supervisor] Stopped capsule handle={}", handle);
+        logger::info!("Stopped capsule handle={}", handle);
         Ok(())
     }
 
@@ -1350,17 +1347,16 @@ impl Supervisor {
                 let code = match vm.wait_for_exit().await {
                     Ok(status) => {
                         let code = status.code().unwrap_or(-1);
-                        eprintln!(
-                            "[supervisor] Capsule '{}' (handle={}) exited with code {}",
-                            capsule.name, handle, code
+                        logger::info!(
+                            "Capsule '{}' (handle={}) exited with code {}",
+                            capsule.name,
+                            handle,
+                            code
                         );
                         code
                     }
                     Err(e) => {
-                        eprintln!(
-                            "[supervisor] Error waiting for capsule '{}': {}",
-                            capsule.name, e
-                        );
+                        logger::warn!("Error waiting for capsule '{}': {}", capsule.name, e);
                         bail!("VM wait failed for '{}': {}", capsule.name, e);
                     }
                 };
@@ -1377,9 +1373,10 @@ impl Supervisor {
             CapsuleBackend::HostProcess => {
                 // Carrier services are background services — they don't "exit".
                 // Waiting on them is a no-op; they run until stopped.
-                eprintln!(
-                    "[supervisor] Carrier service '{}' (handle={}) — wait is a no-op",
-                    capsule.name, handle
+                logger::info!(
+                    "Carrier service '{}' (handle={}) — wait is a no-op",
+                    capsule.name,
+                    handle
                 );
                 0
             }
@@ -1523,7 +1520,7 @@ impl Supervisor {
                     )
                     .await
                 {
-                    tracing::error!("Gateway server exited with error: {}", e);
+                    logger::error!("Gateway server exited with error: {}", e);
                 }
             }
         });

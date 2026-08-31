@@ -20,7 +20,7 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 anyhow = "1.0"
-tracing = "0.1"
+elastos-logger = { path = "../elastos-logger" }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 bs58 = "0.5"
 

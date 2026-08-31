@@ -8,11 +8,11 @@ use tokio::sync::RwLock;
 use elastos_common::{CapsuleManifest, CapsuleType, ElastosError, Result};
 use elastos_compute::providers::{BridgeHostcall, ComponentProvider};
 use elastos_compute::{CapsuleHandle, ComputeProvider};
-use elastos_storage::StorageProvider;
-
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::signature::{hash_content, SignatureVerifier};
+use elastos_storage::StorageProvider;
 
+use crate::logger::gateway_capsule as logger;
 /// Information about a running capsule (for API responses and lifecycle management)
 #[derive(Debug, Clone)]
 pub struct RunningCapsuleInfo {
@@ -123,7 +123,7 @@ impl Runtime {
                     .map_err(|err| err.to_string())?;
                 serde_json::to_string(&response).map_err(|err| err.to_string())
             }));
-            tracing::info!("Component resource bridge configured");
+            logger::info!("Component resource bridge configured");
         }
 
         let mut guard = self.provider_registry.write().await;
@@ -195,11 +195,10 @@ impl Runtime {
         *self.signature_dev_mode.write().await = dev_mode;
 
         if dev_mode {
-            tracing::warn!(
-                "Capsule signature verification running in dev_mode=true; unsigned local capsules are allowed"
+            logger::warn!("Capsule signature verification running in dev_mode=true; unsigned local capsules are allowed"
             );
         } else {
-            tracing::info!(
+            logger::info!(
                 "Capsule signature verification enforced with {} trusted key(s)",
                 trusted_key_count
             );
@@ -250,7 +249,7 @@ impl Runtime {
             ));
         }
 
-        tracing::info!(
+        logger::info!(
             "Loading capsule '{}' ({:?})",
             manifest.name,
             manifest.capsule_type
@@ -340,7 +339,7 @@ impl Runtime {
 
         if manifest.signature.is_none() {
             if dev_mode {
-                tracing::warn!(
+                logger::warn!(
                     "Unsigned capsule '{}' allowed because dev_mode=true",
                     manifest.name
                 );
@@ -375,7 +374,7 @@ impl Runtime {
             ));
         }
 
-        tracing::info!("Capsule signature verified successfully");
+        logger::info!("Capsule signature verified successfully");
         Ok(())
     }
 
@@ -405,7 +404,7 @@ impl Runtime {
     /// register capsules that weren't started through Runtime's run_* methods.
     pub async fn register_capsule(&self, info: RunningCapsuleInfo) {
         let mut capsules = self.running_capsules.write().await;
-        tracing::info!("Registered capsule '{}' with ID: {}", info.name, info.id);
+        logger::info!("Registered capsule '{}' with ID: {}", info.name, info.id);
         capsules.insert(info.id.clone(), info);
     }
 
@@ -413,7 +412,7 @@ impl Runtime {
     pub async fn unregister_capsule(&self, id: &str) {
         let mut capsules = self.running_capsules.write().await;
         if capsules.remove(id).is_some() {
-            tracing::info!("Unregistered capsule: {}", id);
+            logger::info!("Unregistered capsule: {}", id);
         }
     }
 
@@ -434,7 +433,7 @@ impl Runtime {
         let mut capsules = self.running_capsules.write().await;
         if let Some(info) = capsules.get_mut(id) {
             info.status = status.to_string();
-            tracing::debug!("Updated capsule {} status to: {}", id, status);
+            logger::trace!("Updated capsule {} status to: {}", id, status);
         }
     }
 
@@ -457,7 +456,7 @@ impl Runtime {
         if let Some(handle) = &info.handle {
             // Find the provider that supports this capsule type
             if let Some(provider) = self.get_provider_for_manifest(&handle.manifest) {
-                tracing::info!("Stopping capsule '{}' ({})", info.name, id);
+                logger::info!("Stopping capsule '{}' ({})", info.name, id);
                 provider.stop(handle).await?;
             }
         }

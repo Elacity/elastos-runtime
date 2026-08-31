@@ -33,6 +33,7 @@ pub(in crate::api::gateway) use gateway_browser_transport::*;
 pub(in crate::api::gateway) use gateway_browser_validation::*;
 pub(in crate::api::gateway) use gateway_browser_wallet::*;
 
+use crate::logger::gateway_browser as logger;
 const BROWSER_PROFILE_STORAGE: &str = "principal_owned_profile_disk";
 const BROWSER_PROFILE_STORAGE_POSTURE: &str = "principal_owned_reset_scoped_unprotected";
 const BROWSER_PROFILE_RECOVERY: &str = "not_recovery_kit_packaged";
@@ -1891,10 +1892,8 @@ async fn reconcile_dispatched_browser_launch_failure(
         } => {
             if let Some(authority) = transport_authority.as_ref() {
                 if let Err(err) = close_browser_vz_fixed_media_listener(authority).await {
-                    tracing::warn!(
-                        error = %err,
-                        generation = reservation.generation(),
-                        "Browser terminal reconciliation could not retire its VZ media listener"
+                    logger::warn!("Browser terminal reconciliation could not retire its VZ media listener: {err} generation={}",
+                        reservation.generation()
                     );
                     return browser_cleanup_pending_outcome(page_acquired, vm_acquired, true);
                 }
@@ -1902,18 +1901,14 @@ async fn reconcile_dispatched_browser_launch_failure(
             if let Err(err) =
                 discard_browser_vz_transport_preparation(&state.data_dir, reservation).await
             {
-                tracing::warn!(
-                    error = %err,
-                    generation = reservation.generation(),
-                    "Browser terminal reconciliation could not retire transport authority"
+                logger::warn!("Browser terminal reconciliation could not retire transport authority: {err} generation={}",
+                    reservation.generation()
                 );
                 return browser_cleanup_pending_outcome(page_acquired, vm_acquired, true);
             }
             release_browser_launch(reservation).await;
             if let Err(err) = close_browser_stream_cleanup(state, stream_cleanup).await {
-                tracing::warn!(
-                    error = %err,
-                    "Browser post-dispatch terminal reconciliation could not close its stream"
+                logger::warn!("Browser post-dispatch terminal reconciliation could not close its stream: {err}"
                 );
                 browser_cleanup_pending_outcome(page_acquired, vm_acquired, true)
             } else {
@@ -1938,11 +1933,8 @@ async fn reconcile_dispatched_browser_launch_failure(
         }
         BrowserLaunchReconciliationDecision::RetainIndeterminate(reconciliation_error) => {
             if let Some(err) = reconciliation_error {
-                tracing::warn!(
-                    error = %err,
-                    generation = reservation.generation(),
-                    stream_id,
-                    "Browser dispatched launch reconciliation remains indeterminate"
+                logger::warn!("Browser dispatched launch reconciliation remains indeterminate: {err} generation={} stream_id={stream_id}",
+                    reservation.generation()
                 );
             }
             if let Err(err) = record_browser_launch_reconciliation_obligation(
@@ -1953,11 +1945,8 @@ async fn reconcile_dispatched_browser_launch_failure(
             )
             .await
             {
-                tracing::error!(
-                    error = %err,
-                    generation = reservation.generation(),
-                    stream_id,
-                    "Browser could not durably persist indeterminate launch ownership"
+                logger::error!("Browser could not durably persist indeterminate launch ownership: {err} generation={} stream_id={stream_id}",
+                    reservation.generation()
                 );
             }
             browser_launch_reconciliation_pending_outcome()
@@ -2401,9 +2390,8 @@ pub(in crate::api::gateway) async fn cleanup_stale_browser_pages(state: &Gateway
     let stale_pages = match take_stale_browser_pages(&state.data_dir).await {
         Ok(pages) => pages,
         Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "Browser stale ownership could not be transferred into durable cleanup"
+            logger::warn!(
+                "Browser stale ownership could not be transferred into durable cleanup: {err}"
             );
             return settled;
         }
@@ -2452,10 +2440,8 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
             | BrowserLaunchReconciliationDecision::TerminalPostEffectCleanup { .. } => {
                 if let Some(authority) = reconciliation.transport_authority() {
                     if let Err(err) = close_browser_vz_fixed_media_listener(authority).await {
-                        tracing::warn!(
-                            error = %err,
-                            generation = %reconciliation.generation,
-                            "Browser launch reconciliation could not close its VZ media listener"
+                        logger::warn!("Browser launch reconciliation could not close its VZ media listener: {err} generation={}",
+                            reconciliation.generation
                         );
                         release_browser_launch_reconciliation_claim(
                             &state.data_dir,
@@ -2473,10 +2459,8 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
                 .map_err(|_| "Browser stream cleanup timed out".to_string())
                 .and_then(|result| result);
                 if let Err(err) = stream_result {
-                    tracing::warn!(
-                        error = %err,
-                        generation = %reconciliation.generation,
-                        "Browser launch reconciliation terminal proof could not close its stream"
+                    logger::warn!("Browser launch reconciliation terminal proof could not close its stream: {err} generation={}",
+                        reconciliation.generation
                     );
                     release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation)
                         .await;
@@ -2488,10 +2472,8 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
                 )
                 .await
                 {
-                    tracing::warn!(
-                        error = %err,
-                        generation = %reconciliation.generation,
-                        "Browser launch reconciliation terminal release could not be committed"
+                    logger::warn!("Browser launch reconciliation terminal release could not be committed: {err} generation={}",
+                        reconciliation.generation
                     );
                     release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation)
                         .await;
@@ -2530,10 +2512,8 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
                 )
                 .await
                 {
-                    tracing::warn!(
-                        error = %err,
-                        generation = %reconciliation.generation,
-                        "Browser could not promote reconciled launch ownership into exact cleanup"
+                    logger::warn!("Browser could not promote reconciled launch ownership into exact cleanup: {err} generation={}",
+                        reconciliation.generation
                     );
                     release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation)
                         .await;
@@ -2556,10 +2536,8 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
                 if engine_result.is_ok() && stream_result.is_ok() {
                     if let Err(err) = commit_browser_terminal_cleanup(state, &cleanup, None).await {
                         release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
-                        tracing::warn!(
-                            error = %err,
-                            page_id = %cleanup.page_id,
-                            "Browser reconciled cleanup terminal receipt and release could not be committed"
+                        logger::warn!("Browser reconciled cleanup terminal receipt and release could not be committed: {err} page_id={}",
+                            cleanup.page_id
                         );
                     } else {
                         release_browser_open_job_instance_for_owner(
@@ -2572,20 +2550,17 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
                     }
                 } else {
                     release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
-                    tracing::warn!(
-                        page_id = %cleanup.page_id,
-                        engine_error = ?engine_result.err(),
-                        stream_error = ?stream_result.err(),
-                        "Browser reconciled cleanup remains pending"
+                    logger::warn!("Browser reconciled cleanup remains pending: page_id={} engine_error={:?} stream_error={:?}",
+                        cleanup.page_id,
+                        engine_result.err(),
+                        stream_result.err()
                     );
                 }
             }
             BrowserLaunchReconciliationDecision::RetainIndeterminate(error) => {
                 if let Some(error) = error {
-                    tracing::warn!(
-                        error,
-                        generation = %reconciliation.generation,
-                        "Browser launch reconciliation retry remains indeterminate"
+                    logger::warn!("Browser launch reconciliation retry remains indeterminate: error={error} generation={}",
+                        reconciliation.generation
                     );
                 }
                 release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation).await;
@@ -2623,10 +2598,8 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
             (Ok(_), Ok(())) => {
                 if let Err(err) = commit_browser_terminal_cleanup(state, &cleanup, None).await {
                     release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
-                    tracing::warn!(
-                        page_id = %cleanup.page_id,
-                        error = %err,
-                        "Browser terminal cleanup could not commit its receipt and owner release"
+                    logger::warn!("Browser terminal cleanup could not commit its receipt and owner release: page_id={} error={err}",
+                        cleanup.page_id
                     );
                 } else {
                     release_browser_open_job_instance_for_owner(
@@ -2640,11 +2613,10 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
             }
             (engine_result, stream_result) => {
                 release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
-                tracing::warn!(
-                    page_id = %cleanup.page_id,
-                    engine_error = ?engine_result.err(),
-                    stream_error = ?stream_result.err(),
-                    "Browser pending engine cleanup retry failed"
+                logger::warn!("Browser pending engine cleanup retry failed: page_id={} engine_error={:?} stream_error={:?}",
+                    cleanup.page_id,
+                    engine_result.err(),
+                    stream_result.err()
                 );
             }
         }
@@ -2670,10 +2642,7 @@ async fn retry_pending_browser_stream_cleanups(state: &GatewayState) -> bool {
         .and_then(|result| result);
         if let Err(err) = result {
             release_browser_stream_cleanup_claim(&state.data_dir, &cleanup_for_release).await;
-            tracing::warn!(
-                error = %err,
-                "Browser pending stream cleanup retry failed"
-            );
+            logger::warn!("Browser pending stream cleanup retry failed: {err}");
         } else {
             settled = true;
         }
@@ -2723,20 +2692,17 @@ async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanu
         (Ok(_), Ok(())) => {
             if let Err(err) = commit_browser_terminal_cleanup(state, &engine_cleanup, None).await {
                 release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
-                tracing::warn!(
-                    page_id = %engine_cleanup.page_id,
-                    error = %err,
-                    "Browser stale page terminal receipt and release could not be committed"
+                logger::warn!("Browser stale page terminal receipt and release could not be committed: page_id={} error={err}",
+                    engine_cleanup.page_id
                 );
             }
         }
         _ => {
             release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
-            tracing::warn!(
-                page_id = %engine_cleanup.page_id,
-                engine_error = ?engine_result.as_ref().err(),
-                stream_error = ?stream_result.as_ref().err(),
-                "Browser stale page engine cleanup failed"
+            logger::warn!("Browser stale page engine cleanup failed: page_id={} engine_error={:?} stream_error={:?}",
+                engine_cleanup.page_id,
+                engine_result.as_ref().err(),
+                stream_result.as_ref().err()
             );
         }
     }
@@ -2832,28 +2798,23 @@ async fn release_browser_open_resources(
 ) -> serde_json::Value {
     if let Some(authority) = browser_launch_transport_authority(reservation).await {
         if let Err(err) = close_browser_vz_fixed_media_listener(&authority).await {
-            tracing::warn!(
-                error = %err,
-                generation = reservation.generation(),
-                "Browser VZ prepared media listener could not be retired"
+            logger::warn!(
+                "Browser VZ prepared media listener could not be retired: {err} generation={}",
+                reservation.generation()
             );
             return browser_cleanup_pending_outcome(false, false, true);
         }
     }
     if let Err(err) = discard_browser_vz_transport_preparation(&state.data_dir, reservation).await {
-        tracing::warn!(
-            error = %err,
-            generation = reservation.generation(),
-            "Browser VZ prepared transport authority could not be retired"
+        logger::warn!(
+            "Browser VZ prepared transport authority could not be retired: {err} generation={}",
+            reservation.generation()
         );
         return browser_cleanup_pending_outcome(false, false, true);
     }
     release_browser_launch(reservation).await;
     if let Err(err) = close_browser_stream_cleanup(state, stream_cleanup).await {
-        tracing::warn!(
-            error = %err,
-            "Browser open resource cleanup failed"
-        );
+        logger::warn!("Browser open resource cleanup failed: {err}");
         return browser_cleanup_pending_outcome(false, false, true);
     }
     if provider_dispatched {
@@ -2882,17 +2843,12 @@ async fn reap_browser_open_effect_after_failure(
     {
         Ok(Some(cleanup)) => cleanup,
         Ok(None) => {
-            tracing::warn!(
-                page_id,
-                "Browser open failure could not recover its exact cleanup binding"
+            logger::warn!("Browser open failure could not recover its exact cleanup binding: page_id={page_id}"
             );
             return browser_cleanup_pending_outcome(true, true, true);
         }
         Err(err) => {
-            tracing::warn!(
-                page_id,
-                error = %err,
-                "Browser open failure could not load its exact cleanup binding"
+            logger::warn!("Browser open failure could not load its exact cleanup binding: page_id={page_id} error={err}"
             );
             return browser_cleanup_pending_outcome(true, true, true);
         }
@@ -2908,20 +2864,15 @@ async fn reap_browser_open_effect_after_failure(
     {
         Ok(()) => true,
         Err(err) => {
-            tracing::warn!(
-                page_id,
-                error = %err,
-                "Browser open failure cleanup could not persist its obligation"
+            logger::warn!("Browser open failure cleanup could not persist its obligation: page_id={page_id} error={err}"
             );
             false
         }
     };
     let engine_result = attempt_browser_engine_cleanup(state, &engine_cleanup).await;
     if !ownership_persisted && !obligation_persisted && engine_result.is_err() {
-        tracing::warn!(
-            page_id,
-            error = ?engine_result.as_ref().err(),
-            "Browser open failure remains actively owned because neither terminal cleanup nor durable transfer succeeded"
+        logger::warn!("Browser open failure remains actively owned because neither terminal cleanup nor durable transfer succeeded: page_id={page_id} error={:?}",
+            engine_result.as_ref().err()
         );
         return browser_cleanup_pending_outcome(true, true, true);
     }
@@ -2935,21 +2886,16 @@ async fn reap_browser_open_effect_after_failure(
     if engine_result.is_ok() && stream_result.is_ok() {
         if let Err(err) = commit_browser_terminal_cleanup(state, &engine_cleanup, None).await {
             release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
-            tracing::warn!(
-                page_id,
-                error = %err,
-                "Browser open failure terminal cleanup could not commit its receipt and release"
+            logger::warn!("Browser open failure terminal cleanup could not commit its receipt and release: page_id={page_id} error={err}"
             );
             return browser_cleanup_pending_outcome(false, false, false);
         }
         browser_terminal_post_effect_outcome()
     } else {
         release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
-        tracing::warn!(
-            page_id,
-            engine_error = ?engine_result.as_ref().err(),
-            stream_error = ?stream_result.as_ref().err(),
-            "Browser open failure transferred exact cleanup into a retryable obligation"
+        logger::warn!("Browser open failure transferred exact cleanup into a retryable obligation: page_id={page_id} engine_error={:?} stream_error={:?}",
+            engine_result.as_ref().err(),
+            stream_result.as_ref().err()
         );
         browser_cleanup_pending_outcome(
             engine_result.is_err(),

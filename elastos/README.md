@@ -56,6 +56,17 @@ cargo test -p elastos-runtime
 The repository root also provides `just test`, `just test-crate <crate>`, and
 `just verify`.
 
+## Logging
+
+Workspace crates log through the in-house
+[`elastos-logger`](crates/elastos-logger/README.md) crate (no `log`/`tracing`).
+The `elastos` binary resolves its threshold as `--log-level` >
+`ELASTOS_LOG` > `info`, and `ELASTOS_LOG_JSON_DIR` optionally adds
+per-component JSON-lines ring files for tooling. Each crate declares its
+components once in `src/logger.rs`; call sites use
+`logger::warn!("...")`. See the crate README for the format contract and
+the secret-free TRACE rule.
+
 ## Related documentation
 
 - [Architecture](../docs/ARCHITECTURE.md)

@@ -10,6 +10,7 @@ use elastos_common::{CapsuleManifest, ElastosError, Result};
 /// Re-export for use by CLI
 pub use ed25519_dalek::SigningKey;
 
+use crate::logger;
 /// Verifies capsule signatures
 pub struct SignatureVerifier {
     /// Trusted public keys for verification
@@ -64,7 +65,7 @@ impl SignatureVerifier {
             count += 1;
         }
 
-        tracing::info!("Loaded {} trusted keys from {:?}", count, path);
+        logger::info!("Loaded {} trusted keys from {:?}", count, path);
         Ok(count)
     }
 

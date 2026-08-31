@@ -13,6 +13,7 @@ wit-bindgen = { version = "0.57.1", optional = true }
 
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
 libc = "0.2"
+elastos-logger = { path = "../elastos-logger" }
 
 [features]
 default = ["serde"]

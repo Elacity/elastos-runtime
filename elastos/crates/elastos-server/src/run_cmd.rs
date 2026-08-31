@@ -1,5 +1,5 @@
+use crate::logger::cmd_run as logger;
 use std::path::{Path, PathBuf};
-
 pub async fn run_capsule(
     path: Option<PathBuf>,
     cid: Option<String>,
@@ -58,7 +58,7 @@ async fn resolve_capsule_dir(
     cid: Option<String>,
 ) -> anyhow::Result<PathBuf> {
     if let Some(cid) = cid {
-        tracing::info!("Running capsule from CID: {}", cid);
+        logger::info!("Running capsule from CID: {}", cid);
         let content_registry = crate::get_content_registry().await?;
         return elastos_server::content::prepare_capsule_from_content_provider(
             &content_registry,
@@ -68,7 +68,7 @@ async fn resolve_capsule_dir(
     }
 
     if let Some(path) = path {
-        tracing::info!("Running capsule from: {}", path.display());
+        logger::info!("Running capsule from: {}", path.display());
         return Ok(path);
     }
 
@@ -104,7 +104,7 @@ async fn run_microvm_via_operator_runtime(
     capsule_args: &[String],
 ) -> anyhow::Result<()> {
     let coords = operator_runtime_coords().await?;
-    eprintln!("[run] Attaching to runtime at {}", coords.api_url);
+    logger::info!("Attaching to runtime at {}", coords.api_url);
 
     let tokens = crate::runtime_control::attach_to_runtime(&coords).await?;
     let client = reqwest::Client::new();
@@ -138,7 +138,7 @@ async fn run_microvm_via_operator_runtime(
     }
 
     let handle = body["handle"].as_str().unwrap_or("?").to_string();
-    eprintln!("[run] MicroVM '{}' launched: {}", manifest.name, handle);
+    logger::info!("MicroVM '{}' launched: {}", manifest.name, handle);
     let saved = crate::runtime_control::enable_host_raw_mode_pub();
     tokio::signal::ctrl_c().await?;
     drop(saved);
@@ -157,8 +157,8 @@ async fn run_component_via_operator_runtime(
     capsule_args: Vec<String>,
 ) -> anyhow::Result<()> {
     let coords = operator_runtime_coords().await?;
-    eprintln!(
-        "[run] Component capsule attached to runtime at {}",
+    logger::info!(
+        "Component capsule attached to runtime at {}",
         coords.api_url
     );
 
@@ -194,7 +194,7 @@ async fn run_component_via_operator_runtime(
         .run_local(capsule_dir, capsule_args)
         .await
         .map_err(|e| anyhow::anyhow!("Component capsule failed: {}", e))?;
-    eprintln!("[run] Component capsule '{}' exited", handle.manifest.name);
+    logger::info!("Component capsule '{}' exited", handle.manifest.name);
     Ok(())
 }
 
