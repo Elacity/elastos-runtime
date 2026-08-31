@@ -37,6 +37,8 @@ const TUI_FOOTER_TEXT: &str =
     " Keys: Up/Down select  Left/Right/Tab sections  Enter open  r refresh  q/Esc Desktop  ? help";
 const TUI_HELP_FOOTER_TEXT: &str = " Keys: ? close help  q/Esc Desktop  Left/Right/Tab sections";
 const PEOPLE_TARGET_ID: &str = "people";
+const INBOX_TARGET_ID: &str = "inbox";
+const INBOX_NOTIFICATION_HANDOFF_ACTION_PREFIX: &str = "inbox-review-notification:";
 
 #[derive(Debug, Clone, Deserialize)]
 struct HomeSnapshot {
@@ -141,8 +143,6 @@ struct RoomStatus {
     #[serde(default)]
     title: String,
     #[serde(default)]
-    owner_did: Option<String>,
-    #[serde(default)]
     current_key_epoch: u64,
     #[serde(default)]
     admin_count: usize,
@@ -178,10 +178,6 @@ struct RoomStatus {
     pending_requests: Vec<RoomPendingRequestStatus>,
     #[serde(default)]
     active_sessions: Vec<RoomSessionStatus>,
-    #[serde(default)]
-    members: Vec<RoomMemberStatus>,
-    #[serde(default)]
-    pending_invites: Vec<RoomInviteStatus>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -203,17 +199,6 @@ struct RoomSessionStatus {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-struct RoomMemberStatus {
-    member_did: String,
-    role: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-struct RoomInviteStatus {
-    invited_did: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
 struct PeopleStatus {
     #[serde(default)]
     schema: String,
@@ -223,8 +208,6 @@ struct PeopleStatus {
     contacts: Vec<PeopleContactStatus>,
     #[serde(default)]
     service_offer_count: usize,
-    #[serde(default)]
-    discovery: PeopleDiscoveryStatus,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -254,68 +237,6 @@ struct PeopleProfileCardStatus {
     display_name: String,
     #[serde(default)]
     handle: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-struct PeopleDiscoveryStatus {
-    #[serde(default)]
-    schema: String,
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default)]
-    remaining_seconds: Option<u64>,
-    #[serde(default)]
-    visibility: String,
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    status_message: String,
-    #[serde(default)]
-    topic: String,
-    #[serde(default)]
-    local_peer_id: Option<String>,
-    #[serde(default)]
-    discovered_peers: Vec<PeopleDiscoveryPeerStatus>,
-    #[serde(default)]
-    requests: Vec<PeopleDiscoveryRequestStatus>,
-    #[serde(default)]
-    next_refresh_after_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-struct PeopleDiscoveryPeerStatus {
-    #[serde(default)]
-    peer_id: String,
-    #[serde(default)]
-    did: Option<String>,
-    #[serde(default)]
-    display_name: String,
-    #[serde(default)]
-    handle: Option<String>,
-    #[serde(default)]
-    last_seen_at: u64,
-    #[serde(default)]
-    status: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-struct PeopleDiscoveryRequestStatus {
-    #[serde(default)]
-    request_id: String,
-    #[serde(default)]
-    peer_id: String,
-    #[serde(default)]
-    did: Option<String>,
-    #[serde(default)]
-    display_name: String,
-    #[serde(default)]
-    handle: Option<String>,
-    #[serde(default)]
-    created_at: u64,
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    invite_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

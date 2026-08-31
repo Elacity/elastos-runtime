@@ -10,6 +10,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use elastos_guest::prelude::*;
+use elastos_identity::{decode_did_key, encode_did_key, encode_signing_key_did};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -26,9 +27,6 @@ const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
 };
-
-/// Multicodec prefix for Ed25519 public key (0xed01, varint-encoded)
-const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
 
 // === Wire protocol types ===
 
@@ -99,41 +97,6 @@ impl Response {
             message: message.to_string(),
         }
     }
-}
-
-// === did:key encoding/decoding ===
-
-fn encode_did_key(verifying_key: &VerifyingKey) -> String {
-    let mut bytes = Vec::with_capacity(2 + 32);
-    bytes.extend_from_slice(&MULTICODEC_ED25519_PUB);
-    bytes.extend_from_slice(verifying_key.as_bytes());
-    format!("did:key:z{}", bs58::encode(&bytes).into_string())
-}
-
-fn decode_did_key(did: &str) -> Result<VerifyingKey, String> {
-    let multibase_part = did
-        .strip_prefix("did:key:z")
-        .ok_or_else(|| "DID must start with did:key:z".to_string())?;
-
-    let bytes = bs58::decode(multibase_part)
-        .into_vec()
-        .map_err(|e| format!("Invalid base58: {}", e))?;
-
-    if bytes.len() != 34 {
-        return Err(format!(
-            "Expected 34 bytes (2 prefix + 32 key), got {}",
-            bytes.len()
-        ));
-    }
-    if bytes[0] != MULTICODEC_ED25519_PUB[0] || bytes[1] != MULTICODEC_ED25519_PUB[1] {
-        return Err("Not an Ed25519 multicodec prefix".to_string());
-    }
-
-    let key_bytes: [u8; 32] = bytes[2..34]
-        .try_into()
-        .map_err(|_| "Invalid key length".to_string())?;
-
-    VerifyingKey::from_bytes(&key_bytes).map_err(|e| format!("Invalid Ed25519 public key: {}", e))
 }
 
 fn did_document(did: &str) -> serde_json::Value {
@@ -259,17 +222,16 @@ impl DidProvider {
     }
 
     fn get_did(&self) -> Response {
-        match &self.verifying_key {
-            Some(vk) => {
-                let did = encode_did_key(vk);
-                Response::ok(serde_json::json!({ "did": did }))
-            }
+        match &self.signing_key {
+            Some(signing_key) => Response::ok(serde_json::json!({
+                "did": encode_signing_key_did(signing_key),
+            })),
             None => Response::error("not_init", "DID key not available"),
         }
     }
 
     fn resolve(&self, did: &str) -> Response {
-        match decode_did_key(did) {
+        match decode_did_key(did).map_err(|e| e.to_string()) {
             Ok(vk) => Response::ok(serde_json::json!({
                 "public_key": hex::encode(vk.as_bytes()),
                 "document": did_document(did),
@@ -309,7 +271,7 @@ impl DidProvider {
     }
 
     fn verify(&self, did: &str, data_hex: &str, sig_hex: &str) -> Response {
-        let vk = match decode_did_key(did) {
+        let vk = match decode_did_key(did).map_err(|e| e.to_string()) {
             Ok(vk) => vk,
             Err(e) => return Response::error("invalid_did", &e),
         };
@@ -365,7 +327,7 @@ impl DidProvider {
             return Response::error("invalid_recovery_proof", &err);
         }
 
-        let vk = match decode_did_key(did) {
+        let vk = match decode_did_key(did).map_err(|e| e.to_string()) {
             Ok(vk) => vk,
             Err(e) => return Response::error("invalid_did", &e),
         };
@@ -484,8 +446,14 @@ impl DidProvider {
             vk
         };
 
-        let persona_did = encode_did_key(&persona_vk);
-        let owner_did = self.verifying_key.as_ref().map(encode_did_key);
+        let persona_did = match encode_did_key(&persona_vk).map_err(|e| e.to_string()) {
+            Ok(did) => did,
+            Err(e) => return Response::error("invalid_did", &e),
+        };
+        let owner_did = match self.signing_key.as_ref() {
+            Some(signing_key) => Some(encode_signing_key_did(signing_key)),
+            None => None,
+        };
 
         Response::ok(serde_json::json!({
             "did": persona_did,
@@ -609,9 +577,8 @@ fn validate_did_recovery_request(
     recovery: &DidRecoveryPayload<'_>,
     now: u64,
 ) -> Result<(), String> {
-    if !recovery.did.starts_with("did:key:z") {
-        return Err("DID recovery currently supports did:key subjects only".to_string());
-    }
+    decode_did_key(recovery.did)
+        .map_err(|e| format!("invalid DID recovery subject: {e}"))?;
     validate_token_like_id(recovery.principal_id, "principal_id")?;
     validate_principal_localhost_root(recovery.principal_id, recovery.localhost_root)?;
     validate_token_like_id(recovery.protector_id, "protector_id")?;
@@ -736,6 +703,8 @@ fn main() {
 mod tests {
     use super::*;
 
+    const NONCANONICAL_ALIAS_DID: &str = "did:key:z2DQYePVrytqCLfdq5VSDGtksAZC9NAt75iCed5WwSKKVXt";
+
     fn make_device_key() -> [u8; 32] {
         [42u8; 32]
     }
@@ -771,6 +740,24 @@ mod tests {
         }
     }
 
+    fn overlong_did(did: &str) -> String {
+        format!("{did}1")
+    }
+
+    fn assert_invalid_did(response: Response) {
+        match response {
+            Response::Error { code, .. } => assert_eq!(code, "invalid_did"),
+            other => panic!("Expected invalid_did error, got {:?}", other),
+        }
+    }
+
+    fn assert_invalid_recovery_proof(response: Response) {
+        match response {
+            Response::Error { code, .. } => assert_eq!(code, "invalid_recovery_proof"),
+            other => panic!("Expected invalid_recovery_proof error, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_init_generates_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -802,12 +789,27 @@ mod tests {
     fn test_did_key_encoding_roundtrip() {
         let signing_key = SigningKey::generate(&mut OsRng);
         let vk = signing_key.verifying_key();
-        let did = encode_did_key(&vk);
+        let did = encode_did_key(&vk).unwrap();
 
         assert!(did.starts_with("did:key:z"));
 
         let decoded = decode_did_key(&did).unwrap();
         assert_eq!(vk.as_bytes(), decoded.as_bytes());
+    }
+
+    #[test]
+    fn test_resolve_rejects_noncanonical_alias_did_via_shared_codec() {
+        let provider = DidProvider::new();
+        assert_invalid_did(provider.resolve(NONCANONICAL_ALIAS_DID));
+    }
+
+    #[test]
+    fn test_resolve_rejects_overlong_did_via_shared_codec() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let provider = DidProvider::new();
+        assert_invalid_did(provider.resolve(&overlong_did(&encode_signing_key_did(
+            &signing_key,
+        ))));
     }
 
     #[test]
@@ -887,6 +889,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_verify_rejects_noncanonical_alias_did_via_shared_codec() {
+        let provider = DidProvider::new();
+        assert_invalid_did(provider.verify(NONCANONICAL_ALIAS_DID, "00", "00"));
+    }
+
+    #[test]
+    fn test_verify_rejects_overlong_did_via_shared_codec() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let provider = DidProvider::new();
+        let did = overlong_did(&encode_signing_key_did(&signing_key));
+        assert_invalid_did(provider.verify(&did, "00", "00"));
+    }
+
     fn did_recovery_test_signature(
         signing_key: &SigningKey,
         recovery: DidRecoveryPayload<'_>,
@@ -939,7 +955,7 @@ mod tests {
     #[test]
     fn test_verify_did_recovery_accepts_typed_did_key_proof() {
         let signing_key = SigningKey::generate(&mut OsRng);
-        let did = encode_did_key(&signing_key.verifying_key());
+        let did = encode_signing_key_did(&signing_key);
         let principal_id = "person:local:abc123";
         let localhost_root = "localhost://Users/person:local:abc123";
         let protector_id = "protector:did:abc123";
@@ -985,7 +1001,7 @@ mod tests {
     #[test]
     fn test_verify_did_recovery_rejects_noncanonical_root_binding() {
         let signing_key = SigningKey::generate(&mut OsRng);
-        let did = encode_did_key(&signing_key.verifying_key());
+        let did = encode_signing_key_did(&signing_key);
         let provider = DidProvider::new();
 
         let err = match provider.verify_did_recovery(
@@ -1008,7 +1024,7 @@ mod tests {
     #[test]
     fn test_verify_did_recovery_rejects_tampered_payload_binding() {
         let signing_key = SigningKey::generate(&mut OsRng);
-        let did = encode_did_key(&signing_key.verifying_key());
+        let did = encode_signing_key_did(&signing_key);
         let principal_id = "person:local:abc123";
         let localhost_root = "localhost://Users/person:local:abc123";
         let protector_id = "protector:did:abc123";
@@ -1066,9 +1082,43 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_did_recovery_rejects_noncanonical_alias_did_via_shared_codec() {
+        let provider = DidProvider::new();
+        assert_invalid_recovery_proof(provider.verify_did_recovery(
+            NONCANONICAL_ALIAS_DID,
+            "person:local:abc123",
+            "localhost://Users/person:local:abc123",
+            "protector:did:abc123",
+            "pdek:abc123",
+            "nonce:abc123",
+            now_ts(),
+            now_ts() + 300,
+            "00",
+        ));
+    }
+
+    #[test]
+    fn test_verify_did_recovery_rejects_overlong_did_via_shared_codec() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let did = overlong_did(&encode_signing_key_did(&signing_key));
+        let provider = DidProvider::new();
+        assert_invalid_recovery_proof(provider.verify_did_recovery(
+            &did,
+            "person:local:abc123",
+            "localhost://Users/person:local:abc123",
+            "protector:did:abc123",
+            "pdek:abc123",
+            "nonce:abc123",
+            now_ts(),
+            now_ts() + 300,
+            "00",
+        ));
+    }
+
+    #[test]
     fn test_verify_did_recovery_rejects_expired_proof() {
         let signing_key = SigningKey::generate(&mut OsRng);
-        let did = encode_did_key(&signing_key.verifying_key());
+        let did = encode_signing_key_did(&signing_key);
         let issued_at = now_ts().saturating_sub(600);
         let expires_at = issued_at + 300;
         let signature = did_recovery_test_signature(

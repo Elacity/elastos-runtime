@@ -8,8 +8,8 @@ use super::*;
 const HOME_LAUNCH_TOKEN_SCHEMA: &str = "elastos.home.launch-token/v4";
 const HOME_LAUNCH_CONTEXT_SCHEMA: &str = "elastos.runtime.browser-launch/v1";
 
-#[derive(Debug, Clone)]
-pub(crate) struct HomeLaunchTokenContext {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::api) struct HomeLaunchTokenContext {
     pub principal_id: String,
     pub session_id: String,
     pub proof_binding_id: Option<String>,
@@ -94,12 +94,12 @@ pub(in crate::api) struct RequiredHomeLaunchToken {
 
 /// Runtime-owned Wallet authority produced only after launch-token validation.
 #[derive(Debug, Clone)]
-pub(in crate::api) struct RuntimeWalletAuthority {
+pub(crate) struct RuntimeWalletAuthority {
     context: VerifiedWalletInvocationContext,
 }
 
 impl RuntimeWalletAuthority {
-    pub(in crate::api) fn verified_context(&self) -> &VerifiedWalletInvocationContext {
+    pub(crate) fn verified_context(&self) -> &VerifiedWalletInvocationContext {
         &self.context
     }
 
@@ -163,7 +163,7 @@ fn home_launch_cookie_header(
     HeaderValue::from_str(&value).map_err(|err| anyhow::anyhow!("invalid Set-Cookie header: {err}"))
 }
 
-pub(crate) fn local_home_launch_token_context(
+pub(in crate::api) fn local_home_launch_token_context(
     data_dir: &std::path::Path,
 ) -> anyhow::Result<HomeLaunchTokenContext> {
     let (_signing_key, did) = elastos_identity::load_or_create_did(data_dir)?;
@@ -220,7 +220,7 @@ pub(crate) fn issue_home_launch_token_for_auth_grant(
     )
 }
 
-pub(crate) fn issue_home_launch_token_with_context(
+pub(in crate::api) fn issue_home_launch_token_with_context(
     data_dir: &std::path::Path,
     app: &str,
     context: &HomeLaunchTokenContext,
@@ -228,7 +228,7 @@ pub(crate) fn issue_home_launch_token_with_context(
     issue_home_launch_token_at(data_dir, &HomeLaunchContext::direct(app), context, now_ts())
 }
 
-pub(crate) fn issue_home_projection_launch_token_with_context(
+pub(in crate::api) fn issue_home_projection_launch_token_with_context(
     data_dir: &std::path::Path,
     selected_resource: &str,
     executable_actor: &str,
@@ -287,7 +287,7 @@ fn issue_home_launch_token_at(
 }
 
 #[cfg(test)]
-fn issue_expired_home_launch_token_with_context(
+pub(crate) fn issue_expired_home_launch_token_with_context(
     data_dir: &std::path::Path,
     app: &str,
     context: &HomeLaunchTokenContext,
@@ -422,6 +422,21 @@ pub(in crate::api) fn require_runtime_wallet_authority(
     runtime_wallet_authority(&required)
 }
 
+pub(in crate::api) fn require_internal_shell_runtime_wallet_authority(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+    allowed_apps: &[&str],
+) -> anyhow::Result<RuntimeWalletAuthority> {
+    let required = require_home_launch_token_for_any_from_with_origin(
+        data_dir,
+        headers,
+        allowed_apps,
+        None,
+        HomeLaunchOriginPolicy::InternalShell,
+    )?;
+    runtime_wallet_authority(&required)
+}
+
 pub(in crate::api) fn require_home_runtime_wallet_authority(
     data_dir: &std::path::Path,
     headers: &HeaderMap,
@@ -481,7 +496,8 @@ fn require_home_launch_token_for_any_from_with_origin(
     cookie_name: Option<&str>,
     origin_policy: HomeLaunchOriginPolicy,
 ) -> anyhow::Result<RequiredHomeLaunchToken> {
-    if home_launch_token_credential(headers, cookie_name)?.is_none() {
+    let (header_token, cookie_token) = home_launch_token_candidates(headers, cookie_name)?;
+    if header_token.is_none() && cookie_token.is_none() {
         anyhow::bail!("missing home launch token");
     }
     let expected_did = load_existing_gateway_runtime_did(data_dir)
@@ -507,14 +523,52 @@ fn require_home_launch_token_for_any_from_expected_did(
     auth_data_dir: &std::path::Path,
     origin_policy: HomeLaunchOriginPolicy,
 ) -> anyhow::Result<RequiredHomeLaunchToken> {
-    let token = home_launch_token_credential(headers, cookie_name)?
-        .ok_or_else(|| anyhow::anyhow!("missing home launch token"))?;
-    let required = require_home_launch_token_value_from_expected_did(
-        token.as_str(),
-        allowed_apps,
-        expected_did,
-        auth_data_dir,
-    )?;
+    let (header_token, cookie_token) = home_launch_token_candidates(headers, cookie_name)?;
+    let required = match (header_token.as_deref(), cookie_token.as_deref()) {
+        (None, None) => anyhow::bail!("missing home launch token"),
+        (Some(token), None) | (None, Some(token)) => {
+            require_home_launch_token_value_from_expected_did(
+                token,
+                allowed_apps,
+                expected_did,
+                auth_data_dir,
+            )?
+        }
+        (Some(header), Some(cookie)) if header == cookie => {
+            require_home_launch_token_value_from_expected_did(
+                header,
+                allowed_apps,
+                expected_did,
+                auth_data_dir,
+            )?
+        }
+        (Some(header), Some(cookie)) => {
+            // Session refresh rotates the cookie while open tabs still hold
+            // the prior mint, so a divergent pair is only a conflict when the
+            // two tokens verify to different session authorities. Same
+            // authority answers with the cookie, the newest server-set mint.
+            let from_cookie = require_home_launch_token_value_from_expected_did(
+                cookie,
+                allowed_apps,
+                expected_did.clone(),
+                auth_data_dir,
+            );
+            let from_header = require_home_launch_token_value_from_expected_did(
+                header,
+                allowed_apps,
+                expected_did,
+                auth_data_dir,
+            );
+            match (from_cookie, from_header) {
+                (Ok(from_cookie), Ok(from_header))
+                    if from_cookie.context == from_header.context =>
+                {
+                    from_cookie
+                }
+                _ => anyhow::bail!("conflicting Home launch-token authorities"),
+            }
+        }
+    };
     match origin_policy {
         HomeLaunchOriginPolicy::Browser
             if required.launch_context.executable_actor == HOME_CAPSULE_ID =>
@@ -756,21 +810,16 @@ fn single_home_launch_token_header(headers: &HeaderMap) -> anyhow::Result<Option
     Ok(Some(value.to_string()))
 }
 
-fn home_launch_token_credential(
+fn home_launch_token_candidates(
     headers: &HeaderMap,
     cookie_name: Option<&str>,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<(Option<String>, Option<String>)> {
     let header = single_home_launch_token_header(headers)?;
     let cookie = match cookie_name {
         Some(name) => single_cookie_value(headers, name)?,
         None => None,
     };
-    if let (Some(header), Some(cookie)) = (header.as_deref(), cookie.as_deref()) {
-        if header != cookie {
-            anyhow::bail!("conflicting Home launch-token authorities");
-        }
-    }
-    Ok(header.or(cookie))
+    Ok((header, cookie))
 }
 
 fn single_cookie_value(headers: &HeaderMap, name: &str) -> anyhow::Result<Option<String>> {
@@ -1317,12 +1366,10 @@ mod tests {
         .to_string()
         .contains("proofless home launch token"));
 
-        let home_token = issue_home_launch_token_with_context(
-            data_dir.path(),
-            HOME_CAPSULE_ID,
-            &local_home_launch_token_context(data_dir.path()).unwrap(),
-        )
-        .unwrap();
+        let home_context = local_home_launch_token_context(data_dir.path()).unwrap();
+        let home_token =
+            issue_home_launch_token_with_context(data_dir.path(), HOME_CAPSULE_ID, &home_context)
+                .unwrap();
         let mut home = HeaderMap::new();
         home.insert("x-elastos-home-token", home_token.parse().unwrap());
         home.insert("host", "localhost:45542".parse().unwrap());
@@ -1358,6 +1405,20 @@ mod tests {
                 .to_string()
                 .contains("conflicting Home launch-token authorities")
         );
+
+        let rotated_token =
+            issue_home_launch_token_with_context(data_dir.path(), HOME_CAPSULE_ID, &home_context)
+                .unwrap();
+        assert_ne!(rotated_token, home_token);
+        let mut rotated_cookie = home.clone();
+        rotated_cookie.insert(
+            axum::http::header::COOKIE,
+            format!("{HOME_SESSION_COOKIE}={rotated_token}")
+                .parse()
+                .unwrap(),
+        );
+        require_home_token_context(data_dir.path(), &rotated_cookie)
+            .expect("a rotated same-session cookie beside a stale header must stay signed");
 
         let mut sibling = home.clone();
         sibling.insert("origin", "http://localhost:45543".parse().unwrap());
@@ -1519,5 +1580,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parent_auth_result.context.session_id, "auth:alice");
+    }
+
+    #[test]
+    fn internal_shell_runtime_wallet_authority_accepts_only_home_cli_without_browser_provenance() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let context = local_home_launch_token_context(data_dir.path()).unwrap();
+        let token =
+            issue_home_launch_token_with_context(data_dir.path(), HOME_CLI_SHELL_ID, &context)
+                .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-elastos-home-token", token.parse().unwrap());
+
+        let authority = require_internal_shell_runtime_wallet_authority(
+            data_dir.path(),
+            &headers,
+            &[HOME_CLI_SHELL_ID],
+        )
+        .unwrap();
+        assert_eq!(
+            authority.home_launch_context().principal_id,
+            context.principal_id
+        );
+
+        headers.insert(axum::http::header::ORIGIN, "null".parse().unwrap());
+        assert!(require_internal_shell_runtime_wallet_authority(
+            data_dir.path(),
+            &headers,
+            &[HOME_CLI_SHELL_ID],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("must not carry browser provenance"));
+
+        let regular_token =
+            issue_home_launch_token_with_context(data_dir.path(), "regular-app", &context).unwrap();
+        let mut regular_headers = HeaderMap::new();
+        regular_headers.insert("x-elastos-home-token", regular_token.parse().unwrap());
+        assert!(require_internal_shell_runtime_wallet_authority(
+            data_dir.path(),
+            &regular_headers,
+            &[HOME_CLI_SHELL_ID],
+        )
+        .is_err());
     }
 }

@@ -2,6 +2,7 @@
 import hashlib
 import importlib.util
 import json
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -87,15 +88,15 @@ def projection_manifest():
     }
 
 
-def content_manifest():
-    return {
+def content_manifest(name, description, entrypoint, *, icon=None):
+    manifest = {
         "schema": "elastos.capsule/v1",
-        "name": "gba-ucity",
+        "name": name,
         "version": "0.1.0",
-        "description": "uCity",
+        "description": description,
         "role": "content",
         "type": "data",
-        "entrypoint": "ucity.gba",
+        "entrypoint": entrypoint,
         "viewer": "gba-emulator",
         "interfaces": [
             {
@@ -114,6 +115,9 @@ def content_manifest():
             }
         ],
     }
+    if icon is not None:
+        manifest["icon"] = icon
+    return manifest
 
 
 def make_source_capsules(root):
@@ -125,8 +129,26 @@ def make_source_capsules(root):
     )
 
     ucity = root / "capsules" / "gba-ucity"
-    write_json(ucity / "capsule.json", content_manifest())
+    write_json(ucity / "capsule.json", content_manifest("gba-ucity", "uCity", "ucity.gba"))
     (ucity / "ucity.gba").write_bytes(b"gba-rom")
+
+    nonogram = root / "capsules" / "gba-nonogram"
+    write_json(
+        nonogram / "capsule.json",
+        content_manifest(
+            "gba-nonogram",
+            "Nonogram Advance",
+            "nonogram.gba",
+            icon="icons",
+        ),
+    )
+    (nonogram / "nonogram.gba").write_bytes(b"nonogram-rom")
+    (nonogram / "icons").mkdir(parents=True)
+    (nonogram / "icons" / "icon.svg").write_text("<svg></svg>\n", encoding="utf-8")
+    for size in [32, 64, 128, 256]:
+        (nonogram / "icons" / f"icon-{size}.png").write_bytes(
+            f"png-{size}".encode("utf-8")
+        )
 
     provider = root / "capsules" / "object-provider"
     write_json(
@@ -144,7 +166,7 @@ def make_source_capsules(root):
 
 
 def make_installed_capsules(root, data_dir):
-    for name in ["gba-emulator", "gba-ucity"]:
+    for name in ["gba-emulator", "gba-ucity", "gba-nonogram"]:
         shutil.copytree(root / "capsules" / name, data_dir / "capsules" / name)
     for name in ["chat-wasm", "old-managed", "user-capsule"]:
         capsule_dir = data_dir / "capsules" / name
@@ -188,9 +210,10 @@ def make_kubo_rewritten_components(path):
             "capsules": {
                 "gba-emulator": {"cid": "", "sha256": "", "size": 0},
                 "gba-ucity": {"cid": "", "sha256": "", "size": 0},
+                "gba-nonogram": {"cid": "", "sha256": "", "size": 0},
             },
             "profiles": {
-                "demo": {"components": ["gba-emulator", "gba-ucity"]}
+                "demo": {"components": ["gba-emulator", "gba-ucity", "gba-nonogram"]}
             },
         },
     )
@@ -199,18 +222,40 @@ def make_kubo_rewritten_components(path):
 def assert_setup_order():
     setup = (ROOT / "scripts" / "setup-source-home.sh").read_text(encoding="utf-8")
     main = setup.split('echo "[setup-source-home] repo:', 1)[1]
-    ordered = [
-        "stamp_source_home_components_manifest\n",
-        "install_content_publish_backend\n",
-        "install_app_capsules\n",
-        "stamp_source_home_capsule_artifacts_manifest\n",
-        'python3 "${ROOT}/scripts/components-release-integrity-check.py"',
+    stamps = [
+        match.start()
+        for match in re.finditer(r"^stamp_source_home_components_manifest$", main, re.MULTILINE)
     ]
-    positions = [main.index(marker) for marker in ordered]
+    if len(stamps) != 2:
+        raise AssertionError("source-home setup must stamp components before and after Kubo setup")
+    positions = [
+        stamps[0],
+        main.index("install_content_publish_backend\n"),
+        stamps[1],
+        main.index("install_app_capsules\n"),
+        main.index("stamp_source_home_capsule_artifacts_manifest\n"),
+        main.index('python3 "${ROOT}/scripts/components-release-integrity-check.py"'),
+    ]
     if positions != sorted(positions):
         raise AssertionError(
             "components.json mutators must finish before the final capsule stamp and integrity check"
         )
+    install_function = setup.split("install_content_publish_backend() {", 1)[1].split(
+        "\n}\n\necho \"[setup-source-home] repo:", 1
+    )[0]
+    success_index = install_function.index('SOURCE_HOME_KUBO_INSTALLED="1"')
+    for marker in [
+        'if [[ "$mode" == "0" ]]',
+        'if [[ "$mode" != "1" && "$PLATFORM" != "darwin-arm64" ]]',
+        'setup --with kubo',
+        'if [[ ! -f "${DATA_DIR}/bin/kubo" || ! -x "${DATA_DIR}/bin/kubo" ]]',
+    ]:
+        if install_function.index(marker) >= success_index:
+            raise AssertionError("source-home must mark Kubo only after setup and executable verification")
+    if install_function.count('SOURCE_HOME_KUBO_INSTALLED="1"') != 1:
+        raise AssertionError("source-home setup must record Kubo only after successful setup")
+    if 'source_home_components.append("kubo")' not in setup:
+        raise AssertionError("source-home final profile must include successfully installed Kubo")
     if 'manifest.setdefault("profiles", {})["source-home"]' not in setup:
         raise AssertionError("source-home setup must stamp the exact components it installs")
     integrity_call = main.split(
@@ -224,6 +269,33 @@ def assert_setup_order():
 
 def run_smoke():
     stamper = load_stamper()
+    player_manifest = json.loads(
+        (ROOT / "capsules" / "elacity-player" / "capsule.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    if player_manifest.get("name") != "elacity-player":
+        raise AssertionError("Elacity Player manifest name drifted")
+    if player_manifest.get("icon") != "browser/icons":
+        raise AssertionError("Elacity Player must keep capsule-owned icons")
+    for icon_file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"]:
+        if not (
+            ROOT / "capsules" / "elacity-player" / "browser" / "icons" / icon_file
+        ).is_file():
+            raise AssertionError(f"missing Elacity Player icon asset {icon_file}")
+
+    source_components = json.loads((ROOT / "components.json").read_text(encoding="utf-8"))
+    if (
+        source_components["external"]["elacity-player"]["install_path"]
+        != "capsules/elacity-player"
+    ):
+        raise AssertionError(
+            "components.json must install Elacity Player from its capsule tree"
+        )
+    for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"]:
+        if "elacity-player" not in source_components["profiles"][profile]["components"]:
+            raise AssertionError(f"profile {profile} must include Elacity Player")
+
     with tempfile.TemporaryDirectory() as temp:
         temp_root = Path(temp)
         root = temp_root / "repo"
@@ -255,7 +327,7 @@ def run_smoke():
             data_dir=data_dir,
             root=root,
             platform="darwin-arm64",
-            capsules=["gba-emulator", "gba-ucity", "object-provider"],
+            capsules=["gba-emulator", "gba-ucity", "gba-nonogram", "object-provider"],
             retired_capsules=["chat-wasm"],
             managed_state_path=managed_state_path,
         )
@@ -286,6 +358,7 @@ def run_smoke():
         components = json.loads(components_path.read_text(encoding="utf-8"))
         emulator = components["capsules"]["gba-emulator"]
         ucity = components["capsules"]["gba-ucity"]
+        nonogram = components["capsules"]["gba-nonogram"]
         if emulator.get("runtime_abi") != "elastos.runtime-projection/v1":
             raise AssertionError("GBA emulator runtime ABI was not restored")
         if emulator.get("execution") != "web-projection":
@@ -296,12 +369,25 @@ def run_smoke():
             raise AssertionError("uCity content role/type metadata was not restored")
         if ucity.get("viewer") != "gba-emulator":
             raise AssertionError("uCity viewer metadata was not restored")
+        if (
+            nonogram.get("role") != "content"
+            or nonogram.get("type") != "data"
+            or nonogram.get("viewer") != "gba-emulator"
+        ):
+            raise AssertionError("Nonogram content metadata was not restored")
 
-        for name in ["gba-emulator", "gba-ucity"]:
+        for name in ["gba-emulator", "gba-ucity", "gba-nonogram"]:
             source = root / "capsules" / name
             installed = data_dir / "capsules" / name
             if tree_hashes(source) != tree_hashes(installed):
                 raise AssertionError(f"source-installed capsule tree mismatch: {name}")
+        installed_nonogram = json.loads(
+            (data_dir / "capsules" / "gba-nonogram" / "capsule.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        if installed_nonogram.get("icon") != "icons":
+            raise AssertionError("installed Nonogram icon manifest was not preserved")
         installed_emulator = json.loads(
             (data_dir / "capsules" / "gba-emulator" / "capsule.json").read_text(
                 encoding="utf-8"
@@ -316,7 +402,7 @@ def run_smoke():
         managed = json.loads(managed_state_path.read_text(encoding="utf-8"))
         if managed != {
             "schema": MANAGED_STATE_SCHEMA,
-            "capsules": ["gba-emulator", "gba-ucity", "object-provider"],
+            "capsules": ["gba-emulator", "gba-nonogram", "gba-ucity", "object-provider"],
         }:
             raise AssertionError(f"unexpected managed state: {managed}")
 

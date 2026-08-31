@@ -42,7 +42,7 @@ export function createLibraryState({ queryParams, storage, perfTarget }) {
     objectNodeCache: new Map(),
     selectedUris: new Set(),
     selectionAnchorUri: "",
-    view: storage.getItem("library.view") || "grid",
+    view: storage.getItem("library.view") || "list",
     sort: storage.getItem("library.sort") || "name",
     sortOrder: storage.getItem("library.sortOrder") || "asc",
     sidebarOrder: readStoredStringArray(storage.getItem("library.sidebarOrder")),

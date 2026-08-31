@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260725a";
+const moduleVersion = "home-20260802a";
 const requests = [];
 const localStorageValues = new Map([
   ["elastos.home.active-shell-hint", "home-cli"],
@@ -271,6 +271,9 @@ globalThis.fetch = async (url, init = {}) => {
   if (url === "/api/apps/home/summary") {
     return jsonResponse(summary);
   }
+  if (url === "/api/auth/sessions/refresh") {
+    return jsonResponse({ home_token: "host-token" });
+  }
   if (url === "/api/apps/home/launch") {
     assert(body?.target === "home-cli", "switchback recovery launched the wrong active shell", body);
     assert(body?.query?.shell_mode === "root", "switchback recovery did not launch root shell mode", body);
@@ -283,8 +286,8 @@ globalThis.fetch = async (url, init = {}) => {
   if (url === "/api/apps/home/active-shell") {
     assert(body?.active === "home-gui", "switchback recovery requested the wrong active shell", body);
     assert(
-      init.headers?.["x-elastos-home-token"] === "root-token",
-      "switchback recovery did not use the mounted shell launch token",
+      init.headers?.["x-elastos-home-token"] === "host-token",
+      "switchback recovery did not use the trusted Home host token",
       init.headers,
     );
     return failedResponse(500, "Internal Server Error", "simulated active shell switch failure");
@@ -329,7 +332,7 @@ for (let attempt = 0; attempt < 20 && recovery.hidden; attempt += 1) {
 
 const activeShellRequests = requests.filter((request) => request.url === "/api/apps/home/active-shell");
 assert(activeShellRequests.length === 1, "switchback recovery should make exactly one active-shell request", requests);
-assert(activeShellRequests[0].headers["x-elastos-home-token"] === "root-token", "switchback recovery lost the shell launch token", activeShellRequests[0]);
+assert(activeShellRequests[0].headers["x-elastos-home-token"] === "host-token", "switchback recovery lost the trusted Home host token", activeShellRequests[0]);
 assert(recovery.hidden === false, "switchback failure did not show host recovery");
 assert(recovery.dataset.host === "home-shell-host", "switchback recovery did not advertise host ownership", recovery.dataset);
 assert(recovery.dataset.target === "home-cli", "switchback recovery target drifted", recovery.dataset);

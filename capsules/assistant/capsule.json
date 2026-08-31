@@ -1,0 +1,60 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "assistant",
+  "version": "0.1.0",
+  "description": "Assistant capsule for typed model access through Runtime authorization.",
+  "author": "elastos",
+  "role": "app",
+  "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
+  "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
+  "interfaces": [
+    {
+      "id": "elastos.assistant.model",
+      "version": "0.1.0",
+      "description": "Assistant UI for typed model offers and runs through Runtime authorization.",
+      "methods": [
+        {
+          "id": "offers.list",
+          "description": "List typed model offers through Runtime authorization.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://model/offers",
+          "operation": "offers_list"
+        },
+        {
+          "id": "run.create",
+          "description": "Create a typed model run through Runtime authorization.",
+          "risk": "privileged",
+          "approval": "runtime_policy",
+          "audit": "full",
+          "resource": "elastos://model/*",
+          "operation": "runs_create"
+        },
+        {
+          "id": "run.events",
+          "description": "Read typed model run events through Runtime authorization.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://model/*",
+          "operation": "runs_events"
+        },
+        {
+          "id": "run.cancel",
+          "description": "Cancel a typed model run through Runtime authorization.",
+          "risk": "privileged",
+          "approval": "runtime_policy",
+          "audit": "full",
+          "resource": "elastos://model/*",
+          "operation": "runs_cancel"
+        }
+      ]
+    }
+  ]
+}

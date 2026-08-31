@@ -1,21 +1,22 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "chat-room",
-  "version": "0.1.0",
-  "description": "Runtime-launched Chat capsule with a web surface adapter",
+  "version": "0.2.0",
+  "description": "Runtime-launched Chat capsule with a typed web surface adapter",
   "role": "app",
   "type": "wasm",
   "runtime_abi": "elastos.runtime-projection/v1",
   "bus_contract": "elastos.runtime-projection/v1",
   "execution": "web-projection",
-  "projections": ["web", "facts", "affordances", "gates", "carrier"],
+  "projections": ["web", "facts", "affordances", "gates"],
   "author": "elastos",
   "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
   "interfaces": [
     {
       "id": "elastos.chat.room",
       "version": "0.5.0",
-      "description": "Chat room projection over Runtime room facts and Carrier-backed intents",
+      "description": "Chat room projection over Runtime room facts and typed room intents",
       "methods": [
         {
           "id": "room.view",
@@ -28,7 +29,7 @@
         },
         {
           "id": "message.send",
-          "description": "Send a chat message through Runtime room and Carrier policy",
+          "description": "Send a chat message through Runtime room policy",
           "risk": "write",
           "approval": "runtime_policy",
           "audit": "event",

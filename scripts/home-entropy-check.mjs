@@ -184,6 +184,10 @@ function listMarkdownFiles(dir = repoRootPath) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".elastos" ||
+      entry.name === ".superpowers" ||
+      entry.name === "superpowers" ||
+      entry.name === ".claude" ||
       entry.name === "target" ||
       entry.name === "node_modules"
     ) {
@@ -205,6 +209,10 @@ function listTextFiles(dir) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".elastos" ||
+      entry.name === ".superpowers" ||
+      entry.name === "superpowers" ||
+      entry.name === ".claude" ||
       entry.name === "target" ||
       entry.name === "node_modules"
     ) {
@@ -242,7 +250,7 @@ function assertProviderOperationEnumsRejectUnknownFields() {
 function assertGatewayRequestStructsRejectUnknownFields() {
   const names = [
     "HomeBrowserStateUpdate",
-    "SystemHandleUpdateRequest",
+    "PeopleProfileUpdateRequest",
     "SystemBackgroundOverlayRequest",
     "SystemGuestRegistrationRequest",
     "WalletApprovalRejectRequest",
@@ -344,15 +352,33 @@ function assertMarkdownLocalLinksResolve() {
   assert(failures.length === 0, "Markdown local links must resolve", failures);
 }
 
+function assertStandingDocsHaveNoReleaseSnapshots() {
+  const records = new Set(["state.md", "TASKS.md", "elastos/CHANGELOG.md"]);
+  const failures = [];
+  const snapshot = /\bPR\s*#?\s*\d+\b|\bupstream\/\d[\w.-]*-dev\b|`(?:origin\/)?(?:feat|fix|review|codex)\/[a-z0-9][\w/-]*|`[a-f0-9]{7,40}`|\b\d+\.\d+(?:\.\d+)? (?:source candidate|release line|development branch|truth boundary)\b/i;
+  for (const file of listMarkdownFiles()) {
+    const path = relativeToRepo(file);
+    if (records.has(path) || path.startsWith("docs/audits/") ||
+        path.includes("/vendor/") || /\/(?:UPSTREAM|ATTRIBUTION)\.md$/.test(path)) {
+      continue;
+    }
+    readFileSync(file, "utf8").split("\n").forEach((line, index) => {
+      if (snapshot.test(line)) failures.push(`${path}:${index + 1}: ${line.trim()}`);
+    });
+  }
+  assert(failures.length === 0,
+    "Standing docs must keep release snapshots in state.md, TASKS.md, changelog or dated audit records",
+    failures);
+}
+
 function assertUsersSelfReferencesAreApproved() {
   const allowed = new Set([
-    "capsules/chat/capsule.json",
-    "capsules/chat/src/carrier.rs",
-    "capsules/chat/src/session.rs",
+    // Retained, unshipped operator-path evidence. Product packaging is rejected below.
     "capsules/browser-engine-adapter/src/main.rs",
     "capsules/browser-engine-adapter/src/tests.rs",
     "capsules/browser-engine-adapter/src/validation.rs",
     "capsules/gba-emulator/capsule.json",
+    "capsules/gba-nonogram/capsule.json",
     "capsules/gba-ucity/capsule.json",
     "elastos/crates/elastos-server/src/api/browser_capsules.rs",
     "elastos/crates/elastos-server/src/api/gateway_browser.rs",
@@ -365,7 +391,7 @@ function assertUsersSelfReferencesAreApproved() {
     "elastos/crates/elastos-server/src/api/gateway_tests/support_runtime.rs",
     "elastos/crates/elastos-server/src/api/handlers/storage.rs",
     "elastos/crates/elastos-server/src/api/viewer_gateway.rs",
-    "elastos/crates/elastos-server/src/carrier_bridge.rs",
+    "elastos/crates/elastos-server/src/resource_bridge.rs",
     "elastos/crates/elastos-server/src/notifications.rs",
     "elastos/crates/elastos-server/src/runtime_control.rs",
   ]);
@@ -416,6 +442,9 @@ function listFilesRecursive(dir) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".superpowers" ||
+      entry.name === "superpowers" ||
+      entry.name === ".claude" ||
       entry.name === "target" ||
       entry.name === "node_modules"
     ) {
@@ -670,6 +699,9 @@ const activeUiFiles = [
   "capsules/home-cli/browser/index.html",
   "capsules/home-cli/browser/home-cli.js",
   "capsules/home-cli/browser/style.css",
+  "capsules/assistant/browser/index.html",
+  "capsules/assistant/browser/assistant.js",
+  "capsules/assistant/browser/style.css",
   "capsules/system/browser/index.html",
   "capsules/system/browser/system.js",
   "capsules/system/browser/esp-projections.mjs",
@@ -723,6 +755,7 @@ const activeUiFiles = [
 const activeHtmlFiles = [
   "capsules/home/browser/index.html",
   "capsules/home-cli/browser/index.html",
+  "capsules/assistant/browser/index.html",
   "capsules/system/browser/index.html",
   "capsules/wallet-metamask/browser/index.html",
   "capsules/wallet-unisat/browser/index.html",
@@ -762,52 +795,202 @@ for (const file of activeHtmlFiles) {
   assertStaticControlsAreNamed(file);
 }
 
-const lightTokenFiles = [
-  "capsules/chat-room/browser/style.css",
-  "capsules/documents/browser/index.html",
-];
+// Documents now uses the shared token sheet. Check the stronger rule: it must
+// map onto canonical shared tokens and must not re-declare its own palette.
+const documentsStyle = read("capsules/documents/browser/index.html");
+for (const [token, value] of new Map([
+  ["--bg", "var(--el-bg)"],
+  ["--panel", "color-mix(in srgb, var(--el-surface) 94%, transparent)"],
+  ["--panel-strong", "color-mix(in srgb, var(--el-surface-raised) 96%, transparent)"],
+  ["--panel-soft", "color-mix(in srgb, var(--el-surface-raised) 84%, var(--el-accent-faint))"],
+  ["--line", "var(--el-hairline)"],
+  ["--line-strong", "var(--el-hairline-strong)"],
+  ["--text", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "var(--el-accent)"],
+  ["--accent-soft", "var(--el-accent-soft)"],
+  ["--accent-deep", "var(--el-accent-strong)"],
+  ["--danger", "var(--el-danger)"],
+])) {
+  assertToken(documentsStyle, "capsules/documents/browser/index.html", token, value);
+}
+assert(
+  documentsStyle.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    documentsStyle.includes('<script src="./elastos-theme.js"></script>'),
+  "Documents must load the vendored shared token sheet and theme runtime",
+);
 
-const lightTokens = new Map([
-  ["--bg", "#edf1fb"],
-  ["--bg-strong", "#e3e9fb"],
-  ["--panel", "rgba(255, 255, 255, 0.9)"],
-  ["--panel-strong", "#ffffff"],
-  ["--panel-soft", "#eef2ff"],
-  ["--line", "rgba(83, 103, 164, 0.14)"],
-  ["--line-strong", "rgba(83, 103, 164, 0.22)"],
-  ["--ink", "#1d2438"],
-  ["--muted", "#66708a"],
-  ["--brand", "#f6921a"],
-  ["--brand-soft", "#fff1dc"],
-  ["--accent", "#5f76d8"],
-  ["--accent-soft", "#e8edff"],
-  ["--accent-deep", "#3c53a7"],
-  ["--danger", "#b14c5a"],
-]);
-
-for (const file of lightTokenFiles) {
-  const source = read(file);
-  for (const [token, value] of lightTokens) {
-    assertToken(source, file, token, value);
-  }
+const chatRoomStyle = read("capsules/chat-room/browser/style.css");
+for (const [token, value] of new Map([
+  ["--bg", "var(--el-bg)"],
+  ["--panel", "var(--el-surface)"],
+  ["--panel-strong", "var(--el-surface-raised)"],
+  ["--panel-soft", "var(--el-inset)"],
+  ["--line", "var(--el-hairline)"],
+  ["--line-strong", "var(--el-hairline-strong)"],
+  ["--ink", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "var(--el-accent)"],
+  ["--accent-soft", "var(--el-accent-soft)"],
+  ["--accent-deep", "var(--el-accent-strong)"],
+  ["--accent-ink", "var(--el-accent-ink)"],
+  ["--danger", "var(--el-danger)"],
+])) {
+  assertToken(chatRoomStyle, "capsules/chat-room/browser/style.css", token, value);
+}
+{
+  const literalColours = chatRoomStyle
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /#[0-9a-fA-F]{3,8}\b|rgba?\(/.test(line))
+    .filter((line) => !line.includes("var(--el-") && !line.includes("color-mix"));
+  assert(
+    literalColours.length === 0,
+    "Chat Room must take every colour from the shared token sheet, never name one itself",
+    literalColours,
+  );
+  assert(
+    !chatRoomStyle.includes("color: #f8fbff"),
+    "Text on an accent fill must use --accent-ink, which flips with the chosen accent",
+  );
+  const chatRoomIndex = read("capsules/chat-room/browser/index.html");
+  assert(
+    chatRoomIndex.includes('<link rel="stylesheet" href="./elastos-ui.css" />') &&
+      chatRoomIndex.includes('<script src="./elastos-theme.js"></script>'),
+    "Chat Room must load the vendored token sheet and theme runtime it maps onto",
+  );
 }
 
+const assistantIndex = read("capsules/assistant/browser/index.html");
+const assistantScript = read("capsules/assistant/browser/assistant.js");
+const assistantStyle = read("capsules/assistant/browser/style.css");
+const assistantGateway = read(
+  "elastos/crates/elastos-server/src/api/gateway_assistant.rs",
+);
+const gatewaySource = read("elastos/crates/elastos-server/src/api/gateway.rs");
+
+assert(
+  assistantIndex.includes('<script type="module" src="./assistant.js"></script>'),
+  "Assistant must boot through its capsule-owned browser shell",
+);
+assert(
+  !/\blocalStorage\b|\bsessionStorage\b|\bindexedDB\b/.test(assistantScript),
+  "Assistant must not add browser-owned persistence",
+);
+assert(
+  assistantScript.includes("/api/apps/assistant/workspace") &&
+    !assistantScript.includes("workspace.json") &&
+    !assistantScript.includes("session.agent"),
+  "Assistant shell must use the dedicated Runtime workspace route without reaching for Home session.agent or raw path literals",
+);
+assert(
+  assistantScript.includes('/apps/home/home-clipboard-client.js?v=home-20260726a') &&
+    !/home:clipboard-request|home:clipboard-ready|home:clipboard-result|home:clipboard-cancel/.test(
+      assistantScript,
+    ),
+  "Assistant must use the trusted Home Clipboard client without reimplementing the Clipboard protocol",
+);
+assert(
+  !/\bnavigator\.clipboard\b|\bexecCommand\b/.test(assistantScript),
+  "Assistant must not add direct clipboard fallbacks",
+);
+assert(
+  !/offer:flash-chat:pair-a|offer:h3-video:2x|mock-agent-provider|install catalog/i.test(
+    assistantScript,
+  ) &&
+    !/(["'](?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)["']\s*:|\b(?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)\s*:)/i.test(
+      assistantScript,
+    ),
+  "Assistant shell must not hardcode donor offer IDs or reintroduce mock, grant, install, or authority fields",
+);
+assert(
+  !/assistant-message-meta|typed text runs only|Build mode uses the same typed text runs/i.test(
+    assistantScript,
+  ),
+  "Assistant shell must not render run ids or visible contract wording",
+);
+assert(
+  !/localStorage|sessionStorage|indexedDB|navigator\.clipboard|execCommand/i.test(
+    `${assistantIndex}\n${assistantScript}\n${assistantStyle}`,
+  ),
+  "Assistant capsule source must not introduce browser-owned storage or direct clipboard authority",
+);
+assert(
+  !/https?:\/\/|ws:\/\/|wss:\/\/|127\.0\.0\.1|carrier_route|connect_ticket|backend_url|api_key|bearer/i.test(
+    `${assistantIndex}\n${assistantScript}\n${assistantStyle}`,
+  ),
+  "Assistant capsule source must not expose backend endpoints, topology, or credentials",
+);
+assert(
+  (gatewaySource.match(/\/api\/apps\/assistant\/workspace/g) || []).length === 1,
+  "Assistant workspace must expose exactly one dedicated Runtime route",
+);
+assert(
+  (assistantGateway.match(/elastos\.assistant\.workspace\/v1/g) || []).length >= 1,
+  "Assistant workspace must use one bounded v1 schema",
+);
+assert(
+  (assistantGateway.match(
+    /const ASSISTANT_WORKSPACE_RELATIVE_ROOT: &str = "\.AppData\/ElastOS\/Assistant";/g,
+  ) || []).length === 1 &&
+    (assistantGateway.match(
+      /const ASSISTANT_WORKSPACE_FILE: &str = "workspace\.json";/g,
+    ) || []).length === 1 &&
+    (assistantGateway.match(/fn assistant_workspace_uri\(/g) || []).length === 1 &&
+    (assistantGateway.match(/\.AppData\/ElastOS\/Assistant\/workspace\.json/g) || []).length === 0,
+  "Assistant workspace must use exactly one protected principal-root file",
+);
+assert(
+  assistantGateway.includes("read_principal_root_object(") &&
+    assistantGateway.includes("write_protected_principal_root_object("),
+  "Assistant workspace must use the principal-root protected-object APIs",
+);
+assert(
+  !/https?:\/\/|ws:\/\/|wss:\/\/|127\.0\.0\.1|carrier_route|connect_ticket|backend_url|api_key|bearer/i.test(
+    assistantGateway,
+  ),
+  "Assistant workspace route must not encode backend endpoints, topology, or credentials",
+);
+
+// Inbox took the shared token sheet, so pinning its own hex palette here
+// would pin a copy of someone else's decision. The stronger rule: every name
+// it uses must resolve to a shared token, and it must name no colour of its
+// own. `just vendor-ui --check` guards the token sheet itself against drift.
 const inboxStyle = read("capsules/inbox/browser/index.html");
 for (const [token, value] of new Map([
-  ["--bg", "#ffffff"],
-  ["--sidebar-bg", "#f9f9f9"],
-  ["--toolbar-bg", "#fafafa"],
-  ["--panel", "#ffffff"],
-  ["--panel-soft", "#f9f9f9"],
-  ["--line", "#e5e7eb"],
-  ["--line-strong", "#d1d5db"],
-  ["--ink", "#1f2937"],
-  ["--muted", "#6b7280"],
-  ["--brand", "#f6921a"],
-  ["--accent", "#007aff"],
-  ["--accent-soft", "#e5f0ff"],
+  ["--bg", "var(--el-bg)"],
+  ["--sidebar-bg", "var(--el-surface)"],
+  ["--toolbar-bg", "var(--el-surface)"],
+  ["--panel", "var(--el-surface-raised)"],
+  ["--panel-soft", "var(--el-inset)"],
+  ["--line", "var(--el-hairline)"],
+  ["--line-strong", "var(--el-hairline-strong)"],
+  ["--ink", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "var(--el-accent)"],
+  ["--accent-soft", "var(--el-accent-soft)"],
 ])) {
   assertToken(inboxStyle, "capsules/inbox/browser/index.html", token, value);
+}
+{
+  const inboxOwnStyle = (inboxStyle.match(/<style>([\s\S]*?)<\/style>/g) || []).join("\n");
+  const literalColours = inboxOwnStyle
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /#[0-9a-fA-F]{3,8}\b|rgba?\(/.test(line));
+  assert(
+    literalColours.length === 0,
+    "Inbox must take every colour from the shared token sheet, never name one itself",
+    literalColours,
+  );
+  assert(
+    inboxStyle.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+      inboxStyle.includes('<script src="./elastos-theme.js"></script>'),
+    "Inbox must load the vendored token sheet and theme runtime it maps onto",
+  );
 }
 
 const systemSettingsStyle = read("capsules/system/browser/style.css");
@@ -817,33 +1000,56 @@ const systemJs = read("capsules/system/browser/system.js");
 const systemEspProjections = read("capsules/system/browser/esp-projections.mjs");
 const walletApiSource = read("capsules/wallet/browser/wallet-api.js");
 for (const [token, value] of new Map([
-  ["--color-settings-bg", "#ffffff"],
-  ["--color-settings-sidebar", "#f9f9f9"],
-  ["--color-settings-card", "#ffffff"],
-  ["--color-bg-tertiary", "#f3f4f6"],
-  ["--color-text-primary", "#1f2937"],
-  ["--color-text-secondary", "#4b5563"],
-  ["--color-text-muted", "#6b7280"],
-  ["--color-border", "#e5e7eb"],
-  ["--color-border-light", "#d1d5db"],
-  ["--color-input-bg", "#ffffff"],
-  ["--color-input-border", "#d1d5db"],
-  ["--color-input-text", "#1f2937"],
+  ["--color-settings-bg", "var(--el-bg)"],
+  ["--color-settings-card", "var(--el-surface-raised)"],
+  ["--color-bg-tertiary", "var(--el-inset)"],
+  ["--color-text-primary", "var(--el-text)"],
+  ["--color-text-secondary", "var(--el-muted)"],
+  ["--color-text-muted", "var(--el-soft)"],
+  ["--color-border", "var(--el-hairline)"],
+  ["--color-border-light", "var(--el-hairline-strong)"],
+  ["--color-input-bg", "var(--el-inset)"],
+  ["--color-input-border", "var(--el-hairline)"],
+  ["--color-input-text", "var(--el-text)"],
+  ["--color-success", "var(--el-ok)"],
+  ["--color-error", "var(--el-danger)"],
 ])) {
   assertToken(systemSettingsStyle, "capsules/system/browser/style.css", token, value);
 }
+assert(
+  system.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    system.includes('<script src="./elastos-theme.js"></script>') &&
+    system.includes('<script src="./elastos-accent-picker.js"></script>'),
+  "System must load the shared token sheet, theme runtime, and accent picker",
+);
+assert(
+  systemJs.includes('"/api/apps/system/summary"') &&
+    systemJs.includes('"/api/apps/system/appearance/preferences"') &&
+    systemJs.includes("createHomeClipboardClient") &&
+    systemJs.includes('targetId: "system"') &&
+    systemJs.includes('purpose: "identity.did"') &&
+    !systemJs.includes('"home:ui-preference"') &&
+    !systemJs.includes("localStorage") &&
+    !systemJs.includes("sessionStorage") &&
+    !systemJs.includes("navigator.clipboard") &&
+    !systemJs.includes("execCommand") &&
+    !systemJs.includes("account-picture") &&
+    !systemJs.includes("avatar") &&
+    !system.includes("account-picture") &&
+    !system.includes("avatar"),
+  "System appearance and DID copy must stay Runtime-owned and avoid browser storage, Home write fallbacks, or avatar surfaces",
+);
 
 const libraryStyle = read("capsules/library/browser/library.css");
 for (const [token, value] of new Map([
-  ["--bg", "#f6f7f9"],
-  ["--sidebar-bg", "#f0f1f4"],
-  ["--panel", "#ffffff"],
-  ["--panel-soft", "#f3f4f6"],
-  ["--line", "rgba(60, 60, 67, 0.14)"],
-  ["--ink", "#1d1d1f"],
-  ["--muted", "#6b6b6b"],
-  ["--brand", "#f6921a"],
-  ["--accent", "#007aff"],
+  ["--bg", "var(--el-bg)"],
+  ["--panel", "var(--el-surface-raised)"],
+  ["--panel-soft", "var(--el-inset)"],
+  ["--line", "var(--el-hairline)"],
+  ["--ink", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "var(--el-accent)"],
 ])) {
   assertToken(libraryStyle, "capsules/library/browser/library.css", token, value);
 }
@@ -874,9 +1080,13 @@ assert(
   "Each independent Home document should define hover orange once as --brand-strong",
 );
 assert(
-  shellHostStyle.includes("min-height: 100dvh;") &&
-    homeGuiStyle.includes("font-family: \"Inter\", \"Segoe UI\", \"SF Pro Text\", sans-serif;"),
+  shellHostStyle.includes("min-height: 100dvh;"),
   "Home must use dynamic viewport height for mobile browsers",
+);
+assert(
+  homeGuiStyle.includes("font-family: var(--el-font);") &&
+    !/font-family:\s*"Inter"/.test(homeGuiStyle),
+  "Home GUI must take its type from the shared token sheet rather than repeating a font stack",
 );
 assert(
   shellStyle.includes("env(safe-area-inset-top"),
@@ -916,7 +1126,32 @@ const homeGuiTemplateHtml = read("capsules/home-gui/browser/home-gui-template.ht
 const homeGuiJs = read("capsules/home-gui/browser/home-gui.js");
 const homeGuiCore = read("capsules/home-gui/browser/shell-core.js");
 const shellSurface = read("capsules/home-gui/browser/shell-surface.js");
+const shellMenubar = read("capsules/home-gui/browser/shell-menubar.js");
+const shellSpotlight = read("capsules/home-gui/browser/shell-spotlight.js");
+const shellStages = read("capsules/home-gui/browser/shell-stages.js");
+const shellExpose = read("capsules/home-gui/browser/shell-expose.js");
+const shellKeyboard = read("capsules/home-gui/browser/shell-keyboard.js");
+const shellQuickLook = read("capsules/home-gui/browser/shell-quicklook.js");
 const shellJs = read("capsules/home/browser/home-shell-host.js");
+const contactStore = read("elastos/crates/elastos-server/src/collaboration_contact_store.rs");
+const profileUpdates = read(
+  "elastos/crates/elastos-server/src/collaboration_profile_updates.rs",
+);
+const notificationsStore = read("elastos/crates/elastos-server/src/notifications.rs");
+const collaborationDelivery = read(
+  "elastos/crates/elastos-server/src/collaboration_delivery.rs",
+);
+const collaborationProtocol = read(
+  "elastos/crates/elastos-server/src/collaboration_protocol.rs",
+);
+const discoveryRuntime = read(
+  "elastos/crates/elastos-server/src/collaboration_discovery_runtime.rs",
+);
+const systemCapsuleJs = read("capsules/system/browser/system.js");
+const profileAuthority = read(
+  "elastos/crates/elastos-server/src/collaboration_profile_authority.rs",
+);
+const directMessages = read("elastos/crates/elastos-server/src/collaboration_direct_messages.rs");
 const homeBrowserContext = read("capsules/home/browser/home-browser-context.js");
 const homeClipboardHost = read(
   "capsules/home/browser/home-clipboard-host.js",
@@ -960,10 +1195,8 @@ const peopleCapsuleManifest = JSON.parse(read("capsules/people/capsule.json"));
 const systemCapsuleManifest = JSON.parse(read("capsules/system/capsule.json"));
 const appSurfaceCapsuleManifests = Object.fromEntries(
   [
-    "agent",
     "archive-manager",
     "browser",
-    "chat",
     "chat-room",
     "documents",
     "gba-emulator",
@@ -984,7 +1217,6 @@ const appSurfaceCapsuleManifests = Object.fromEntries(
 );
 const providerCapsuleManifests = Object.fromEntries(
   [
-    "ai-provider",
     "availability-provider",
     "browser-engine-adapter",
     "chain-provider",
@@ -995,7 +1227,7 @@ const providerCapsuleManifests = Object.fromEntries(
     "exit-provider",
     "ipfs-provider",
     "key-provider",
-    "llama-provider",
+    "model-provider",
     "net-provider",
     "object-provider",
     "operator-drive-adapter",
@@ -1009,6 +1241,14 @@ const firstPartyCapsuleManifests = {
   ...appSurfaceCapsuleManifests,
   ...providerCapsuleManifests,
 };
+assert(
+  !fileExists("capsules/ai-provider/capsule.json"),
+  "legacy ai-provider manifest must be absent",
+);
+assert(
+  !fileExists("capsules/llama-provider/capsule.json"),
+  "legacy llama-provider manifest must be absent",
+);
 const coreCapsuleManifests = {
   home: homeCapsuleManifest,
   "home-gui": homeGuiCapsuleManifest,
@@ -1105,6 +1345,8 @@ const peopleCapsule = read("capsules/people/capsule.json");
 const peopleIndex = read("capsules/people/browser/index.html");
 const peopleScript = read("capsules/people/browser/people.js");
 const peopleStyle = read("capsules/people/browser/style.css");
+const peopleDiscoverySmoke = read("scripts/people-discovery-smoke.mjs");
+const debugGuide = read("DEBUG.md");
 const servicesIndex = read("capsules/services/browser/index.html");
 const servicesScript = read("capsules/services/browser/services.js");
 const servicesStyle = read("capsules/services/browser/style.css");
@@ -1125,7 +1367,7 @@ const homeCliTerminal = read("capsules/home-cli/src/terminal.rs");
 const homeCliText = read("capsules/home-cli/src/text.rs");
 const homeCliTests = read("capsules/home-cli/src/tests.rs");
 const homeCli = [homeCliMain, homeCliTerminal, homeCliText, homeCliTests].join("\n");
-const chatCarrier = read("capsules/chat/src/carrier.rs");
+const carrier = read("elastos/crates/elastos-server/src/carrier.rs");
 const carrierService = read("elastos/crates/elastos-server/src/carrier_service.rs");
 const localhostProvider = read("elastos/capsules/localhost-provider/src/main.rs");
 const operatorControl = read(
@@ -1141,6 +1383,8 @@ const chatRoomIndex = read("capsules/chat-room/browser/index.html");
 const roomService = read("elastos/crates/elastos-server/src/room_service.rs");
 const gatewayApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway.rs",
+  "elastos/crates/elastos-server/src/api/gateway_collaboration_presence.rs",
+  "elastos/crates/elastos-server/src/api/browser_sessions.rs",
   "elastos/crates/elastos-server/src/api/gateway_home_runtime.rs",
   "elastos/crates/elastos-server/src/api/gateway_esp.rs",
   "elastos/crates/elastos-server/src/api/gateway_home_system.rs",
@@ -1280,7 +1524,7 @@ const notifications = read(
   "elastos/crates/elastos-server/src/notifications.rs",
 );
 const carrierBridge = read(
-  "elastos/crates/elastos-server/src/carrier_bridge.rs",
+  "elastos/crates/elastos-server/src/resource_bridge.rs",
 );
 const carrierRuntime = read("elastos/crates/elastos-server/src/carrier.rs");
 const runtimeCore = read("elastos/crates/elastos-server/src/runtime.rs");
@@ -1564,25 +1808,33 @@ assert(
     agentsContract.includes("## Public Live Deployment") &&
     agentsContract.includes("## Staging Machines") &&
     agentsContract.includes("## Browser Claim Discipline") &&
-    agentsContract.includes("`main` is the stable release line; it currently represents 0.5.0") &&
-    agentsContract.includes("`upstream/0.6-dev` is the current 0.6 development integration line") &&
+    agentsContract.includes("`main` is the stable source line") &&
+    agentsContract.includes("`upstream/<version>-dev` branches are development integration lines") &&
+    includesNormalized(agentsContract, "the active line from `state.md` and fetched refs") &&
     agentsContract.includes("Do not assume a `review/*` or `live` ref exists") &&
     agentsContract.includes("reporting its exact branch, commit, tree id, dirty status") &&
     agentsContract.includes("Target proof must cite the exact source tree") &&
     agentsContract.includes("explicit user approval before the mutation") &&
     agentsContract.includes("WebRTC remote display"),
-  "Root AGENTS.md must preserve the operator contract headings, actual branch roles, target proof discipline, public-live approval rule, and Browser claim discipline",
+  "Root AGENTS.md must preserve standing branch roles, fetched-base selection, target proof, public-live approval and Browser claim discipline",
 );
 assert(
-  linuxSourceHomeRestart.includes("process_matches_gateway_listener") &&
-    linuxSourceHomeRestart.includes("refusing to kill unrelated listener") &&
-    linuxSourceHomeRestart.includes("http_status") &&
-    linuxSourceHomeRestart.includes("OK=0") &&
-    linuxSourceHomeRestart.includes("Linux source-home restart verification failed") &&
-    linuxSourceHomeRestartSmoke.includes("live_failure_receipt") &&
-    linuxSourceHomeRestartSmoke.includes("hash_mismatch_receipt") &&
-    linuxSourceHomeRestartSmoke.includes("unrelated_listener_protected"),
-  "Linux source-home restart must preserve safe listener ownership checks and ok=false failure receipts",
+  linuxSourceHomeRestart.includes('gateway = data_dir / "bin" / "elastos"') &&
+    linuxSourceHomeRestart.includes("elastos.source-home.installation-receipt/v1") &&
+    linuxSourceHomeRestart.includes("elastos.linux-source-home-gateway-pid/v1") &&
+    linuxSourceHomeRestart.includes('pathlib.Path("/proc")') &&
+    linuxSourceHomeRestart.includes("pidfd_send_signal") &&
+    linuxSourceHomeRestart.includes("listener_pids") &&
+    linuxSourceHomeRestart.includes("principal_root_rollback") &&
+    !linuxSourceHomeRestart.includes("pkill") &&
+    !linuxSourceHomeRestart.includes("--gateway-bin") &&
+    !linuxSourceHomeRestart.includes("--pid-file") &&
+    !linuxSourceHomeRestart.includes("target/release/elastos") &&
+    linuxSourceHomeRestartSmoke.includes("stable_installation_receipt") &&
+    linuxSourceHomeRestartSmoke.includes("source_dirt_rejected") &&
+    linuxSourceHomeRestartSmoke.includes("rollback_and_failure_cleanup") &&
+    linuxSourceHomeRestartSmoke.includes("home_services_parity"),
+  "Linux source-home restart must use the stable receipt-bound Runtime, exact Linux process ownership, and one bounded rollback",
 );
 const debugPolicy = read("DEBUG.md");
 const gbaDemoSmoke = read("scripts/gba-demo-smoke.sh");
@@ -1592,25 +1844,28 @@ const gbaOpaqueBrowserProof = read("scripts/fixtures/gba-opaque-frame-browser-pr
 const gbaOpaqueBrowserInput = read("scripts/fixtures/gba-opaque-frame-browser-proof/cdp-input.mjs");
 const gbaOpaqueBrowserServer = read("scripts/fixtures/gba-opaque-frame-browser-proof/server.py");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
-const homeAssetVersion = "home-20260725a";
+const homeAssetVersion = "home-20260805a";
 const homeClipboardAssetVersion = "home-20260726a";
-const homeGuiAssetVersion = "home-20260731b";
-const homeShellHostAssetVersion = "home-20260731b";
+const homeGuiAssetVersion = "home-20260813a";
+const homeShellHostAssetVersion = "home-20260802a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
   ["home-shell-no-hint-boot-smoke.mjs", homeShellNoHintBootSmoke],
   ["home-shell-recovery-smoke.mjs", homeShellRecoverySmoke],
-  ["home-shell-regression-smoke.mjs", homeShellRegressionSmoke],
   ["home-shell-stale-hint-boot-smoke.mjs", homeShellStaleHintBootSmoke],
   ["home-shell-switchback-recovery-smoke.mjs", homeShellSwitchbackRecoverySmoke],
   ["home-shell-system-switch-smoke.mjs", homeShellSystemSwitchSmoke],
 ]) {
   assert(
-    source.includes(`const moduleVersion = "${homeAssetVersion}";`),
+    source.includes(`const moduleVersion = "${homeShellHostAssetVersion}";`),
     `${file} must load the same Home module graph as the production shell`,
   );
 }
+assert(
+  homeShellRegressionSmoke.includes(`const moduleVersion = "${homeGuiAssetVersion}";`),
+  "home-shell-regression-smoke.mjs must load the same Home GUI module graph as production",
+);
 assertUsersSelfReferencesAreApproved();
 assert(
   homeGuiTemplateHtml.includes('role="listbox"'),
@@ -1629,16 +1884,175 @@ assert(
   "Home readiness state must not preserve shell naming",
 );
 assert(
-  homeGuiTemplateHtml.includes('data-action="minimize"'),
-  "Window minimize action must remain explicit",
+  /<div class="window-head">\s*<div class="window-traffic-lights">\s*<button class="window-action-btn" data-action="close"[\s\S]*?<button class="window-action-btn" data-action="minimize"[\s\S]*?<button class="window-action-btn" data-action="maximize"[\s\S]*?<\/div>\s*<div class="window-head-draggable">[\s\S]*?<\/div>\s*<div class="window-head-balance" aria-hidden="true"><\/div>\s*<\/div>/.test(
+    homeGuiTemplateHtml,
+  ),
+  "Home window template must keep one traffic-light group in close/minimize/maximize order before the draggable title and balance shim",
 );
 assert(
-  homeGuiTemplateHtml.includes('data-action="maximize"'),
-  "Window maximize action must remain explicit",
+  (homeGuiTemplateHtml.match(/id="launcher"/g) || []).length === 1 &&
+    (() => {
+      const taskbarOpenIndex = homeGuiTemplateHtml.indexOf('<footer class="taskbar"');
+      const launcherOpenIndex = homeGuiTemplateHtml.indexOf('<aside id="launcher"');
+      const launcherCloseIndex = homeGuiTemplateHtml.indexOf("</aside>", launcherOpenIndex);
+      const taskbarPrimaryIndex = homeGuiTemplateHtml.indexOf('<div class="taskbar-primary">', launcherCloseIndex);
+      const taskbarCloseIndex = homeGuiTemplateHtml.indexOf("</footer>", taskbarPrimaryIndex);
+      const launcherMarkup =
+        launcherOpenIndex >= 0 && launcherCloseIndex > launcherOpenIndex
+          ? homeGuiTemplateHtml.slice(launcherOpenIndex, launcherCloseIndex)
+          : "";
+      return taskbarOpenIndex >= 0 &&
+        launcherOpenIndex > taskbarOpenIndex &&
+        launcherCloseIndex > launcherOpenIndex &&
+        taskbarPrimaryIndex > launcherCloseIndex &&
+        taskbarCloseIndex > taskbarPrimaryIndex &&
+        launcherMarkup.includes('class="launcher-popover" role="dialog" aria-label="Home launcher"') &&
+        !launcherMarkup.includes('aria-modal="true"') &&
+        !launcherMarkup.includes('id="close-launcher"') &&
+        !launcherMarkup.includes('placeholder="Search Home"');
+    })() &&
+    fileExists("capsules/home-gui/browser/icons/apps-launcher/dark-dock/icon-64.png") &&
+    fileExists("capsules/home-gui/browser/icons/apps-launcher/light-dock/icon-64.png") &&
+    fileExists("capsules/home-gui/browser/icons/apps-launcher/icon-64.png"),
+  "Home launcher must keep exactly one Shelf-nested non-modal launcher surface with its raster icon set",
 );
 assert(
-  homeGuiTemplateHtml.includes('data-action="close"'),
-  "Window close action must remain explicit",
+  shellSurface.includes('taskbar?.classList.toggle("is-launcher-face", isVisible);') &&
+    shellSurface.includes('launcherToggleButton.setAttribute("aria-expanded", isVisible ? "true" : "false");') &&
+    shellSurface.includes('trapTabWithin(launcher.querySelector(".launcher-popover"), event);') &&
+    !shellSurface.includes("pendingRunningDockIds") &&
+    !shellSurface.includes("dockFlyRevealTargetId") &&
+    !shellSurface.includes("shelfMorphApi") &&
+    !shellSurface.includes("flyLauncherCardToDock") &&
+    !shellSurface.includes("is-receiving-fly"),
+  "Home launcher must use one simple Shelf-face state and keep the existing keyboard trap without donor morph choreography",
+);
+assert(
+  homeGuiStyle.includes("body.dock-autohide .taskbar.is-launcher-face,") &&
+    homeGuiStyle.includes(".taskbar.is-launcher-face .launcher {") &&
+    homeGuiStyle.includes(".taskbar .launcher[hidden] {") &&
+    homeGuiStyle.includes(".launcher {\n  position: static;") &&
+    !homeGuiStyle.includes(".launcher {\n  position: fixed;") &&
+    homeGuiStyle.includes("@media (prefers-reduced-motion: reduce) {\n  .launcher,") &&
+    homeGuiStyle.includes(".taskbar.is-launcher-face {\n    width: calc(100vw - 20px);") &&
+    homeGuiStyle.includes(".launcher-popover {\n    height: min(48vh, 380px);") &&
+    homeGuiStyle.includes(".taskbar.is-launcher-face .launcher {\n    max-height: min(48vh, 380px);") &&
+    !homeGuiStyle.includes("launcher-fly-icon") &&
+    !homeGuiStyle.includes("data-launcher-morphing"),
+  "Home launcher styles must keep one material Shelf face, narrow bounds, reduced motion, and matched narrow launcher heights",
+);
+assert(
+  /people:\s*WINDOW_CHROME_UNIFIED_SIDEBAR/.test(homeGuiCore) &&
+    /inbox:\s*WINDOW_CHROME_UNIFIED_SIDEBAR/.test(homeGuiCore) &&
+    /chat:\s*WINDOW_CHROME_UNIFIED_SIDEBAR/.test(homeGuiCore) &&
+    /"chat-room":\s*WINDOW_CHROME_UNIFIED_SIDEBAR/.test(homeGuiCore) &&
+    homeGuiCore.includes("browser: WINDOW_CHROME_UNIFIED_TOOLBAR"),
+  "People, Chat, and Inbox must keep the canonical unified-sidebar Home chrome while Browser keeps its toolbar chrome",
+);
+assert(
+  peopleStyle.includes("padding: var(--window-chrome-safe-top, 52px) 12px 16px;") &&
+    !chatRoomStyle.includes("window-chrome-safe-top") &&
+    !inboxStyle.includes("window-chrome-safe-top"),
+  "People must reserve the Home safe-top inset in unified-sidebar mode while Chat and Inbox keep capsule-local top padding only",
+);
+assert(
+  !/window-action-btn|window-traffic-lights|data-action="(?:minimize|maximize|close)"/.test(
+    [peopleStyle, chatRoomStyle, inboxStyle].join("\n"),
+  ),
+  "People, Chat, and Inbox capsules must not define duplicate outer window chrome",
+);
+assert(
+  !/fetch\(/.test(shellQuickLook) &&
+    shellQuickLook.includes("Deliberately NO byte-level preview") &&
+    shellQuickLook.includes('import { openFileObject } from "./shell-surface.js') &&
+    !/fetch\(/.test(shellKeyboard),
+  "Quick Look previews glyph and metadata only — object bytes stay behind viewer authority, and Open routes through the guarded path",
+);
+assert(
+  shellKeyboard.includes("function homeGuiOwnsKeys()") &&
+    shellKeyboard.includes("shellState.homeGuiMounted === true") &&
+    homeGuiJs.includes("retireKeyboardSurfaces();"),
+  "The keyboard layer sleeps while an alternate root shell owns the surface, and its overlays retire on shell switch",
+);
+assert(
+  !homeGuiJs.includes('event.code === "Space"') &&
+    shellKeyboard.includes("toggleSpotlight();"),
+  "Shell chords live in the keyboard layer alone — a second binding in home-gui.js would toggle surfaces straight back closed",
+);
+assert(
+  (homeGuiTemplateHtml.match(/id="wallet-rail"/g) || []).length === 1 &&
+    (homeGuiTemplateHtml.match(/id="wallet-rail-frame"/g) || []).length === 1 &&
+    (homeGuiTemplateHtml.match(/id="inbox-rail"/g) || []).length === 1 &&
+    (homeGuiTemplateHtml.match(/id="inbox-rail-frame"/g) || []).length === 1 &&
+    homeGuiTemplateHtml.includes('aria-controls="wallet-rail"') &&
+    homeGuiTemplateHtml.includes('aria-controls="inbox-rail"'),
+  "Home GUI toolbar and notifications must point at real Wallet and Inbox rails, not missing template surfaces",
+);
+assert(
+  homeGuiTemplateHtml.includes('id="wallet-rail"') ||
+    !/shortcuts-row"><dt>Wallet<\/dt>/.test(homeGuiTemplateHtml),
+  "The shortcuts overlay documents only surfaces that exist: no Wallet row until the wallet rail lands",
+);
+assert(
+  !/agent|harness/i.test(shellStages) &&
+    !/agent|harness/i.test(shellExpose) &&
+    !shellWindows.includes("AgentWorkspace") &&
+    !homeGuiTemplateHtml.includes("agent"),
+  "Stages and Mission Control migrate without the agent harness: no Agent Space, no shelf morph, no workspace snapshot hook",
+);
+assert(
+  !/fetch\(/.test(shellStages) &&
+    !/fetch\(/.test(shellExpose) &&
+    shellStages.includes("UI ≠ authority: Space switches never mint Capsule/Carrier grants."),
+  "Stages and Mission Control are presentation only: no server calls, and a Space switch mints no authority",
+);
+assert(
+  shellWindows.includes("toggleFullscreenStage(id);") &&
+    shellWindows.includes(`export function minimizeWindow(id) {
+  const entry = shellState.windows.get(id);
+  // Same rule as the yellow control — never leave a hidden fullscreen Space ghost.
+  if (entry?.fullscreenStage) {
+    exitFullscreenStage(id);
+    return;
+  }
+  hideWindow(id);
+}`) &&
+    shellWindows.includes("minimizeWindow(id);"),
+  "The green button enters a fullscreen Space and minimize exits one — never a hidden Space ghost",
+);
+assert(
+  shellWindows.includes("active_stage: stableSpaceKeyForId(getActiveStageId())") &&
+    shellWindows.includes("function resolveStableSpaceKey(key, restoredEntries)") &&
+    shellWindows.includes("restoreExtraDesktops(storedSession?.desktops)") &&
+    shellWindows.includes("fs:${entry.targetId}:${inst}"),
+  "The session persists the Space ring under stable keys and restores the Space the user was on, not whichever window was focused",
+);
+assert(
+  shellSpotlight.includes('import { openFileObject } from "./shell-surface.js') &&
+    !shellSpotlight.includes("desktopObjectViewer") &&
+    !/fetch\(/.test(shellSpotlight),
+  "Spotlight must search what the shell already holds and open objects through the capability-guarded path, never resolve a viewer or sweep the server itself",
+);
+assert(
+  shellMenubar.includes("textContent") &&
+    !shellMenubar.includes("innerHTML") &&
+    shellMenubar.includes("const MAX_MENUS = 6;") &&
+    shellMenubar.includes("const MAX_ITEMS = 20;") &&
+    shellMenubar.includes("const MAX_LABEL = 48;") &&
+    shellMenubar.includes("const CMD_PATTERN = /^[a-z0-9:._-]{1,64}$/i;"),
+  "App menu manifests are data, not markup: labels render as text and titles, items, length and command shape stay capped",
+);
+assert(
+  shellJs.includes('data.type === "home:menu-manifest"') &&
+    shellJs.includes('console.warn("home ignored unauthorized menu-manifest message"') &&
+    shellJs.includes("homeToken: context.homeToken,") &&
+    !shellJs.includes("windowId: data.windowId"),
+  "Home must bind a menu manifest to the sending app frame's own launch token and never take a window id from the sender",
+);
+assert(
+  homeGuiShell.includes('hasExactKeys(message, ["type", "command", "homeToken", "menus"])') &&
+    homeGuiJs.includes("function setHomeGuiMenuManifest(homeToken, menus)"),
+  "Home GUI must resolve a menu manifest through the sender's token against its own windows",
 );
 assert(
   shellIndex.includes('rel="manifest"'),
@@ -1653,8 +2067,13 @@ assert(
   "Home PWA metadata must include mobile-web-app-capable",
 );
 assert(
-  homeGuiTemplateHtml.includes('id="toolbar-fullscreen"'),
-  "Home must expose a fullscreen control in the top toolbar",
+  homeGuiTemplateHtml.includes('id="toolbar-system"') &&
+    homeGuiTemplateHtml.includes('id="toolbar-active-title"') &&
+    homeGuiTemplateHtml.includes('id="toolbar-menubar"') &&
+    homeGuiTemplateHtml.includes('id="toolbar-control-centre"') &&
+    homeGuiTemplateHtml.includes('id="control-centre-fullscreen"') &&
+    !homeGuiTemplateHtml.includes('id="toolbar-fullscreen"'),
+  "Home must expose fullscreen through the canonical system bar and control centre, not the obsolete naked toolbar button",
 );
 assert(
   shellManifest.name === "ElastOS Home",
@@ -1881,7 +2300,7 @@ assert(
 );
 assert(
   !shellIndex.includes(`/apps/home-gui/style.css?v=${homeAssetVersion}`) &&
-    homeGuiIndex.includes(`./style.css?v=${homeAssetVersion}`) &&
+    homeGuiIndex.includes(`./style.css?v=${homeGuiAssetVersion}`) &&
     homeGuiIndex.includes(`./home-gui-shell.js?v=${homeGuiAssetVersion}`) &&
     homeGuiShell.includes(`./home-gui.js?v=${homeGuiAssetVersion}`),
   "Home GUI must own its document, stylesheet, and entry module on its isolated capsule origin",
@@ -1894,8 +2313,20 @@ assert(
   "Home must launch Home GUI as an isolated shell document instead of importing GUI code into its trusted DOM",
 );
 assert(
-  shellJs.includes(`shell-core.js?v=${homeAssetVersion}`),
+  shellJs.includes(`shell-core.js?v=${homeShellHostAssetVersion}`) &&
+    shellJs.includes(`shell-auth.js?v=${homeShellHostAssetVersion}`) &&
+    shellJs.includes(`home-wallet-connector-host.js?v=${homeShellHostAssetVersion}`) &&
+    shellAuthJs.includes(`shell-core.js?v=${homeShellHostAssetVersion}`) &&
+    homeWalletConnectorHost.includes(`shell-core.js?v=${homeShellHostAssetVersion}`),
   "Home home-shell-host.js must import the current shell-core module instance",
+);
+assert(
+  shellJs.includes('fetchJson("/api/apps/home/collaboration/presence"') &&
+    shellJs.includes("homeSummaryHasProofBoundSession") &&
+    shellJs.includes("stopHomePresenceHeartbeat") &&
+    shellJs.includes("isHomeAuthError(error)") &&
+    shellCore.includes('url === "/api/apps/home/collaboration/presence"'),
+  "trusted Home presence must remain proof-bound, singular, and fail closed on authorization errors",
 );
 assert(
   shellJs.includes(`home-browser-context.js?v=${homeAssetVersion}`),
@@ -1916,13 +2347,13 @@ assert(
   "Home home-shell-host.js must not statically import the GUI window manager",
 );
 assert(
-  homeGuiJs.includes(`./shell-core.js?v=${homeAssetVersion}`) &&
+  homeGuiJs.includes(`./shell-core.js?v=${homeGuiAssetVersion}`) &&
     homeGuiJs.includes(`./shell-surface.js?v=${homeGuiAssetVersion}`) &&
     homeGuiJs.includes(`./shell-windows.js?v=${homeGuiAssetVersion}`),
   "Home home-gui facade must import the current GUI surface/window module instances",
 );
 assert(
-  shellSurface.includes(`./shell-core.js?v=${homeAssetVersion}`),
+  shellSurface.includes(`./shell-core.js?v=${homeGuiAssetVersion}`),
   "Home shell-surface must import the home-gui-owned shell-core module instance",
 );
 assert(
@@ -1997,6 +2428,8 @@ assert(
     homeClipboardProtocol.includes('"browser.text"') &&
     homeClipboardProtocol.includes('"wallet.address"') &&
     homeClipboardProtocol.includes('"wallet.recovery-key"') &&
+    homeClipboardProtocol.includes("assistant: Object.freeze({") &&
+    homeClipboardProtocol.includes('"transcript.markdown"') &&
     homeClipboardProtocol.includes('"resource.identifier"') &&
     homeClipboardProtocol.includes('"resource.uri"') &&
     homeClipboardProtocol.includes(
@@ -2220,37 +2653,70 @@ assert(
     peopleIndex.includes("Open People from Home.") &&
     peopleIndex.includes('id="profile-form"') &&
     peopleIndex.includes('id="discovery"') &&
+    peopleIndex.includes("people-20260805a") &&
     peopleScript.includes("/api/apps/people/summary") &&
-    peopleScript.includes("/api/apps/people/profile-card") &&
+    peopleScript.includes("/api/apps/people/profile") &&
     peopleScript.includes("/api/apps/people/discovery") &&
     peopleScript.includes("/api/apps/people/discovery/refresh") &&
     peopleScript.includes("/api/apps/people/discovery/requests") &&
     peopleScript.includes("/api/apps/people/contacts/remove") &&
+    peopleScript.includes("Refresh requested.") &&
+    !peopleScript.includes("DISCOVERY_REFRESH_") &&
+    !peopleScript.includes("discoveryRefreshInFlight") &&
+    !peopleScript.includes("startDiscoveryRefresh") &&
+    !peopleScript.includes("stopDiscoveryRefresh") &&
+    !peopleScript.includes("refreshDiscovery") &&
+    !peopleScript.includes("next_refresh_after_ms") &&
+    peopleScript.includes("function publicError") &&
+    !peopleScript.includes("/api/apps/people/presence") &&
+    !peopleScript.includes("connect_ticket") &&
+    !peopleScript.includes("peer_id") &&
+    !peopleScript.includes("topic") &&
     peopleScript.includes('type: "home:open-target"') &&
-    peopleScript.includes('target !== "chat-room"') &&
+    peopleScript.includes('target: "chat-room"') &&
+    peopleScript.includes("conversation_id: selector") &&
+    !peopleScript.includes("data-contact-route") &&
+    peopleScript.includes('const KNOWN_RELATIONSHIPS = new Map([') &&
+    !peopleScript.includes('readText(contact?.relationship) || "connected"') &&
+    peopleScript.includes("Unknown state") &&
     peopleStyle.includes(".people-shell") &&
     peopleStyle.includes(".people-sidebar") &&
-    peopleStyle.includes(".discovery-grid") &&
+    peopleStyle.includes(".people-sidebar-icon-discovery") &&
+    peopleStyle.includes(".discovery-header") &&
+    !peopleStyle.includes(".online-badge") &&
+    peopleDiscoverySmoke.includes("people-discovery-smoke: PASS") &&
+    peopleCapsule.includes('"id": "presence.read"') &&
     !shellWindows.includes("renderPeopleWindowBody") &&
     !shellWindows.includes("/api/apps/people/") &&
     !shellStyle.includes(".home-people-") &&
     shellWindows.includes('"people",') &&
-    shellJs.includes('people: new Set(["chat-room"])') &&
+    shellJs.includes('people: new Set(["chat-room", "system"])') &&
     homeCmd.includes("issue_capsule_launch_token(&data_dir, PEOPLE_CAPSULE_NAME)"),
   "People must be a standalone app capsule while Home remains only its launch and message host",
+);
+assert(
+  debugGuide.includes("## People Discovery And Presence Invariant") &&
+    debugGuide.includes("People Discovery is explicit and opt-in.") &&
+    debugGuide.includes("The seed/relay may help") &&
+    debugGuide.includes("Signed presence is separate.") &&
+    debugGuide.includes("accepted contacts and active group participants") &&
+    debugGuide.includes("contact, admission, or authorization"),
+  "DEBUG.md must describe opt-in signed Discovery separately from signed presence annotations",
 );
 
 assert(
   servicesCapsule.includes('"name": "services"') &&
     servicesCapsule.includes('"role": "app"') &&
     servicesIndex.includes("Services · ElastOS") &&
+    servicesIndex.includes('./elastos-theme.js') &&
+    servicesIndex.includes('./elastos-ui.css') &&
     servicesIndex.includes("This device") &&
     servicesIndex.includes("From People") &&
     servicesIndex.includes("Shared from this device") &&
     servicesIndex.includes("Available from People") &&
     servicesIndex.includes("mine-services") &&
     servicesIndex.includes("other-services") &&
-    servicesIndex.includes("services-20260626a") &&
+    servicesIndex.includes("services-20260819a") &&
     servicesIndex.includes("services-20260711i") &&
     servicesScript.includes("/api/apps/services/summary") &&
     servicesScript.includes("/api/apps/services/offers") &&
@@ -2283,6 +2749,11 @@ assert(
     servicesStyle.includes(".services-toolbar") &&
     servicesStyle.includes(".service-confirm") &&
     servicesStyle.includes(".pc2-btn-danger") &&
+    (servicesStyle.match(/letter-spacing:\s*[^;]+;/g) || []).length === 4 &&
+    (servicesStyle.match(/letter-spacing:\s*[^;]+;/g) || []).every(
+      (declaration) => declaration === "letter-spacing: 0;",
+    ) &&
+    !servicesStyle.includes("Narrow stopgap") &&
     !servicesIndex.includes("settings-sidebar-title") &&
     !servicesStyle.includes(".settings-sidebar-title") &&
     !servicesStyle.includes(".service-filter-banner") &&
@@ -2324,7 +2795,9 @@ assert(
     ) &&
     gatewayHomeSystemTests.includes('approved_offer["status"], "active"') &&
     gatewayHomeSystemTests.includes("fake-ticket-services-right") &&
-    gatewayHomeSystemTests.includes("offer[\"grant_required\"] == true") &&
+    gatewayHomeSystemTests.includes(
+      'assert_eq!(approved_offer["grant_required"], false)',
+    ) &&
     gatewayApi.includes("local:provider:browser-engine") &&
     gatewayApi.includes("local:provider:browser-exit") &&
     gatewayApi.includes("home_configured_remote_exit_offers") &&
@@ -2414,116 +2887,34 @@ assert(
 );
 assert(
   gatewayApi.includes('const PEOPLE_CAPSULE_ID: &str = "people"') &&
-    gatewayApi.includes('"/api/apps/people/summary"') &&
-    gatewayApi.includes('"/api/apps/people/discovery"') &&
-    gatewayApi.includes('"/api/apps/people/profile-card"') &&
-    gatewayApi.includes('"/api/apps/people/discovery/refresh"') &&
-    gatewayApi.includes('"/api/apps/people/discovery/requests"') &&
-    gatewayApi.includes('"/api/apps/people/discovery/requests/:request_id/accept"') &&
-    gatewayApi.includes('"/api/apps/people/discovery/requests/:request_id/join"') &&
-    gatewayApi.includes("HOME_PEOPLE_DISCOVERY_SCHEMA") &&
-    gatewayApi.includes("HOME_PEOPLE_CONTACTS_SCHEMA") &&
-    gatewayApi.includes("HOME_PEOPLE_DISCOVERY_TOPIC") &&
-    gatewayApi.includes("people_discovery_update") &&
-    gatewayApi.includes("people_profile_card_update") &&
-    gatewayApi.includes("update_profile_card_for_context") &&
-    gatewayApi.includes("people_discovery_refresh") &&
-    gatewayApi.includes("home_people_discovery_sync") &&
-    gatewayApi.includes("HOME_PEOPLE_DISCOVERY_PRESENCE_INTERVAL_SECS") &&
-    gatewayApi.includes("HOME_PEOPLE_DISCOVERY_BOOTSTRAP_INTERVAL_SECS") &&
-    gatewayApi.includes("home_people_discovery_annotate_refresh") &&
-    gatewayApi.includes("home_people_discovery_state_signature") &&
-    gatewayApi.includes("next_refresh_after_ms") &&
-    gatewayApi.includes("refresh_fingerprint") &&
-    gatewayApi.includes('"gossip_send"') &&
-    gatewayApi.includes('"gossip_recv"') &&
-    gatewayApi.includes("HOME_PEOPLE_DISCOVERY_ENABLED_SECS") &&
-    gatewayApi.includes("enabled_until: Option<u64>") &&
-    gatewayApi.includes("remaining_seconds: Option<u64>") &&
-    gatewayApi.includes("home_people_discovery_active") &&
-    gatewayApi.includes("home_people_discovery_apply_expiry") &&
+    gatewayApi.includes('\"/api/apps/people/summary\"') &&
+    gatewayApi.includes('\"/api/apps/people/profile\"') &&
+    gatewayApi.includes('\"/api/apps/people/contacts/remove\"') &&
+    gatewayApi.includes('\"/api/apps/people/presence\"') &&
+    gatewayApi.includes('\"/api/apps/people/discovery\"') &&
+    gatewayApi.includes('\"/api/apps/people/discovery/refresh\"') &&
+    gatewayApi.includes('\"/api/apps/people/discovery/requests\"') &&
+    !gatewayApi.includes('\"/api/apps/people/discovery/requests/:request_id/accept\"') &&
+    gatewayApi.includes("CollaborationPresenceProductPort") &&
+    !gatewayApi.includes("HOME_PEOPLE_CONTACTS_SCHEMA") &&
+    gatewayApi.includes("HOME_SERVICES_PEER_CONTACTS_SCHEMA") &&
+    !gatewayApi.includes("HOME_PEOPLE_DISCOVERY_TOPIC") &&
+    !gatewayApi.includes("people-discovery-peers.json") &&
+    gatewayApi.includes("HomePeopleDiscoverySummary") &&
     gatewayApi.includes("people_discovery_request_create") &&
-    gatewayApi.includes("people_discovery_request_accept") &&
-    gatewayApi.includes("people_discovery_request_join") &&
-    gatewayApi.includes("home_people_discovery_send_acceptance") &&
-    gatewayApi.includes("home_people_discovery_send_room_acceptance") &&
-    gatewayApi.includes("people discovery delivery failed") &&
-    gatewayApi.includes("home_people_upsert_contact") &&
-    gatewayApi.includes("clean_people_person_display_name") &&
-    gatewayApi.includes("home_people_discovery_request_visible") &&
-    gatewayApi.includes('matches!(request.status.as_str(), "incoming" | "requested")') &&
-    gatewayApi.includes('"connected".to_string()') &&
-    !gatewayApi.includes('"Carrier contact".to_string()') &&
-    !gatewayApi.includes("local Carrier runtime") &&
-    gatewayApi.includes('"Conversation provider".to_string()') &&
-    gatewayApi.includes('"Remote Exit".to_string()') &&
-    !gatewayApi.includes('"Carrier conversation".to_string()') &&
-    !gatewayApi.includes('"Carrier room service".to_string()') &&
-    gatewayApi.includes("apply_home_people_contacts_state") &&
-    gatewayApi.includes("home_people_discovery_sync_contacts") &&
-    gatewayApi.includes("merge_people_discovery_acceptance") &&
-    !sourceBlock(
-      gatewayApi,
-      "pub(super) async fn people_discovery_request_accept",
-      "People discovery accept handler",
-    ).includes("export_room_invite") &&
-    sourceBlock(
-      gatewayApi,
-      "pub(super) async fn people_discovery_request_create",
-      "People discovery request create handler",
-    ).includes('.context("people discovery delivery failed")?') &&
-    sourceBlock(
-      gatewayApi,
-      "pub(super) async fn people_discovery_request_accept",
-      "People discovery request accept handler",
-    ).includes('.context("people discovery delivery failed")?') &&
-    sourceBlock(
-      gatewayApi,
-      "pub(super) async fn people_discovery_request_join",
-      "People discovery request join handler",
-    ).includes('.context("people discovery delivery failed")?') &&
-    !sourceBlock(
-      gatewayApi,
-      "pub(super) async fn people_discovery_request_create",
-      "People discovery request create handler",
-    ).includes("let _ = home_people_discovery_send_request") &&
-    !sourceBlock(
-      gatewayApi,
-      "pub(super) async fn people_discovery_request_accept",
-      "People discovery request accept handler",
-    ).includes("let _ = home_people_discovery_send_acceptance") &&
-    !sourceBlock(
-      gatewayApi,
-      "pub(super) async fn people_discovery_request_join",
-      "People discovery request join handler",
-    ).includes("let _ = home_people_discovery_send_room_acceptance") &&
-    !gatewayApi.includes("home_people_discovery_send_invite") &&
-    gatewayApi.includes("struct HomePeopleDiscoverySummary") &&
-    gatewayApi.includes("discovery: HomePeopleDiscoverySummary") &&
-    gatewayHomeSystemTests.includes("test_people_discovery_toggle_persists_in_home_summary") &&
-    gatewayHomeSystemTests.includes(
-      "test_people_discovery_expired_visibility_reports_off_and_refresh_does_not_publish",
-    ) &&
-    gatewayHomeSystemTests.includes("test_people_discovery_refresh_finds_visible_peer") &&
-    gatewayHomeSystemTests.includes("test_people_profile_card_update_uses_people_launch_token") &&
+    !gatewayApi.includes("people_discovery_request_accept") &&
+    gatewayInboxApi.includes("contact-accept-request:") &&
+    gatewayInboxApi.includes("contact-decline-request:") &&
+    gatewayApi.includes("configured_people_discovery_summary") &&
+    gatewayHomeSystemTests.includes("test_people_profile_update_uses_people_launch_token") &&
     gatewayHomeSystemTests.includes("test_people_summary_requires_people_launch_token") &&
-    gatewayHomeSystemTests.includes("test_people_discovery_request_accept_contact_round_trip") &&
-    gatewayHomeSystemTests.includes(
-      "test_people_discovery_request_send_failure_does_not_save_requested_state",
-    ) &&
-    gatewayHomeSystemTests.includes(
-      "test_people_discovery_accept_send_failure_does_not_save_joined_state",
-    ) &&
-    gatewayHomeSystemTests.includes(
-      "test_people_discovery_join_send_failure_does_not_save_joined_state",
-    ) &&
-    gatewayApi.includes('"/api/apps/people/invites/create"') &&
-    gatewayApi.includes("people_invite_create") &&
-    gatewayApi.includes("ensure_local_principal_room_session") &&
-    gatewayApi.includes("export_room_join_invite") &&
+    gatewayHomeSystemTests.includes('payload["discovery"]["schema"]') &&
+    gatewayHomeSystemTests.includes('payload["discovery"].get("peer_id").is_none()') &&
+    !gatewayApi.includes('\"/api/apps/people/invites/create\"') &&
+    !gatewayApi.includes("people_invite_create") &&
     roomService.includes('invite_url: format!("elastos://peer/invite?token={token}")') &&
     roomService.includes("RoomRole::Member => matches!(invited_role, RoomRole::Member)"),
-  "People Discovery must create People entries while conversation invites remain a separate room policy route",
+  "People must expose opt-in discovery and signed-contact projection without reviving the old raw-peer discovery backend or the stale shared-room invite handoff",
 );
 const finishAttachmentUploadBlock = sourceBlock(
   roomService,
@@ -2543,30 +2934,342 @@ assert(
   "Room attachment upload finish must keep retry state until the attachment commit is proven",
 );
 assert(
-  gatewayApi.includes("CarrierClient::connect_endpoint_addr") &&
-    gatewayApi.includes("room transport trusted-source pull returned messages") &&
-    gatewayTests.includes("Chat Room summary must not expose raw trusted-source ticket authority") &&
-    gatewayTests.includes("Chat Room summary must not expose trusted-source connect_ticket fields") &&
-    read("docs/ARCHITECTURE.md").includes(
-      "Runtime-owned trusted-source Room bootstrap exception",
-    ) &&
-    read("docs/CARRIER.md").includes("raw trusted-source") &&
-    read("docs/CARRIER.md").includes("decoded endpoints") &&
-    read("docs/CARRIER.md").includes("direct Carrier socket authority"),
-  "Room trusted-source bootstrap must be classified as a Runtime-owned Carrier exception and must not expose raw ticket authority to capsules/UI",
+  gatewayApi.includes("collaboration_chat_product_port") &&
+    gatewayApi.includes("port.conversation_poll") &&
+    gatewayApi.includes("port.prepare_message") &&
+    gatewayApi.includes("port.project_prepared_message") &&
+    gatewayApi.includes("start_configured_chat_room_session") &&
+    gatewayApi.includes("configured_legacy_room_control_unsupported_response") &&
+    gatewayApi.includes("configured_collaboration_browser_session_unsupported_response") &&
+    chatRoomUi.includes("transport.configured") &&
+    chatRoomUi.includes("chat_control_policy") &&
+    !gatewayApi.includes(["RoomTransport", "Bridge"].join("")) &&
+    !carrier.includes(["CHAT_ROOM", "SYNC_TOPIC"].join("_")) &&
+    !carrier.includes(["room-sync", "-v1"].join("")) &&
+    gatewayTests.includes("retired Chat room-sync topic must be absent"),
+  "Configured Chat must use the Runtime collaboration product port without legacy room/browser authority or a Carrier room-sync bridge",
 );
 assert(
   gatewayApi.includes('"/api/apps/people/contacts/remove"') &&
     gatewayApi.includes("people_contact_remove") &&
-    gatewayApi.includes("HOME_PEOPLE_REMOVED_CONTACTS_SCHEMA") &&
-    gatewayApi.includes("home_mark_people_contact_removed") &&
-    gatewayApi.includes("filter_removed_people_contacts") &&
+    gatewayApi.includes(
+      ".remove_contact(&authority.store, &authority.profile, &remote_did, now_ts())",
+    ) &&
+    !sourceBlock(
+      gatewayApi,
+      "pub(super) async fn people_contact_remove",
+      "People contact remove handler",
+    ).includes("record_local_contact_revocation") &&
+    gatewayApi.includes('"scope": "profile_contact"') &&
+    !gatewayApi.includes("HOME_PEOPLE_REMOVED_CONTACTS_SCHEMA") &&
+    !gatewayApi.includes("home_mark_people_contact_removed") &&
+    !gatewayApi.includes("filter_removed_people_contacts") &&
     !sourceBlock(
       gatewayApi,
       "pub(super) async fn people_contact_remove",
       "People contact remove handler",
     ).includes("remove_room_member"),
-  "People Remove must be local People state, not conversation member ejection",
+  "People Remove must use Profile-contact authority, not device-contact state or conversation member ejection",
+);
+assert(
+  contactStore.includes("removed_contacts") &&
+    contactStore.includes("fn record_local_contact_revocation") &&
+    contactStore.includes("fn apply_remote_contact_revocation") &&
+    contactStore.includes("removed relationship has no signed acceptance chain") &&
+    contactStore.includes("accepted profile head is not bound to a known relationship"),
+  "Contact removal is signed and visible on both sides: removed pairs trace to acceptance truth, and retained heads bind to known relationships only",
+);
+assert(
+  directMessages.includes("enum DirectHistoryPolicy") &&
+    directMessages.includes("DECLARED_DIRECT_HISTORY_POLICY") &&
+    directMessages.includes("ReadableAfterRemoval => removed"),
+  "Post-removal read behaviour is an explicit declared policy the Runtime enforces, not an emergent refusal",
+);
+assert(
+  gatewayApi.includes("fn room_profile_attribution_names") &&
+    !gatewayApi.includes("verified_presence_display_name") &&
+    sourceBlock(
+      gatewayApi,
+      "pub(super) async fn room_service_poll",
+      "Chat poll handler",
+    ).includes("apply_profile_attribution_to_room_poll") &&
+    !sourceBlock(
+      gatewayApi,
+      "pub(super) async fn room_service_poll",
+      "Chat poll handler",
+    ).includes("presence_port") &&
+    sourceBlock(
+      gatewayApi,
+      "pub(super) async fn chat_room_session_start",
+      "Chat session start handler",
+    ).includes("apply_profile_attribution_to_room_poll") &&
+    !sourceBlock(
+      gatewayApi,
+      "pub(super) async fn chat_room_session_start",
+      "Chat session start handler",
+    ).includes("presence_port"),
+  "Shared-room attribution binds names to signed Profile heads: presence proves liveness, never identity",
+);
+assert(
+  sourceBlock(
+    gatewayApi,
+    "pub(super) fn apply_profile_attribution_to_room_poll",
+    "Room attribution projection",
+  ).includes("object.sender_profile_verified != Some(true)") &&
+    !sourceBlock(
+      gatewayApi,
+      "pub(super) fn apply_profile_attribution_to_room_poll",
+      "Room attribution projection",
+    ).includes("String::new()") &&
+    sourceBlock(
+      gatewayApi,
+      "pub(super) fn apply_profile_attribution_to_participants",
+      "Participant attribution projection",
+    ).includes("participant.profile_verified != Some(true)") &&
+    !sourceBlock(
+      gatewayApi,
+      "pub(super) fn apply_profile_attribution_to_participants",
+      "Participant attribution projection",
+    ).includes("String::new()") &&
+    !gatewayApi.includes("fn home_people_fallback_display_name") &&
+    !gatewayApi.includes("Conversation member "),
+  "Configured shared Chat name refresh never upgrades authority: gateway renames only rows already verified by room_service",
+);
+assert(
+  chatRoomUi.includes("filter_configured_shared_poll") &&
+    chatRoomUi.includes("configured_shared_object_visible") &&
+    chatRoomUi.includes("configured_shared_participant_visible") &&
+    !chatRoomUi.includes("const UNVERIFIED_MEMBER_NAME") &&
+    !chatRoomUi.includes("participant-name-unverified") &&
+    !chatRoomUi.includes("sender-unverified"),
+  "Configured shared Chat omits false/None rows defensively instead of rendering placeholder people",
+);
+assert(
+  authGatewayApi.includes('schema: "elastos.auth.passkey.verify/v2"') &&
+    authGatewayApi.includes("profile_readiness_for_principal") &&
+    !authGatewayApi.includes("create_initial_profile_for_registration") &&
+    !authGatewayApi.includes("profile creation at registration failed") &&
+    gatewayApi.includes('const SCHEMA: &\'static str = "elastos.profile.readiness/v1"') &&
+    gatewayApi.includes('status: "ready"') &&
+    gatewayApi.includes('status: "setup_required"') &&
+    gatewayApi.includes('status: "unavailable"'),
+  "Passkey verification and Home identity must share one derived Profile readiness state, with no swallowed registration-time Profile creation",
+);
+assert(
+  shellAuthJs.includes("profileReadinessActionTarget") &&
+    shellAuthJs.includes('return "people"') &&
+    shellAuthJs.includes('return "system"') &&
+    shellJs.includes("openTargetFromHomeGui(profileActionTarget)") &&
+    peopleScript.includes('readiness.schema === "elastos.profile.readiness/v1"') &&
+    peopleScript.includes('profileForm?.dataset.profileState === "unavailable"') &&
+    !peopleScript.includes("identity.profile ?") &&
+    !peopleDiscoverySmoke.includes("identity.profile ?"),
+  "First-run Profile UX must consume typed Runtime readiness: only setup-required opens People, while unavailable, missing, or unknown authority fails closed through System without browser identity inference",
+);
+const peopleProfileSave = sourceBlock(
+  gatewayApi,
+  "pub(super) async fn people_profile_update",
+  "People Profile save",
+);
+assert(
+  peopleProfileSave.includes("validate_profile_authority_update") &&
+    peopleProfileSave.includes("principal_root_recovery_status_for_context") &&
+    peopleProfileSave.includes("PeopleProfileProtectionRequiredResponse") &&
+    gatewayApi.includes("elastos.people.profile-protection-required/v1") &&
+    !peopleProfileSave.includes("ensure_principal_root_protection") &&
+    !peopleProfileSave.includes("RecoveryKitDelivery") &&
+    peopleScript.includes("elastos.people.profile-protection-required/v1") &&
+    peopleScript.includes("Open System") &&
+    peopleScript.includes("choose Security") &&
+    authGatewayApi.includes("mark_recovery_kit_handed_to_person") &&
+    gatewayHomeSystemTests.includes(
+      "test_people_profile_creation_requires_completed_system_recovery_without_partial_state",
+    ),
+  "People Profile creation must remain mutation-free until verified System Recovery protection exists; People never mints or retains unseen Recovery material",
+);
+assert(
+  profileUpdates.includes(
+    'PROFILE_UPDATE_PROVIDER_SCHEME: &str = "collaboration-profile"',
+  ) &&
+    sourceBlock(
+      profileUpdates,
+      "fn receive(",
+      "Profile update receive path",
+    ).includes("apply_accepted_profile_chain") &&
+    !directMessages.includes("collaboration-profile") &&
+    profileUpdates.includes("acknowledged: Mutex<BTreeMap<(String, String), u64>>") &&
+    profileUpdates.includes("restart re-announces, and the receiver treats that as an idempotent"),
+  "Profile updates travel their own Runtime provider, resolve by Profile DID, apply through the store's chain rules, and need no durable outbox: announcement is a pure function of the local head",
+);
+assert(
+  sourceBlock(
+    discoveryRuntime,
+    "async fn invoke_bootstrap(",
+    "Collaboration Discovery bootstrap",
+  ).includes("ProviderInvocationTransport::Carrier") &&
+    sourceBlock(
+      discoveryRuntime,
+      "async fn invoke_bootstrap(",
+      "Collaboration Discovery bootstrap",
+    ).includes("ProviderCarrierRoute::ConnectTicket") &&
+    !sourceBlock(
+      discoveryRuntime,
+      "async fn invoke_bootstrap(",
+      "Collaboration Discovery bootstrap",
+    ).includes("ProviderInvocationTransport::Local") &&
+    !sourceBlock(
+      discoveryRuntime,
+      "async fn invoke_bootstrap(",
+      "Collaboration Discovery bootstrap",
+    ).includes('send_raw("peer"') &&
+    !discoveryRuntime.includes("local_carrier_endpoint_node_id") &&
+    !discoveryRuntime.includes("bootstrap_transport_for_peer") &&
+    discoveryRuntime.includes(
+      "invoke_bootstrap_self_peer_uses_carrier_loopback_without_network_connect",
+    ) &&
+    discoveryRuntime.includes("invoke_bootstrap_rejects_local_node_id_with_foreign_ticket"),
+  "Collaboration Discovery always emits its signed bootstrap request over the normal Carrier ConnectTicket route; Carrier alone may loop the authenticated endpoint locally",
+);
+assert(
+  gatewayApi.includes(".AppData/ElastOS/Home/services-peer-contacts.json") &&
+    gatewayApi.includes(
+      'HOME_SERVICES_PEER_CONTACTS_SCHEMA: &str = "elastos.services.peer-contacts-state/v1"',
+    ) &&
+    sourceBlock(
+      gatewayApi,
+      "fn migrate_legacy_services_peer_contacts",
+      "Services peer contacts migration",
+    ).includes("LEGACY_HOME_SERVICES_PEER_CONTACTS_SCHEMA") &&
+    sourceBlock(
+      gatewayApi,
+      "pub(super) async fn home_launch",
+      "Home launch mutation boundary",
+    ).includes("migrate_legacy_services_peer_contacts") &&
+    sourceBlock(
+      gatewayApi,
+      "fn home_services_peer_contacts_state",
+      "Services peer contacts read",
+    ).includes("migrate_legacy_services_peer_contacts") === false,
+  "The Services peer contact object is named as what it holds, and the released People-named object migrates whole — name and schema together — only at explicit Home launch",
+);
+assert(
+  collaborationDelivery.includes("fn run_bounded_delivery_pass") &&
+    collaborationDelivery.includes("enum DeliveryEndOfLife") &&
+    sourceBlock(
+      directMessages,
+      "pub(crate) async fn retry_pending",
+      "Direct message retry pass",
+    ).includes("run_bounded_delivery_pass") &&
+    sourceBlock(
+      discoveryRuntime,
+      "async fn retry_contact_revocations",
+      "Contact revocation retry pass",
+    ).includes("run_bounded_delivery_pass") &&
+    sourceBlock(
+      profileUpdates,
+      "pub(crate) async fn announce_pending",
+      "Profile update announce pass",
+    ).includes("run_bounded_delivery_pass"),
+  "Every request/response collaboration retry is one shared bounded delivery pass — a new transport extends the engine, never adds another hand-rolled loop",
+);
+assert(
+  /DECLARED_DIRECT_MESSAGE_END_OF_LIFE[^;]{0,220}TerminalExpired;/s.test(directMessages) &&
+    /DECLARED_CONTACT_REVOCATION_END_OF_LIFE[^;]{0,220}RemintExact;/s.test(discoveryRuntime) &&
+    /DECLARED_PROFILE_UPDATE_END_OF_LIFE[^;]{0,220}RegenerateFromTruth;/s.test(profileUpdates),
+  "What happens at an envelope's end of life is a declared per-source product decision — terminal for messages, re-mint for revocations, regenerate for Profile announcements — never an emergent property of a retry loop",
+);
+assert(
+  sourceBlock(
+    authGatewayApi,
+    "async fn full_recovery_bundle_export_inner",
+    "Full recovery bundle export",
+  ).includes("people_identity_for_full_bundle") &&
+    sourceBlock(
+      authGatewayApi,
+      "async fn full_recovery_bundle_import_inner",
+      "Full recovery bundle import",
+    ).includes("restore_people_identity_from_full_bundle") &&
+    sourceBlock(
+      authGatewayApi,
+      "fn restore_people_identity_inner",
+      "People identity restore",
+    ).includes("update_profile_authority") &&
+    profileAuthority.includes(
+      "recovered profile signing seed does not control the recovered Profile DID",
+    ) &&
+    contactStore.includes("recovered contact state is bound to another Profile"),
+  "Recovery carries the signed People identity: the bundle exports the seed and contacts, the import restores them fail-closed, and the new device is authorized through the normal signed-revision path, never a bespoke signer",
+);
+assert(
+  systemCapsuleJs.includes("people_identity_restore") &&
+    systemCapsuleJs.includes("not a complete account restore"),
+  "The recovery UI reports the People identity outcome and never claims a complete account restore when it is not",
+);
+assert(
+  notificationsStore.includes('CONTACT_REQUEST_KIND: &str = "contact_request"') &&
+    notificationsStore.includes('DIRECT_MESSAGE_KIND: &str = "direct_message"') &&
+    !notificationsStore.includes("collaboration_contact_store") &&
+    !notificationsStore.includes("submit_contact_decision") &&
+    sourceBlock(
+      directMessages,
+      "fn receive(",
+      "Direct message receive path",
+    ).includes("upsert_direct_message_notification") &&
+    sourceBlock(
+      gatewayApi,
+      "pub(super) async fn chat_direct_conversation_messages",
+      "Chat direct conversation read",
+    ).includes("direct_message_notification_action_id"),
+  "Incoming contact requests and direct messages notify the person durably: the verified receive mints, the conversation read resolves, and the notification store never touches collaboration state or decisions",
+);
+assert(
+  carrier.includes("let source_endpoint_id = conn.remote_id();") &&
+    carrier.includes('"source_endpoint_did": public_key_to_did(source_endpoint_id)') &&
+    collaborationProtocol.includes("authenticated_carrier_source_endpoint") &&
+    directMessages.includes("sender_profile.sole_endpoint_did()? != source_endpoint_did") &&
+    directMessages.includes("authenticated_carrier_source_endpoint(runtime.get(\"carrier\"))") &&
+    profileUpdates.includes("source_endpoint_did") &&
+    contactStore.includes(
+      "profile update did not arrive from the signed Profile endpoint",
+    ),
+  "Carrier provider ingress derives the source endpoint from the authenticated connection; direct messages, revocations, and Profile updates compare that route independently from Profile-authorized application signing",
+);
+const peopleConversationsDoc = read("docs/PEOPLE_CONVERSATIONS.md");
+assert(
+  chatRoomUi.includes(
+    'DIRECT_ATTACHMENTS_UNAVAILABLE: &str = "Direct conversations are text-only for now."',
+  ) &&
+    chatRoomUi.includes("set_hidden(&self.attach_button, !direct_mode && !controls.show_attach)") &&
+    peopleConversationsDoc.includes("Direct conversations are text-only for now.") &&
+    peopleConversationsDoc.includes("Attachments in direct conversations. Deferred by decision, not omission"),
+  "Direct attachments are deferred by declared decision: the product doc says so, and the direct-mode control is visibly unavailable, never silently missing",
+);
+assert(
+  notificationsStore.includes("pub fn project_contact_request_notifications") &&
+    !gatewayApi.includes("sync_people_notifications_for_context") &&
+    sourceBlock(
+      gatewayApi,
+      "fn apply_contact_request_notification_projection",
+      "Home contact-request projection",
+    ).includes("project_contact_request_notifications") &&
+    sourceBlock(
+      gatewayApi,
+      "pub(super) async fn inbox_summary",
+      "Inbox summary",
+    ).includes("apply_contact_request_notification_projection"),
+  "Contact requests remain durable only in the protected contact store; Home and Inbox project the same pending facts in memory without writing a duplicate notification truth",
+);
+assert(
+  contactStore.includes("accepted profile chain rolls the revision back") &&
+    contactStore.includes("accepted profile chain skips a revision") &&
+    contactStore.includes("accepted profile chain breaks the chain hash") &&
+    contactStore.includes("accepted profile chain is not contiguous") &&
+    contactStore.includes("accepted profile chain mixes profiles") &&
+    contactStore.includes(
+      "profile update did not arrive from the signed Profile endpoint",
+    ) &&
+    profileAuthority.includes("MAX_RETAINED_PROFILE_REVISIONS: usize = 8"),
+  "A Profile update is an exact bounded signed chain: rollback, gaps, hash breaks, mixed profiles, and unauthorized source endpoints fail closed",
 );
 assert(
   shellJs.includes('scope === "people"') &&
@@ -2672,10 +3375,11 @@ assert(
   "Chat Room shell close must send a scoped leave request before Home removes the capsule frame",
 );
 assert(
-  chatRoomUi.includes(
-    "summary.local_runtime_role.is_none() && !summary.browser_access_allowed",
-  ),
-  "Chat Room shell sessions must remain openable when guest requests are disabled for active members",
+  chatRoomUi.includes("fn shell_summary_allows_session") &&
+    chatRoomUi.includes("summary.transport.configured") &&
+    chatRoomUi.includes("summary.local_runtime_role.is_some()") &&
+    chatRoomUi.includes("summary.browser_access_allowed"),
+  "Chat Room shell sessions must distinguish configured Home authority from isolated local membership and guest access",
 );
 assert(
   gatewayApi.includes('"/api/apps/chat-room/guests/:session_id/kick"'),
@@ -3047,6 +3751,33 @@ assert(
     homeGuiCapsuleManifest.description === "Desktop Home view for ElastOS" &&
     homeCliManifest.role === "shell",
   "Home identity split must keep home as the host and expose plain Desktop and Terminal shell descriptions",
+);
+assert(
+  homeGuiCapsuleManifest.icon === "browser/icons" &&
+    fileExists("capsules/home-gui/browser/icons/icon-32.png") &&
+    fileExists("capsules/home-gui/browser/icons/icon-64.png") &&
+    fileExists("capsules/home-gui/browser/icons/icon-128.png") &&
+    fileExists("capsules/home-gui/browser/icons/icon-256.png"),
+  "Home GUI must own its capsule icon manifest and four top-level raster icon sizes",
+);
+const gbaNonogramManifest = JSON.parse(read("capsules/gba-nonogram/capsule.json"));
+assert(
+  gbaNonogramManifest.icon === "icons" &&
+    gbaNonogramManifest.role === "content" &&
+    gbaNonogramManifest.type === "data" &&
+    gbaNonogramManifest.viewer === "gba-emulator" &&
+    fileExists("capsules/gba-nonogram/icons/icon.svg") &&
+    fileExists("capsules/gba-nonogram/icons/icon-32.png") &&
+    fileExists("capsules/gba-nonogram/icons/icon-64.png") &&
+    fileExists("capsules/gba-nonogram/icons/icon-128.png") &&
+    fileExists("capsules/gba-nonogram/icons/icon-256.png") &&
+    listFilesRecursive(resolve(repoRootPath, "capsules/home/browser")).every(
+      (file) => !file.includes("gba-nonogram"),
+    ) &&
+    listFilesRecursive(resolve(repoRootPath, "capsules/home-gui/browser")).every(
+      (file) => !file.includes("gba-nonogram"),
+    ),
+  "GBA Nonogram must keep a schema-valid content manifest, capsule-owned icon assets, and no central Home mirror",
 );
 assertManifestMethod(coreCapsuleManifests, "browser", "elastos.browser.page", "page.open", {
   risk: "launch",
@@ -3531,9 +4262,13 @@ assert(
     homeCliMain.includes("fn people_contact_id_for_reference(") &&
     homeCli.includes("people_tab_uses_people_model_and_keeps_transport_in_debug") &&
     homeCli.includes("people_line_mode_resolves_visible_contacts_and_requires_message_route") &&
-    homeCli.includes('"Add People"') &&
+    homeCli.includes('"Online"') &&
+    homeCli.includes("Open People from Home to see signed online presence.") &&
     homeCli.includes("ContactsSchema") &&
-    homeCli.includes("DiscoverySchema") &&
+    !homeCli.includes("PeopleDiscovery") &&
+    !homeCli.includes("people-discovery-") &&
+    !homeCli.includes("people-request-peer") &&
+    !homeCli.includes("people-accept-request") &&
     !homeCliMain.includes("direct contact threads are not available yet") &&
     !homeCliMain.includes('"Visible People"') &&
     homeCli.includes("system_tab_stays_short_and_actionable") &&
@@ -3741,7 +4476,7 @@ assert(
   "Capsule-kernel bridge must scope Users/self through a principal context or fail closed",
 );
 assert(
-  carrierBridge.includes("protected_principal_root_carrier_response") &&
+  carrierBridge.includes("protected_principal_root_resource_response") &&
     carrierBridge.includes("write_principal_root_object("),
   "Capsule-kernel bridge must route protected Users/self object writes through runtime principal-root encryption",
 );
@@ -3839,15 +4574,14 @@ assert(
     localhostProvider.includes("test_storage_request_body_token_is_optional") &&
     carrierBridge.includes('object.remove("token")') &&
     carrierBridge.includes(
-      "carrier_invoke_localhost_uses_envelope_token_and_redacts_body_token",
+      "resource_invoke_localhost_uses_envelope_token_and_redacts_body_token",
     ) &&
     carrierBridge.includes(
-      "carrier_invoke_localhost_rejects_missing_envelope_token_even_with_body_token",
+      "resource_invoke_localhost_rejects_missing_envelope_token_even_with_body_token",
     ) &&
     !carrierService.includes('"token": ""') &&
     !homeCmd.includes('"token": access.') &&
-    !homeCli.includes('"token": token') &&
-    !chatCarrier.includes('"token": storage_token'),
+    !homeCli.includes('"token": token'),
   "Localhost provider storage authority must use the carrier/provider envelope token, not duplicate body token fields",
 );
 assert(
@@ -3907,7 +4641,7 @@ assert(
 );
 assert(
   operatorControl.includes(
-    "crate::runtime_control::read_operator_runtime_coords",
+    "crate::runtime_control::read_attachable_runtime_coords",
   ),
   "Operator control must use canonical runtime coord validation",
 );
@@ -3938,17 +4672,28 @@ assert(
     ),
   "obsolete ESP Shell capsule must not be packaged",
 );
+for (const obsolete of ["chat", "agent"]) {
+  assert(
+    !components.capsules?.[obsolete] &&
+      !components.external?.[obsolete] &&
+      Object.values(components.profiles).every(
+        (profile) => !new Set(profile.components || []).has(obsolete),
+      ),
+    `obsolete transport-facing ${obsolete} capsule must not be packaged`,
+  );
+}
 const publishRust = read("elastos/crates/elastos-server/src/publish.rs");
-function shellArrayItems(text, name) {
+function shellArrayEntries(text, name) {
   const pattern = new RegExp(`^${name}=\\(([\\s\\S]*?)^\\)`, "m");
   const match = text.match(pattern);
   assert(Boolean(match), `publish-release must define ${name}`);
-  return new Set(
-    match[1]
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => /^[A-Za-z0-9_-]+$/.test(line)),
-  );
+  return match[1]
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^[A-Za-z0-9_-]+$/.test(line));
+}
+function shellArrayItems(text, name) {
+  return new Set(shellArrayEntries(text, name));
 }
 function rustConstItems(text, name) {
   const pattern = new RegExp(
@@ -3967,6 +4712,10 @@ const publishReleaseSupport = shellArrayItems(
   publishReleaseScript,
   "SUPPORT_BINARY_ASSETS",
 );
+const publishReleaseSupportEntries = shellArrayEntries(
+  publishReleaseScript,
+  "SUPPORT_BINARY_ASSETS",
+);
 const publishRustHome = rustConstItems(publishRust, "HOME_PUBLISH_CAPSULES");
 const publishRustDemo = rustConstItems(publishRust, "DEMO_PUBLISH_CAPSULES");
 const publishRustRequired = rustConstItems(
@@ -3975,6 +4724,58 @@ const publishRustRequired = rustConstItems(
 );
 const homeProfile = new Set(components.profiles.home.components);
 const demoProfile = new Set(components.profiles.demo.components);
+const protectedRuntimeProviders = new Set([
+  "protected-content-protect-provider",
+  "media-provider",
+  "custody-provider",
+  "protected-content-decrypt-provider",
+]);
+const protectedHomeDependencies = new Set([
+  "chain-provider",
+  "wallet-provider",
+  "kubo",
+  "ipfs-provider",
+  "protected-content-protect-provider",
+  "media-provider",
+  "protected-content-decrypt-provider",
+]);
+const protectedHomeSurface = ["library", "marketplace", "elacity-player"];
+for (const [profileName, profile] of Object.entries(components.profiles)) {
+  const profileList = profile.components || [];
+  const profileComponents = new Set(profileList);
+  if (protectedHomeSurface.every((component) => profileComponents.has(component))) {
+    for (const dependency of protectedHomeDependencies) {
+      assert(
+        profileList.filter((component) => component === dependency).length === 1,
+        `${profileName} protected-content Home profile must install ${dependency} exactly once`,
+      );
+    }
+  }
+}
+for (const provider of protectedRuntimeProviders) {
+  assert(
+    publishReleaseSupportEntries.filter((component) => component === provider).length === 1,
+    `publish-release support assets must include ${provider} exactly once`,
+  );
+  assert(
+    components.external?.[provider]?.provider_runtime?.runtime_only === true,
+    `${provider} must remain a Runtime-only native provider`,
+  );
+  assert(
+    !components.capsules?.[provider] &&
+      !existsSync(new URL(`capsules/${provider}/capsule.json`, repoRoot)) &&
+      !existsSync(new URL(`elastos/capsules/${provider}/capsule.json`, repoRoot)),
+    `${provider} must stay out of capsule-facing inventories`,
+  );
+}
+const custodyProfiles = Object.entries(components.profiles)
+  .filter(([, profile]) => new Set(profile.components || []).has("custody-provider"))
+  .map(([profileName]) => profileName)
+  .sort();
+assert(
+  JSON.stringify(custodyProfiles) === JSON.stringify(["blockchain", "full"]),
+  "custody-provider must stay in blockchain/full profiles only",
+);
 assert(
   !components.external?.["capsule-inspector"] &&
     Object.values(components.profiles).every(
@@ -4124,7 +4925,7 @@ for (const component of [...publishReleaseDefault]) {
     `publish-release default capsule set must not include demo-only capsule ${component}`,
   );
 }
-for (const component of ["chat", "gba-emulator", "gba-ucity", "chat-room", "ipfs-provider", "tunnel-provider"]) {
+for (const component of ["gba-emulator", "gba-ucity", "chat-room", "tunnel-provider"]) {
   assert(
     publishRustDemo.has(component),
     `Rust demo publish profile must include ${component}`,
@@ -4173,6 +4974,8 @@ assert(
   "Marketplace must read the canonical catalog and interface registry",
 );
 const marketplaceUi = read("capsules/marketplace/browser/marketplace.js");
+const marketplaceBehaviorSmoke = read("scripts/marketplace-product-behavior-smoke.mjs");
+const marketplaceLayoutSmoke = read("scripts/marketplace-product-layout-smoke.mjs");
 assert(
   marketplaceUi.includes("const installed = capsule.installed === true;") &&
     marketplaceUi.includes('type: "home:open-target"') &&
@@ -4187,17 +4990,21 @@ assert(
     marketplaceUi.includes("function executableActions(") &&
     marketplaceUi.includes("binding?.executable !== true") &&
     marketplaceUi.includes("function relationshipSection(") &&
-    !marketplaceUi.includes('name.includes("wallet")') &&
-    !marketplaceUi.includes('name.includes("provider")') &&
-    !marketplaceUi.includes('name.includes("gba")') &&
+    marketplaceUi.includes("function isValidCapsuleIconVariant(capsuleName, entry)") &&
+    marketplaceUi.includes('route.startsWith(`/apps/${capsuleName}/`)') &&
+    !marketplaceUi.includes("FIRST_PARTY_ICON_IDS") &&
+    !marketplaceUi.includes("OWN_ICON_CAPSULES") &&
+    !marketplaceUi.includes("resolveFirstPartyIconId") &&
     !marketplaceUi.includes("function isStaffPick(") &&
     !marketplaceUi.includes("function isPopular("),
-  "Marketplace must project canonical roles, relationships, and executable bindings without name-based guesses",
+  "Marketplace must project canonical roles, relationships, executable bindings, and declared icon routes without name-based guesses",
 );
 assert(
   marketplaceUi.includes('size: capsule.cid ? "Verified app" : "Local app"') &&
-    marketplaceUi.includes('storage: capsule.cid ? "SmartWeb" : "Local"') &&
-    marketplaceUi.includes("App identity:") &&
+    marketplaceUi.includes('sourceSummary: capsule.cid ? "SmartWeb" : "Local"') &&
+    marketplaceUi.includes("Trust:") &&
+    marketplaceUi.includes("Status:") &&
+    marketplaceUi.includes("Available actions") &&
     !marketplaceUi.includes("CID-backed") &&
     !marketplaceUi.includes("Content ID") &&
     !marketplaceUi.includes("Signed package") &&
@@ -4206,7 +5013,22 @@ assert(
     !marketplaceUi.includes("signed CID manifests") &&
     !marketplaceUi.includes("capsule catalog route missing") &&
     !marketplaceUi.includes("`CID:"),
-  "Marketplace must describe app trust in user-facing language instead of raw CID/package jargon",
+  "Marketplace must describe app trust and status in user-facing language instead of raw CID/package jargon",
+);
+assert(
+  marketplaceUi.includes("function announceHomeChrome()") &&
+    marketplaceUi.includes("lastHomeMenuManifestSignature") &&
+    marketplaceUi.includes('if (event.origin !== "null" || event.source !== window.parent) {') &&
+    !marketplaceUi.includes("window.location.origin") &&
+    !marketplaceUi.includes("onerror="),
+  "Marketplace must keep the exact Home menu boundary and bind icon fallback without inline event attributes",
+);
+assert(
+  marketplaceBehaviorSmoke.includes("marketplace-product-behavior-smoke: OK") &&
+    marketplaceLayoutSmoke.includes("marketplace-product-layout-smoke: OK") &&
+    read("justfile").includes("node scripts/marketplace-product-behavior-smoke.mjs") &&
+    read("justfile").includes("node scripts/marketplace-product-layout-smoke.mjs"),
+  "Marketplace UIUX must stay wired into the focused source and browser gates",
 );
 assert(
   read("elastos/crates/elastos-server/src/api/gateway_marketplace.rs").includes(
@@ -4358,7 +5180,10 @@ const libraryDesktopIcon = read("capsules/library/browser/icons/sidebar-folder-d
 const libraryMenuSmoke = read("scripts/library-menu-smoke.mjs");
 const libraryPerformanceSmoke = read("scripts/library-performance-smoke.mjs");
 const libraryLiveSmoke = read("scripts/library-live-smoke.sh");
+const archiveBehaviorSmoke = read("scripts/archive-product-behavior-smoke.mjs");
+const archiveLayoutSmoke = read("scripts/archive-product-layout-smoke.mjs");
 const namespacesDoc = read("docs/NAMESPACES.md");
+const justfile = read("justfile");
 const chatStyle = read("capsules/chat-room/browser/style.css");
 const gba = read("capsules/gba-emulator/browser/index.html");
 const gbaStyle = read("capsules/gba-emulator/browser/style.css");
@@ -4366,8 +5191,10 @@ const gbaJs = read("capsules/gba-emulator/browser/emulator.js");
 const gbaInputJs = read("capsules/gba-emulator/browser/gba-input.js");
 const walletMetamask = read("capsules/wallet-metamask/browser/index.html");
 const walletMetamaskJs = read("capsules/wallet-metamask/browser/wallet-metamask.js");
+const walletMetamaskStyle = read("capsules/wallet-metamask/browser/style.css");
 const walletUnisat = read("capsules/wallet-unisat/browser/index.html");
 const walletUnisatJs = read("capsules/wallet-unisat/browser/wallet-unisat.js");
+const walletUnisatStyle = read("capsules/wallet-unisat/browser/style.css");
 const walletConnectorTransactionSmoke = read(
   "scripts/wallet-connector-transaction-smoke.mjs",
 );
@@ -4511,6 +5338,7 @@ const walletWalletconnect = read("capsules/wallet-walletconnect/browser/index.ht
 const walletWalletconnectJs = read(
   "capsules/wallet-walletconnect/browser/wallet-walletconnect.js",
 );
+const walletWalletconnectStyle = read("capsules/wallet-walletconnect/browser/style.css");
 const homeSmoke = read("scripts/home-camofox-smoke.mjs");
 const systemSmoke = read("scripts/system-camofox-smoke.mjs");
 const homeVirtualAuthSmoke = read(
@@ -4527,7 +5355,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-20260712a";
+const systemAssetVersion = "system-20260819f";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 const auditChainBoundary = {
@@ -4810,13 +5638,25 @@ assert(
   "Inbox Inspector approval must require fresh same-principal passkey proof before approved provider dispatch",
   inboxInspectorApprovalBoundary,
 );
-assert(
-  inbox.includes('entry.kind !== "wallet_approval_request"') &&
-    inbox.includes("const unreadIdSet = new Set(unreadIds)") &&
-    inbox.includes("unread_count: unreadCount") &&
-    !inbox.includes("renderInbox(Object.assign({}, notifications, { unread_count: 0 }))"),
-  "Inbox auto-read must not locally mark wallet approval requests as read when clearing ordinary visible notifications",
-);
+{
+  const markVisibleReadBlock = inbox.slice(
+    inbox.indexOf("function markVisibleRead() {"),
+    inbox.indexOf("function formatInboxTime(", inbox.indexOf("function markVisibleRead() {")),
+  );
+  assert(
+    markVisibleReadBlock.includes('entry.kind !== "wallet_approval_request"') &&
+      markVisibleReadBlock.includes('entry.kind !== "contact_request"') &&
+      markVisibleReadBlock.includes("const unreadIds = state.entries") &&
+      markVisibleReadBlock.includes("const unreadIdSet = new Set(unreadIds)") &&
+      markVisibleReadBlock.includes("for (const entry of state.entries)") &&
+      markVisibleReadBlock.includes("if (unreadIdSet.has(entry.id))") &&
+      markVisibleReadBlock.includes("entry.read = true;") &&
+      markVisibleReadBlock.includes("renderInbox();") &&
+      !markVisibleReadBlock.includes("unread_count") &&
+      !markVisibleReadBlock.includes("Object.assign({}, notifications"),
+    "Inbox auto-read must derive eligible unread ids from current entries, mark only matching entries as read, rerender from current state, and avoid synthesizing notification unread_count",
+  );
+}
 assert(
   inbox.includes("capability-approve-request:") &&
     inbox.includes("capability-deny-request:") &&
@@ -4917,7 +5757,8 @@ assert(
   "Object provider must be the only provider capsule authority metadata for every routed operation",
 );
 assert(
-  serverInfra.includes('find_installed_provider_binary("object-provider")') &&
+  serverInfra.includes('resolve_verified_native_provider_binary("object-provider")') &&
+    !serverInfra.includes('find_installed_provider_binary("object-provider")') &&
     !serverInfra.includes(
       `find_installed_provider_binary("${retiredObjectProviderMarkers.oldBinary}")`,
     ) &&
@@ -4989,6 +5830,21 @@ assert(
     libraryApp.includes('menuAction("Compress Selected to ZIP"') &&
     libraryState.includes('"compress_archive"'),
   "Library Compress to ZIP must be provider-owned, capability-gated, cache-invalidating, and available for single objects and same-folder selections",
+);
+assert(
+  archiveManager.includes('<script src="./elastos-theme.js"></script>') &&
+    archiveManager.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    archiveManager.includes('window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);') &&
+    archiveManager.includes('type: "home:menu-manifest"') &&
+    archiveManager.includes('title: "File"') &&
+    archiveManager.includes('title: "Edit"') &&
+    archiveManager.includes('return event.origin === "null" && event.source === window.parent;') &&
+    !archiveManager.includes("event.origin !== homeParentOrigin || event.source !== window.top") &&
+    archiveBehaviorSmoke.includes("archive-product-behavior-smoke: OK") &&
+    archiveLayoutSmoke.includes("archive-product-layout-smoke: OK") &&
+    justfile.includes("node scripts/archive-product-behavior-smoke.mjs") &&
+    justfile.includes("node scripts/archive-product-layout-smoke.mjs"),
+  "Archive must use the shared UI tokens, the accepted Home top-out or trusted-parent-in boundary, and dedicated source or browser smokes wired into the normal UIUX gate",
 );
 assert(
     archiveManagerManifest.includes('"name": "archive-manager"') &&
@@ -5370,7 +6226,8 @@ assert(
     libraryRender.includes("This space is empty") &&
     libraryRender.includes("Add files or folders to this space.") &&
     libraryRender.includes('${visible} item${visible === 1 ? "" : "s"}') &&
-    libraryRender.includes('elements.currentTitle.textContent || "Library"') &&
+    libraryRender.includes('const currentCrumb = elements.breadcrumbs.querySelector(".crumb-current");') &&
+    libraryRender.includes('elements.footerRight.textContent = currentCrumb?.textContent || "Library";') &&
     !libraryRender.includes("No connected spaces") &&
     libraryActions.includes("This Space is read-only.") &&
     !libraryActions.includes("Mounted WebSpaces are read-only resolver handles."),
@@ -5446,12 +6303,11 @@ assert(
     providerRegistry.includes("elastos.provider.invocation/v1") &&
     providerRegistry.includes("runtime-local-provider-plane") &&
     providerRegistry.includes("carrier-provider-plane") &&
-    providerRegistry.includes("struct ProviderCarrierRoute") &&
+    providerRegistry.includes("enum ProviderCarrierRoute") &&
     providerRegistry.includes("enum ProviderInvocationTransport") &&
     providerRegistry.includes("trait ProviderCarrierInvoker") &&
     providerRegistry.includes("set_carrier_invoker") &&
-    providerRegistry.includes("provider_carrier_route_receipt") &&
-    providerRegistry.includes("route.peer_did.as_deref()") &&
+    providerRegistry.includes("peer_did.as_deref()") &&
     providerRegistry.includes(
       "Carrier provider invocation requires registered Carrier invoker",
     ) &&
@@ -5463,7 +6319,9 @@ assert(
     providerRegistry.includes("provider byte range expected {expected} bytes") &&
     providerRegistry.includes("provider invocation request must not predeclare runtime field") &&
     providerRegistry.includes('response["data"]["runtime_invocation"]["schema"]') &&
+    providerRegistry.includes('response["data"]["runtime_invocation"]["carrier"]') &&
     providerRegistry.includes('response["_runtime_transfer"]["capability"]') &&
+    providerRegistry.includes('response["_runtime_transfer"]["carrier"]') &&
     providerRegistry.includes('response["_runtime_transfer"]["transport"]') &&
     providerRegistry.includes("test_provider_invocation_attaches_range_progress_transfer_receipt") &&
     providerRegistry.includes('assert_eq!(sliced, b"abcdefghij");') &&
@@ -5922,16 +6780,39 @@ assert(
     carrierRuntime.includes('"transfer": "stream"') &&
     carrierRuntime.includes("ProviderTransfer::Stream") &&
     carrierRuntime.includes('"carrier_provider_invoke"') &&
-    carrierRuntime.includes('"content" | "availability" | "rights" | "key" | "decrypt" | "drm"') &&
+    /"content"\s*\|\s*"availability"\s*\|\s*"custody"\s*\|\s*"rights"\s*\|\s*"key"\s*\|\s*"decrypt"\s*\|\s*"drm"\s*\|\s*"collaboration"\s*\|\s*"collaboration-direct"\s*\|\s*"collaboration-profile"/.test(
+      carrierRuntime,
+    ) &&
     carrierRuntime.includes("CarrierProviderInvoker") &&
     carrierRuntime.includes("ProviderCarrierInvoker for CarrierProviderInvoker") &&
+    carrierRuntime.includes("with_carrier_endpoint_and_registry") &&
+    carrierRuntime.includes("provider_registry: Weak<ProviderRegistry>") &&
+    carrierRuntime.includes("invoke_loopback_provider") &&
+    !carrierRuntime.includes("peer_did_is_local") &&
+    !discoveryRuntime.includes("ProviderInvocationTransport::Local") &&
     carrierRuntime.includes("invoke_provider(") &&
     carrierRuntime.includes("carrier_endpoint_matches_peer") &&
-    carrierRuntime.includes("provider_invoke carrier metadata must not expose connect_ticket") &&
+    carrierRuntime.includes('assert!(!response.to_string().contains("\\\"connect_ticket\\\":"));') &&
     carrierRuntime.includes("test_carrier_provider_invoke_dispatches_runtime_enveloped_request") &&
     carrierRuntime.includes("test_carrier_provider_invoke_accepts_stream_contract_metadata") &&
     carrierRuntime.includes("test_carrier_provider_invoke_rejects_stream_without_contract_metadata") &&
     carrierRuntime.includes("test_carrier_provider_invoke_rejects_raw_backend_target") &&
+    carrierRuntime.includes(
+      "test_carrier_provider_target_admission_keeps_protected_runtime_targets_narrow",
+    ) &&
+    carrierRuntime.includes("test_peer_did_route_reaches_runtime_only_custody_target") &&
+    carrierRuntime.includes(
+      "test_peer_did_self_route_uses_carrier_admission_without_network_connect",
+    ) &&
+    carrierRuntime.includes(
+      "test_peer_did_self_route_requires_a_live_loopback_registry_before_provider_effect",
+    ) &&
+    carrierRuntime.includes(
+      "test_connect_ticket_self_route_uses_carrier_admission_without_network_connect",
+    ) &&
+    carrierRuntime.includes(
+      "test_connect_ticket_self_route_rejects_mismatched_peer_before_provider_effect",
+    ) &&
     carrierRuntime.includes("test_carrier_availability_fetch_uses_provider_invocation_transport") &&
     carrierRuntime.includes("test_carrier_replication_proof_uses_remote_content_provider_invocation") &&
     carrierRuntime.includes("test_carrier_replication_falls_back_to_exact_import_when_remote_pin_fails") &&
@@ -5953,9 +6834,13 @@ assert(
     carrierRuntime.includes("test_content_availability_replicas_ignore_signed_repair_only_announcements") &&
     carrierRuntime.includes("test_content_availability_replicas_ignore_oversized_candidate_metadata") &&
     carrierRuntime.includes('remote_transfer["transfer"], "stream"') &&
+    carrierRuntime.includes("connect_resolved_peer") &&
+    carrierRuntime.includes("ProviderError::Unavailable") &&
     serverInfra.includes("set_carrier_invoker") &&
     serverInfra.includes("CarrierAvailabilityProvider::with_provider_registry") &&
-    serverInfra.includes("CarrierProviderInvoker::new()") &&
+    serverInfra.includes(
+      "CarrierProviderInvoker::with_carrier_endpoint_and_registry(",
+    ) &&
     serverInfra.includes("maybe_spawn_content_repair_scheduler") &&
     serverInfra.includes("ELASTOS_CONTENT_REPAIR_SCHEDULER") &&
     serverInfra.includes("invoke_content_repair_worker(") &&
@@ -6323,18 +7208,31 @@ assert(
   "Library toolbar must stack on narrow screens",
 );
 assert(
-  libraryCss.includes("padding: 4px;") && libraryCss.includes("border-radius: 14px;"),
-  "Library mobile panels must use compact Home-aligned spacing",
+  libraryCss.includes("@media (max-width: 720px)") &&
+    libraryCss.includes(".shell {\n        gap: 0;") &&
+    libraryCss.includes("padding: 0;"),
+  "Library narrow layouts must keep the donor full-bleed shell without clipped mobile padding wrappers",
 );
 assert(
-  chatStyle.includes("width: 100%;") &&
-    chatStyle.includes("padding-top: 0.35rem;"),
-  "Chat Room mobile shell must avoid nested browser gutters",
+  chatStyle.includes("grid-template-columns: 220px minmax(0, 1fr);") &&
+    chatStyle.includes("width: 100%;") &&
+    chatStyle.includes("height: 100%;"),
+  "Chat must use one full-window conversation shell",
 );
 assert(
-  chatStyle.includes("border-radius: 0.82rem;") &&
-    chatStyle.includes("padding: 0.48rem;"),
-  "Chat Room mobile cards must use compact Home-aligned spacing",
+  chatStyle.includes(".conversation-selector") &&
+    chatStyle.includes("flex-direction: column;") &&
+    chatStyle.includes("grid-template-columns: 72px minmax(0, 1fr);") &&
+    chatStyle.includes(".conversation-choice-copy") &&
+    !chatStyle.includes("repeat(auto-fit, minmax(min(9rem, 100%), 1fr))"),
+  "Chat conversations must use one vertical list with a compact narrow rail",
+);
+assert(
+  chatStyle.includes("border-radius: 8px;") &&
+    chatStyle.includes("padding: 0.42rem 0.55rem;") &&
+    chatStyle.includes(".chat-people") &&
+    chatStyle.includes('data-roster-open="true"'),
+  "Chat rows and the conversation details drawer must stay compact",
 );
 assert(
   gba.includes('id="canvas"') &&
@@ -6779,6 +7677,13 @@ assert(
   "Home passkey login must use concise data/apps/desktop copy without redundant kicker text",
 );
 assert(
+  shellIndex.includes('class="home-unlock-face"') &&
+    shellIndex.includes('id="home-unlock-person"') &&
+    shellIndex.includes('id="home-unlock-person-name"') &&
+    shellIndex.indexOf('id="home-unlock-person"') < shellIndex.indexOf('id="home-unlock-person-name"'),
+  "Home lock face must keep the profile name outside the passkey hit target",
+);
+assert(
   shellIndex.includes('id="home-unlock-name"') &&
     shellAuth.includes("display_name: displayName"),
   "Home passkey creation must collect and persist a passkey/user display name",
@@ -6793,22 +7698,26 @@ assert(
   "Home must present guest enrollment as self-registration",
 );
 assert(
-  shellAuth.includes("startAutomaticPasskeySignIn") &&
-    shellAuth.includes("Choose your passkey."),
-  "Home sign-in must automatically ask for a passkey instead of requiring a duplicate continue click",
+  shellAuth.includes("unlockPerson?.addEventListener(\"click\", startUnlock);") &&
+    shellAuth.includes("setUnlockStatus(\"Choose your passkey.\", \"muted\");") &&
+    shellAuth.includes('unlockPanel.dataset.surface = showFace ? "lock-face" : "neutral";') &&
+    shellAuth.includes("unlockPersonName.textContent = unlockPersonLabel;") &&
+    shellAuth.includes("Use passkey for ${unlockPersonLabel}") &&
+    shellAuth.includes("unlockPanel?.dataset.surface === \"lock-face\""),
+  "Home lock sign-in must keep the explicit-click lock-face flow",
 );
-const renderUnlockCheckingBody = shellAuth.match(
-  /function renderUnlockChecking\(\) \{[\s\S]*?\n\}/,
-)?.[0] || "";
 assert(
-  shellAuth.includes("if (registered) {\n      startAutomaticPasskeySignIn") &&
-    renderUnlockCheckingBody.includes("autoSignInAttempted = false") &&
+  !shellAuth.includes("startAutomaticPasskeySignIn") &&
+    !shellAuth.includes("autoSignInAttempted") &&
     !shellAuth.includes("AbortController") &&
-    !shellAuth.includes('name === "AbortError"') &&
-    !shellAuth.includes("guestRegistrationAvailable") &&
-    !shellAuth.includes('registered && unlockPresentation === "modal"') &&
-    shellAuth.includes('unlockMode === "signin_guest_enabled" && guestRegistrationEnabled'),
-  "Home unsigned desktop unlock must stay aligned with the main passkey prompt behavior",
+    !shellAuth.includes('name === "AbortError"'),
+  "Home lock sign-in must not auto-start or add hidden cancellation state",
+);
+assert(
+  !shellAuth.includes("status.accounts") &&
+    !shellAuth.includes("profile_setup_display_name") &&
+    !shellAuth.includes("guestRegistrationAvailable"),
+  "Home lock sign-in must not depend on unsigned account-directory or profile setup fields",
 );
 assert(
   shellAuth.includes('unlockMode === "create_guest"') &&
@@ -6826,6 +7735,19 @@ assert(
   shellAuth.includes("isPasskeyNotSelected") &&
     shellAuth.includes('setUnlockStatus("No passkey selected.", "muted")'),
   "Home sign-in must suppress raw WebAuthn cancellation errors and keep onboarding actionable",
+);
+assert(
+  shellJs.includes("identity?.profile?.display_name") &&
+    shellJs.includes("options?.preserveSignedProfileLabel ? currentSignedProfileDisplayName() : \"\"") &&
+    shellJs.includes("preserveSignedProfileLabel: true") &&
+    !shellJs.includes("/api/auth/passkey/accounts") &&
+    !shellJs.includes("profile_setup_display_name"),
+  "Home host must reveal the signed-session profile label only for the authorized explicit lock action",
+);
+assert(
+  homeGuiJs.includes("homeGuiHostActions.requestHomeUnlock?.();") &&
+    !homeGuiJs.includes('CustomEvent("elastos:request-lock")'),
+  "Home GUI lock action must use the host unlock seam instead of a detached DOM event",
 );
 assert(
   shellAuth.includes(
@@ -6895,7 +7817,7 @@ assert(
   "Home passkey flow must not flicker from checking copy before the final unlock card",
 );
 assert(
-  homeGuiTemplateHtml.includes("toolbar-sign-out") &&
+  homeGuiTemplateHtml.includes("identity-menu-sign-out") &&
     shellAuth.includes("/api/auth/sessions/sign-out") &&
     homeGuiAuthority.includes("summary?.authority?.signed_in === true") &&
     homeGuiShell.includes("projectHomeGuiAuthority(document.body, summary);") &&
@@ -6908,12 +7830,15 @@ assert(
     homeGuiSignOutOpaqueServer.includes("proof:click-sign-out") &&
     homeShellBridgeSmoke.includes("an unauthorized frame or substituted token reached Runtime sign-out") &&
     homeShellBridgeSmoke.includes("trusted Home GUI sign-out did not make exactly one Runtime revocation request"),
-  "Home must expose an explicit sign-out path that clears the browser session through Runtime",
+  "Home must expose an explicit sign-out path through the system menu and clear the browser session through Runtime",
 );
 assert(
-  shellStyle.includes(".sign-out-btn") &&
-    shellStyle.includes('background-image: url("data:image/svg+xml'),
-  "Home sign-out toolbar icon must use a complete SVG glyph",
+  homeGuiTemplateHtml.includes('id="identity-menu-sign-out"') &&
+    homeGuiTemplateHtml.includes(
+      "<path d=\"M6.5 3.5H4.2A1.7 1.7 0 0 0 2.5 5.2v5.6A1.7 1.7 0 0 0 4.2 12.5h2.3M7 8h6.5M11.2 5.5 13.5 8l-2.3 2.5\"",
+    ) &&
+    !shellStyle.includes('.sign-out-btn .toolbar-identity-item-icon {\n  background-image: url("data:image/svg+xml'),
+  "Home sign-out menu icon must use the inline SVG glyph without a duplicate CSS background image",
 );
 assert(
   !shellStyle.includes(".sign-out-btn::before") &&
@@ -8324,8 +9249,10 @@ assert(
     currentState.includes(
       "Docker/Selkies is only `managed_baseline_not_final_product`",
     ) &&
-    currentState.includes(
-      "single-session; active pages are a serialization blocker",
+    currentState.includes("Hosted tooling supports per-launch targets") &&
+    includesNormalized(
+      currentState,
+      "concurrent product sessions require their own installed capacity and cleanup proof",
     ) &&
     currentState.includes("not a product native-browser proof target") &&
     currentState.includes(
@@ -8377,7 +9304,7 @@ assert(
     currentState.includes("signed virtual-passkey System picker switch") &&
     includesNormalized(currentState, "failed signed switchback recovery without mounting `home-gui`") &&
     includesNormalized(currentState, "Home CLI Apps showing GUI-only Browser/GBA targets read-only without implicit launch") &&
-    includesNormalized(currentState, "Home shell implementation, source gates, and machine smokes pass") &&
+    includesNormalized(currentState, "Home shell source gates assert these ownership rules") &&
     includesNormalized(currentState, "origin-isolation change requires a fresh commit-bound operator pass") &&
     currentState.includes("any later Home shell behavior change requires a new or re-reviewed") &&
     !tasks.includes("finish operator-profile proof for the reduced CLI dispatch boundary") &&
@@ -9698,6 +10625,9 @@ assert(
     shellWindows.includes("fitWindowToLargestBrowserAspect") &&
     shellWindows.includes("dataset.browserMaximized") &&
     shellWindows.includes(`syncBrowserWindow(entry, launched);
+  if (restoredPlacement) {
+    applyFullscreenStageFromPlacement(entry, restoredPlacement);
+  }
   if (entry.targetId === "browser") {
     fitLaunchedWindow(entry);
   }`) &&
@@ -9927,9 +10857,14 @@ assert(
   "Browser capsule must use the high-level Browser open route without faking EIP-1193 wallet injection, external host browsing, iframe host browsing, or diagnostic frame fallbacks into arbitrary web pages",
 );
 assert(
-  browserStyle.includes(".browser-stage") &&
+  browser.includes('<script src="./elastos-theme.js"></script>') &&
+    browser.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    browserStyle.includes(".browser-stage") &&
     browserStyle.includes("@media (max-width: 640px)") &&
-    browserStyle.includes("--accent: #d46f24") &&
+    browserStyle.includes("--accent: var(--el-accent)") &&
+    browserStyle.includes("overflow: hidden") &&
+    browserStyle.includes("height: 100%") &&
+    browserStyle.includes("min-height: 0") &&
     !browserStyle.includes(".browser-hero") &&
     !browserStyle.includes(".browser-card"),
   "Browser capsule must have a compact responsive ElastOS-aligned host-adapter UI without proof/debug cards",
@@ -10097,7 +11032,13 @@ assert(
   walletMetamask.includes('id="wallet-connect"') &&
     walletMetamask.includes('id="wallet-state"') &&
     walletMetamask.includes('id="wallet-accounts"') &&
-    walletMetamask.includes('id="wallet-requests"'),
+    walletMetamask.includes('id="wallet-requests"') &&
+    walletMetamask.includes('<script src="./elastos-theme.js"></script>') &&
+    walletMetamask.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    [...walletMetamaskStyle.matchAll(/letter-spacing:\s*([^;]+);/g)].every(([, value]) => value.trim() === "0") &&
+    !walletMetamaskStyle.includes("linear-gradient(") &&
+    !walletMetamaskStyle.includes("radial-gradient(") &&
+    walletMetamaskStyle.includes('font-family: var(--el-font, "Inter", sans-serif);'),
   "MetaMask must live in a dedicated connector capsule with connected-account visibility",
 );
 assert(
@@ -10180,7 +11121,13 @@ assert(
   walletUnisat.includes('id="wallet-connect"') &&
     walletUnisat.includes('id="wallet-state"') &&
     walletUnisat.includes('id="wallet-accounts"') &&
-    walletUnisat.includes('id="wallet-requests"'),
+    walletUnisat.includes('id="wallet-requests"') &&
+    walletUnisat.includes('<script src="./elastos-theme.js"></script>') &&
+    walletUnisat.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    [...walletUnisatStyle.matchAll(/letter-spacing:\s*([^;]+);/g)].every(([, value]) => value.trim() === "0") &&
+    !walletUnisatStyle.includes("linear-gradient(") &&
+    !walletUnisatStyle.includes("radial-gradient(") &&
+    walletUnisatStyle.includes('font-family: var(--el-font, "Inter", sans-serif);'),
   "UniSat must live in a dedicated connector capsule with connected-account visibility",
 );
 assert(
@@ -10212,9 +11159,18 @@ assert(
   "Wallet must provide balances and built-in Bitcoin accounts without manual Bitcoin proof linking",
 );
 assert(
-  wallet.includes("wallet.js?v=wallet-20260726b") &&
+  walletJs.includes("homeClipboard.start();") &&
+    !walletJs.includes('window.top.postMessage({ type: "home:app-ready", homeToken: activeHomeToken }, homeParentOrigin);') &&
+    walletPreferencesForConnectorContinuity.includes('type: "home:open-target"'),
+  "Wallet must keep one canonical Home Clipboard/app-ready path and one exact Home connector-launch path.",
+);
+assert(
+  wallet.includes("wallet.js?v=wallet-20260819f") &&
     wallet.includes('id="wallet-send"') &&
     wallet.includes('id="wallet-receive"') &&
+    wallet.includes('id="wallet-account-card"') &&
+    wallet.includes('id="wallet-hero-pending"') &&
+    wallet.includes('id="wallet-signers"') &&
     wallet.includes("data-wallet-create-account") &&
     wallet.includes("data-wallet-import-recovery-key") &&
     (wallet.match(/data-wallet-create-account/g) || []).length === 2 &&
@@ -10229,7 +11185,9 @@ assert(
     walletJs.includes("openReceiveFlow") &&
     walletJs.includes("openSendFlow") &&
     walletJs.includes("balance_key") &&
-    walletJs.includes("wallet-detail-summary") &&
+    walletJs.includes("wallet-account-card") &&
+    walletJs.includes("wallet-hero-pending") &&
+    walletJs.includes("wallet-signers") &&
     walletJs.includes("fundedSendableAccounts"),
   "Wallet must expose Send/Receive plus canonical Accounts/Settings create-import surfaces with cache-busted assets",
 );
@@ -10271,11 +11229,11 @@ assert(
 assert(
   wallet.includes("wallet-settings-drawer") &&
     wallet.includes("wallet-settings-main") &&
-    wallet.includes("wallet-settings-side") &&
-    wallet.indexOf('class="wallet-settings-side"') <
-      wallet.indexOf('id="wallet-methods"') &&
-    !wallet.includes("<h2>Wallet settings</h2>") &&
-    !wallet.includes("<h3>Identity</h3>") &&
+    wallet.includes("<h2>Settings</h2>") &&
+    wallet.includes("<h3>Manage accounts</h3>") &&
+    wallet.includes("<h3>Display currency</h3>") &&
+    !wallet.includes("wallet-settings-side") &&
+    !wallet.includes("<h3>Appearance</h3>") &&
     !wallet.includes('id="wallet-theme"') &&
     !wallet.includes("data-wallet-theme") &&
     !walletJs.includes("applyStoredTheme") &&
@@ -10291,8 +11249,9 @@ assert(
 assert(
   !wallet.includes("wallet-brand") &&
     walletJs.includes("selectedAccountId") &&
-    walletJs.includes("wallet-detail-address") &&
-    walletJs.includes("wallet-detail-qr") &&
+    walletJs.includes("wallet-account-card-address") &&
+    walletJs.includes("wallet-account-card-copy") &&
+    walletJs.includes("wallet-copy-icon") &&
     walletJs.includes('account.proof_type === "siwe"') &&
     walletJs.includes("unavailable: Boolean(payload.unavailable)") &&
     !walletJs.includes("Balances update through approved Runtime providers.") &&
@@ -10312,13 +11271,12 @@ assert(
     walletJs.includes("balanceTargetsForAccounts") &&
     walletJs.includes("accountForAsset") &&
     walletJs.includes("account_ids") &&
-    walletJs.includes("accountActionsNode.hidden = accounts.length > 0") &&
-    walletJs.includes("onWalletActionClick") &&
+    walletJs.includes("openAccountMenu") &&
+    walletJs.includes("data-wallet-account-menu") &&
     !walletJs.includes("createAccountTile") &&
     !walletStyle.includes(".wallet-create-card") &&
     walletJs.includes("create_new: index === 0") &&
     walletJs.includes("Create an EVM account for supported networks.") &&
-    walletJs.includes("dataset.walletAccountMenu") &&
     walletJs.includes("/api/apps/wallet/wallet/default") &&
     walletJs.includes("openRenameAccount") &&
     walletJs.includes('method: "PUT"') &&
@@ -10368,37 +11326,33 @@ assert(
   "wallet-provider manifest must keep principal-sensitive operations off its public interface while retaining internal audit truth",
 );
 assert(
-  wallet.includes(
-    '<section id="wallet-account-detail" class="wallet-detail" aria-label="Default account"></section>',
-  ) &&
+  wallet.includes('id="wallet-account-card"') &&
+    wallet.includes('id="wallet-account-card-address"') &&
+    wallet.includes('id="wallet-account-card-copy"') &&
+    wallet.includes('id="wallet-hero-back"') &&
     wallet.indexOf('class="wallet-hero-balance"') <
       wallet.indexOf('id="wallet-delta"') &&
     wallet.indexOf('id="wallet-delta"') <
-      wallet.indexOf('id="wallet-account-detail"') &&
+      wallet.indexOf('id="wallet-account-card"') &&
     wallet.indexOf('id="wallet-total-balance"') <
       wallet.indexOf('class="wallet-action-row"') &&
     walletJs.includes("renderHeroAccount(allAccounts)") &&
     walletJs.includes("selectedOrDefaultAccount") &&
     walletJs.includes("defaultWalletAccount") &&
     walletJs.includes("latestDefault") &&
-    walletJs.includes("wallet-detail-inline") &&
+    walletJs.includes("has-account-card") &&
     walletJs.includes(
       'selectedAccountId = selectedAccountId === accountId ? "" : accountId',
     ) &&
-    walletJs.includes(
-      'getSelectedAccountId() === account.account_id ? "Show default wallet" : "Show in hero"',
-    ) &&
     walletJs.includes("clearAccountSelection") &&
     walletJs.includes("is-selected") &&
-    walletJs.includes("wallet-detail-qr") &&
+    walletJs.includes("accountCardCopyNode.replaceChildren") &&
+    walletJs.includes("openReceiveFlow") &&
     walletJs.includes("/api/wallet/qr") &&
     !walletJs.includes("visibleAccounts") &&
     !walletJs.includes("Selected account ·") &&
     !walletJs.includes("Hide details") &&
     !walletJs.includes("clearAccountFilter") &&
-    !walletJs.includes("accountDetailNode.scrollIntoView") &&
-    !walletJs.includes("wallet-detail-balance") &&
-    !walletJs.includes("wallet-detail-section") &&
     !walletJs.includes("No transactions yet") &&
     !walletJs.includes("closeOverlaySurfaces") &&
     !walletJs.includes("walletPageNode") &&
@@ -10406,55 +11360,39 @@ assert(
       walletStyle,
       ".wallet-hero-row {",
       "Wallet hero row style",
-    ).includes(
-      "grid-template-columns: minmax(240px, 1fr) minmax(160px, 0.6fr) minmax(190px, 220px)",
-    ) &&
+    ).includes("grid-template-columns: 1fr;") &&
     sourceBlock(walletStyle, ".wallet-delta {", "Wallet graph style").includes(
       "justify-self: center",
     ) &&
     sourceBlock(
       walletStyle,
-      ".wallet-detail {",
-      "Wallet detail style",
-    ).includes("justify-self: end") &&
+      "@container wallet-hero-front (min-width: 700px)",
+      "Wallet wide hero layout",
+    ).includes("grid-template-columns: minmax(0, 1fr) minmax(240px, 340px);") &&
     sourceBlock(
       walletStyle,
-      "@media (max-width: 780px)",
-      "Wallet mobile media",
-    ).includes(".wallet-detail {\n    justify-self: center;") &&
-    !sourceBlock(
+      "\n.wallet-account-card {",
+      "Wallet account card style",
+    ).includes("margin: 6px auto 0;") &&
+    sourceBlock(
       walletStyle,
-      ".wallet-detail {",
-      "Wallet detail style",
-    ).includes("min-height:") &&
-    !sourceBlock(
-      walletStyle,
-      ".wallet-detail {",
-      "Wallet detail style",
-    ).includes("border:") &&
-    !sourceBlock(
-      walletStyle,
-      ".wallet-detail {",
-      "Wallet detail style",
-    ).includes("background:") &&
-    !sourceBlock(
-      walletStyle,
-      ".wallet-detail {",
-      "Wallet detail style",
-    ).includes("position: fixed") &&
-    walletStyle.includes(".wallet-detail-inline") &&
-    walletStyle.includes("width: 156px;") &&
-    walletStyle.includes("width: 132px;") &&
+      "@container wallet-hero-front (min-width: 700px)",
+      "Wallet wide hero layout",
+    ).includes("justify-self: end") &&
+    walletStyle.includes(".wallet-hero-face-back .wallet-qr") &&
+    walletStyle.includes(".wallet-account-card-copy") &&
     walletStyle.includes(
       "grid-template-columns: repeat(auto-fill, minmax(200px, 1fr))",
     ) &&
-    walletStyle.includes("min-height: 118px") &&
+    !walletStyle.includes(".wallet-detail") &&
+    !walletStyle.includes(".wallet-detail-inline") &&
+    !walletStyle.includes(".wallet-detail-qr") &&
+    !walletStyle.includes(".wallet-detail-address") &&
+    !walletStyle.includes(".wallet-detail-summary") &&
     !walletStyle.includes(".wallet-address") &&
     !walletStyle.includes(".wallet-detail-close") &&
-    !walletStyle.includes(".wallet-detail-balance") &&
-    !walletStyle.includes(".wallet-detail-section") &&
     walletStyle.includes(".wallet-account.is-selected"),
-  "Wallet hero must keep balance/actions on the left, graph centered, QR/address on the right, center QR on mobile, and denser account cards without separate containers, side sheets, scroll jumps, transactions placeholders, or duplicate balances",
+  "Wallet hero must keep the reviewed front-face balance and branded account card, move QR/address into the receive face, and avoid stale detail-pane or placeholder chrome",
 );
 assert(
   gatewayApi.includes('WALLET_CAPSULE_ID => "Wallet"') &&
@@ -10509,6 +11447,19 @@ assert(
   !walletMetamask.includes("WalletConnect") &&
     !walletMetamaskJs.includes("walletconnect"),
   "WalletConnect must not be visible until a pinned connector exists",
+);
+assert(
+  walletWalletconnect.includes('id="wallet-connect"') &&
+    walletWalletconnect.includes('id="wallet-state"') &&
+    walletWalletconnect.includes('id="wallet-accounts"') &&
+    walletWalletconnect.includes('id="wallet-requests"') &&
+    walletWalletconnect.includes('<script src="./elastos-theme.js"></script>') &&
+    walletWalletconnect.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    [...walletWalletconnectStyle.matchAll(/letter-spacing:\s*([^;]+);/g)].every(([, value]) => value.trim() === "0") &&
+    !walletWalletconnectStyle.includes("linear-gradient(") &&
+    !walletWalletconnectStyle.includes("radial-gradient(") &&
+    walletWalletconnectStyle.includes('font-family: var(--el-font, "Inter", sans-serif);'),
+  "WalletConnect connector UI must use the same shared-token surface without adding a second authority path",
 );
 assert(
   !system.includes("<dt>Wallet requests</dt>") &&
@@ -10734,9 +11685,15 @@ assert(
   systemStyle.includes(".pc2-section-title") &&
     systemStyle.includes("font-size: 11px;") &&
     systemStyle.includes("text-transform: uppercase;") &&
-    systemStyle.includes("background: #f9f9f9;") &&
-    systemStyle.includes("border: 1px solid #d0d0d0;"),
-  "System Settings must keep PC2 compact section/card styling",
+    systemStyle.includes(".settings-content h1") &&
+    (systemStyle.match(/letter-spacing:\s*[^;]+;/g) || []).length === 5 &&
+    (systemStyle.match(/letter-spacing:\s*[^;]+;/g) || []).every(
+      (declaration) => declaration === "letter-spacing: 0;",
+    ) &&
+    systemStyle.includes(".pc2-card-row") &&
+    systemStyle.includes("background: var(--color-settings-card);") &&
+    systemStyle.includes("border: 1px solid var(--color-border);"),
+  "System Settings must keep PC2 compact section/card styling with exact zero letter spacing throughout System",
 );
 assert(
   !system.includes('data-settings="storage"') &&
@@ -10768,6 +11725,7 @@ const publicInstallHomeFrontdoorSmoke = read("scripts/public-install-home-frontd
 const publicInstallIdentitySmoke = read("scripts/public-install-identity-smoke.sh");
 assertMarkdownLocalLinksResolve();
 assertMarkdownScriptReferencesResolve();
+assertStandingDocsHaveNoReleaseSnapshots();
 assertOrdinaryCapsulesDoNotReferenceRawBlockchainAuthority();
 assert(
     installDoc.includes("## Install from the publisher") &&
@@ -10780,7 +11738,9 @@ assert(
     runtimeChecklist.includes("## Installed acceptance") &&
     runtimeChecklist.includes("## Release gate") &&
     runtimeChecklist.includes("source, installed-product behavior, and public deployment as separate") &&
-    runtimeChecklist.includes("fix/elastos-shell-protocol-browser-wallet-consolidation") &&
+    runtimeChecklist.includes("ELASTOS_REVIEW_BASE") &&
+    runtimeChecklist.includes("from `state.md` and fetched refs") &&
+    runtimeChecklist.includes("## Source integration gate") &&
     runtimeChecklist.includes("just verify") &&
     runtimeChecklist.includes("scripts/public-install-identity-smoke.sh") &&
     runtimeChecklist.includes("scripts/public-install-home-frontdoor-smoke.sh") &&
@@ -10804,12 +11764,17 @@ assert(
     currentState.includes("lacks the current `home` setup profile") &&
     tasks.includes("Keep source/local Carrier setup proof green") &&
     tasks.includes("scripts/local-carrier-setup-smoke.sh") &&
-    tasks.includes("publish the 0.6.0 binary/artifact set so no-override public installed-path smokes use current code"),
+    tasks.includes("publish the approved version's binary/artifact set so no-override public installed-path smokes use current code"),
   "Install docs, release checklist, state, tasks, and executable smokes must preserve separate source, installed, and public-release proof boundaries",
 );
 assert(
   !tasks.includes("- [x]"),
   "TASKS.md must contain open work only; completed work belongs in elastos/CHANGELOG.md",
+);
+assert(
+  read("scripts/local-carrier-setup-smoke.sh").includes("printf 'q\\n' | XDG_DATA_HOME=\"${XDG_DATA_HOME}\" \\\n    \"${ELASTOS_BIN}\" >\"${HOME_OUT}\"") &&
+    !read("scripts/local-carrier-setup-smoke.sh").includes("script -qec"),
+  "Local carrier setup smoke must exercise the direct Home CLI contract, not a PTY wrapper path",
 );
 const productionStorageTaskLines =
   tasks.match(/^- \[ \] BLOCKER - production multi-peer availability\/storage markets .+$/gm) ??

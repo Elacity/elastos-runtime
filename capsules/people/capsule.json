@@ -1,8 +1,8 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "people",
-  "version": "0.1.0",
-  "description": "Manage people, profile details, and local discovery",
+  "version": "0.2.0",
+  "description": "Manage profile details and contacts, and view signed online presence",
   "author": "elastos",
   "role": "app",
   "type": "wasm",
@@ -11,15 +11,16 @@
   "execution": "web-projection",
   "projections": ["web", "facts", "affordances", "gates"],
   "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
   "interfaces": [
     {
       "id": "elastos.people.contacts",
       "version": "0.6.0",
-      "description": "Manage people and discovery for the signed-in user",
+      "description": "Manage profile and contacts and read signed online presence",
       "methods": [
         {
           "id": "people.summary",
-          "description": "Read the current profile, contacts, and discovery state",
+          "description": "Read the current profile and contacts",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "summary",
@@ -36,22 +37,13 @@
           "operation": "update"
         },
         {
-          "id": "discovery.update",
-          "description": "Change local People discovery state",
-          "risk": "write",
+          "id": "presence.read",
+          "description": "Read verified, unexpired online presence for the configured collaboration network",
+          "risk": "read",
           "approval": "runtime_policy",
-          "audit": "event",
-          "resource": "elastos://people/discovery",
-          "operation": "update"
-        },
-        {
-          "id": "discovery.request",
-          "description": "Request or approve a connection with a visible person",
-          "risk": "privileged",
-          "approval": "user",
-          "audit": "full",
-          "resource": "elastos://people/discovery/requests",
-          "operation": "request"
+          "audit": "summary",
+          "resource": "elastos://people/presence",
+          "operation": "read"
         },
         {
           "id": "contacts.remove",

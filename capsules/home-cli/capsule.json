@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "home-cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Terminal Home view for ElastOS",
   "author": "elastos",
   "role": "shell",
@@ -11,6 +11,7 @@
   "execution": "web-projection",
   "projections": ["web", "terminal", "cli", "facts", "affordances", "gates"],
   "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
   "interfaces": [
     {
       "id": "elastos.shell.cli",

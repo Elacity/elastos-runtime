@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "archive-manager",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Browse and extract supported archive contents through Library",
   "role": "viewer",
   "type": "wasm",
@@ -11,6 +11,7 @@
   "projections": ["web", "facts", "affordances", "gates"],
   "author": "elastos",
   "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
   "interfaces": [
     {
       "id": "elastos.archive.viewer",

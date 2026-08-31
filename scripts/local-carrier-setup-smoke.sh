@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# The Runtime's media-provider validators require every data-root directory
+# to be owner-only; the default umask (022) stages this smoke's ephemeral
+# tree world-readable and setup fails with "Runtime data root must be
+# owner-only".
+umask 077
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ELASTOS_ROOT="${REPO_ROOT}/elastos"
@@ -98,6 +103,10 @@ echo "[local-carrier-setup] building current binary and first-party Home core as
 (cd "${REPO_ROOT}/capsules/chain-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/net-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/exit-provider" && cargo build --release)
+(cd "${REPO_ROOT}/capsules/ipfs-provider" && cargo build --release)
+(cd "${REPO_ROOT}/capsules/media-provider" && cargo build --release)
+(cd "${REPO_ROOT}/capsules/protected-content-protect-provider" && cargo build --release)
+(cd "${REPO_ROOT}/capsules/protected-content-decrypt-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/browser-engine-adapter" && cargo build --release)
 (cd "${REPO_ROOT}/elastos/tools/browser-engine-supervisor" && cargo build --release)
 (cd "${REPO_ROOT}/elastos/tools/browser-native-proxy-engine" && cargo build --release)
@@ -113,10 +122,12 @@ for capsule in \
     home-cli \
     home-gui \
     archive-manager \
+    assistant \
     browser \
     system \
     services \
     documents \
+    elacity-player \
     inbox \
     library \
     marketplace \
@@ -149,6 +160,10 @@ DID_PROVIDER_BIN="${REPO_ROOT}/capsules/did-provider/target/release/did-provider
 CHAIN_PROVIDER_BIN="${REPO_ROOT}/capsules/chain-provider/target/release/chain-provider" \
 NET_PROVIDER_BIN="${REPO_ROOT}/capsules/net-provider/target/release/net-provider" \
 EXIT_PROVIDER_BIN="${REPO_ROOT}/capsules/exit-provider/target/release/exit-provider" \
+IPFS_PROVIDER_BIN="${REPO_ROOT}/capsules/ipfs-provider/target/release/ipfs-provider" \
+MEDIA_PROVIDER_BIN="${REPO_ROOT}/capsules/media-provider/target/release/media-provider" \
+PROTECTED_CONTENT_PROTECT_PROVIDER_BIN="${REPO_ROOT}/capsules/protected-content-protect-provider/target/release/protected-content-protect-provider" \
+PROTECTED_CONTENT_DECRYPT_PROVIDER_BIN="${REPO_ROOT}/capsules/protected-content-decrypt-provider/target/release/protected-content-decrypt-provider" \
 BROWSER_ENGINE_ADAPTER_BIN="${REPO_ROOT}/capsules/browser-engine-adapter/target/release/browser-engine-adapter" \
 BROWSER_ENGINE_SUPERVISOR_BIN="${REPO_ROOT}/elastos/tools/browser-engine-supervisor/target/release/browser-engine-supervisor" \
 BROWSER_NATIVE_PROXY_ENGINE_BIN="${REPO_ROOT}/elastos/tools/browser-native-proxy-engine/target/release/browser-native-proxy-engine" \
@@ -169,6 +184,8 @@ DOCUMENTS_CAPSULE_DIR="${REPO_ROOT}/capsules/documents" \
 LIBRARY_CAPSULE_DIR="${REPO_ROOT}/capsules/library" \
 MARKETPLACE_CAPSULE_DIR="${REPO_ROOT}/capsules/marketplace" \
 ARCHIVE_MANAGER_CAPSULE_DIR="${REPO_ROOT}/capsules/archive-manager" \
+ASSISTANT_CAPSULE_DIR="${REPO_ROOT}/capsules/assistant" \
+ELACITY_PLAYER_CAPSULE_DIR="${REPO_ROOT}/capsules/elacity-player" \
 INBOX_CAPSULE_DIR="${REPO_ROOT}/capsules/inbox" \
 WALLET_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet" \
 WALLET_METAMASK_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet-metamask" \
@@ -206,6 +223,14 @@ mapping = {
     "chain-provider": pathlib.Path(os.environ["CHAIN_PROVIDER_BIN"]),
     "net-provider": pathlib.Path(os.environ["NET_PROVIDER_BIN"]),
     "exit-provider": pathlib.Path(os.environ["EXIT_PROVIDER_BIN"]),
+    "ipfs-provider": pathlib.Path(os.environ["IPFS_PROVIDER_BIN"]),
+    "media-provider": pathlib.Path(os.environ["MEDIA_PROVIDER_BIN"]),
+    "protected-content-protect-provider": pathlib.Path(
+        os.environ["PROTECTED_CONTENT_PROTECT_PROVIDER_BIN"]
+    ),
+    "protected-content-decrypt-provider": pathlib.Path(
+        os.environ["PROTECTED_CONTENT_DECRYPT_PROVIDER_BIN"]
+    ),
     "browser-engine-adapter": pathlib.Path(os.environ["BROWSER_ENGINE_ADAPTER_BIN"]),
     "browser-engine-supervisor": pathlib.Path(os.environ["BROWSER_ENGINE_SUPERVISOR_BIN"]),
     "browser-native-proxy-engine": pathlib.Path(os.environ["BROWSER_NATIVE_PROXY_ENGINE_BIN"]),
@@ -267,6 +292,8 @@ browser_capsules = {
     "library": pathlib.Path(os.environ["LIBRARY_CAPSULE_DIR"]),
     "marketplace": pathlib.Path(os.environ["MARKETPLACE_CAPSULE_DIR"]),
     "archive-manager": pathlib.Path(os.environ["ARCHIVE_MANAGER_CAPSULE_DIR"]),
+    "assistant": pathlib.Path(os.environ["ASSISTANT_CAPSULE_DIR"]),
+    "elacity-player": pathlib.Path(os.environ["ELACITY_PLAYER_CAPSULE_DIR"]),
     "wallet": pathlib.Path(os.environ["WALLET_CAPSULE_DIR"]),
     "wallet-metamask": pathlib.Path(os.environ["WALLET_METAMASK_CAPSULE_DIR"]),
     "wallet-unisat": pathlib.Path(os.environ["WALLET_UNISAT_CAPSULE_DIR"]),
@@ -496,7 +523,7 @@ HOME_OUT="${TEST_ROOT}/home.txt"
     printf 'q\n' | XDG_DATA_HOME="${XDG_DATA_HOME}" \
     "${ELASTOS_BIN}" >"${HOME_OUT}"
 )
-grep -q "ElastOS Home" "${HOME_OUT}" || {
+grep -q "Home CLI /" "${HOME_OUT}" || {
     echo "expected home output missing from ${HOME_OUT}" >&2
     exit 1
 }

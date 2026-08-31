@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "system",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Manage your account, appearance, security, apps, and device",
   "author": "elastos",
   "role": "app",
@@ -11,6 +11,7 @@
   "execution": "web-projection",
   "projections": ["web", "facts", "affordances", "gates"],
   "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
   "interfaces": [
     {
       "id": "elastos.system.shell",

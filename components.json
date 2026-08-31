@@ -19,15 +19,6 @@
         "aarch64-linux"
       ]
     },
-    "chat": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "x86_64-linux",
-        "aarch64-linux"
-      ]
-    },
     "did-provider": {
       "cid": "",
       "sha256": "",
@@ -100,8 +91,8 @@
       ],
       "install_path": "capsules/wallet-walletconnect",
       "entrypoint": "browser/index.html",
-      "entrypoint_sha256": "sha256:6e18e94f36708b7a7b9ee1fa672cc69db871ffb7d6130062de8b99cd8ced906b",
-      "entrypoint_size": 1389,
+      "entrypoint_sha256": "sha256:b5fc187eef3396671ff204cd0ba7291f8af6739b6fd6b964689f29160e082865",
+      "entrypoint_size": 1480,
       "runtime_abi": "elastos.runtime-projection/v1",
       "execution": "web-projection",
       "bus_contract": "elastos.runtime-projection/v1",
@@ -115,13 +106,13 @@
       "browser_assets": [
         {
           "path": "browser/index.html",
-          "sha256": "sha256:6e18e94f36708b7a7b9ee1fa672cc69db871ffb7d6130062de8b99cd8ced906b",
-          "size": 1389
+          "sha256": "sha256:b5fc187eef3396671ff204cd0ba7291f8af6739b6fd6b964689f29160e082865",
+          "size": 1480
         },
         {
           "path": "browser/style.css",
-          "sha256": "sha256:3bafe2b1f9e88a5c474acdd7e3a2053ed4fd0848b6e624acd5098a0cbb639387",
-          "size": 4606
+          "sha256": "sha256:4a0374a4dc24d660c3cef462159de484aaaba9ad97f9f2d802fdee2083e1452c",
+          "size": 4704
         },
         {
           "path": "browser/wallet-walletconnect.js",
@@ -193,34 +184,7 @@
         "aarch64-linux"
       ]
     },
-    "ai-provider": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "x86_64-linux",
-        "aarch64-linux"
-      ]
-    },
-    "llama-provider": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "x86_64-linux",
-        "aarch64-linux"
-      ]
-    },
     "tunnel-provider": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "x86_64-linux",
-        "aarch64-linux"
-      ]
-    },
-    "agent": {
       "cid": "",
       "sha256": "",
       "size": 0,
@@ -261,6 +225,13 @@
     "localhost-provider": {
       "install_path": "bin/localhost-provider",
       "description": "Host localhost provider binary required for runtime storage access",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "localhost://*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -288,6 +259,13 @@
     "did-provider": {
       "install_path": "bin/did-provider",
       "description": "Host DID provider binary required for managed chat identity",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://did/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -315,6 +293,13 @@
     "chain-provider": {
       "install_path": "bin/chain-provider",
       "description": "Host chain provider binary for typed production chain access",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://chain/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -342,6 +327,13 @@
     "net-provider": {
       "install_path": "bin/net-provider",
       "description": "Host Browser/Net provider binary for exit-mediated web connectivity",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://net/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -369,6 +361,13 @@
     "exit-provider": {
       "install_path": "bin/exit-provider",
       "description": "Host Browser Exit provider contract for Runtime-mediated network egress",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://exit/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -396,6 +395,13 @@
     "browser-engine-adapter": {
       "install_path": "bin/browser-engine-adapter",
       "description": "Host Browser Engine Adapter contract for Runtime-mediated browser rendering",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://browser-engine/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -510,6 +516,13 @@
     "wallet-provider": {
       "install_path": "bin/wallet-provider",
       "description": "Host wallet provider binary for proof challenges, linked-account metadata, and typed wallet authority",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://wallet/meta/status"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -537,6 +550,13 @@
     "object-provider": {
       "install_path": "bin/object-provider",
       "description": "Host object provider binary for principal-root Library object authority",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://object/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -564,6 +584,13 @@
     "content-block-graph-provider": {
       "install_path": "bin/content-block-graph-provider",
       "description": "Host block graph provider binary for Runtime-mediated arbitrary DAG repair",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://block-graph/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -668,9 +695,156 @@
         }
       }
     },
+    "custody-provider": {
+      "install_path": "bin/custody-provider",
+      "description": "Host protected-content custody node provider binary for owner-only node provisioning and inactive Runtime-selected custody routes",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "custody",
+        "runtime_only": true
+      },
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "custody-provider-linux-amd64",
+          "install_path": "bin/custody-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "custody-provider-linux-arm64",
+          "install_path": "bin/custody-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "custody-provider-darwin-arm64",
+          "install_path": "bin/custody-provider"
+        }
+      }
+    },
+    "protected-content-protect-provider": {
+      "install_path": "bin/protected-content-protect-provider",
+      "description": "Host protected-content protect provider binary for inactive Runtime-selected CENC origin packaging",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "protect",
+        "runtime_only": true
+      },
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-protect-provider-linux-amd64",
+          "install_path": "bin/protected-content-protect-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-protect-provider-linux-arm64",
+          "install_path": "bin/protected-content-protect-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-protect-provider-darwin-arm64",
+          "install_path": "bin/protected-content-protect-provider"
+        }
+      }
+    },
+    "media-provider": {
+      "install_path": "bin/media-provider",
+      "description": "Host protected-content media preparation provider binary for Runtime-selected clear fragmented MP4 preparation",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "media",
+        "runtime_only": true
+      },
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "media-provider-linux-amd64",
+          "install_path": "bin/media-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "media-provider-linux-arm64",
+          "install_path": "bin/media-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "media-provider-darwin-arm64",
+          "install_path": "bin/media-provider"
+        }
+      }
+    },
+    "protected-content-decrypt-provider": {
+      "install_path": "bin/protected-content-decrypt-provider",
+      "description": "Host protected-content decrypt provider binary for inactive Runtime-selected scoped viewer sessions",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "protected-content-decrypt",
+        "runtime_only": true
+      },
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-decrypt-provider-linux-amd64",
+          "install_path": "bin/protected-content-decrypt-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-decrypt-provider-linux-arm64",
+          "install_path": "bin/protected-content-decrypt-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-decrypt-provider-darwin-arm64",
+          "install_path": "bin/protected-content-decrypt-provider"
+        }
+      }
+    },
     "webspace-provider": {
       "install_path": "bin/webspace-provider",
       "description": "Host WebSpace resolver binary for mounted localhost://WebSpaces/<moniker>/... handles",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "localhost://WebSpaces/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -692,6 +866,40 @@
           "size": 0,
           "release_path": "webspace-provider-darwin-arm64",
           "install_path": "bin/webspace-provider"
+        }
+      }
+    },
+    "model-provider": {
+      "install_path": "bin/model-provider",
+      "description": "Host model provider binary for typed local model offers and runs",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://model/*"
+      },
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "model-provider-linux-amd64",
+          "install_path": "bin/model-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "model-provider-linux-arm64",
+          "install_path": "bin/model-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "model-provider-darwin-arm64",
+          "install_path": "bin/model-provider"
         }
       }
     },
@@ -754,6 +962,20 @@
           "release_path": "home.tar.gz",
           "extract_path": "home",
           "install_path": "capsules/home"
+        }
+      }
+    },
+    "assistant": {
+      "install_path": "capsules/assistant",
+      "description": "Assistant capsule for typed model access through Runtime authorization",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "assistant.tar.gz",
+          "extract_path": "assistant",
+          "install_path": "capsules/assistant"
         }
       }
     },
@@ -869,31 +1091,16 @@
         }
       }
     },
-    "chat": {
-      "install_path": "capsules/chat",
-      "description": "Packaged microVM chat bundle for the full-screen Carrier chat path",
-      "platforms": {
-        "linux-amd64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "chat-linux-amd64.tar.gz",
-          "extract_path": "chat",
-          "install_path": "capsules/chat"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "chat-linux-arm64.tar.gz",
-          "extract_path": "chat",
-          "install_path": "capsules/chat"
-        }
-      }
-    },
     "ipfs-provider": {
       "install_path": "bin/ipfs-provider",
       "description": "Host IPFS bridge binary required for direct share/open and attest commands",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://ipfs/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -1006,6 +1213,20 @@
         }
       }
     },
+    "elacity-player": {
+      "install_path": "capsules/elacity-player",
+      "description": "Protected video viewer capsule through Runtime-scoped object-provider access.",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "elacity-player.tar.gz",
+          "extract_path": "elacity-player",
+          "install_path": "capsules/elacity-player"
+        }
+      }
+    },
     "marketplace": {
       "install_path": "capsules/marketplace",
       "description": "Marketplace for browsing installed apps, viewers, providers, and content",
@@ -1073,6 +1294,20 @@
           "release_path": "gba-ucity.tar.gz",
           "extract_path": "gba-ucity",
           "install_path": "capsules/gba-ucity"
+        }
+      }
+    },
+    "gba-nonogram": {
+      "install_path": "capsules/gba-nonogram",
+      "description": "Nonogram Advance — MIT homebrew cartridge for the browser GBA viewer",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "gba-nonogram.tar.gz",
+          "extract_path": "gba-nonogram",
+          "install_path": "capsules/gba-nonogram"
         }
       }
     },
@@ -1218,7 +1453,7 @@
       ]
     },
     "home": {
-      "description": "Managed Home plus native Carrier chat",
+      "description": "Managed Home",
       "components": [
         "shell",
         "localhost-provider",
@@ -1245,16 +1480,23 @@
         "wallet",
         "object-provider",
         "content-block-graph-provider",
+        "kubo",
+        "ipfs-provider",
+        "protected-content-protect-provider",
+        "media-provider",
+        "protected-content-decrypt-provider",
         "browser",
         "documents",
         "library",
+        "elacity-player",
         "marketplace",
         "archive-manager",
-        "inbox"
+        "inbox",
+        "assistant"
       ]
     },
     "demo": {
-      "description": "Home demo path with native chat, room, full-screen chat, site, sharing, GBA, and browser capsule surfaces",
+      "description": "Home demo path with Runtime-backed Chat, site, sharing, GBA, and Browser surfaces",
       "components": [
         "shell",
         "localhost-provider",
@@ -1282,31 +1524,25 @@
         "object-provider",
         "content-block-graph-provider",
         "browser",
-        "chat",
         "gba-emulator",
         "gba-ucity",
+        "gba-nonogram",
         "chat-room",
         "site-provider",
         "tunnel-provider",
         "cloudflared",
         "kubo",
         "ipfs-provider",
+        "protected-content-protect-provider",
+        "media-provider",
+        "protected-content-decrypt-provider",
         "documents",
         "library",
+        "elacity-player",
         "marketplace",
         "archive-manager",
-        "inbox"
-      ]
-    },
-    "chat": {
-      "description": "Packaged full-screen microVM chat on a KVM-capable host",
-      "components": [
-        "shell",
-        "localhost-provider",
-        "did-provider",
-        "chat",
-        "crosvm",
-        "vmlinux"
+        "inbox",
+        "assistant"
       ]
     },
     "operator": {
@@ -1328,7 +1564,11 @@
         "drm-provider",
         "rights-provider",
         "key-provider",
-        "decrypt-provider"
+        "decrypt-provider",
+        "protected-content-protect-provider",
+        "media-provider",
+        "custody-provider",
+        "protected-content-decrypt-provider"
       ]
     },
     "agent-local-ai": {
@@ -1362,11 +1602,17 @@
         "browser",
         "kubo",
         "ipfs-provider",
+        "protected-content-protect-provider",
+        "media-provider",
+        "protected-content-decrypt-provider",
         "documents",
         "library",
+        "elacity-player",
         "marketplace",
         "archive-manager",
         "inbox",
+        "assistant",
+        "model-provider",
         "llama-server",
         "model-qwen3.5-0.8b"
       ]
@@ -1403,13 +1649,18 @@
         "kubo",
         "ipfs-provider",
         "availability-provider",
+        "protected-content-protect-provider",
+        "media-provider",
+        "protected-content-decrypt-provider",
         "site-provider",
         "tunnel-provider",
         "documents",
         "library",
+        "elacity-player",
         "marketplace",
         "archive-manager",
         "inbox",
+        "assistant",
         "cloudflared"
       ]
     },
@@ -1435,6 +1686,10 @@
         "rights-provider",
         "key-provider",
         "decrypt-provider",
+        "protected-content-protect-provider",
+        "media-provider",
+        "custody-provider",
+        "protected-content-decrypt-provider",
         "home-cli",
         "home-gui",
         "home",
@@ -1446,9 +1701,9 @@
         "wallet-walletconnect",
         "wallet",
         "browser",
-        "chat",
         "gba-emulator",
         "gba-ucity",
+        "gba-nonogram",
         "chat-room",
         "ipfs-provider",
         "availability-provider",
@@ -1456,9 +1711,12 @@
         "tunnel-provider",
         "documents",
         "library",
+        "elacity-player",
         "marketplace",
         "archive-manager",
         "inbox",
+        "assistant",
+        "model-provider",
         "crosvm",
         "vmlinux",
         "kubo",

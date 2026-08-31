@@ -7,6 +7,7 @@ import {
   inTrash,
   isBlockedObject,
   isDirectory,
+  isRuntimeCustodyProtectableVideo,
   isTrashRootUri,
   isTrashUri,
   isWebSpaceUri,
@@ -37,6 +38,10 @@ import {
   createHomeClipboardClient,
 } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
 
+    const LIBRARY_SIDEBAR_WIDTH_DEFAULT = 220;
+    const LIBRARY_SIDEBAR_WIDTH_MIN = 180;
+    const LIBRARY_SIDEBAR_WIDTH_MAX = 320;
+
     const viewPreferences = new Map();
     const viewPreferenceStore = {
       getItem: (key) => viewPreferences.get(key) ?? null,
@@ -48,6 +53,8 @@ import {
       storage: viewPreferenceStore,
       perfTarget: (window.__libraryPerf = window.__libraryPerf || {}),
     });
+    state.searchOpen = false;
+    state.sidebarWidth = LIBRARY_SIDEBAR_WIDTH_DEFAULT;
     const homeOrigin = queryParams.get("home_origin") || "";
     const homeClipboard = createHomeClipboardClient({
       targetId: "library",
@@ -75,10 +82,12 @@ import {
       uploadButton: document.getElementById("upload-button"),
       newFolderButton: document.getElementById("new-folder-button"),
       pickerActionButton: document.getElementById("picker-action-button"),
+      toolbarSearch: document.getElementById("toolbar-search"),
+      searchToggleButton: document.getElementById("search-toggle-button"),
       search: document.getElementById("search"),
-      currentTitle: document.getElementById("current-title"),
       statusText: document.getElementById("status-text"),
       refreshButton: document.getElementById("refresh-button"),
+      moreButton: document.getElementById("more-button"),
       gridButton: document.getElementById("grid-button"),
       listButton: document.getElementById("list-button"),
       sortSelect: document.getElementById("sort-select"),
@@ -91,7 +100,10 @@ import {
       contextMenu: document.getElementById("context-menu"),
       dialog: document.getElementById("dialog"),
       sidebar: document.querySelector(".sidebar"),
+      sidebarResizer: document.getElementById("sidebar-resizer"),
     };
+    let homeChromeReady = false;
+    let lastHomeMenuManifestSignature = "";
     let renderContent = () => {};
     let renderFooter = () => {};
     let scheduleContentRender = () => {};
@@ -123,6 +135,7 @@ import {
     let openObject = async () => {};
     let openWithViewer = () => false;
     let pasteClipboardTo = async () => {};
+    let protectAndListObject = async () => {};
     let publishObject = async () => {};
     let publishSelectedObjects = async () => {};
     let repairObject = async () => {};
@@ -195,6 +208,7 @@ import {
       confirmDestructive,
       hideDialog,
       showObjectStatus,
+      showProtectAndListDialog,
       showProperties,
       showShareDialog,
       showShareReceipt,
@@ -273,6 +287,7 @@ import {
       openObject,
       openWithViewer,
       pasteClipboardTo,
+      protectAndListObject,
       publishObject,
       publishSelectedObjects,
       repairObject,
@@ -306,6 +321,7 @@ import {
       setUploadProgress,
       showMenuForObject,
       showObjectStatus,
+      showProtectAndListDialog,
       showProperties,
       showShareDialog,
       showShareReceipt,
@@ -352,7 +368,10 @@ import {
 
     function publicLibraryText(value) {
       const message = String(value || "").trim();
-      if (!message || !/\b(schema|projection|provider|adapter|capability|affordance|runtime-owned|launch token|hostcall|objects?|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(message)) {
+      if (
+        !message ||
+        !/\b(schema|projection|provider|adapter|capability|affordance|runtime|runtime-owned|launch token|hostcall|objects?|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(message)
+      ) {
         return message;
       }
       return "Library action could not be completed.";
@@ -396,6 +415,15 @@ import {
       return folderObject?.metadata?.readonly !== false;
     }
 
+    function clampSidebarWidth(value) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return LIBRARY_SIDEBAR_WIDTH_DEFAULT;
+      return Math.min(
+        LIBRARY_SIDEBAR_WIDTH_MAX,
+        Math.max(LIBRARY_SIDEBAR_WIDTH_MIN, Math.round(numeric)),
+      );
+    }
+
     function setFolderStatus(text) {
       if (isArchivePickerMode()) {
         setStatus("");
@@ -405,11 +433,36 @@ import {
         setStatus(attachStatusText());
         return;
       }
-      setStatus(text);
+      setStatus("");
+    }
+
+    function syncSearchChrome() {
+      const searchOpen = state.searchOpen || Boolean(state.query);
+      elements.libraryShell.dataset.searchOpen = searchOpen ? "true" : "false";
+      elements.toolbarSearch?.classList.toggle("open", searchOpen);
+      elements.searchToggleButton.title = searchOpen ? "Hide search" : "Search";
+      elements.searchToggleButton.setAttribute("aria-label", searchOpen ? "Hide search" : "Search");
+      elements.searchToggleButton.setAttribute("aria-pressed", searchOpen ? "true" : "false");
+      elements.searchToggleButton.setAttribute("aria-expanded", searchOpen ? "true" : "false");
+      elements.search.tabIndex = searchOpen ? 0 : -1;
+      elements.search.setAttribute("aria-hidden", searchOpen ? "false" : "true");
+    }
+
+    function syncToolbarChrome() {
+      const pickerMode = isPickerActionMode();
+      const readOnly = currentFolderReadOnly();
+      elements.pickerActionButton.classList.toggle("hidden", !pickerMode);
+      elements.uploadButton.classList.toggle("hidden", pickerMode || readOnly);
+      elements.newFolderButton.classList.toggle("hidden", pickerMode || readOnly);
+      elements.sortSelect.classList.toggle("hidden", true);
+      elements.refreshButton.classList.toggle("hidden", true);
+      elements.moreButton.classList.toggle("hidden", false);
+      syncSearchChrome();
+      syncHomeMenuManifest();
     }
 
     function syncModeChrome() {
-      elements.pickerActionButton.classList.toggle("hidden", !isPickerActionMode());
+      syncToolbarChrome();
       if (isAttachMode()) {
         elements.pickerActionButton.textContent =
           state.returnTarget === "browser" ? "Select for Browser" : "Attach to Chat";
@@ -428,6 +481,112 @@ import {
         return;
       }
       setStatus("Ready.");
+    }
+
+    function showToolbarMenu(button) {
+      const rect = button.getBoundingClientRect();
+      showBackgroundMenu(rect.left, rect.bottom + 8);
+    }
+
+    function toggleSearch() {
+      const nextOpen = !(state.searchOpen || Boolean(state.query));
+      state.searchOpen = nextOpen;
+      if (!nextOpen) {
+        elements.search.value = "";
+        state.query = "";
+        scheduleContentRender();
+      }
+      syncSearchChrome();
+      syncHomeMenuManifest();
+      if (nextOpen) {
+        elements.search.focus({ preventScroll: true });
+      } else {
+        elements.searchToggleButton.focus({ preventScroll: true });
+      }
+    }
+
+    function setSidebarWidth(width) {
+      state.sidebarWidth = clampSidebarWidth(width);
+      elements.libraryShell.style.setProperty("--library-sidebar-width", `${state.sidebarWidth}px`);
+      elements.sidebarResizer?.setAttribute("aria-valuenow", String(state.sidebarWidth));
+    }
+
+    function beginSidebarResize(startEvent) {
+      const startX = startEvent.clientX;
+      const startWidth = state.sidebarWidth;
+      const onMove = (moveEvent) => {
+        setSidebarWidth(startWidth + (moveEvent.clientX - startX));
+      };
+      const onUp = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        elements.libraryShell.dataset.sidebarResizing = "false";
+      };
+      elements.libraryShell.dataset.sidebarResizing = "true";
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp, { once: true });
+    }
+
+    function announceHomeChrome() {
+      if (!state.homeToken || !homeOrigin || window.top === window || homeChromeReady) {
+        return;
+      }
+      window.top.postMessage({ type: "home:app-ready", homeToken: state.homeToken }, homeOrigin);
+      homeChromeReady = true;
+      syncHomeMenuManifest();
+    }
+
+    function homeMenuManifest() {
+      return [
+        {
+          title: "File",
+          items: [{ label: "Close Window", cmd: "__close-window" }],
+        },
+        {
+          title: "View",
+          items: [
+            { label: "Refresh", cmd: "refresh" },
+            { label: state.searchOpen || state.query ? "Hide Search" : "Search", cmd: "toggle-search" },
+            { label: "Icon View", cmd: "view-grid" },
+            { label: "List View", cmd: "view-list" },
+          ],
+        },
+      ];
+    }
+
+    function syncHomeMenuManifest() {
+      if (!state.homeToken || !homeOrigin || window.top === window || !homeChromeReady) {
+        return;
+      }
+      const menus = homeMenuManifest();
+      const signature = JSON.stringify(menus);
+      if (signature === lastHomeMenuManifestSignature) {
+        return;
+      }
+      lastHomeMenuManifestSignature = signature;
+      window.top.postMessage({
+        type: "home:menu-manifest",
+        homeToken: state.homeToken,
+        menus,
+      }, homeOrigin);
+    }
+
+    function handleMenuCommand(command) {
+      if (command === "refresh") {
+        loadCurrentFolder().catch(showError);
+        return;
+      }
+      if (command === "toggle-search") {
+        toggleSearch();
+        return;
+      }
+      if (command === "view-grid") {
+        setView("grid");
+        return;
+      }
+      if (command === "view-list") {
+        setView("list");
+      }
     }
 
     async function completeAttachPicker() {
@@ -654,6 +813,7 @@ import {
       renderUploads();
       syncViewButtons();
       syncNavigationButtons();
+      syncToolbarChrome();
     }
 
     function renderPlaces(options = {}) {
@@ -671,7 +831,7 @@ import {
         button.draggable = true;
         button.title = "Drag to reorder";
         button.innerHTML = `
-          ${iconPlaceholder(placeIcon(root), "place-icon window-sidebar-item-icon")}
+          ${placeIconMarkup(root)}
           <span class="place-label">${escapeHtml(root.label)}</span>
         `;
         elements.places.appendChild(button);
@@ -725,6 +885,7 @@ import {
       syncPlacesActive();
       renderBreadcrumbs();
       renderFooter();
+      syncToolbarChrome();
     }
 
     function placeIcon(root) {
@@ -744,6 +905,14 @@ import {
       }[id] || "icons/sidebar-folder.svg";
     }
 
+    function placeIconMarkup(root) {
+      if (root?.id === "trash") {
+        return iconPlaceholder(placeIcon(root), "place-icon window-sidebar-item-icon");
+      }
+      const mask = escapeHtml(placeIcon(root));
+      return `<span class="place-icon place-icon-accent window-sidebar-item-icon" style="--place-mask: url('${mask}')"></span>`;
+    }
+
     function renderBreadcrumbs() {
       elements.breadcrumbs.innerHTML = "";
       const root = rootForUri(state.currentUri);
@@ -759,7 +928,6 @@ import {
         elements.breadcrumbs.appendChild(pathSeparator());
         elements.breadcrumbs.appendChild(crumbButton(decodeURIComponent(segments[index]), cursor, index === segments.length - 1));
       }
-      elements.currentTitle.textContent = segments.length ? decodeURIComponent(segments[segments.length - 1]) : root.label;
     }
 
     function pathSeparator() {
@@ -841,6 +1009,9 @@ import {
               if (hasCapability(object, "unpublish")) actions.push(menuAction("Unpublish", () => unpublishObject(object)));
           } else if (hasCapability(object, "publish")) {
             actions.push(menuAction("Publish", () => publishObject(object)));
+            if (isRuntimeCustodyProtectableVideo(object)) {
+              actions.push(menuAction("Protect and List...", () => protectAndListObject(object)));
+            }
           }
         }
         actions.push("-");
@@ -872,7 +1043,11 @@ import {
         );
       }
       if (object.published && publicCid) {
-        actions.push(menuAction("Copy Published Link", () => copyText("elastos://" + publicCid, "published link")));
+        actions.push(menuAction("Copy Published Link", () => copyText(
+          "elastos://" + publicCid,
+          "published link",
+          "resource.uri",
+        )));
       }
       actions.push(menuAction("Properties", () => showProperties(object)));
       renderMenu(actions, x, y);
@@ -1024,6 +1199,7 @@ import {
       syncContentViewMode();
       syncViewButtons();
       renderFooter();
+      syncHomeMenuManifest();
     }
 
     function showError(error) {
@@ -1035,6 +1211,38 @@ import {
       elements.pickerActionButton.addEventListener("click", () => {
         const action = isAttachMode() ? completeAttachPicker : completeArchivePicker;
         action().catch(showError);
+      });
+      elements.searchToggleButton.addEventListener("click", () => {
+        toggleSearch();
+      });
+      elements.moreButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        showToolbarMenu(elements.moreButton);
+      });
+      elements.sidebarResizer?.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        beginSidebarResize(event);
+      });
+      elements.sidebarResizer?.addEventListener("keydown", (event) => {
+        if (event.key === "ArrowLeft") {
+          event.preventDefault();
+          setSidebarWidth(state.sidebarWidth - 16);
+          return;
+        }
+        if (event.key === "ArrowRight") {
+          event.preventDefault();
+          setSidebarWidth(state.sidebarWidth + 16);
+        }
+      });
+      window.addEventListener("message", (event) => {
+        if (event.origin !== "null" || event.source !== window.parent) {
+          return;
+        }
+        const message = event.data;
+        if (message?.type !== "elastos:menu-command" || typeof message.cmd !== "string") {
+          return;
+        }
+        handleMenuCommand(message.cmd);
       });
       bindLibraryEvents({
         bindDialogEvents,
@@ -1077,6 +1285,7 @@ import {
     }
 
     async function boot() {
+      setSidebarWidth(state.sidebarWidth);
       if (!state.homeToken) {
         elements.lockedShell.classList.remove("hidden");
         return;
@@ -1085,6 +1294,7 @@ import {
       elements.content.dataset.view = state.view;
       syncModeChrome();
       bindEvents();
+      announceHomeChrome();
       try {
         await loadRoots();
         installBrowserHistory();

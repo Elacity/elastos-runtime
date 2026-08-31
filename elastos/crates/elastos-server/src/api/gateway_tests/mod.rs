@@ -10,6 +10,7 @@ use axum::routing::{get, post};
 use axum::Json as AxumJson;
 use base64::Engine;
 use ed25519_dalek::{Signer as _, Verifier as _};
+use elastos_protected_content_contracts::CanonicalContract;
 use elastos_runtime::auth::{
     ethereum_signed_message_hash, verify_siwe_challenge, AuthChallengeInput, AuthChallengeV1,
     AuthSessionGrantV1, PasskeyWebAuthnBinding, ProofBinding,
@@ -68,6 +69,9 @@ fn test_state(cache_dir: &std::path::Path) -> GatewayState {
     seed_test_browser_capsules(cache_dir);
     GatewayState {
         provider_registry: None,
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -128,6 +132,9 @@ async fn documents_test_state(cache_dir: &std::path::Path) -> GatewayState {
         .await;
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -140,35 +147,6 @@ async fn library_test_state(cache_dir: &std::path::Path) -> GatewayState {
 
 async fn library_test_state_without_content(cache_dir: &std::path::Path) -> GatewayState {
     library_test_state_with_content(cache_dir, false).await
-}
-
-async fn library_protected_content_test_state(cache_dir: &std::path::Path) -> GatewayState {
-    seed_test_browser_capsules(cache_dir);
-    let registry = Arc::new(ProviderRegistry::new());
-    registry
-        .register_sub_provider("content", Arc::new(MockContentProvider))
-        .await
-        .unwrap();
-    registry.register(Arc::new(MockDrmProvider)).await;
-    registry.register(Arc::new(MockRightsProvider)).await;
-    registry.register(Arc::new(MockKeyProvider)).await;
-    registry.register(Arc::new(MockDecryptProvider)).await;
-    registry
-        .register_sub_provider(
-            "object",
-            Arc::new(crate::library::ObjectProvider::new(
-                cache_dir.to_path_buf(),
-                Arc::downgrade(&registry),
-            )),
-        )
-        .await
-        .unwrap();
-    GatewayState {
-        provider_registry: Some(registry),
-        identity_manager: Arc::new(std::sync::OnceLock::new()),
-        cache_dir: cache_dir.to_path_buf(),
-        data_dir: cache_dir.to_path_buf(),
-    }
 }
 
 async fn library_external_provider_test_state(cache_dir: &std::path::Path) -> GatewayState {
@@ -189,6 +167,9 @@ async fn library_external_provider_test_state(cache_dir: &std::path::Path) -> Ga
         .unwrap();
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -218,6 +199,9 @@ async fn library_webspace_test_state(cache_dir: &std::path::Path) -> GatewayStat
         .await;
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -248,6 +232,9 @@ async fn library_test_state_with_content(
         .unwrap();
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -263,6 +250,9 @@ async fn chain_test_state(cache_dir: &std::path::Path) -> GatewayState {
         .unwrap();
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -278,6 +268,9 @@ async fn content_test_state(cache_dir: &std::path::Path) -> GatewayState {
         .unwrap();
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -293,6 +286,9 @@ async fn net_test_state(cache_dir: &std::path::Path) -> GatewayState {
         .unwrap();
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -312,6 +308,9 @@ async fn net_exit_test_state(cache_dir: &std::path::Path) -> GatewayState {
         .unwrap();
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -332,13 +331,71 @@ async fn browser_engine_attached_test_state(cache_dir: &std::path::Path) -> Gate
     browser_engine_attached_test_state_with_relay(cache_dir, None).await
 }
 
+/// Test-only recorder for Browser provider calls.
+///
+/// The mock path appends the exact call before publishing the new
+/// committed count, so a waiter that observes a count can always read the calls
+/// that produced it. Waiting on the published count is a notification rather
+/// than a spin budget, which matters under `start_paused` runtimes: a yield spin
+/// keeps the runtime busy and stops Tokio from auto-advancing the paused clock.
+#[derive(Clone)]
+struct BrowserCallRecorder {
+    calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    committed: Arc<tokio::sync::watch::Sender<usize>>,
+}
+
+type BrowserCloseCallRecorder = BrowserCallRecorder;
+type BrowserReconciliationCallRecorder = BrowserCallRecorder;
+
+impl BrowserCallRecorder {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(TokioMutex::new(Vec::new())),
+            committed: Arc::new(tokio::sync::watch::channel(0).0),
+        }
+    }
+
+    /// Appends the exact call, then publishes the new committed count. Returns
+    /// the number of calls recorded so far, including this one.
+    async fn record(&self, call: serde_json::Value) -> usize {
+        let committed = {
+            let mut calls = self.calls.lock().await;
+            calls.push(call);
+            calls.len()
+        };
+        self.committed.send_replace(committed);
+        committed
+    }
+
+    async fn snapshot(&self) -> Vec<serde_json::Value> {
+        self.calls.lock().await.clone()
+    }
+
+    fn count(&self) -> usize {
+        *self.committed.borrow()
+    }
+
+    async fn wait_for_count(&self, expected: usize) {
+        let mut committed = self.committed.subscribe();
+        loop {
+            if *committed.borrow_and_update() >= expected {
+                return;
+            }
+            committed
+                .changed()
+                .await
+                .expect("Browser provider-call recorder must remain available");
+        }
+    }
+}
+
 async fn browser_engine_reconciliation_test_state(
     cache_dir: &std::path::Path,
     failure: MockDispatchedBrowserLaunchFailure,
 ) -> (
     GatewayState,
-    Arc<TokioMutex<Vec<serde_json::Value>>>,
-    Arc<std::sync::atomic::AtomicUsize>,
+    BrowserCloseCallRecorder,
+    BrowserReconciliationCallRecorder,
 ) {
     seed_test_browser_capsules(cache_dir);
     let registry = Arc::new(ProviderRegistry::new());
@@ -356,8 +413,8 @@ async fn browser_engine_reconciliation_test_state(
         )
         .await
         .unwrap();
-    let close_calls = Arc::new(TokioMutex::new(Vec::new()));
-    let reconciliation_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let close_calls = BrowserCloseCallRecorder::new();
+    let reconciliation_calls = BrowserReconciliationCallRecorder::new();
     registry
         .register_sub_provider(
             "browser-engine",
@@ -374,6 +431,9 @@ async fn browser_engine_reconciliation_test_state(
     (
         GatewayState {
             provider_registry: Some(registry),
+            collaboration_chat_product_port: None,
+            collaboration_presence_product_port: None,
+            collaboration_discovery_service: None,
             identity_manager: Arc::new(std::sync::OnceLock::new()),
             cache_dir: cache_dir.to_path_buf(),
             data_dir: cache_dir.to_path_buf(),
@@ -384,7 +444,7 @@ async fn browser_engine_reconciliation_test_state(
 }
 
 struct MockExitClosePlan {
-    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    close_calls: BrowserCloseCallRecorder,
     close_failures: usize,
     close_hangs: usize,
     close_started: Option<Arc<tokio::sync::Notify>>,
@@ -443,6 +503,9 @@ async fn browser_engine_retrying_close_test_state(
         .unwrap();
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -466,6 +529,9 @@ async fn browser_engine_policy_blocked_test_state(cache_dir: &std::path::Path) -
         .unwrap();
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -477,14 +543,14 @@ async fn browser_engine_remote_carrier_exit_test_state(
 ) -> GatewayState {
     browser_engine_remote_carrier_exit_test_state_with_close_calls(
         cache_dir,
-        Arc::new(TokioMutex::new(Vec::new())),
+        BrowserCloseCallRecorder::new(),
     )
     .await
 }
 
 async fn browser_engine_remote_carrier_exit_test_state_with_close_calls(
     cache_dir: &std::path::Path,
-    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    close_calls: BrowserCloseCallRecorder,
 ) -> GatewayState {
     browser_engine_remote_carrier_exit_test_state_with_close_failures(cache_dir, close_calls, 0)
         .await
@@ -492,7 +558,7 @@ async fn browser_engine_remote_carrier_exit_test_state_with_close_calls(
 
 async fn browser_engine_remote_carrier_exit_test_state_with_close_failures(
     cache_dir: &std::path::Path,
-    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    close_calls: BrowserCloseCallRecorder,
     close_failures: usize,
 ) -> GatewayState {
     seed_test_browser_capsules(cache_dir);
@@ -517,6 +583,9 @@ async fn browser_engine_remote_carrier_exit_test_state_with_close_failures(
         .unwrap();
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -525,7 +594,7 @@ async fn browser_engine_remote_carrier_exit_test_state_with_close_failures(
 
 async fn rejecting_browser_engine_remote_carrier_exit_test_state_with_close_calls(
     cache_dir: &std::path::Path,
-    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    close_calls: BrowserCloseCallRecorder,
 ) -> GatewayState {
     rejecting_browser_engine_remote_carrier_exit_test_state_with_close_failures(
         cache_dir,
@@ -537,7 +606,7 @@ async fn rejecting_browser_engine_remote_carrier_exit_test_state_with_close_call
 
 async fn rejecting_browser_engine_remote_carrier_exit_test_state_with_close_failures(
     cache_dir: &std::path::Path,
-    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    close_calls: BrowserCloseCallRecorder,
     close_failures: usize,
 ) -> GatewayState {
     seed_test_browser_capsules(cache_dir);
@@ -565,6 +634,9 @@ async fn rejecting_browser_engine_remote_carrier_exit_test_state_with_close_fail
         .unwrap();
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -591,6 +663,9 @@ async fn malformed_browser_summary_test_state(cache_dir: &std::path::Path) -> Ga
         .unwrap();
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -623,6 +698,9 @@ async fn browser_engine_attached_test_state_with_relay(
         .unwrap();
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -667,6 +745,9 @@ async fn wallet_test_state_with_shared_provider(
         .unwrap();
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -717,6 +798,9 @@ async fn wallet_chain_test_state_with_shared_wallet_provider(
         .unwrap();
     GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
@@ -728,6 +812,7 @@ include!("support_runtime.rs");
 
 mod browser_profile;
 mod browser_reconciliation;
+mod collaboration_presence;
 mod documents;
 mod esp;
 #[path = "../gateway_browser_route_tests.rs"]
@@ -737,6 +822,7 @@ mod home_system;
 mod inspect;
 mod library;
 mod marketplace;
+mod model;
 mod recovery;
 mod room;
 mod site_publication;

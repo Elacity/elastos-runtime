@@ -22,53 +22,42 @@ key and revocation state are committed atomically, operators must verify the
 persisted key and restart result instead of treating command completion as a
 durable rotation receipt.
 
-### No replay protection in chat signatures
-
-**Severity:** Medium
-**Files:** `capsules/chat/src/session.rs`, `capsules/chat/src/app.rs`
-**Status:** Open
-
-The signing payload is `SHA256(sender_id:ts:content)` with no nonce, topic binding, or timestamp freshness validation. The same signed message is valid on any channel and can be replayed indefinitely.
-
-### Empty capability tokens in carrier service
+### Host-plane Carrier providers use Runtime admission
 
 **Severity:** Medium
 **Files:** `elastos/crates/elastos-server/src/carrier_service.rs`
 **Status:** Open
 
-Host-plane Carrier service providers receive empty capability tokens on all requests. This is by design for trusted host-plane code, but it means this provider class does not use the same token-forwarding path as ordinary app capsules. The trust-domain distinction needs to stay explicit in docs, manifests, and audit output.
+Host-plane Carrier service requests use a raw operation/path envelope without
+a capsule capability-token field. Runtime owns admission for this trusted
+provider class. Its trust boundary must remain explicit in manifests and audit
+output; the envelope is not an independent grant of capsule authority.
+
+### Request framing remains incompletely bounded
+
+**Files:** `elastos/crates/elastos-server/src/carrier.rs`, `elastos/crates/elastos-runtime/src/handler/io_bridge.rs`
+**Status:** Open
+
+The incoming Carrier request handler reads a line before parsing without a
+request-size cap or read deadline at that boundary. The I/O bridge rejects
+complete lines above 1 MiB, but its line readers allocate before that check.
+Size checks after reading do not bound memory use or an incomplete frame's
+lifetime. Add bounds while reading, with oversized and slow-frame tests;
+the Carrier integration task is tracked in [TASKS.md](TASKS.md#deferred-source-integration).
 
 ## Resolved Findings
 
 These findings are fixed in the current branch but remain listed as security history because they shaped the runtime contract.
 
-### Chat message verification enforcement
-
-**Severity:** Medium (reduced from High)
-**Files:** `capsules/chat/src/main.rs`, `capsules/chat/src/main_stdio.rs`, `elastos/crates/elastos-server/src/chat_cmd.rs`
-**Status:** Fixed (2026-03-28)
-
-All chat surfaces (native, WASM, agent) now sign outgoing messages via the DID provider and verify incoming messages. Unknown senders with unverified or unsigned messages are dropped before display, nick recording, or peer attachment. The shared verification logic lives in `elastos_common::chat_protocol`.
-
-**Residual risk:** Chat is still a pre-release surface. The signing payload lacks replay protection (see open finding above).
-
-### Presence announcement signing
-
-**Severity:** Medium (reduced from High)
-**Files:** `capsules/chat/src/session.rs`
-**Status:** Fixed (2026-03-28)
-
-Presence announcements are now signed via the DID provider. Unsigned presence messages are dropped on receive. This prevents fake presence injection with arbitrary tickets.
-
-**Residual risk:** No freshness check on presence signatures — replay of valid presence is still possible.
-
-### Bridge line length limits
+### I/O bridge parse-size check
 
 **Severity:** Low (reduced from Medium)
-**Files:** `elastos/crates/elastos-server/src/carrier_bridge.rs`, `elastos/crates/elastos-runtime/src/handler/io_bridge.rs`
+**Files:** `elastos/crates/elastos-runtime/src/handler/io_bridge.rs`
 **Status:** Fixed (2026-03-28)
 
-Bridge paths now enforce a 1MB maximum line length. Oversized requests are rejected before parsing.
+The I/O bridge rejects complete request lines above 1 MiB before parsing. The
+old `carrier_bridge.rs` has been removed. This resolved parse-size check does
+not close the read-time framing gap above.
 
 ## Architecture
 
@@ -78,6 +67,7 @@ The runtime enforces a capability-based security model:
 - **Capability tokens** are Ed25519-signed by the runtime and validated on every resource access
 - **12-point token validation** covers version, signature, issuer, caller, action, resource, epoch, revocation, timing, use-count, and classification
 - **Audit events** are emitted at every security-critical operation
-- **Carrier** is transport-only — it does not authenticate message content (that is the application's responsibility)
+- **Carrier** authenticates transport endpoints. Runtime verifies product
+  identity and signed message authority before exposing typed app projections.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full trust model.

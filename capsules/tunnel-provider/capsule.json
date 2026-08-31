@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "tunnel-provider",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Carrier network provider for elastos://tunnel/ (public cloudflared quick tunnels)",
   "author": "elastos",
   "role": "provider",
@@ -72,6 +72,6 @@
     "gpu": false
   },
   "permissions": {
-    "carrier": true
+    "host_process": true
   }
 }

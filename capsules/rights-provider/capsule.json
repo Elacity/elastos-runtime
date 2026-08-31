@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "rights-provider",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Runtime rights boundary for protected-content access checks",
   "author": "elastos",
   "role": "provider",

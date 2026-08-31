@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "browser",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Browse websites with your chosen Browser Engine and Exit Node",
   "author": "elastos",
   "role": "app",
@@ -11,6 +11,7 @@
   "execution": "web-projection",
   "projections": ["web", "facts", "affordances", "gates"],
   "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
   "interfaces": [
     {
       "id": "elastos.browser.page",

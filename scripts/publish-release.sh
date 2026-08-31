@@ -7,7 +7,7 @@
 #   ./scripts/publish-release.sh --version 0.10.0 --key path/to/release.key
 #   ./scripts/publish-release.sh --version 0.10.0 --key release.key --channel canary
 #   ./scripts/publish-release.sh --version 0.10.0 --key release.key --skip-build
-#   ./scripts/publish-release.sh --version 0.10.0 --key release.key --capsules chat,chat-room
+#   ./scripts/publish-release.sh --version 0.10.0 --key release.key --capsules chat-room
 #   ./scripts/publish-release.sh --version 0.10.0 --key release.key --no-public-url
 #   ./scripts/publish-release.sh --version 0.10.0 --key release.key --public-with-sudo
 #   ./scripts/publish-release.sh --help
@@ -42,10 +42,10 @@ NC='\033[0m'
 # Wallet/Browser surfaces require chain-provider and wallet-provider authority.
 # Demo-only capsules such as chat-room and GBA are published by passing an
 # explicit --capsules list or through the Rust `demo` publish profile.
-# ipfs-provider, availability-provider, drm-provider, rights-provider,
-# key-provider, decrypt-provider, and tunnel-provider are supported direct
-# command assets. They are not part of the default managed user runtime, but
-# fresh installs must provision them for share/open/public-share where needed.
+# availability-provider, drm-provider, rights-provider, key-provider,
+# decrypt-provider, and tunnel-provider are supported direct command assets
+# outside the default managed Home. Runtime-only protected providers are
+# support assets selected by the component profile rather than capsule publish.
 DEFAULT_CAPSULES=(
     shell
     localhost-provider
@@ -58,6 +58,7 @@ DEFAULT_CAPSULES=(
     wallet-provider
     object-provider
     content-block-graph-provider
+    ipfs-provider
     home-cli
     home-gui
     home
@@ -74,6 +75,8 @@ DEFAULT_CAPSULES=(
     marketplace
     archive-manager
     inbox
+    assistant
+    elacity-player
 )
 CAPSULES=("${DEFAULT_CAPSULES[@]}")
 REQUIRED_SUPPORTED_CAPSULES=(
@@ -88,6 +91,7 @@ REQUIRED_SUPPORTED_CAPSULES=(
     wallet-provider
     object-provider
     content-block-graph-provider
+    ipfs-provider
     home-cli
     home-gui
     home
@@ -104,6 +108,8 @@ REQUIRED_SUPPORTED_CAPSULES=(
     marketplace
     archive-manager
     inbox
+    assistant
+    elacity-player
 )
 SUPPORT_BINARY_ASSETS=(
     shell
@@ -126,6 +132,11 @@ SUPPORT_BINARY_ASSETS=(
     rights-provider
     key-provider
     decrypt-provider
+    protected-content-protect-provider
+    media-provider
+    model-provider
+    custody-provider
+    protected-content-decrypt-provider
     ipfs-provider
     availability-provider
     operator-drive-adapter
@@ -159,6 +170,8 @@ show_help() {
     echo "  --channel NAME     Release channel (stable | canary | jetson-test; default: stable)"
     echo "  --skip-build       Skip building binaries (use existing artifacts)"
     echo "  --skip-rootfs      Skip rootfs building (reuse existing .capsule.tar.gz and skip capsule rebuilds)"
+    echo "  --dry-run          Local rehearsal: no network reads/writes, no IPNS publish, no public URL,"
+    echo "                     publish state (last-release-*) untouched; --key optional (ephemeral key)"
     echo "  --capsules CSV     Override publish capsule list (default: Home capsule set)"
     echo "  --no-public-url    Skip auto-starting gateway+tunnel and URL emission"
     echo "  --public-with-sudo Start auto-public gateway+tunnel via sudo"
@@ -644,32 +657,6 @@ stage_wasm_capsule() {
     fi
 }
 
-build_chat_archive() {
-    local platform="$1"
-    local use_cross="${2:-false}"
-    local artifacts_dir artifact stage_root archive
-
-    if [[ "$use_cross" == true ]]; then
-        artifacts_dir="${CROSS_ARTIFACTS_DIR:-}"
-    else
-        artifacts_dir="${ARTIFACTS_DIR:-}"
-    fi
-
-    [[ -n "$artifacts_dir" ]] || die "chat archive requested before rootfs artifacts were prepared"
-    artifact="${artifacts_dir}/chat.capsule.tar.gz"
-    [[ -f "$artifact" ]] || die "chat capsule artifact missing at ${artifact}"
-
-    stage_root="${TMPDIR}/support-assets-${platform}"
-    archive="${stage_root}/chat.tar.gz"
-    rm -rf "${stage_root}/chat"
-    mkdir -p "${stage_root}/chat"
-    tar -xzf "$artifact" -C "${stage_root}/chat"
-    [[ -f "${stage_root}/chat/capsule.json" ]] || die "chat archive staging missing capsule.json after extraction"
-    [[ -f "${stage_root}/chat/rootfs.ext4" ]] || die "chat archive staging missing rootfs.ext4 after extraction"
-    tar -czf "$archive" -C "$stage_root" chat
-    echo "$archive"
-}
-
 record_direct_asset() {
     local updates_json="$1"
     local name="$2"
@@ -751,13 +738,6 @@ build_supported_direct_assets() {
         updates_json=$(record_direct_asset "$updates_json" "$name" "$staged" "$install_path" "$release_path")
     done
 
-    local chat_archive chat_staged
-    chat_archive=$(build_chat_archive "$platform" "$use_cross")
-    release_path="chat-${setup_platform}.tar.gz"
-    chat_staged="${stage_dir}/${release_path}"
-    cp "$chat_archive" "$chat_staged"
-    updates_json=$(record_direct_asset "$updates_json" "chat" "$chat_staged" "capsules/chat" "$release_path" "chat")
-
     stamp_direct_assets "$setup_platform" "$updates_json"
 }
 
@@ -789,7 +769,10 @@ build_platform_independent_direct_assets() {
         people \
         gba-emulator \
         gba-ucity \
-        chat-room; do
+        gba-nonogram \
+        chat-room \
+        assistant \
+        elacity-player; do
         if [[ -n "${ARTIFACTS_DIR:-}" && -f "${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" ]]; then
             archive="${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz"
         else
@@ -840,6 +823,7 @@ IPFS_PROVIDER_BIN=""
 CHANNEL="stable"
 SKIP_BUILD=false
 SKIP_ROOTFS=false
+DRY_RUN=false
 PUBLISH_PUBLIC_URL=true
 PUBLIC_WITH_SUDO=false
 ALLOW_SIGNER_ROTATION=false
@@ -865,6 +849,7 @@ while [[ $# -gt 0 ]]; do
             CHANNEL="$2"; shift 2 ;;
         --skip-build) SKIP_BUILD=true; shift ;;
         --skip-rootfs) SKIP_ROOTFS=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
         --no-public-url) PUBLISH_PUBLIC_URL=false; shift ;;
         --public-with-sudo) PUBLIC_WITH_SUDO=true; shift ;;
         --allow-signer-rotation) ALLOW_SIGNER_ROTATION=true; shift ;;
@@ -888,6 +873,15 @@ done
 # ── Preflight ─────────────────────────────────────────────────────────
 
 [[ -z "$VERSION" ]] && die "--version is required"
+if [[ "$DRY_RUN" == true ]]; then
+    # Local-only rehearsal: never start the public gateway/tunnel path.
+    PUBLISH_PUBLIC_URL=false
+    if [[ -z "$KEY_PATH" ]]; then
+        KEY_PATH=$(mktemp -t elastos-dryrun-key.XXXXXX)
+        python3 -c 'import secrets; print(secrets.token_hex(32))' > "$KEY_PATH"
+        warn "Dry run without --key: signing with ephemeral throwaway key ${KEY_PATH}"
+    fi
+fi
 [[ -z "$KEY_PATH" ]] && die "--key is required (release signing must use an explicit key)"
 [[ ! -f "$KEY_PATH" ]] && die "Key file not found: $KEY_PATH"
 bash "./scripts/check-versioning.sh" "$VERSION"
@@ -925,7 +919,12 @@ fi
 CANDIDATE_SIGNER_DID="$(inspect_signer_did)"
 [[ -n "$CANDIDATE_SIGNER_DID" ]] || die "Failed to determine signer DID from ${KEY_PATH}"
 CANONICAL_GATEWAY="$(canonical_publisher_gateway)"
-CURRENT_CANONICAL_SIGNER_DID="$(fetch_canonical_signer_did "$CANONICAL_GATEWAY" || true)"
+CURRENT_CANONICAL_SIGNER_DID=""
+if [[ "$DRY_RUN" == true ]]; then
+    warn "Dry run: skipping canonical signer check against ${CANONICAL_GATEWAY}"
+else
+    CURRENT_CANONICAL_SIGNER_DID="$(fetch_canonical_signer_did "$CANONICAL_GATEWAY" || true)"
+fi
 if [[ -n "$CURRENT_CANONICAL_SIGNER_DID" && "$ALLOW_SIGNER_ROTATION" != true && "$CANDIDATE_SIGNER_DID" != "$CURRENT_CANONICAL_SIGNER_DID" ]]; then
     die "Signer DID mismatch for canonical publisher.\n  Candidate: ${CANDIDATE_SIGNER_DID}\n  Canonical: ${CURRENT_CANONICAL_SIGNER_DID}\n  Gateway:   ${CANONICAL_GATEWAY}\nRe-run with --allow-signer-rotation only for an intentional trust-anchor rotation."
 fi
@@ -936,6 +935,9 @@ echo -e "${DIM}  Version:  ${VERSION}${NC}"
 echo -e "${DIM}  Channel:  ${CHANNEL}${NC}"
 echo -e "${DIM}  IPFS provider: ${IPFS_PROVIDER_BIN}${NC}"
 echo -e "${DIM}  Capsules: ${CAPSULES[*]}${NC}"
+if [[ "$DRY_RUN" == true ]]; then
+    echo -e "${YELLOW}  Mode:     DRY RUN (local only — no network, no publish-state writes)${NC}"
+fi
 echo ""
 
 # ── Step 1: Build runtime (and capsules only when needed) ────────────
@@ -1138,6 +1140,10 @@ PY
             [[ "$strategy" == "source-build" || "$strategy" == "local-copy" ]] && continue  # Can't auto-download
 
             if [[ -n "$dep_url" ]]; then
+                if [[ "$DRY_RUN" == true ]]; then
+                    warn "  Dry run: skipping download of ${dep} for ${CROSS_ARCH}"
+                    continue
+                fi
                 info "  Downloading ${dep} for ${CROSS_ARCH}..."
                 local dl_tmp
                 dl_tmp="$(mktemp -d)"
@@ -1885,7 +1891,9 @@ if [[ -f "$KUBO_COORD_FILE" ]]; then
     KUBO_PORT=$(jq -r '.api_port // empty' "$KUBO_COORD_FILE" 2>/dev/null || true)
 fi
 
-if [[ -n "$KUBO_PORT" ]]; then
+if [[ "$DRY_RUN" == true ]]; then
+    info "Dry run: skipping IPNS publish (would announce /ipfs/${HEAD_CID})."
+elif [[ -n "$KUBO_PORT" ]]; then
     info "Publishing HEAD to IPNS (lifetime=8760h)..."
     IPNS_RESPONSE=$(curl -s -X POST "http://127.0.0.1:${KUBO_PORT}/api/v0/name/publish?arg=/ipfs/${HEAD_CID}&key=self&lifetime=8760h" 2>/dev/null || true)
     IPNS_NAME=$(echo "$IPNS_RESPONSE" | jq -r '.Name // empty' 2>/dev/null || true)
@@ -2200,19 +2208,29 @@ fi
 
 # ── Step 11: Save state ───────────────────────────────────────────────
 
-echo -n "$RELEASE_CID" > "${STATE_DIR}/last-release-cid"
-echo -n "$HEAD_CID" > "${STATE_DIR}/last-release-head-cid"
-echo -n "$INSTALL_SCRIPT_CID" > "${STATE_DIR}/last-install-script-cid"
-echo -n "$RELEASE_OBJECT_CID" > "${STATE_DIR}/last-release-object-cid"
-echo -n "$HEAD_OBJECT_CID" > "${STATE_DIR}/last-release-head-object-cid"
-if [[ -n "$PUBLIC_INSTALL_URL" ]]; then
-    echo -n "$PUBLIC_INSTALL_URL" > "${STATE_DIR}/last-public-install-url"
+if [[ "$DRY_RUN" == true ]]; then
+    info "Dry run: publish state untouched (last-release-* files not written)."
+else
+    echo -n "$RELEASE_CID" > "${STATE_DIR}/last-release-cid"
+    echo -n "$HEAD_CID" > "${STATE_DIR}/last-release-head-cid"
+    echo -n "$INSTALL_SCRIPT_CID" > "${STATE_DIR}/last-install-script-cid"
+    echo -n "$RELEASE_OBJECT_CID" > "${STATE_DIR}/last-release-object-cid"
+    echo -n "$HEAD_OBJECT_CID" > "${STATE_DIR}/last-release-head-object-cid"
+    if [[ -n "$PUBLIC_INSTALL_URL" ]]; then
+        echo -n "$PUBLIC_INSTALL_URL" > "${STATE_DIR}/last-public-install-url"
+    fi
 fi
 
 # ── Step 12: Print results ────────────────────────────────────────────
 
 echo ""
-echo -e "${GREEN}${BOLD}Release published!${NC}"
+if [[ "$DRY_RUN" == true ]]; then
+    echo -e "${YELLOW}${BOLD}Dry run complete — nothing published.${NC}"
+    echo -e "${DIM}  Local only: artifacts built, signed and pinned to the local IPFS repo.${NC}"
+    echo -e "${DIM}  Skipped: canonical signer check, IPNS publish, public URL, publish-state writes.${NC}"
+else
+    echo -e "${GREEN}${BOLD}Release published!${NC}"
+fi
 echo ""
 echo -e "  Version:      ${BOLD}${VERSION}${NC}"
 echo -e "  Channel:      ${CHANNEL}"
@@ -2244,7 +2262,7 @@ fi
 echo ""
 CANONICAL_PUBLIC_GATEWAY_URL=""
 CANONICAL_PUBLIC_INSTALL_URL=""
-if [[ -z "$PUBLIC_GATEWAY_URL" && -n "${STAMPED_PUBLISHER_GATEWAY:-}" && "${STAMPED_PUBLISHER_GATEWAY}" != "__PUBLISHER_GATEWAY__" ]]; then
+if [[ "$DRY_RUN" != true && -z "$PUBLIC_GATEWAY_URL" && -n "${STAMPED_PUBLISHER_GATEWAY:-}" && "${STAMPED_PUBLISHER_GATEWAY}" != "__PUBLISHER_GATEWAY__" ]]; then
     if curl -fsSI --max-time 10 "${STAMPED_PUBLISHER_GATEWAY}/install.sh" >/dev/null 2>&1 && \
        curl -fsSI --max-time 10 "${STAMPED_PUBLISHER_GATEWAY}/release-head.json" >/dev/null 2>&1; then
         CANONICAL_PUBLIC_GATEWAY_URL="${STAMPED_PUBLISHER_GATEWAY}"
@@ -2290,24 +2308,6 @@ echo "    curl -fsSL https://<explicit-gateway>/ipfs/${INSTALL_SCRIPT_CID}/insta
 echo "    # Optional explicit anchors:"
 echo "    #   --head-cid ${HEAD_CID} --maintainer-did ${SIGNER_DID}"
 echo ""
-echo -e "${BOLD}  Host Chat After Install:${NC}"
-echo "    elastos setup"
-echo "    elastos chat --nick host"
-if [[ -n "$CROSS_BINARY_CID" ]]; then
-    echo ""
-    if [[ -n "$PUBLIC_INSTALL_URL" ]]; then
-        echo -e "${BOLD}  Jetson Chat After Install:${NC}"
-        echo "    curl -fsSL ${PUBLIC_INSTALL_URL} | bash"
-        echo "    ~/.local/bin/elastos setup"
-        echo "    ~/.local/bin/elastos chat --nick jetson"
-        echo ""
-        echo -e "${BOLD}  Jetson TUI Chat (microVM):${NC}"
-        echo "    ~/.local/bin/elastos setup --profile chat"
-        echo "    ~/.local/bin/elastos capsule chat --lifecycle interactive --interactive --config '{\"nick\":\"jetson\"}'"
-    else
-        echo -e "${DIM}  Jetson: requires public gateway for remote install${NC}"
-    fi
-fi
 if [[ -n "$PUBLIC_GATEWAY_PID" ]]; then
     echo ""
     echo -e "${DIM}  Gateway process: PID ${PUBLIC_GATEWAY_PID}${NC}"

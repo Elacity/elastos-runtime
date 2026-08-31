@@ -25,8 +25,8 @@ pub enum RuntimeRequest {
         reason: String,
     },
 
-    /// Invoke an ElastOS resource through the capsule-kernel Carrier contract.
-    CarrierInvoke {
+    /// Invoke an ElastOS resource through the capsule-kernel resource contract.
+    ResourceInvoke {
         uri: String,
         operation: String,
         #[serde(default)]
@@ -59,8 +59,8 @@ pub enum RuntimeResponse {
     /// Capability token received (capsule requested, shell approved)
     CapabilityToken { token: String },
 
-    /// Carrier invoke result
-    CarrierResult {
+    /// Resource invoke result
+    ResourceResult {
         result: serde_json::Value,
         #[serde(default)]
         audit: Option<String>,
@@ -95,7 +95,7 @@ pub struct ResponseEnvelope {
 /// Transport channel for the runtime client.
 /// Detected automatically based on the environment.
 #[cfg(feature = "serde")]
-enum CarrierChannel {
+enum RuntimeBridgeChannel {
     /// Runtime-provided host import for WASM capsules.
     #[cfg(target_os = "wasi")]
     HostCall,
@@ -110,7 +110,7 @@ enum CarrierChannel {
         writer: std::fs::File,
     },
     /// HTTP API to a running runtime (attached mode).
-    /// WASM capsules running locally use this to reach the runtime's Carrier.
+    /// WASM capsules running locally use this to reach the runtime resource bridge.
     Http { api_url: String, token: String },
 }
 
@@ -129,7 +129,7 @@ unsafe extern "C" {
 
 /// Runtime client for capsules.
 ///
-/// Communicates with the ElastOS runtime via Carrier. The transport is
+/// Communicates with the ElastOS runtime via the runtime resource bridge. The transport is
 /// detected automatically:
 /// - `ELASTOS_CARRIER_FIFOS` set (e.g., "/_carrier/response,/_carrier/request")
 ///   → open those FIFO paths (WASM bridge mode, wasmtime 24+ compatible)
@@ -140,7 +140,7 @@ unsafe extern "C" {
 #[cfg(feature = "serde")]
 pub struct RuntimeClient {
     next_id: RequestId,
-    channel: CarrierChannel,
+    channel: RuntimeBridgeChannel,
 }
 
 #[cfg(feature = "serde")]
@@ -164,7 +164,7 @@ impl RuntimeClient {
 
     /// Create a new runtime client.
     ///
-    /// Detects the Carrier channel automatically:
+    /// Detects the runtime bridge channel automatically:
     /// 1. `ELASTOS_CARRIER_FIFOS=reader_path,writer_path` → FIFO pair via
     ///    preopened-dir (WASM bridge, wasmtime 24+ compatible)
     /// 2. `ELASTOS_CARRIER_PATH=/dev/hvc0` → file-based (microVM virtio-console device)
@@ -174,7 +174,7 @@ impl RuntimeClient {
         let channel = if std::env::var_os("ELASTOS_CARRIER_HOSTCALL").is_some() {
             #[cfg(target_os = "wasi")]
             {
-                CarrierChannel::HostCall
+                RuntimeBridgeChannel::HostCall
             }
             #[cfg(not(target_os = "wasi"))]
             {
@@ -184,7 +184,7 @@ impl RuntimeClient {
             Self::channel_from_fifos()
                 .unwrap_or_else(|e| panic!("ELASTOS_CARRIER_FIFOS is set but invalid: {e}"))
         } else if let Ok(path) = std::env::var("ELASTOS_CARRIER_PATH") {
-            // MicroVM: use one kept-open serial fd for Carrier. Avoid BufReader
+            // MicroVM: use one kept-open serial fd for the runtime bridge. Avoid BufReader
             // and split reader/writer handles on tty devices; they are too easy
             // to deadlock or confuse with line discipline and echo behavior.
             match std::fs::OpenOptions::new()
@@ -203,12 +203,12 @@ impl RuntimeClient {
                                 path, e
                             );
                         }
-                        CarrierChannel::Serial { file }
+                        RuntimeBridgeChannel::Serial { file }
                     }
                     #[cfg(target_os = "wasi")]
                     {
                         let _ = file;
-                        CarrierChannel::Stdio
+                        RuntimeBridgeChannel::Stdio
                     }
                 }
                 Err(e) => {
@@ -222,12 +222,12 @@ impl RuntimeClient {
             (std::env::var("ELASTOS_API"), std::env::var("ELASTOS_TOKEN"))
         {
             if !api_url.is_empty() && !token.is_empty() {
-                CarrierChannel::Http { api_url, token }
+                RuntimeBridgeChannel::Http { api_url, token }
             } else {
-                CarrierChannel::Stdio
+                RuntimeBridgeChannel::Stdio
             }
         } else {
-            CarrierChannel::Stdio
+            RuntimeBridgeChannel::Stdio
         };
 
         Self {
@@ -280,7 +280,7 @@ impl RuntimeClient {
                 serde_json::json!({"resource": resource, "action": action, "reason": reason}),
                 None,
             ),
-            RuntimeRequest::CarrierInvoke {
+            RuntimeRequest::ResourceInvoke {
                 uri,
                 operation,
                 body,
@@ -291,7 +291,7 @@ impl RuntimeClient {
                     Self::provider_scheme_for_uri(uri)?,
                     operation
                 ),
-                Self::carrier_body_for_http(uri, body),
+                Self::resource_body_for_http(uri, body),
                 if cap_token.is_empty() {
                     None
                 } else {
@@ -390,7 +390,7 @@ impl RuntimeClient {
                     })
                 }
             }
-            RuntimeRequest::CarrierInvoke { .. } => Ok(RuntimeResponse::CarrierResult {
+            RuntimeRequest::ResourceInvoke { .. } => Ok(RuntimeResponse::ResourceResult {
                 result: resp_json,
                 audit: None,
             }),
@@ -416,11 +416,11 @@ impl RuntimeClient {
         }
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "carrier URI must use elastos:// or localhost://",
+            "resource URI must use elastos:// or localhost://",
         ))
     }
 
-    fn carrier_body_for_http(uri: &str, body: &serde_json::Value) -> serde_json::Value {
+    fn resource_body_for_http(uri: &str, body: &serde_json::Value) -> serde_json::Value {
         let mut body = body.clone();
         if uri.starts_with("localhost://") && body.get("path").is_none() {
             body["path"] = serde_json::Value::String(uri.to_string());
@@ -595,7 +595,7 @@ impl RuntimeClient {
         }
     }
 
-    /// Try to open a Carrier channel from ELASTOS_CARRIER_FIFOS env var.
+    /// Try to open a runtime bridge channel from ELASTOS_CARRIER_FIFOS env var.
     ///
     /// Format: `"reader_path,writer_path"` — sandbox-relative paths (e.g.,
     /// `"/_carrier/response,/_carrier/request"`). `reader_path` is the FIFO the
@@ -606,7 +606,7 @@ impl RuntimeClient {
     /// runtime preopens a per-launch directory containing both FIFOs via
     /// `WasiCtxBuilder::preopened_dir()`. The capsule opens them by path.
     /// stdin/stdout remain inherited for user I/O.
-    fn channel_from_fifos() -> io::Result<CarrierChannel> {
+    fn channel_from_fifos() -> io::Result<RuntimeBridgeChannel> {
         let env = std::env::var("ELASTOS_CARRIER_FIFOS")
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let parts: Vec<&str> = env.split(',').collect();
@@ -634,7 +634,7 @@ impl RuntimeClient {
             .open(writer_path)
             .map_err(|e| io::Error::new(e.kind(), format!("open {writer_path} (write): {e}")))?;
 
-        Ok(CarrierChannel::FilePair {
+        Ok(RuntimeBridgeChannel::FilePair {
             reader: io::BufReader::new(reader),
             writer,
         })
@@ -650,7 +650,7 @@ impl RuntimeClient {
                     if bytes.is_empty() {
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
-                            "carrier channel closed",
+                            "runtime bridge channel closed",
                         ));
                     }
                     break;
@@ -696,8 +696,8 @@ impl RuntimeClient {
         // Send request and read response via the detected channel
         let line = match &mut self.channel {
             #[cfg(target_os = "wasi")]
-            CarrierChannel::HostCall => Self::call_hostcall(&json)?,
-            CarrierChannel::Stdio => {
+            RuntimeBridgeChannel::HostCall => Self::call_hostcall(&json)?,
+            RuntimeBridgeChannel::Stdio => {
                 let mut stdout = io::stdout().lock();
                 writeln!(stdout, "{}", json)?;
                 stdout.flush()?;
@@ -708,11 +708,11 @@ impl RuntimeClient {
                 line
             }
             #[cfg(not(target_os = "wasi"))]
-            CarrierChannel::Serial { file } => {
+            RuntimeBridgeChannel::Serial { file } => {
                 Self::serial_write_line(file, &json)?;
                 Self::read_unbuffered_line(file)?
             }
-            CarrierChannel::FilePair { reader, writer } => {
+            RuntimeBridgeChannel::FilePair { reader, writer } => {
                 writeln!(writer, "{}", json).map_err(|e| {
                     io::Error::new(e.kind(), format!("carrier fifo write failed: {e}"))
                 })?;
@@ -726,7 +726,7 @@ impl RuntimeClient {
                 })?;
                 line
             }
-            CarrierChannel::Http { api_url, token } => {
+            RuntimeBridgeChannel::Http { api_url, token } => {
                 // Translate SDK request into HTTP API call to the running runtime.
                 return Self::http_call(id, &envelope.request, api_url, token);
             }
@@ -759,7 +759,7 @@ impl RuntimeClient {
         request: RuntimeRequest,
         timeout: Duration,
     ) -> io::Result<RuntimeResponse> {
-        if !matches!(self.channel, CarrierChannel::Stdio) {
+        if !matches!(self.channel, RuntimeBridgeChannel::Stdio) {
             return self.call(request);
         }
 
@@ -772,19 +772,19 @@ impl RuntimeClient {
 
         // Send request via the detected channel
         match &mut self.channel {
-            CarrierChannel::Stdio => {
+            RuntimeBridgeChannel::Stdio => {
                 let mut stdout = io::stdout().lock();
                 writeln!(stdout, "{}", json)?;
                 stdout.flush()?;
             }
             #[cfg(not(target_os = "wasi"))]
-            CarrierChannel::Serial { .. }
-            | CarrierChannel::FilePair { .. }
-            | CarrierChannel::Http { .. } => unreachable!(),
+            RuntimeBridgeChannel::Serial { .. }
+            | RuntimeBridgeChannel::FilePair { .. }
+            | RuntimeBridgeChannel::Http { .. } => unreachable!(),
             #[cfg(target_os = "wasi")]
-            CarrierChannel::HostCall
-            | CarrierChannel::FilePair { .. }
-            | CarrierChannel::Http { .. } => unreachable!(),
+            RuntimeBridgeChannel::HostCall
+            | RuntimeBridgeChannel::FilePair { .. }
+            | RuntimeBridgeChannel::Http { .. } => unreachable!(),
         }
 
         // Read response with timeout — spawn a reader thread
@@ -872,24 +872,24 @@ impl RuntimeClient {
         }
     }
 
-    /// Invoke an ElastOS resource through the capsule-kernel Carrier contract.
+    /// Invoke an ElastOS resource through the capsule-kernel resource contract.
     ///
     /// Capsule code supplies a resource URI and operation. The runtime decides
     /// which local or remote provider handles it.
-    pub fn carrier_invoke(
+    pub fn resource_invoke(
         &mut self,
         uri: &str,
         operation: &str,
         body: &serde_json::Value,
         token: &str,
     ) -> io::Result<serde_json::Value> {
-        match self.call(RuntimeRequest::CarrierInvoke {
+        match self.call(RuntimeRequest::ResourceInvoke {
             uri: uri.to_string(),
             operation: operation.to_string(),
             body: body.clone(),
             token: token.to_string(),
         })? {
-            RuntimeResponse::CarrierResult { result, .. } => Ok(result),
+            RuntimeResponse::ResourceResult { result, .. } => Ok(result),
             RuntimeResponse::Ok { data } => Ok(data.unwrap_or(serde_json::json!({}))),
             RuntimeResponse::Error { code, message } => {
                 Err(io::Error::other(format!("{}: {}", code, message)))
@@ -949,12 +949,12 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn test_response_serialization() {
-        let resp = RuntimeResponse::CarrierResult {
+        let resp = RuntimeResponse::ResourceResult {
             result: serde_json::json!({"status": "ok"}),
             audit: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("carrier_result"));
+        assert!(json.contains("resource_result"));
         assert!(json.contains("ok"));
     }
 
@@ -988,7 +988,7 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn test_carrier_body_adds_host_adapter_defaults() {
-        let localhost = RuntimeClient::carrier_body_for_http(
+        let localhost = RuntimeClient::resource_body_for_http(
             "localhost://Users/self/Documents/a.md",
             &serde_json::json!({}),
         );
@@ -997,7 +997,7 @@ mod tests {
             Some("localhost://Users/self/Documents/a.md")
         );
 
-        let chain = RuntimeClient::carrier_body_for_http(
+        let chain = RuntimeClient::resource_body_for_http(
             "elastos://chain/esc-mainnet/block_number",
             &serde_json::json!({}),
         );
@@ -1075,7 +1075,9 @@ mod tests {
         unsafe {
             let mut master_fd = -1;
             let mut slave_fd = -1;
-            let mut name = [0i8; 128];
+            // c_char is i8 on x86_64/macOS but u8 on Linux aarch64; the
+            // libc alias keeps the buffer portable across targets.
+            let mut name = [0 as libc::c_char; 128];
 
             // Newer libc expects mutable termios/winsize pointers here.
             let rc = libc::openpty(
@@ -1126,13 +1128,13 @@ mod tests {
 
                 line.clear();
 
-                // Request 2: carrier_invoke(get_did)
+                // Request 2: resource_invoke(get_did)
                 let _ = reader.read_line(&mut line).unwrap();
                 seen.push(line.clone());
-                if line.contains("\"carrier_invoke\"") {
+                if line.contains("\"resource_invoke\"") {
                     assert!(
                         line.contains("\"uri\":\"elastos://did/*\""),
-                        "unexpected carrier URI: {line}"
+                        "unexpected resource URI: {line}"
                     );
                     assert!(
                         line.contains("\"operation\":\"get_did\""),
@@ -1140,7 +1142,7 @@ mod tests {
                     );
                     master
                         .write_all(
-                            br#"{"id":2,"response":{"type":"carrier_result","result":{"data":{"did":"did:key:zTest"}}}}"#,
+                            br#"{"id":2,"response":{"type":"resource_result","result":{"data":{"did":"did:key:zTest"}}}}"#,
                         )
                         .unwrap();
                     master.write_all(b"\n").unwrap();
@@ -1161,7 +1163,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(token, token_payload);
 
-                client.carrier_invoke("elastos://did/*", "get_did", &serde_json::json!({}), &token)
+                client.resource_invoke("elastos://did/*", "get_did", &serde_json::json!({}), &token)
             };
 
             if let Some(value) = old_path {
@@ -1173,7 +1175,7 @@ mod tests {
             let seen = bridge.join().unwrap();
             assert!(
                 result.is_ok(),
-                "carrier_invoke failed: {:?}; bridge saw: {:?}",
+                "resource_invoke failed: {:?}; bridge saw: {:?}",
                 result,
                 seen
             );
@@ -1324,7 +1326,7 @@ mod tests {
         // Send a request through the channel and read it via the host's
         // RDWR anchor on the request FIFO. Tests that the writer side of
         // the channel is wired to the right FIFO.
-        if let CarrierChannel::FilePair { ref mut writer, .. } = channel {
+        if let RuntimeBridgeChannel::FilePair { ref mut writer, .. } = channel {
             writeln!(writer, "{{\"id\":1,\"request\":{{\"type\":\"ping\"}}}}").unwrap();
             writer.flush().unwrap();
         } else {
@@ -1353,7 +1355,7 @@ mod tests {
         .unwrap();
         host_resp_rw.flush().unwrap();
 
-        if let CarrierChannel::FilePair { ref mut reader, .. } = channel {
+        if let RuntimeBridgeChannel::FilePair { ref mut reader, .. } = channel {
             let mut resp_buf = String::new();
             reader
                 .read_line(&mut resp_buf)

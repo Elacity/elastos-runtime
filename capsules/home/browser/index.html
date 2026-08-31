@@ -10,8 +10,8 @@
     <meta name="apple-mobile-web-app-title" content="ElastOS Home" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>Home · ElastOS</title>
-    <script src="./home-boot-hint.js?v=home-20260725a"></script>
-    <link rel="manifest" href="./manifest.webmanifest?v=home-20260725a" />
+    <script src="./home-boot-hint.js?v=home-20260805a"></script>
+    <link rel="manifest" href="./manifest.webmanifest?v=home-20260805a" />
     <link rel="icon" href="./elastos-home-icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./elastos-home-icon-192.png" />
     <link rel="stylesheet" href="./style.css?v=home-20260726a" />
@@ -61,6 +61,24 @@
       </section>
 
       <section id="home-unlock" class="home-unlock" aria-labelledby="home-unlock-title" aria-hidden="true" data-surface="neutral" hidden>
+        <div class="home-unlock-face" aria-hidden="true" hidden>
+          <div class="home-unlock-brand">
+            <img class="home-unlock-brand-mark" src="./elastos-home-icon.svg" alt="" draggable="false" />
+            <span class="home-unlock-brand-word">Elastos</span>
+          </div>
+          <div class="home-unlock-clock">
+            <p id="home-unlock-date" class="home-unlock-date"></p>
+            <p id="home-unlock-time" class="home-unlock-time"></p>
+          </div>
+          <div class="home-unlock-account">
+            <button id="home-unlock-person" class="home-unlock-person" type="button">
+              <span class="home-unlock-avatar" aria-hidden="true">
+                <span id="home-unlock-monogram" class="home-unlock-avatar-monogram">e</span>
+              </span>
+            </button>
+            <p id="home-unlock-person-name" class="home-unlock-account-name" hidden></p>
+          </div>
+        </div>
         <div class="home-unlock-card" role="dialog" aria-modal="true">
           <img class="home-unlock-logo" src="./elastos-logo.svg" alt="ElastOS" draggable="false" />
           <h1 id="home-unlock-title">Sign in</h1>
@@ -117,6 +135,6 @@
       </section>
     </div>
 
-    <script type="module" src="./home-shell-host.js?v=home-20260731b"></script>
+    <script type="module" src="./home-shell-host.js?v=home-20260802a"></script>
   </body>
 </html>

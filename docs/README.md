@@ -12,17 +12,29 @@ Each top-level ledger has one job:
 
 - [Repository README](../README.md): quick install, source build, and system model
 - [Getting started](GETTING_STARTED.md): user installation and source development
+- [Local source Home setup](HOME_LOCAL_SETUP.md): source-home browser Home on one machine
 - [Installing ElastOS](INSTALL.md): Linux setup, update, and trust
+- [Windows strategy](WINDOWS.md): WSL-first host direction and later native adapters
 - [Glossary](GLOSSARY.md): canonical terminology
+- [ElastOS system map](system-map/README.md): layered C4 and code paths for
+  people and agents
 
 ## Architecture and core model
 
 - [Architecture](ARCHITECTURE.md): responsibility, authority, and isolation boundaries
+- [Human and agent architecture](AGENT_ARCHITECTURE.md): principal parity,
+  profiles, Agent Host capsules, delegation, and provider effects
 - [Capsule model](CAPSULE_MODEL.md): artifact, Runtime contract, instance, state,
   and head
 - [Namespaces](NAMESPACES.md): `localhost://`, `elastos://`, and principal roots
 - [Carrier](CARRIER.md): endpoint-authenticated communication and content transport
+- [Private network](PRIVATE_NETWORK.md): signed membership, named services,
+  optional IP compatibility, Exit, and LAN Gateway policy
+- [Consequence-aware effects](CONSEQUENCE_AWARE_EFFECTS.md): shared observation,
+  actuation, settlement, and local-safety rules
 - [Content availability](CONTENT_AVAILABILITY.md): CID, IPLD, availability, and replication
+- [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md): games,
+  models, Get, bootstrap sources, and external gateways
 - [People and conversations](PEOPLE_CONVERSATIONS.md): profiles, contacts,
   discovery, and current Chat integration
 - [Design system](DESIGN_SYSTEM.md): first-party visual and interaction contract
@@ -53,12 +65,18 @@ Each top-level ledger has one job:
 
 - [Peer resource contract](../elastos/docs/PEER_PROTOCOL.md): peer bootstrap,
   topic membership, gossip operations, and trust limits
+- [Model provider](MODEL_PROVIDER.md): provider and model selection, streams,
+  cancellation, recovery, and terminal outcomes
 - [Chain provider](CHAIN_PROVIDER.md): typed chain reads, proofs, and transactions
 - [Wallet provider](WALLET_PROVIDER.md): account, proof, approval, and signing authority
 - [Protected content](PROTECTED_CONTENT.md): sealed object access sequence
-- [Rights provider](RIGHTS_PROVIDER.md): rights questions and failure policy
-- [Key provider](KEY_PROVIDER.md): protected content key release
-- [Decrypt provider](DECRYPT_PROVIDER.md): decrypt and render sessions
+- [Protected-content v1 contracts](PROTECTED_CONTENT_CONTRACTS_V1.md): canonical
+  identity, rights, custody and release schemas
+- [Rights provider](RIGHTS_PROVIDER.md): canonical role and provisional capsule
+  retirement state
+- [Key provider](KEY_PROVIDER.md): provisional provider retirement notice
+- [Decrypt provider](DECRYPT_PROVIDER.md): canonical role and provisional
+  capsule retirement state
 - [Archive policy](ARCHIVE_POLICY.md): archive dependencies and family enablement
 
 ## Browser contracts and decisions
@@ -70,8 +88,10 @@ Each top-level ledger has one job:
 
 ## Operations and verification
 
-- [0.6.0 release acceptance](RUNTIME_REPO_USER_STORY_CHECKLIST.md): source,
+- [Source integration and release acceptance](RUNTIME_REPO_USER_STORY_CHECKLIST.md): source,
   installed-product, and release decision checklist
+- [Home journey audit](audits/README.md): privacy-reviewed workbook with
+  findings, coverage and the limits of its installed test evidence
 - [Mac source-home staging](MAC.md): Apple silicon staging and Browser acceptance
 - [Inspector testing](INSPECTOR_TESTING.md): local Inspector checks
 - [Sites](SITES.md): local site roots and public exposure

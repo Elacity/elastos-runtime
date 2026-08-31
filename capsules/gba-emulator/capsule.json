@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "gba-emulator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Play GBA games",
   "role": "viewer",
   "type": "wasm",
@@ -11,6 +11,7 @@
   "projections": ["web", "facts", "affordances", "gates"],
   "author": "elastos",
   "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
   "interfaces": [
     {
       "id": "elastos.gba.emulator",

@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "did-provider",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DID identity provider - device-backed did:key identity",
   "author": "elastos",
   "role": "provider",

@@ -687,7 +687,6 @@ mod tests {
     #[test]
     fn test_supported_resource_schemes() {
         assert!(is_supported_resource_scheme("elastos://did/*"));
-        assert!(is_supported_resource_scheme("elastos://ai/local/chat"));
         assert!(is_supported_resource_scheme(
             "localhost://MyWebSite/Documents/*"
         ));

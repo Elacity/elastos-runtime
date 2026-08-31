@@ -1,5 +1,19 @@
 use super::*;
 
+#[test]
+fn gba_nonogram_manifest_parses_through_canonical_capsule_schema() {
+    let manifest: elastos_common::CapsuleManifest = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../capsules/gba-nonogram/capsule.json"
+    )))
+    .expect("gba-nonogram manifest must parse through CapsuleManifest");
+
+    assert_eq!(manifest.name, "gba-nonogram");
+    assert_eq!(manifest.role, elastos_common::CapsuleRole::Content);
+    assert_eq!(manifest.viewer.as_deref(), Some("gba-emulator"));
+    assert_eq!(manifest.icon.as_deref(), Some("icons"));
+}
+
 #[tokio::test]
 async fn home_content_launch_uses_the_bound_gba_viewer_without_compute() {
     let dir = tempfile::tempdir().unwrap();
@@ -127,6 +141,67 @@ async fn home_content_launch_uses_the_bound_gba_viewer_without_compute() {
         .await
         .unwrap();
     assert_eq!(resource_substitution.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn home_launches_gba_nonogram_through_the_bound_viewer() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = library_test_state(dir.path()).await;
+    write_test_viewer_capsule(
+        dir.path(),
+        "gba-nonogram",
+        GBA_EMULATOR_CAPSULE_ID,
+        "nonogram.gba",
+        "Nonogram Advance",
+    );
+    let app = gateway_router(state);
+
+    let launched = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
+                .header("x-elastos-home-token", home_app_token(dir.path()))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target":"gba-nonogram"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = launched.status();
+    let body = axum::body::to_bytes(launched.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let launch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(launch["route"].as_str().is_some_and(
+        |route| route.contains("/apps/gba-emulator/") && route.contains("capsule=gba-nonogram")
+    ));
+
+    let route = url::Url::parse("http://localhost")
+        .unwrap()
+        .join(launch["route"].as_str().unwrap())
+        .unwrap();
+    let token = url::form_urlencoded::parse(route.fragment().unwrap().as_bytes())
+        .find_map(|(key, value)| (key == "home_token").then(|| value.into_owned()))
+        .unwrap();
+    let content = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/viewers/gba-emulator/content/gba-nonogram")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
+                .header("x-elastos-home-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(content.status(), StatusCode::OK);
 }
 
 #[tokio::test]

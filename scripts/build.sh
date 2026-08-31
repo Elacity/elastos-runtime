@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./scripts/build.sh              # Build runtime + core capsules
-#   ./scripts/build.sh --all        # Build everything (including chat, P2P)
+#   ./scripts/build.sh --all        # Build the Runtime and supported provider capsules
 #   ./scripts/build.sh --capsule X  # Build a specific capsule
 #   ./scripts/build.sh --clean      # Clean all build artifacts first
 #   ./scripts/build.sh --help       # Show help
@@ -38,20 +38,20 @@ show_help() {
     echo "  ./scripts/build.sh                Build runtime + core capsules"
     echo "  ./scripts/build.sh --all          Build everything (runtime + all capsules)"
     echo "  ./scripts/build.sh --runtime      Build runtime only"
-    echo "  ./scripts/build.sh --capsule X    Build specific capsule (e.g. chat, did-provider)"
+    echo "  ./scripts/build.sh --capsule X    Build specific capsule (e.g. did-provider)"
     echo "  ./scripts/build.sh --clean        Clean all artifacts, then build"
     echo "  ./scripts/build.sh --list         List all buildable capsules"
     echo "  ./scripts/build.sh --help         Show this help"
     echo ""
     echo -e "${BOLD}Capsule locations:${NC}"
     echo "  Core capsules:    elastos/capsules/ + provider capsules"
-    echo "  App capsules:     capsules/         (chat, did-provider, chain-provider, wallet-provider, object-provider, content-block-graph-provider, drm-provider, rights-provider, key-provider, decrypt-provider, availability-provider, ai-provider, llama-provider, agent, ipfs-provider, site-provider, tunnel-provider)"
+    echo "  Provider capsules: capsules/         (did-provider, chain-provider, wallet-provider, object-provider, content-block-graph-provider, drm-provider, rights-provider, key-provider, decrypt-provider, availability-provider, ipfs-provider, site-provider, tunnel-provider)"
     echo "  Data capsules:    capsules/         (gba-emulator, gba-ucity)"
     echo "  Data capsules don't need building — they're static assets."
     echo ""
     echo -e "${BOLD}Component setup:${NC}"
     echo "  elastos setup --list          List available external components"
-    echo "  elastos setup                 Install the default Home/chat core"
+    echo "  elastos setup                 Install the default Home product"
     echo "  elastos setup --with kubo     Install a specific component"
     echo ""
     exit 0
@@ -99,7 +99,6 @@ CORE_CAPSULES=(
 )
 
 APP_CAPSULES=(
-    "chat:capsules/chat"
     "did-provider:capsules/did-provider"
     "chain-provider:capsules/chain-provider"
     "wallet-provider:capsules/wallet-provider"
@@ -111,9 +110,6 @@ APP_CAPSULES=(
     "decrypt-provider:capsules/decrypt-provider"
     "availability-provider:capsules/availability-provider"
     "operator-drive-adapter:capsules/operator-drive-adapter"
-    "ai-provider:capsules/ai-provider"
-    "llama-provider:capsules/llama-provider"
-    "agent:capsules/agent"
     "ipfs-provider:capsules/ipfs-provider"
 )
 
@@ -280,6 +276,6 @@ fi
 echo ""
 echo -e "${GREEN}Done.${NC}"
 if [ "$BUILD_ALL" = false ]; then
-    echo -e "${DIM}Run with --all to also build chat, did-provider, chain-provider, wallet-provider, object-provider, content-block-graph-provider, drm-provider, rights-provider, key-provider, decrypt-provider, availability-provider, operator-drive-adapter, ai-provider, llama-provider, agent, ipfs-provider.${NC}"
+    echo -e "${DIM}Run with --all to also build did-provider, chain-provider, wallet-provider, object-provider, content-block-graph-provider, drm-provider, rights-provider, key-provider, decrypt-provider, availability-provider, operator-drive-adapter, and ipfs-provider.${NC}"
 fi
 echo ""

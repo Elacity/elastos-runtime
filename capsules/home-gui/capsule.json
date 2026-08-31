@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "home-gui",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Desktop Home view for ElastOS",
   "author": "elastos",
   "role": "shell",
@@ -48,6 +48,7 @@
     }
   ],
   "requires": [],
+  "icon": "browser/icons",
   "resources": {
     "memory_mb": 64,
     "gpu": false

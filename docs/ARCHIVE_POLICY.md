@@ -1,10 +1,6 @@
 # Archive Dependency And Release Policy
 
-Date: 2026-06-06
-
-This release enables Archive only for archive families that already have
-bounded provider-owned support in `object-provider`: `.zip`, `.tar`, `.tar.gz`,
-and `.tgz`.
+Archive enables a family only when `object-provider` provides bounded support.
 
 ## Runtime Boundary
 

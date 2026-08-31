@@ -29,6 +29,7 @@ elastos/storage/
 
 # Allow tracked ROM templates (uCity Advance is open-source)
 !capsules/gba-ucity/ucity.gba
+!capsules/gba-nonogram/nonogram.gba
 
 # Logs
 *.log
@@ -141,3 +142,4 @@ scripts/dev-sync-jetson.sh
 scripts/full-check-inventory.sh
 scripts/control_graph_cron.py
 scripts/status.sh
+scripts/dev/dkms-docker/shared

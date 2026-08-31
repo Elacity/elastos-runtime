@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "decrypt-provider",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Runtime decrypt/render boundary for protected-content sessions",
   "author": "elastos",
   "role": "provider",

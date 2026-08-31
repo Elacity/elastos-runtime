@@ -375,7 +375,7 @@ async function shellState(tabId) {
     })),
     topToolbar: {
       launcherPresent: !!document.querySelector("#toolbar-launcher"),
-      fullscreenPresent: !!document.querySelector("#toolbar-fullscreen"),
+      fullscreenPresent: !!document.querySelector("#control-centre-fullscreen"),
       searchPresent: !!document.querySelector("#toolbar-search"),
       identityPresent: !!document.querySelector("#identity-button"),
       systemPresent: !!document.querySelector("#toolbar-system"),
@@ -612,7 +612,7 @@ async function main() {
       assert(state.topToolbar.fullscreenPresent === true, "top toolbar should expose fullscreen as a working mobile control", state);
       assert(state.topToolbar.searchPresent === false, "top toolbar should not show a search button", state);
       assert(state.topToolbar.identityPresent === false, "top toolbar should not show a local identity button", state);
-      assert(state.topToolbar.systemPresent === false, "top toolbar should not show a System button", state);
+      assert(state.topToolbar.systemPresent === true, "top toolbar should expose the canonical system menu", state);
       assert(state.topToolbar.workspacePresent === false, "top toolbar should not show a desktop workspace dot", state);
       assert(state.inboxButtonTitle === "Inbox", "empty Inbox toolbar title should stay terse", state);
       assert(state.inboxButtonLabel === "Open Inbox", "empty Inbox toolbar label should stay terse", state);
@@ -1891,8 +1891,8 @@ async function main() {
       assert(desktopTargets.includes("library"), "Library should be exposed as a Home desktop shortcut", desktopTargets);
       assert(launcherTargets.includes("archive-manager"), "Archive should be exposed in the Home launcher", launcherTargets);
       assert(desktopTargets.includes("archive-manager"), "Archive should be exposed as a Home desktop shortcut", desktopTargets);
-      assert(state.launcherHeading === "Open", "Home launcher heading should use plain product wording", state);
-      assert(state.launcherSearchPlaceholder === "Search Home", "Home launcher search should use plain product wording", state);
+      assert(state.launcherHeading === "Apps", "Home launcher heading should match the canonical Apps launcher", state);
+      assert(state.launcherSearchPlaceholder === "Search", "Home launcher search placeholder should match the canonical launcher copy", state);
       assert(!state.launcherGroupHeadings.includes("All Apps"), "Home launcher should not describe mixed targets as apps", state);
       assert(state.launcherGroupHeadings.includes("Library"), "Home launcher should group content under Library", state);
       assert(!state.launcherGroupHeadings.includes("Objects"), "Home launcher should not expose raw object jargon", state);

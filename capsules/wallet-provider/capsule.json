@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "wallet-provider",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Wallet authority provider for proof challenges, linked accounts, and typed signing approvals",
   "author": "elastos",
   "role": "provider",

@@ -46,6 +46,7 @@ export function createLibraryEditor({
     setStatus(isFolder ? "Name the new folder." : "Name the new text document.");
     window.requestAnimationFrame(() => {
       startNameEdit(draft, {
+        editingStatusText: isFolder ? "Name the new folder." : "Name the new text document.",
         async commit(finalName) {
           if (isFolder) {
             await providerApi("mkdir", { parent_uri: state.currentUri, name: finalName });
@@ -53,6 +54,7 @@ export function createLibraryEditor({
             await providerApi("write", {
               uri: childUri(state.currentUri, finalName),
               mime: "text/plain",
+              create_only: true,
               data: "",
             });
           }
@@ -96,6 +98,7 @@ export function createLibraryEditor({
     input.focus();
     input.select();
     let committed = false;
+    let failed = false;
     async function commit() {
       if (committed) return;
       committed = true;
@@ -104,7 +107,13 @@ export function createLibraryEditor({
         handlers.cancel();
         return;
       }
-      await handlers.commit(name);
+      try {
+        await handlers.commit(name);
+      } catch (error) {
+        committed = false;
+        failed = true;
+        throw error;
+      }
     }
     input.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
@@ -114,6 +123,12 @@ export function createLibraryEditor({
       if (event.key === "Escape") {
         committed = true;
         handlers.cancel();
+      }
+    });
+    input.addEventListener("input", () => {
+      if (failed && handlers.editingStatusText) {
+        failed = false;
+        setStatus(handlers.editingStatusText);
       }
     });
     input.addEventListener("blur", () => commit().catch(showError));

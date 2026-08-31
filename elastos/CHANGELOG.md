@@ -2,6 +2,369 @@
 
 All notable changes to the public ElastOS Runtime repository.
 
+## [Unreleased]
+
+## [0.7.0] - 2026-08-31
+
+The coordinated workspace version moves to `0.7.0`. Capsule manifests changed
+since 0.6.0 take a minor bump (`0.1.0` to `0.2.0`; `wallet-provider` to
+`0.3.0`); capsules new in this release keep their initial manifest versions.
+Installed artifacts report `0.7.0` only when built through the checked publish
+flow with `ELASTOS_RELEASE_VERSION`; unstamped source builds report
+`0.7.0-dev`.
+
+### Added
+- The 0.7 source candidate integrates the reviewed protected-content
+  lifecycle with collaboration, Home/platform, Wallet, GBA, model-provider,
+  Assistant, Library, Marketplace, and player UIUX. The Runtime-owned
+  protected-content path remains inactive until installed proof and cutover.
+- Protected-content creators publish one canonical Chain-bound listing package
+  through content addressing. A buyer Runtime imports the shared listing,
+  verifies it, and uses the same immutable projection for purchase and playback.
+- The source proof now covers two distinct Runtimes and real process-backed
+  2-of-3 custody nodes. The creator Runtime provisions the nodes; the buyer
+  Runtime completes import, deny-before-buy, purchase, open, read, and close
+  through its own Profile, Wallet, device identity, and signed release.
+- A bounded read-only protected-content audit verifies source and installed
+  artifact parity, private provider declarations, profile and role facts, and
+  operator prerequisites. Its redacted receipt reports readiness for active
+  proof separately from product readiness.
+- Full source-home setup installs one stable Runtime under the platform data
+  root and writes an owner-only receipt that binds source identity, Runtime,
+  components, capsule metadata, platform, and installation time.
+- macOS and Linux source-home restart helpers validate the stable installation
+  receipt and exact prior process before replacement. They own one PID file,
+  one bounded principal-root rollback, and one atomic restart receipt.
+- People now reports Profile readiness explicitly. Passkey registration and
+  Profile setup are separate: a valid passkey remains valid when Profile setup
+  is not ready, and People directs the person to System Recovery rather than
+  hiding protection or Recovery changes behind a profile save.
+- The privacy-reviewed Home journey audit is available under `docs/audits`.
+  It records findings and test coverage; prerequisite-blocked and partial
+  observations remain separate from completed tests.
+
+### Added (release tooling)
+- `scripts/publish-release.sh --dry-run` rehearses a publish entirely
+  locally: no network reads or writes, no IPNS publish, no public URL,
+  and the `last-release-*` publish state stays untouched. `--key` becomes
+  optional; an ephemeral throwaway key signs the rehearsal artifacts.
+
+### Fixed
+- The release publisher now stamps `model-provider`, `assistant`,
+  `elacity-player`, and `gba-nonogram` direct assets; their
+  `components.json` release entries previously stayed without checksums.
+  The drifted `wallet-walletconnect` entrypoint and stylesheet hashes in
+  `components.json` are restamped from the current source bytes.
+- Runtime's executable watcher skips whole-binary hashing while the file's
+  metadata is unchanged. Startup and changed-file checks still verify the hash.
+- A mint retry adopts a fully completed durable record after a crash loses its
+  intent completion mark. It verifies the complete custody selection and
+  availability evidence. Partial or ambiguous records require reconciliation.
+- Home audit repairs cover Terminal startup and Inbox handoff, Recovery status,
+  window placement, create-only Library writes, document close protection,
+  Assistant output/clipboard handling and model-provider initialization.
+- Source-home setup removes its private install stage after success or a
+  controlled copy/installer failure. Setup checks source and data volumes for
+  at least 10% free capacity. Setup and Browser refresh retain one default VM
+  backup set; a refused restart preserves existing recovery data.
+- Runtime diagnostics omit private VM initialization payloads and provider
+  responses. Log-capture tests cover the privacy boundary.
+- CI and local test recipes cover the own-workspace capsule suites and required
+  provider processes. Fixtures isolate Carrier routing from public relay
+  availability, retry transient executable-busy errors and reap their children.
+- Bound `browser-local-exit` to its launching Runtime through a held-open stdin
+  pipe. Cleanup now checks the relay socket inode, and Runtime refuses to
+  replace a socket still owned by a live helper. Runtime abort, exit, rebuild,
+  and supersession paths no longer leave the helper orphaned.
+- Renaming yourself no longer looks like becoming someone else. A person's
+  identity is their Profile DID and a rename only advances the revision, but
+  the context check compared whole signed Profile documents, so editing your
+  own name read as a different authority and your Home began refusing
+  incoming messages from contacts who had done nothing. The check now asks
+  the question that matters — same Profile DID, and no rolled-back revision
+  replaying an older truth — and a newer revision of the same DID is
+  accepted as what it is: the same person, saying something new about
+  themselves.
+- A running Home announces the people who live on it. Presence was
+  published by a browser tab on a timer, once per tab, and disappeared when
+  the tab closed, so two Homes that were both running showed each other
+  Offline. Everything the announcement carries is durable — the principal
+  record and its signed Profile — and the Runtime now publishes it for
+  every Profile on the Home. The announcement still has a lifetime and is
+  still refreshed on the protocol's cadence, but once per Home rather than
+  per open tab, and whether or not anyone is looking.
+- A running Home receives its owner's messages. Delivery contexts existed
+  only while a signed-in browser session held one, so a Home with nobody
+  looking at it refused messages from contacts it had already accepted:
+  the sender saw "Sending" for minutes, and the queue drained only when the
+  recipient opened Chat, which made a retry loop look like the transport.
+  The Runtime now registers each Profile on this Home at startup, so
+  acceptance rests on the durable relationship and a verified envelope
+  rather than on a browser being open. Sending still requires the person's
+  session, because sending acts on their behalf. Measured on two Homes with
+  no tab open on the receiver: the recipient Runtime accepted it and the send
+  settled in six seconds.
+- Carrier and direct-message failures keep their cause. Both sides of the
+  peer call discarded the underlying error, so a message that would not
+  send reported only that it had not sent; the reason now reaches the log.
+- Chat windows use the standard window bar. The unified-sidebar chrome hides
+  the bar because the app's own left sidebar stands in for it, and Chat was
+  opted in while its sidebar was still unbuilt, leaving the window controls
+  floating over bare content. That chrome is now opt-in by its class alone,
+  and the lone "Shared room" tab no longer renders as a full-width button:
+  a selector appears only once a direct conversation exists to switch to.
+- Profile creation now fails clearly when the principal root is not protected.
+  People opens System Recovery for that prerequisite; Profile setup itself does
+  not establish protection, mint Recovery material, or weaken a valid passkey.
+- Home state directories are created owner-only. The shell writes into a
+  person's root at its first mount, `create_dir_all` follows the process
+  umask, and protected writes then refuse the world-readable parent the
+  Runtime itself had just made — a Home that had drawn its desktop could
+  never save anything protected. Creation now narrows to owner-only inside
+  the data directory, and never reaches above it. The check that refuses a
+  loose parent at write time is unchanged.
+- App windows are visible again. `.window-frame` starts transparent so a
+  capsule never flashes white before it paints, and its rule promised a
+  fade-in on load with a fail-open behind it, but nothing ever restored the
+  opacity: every window since the shell redesign painted correct, fully
+  styled, interactive content into an invisible frame, so the desktop, the
+  chrome and the title drew while the app never appeared. Load now reveals
+  the frame and a 1.5s fail-open reveals it regardless. The launch skeleton
+  had the same shape of bug — its rule says it is hidden the moment the
+  iframe reveals, and nothing hid it — so a grey square pulsed over every
+  app forever; it now hides on that same signal. The passkey smoke's app
+  matrix counted DOM nodes, which is markup and not paint, and passed on
+  eight invisible windows; it now requires each window to become visible
+  within the reveal's own budget, proven by deleting the rule and watching
+  it fail.
+- A Home session the Runtime will not renew sends a person to the passkey
+  gate instead of a signed-looking desktop of empty windows. Boot swallowed
+  the refresh failure and trusted a summary that can still read as signed,
+  which left no way back in.
+- Session refresh rotates the Home cookie while open tabs keep the prior
+  mint, so a divergent header/cookie pair is no longer a conflict when both
+  tokens verify to the same session authority. Genuine conflicts still fail,
+  now as 403 so a client bounces to the gate rather than erroring.
+- A first Recovery Kit can be created on a Home that has already rendered
+  its desktop. Activation demanded a clean principal root while the offline
+  migration path demanded protection that could not exist yet, so any Home
+  that had drawn the shell was locked out of protection — and with it
+  Profile authority and all of People. Activation now migrates the surviving
+  plaintext under its own guard, backing the originals up first.
+- Direct messages send under the authority a person's session actually
+  carries. The check required the grant to name `chat-room`, but passkey
+  sign-in only ever mints grants naming Home and System, so no real person
+  could send; the API tests passed only because their fixture fabricated
+  grants the product never issues.
+- A first run no longer republishes presence it knows will be refused. The
+  Runtime answers 409 until a Profile exists, and the heartbeat now stops on
+  that answer instead of filling the console every interval.
+
+### Changed
+- Product inventory exposes one Chat app. The Runtime-backed `chat-room` app is
+  the only Chat entry in manifests and supported release profiles. The
+  obsolete terminal Chat and Agent capsule source trees are retired. Explicit
+  operator CLI commands remain under their own contract; Git history preserves
+  the old implementations.
+- Runtime keeps `tracing`; the replacement `elastos-logger` is postponed.
+  Advanced Assistant workflows, broader Carrier reconciliation and the legacy
+  audit migration remain deferred. Installed protected-content acceptance and
+  the atomic activation/removal of provisional providers remain open.
+- Collaboration messages now identify people as Profiles and recipients as
+  Profiles or conversations. Runtime derives routing from the currently signed
+  Profile instead of putting endpoint identity in the product message. Endpoint
+  acceptance receipts remain endpoint receipts, so Chat shows `Sent` rather
+  than claiming the person received or read the message. For direct messages,
+  contact revocations, and Profile updates, the receiving Runtime now derives
+  the remote endpoint from the authenticated Carrier connection. It verifies
+  that route independently from the Profile-authorized application signer, and
+  rejects caller-supplied or substituted endpoint metadata before persistence.
+- Shared-room Chat and presence now carry one strict Profile-authenticated
+  payload: `{ product, signed_profile }`. Runtime request binding covers that
+  exact envelope, admission verifies the Profile's endpoint and scoped signer
+  grants, and product code receives the verified Profile plus only its own
+  inner payload. Names and presence therefore come from signed Profile truth,
+  not device labels or fields repeated inside Chat and presence payloads.
+- The Services peer contact object is named as what it holds. The released
+  `people-contacts.json` (schema `elastos.people.contacts-state/v1`) carried
+  Services peer data under a People name; it is now
+  `services-peer-contacts.json` with schema
+  `elastos.services.peer-contacts-state/v1`, and an installed host's object
+  migrates whole — name and schema together, through the protected-object
+  path since the encryption binds the object URI — on first touch. The
+  capsule-facing read-model audit the task list called for came back clean:
+  device identity serializes to the System diagnostics surface only, remote
+  endpoint DIDs are serialization-skipped, offer routes are app navigation,
+  and the one topology field (`source_peer`) is the System trusted-source
+  panel's by design. Offline reach limits are now stated in one place for
+  all three transports: direct messages end terminal and visible, the shared
+  room's gossip buffer bounds catch-up, and Profile updates bridge at most
+  the 8-revision announcement ring before failing closed to a fresh
+  approval.
+- Every request/response collaboration retry now runs on one delivery
+  engine. `collaboration_delivery.rs` owns the bounded pass — attempt the
+  whole plan, settle only what the selected peer endpoint acknowledged, report the
+  first failure without letting one unreachable peer starve the rest — and
+  direct messages, contact revocations, and Profile update announcements all
+  run on it instead of three hand-rolled loops. What happens at an envelope's
+  end of life is now a declared per-source decision pinned beside the code
+  that implements it: terminal and visibly expired for messages, re-mint the
+  exact signed fact for revocations, regenerate from durable truth for
+  Profile announcements. Artifacts stay in the store their authority owns,
+  and the shared-room outbox remains the one stated difference (broadcast
+  with asynchronous receipts). Revocation delivery failures now propagate to
+  the sync scheduler instead of being silently swallowed, so failed passes
+  back off like every other delivery. The encrypted mailbox lands on this
+  layer instead of adding a fifth loop.
+
+### Added
+- Recovery now restores the collaboration identity. The Full Recovery Bundle
+  carries the signed People identity — the Profile signing seed with its
+  retained revision ring, and the signed contact store — alongside the root
+  kit and Wallet keys. Importing it on a genuinely fresh machine keeps the
+  same Profile DID, restores the contacts, and authorizes the new device by
+  minting the next signed revision through the normal Profile authority path,
+  which the existing update-delivery chain then announces to every accepted
+  contact: relationships survive the machine. The import response and the
+  System recovery UI report the People outcome honestly and never claim a
+  complete account restore when the identity did not come back.
+
+### Changed
+- Direct conversations are text-only by declared decision. Attachments need
+  object handling, retention, and a delivery path of their own — designed on
+  the unified delivery layer together with the encrypted mailbox, not as
+  another ad-hoc transport — so until then the attach control in a direct
+  conversation is visibly disabled and says why, instead of silently missing,
+  and the product doc scopes attachments to shared conversations.
+
+### Added
+- Home now tells you when someone wants to connect or has messaged you. A
+  pending contact request appears in the durable notification store — one
+  projection read by the Home badge, the toast, and Inbox alike — and is
+  pruned the moment the signed request is decided, revoked, or expired. A
+  verified incoming direct message mints one live notification per
+  conversation, named by the sender's signed Profile presentation, resolved
+  by reading the conversation in Chat and resurfaced by new mail. Inbox stays
+  the only Accept/Decline surface: notifications point at it and never carry
+  the decision.
+- Signed Profile update delivery now works between runtimes. A rename (or an
+  authorized-device change) travels to accepted contacts as an exact bounded
+  signed revision chain over the dedicated `collaboration-profile` Runtime
+  provider, and the receiving store applies it only under the strict rules:
+  an already accepted Profile DID, the next exact revision bridged by the
+  exact previous signed-envelope hash, a delivery envelope signed by an
+  application signer the new head authorizes, and delivery from the endpoint
+  the new head names — rollback, gaps, conflicts, mixed profiles, and
+  unauthorized signers or endpoints fail closed. Announcement is a pure function of the
+  local head and the accepted contacts, so a restart simply re-announces and
+  the receiver treats it as an idempotent replay. The two-runtime proof
+  surfaced a real wire gap: the Carrier peer provider plane's allow-list had
+  never admitted the profile provider, so no announcement had ever been
+  deliverable; it now is.
+- Shared-room names now come from signed Profile truth. Every configured-room
+  participant and message row with a verified member device is named from the
+  polling principal's own signed Profile, an accepted (or retained removed)
+  contact head, or a room membership profile card — and a verified device none
+  of those name renders as an explicit "Unverified device" row instead of a
+  stored `Device {hex}` label, a presence self-claim, or an invented
+  "Conversation member N" placeholder. Presence heartbeats stay liveness-only,
+  durable conversation history is untouched, and the plain (unconfigured) room
+  keeps its server-stamped home-session and guest names.
+- Bilateral signed contact removal, with the complete People relationship
+  states. Removing a contact mints a pair-scoped signed revocation: removal is
+  immediate locally, the Runtime durably retries the exact envelope until the
+  peer's device acknowledges it (re-minting only after an envelope's own
+  lifetime), and the peer's side verifies it against the pair's accepted
+  authority. Both sides keep the relationship visible in a removed state —
+  named by the retained signed Profile head — instead of letting it vanish.
+  Removed permits reading only: history stays readable under an explicitly
+  declared policy, sending and receiving stop on both sides, and a fresh
+  request through Inbox reopens the pair. People now also projects `requested`
+  and `declined` from the signed request and decision chains, and the store
+  binds retained Profile heads to known relationships only.
+- People shows whether an accepted contact is reachable right now. The signal
+  is the existing presence heartbeat projected onto the contact list — Online
+  now / Offline when presence has an answer, nothing when it has no basis —
+  and it stays out of the realtime signature so heartbeat flaps do not emit
+  people.changed events.
+- The system bar carries the focused app's name and that app's own menus. Apps
+  declare them with a postMessage manifest and receive each chosen command
+  back; an app that declares none gets File with Close Window. Manifests are
+  data, not authority: the host takes one only from an app frame, binds it to
+  that frame's launch token, and never accepts a window id from the sender.
+- Spotlight, opened with Cmd/Ctrl+Space, searches open windows, installed apps
+  and desktop objects together. It reads only what the shell already holds, and
+  opens objects through the same capability guard the desktop uses.
+- The shell keyboard layer: Alt+Tab window switching, Cmd+` cycling, Cmd+W /
+  Cmd+M close and minimize, Cmd+Alt+arrow snapping, F3 for Mission Control,
+  Ctrl+arrows to switch Spaces, and Cmd+/ for a shortcuts overlay that
+  documents exactly what exists. Quick Look arrives with it: Space on a
+  selected desktop icon opens a frameless preview of glyph and metadata —
+  never object bytes, which stay behind viewer authority — and Open routes
+  through the same guarded path the desktop uses. The layer sleeps whenever
+  Home GUI is not the mounted shell.
+- Stages, Desktop Spaces and Mission Control. The green button gives an app its
+  own fullscreen Space, extra Desktops can be added, and Mission Control lays
+  the Spaces out as live thumbs over the open windows — click to preview, click
+  again to enter, drag to reorder. Sessions restore the Space you were on.
+  Presentation only: a Space switch mints no authority.
+- Capsules declare their own app icon. A capsule names an icon directory in its
+  manifest, the Runtime resolves it to that capsule's own asset routes, and the
+  shell renders what it is handed instead of keeping a central icon table keyed
+  by capsule name. Capsules that declare none get the shell's generic glyph.
+  People, Chat Room and Inbox ship their own icons.
+- One canonical source for the shared UI tokens, theme runtime and accent
+  picker, stamped into each participating capsule by `just vendor-ui` and gated
+  against drift in `just verify`. Per-capsule origins make the copies necessary;
+  the gate makes them identical.
+
+### Changed
+- The local device DID reaches exactly one browser surface: System, the
+  runtime-inspection page. The Home and People read models and the People
+  profile-update response no longer serialize it — no other surface consumed
+  it, and device identity stays out of app-facing projections.
+- The People contact read model drops its dead `route` field. Nothing read it,
+  the Profile path always left it empty, and route strings do not belong in
+  capsule read models.
+- The Home GUI shell takes the redesigned look for the surfaces it already has:
+  desktop, dock, windows, launcher, toolbar and notification toast. It loads the
+  shared token sheet, so it follows theme and accent like the app capsules.
+- People, Chat Room and Inbox take every colour from the shared token sheet
+  rather than their own palettes, so all three follow theme and accent. Only the
+  colour source moved; their layouts are unchanged.
+- The shared theme runtime owns no browser-profile storage. It keeps an
+  in-memory view and accepts a persistence adapter that only a host installs,
+  which lets the opaque Home GUI take the shared tokens without violating the
+  rule that capsule frames do not own that storage.
+- People's sidebar behaves as the tabs it looks like: sections switch and the
+  page title names the visible one, replacing a scroll between two
+  always-visible sections.
+
+### Fixed
+- A contact that never acknowledges can no longer wedge the direct message
+  store. Abandoned records — expired with no receipt — are terminal for
+  retention: settled pairs prune first, abandoned records yield next, and only
+  a store made entirely of live unexpired messages refuses a write as honest
+  backpressure.
+- A direct message abandoned at its 24-hour TTL now reads `expired` instead of
+  `pending`, and the Chat UI shows "Not delivered" instead of "Sending". The
+  Runtime already stopped retrying at expiry; the read model and UI now say so.
+  A settled receipt still wins: an acknowledged message stays Sent even
+  when read after the TTL.
+- Home summary reads are side-effect free. Reading the Home summary no longer
+  materializes or rewrites the shared-room store or the notification store; a
+  read now answers from an in-memory expiry view and persists only a real
+  change.
+- Chat Room text on an accent fill uses the accent's own ink colour instead of
+  hardcoded near-white, which was unreadable on the yellow and graphite
+  accents.
+- People no longer presents a contact state it does not recognise as
+  "connected". The Runtime emits two relationships today; anything else now
+  renders as an unknown state, so a build that has not learned a new state
+  cannot tell someone they are still connected to a person they may not be.
+- The Home GUI dock draws its Apps launcher glyph again. It had been pointed at
+  an icon file the shell does not ship.
+
 ## [0.6.0] - 2026-07-31
 
 0.6.0 combines the reviewed ESP line with the Wallet, Recovery, and Browser
@@ -37,6 +400,13 @@ continuation. These changes are not part of the 0.5.0 release history.
   and one `eth_requestAccounts` call creating one pending account-access request.
 
 ### Fixed
+- Bound `browser-local-exit` to the lifetime of the Runtime that launched it via
+  a held-open stdin pipe, so it no longer survives as an orphan when the Runtime
+  is SIGKILLed, aborts on panic, or leaves through `std::process::exit` (the
+  installed-binary supersession watch takes that path on every rebuild). Helper
+  teardown is now scoped by inode identity to the relay socket it bound, and the
+  Runtime refuses to replace a relay socket a live helper is still serving
+  instead of stranding it on an unlinked socket.
 - Fixed Home launch classification so browser projections are attached as
   authorized web surfaces instead of being sent to a WASM compute provider.
 - Bound fresh passkey authority to one app, operation, and request payload;
@@ -74,10 +444,9 @@ continuation. These changes are not part of the 0.5.0 release history.
 
 ## [0.5.0] - Unreleased
 
-0.5.0 is the current `main` baseline. It brings the Mac, Jetson, and server
-work into one line and keeps the release truth explicit: Browser is available
-for review, but product Browser completion is not claimed until target-device
-media, audio, input, and installed-path proof are closed.
+0.5.0 was the baseline before the 0.6.0 release. It brought the Mac, Jetson,
+and server work into one line while keeping Browser readiness claims tied to
+target-device media, audio, input, and installed-path proof.
 
 Notes from the unpublished intermediate patch line are folded into this entry
 because no separate patch release was published.

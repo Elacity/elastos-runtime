@@ -2417,6 +2417,34 @@ pub async fn publish_directory_via_provider(
         .await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentPublishRequirements {
+    min_replicas: u32,
+    require_live_multi_peer_proof: bool,
+}
+
+impl ContentPublishRequirements {
+    pub(crate) fn new(
+        min_replicas: u32,
+        require_live_multi_peer_proof: bool,
+    ) -> anyhow::Result<Self> {
+        if min_replicas == 0 {
+            anyhow::bail!("content publish minimum replicas must be positive");
+        }
+        Ok(Self {
+            min_replicas,
+            require_live_multi_peer_proof,
+        })
+    }
+
+    fn to_json(self) -> Value {
+        json!({
+            "min_replicas": self.min_replicas,
+            "require_live_multi_peer_proof": self.require_live_multi_peer_proof,
+        })
+    }
+}
+
 pub async fn publish_directory_via_provider_with_kind(
     registry: &ProviderRegistry,
     dir: &Path,
@@ -2424,13 +2452,55 @@ pub async fn publish_directory_via_provider_with_kind(
     object_did: Option<&str>,
     publisher_did: Option<&str>,
 ) -> anyhow::Result<String> {
-    publish_directory_via_provider_with_kind_and_links(
+    publish_directory_via_provider_impl(
         registry,
         dir,
         object_kind,
         object_did,
         publisher_did,
         &[],
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn publish_directory_via_provider_with_kind_and_requirements(
+    registry: &ProviderRegistry,
+    dir: &Path,
+    object_kind: &str,
+    object_did: Option<&str>,
+    publisher_did: Option<&str>,
+    requirements: ContentPublishRequirements,
+) -> anyhow::Result<String> {
+    publish_directory_via_provider_impl(
+        registry,
+        dir,
+        object_kind,
+        object_did,
+        publisher_did,
+        &[],
+        Some(requirements),
+    )
+    .await
+}
+
+pub(crate) async fn publish_directory_via_provider_with_kind_links_and_requirements(
+    registry: &ProviderRegistry,
+    dir: &Path,
+    object_kind: &str,
+    object_did: Option<&str>,
+    publisher_did: Option<&str>,
+    links: &[(String, String)],
+    requirements: ContentPublishRequirements,
+) -> anyhow::Result<String> {
+    publish_directory_via_provider_impl(
+        registry,
+        dir,
+        object_kind,
+        object_did,
+        publisher_did,
+        links,
+        Some(requirements),
     )
     .await
 }
@@ -2442,6 +2512,27 @@ pub async fn publish_directory_via_provider_with_kind_and_links(
     object_did: Option<&str>,
     publisher_did: Option<&str>,
     links: &[(String, String)],
+) -> anyhow::Result<String> {
+    publish_directory_via_provider_impl(
+        registry,
+        dir,
+        object_kind,
+        object_did,
+        publisher_did,
+        links,
+        None,
+    )
+    .await
+}
+
+async fn publish_directory_via_provider_impl(
+    registry: &ProviderRegistry,
+    dir: &Path,
+    object_kind: &str,
+    object_did: Option<&str>,
+    publisher_did: Option<&str>,
+    links: &[(String, String)],
+    requirements: Option<ContentPublishRequirements>,
 ) -> anyhow::Result<String> {
     let mut files = Vec::new();
     crate::ipfs::collect_files_for_ipfs(dir, dir, &mut files)?;
@@ -2471,6 +2562,9 @@ pub async fn publish_directory_via_provider_with_kind_and_links(
     }
     if let Some(publisher_did) = publisher_did {
         request["publisher_did"] = Value::String(publisher_did.to_string());
+    }
+    if let Some(requirements) = requirements {
+        request["availability_requirements"] = requirements.to_json();
     }
     if !links.is_empty() {
         request["links"] = Value::Array(
@@ -8203,9 +8297,15 @@ fn directory_object_manifest(
 
 fn validate_content_object_kind(kind: &str) -> Result<String, ProviderError> {
     match kind {
-        "capsule" | "directory" | "document" | "release" | "sealed" | "share" | "site" => {
-            Ok(kind.to_string())
-        }
+        "capsule"
+        | "directory"
+        | "document"
+        | "protected-content"
+        | "protected-content-listing"
+        | "release"
+        | "sealed"
+        | "share"
+        | "site" => Ok(kind.to_string()),
         _ => Err(ProviderError::Provider(format!(
             "unsupported content object kind: {kind}"
         ))),
@@ -9491,6 +9591,12 @@ mod tests {
         assert_eq!(requests[0]["cid"], TEST_CID);
         assert_eq!(requests[0]["uri"], format!("elastos://{TEST_CID}"));
         assert_eq!(requests[0]["local"]["status"], "local_pinned");
+        assert_eq!(requests[0]["requirements"]["min_replicas"], 1);
+        assert_eq!(
+            requests[0]["requirements"]["require_live_multi_peer_proof"],
+            false
+        );
+        assert!(requests[0]["requirements"]["max_replicas"].is_null());
         assert_eq!(
             requests[0]["local"]["peer_selection"]["mode"],
             "single_local"
@@ -9764,6 +9870,116 @@ mod tests {
         assert_eq!(requests[0]["op"], "ensure");
         assert_eq!(requests[1]["op"], "ensure");
         assert_eq!(requests[1]["requirements"]["min_replicas"], 1);
+        assert_eq!(
+            requests[1]["requirements"]["require_live_multi_peer_proof"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn content_repair_worker_reuses_three_replica_live_requirement_after_replica_loss() {
+        let (_data_dir, registry, _ipfs, content) = registry_with_content_and_ipfs().await;
+        let availability_response = |replicas| {
+            provider_ok(json!({
+                "availability": {
+                    "status": "network_available",
+                    "provider": "elacity-supernode",
+                    "policy": "protected-content-replication/v1",
+                    "replicas": replicas,
+                    "peer_selection": {
+                        "mode": "carrier_topic",
+                        "live_multi_peer_proof": true
+                    },
+                    "quota": {
+                        "policy": "operator_default"
+                    },
+                    "repair_worker": {
+                        "scheduled": true,
+                        "status": "healthy"
+                    }
+                }
+            }))
+        };
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(availability_response(3)),
+        });
+        registry.register(availability.clone()).await;
+
+        let publish = content
+            .send_raw(&json!({
+                "op": "publish",
+                "kind": "directory",
+                "files": [{"path": "index.md", "data": "IyBQcm90ZWN0ZWQK"}],
+                "object_did": "did:key:z6Mkprotected",
+                "publisher_did": "did:key:z6Mkpublisher",
+                "pin": true,
+                "availability_requirements": {
+                    "min_replicas": 3,
+                    "require_live_multi_peer_proof": true
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            publish["data"]["availability"]["status"],
+            "network_available"
+        );
+        assert_eq!(
+            publish["data"]["repair_task"]["requirements"]["min_replicas"],
+            3
+        );
+        assert_eq!(
+            publish["data"]["repair_task"]["requirements"]["require_live_multi_peer_proof"],
+            true
+        );
+        assert!(publish["data"]["repair_task"]["requirements"]["max_replicas"].is_null());
+
+        *availability.response.lock().await = availability_response(2);
+        let worker = invoke_content_repair_worker(
+            &registry,
+            json!({
+                "op": "repair_worker",
+                "force": true,
+                "include_healthy_check": true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(worker["data"]["checked"], 1);
+        assert_eq!(worker["data"]["repaired"], 0);
+        assert_eq!(worker["data"]["failed"], 1);
+        assert_eq!(worker["data"]["results"][0]["status"], "repair_needed");
+
+        let requests = availability.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["requirements"]["min_replicas"], 3);
+        assert_eq!(
+            requests[1]["requirements"]["require_live_multi_peer_proof"],
+            true
+        );
+        assert!(requests[1]["requirements"]["max_replicas"].is_null());
+        drop(requests);
+
+        let status = content
+            .send_raw(&json!({
+                "op": "status",
+                "cid": TEST_CID,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(status["data"]["availability"]["status"], "repair_needed");
+        assert_eq!(
+            status["data"]["availability"]["repair_task"]["requirements"]["min_replicas"],
+            3
+        );
+        assert_eq!(
+            status["data"]["availability"]["repair_task"]["requirements"]
+                ["require_live_multi_peer_proof"],
+            true
+        );
     }
 
     #[tokio::test]
@@ -10651,6 +10867,14 @@ mod tests {
         assert!(invalid_link_cid
             .to_string()
             .contains("invalid content object link cid"));
+    }
+
+    #[test]
+    fn content_object_kind_accepts_protected_content_listing() {
+        assert_eq!(
+            validate_content_object_kind("protected-content-listing").unwrap(),
+            "protected-content-listing"
+        );
     }
 
     #[tokio::test]

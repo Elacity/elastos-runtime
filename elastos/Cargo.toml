@@ -1,6 +1,11 @@
 [workspace]
 members = [
     "crates/elastos-common",
+    "crates/elastos-protected-content-contracts",
+    "crates/elastos-protected-content-custody",
+    "crates/elastos-protected-content-provider-contracts",
+    "crates/elastos-protected-content-runtime",
+    "crates/elastos-protected-content-rights",
     "crates/elastos-storage",
     "crates/elastos-compute",
     "crates/elastos-crosvm",
@@ -9,6 +14,7 @@ members = [
     "crates/elastos-identity",
     "crates/elastos-namespace",
     "crates/elastos-auth",
+    "crates/elastos-model-contract",
     "crates/elastos-wallet-contract",
     "crates/elastos-runtime",
     "crates/elastos-server",
@@ -19,11 +25,11 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/elacity/elastos-runtime"
-rust-version = "1.89"
+rust-version = "1.91"
 
 [profile.dev]
 opt-level = 0

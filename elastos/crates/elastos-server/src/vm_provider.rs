@@ -232,12 +232,7 @@ impl VmRawBridge {
             .map_err(|_| ProviderError::Provider("vm bridge mutex poisoned".into()))?;
 
         if guard.is_some() {
-            tracing::info!(
-                "reusing persistent connection to guest {}:{} for: {}",
-                self.guest_host,
-                self.guest_port,
-                serde_json::to_string(request).unwrap_or_default()
-            );
+            tracing::trace!("reusing persistent VM provider connection");
         }
 
         if guard.is_none() {
@@ -249,12 +244,7 @@ impl VmRawBridge {
                 "op": "init",
                 "config": self.init_config.clone()
             });
-            tracing::info!(
-                "sending init to guest {}:{}: {}",
-                self.guest_host,
-                self.guest_port,
-                serde_json::to_string(&init_req).unwrap_or_default()
-            );
+            tracing::info!("sending init to VM provider");
             let init_start = std::time::Instant::now();
             let init_resp = match Self::send_line_and_read_json(
                 io,
@@ -276,24 +266,19 @@ impl VmRawBridge {
                     )));
                 }
             };
-            tracing::info!(
-                "init response from guest {}:{} in {:.1}s: {}",
-                self.guest_host,
-                self.guest_port,
-                init_start.elapsed().as_secs_f64(),
-                init_resp
-            );
             let init_ok = init_resp
                 .get("status")
                 .and_then(|v| v.as_str())
                 .map(|s| s == "ok")
                 .unwrap_or(false);
+            tracing::info!(
+                init_ok,
+                elapsed_seconds = init_start.elapsed().as_secs_f64(),
+                "VM provider init response received"
+            );
             if !init_ok {
                 *guard = None;
-                return Err(ProviderError::Provider(format!(
-                    "provider VM init failed: {}",
-                    init_resp
-                )));
+                return Err(ProviderError::Provider("provider VM init failed".into()));
             }
         }
         let io = guard
@@ -513,20 +498,15 @@ impl VmCapsuleProvider {
             .get("code")
             .and_then(|v| v.as_str())
             .unwrap_or("provider_error");
-        let message = response
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown provider error");
-
         // Classify by code field only. Message content is not trusted for
         // error type classification — a VM could spoof error types via crafted
         // messages. Providers should use structured code fields.
         match code {
-            "not_found" => ProviderError::NotFound(message.to_string()),
+            "not_found" => ProviderError::NotFound("VM provider resource not found".into()),
             "permission_denied" | "path_not_allowed" => {
-                ProviderError::PermissionDenied(message.to_string())
+                ProviderError::PermissionDenied("VM provider permission denied".into())
             }
-            _ => ProviderError::Provider(format!("[{}] {}", code, message)),
+            _ => ProviderError::Provider("VM provider operation failed".into()),
         }
     }
 
@@ -578,8 +558,10 @@ impl VmCapsuleProvider {
             ResourceAction::List => {
                 let data = data
                     .ok_or_else(|| ProviderError::Provider("list response missing data".into()))?;
-                let entries: Vec<serde_json::Value> = serde_json::from_value(data)
-                    .map_err(|e| ProviderError::Provider(format!("parse list: {}", e)))?;
+                let entries: Vec<serde_json::Value> =
+                    serde_json::from_value(data).map_err(|_| {
+                        ProviderError::Provider("invalid VM provider list response".into())
+                    })?;
                 let resource_entries = entries
                     .iter()
                     .map(|e| ResourceEntry {
@@ -658,6 +640,118 @@ impl Provider for VmCapsuleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_vm_provider_logs_redact_payloads_and_init_errors() {
+        #[derive(Clone)]
+        struct LogWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogWriter(Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let secret = "VM_PRIVATE_PAYLOAD".repeat(256);
+        let config = serde_json::json!({"api_key": secret});
+        let request = serde_json::json!({"op": secret, "path": secret, "content": secret});
+        let response = serde_json::json!({"status": "ok", "data": secret});
+
+        for init_ok in [true, false] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let expected_init = serde_json::json!({"op": "init", "config": config});
+            let expected_request = request.clone();
+            let init_response = serde_json::json!({
+                "status": if init_ok { "ok" } else { &secret }, "message": secret
+            });
+            let replies = [init_response, response.clone(), response.clone()];
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                for (index, reply) in replies.iter().take(if init_ok { 3 } else { 1 }).enumerate() {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+                        if index == 0 {
+                            &expected_init
+                        } else {
+                            &expected_request
+                        }
+                        .clone()
+                    );
+                    writeln!(stream, "{reply}").unwrap();
+                }
+                // Keep the peer alive until the bridge closes its exact connection.
+                assert_eq!(reader.read_line(&mut String::new()).unwrap(), 0);
+            });
+            let bridge = VmRawBridge::new("127.0.0.1".into(), port, config.clone());
+            if init_ok {
+                assert_eq!(bridge.send_raw_blocking(&request).unwrap(), response);
+                assert_eq!(bridge.send_raw_blocking(&request).unwrap(), response);
+            } else {
+                let error = bridge.send_raw_blocking(&request).unwrap_err();
+                assert!(!error.to_string().contains("VM_PRIVATE_PAYLOAD"));
+                assert!(error.to_string().len() < 100);
+                assert!(bridge.io.lock().unwrap().is_none());
+            }
+            drop(bridge);
+            server.join().unwrap();
+        }
+
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("reusing persistent VM provider connection"));
+        assert!(logs.contains("init_ok=true"));
+        assert!(logs.contains("init_ok=false"));
+        assert!(logs.contains("elapsed_seconds="));
+        assert!(!logs.contains("VM_PRIVATE_PAYLOAD"));
+        assert!(logs.len() < 8192);
+    }
+
+    #[test]
+    fn test_vm_provider_errors_redact_response_fields() {
+        for code in [
+            "not_found",
+            "permission_denied",
+            "path_not_allowed",
+            "VM_PRIVATE_PAYLOAD",
+        ] {
+            let error = VmCapsuleProvider::to_resource_response(
+                ResourceAction::Read,
+                serde_json::json!({"status": "error", "code": code, "message": "VM_PRIVATE_PAYLOAD"}),
+            ).unwrap_err();
+            match code {
+                "not_found" => assert!(matches!(error, ProviderError::NotFound(_))),
+                "permission_denied" | "path_not_allowed" => {
+                    assert!(matches!(error, ProviderError::PermissionDenied(_)))
+                }
+                _ => assert!(matches!(error, ProviderError::Provider(_))),
+            }
+            assert!(!error.to_string().contains("VM_PRIVATE_PAYLOAD"));
+            assert!(error.to_string().len() < 100);
+        }
+        let error = VmCapsuleProvider::to_resource_response(
+            ResourceAction::List,
+            serde_json::json!({"status": "ok", "data": "VM_PRIVATE_PAYLOAD"}),
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains("VM_PRIVATE_PAYLOAD"));
+    }
 
     #[test]
     fn test_to_raw_request_read() {

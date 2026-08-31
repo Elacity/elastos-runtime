@@ -4,10 +4,27 @@ This file is the durable working contract for people and agents changing this
 repo. Product principles live in [PRINCIPLES.md](PRINCIPLES.md), current truth
 lives in [state.md](state.md), and open work lives in [TASKS.md](TASKS.md).
 
+## User-Facing Communication
+
+- Use ASD-STE100 Simplified Technical English for user-facing communication.
+- Describe the intended behavior first, with clear actors and ownership.
+- Express security and architecture boundaries as positive ownership statements.
+  Example: "Runtime keeps provider routes private" instead of a list of places
+  where routes must not appear.
+- State a current gap once, then explain the desired behavior. Do not repeat the
+  same limitation in several forms.
+- Use connected, natural paragraphs. Avoid staccato status sentences, chains of
+  negation, and long prohibition lists.
+- Before sending a public comment, community update, handoff, or summary, apply
+  the humanizer skill and rewrite repeated uses of "not", "no", "never", and
+  "must not" as direct statements of behavior or ownership.
+- Keep technical precision without turning every sentence into a disclaimer.
+
 ## Branch Roles
 
-- `main` is the stable release line; it currently represents 0.5.0.
-- `upstream/0.6-dev` is the current 0.6 development integration line.
+- `main` is the stable source line.
+- `upstream/<version>-dev` branches are development integration lines. Resolve
+  the active line from `state.md` and fetched refs before choosing a base.
 - Feature and fix branches remain unpublished working lines until they are
   explicitly pushed for review.
 - Do not assume a `review/*` or `live` ref exists. Identify the exact public
@@ -21,10 +38,8 @@ lives in [state.md](state.md), and open work lives in [TASKS.md](TASKS.md).
 
 ## Creating Work Branches
 
-New feature or bugfix branches start from an `upstream/XX-dev` integration
-branch (e.g. `upstream/0.6-dev`) — never silently from `main` or from whatever
-branch happens to be checked out. The user chooses the base; do not pick it
-yourself:
+New feature or bugfix branches start from a user-selected `upstream/XX-dev`
+integration branch. The current checkout and `main` are not implicit bases:
 
 - Run `git fetch origin --prune`, then list `upstream/*-dev` lines and active
   `feat/*`/`fix/*` branches before proposing bases.
@@ -72,6 +87,57 @@ Avoid creating timestamped backup branches during normal work. If a backup is
 unavoidable, name the reason, keep a cleanup task with it, and remove it after
 the protected work is merged or proven duplicate.
 
+## Local Hygiene And Retention
+
+Local refs, worktrees, build outputs, proof directories, installed artifacts,
+and rollback copies are operational state with an explicit lifecycle. Creating
+them creates a cleanup obligation; "temporary" is not a lifecycle.
+
+- Keep a local, untracked operator ledger for every non-canonical branch,
+  worktree, detached HEAD, large proof directory, installed runtime, and
+  rollback set. Record its exact path or ref, commit and tree where applicable,
+  owner or purpose, dirty state, creation or observation date, protection
+  source, and one terminal decision: keep, review/merge, archive, or remove.
+  Never commit private paths or operator details from this ledger.
+- Keep local branches only for active development or valuable work that is not
+  protected by a fetched remote ref or intentional tag. Do not create
+  `backup/*`, `archive/*`, timestamped safety, or sync refs for clean or already
+  published commits. A temporary preservation ref must name the dirty or
+  unanchored state it protects, have a ledger cleanup condition, and be removed
+  as soon as that condition is met.
+- Do not leave an unanchored detached HEAD. Before ending the task that creates
+  one, either attach it to an intentional branch/tag, prove that another ref
+  contains it, or record it as an explicit preservation blocker in the local
+  ledger.
+- A temporary worktree must be removed before handoff unless its ledger entry
+  names the active task and cleanup condition. Keep at most one worktree for a
+  branch. A clean checkout is reproducible state, not a backup.
+- Before deleting a duplicate ref, prove exact commit identity. Same-tree but
+  different-history refs are not automatic deletion candidates: preserve or
+  explicitly waive the unique history first. Before deleting a worktree,
+  verify its status, untracked files, open files/processes, and protecting ref.
+- Build outputs, Cargo targets, dependency caches, VM hibernation state, and
+  proof scratch directories are rebuildable artifacts, not rollback copies.
+  Do not retain them merely because they were expensive to create.
+- Never run an installed or long-lived Runtime from `/tmp`, `/private/tmp`, a
+  Cargo `target` directory, or another disposable checkout. Install it to a
+  stable data path with a receipt binding source commit, source tree, binary
+  SHA-256, components manifest, capsule tree, and installation time.
+- Retain no rollback by default. A named risky deployment, migration, or
+  incident may temporarily keep at most one verified rollback for the affected
+  release/platform; it needs a receipt, size, reason, explicit expiry or cleanup
+  condition, and must be removed when that gate closes. Do not recursively copy
+  a live data root without an explicit size estimate and exclusion list for
+  existing backups, VM images, caches, identity state, and user data.
+- Maintain at least 10% free space on development and staging volumes. If free
+  space falls below that threshold, stop creating worktrees, builds, VM images,
+  and backups until the ledger is reconciled and safe reclaim has completed.
+- Before handoff, rerun the branch/worktree inventory, check every touched
+  worktree for dirt, report local/remote divergence, and update the local
+  ledger. Do not describe a cleanup as complete while an unexplained ref,
+  detached HEAD, worktree, active temporary binary, or unbounded rollback set
+  remains.
+
 ## Publishing Terms And Gates
 
 Use precise verbs. If the user says "publish" without a target, restate the
@@ -80,8 +146,8 @@ target before acting.
 - prepare: make a local, reviewable commit or commit set; do not push or deploy.
 - publish for review: push the named local branch to the named remote only after
   reporting commits, divergence, and verification.
-- deploy live: update `https://elastos.elacitylabs.com/apps/home/` from a named
-  commit and verify the served artifact hashes before moving `live`.
+- deploy live: update the approved public Home target from a named commit and
+  verify the served artifact hashes before moving `live`.
 - release: merge to `main`, update release notes/version/tag, and push only
   after the release gate passes.
 
@@ -121,6 +187,11 @@ capsules, provider config, and `components.json`.
 - Avoid volatile proof logs in durable docs. Store open work in `TASKS.md`,
   verified current truth in `state.md`, and release history in
   `elastos/CHANGELOG.md`.
+- Keep standing instructions, READMEs, contracts and roadmaps independent of
+  the current release. Branch heads, PR numbers, commit IDs, CI results and
+  installation snapshots belong in `state.md` or a dated evidence record.
+  Contract versions, dependency pins and artifact provenance stay with the
+  contract or artifact they identify.
 
 ## Verification Gate
 
@@ -159,6 +230,18 @@ path, installed artifact path, SHA-256 of the built and installed artifact,
 restart or stale-process cleanup performed, and the live localhost proof command
 and result.
 
+## Journey Register Gate
+
+Product-behavior changes and releases are measured against the journey audit
+register [docs/audits/ElastOS-Home-Journey-Audit.xlsx](docs/audits/ElastOS-Home-Journey-Audit.xlsx),
+the standing reference for stability and correctness for any PR or release.
+Before declaring product work done or a release ready, load the
+[e2e-audit skill](.claude/skills/e2e-audit/SKILL.md) and apply its
+invariant: read the touched areas' journeys and findings, keep Pass journeys
+stable, update rows a change intentionally alters in the same PR, add rows for
+new surface, and close findings only with their recorded proof. Live verdicts
+come from installed evidence on the exact revision, never from source reading.
+
 ## Public Live Deployment
 
 The public live host must preserve its data root, signing key, passkey state, and
@@ -167,11 +250,12 @@ provider config while replacing only intentional release artifacts.
 Any public-live mutation requires explicit user approval before the mutation,
 even when a dry-run plan reports ready artifacts.
 
-Current public-live convention:
+Set the deployment inputs from the reviewed target configuration:
 
 - gateway root: `$ELASTOS_LIVE_HOME`
 - data root: `$ELASTOS_LIVE_XDG_DATA_HOME/elastos`
-- public URL: `https://elastos.elacitylabs.com/apps/home/`
+- local Home URL: `$ELASTOS_LIVE_LOCAL_URL`
+- public Home URL: `$ELASTOS_LIVE_PUBLIC_URL`
 
 For source-home rebuilds, keep `HOME` and `XDG_DATA_HOME` pointed at the live
 root, but pin Rust tooling to the real toolchain. Otherwise `rustup` can look in
@@ -199,9 +283,9 @@ capsules, installs app capsule trees with their root WASM entrypoints, stamps
 After restart, verify:
 
 ```bash
-curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/apps/home/
-curl -fsS -o /dev/null -w '%{http_code}\n' https://elastos.elacitylabs.com/apps/home/
-curl -fsS https://elastos.elacitylabs.com/apps/home/ | sha256sum
+curl -fsS -o /dev/null -w '%{http_code}\n' "$ELASTOS_LIVE_LOCAL_URL"
+curl -fsS -o /dev/null -w '%{http_code}\n' "$ELASTOS_LIVE_PUBLIC_URL"
+curl -fsS "$ELASTOS_LIVE_PUBLIC_URL" | sha256sum
 sha256sum \
   "$ELASTOS_LIVE_XDG_DATA_HOME/elastos/capsules/home/browser/index.html" \
   capsules/home/browser/index.html
@@ -236,15 +320,15 @@ active Browser page as a passing Browser product proof.
 
 ## Browser Claim Discipline
 
-The current 0.5.0 Browser product contract is WebRTC remote display through the
+The Browser product contract is WebRTC remote display through the
 Runtime Browser Engine Adapter with Runtime-only networking and explicit Browser
 Engine/Exit service selection. `runtime_frame`, `diagnostic_frame`, screenshot,
 and image-polling display paths are removed from the product path and must not be
 reintroduced as compatibility fallbacks.
 
 Mac VZ and Linux/crosvm Jetson are host adapters behind the same Browser/Net/
-Exit/Wallet contracts. This public server is a non-KVM gateway and remote-engine
-consumer, not a local product Browser VM provider. Host-specific launchers are
+Exit/Wallet contracts. A non-KVM server acts as a gateway and remote-engine
+consumer. Local Browser VM proof requires a suitable host. Host-specific launchers are
 implementation details behind Runtime contracts, not separate Browser products.
 
 Native Browser helpers and hosted/Selkies proof tooling may exist, but native,
@@ -254,7 +338,7 @@ requires target evidence for audio/video/input, frame continuity, heartbeat and
 reconnect behavior, explicit close/orphan cleanup, and wallet dapp flows, plus a
 hash-bound manual UX report where required.
 
-A macOS `.dmg` is a packaging goal, not current support. It requires a stable
+A macOS `.dmg` support claim requires a stable
 macOS source-home path, provider binaries, launch wrapper, passkey/origin policy,
 update story, and human Home/app/chat proof. Do not conflate `.dmg` packaging
 with Browser engine isolation or product media proof.

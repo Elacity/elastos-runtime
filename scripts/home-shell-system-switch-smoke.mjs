@@ -1,10 +1,19 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260725a";
+const moduleVersion = "home-20260802a";
 const requests = [];
 const windowListeners = new Map();
 const localStorageValues = new Map();
 const windowFrames = [];
+const pendingTimers = new Map();
+let nextTimerId = 1;
+const originalConsoleError = console.error;
+console.error = (...args) => {
+  if (String(args[0] || "").includes("active shell root launch failed")) {
+    return;
+  }
+  originalConsoleError(...args);
+};
 
 function addWindowEventListener(type, callback) {
   if (!windowListeners.has(type)) {
@@ -168,11 +177,53 @@ function jsonResponse(value) {
   };
 }
 
+function failedResponse(status, statusText, detail) {
+  return {
+    ok: false,
+    status,
+    statusText,
+    json: async () => ({ error: detail }),
+    text: async () => detail,
+  };
+}
+
 function assert(condition, message, details = null) {
   if (!condition) {
     const error = new Error(message);
     error.details = details;
     throw error;
+  }
+}
+
+async function flush(turns = 1) {
+  for (let attempt = 0; attempt < turns; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+
+async function waitFor(predicate, message, details) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if (predicate()) {
+      return;
+    }
+    await flush();
+  }
+  assert(false, message, details?.());
+}
+
+function dispatchMessage(source, data) {
+  for (const listener of windowListeners.get("message") || []) {
+    listener({
+      origin: "null",
+      source,
+      data,
+    });
+  }
+}
+
+function click(element) {
+  for (const listener of element.listeners.get("click") || []) {
+    listener({ preventDefault() {} });
   }
 }
 
@@ -218,6 +269,14 @@ const summary = {
   ],
 };
 
+let deferredRootShellLaunch = null;
+let failNextRootShellLaunchTarget = "";
+let nextSummaryFailure = null;
+const rootShellLaunchCounts = {
+  "home-gui": 0,
+  "home-cli": 0,
+};
+
 globalThis.HTMLElement = FakeElement;
 globalThis.document = {
   activeElement: null,
@@ -250,11 +309,18 @@ globalThis.window = {
   innerWidth: 1280,
   addEventListener: addWindowEventListener,
   clearInterval() {},
-  clearTimeout() {},
+  clearTimeout(timerId) {
+    pendingTimers.delete(Number(timerId));
+  },
   setInterval: () => 0,
-  setTimeout: (callback) => {
-    Promise.resolve().then(callback);
-    return 0;
+  setTimeout: (callback, delay = 0) => {
+    if (Number(delay) <= 0) {
+      Promise.resolve().then(callback);
+      return 0;
+    }
+    const timerId = nextTimerId++;
+    pendingTimers.set(timerId, callback);
+    return timerId;
   },
 };
 globalThis.EventSource = FakeEventSource;
@@ -277,11 +343,39 @@ globalThis.fetch = async (url, init = {}) => {
     url: String(url),
   });
   if (url === "/api/apps/home/summary") {
+    if (nextSummaryFailure) {
+      const failure = nextSummaryFailure;
+      nextSummaryFailure = null;
+      return failure;
+    }
     return jsonResponse(summary);
+  }
+  if (url === "/api/auth/sessions/refresh") {
+    return jsonResponse({ home_token: "host-token" });
+  }
+  if (url === "/api/apps/home/active-shell") {
+    assert(
+      init.headers?.["x-elastos-home-token"] === "host-token",
+      "Desktop recovery did not use the trusted Home host token",
+      init.headers,
+    );
+    summary.active_shell.active = body?.active || summary.active_shell.active;
+    return jsonResponse({ active: summary.active_shell.active });
   }
   if (url === "/api/apps/home/launch") {
     if (body?.target === "home-gui") {
       assert(body?.query?.shell_mode === "root", "setup did not launch Home GUI in root mode", body);
+      rootShellLaunchCounts["home-gui"] += 1;
+      if (deferredRootShellLaunch?.target === "home-gui") {
+        return new Promise((resolve, reject) => {
+          deferredRootShellLaunch.resolve = resolve;
+          deferredRootShellLaunch.reject = reject;
+        });
+      }
+      if (failNextRootShellLaunchTarget === "home-gui") {
+        failNextRootShellLaunchTarget = "";
+        throw new Error("simulated root shell launch failure");
+      }
       return jsonResponse({
         attach_kind: "iframe",
         route: "/apps/home-gui/?shell_mode=root&home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=gui-token",
@@ -297,6 +391,17 @@ globalThis.fetch = async (url, init = {}) => {
     }
     assert(body?.target === "home-cli", "system switch should launch Home CLI as the root shell", body);
     assert(body?.query?.shell_mode === "root", "system switch did not launch shell root mode", body);
+    rootShellLaunchCounts["home-cli"] += 1;
+    if (deferredRootShellLaunch?.target === "home-cli") {
+      return new Promise((resolve, reject) => {
+        deferredRootShellLaunch.resolve = resolve;
+        deferredRootShellLaunch.reject = reject;
+      });
+    }
+    if (failNextRootShellLaunchTarget === "home-cli") {
+      failNextRootShellLaunchTarget = "";
+      throw new Error("simulated root shell launch failure");
+    }
     return jsonResponse({
       attach_kind: "iframe",
       route: "/apps/home-cli/?shell_mode=root&home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=root-token",
@@ -308,12 +413,16 @@ globalThis.fetch = async (url, init = {}) => {
 
 const hostCore = await import(`../capsules/home/browser/shell-core.js?v=${moduleVersion}`);
 await import(`../capsules/home/browser/home-shell-host.js?v=${moduleVersion}`);
-for (let attempt = 0; attempt < 20 && !elementForSelector("#active-shell-frame").dataset.route; attempt += 1) {
-  await new Promise((resolve) => setTimeout(resolve, 0));
-}
+await waitFor(
+  () => Boolean(elementForSelector("#active-shell-frame").dataset.route),
+  "setup did not launch the initial root shell",
+  () => ({ requests }),
+);
 
 const activeShellRoot = elementForSelector("#active-shell-root");
 const activeShellFrame = elementForSelector("#active-shell-frame");
+const shellHostRecovery = elementForSelector("#shell-host-recovery");
+const shellHostRecoveryHomeButton = elementForSelector("#shell-host-recovery-home");
 assert(document.body.dataset.homeShell === "desktop", "setup did not mount Home GUI", document.body.dataset);
 assert(activeShellFrame.dataset.route.includes("/apps/home-gui/"), "setup did not launch isolated Home GUI", activeShellFrame.dataset);
 
@@ -324,45 +433,27 @@ const guiFrameWindow = {
   },
 };
 activeShellFrame.contentWindow = guiFrameWindow;
-for (const listener of windowListeners.get("message") || []) {
-  listener({
-    origin: "null",
-    source: guiFrameWindow,
-    data: {
-      type: "home:launch-target",
-      requestId: "launch-system",
-      target: "system",
-      query: {},
-      homeToken: "gui-token",
-    },
-  });
-}
-for (let attempt = 0; attempt < 20 && !guiMessages.some((message) => message.payload?.requestId === "launch-system"); attempt += 1) {
-  await new Promise((resolve) => setTimeout(resolve, 0));
-}
+dispatchMessage(guiFrameWindow, {
+  type: "home:launch-target",
+  requestId: "launch-system",
+  target: "system",
+  query: {},
+  homeToken: "gui-token",
+});
+await waitFor(
+  () => guiMessages.some((message) => message.payload?.requestId === "launch-system"),
+  "home GUI did not launch System",
+  () => ({ guiMessages, requests }),
+);
 
 const staleLaunchSeq = hostCore.shellState.activeShellRootLaunchSeq;
-const systemFrameWindow = {};
-for (const listener of windowListeners.get("message") || []) {
-  listener({
-    origin: "null",
-    source: systemFrameWindow,
-    data: { type: "home:app-ready", homeToken: "system-token" },
-  });
-}
-summary.active_shell.active = "home-cli";
-
-for (const listener of windowListeners.get("message") || []) {
-  listener({
-    origin: "null",
-    source: systemFrameWindow,
-    data: {
-      type: "home:active-shell-applied",
-      activeShell: "home-cli",
-      homeToken: "system-token",
-    },
-  });
-}
+const systemFrameWindow = { postMessage() {} };
+dispatchMessage(systemFrameWindow, { type: "home:app-ready", homeToken: "system-token" });
+dispatchMessage(systemFrameWindow, {
+  type: "home:active-shell-applied",
+  activeShell: "home-cli",
+  homeToken: "system-token",
+});
 
 assert(document.body.dataset.homeShell === "alternate", "System shell switch did not retire Home GUI immediately", document.body.dataset);
 assert(document.body.dataset.homeGui === "dormant", "System shell switch left Home GUI mounted", document.body.dataset);
@@ -370,7 +461,7 @@ assert(activeShellRoot.hidden === false, "System shell switch did not expose the
 assert(activeShellRoot.dataset.target === "home-cli", "System shell switch did not preclaim Home CLI root", activeShellRoot.dataset);
 assert(activeShellFrame.hidden === true, "System shell switch did not blank the stale shell frame before relaunch");
 assert(!activeShellFrame.dataset.route, "System shell switch left the stale shell route visible", activeShellFrame.dataset);
-assert(!activeShellFrame.getAttribute("src"), "System shell switch left the stale iframe src visible");
+assert(activeShellFrame.src === "about:blank", "System shell switch did not unload the stale shell frame before relaunch", activeShellFrame.src);
 assert(elementForSelector("#home-shell-boot-mask").hidden === false, "System shell switch did not show the neutral boot mask");
 assert(
   hostCore.shellState.activeShellRootLaunchSeq > staleLaunchSeq,
@@ -382,17 +473,141 @@ assert(
   "System shell switch did not store the alternate-shell paint hint",
   Object.fromEntries(localStorageValues),
 );
+assert(
+  hostCore.shellState.pendingAppliedShellTarget === "home-cli",
+  "System shell switch did not retain the trusted pending shell target while summary was stale",
+  hostCore.shellState,
+);
+await waitFor(
+  () => activeShellFrame.dataset.route.includes("/apps/home-cli/"),
+  "System shell switch did not relaunch Home CLI while the first summary still pointed at Desktop",
+  () => ({ requests, shellState: hostCore.shellState, summary: summary.active_shell }),
+);
 
-for (let attempt = 0; attempt < 20 && activeShellFrame.dataset.route === ""; attempt += 1) {
-  await new Promise((resolve) => setTimeout(resolve, 0));
-}
-
-assert(activeShellFrame.hidden === false, "System shell switch did not restore the active shell frame");
+const cliFrameWindow = { postMessage() {} };
+activeShellFrame.contentWindow = cliFrameWindow;
+assert(activeShellFrame.hidden === true, "System shell switch revealed Home CLI before the shell-ready handshake");
 assert(activeShellFrame.dataset.route.includes("/apps/home-cli/"), "System shell switch did not relaunch Home CLI", activeShellFrame.dataset);
+assert(elementForSelector("#home-shell-boot-mask").hidden === false, "System shell switch hid the neutral host mask before Home CLI was ready");
+dispatchMessage(cliFrameWindow, {
+  type: "home:shell-ready",
+  homeToken: "root-token",
+});
+await waitFor(
+  () => activeShellFrame.hidden === false && elementForSelector("#home-shell-boot-mask").hidden === true,
+  "System shell switch did not settle after the Home CLI ready handshake",
+  () => ({ shellState: hostCore.shellState, activeShellFrame, body: document.body.dataset }),
+);
+assert(shellHostRecovery.hidden === true, "System shell switch surfaced recovery after a valid Home CLI ready handshake");
 assert(
   requests.filter((request) => request.url === "/api/apps/home/launch" && request.body?.target === "home-cli").length >= 1,
   "System shell switch did not relaunch through Runtime after the applied-shell message",
   requests,
+);
+
+summary.active_shell.active = "home-cli";
+await hostCore.shellState.requestSummaryRefresh();
+assert(
+  hostCore.shellState.pendingAppliedShellTarget === "",
+  "System shell switch did not clear the trusted pending shell target after summary catch-up",
+  hostCore.shellState,
+);
+
+const cliRootRoute = activeShellFrame.dataset.route;
+deferredRootShellLaunch = { target: "home-gui" };
+dispatchMessage(cliFrameWindow, {
+  type: "home:active-shell-applied",
+  activeShell: "home-gui",
+  homeToken: "root-token",
+});
+await waitFor(
+  () => typeof deferredRootShellLaunch?.reject === "function",
+  "Desktop relaunch did not begin after Home CLI requested it",
+  () => ({ requests, shellState: hostCore.shellState }),
+);
+summary.active_shell.active = "home-cli";
+hostCore.shellState.activeShellRootLaunchSeq += 1;
+hostCore.shellState.pendingAppliedShellTarget = "";
+hostCore.shellState.activeShellRootTarget = "home-cli";
+hostCore.shellState.activeShellRootRoute = cliRootRoute;
+activeShellFrame.hidden = false;
+activeShellFrame.src = cliRootRoute;
+activeShellFrame.dataset.route = cliRootRoute;
+deferredRootShellLaunch.reject(new Error("simulated stale Desktop launch failure"));
+deferredRootShellLaunch = null;
+await flush(2);
+assert(shellHostRecovery.hidden === true, "A stale Desktop launch failure surfaced recovery after Home CLI superseded it", shellHostRecovery.dataset);
+assert(
+  hostCore.shellState.activeShellRootTarget === "home-cli",
+  "A stale Desktop launch failure revived the wrong active shell target",
+  hostCore.shellState,
+);
+summary.active_shell.active = "home-cli";
+dispatchMessage(cliFrameWindow, {
+  type: "home:active-shell-applied",
+  activeShell: "home-gui",
+  homeToken: "root-token",
+});
+activeShellFrame.contentWindow = guiFrameWindow;
+await waitFor(
+  () => activeShellFrame.dataset.route.includes("/apps/home-gui/"),
+  "Desktop relaunch setup did not restore Home GUI",
+  () => ({ requests, shellState: hostCore.shellState }),
+);
+assert(activeShellFrame.hidden === true, "Desktop relaunch revealed Home GUI before the shell-ready handshake");
+assert(elementForSelector("#home-shell-boot-mask").hidden === false, "Desktop relaunch hid the neutral host mask before Home GUI was ready");
+dispatchMessage(guiFrameWindow, {
+  type: "home:shell-ready",
+  homeToken: "gui-token",
+});
+await waitFor(
+  () => activeShellFrame.hidden === false && elementForSelector("#home-shell-boot-mask").hidden === true,
+  "Desktop relaunch did not settle after the Home GUI ready handshake",
+  () => ({ shellState: hostCore.shellState, activeShellFrame, body: document.body.dataset }),
+);
+summary.active_shell.active = "home-gui";
+await hostCore.shellState.requestSummaryRefresh();
+
+failNextRootShellLaunchTarget = "home-cli";
+dispatchMessage(guiFrameWindow, {
+  type: "home:active-shell-applied",
+  activeShell: "home-cli",
+  homeToken: "gui-token",
+});
+await waitFor(
+  () => shellHostRecovery.hidden === false && shellHostRecovery.dataset.target === "home-cli",
+  "Terminal launch failure did not surface host recovery while summary still pointed at Desktop",
+  () => ({ requests, shellState: hostCore.shellState, summary: summary.active_shell }),
+);
+assert(
+  hostCore.shellState.pendingAppliedShellTarget === "home-cli",
+  "Terminal launch failure did not retain the pending Terminal target until recovery",
+  hostCore.shellState,
+);
+click(shellHostRecoveryHomeButton);
+await waitFor(
+  () => requests.some((request) => request.url === "/api/apps/home/active-shell" && request.body?.active === "home-gui"),
+  "Desktop recovery did not force an active-shell change while summary was stale",
+  () => ({ requests, shellState: hostCore.shellState }),
+);
+await waitFor(
+  () => activeShellFrame.dataset.route.includes("/apps/home-gui/"),
+  "Desktop recovery did not relaunch Home GUI after a stale-summary Terminal failure",
+  () => ({ requests, shellState: hostCore.shellState, summary: summary.active_shell }),
+);
+summary.active_shell.active = "home-gui";
+await hostCore.shellState.requestSummaryRefresh();
+
+nextSummaryFailure = failedResponse(401, "Unauthorized", "expired");
+dispatchMessage(guiFrameWindow, {
+  type: "home:active-shell-applied",
+  activeShell: "home-cli",
+  homeToken: "gui-token",
+});
+await waitFor(
+  () => hostCore.shellState.pendingAppliedShellTarget === "" && activeShellRoot.hidden === true,
+  "Auth gate did not clear the pending shell target and root shell mount",
+  () => ({ shellState: hostCore.shellState, body: document.body.dataset }),
 );
 
 console.log("[home-shell-system-switch] PASS");

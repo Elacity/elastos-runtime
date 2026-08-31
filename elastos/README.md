@@ -16,7 +16,7 @@ When running Cargo from the repository root, pass
 
 ## Requirements
 
-- Rust 1.89.0, pinned by the repository's
+- Rust 1.91.0, pinned by the repository's
   [`rust-toolchain.toml`](../rust-toolchain.toml)
 - Git
 
@@ -53,8 +53,11 @@ cargo test --workspace
 cargo test -p elastos-runtime
 ```
 
-The repository root also provides `just test`, `just test-crate <crate>`, and
-`just verify`.
+From the repository root, `just test` runs both the Runtime workspace and the
+own-workspace capsule suites, preparing the required provider binaries first.
+Use `just test-elastos`, `just test-capsules` or `just test-crate <crate>` for
+narrow checks. `just verify` adds the source, lint and contract gates; a plain
+`cargo test --workspace` covers only this workspace.
 
 ## Related documentation
 

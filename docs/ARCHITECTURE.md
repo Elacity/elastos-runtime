@@ -18,7 +18,7 @@ authority, or availability.
 [CAPSULE_MODEL.md](CAPSULE_MODEL.md) supplements this document with capsule
 layers and lifecycle.
 
-## ElastOS Four Quadrants
+## ElastOS four quadrants
 
 The four quadrants divide responsibility within the ElastOS World Computer
 model. Together they describe one product with one trusted-core boundary. The
@@ -48,14 +48,19 @@ full boundary. See [CARRIER.md](CARRIER.md) and
 [BROWSER_CAPSULE.md](BROWSER_CAPSULE.md) for their concrete contracts.
 
 This is the implemented contract shape, not a claim that every product App has
-migrated substrates. In the 0.6 review tree, the Component runner is exercised
+migrated substrates. In the current source, the Component runner is exercised
 by a conformance fixture and authoring template; all shipped first-party UI Apps
 remain `elastos.runtime-projection/v1` web projections.
 
-The Runtime-owned trusted-source Room bootstrap exception may use configured
-publisher transport state to seed Room gossip. It remains Runtime-only and must
-not expose raw tickets, decoded endpoints, or direct Carrier socket authority to
-capsules or UI.
+A verified signed collaboration-network profile supplies the Runtime's bounded
+bootstrap peers and authenticates the content-addressed default-conversation
+grant. The Runtime collaboration service, durable core, and transport driver own
+that authority and give Carrier only opaque signed envelopes. Configured Chat
+text receives typed projections from the Runtime-owned product port and never
+receives tickets, endpoints, raw sockets, or Carrier topics. The collaboration
+candidate's bounded People discovery uses the same Runtime-owned path. Wider
+discovery rendezvous and the old Services remote-Exit social/contact path remain
+separate work.
 
 Sequencing and incomplete work belong in [ROADMAP.md](../ROADMAP.md) and
 [TASKS.md](../TASKS.md). This document defines the following authority
@@ -143,6 +148,25 @@ The Capsule Runtime contract binds an artifact, session, capabilities,
 resources, state, and lifecycle. User-scoped authority also requires a verified
 principal. The contract should remain stable across compatible substrates.
 
+### Consequence-aware effects
+
+ElastOS does not split information systems and operational systems into
+parallel authority stacks. A document read, sensor observation, model request,
+payment, rights change, and physical actuation all enter the same typed Runtime
+boundary. Their provider contracts impose different authority, timing, retry,
+settlement, and safety requirements.
+
+The admitted provider contract describes operation semantics and hazards.
+Runtime sets and enforces the minimum classification and may strengthen it. A
+capsule declaration cannot downgrade that policy. A remote destination admits
+the operation independently, and a physical controller retains its local
+interlocks and final safety decision. Runtime does not replace a hard real-time
+controller.
+
+[Consequence-aware effects](CONSEQUENCE_AWARE_EFFECTS.md) defines observation,
+actuation, settlement, ownership, and local-safety rules. It is a cross-cutting
+Runtime/provider contract, not another quadrant or a raw device API.
+
 ### Host adapters
 
 The target architecture keeps the capsule contract stable while host adapters
@@ -167,6 +191,11 @@ shell selection, child-message routing, launch grants, and browser-session
 behavior. [CARRIER.md](CARRIER.md) owns peer admission and member/guest
 boundaries.
 
+The Windows plan runs the Linux Runtime inside WSL2 under the same Runtime and
+provider contracts. A planned Windows launcher would handle start, stop, update,
+and Home opening. Later native Windows adapters still belong
+behind the same Runtime and Browser contracts. See [WINDOWS.md](WINDOWS.md).
+
 ## The three layers
 
 ### Layer 1: Runtime (`elastos` binary)
@@ -188,6 +217,8 @@ identity, lifecycle, and intent contract.
 
 Interaction equality is part of the same rule: a visible human action and an
 agent request must reach the same capability-scoped Runtime operation.
+[Human and agent architecture](AGENT_ARCHITECTURE.md) defines the corresponding
+principal, profile, session, capsule, and delegation model.
 
 Home shell browser state may persist safe window and route descriptors for
 restoration, but not Browser VM Chromium profile disks, launch tokens,
@@ -201,6 +232,25 @@ Provider capsules are explicit service-plane exceptions with narrow declared
 authority. Package roles, types, execution ABIs, and checked authoring examples
 belong in [CAPSULE_AUTHORING.md](CAPSULE_AUTHORING.md). All capsule effects
 still cross Runtime authority checks.
+
+### Content capsule distribution contract
+
+Games, local model files, and similar downloadable data are content capsules.
+Their stable identity is the CID of the complete immutable bundle. Signed
+catalog entries point to that identity, availability receipts state who retains
+it, and Runtime records local admission. None of those projections is a service
+offer.
+
+The planned Get operation lets Home request an exact content capsule. Runtime
+will verify the caller and publisher, select content and availability providers,
+fetch and pin the CID, admit it atomically, and write a receipt. External
+repositories remain behind gateway provider capsules. They may import approved bytes into this
+normal content path but may not become ambient capsule networking or a second
+install rail. See
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
+
+The current catalog projects installed capsules. Network catalog discovery and
+Get admission remain implementation work.
 
 ### Boundary decisions
 
@@ -242,6 +292,12 @@ Launch policy follows:
 
 Executable capsules express intent, and Runtime decides how to fulfill it.
 
+A private network follows the same rule. Signed membership admits devices to a
+network, while named service access still requires source and destination
+Runtime authorization. Optional TUN, Exit, and LAN Gateway functions are
+compatibility providers behind that policy, not a second capsule network ABI.
+See [PRIVATE_NETWORK.md](PRIVATE_NETWORK.md).
+
 ## WebSpace addressing
 
 [NAMESPACES.md](NAMESPACES.md) defines accepted schemes, current roots, and URI
@@ -259,6 +315,17 @@ operation to its owning provider. Ordinary capsules receive neither raw keys
 nor provider credentials. [PROTECTED_CONTENT.md](PROTECTED_CONTENT.md) owns the
 access sequence and failure rules; [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md)
 owns publication and retrieval.
+
+The protected-content and dKMS capsule contract is placement-neutral. A
+same-node key or dKMS implementation uses a private Runtime-owned adapter. A
+first-party production dKMS hop that crosses an ElastOS machine boundary uses
+Carrier as its canonical transport, while the dKMS protocol keeps its own
+end-to-end node authorization, encryption, signing, freshness, replay defense,
+and rights binding above Carrier. Carrier authenticates endpoints; it does not
+authorize key release. Raw CEKs never enter Runtime, Carrier, or an ordinary
+App. Runtime selects placement and transport; the caller does not name a dKMS
+peer, host path, backend, or pipe. A quorum placed on one machine is development
+evidence rather than proof of distributed custody.
 
 ## Capability system
 
@@ -336,6 +403,11 @@ Provider namespaces and operations belong in their contract documents, not in
 a universal CRUD interface or hand-maintained architecture table. New provider
 families must define a typed contract before becoming visible in Home. The
 [documentation index](README.md) lists the current provider contracts.
+
+For model inference, the provider owns backend credentials, selection,
+streaming, cancellation, and error translation. Runtime authorizes the caller
+and selection policy. Model output can propose another typed effect but cannot
+authorize it. See [MODEL_PROVIDER.md](MODEL_PROVIDER.md).
 
 ## Orchestration and Runtime communication
 

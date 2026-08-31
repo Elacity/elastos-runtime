@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::local_http::LoopbackHttpBaseUrl;
 use sha2::Digest;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeCoords {
     pub api_url: String,
     /// Opaque secret exchanged at `/api/auth/attach` for a short-lived bearer
@@ -24,6 +24,7 @@ pub struct RuntimeCoords {
 }
 
 pub const RUNTIME_KIND_OPERATOR: &str = "operator";
+pub const RUNTIME_KIND_GATEWAY: &str = "gateway";
 pub const RUNTIME_KIND_MANAGED_IDENTITY: &str = "managed-identity";
 pub const RUNTIME_KIND_MANAGED_CHAT: &str = "managed-chat";
 pub const RUNTIME_KIND_MANAGED_HOME: &str = "managed-home";
@@ -31,8 +32,8 @@ pub const OPERATOR_RUNTIME_REQUIRED_MESSAGE: &str =
     "This command requires a running runtime.\n\n  elastos serve\n\nThen run this command again.";
 pub const GATEWAY_OWNED_HOME_TERMINAL_ENV: &str = "ELASTOS_GATEWAY_OWNED_HOME_TERMINAL";
 const CARRIER_MDNS_ENV: &str = "ELASTOS_CARRIER_MDNS";
-const MANAGED_RUNTIME_REQUIRED_PROVIDERS: &[&str] =
-    &["localhost-provider", "shell", "did-provider"];
+const MANAGED_RUNTIME_REQUIRED_NATIVE_PROVIDERS: &[&str] = &["localhost-provider", "did-provider"];
+const MANAGED_RUNTIME_REQUIRED_COMPONENTS: &[&str] = &["shell"];
 
 enum ManagedRuntimeStart {
     Owner(ManagedRuntimeStartGuard),
@@ -280,7 +281,11 @@ fn managed_runtime_kind_label(kind: &str) -> &str {
 
 impl RuntimeCoords {
     pub fn is_operator_runtime(&self) -> bool {
-        !is_managed_user_runtime_kind(&self.runtime_kind)
+        self.runtime_kind == RUNTIME_KIND_OPERATOR
+    }
+
+    pub fn is_gateway_runtime(&self) -> bool {
+        self.runtime_kind == RUNTIME_KIND_GATEWAY
     }
 }
 
@@ -405,6 +410,32 @@ pub fn runtime_coord_path(data_dir: &Path) -> PathBuf {
     data_dir.join("runtime-coords.json")
 }
 
+pub(crate) fn gateway_runtime_coord_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("gateway-runtime-coords.json")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum AttachableRuntimeKind {
+    Operator,
+    Gateway,
+}
+
+impl AttachableRuntimeKind {
+    pub(crate) fn coord_path(self, data_dir: &Path) -> PathBuf {
+        match self {
+            Self::Operator => runtime_coord_path(data_dir),
+            Self::Gateway => gateway_runtime_coord_path(data_dir),
+        }
+    }
+
+    fn matches(self, coords: &RuntimeCoords) -> bool {
+        match self {
+            Self::Operator => coords.is_operator_runtime(),
+            Self::Gateway => coords.is_gateway_runtime(),
+        }
+    }
+}
+
 /// Portable PID liveness check.
 ///
 /// Previously the codebase used `PathBuf::from(format!("/proc/{}", pid)).exists()`,
@@ -462,6 +493,75 @@ fn managed_runtime_child_xdg_data_home(child_home: &Path) -> PathBuf {
     child_home.join(".local").join("share")
 }
 
+fn managed_runtime_child_data_dir_for_os(child_home: &Path, os: &str) -> PathBuf {
+    match os {
+        "macos" => child_home
+            .join("Library")
+            .join("Application Support")
+            .join("elastos"),
+        _ => managed_runtime_child_xdg_data_home(child_home).join("elastos"),
+    }
+}
+
+fn managed_runtime_child_data_dir(child_home: &Path) -> PathBuf {
+    managed_runtime_child_data_dir_for_os(child_home, std::env::consts::OS)
+}
+
+fn sync_managed_runtime_child_components_manifest(
+    parent_data_dir: &Path,
+    child_home: &Path,
+) -> anyhow::Result<()> {
+    let parent_manifest = parent_data_dir.join("components.json");
+    let manifest_bytes = std::fs::read(&parent_manifest).map_err(|error| {
+        anyhow::anyhow!(
+            "managed home runtime requires installed manifest at {}: {}",
+            parent_manifest.display(),
+            error
+        )
+    })?;
+    let mut verified_binaries = Vec::with_capacity(
+        MANAGED_RUNTIME_REQUIRED_NATIVE_PROVIDERS.len() + MANAGED_RUNTIME_REQUIRED_COMPONENTS.len(),
+    );
+    for name in MANAGED_RUNTIME_REQUIRED_NATIVE_PROVIDERS {
+        let parent_binary = crate::binaries::resolve_verified_native_provider_binary_with_data_dir(
+            parent_data_dir,
+            name,
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "managed home runtime requires verified '{}' install at {}",
+                name,
+                parent_data_dir.join(format!("bin/{name}")).display()
+            )
+        })?;
+        verified_binaries.push((*name, parent_binary));
+    }
+    for name in MANAGED_RUNTIME_REQUIRED_COMPONENTS {
+        let parent_binary = parent_data_dir.join(format!("bin/{name}"));
+        crate::binaries::verify_component_binary_with_data_dir(
+            parent_data_dir,
+            name,
+            &parent_binary,
+        )
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "managed home runtime requires verified '{}' install at {}",
+                name,
+                parent_binary.display()
+            )
+        })?;
+        verified_binaries.push((*name, parent_binary));
+    }
+    let child_data_dir = managed_runtime_child_data_dir(child_home);
+    let child_bin_dir = child_data_dir.join("bin");
+    std::fs::create_dir_all(&child_bin_dir)?;
+    std::fs::write(child_data_dir.join("components.json"), manifest_bytes)?;
+    for (name, parent_binary) in verified_binaries {
+        std::fs::copy(parent_binary, child_bin_dir.join(name))?;
+    }
+    Ok(())
+}
+
 pub fn write_runtime_coords(path: &Path, coords: &RuntimeCoords) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -477,9 +577,143 @@ pub fn write_runtime_coords(path: &Path, coords: &RuntimeCoords) -> anyhow::Resu
     Ok(())
 }
 
+pub(crate) struct GatewayRuntimeCoordsGuard {
+    path: PathBuf,
+    coords: RuntimeCoords,
+}
+
+pub(crate) fn publish_gateway_runtime_coords(
+    data_dir: &Path,
+    coords: RuntimeCoords,
+) -> anyhow::Result<GatewayRuntimeCoordsGuard> {
+    anyhow::ensure!(
+        coords.is_gateway_runtime(),
+        "gateway coordinates must declare gateway runtime kind"
+    );
+    anyhow::ensure!(
+        coords.pid == std::process::id(),
+        "gateway coordinates must name the publishing process"
+    );
+    LoopbackHttpBaseUrl::parse(&coords.api_url)
+        .map_err(|error| anyhow::anyhow!("gateway control URL must be loopback: {error}"))?;
+    let path = gateway_runtime_coord_path(data_dir);
+    write_private_runtime_coords_atomically(&path, &coords)?;
+    Ok(GatewayRuntimeCoordsGuard { path, coords })
+}
+
+fn write_private_runtime_coords_atomically(
+    path: &Path,
+    coords: &RuntimeCoords,
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("runtime coordinate path has no parent"))?;
+    let parent_metadata = std::fs::symlink_metadata(parent)
+        .map_err(|error| anyhow::anyhow!("runtime coordinate directory unavailable: {error}"))?;
+    anyhow::ensure!(
+        parent_metadata.file_type().is_dir() && !parent_metadata.file_type().is_symlink(),
+        "runtime coordinate parent must be a real directory"
+    );
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        anyhow::ensure!(
+            metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+            "runtime coordinate target must be a regular file"
+        );
+    }
+
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|error| anyhow::anyhow!("OS randomness unavailable: {error}"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("runtime coordinate filename is invalid"))?;
+    let temporary_path = parent.join(format!(".{file_name}.{}.tmp", hex::encode(nonce)));
+
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&temporary_path)?;
+        let data = serde_json::to_vec_pretty(coords)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary_path, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    write_result
+}
+
+fn read_private_runtime_coords(path: &Path) -> Option<RuntimeCoords> {
+    use std::io::Read as _;
+
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        if metadata.mode() & 0o777 != 0o600 || metadata.uid() != unsafe { libc::geteuid() } {
+            return None;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(path).ok()?;
+        let opened_metadata = file.metadata().ok()?;
+        if !opened_metadata.is_file()
+            || opened_metadata.mode() & 0o777 != 0o600
+            || opened_metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return None;
+        }
+        let mut data = Vec::new();
+        file.take(64 * 1024 + 1).read_to_end(&mut data).ok()?;
+        if data.len() > 64 * 1024 {
+            return None;
+        }
+        serde_json::from_slice(&data).ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let mut data = Vec::new();
+        std::fs::File::open(path)
+            .ok()?
+            .take(64 * 1024 + 1)
+            .read_to_end(&mut data)
+            .ok()?;
+        if data.len() > 64 * 1024 {
+            return None;
+        }
+        serde_json::from_slice(&data).ok()
+    }
+}
+
+impl Drop for GatewayRuntimeCoordsGuard {
+    fn drop(&mut self) {
+        if read_private_runtime_coords(&self.path).as_ref() == Some(&self.coords) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 pub async fn read_runtime_coords(path: &Path) -> Option<RuntimeCoords> {
     let data = std::fs::read(path).ok()?;
     let coords: RuntimeCoords = serde_json::from_slice(&data).ok()?;
+    validate_runtime_coords(path, coords).await
+}
+
+async fn validate_runtime_coords(path: &Path, coords: RuntimeCoords) -> Option<RuntimeCoords> {
     let api_base = match LoopbackHttpBaseUrl::parse(&coords.api_url) {
         Ok(api_base) => api_base,
         Err(_) => {
@@ -596,6 +830,20 @@ pub async fn read_operator_runtime_coords(path: &Path) -> Option<RuntimeCoords> 
     } else {
         None
     }
+}
+
+pub async fn read_attachable_runtime_coords(
+    data_dir: &Path,
+    runtime_kind: AttachableRuntimeKind,
+) -> Option<RuntimeCoords> {
+    let path = runtime_kind.coord_path(data_dir);
+    let coords = match runtime_kind {
+        AttachableRuntimeKind::Operator => read_runtime_coords(&path).await?,
+        AttachableRuntimeKind::Gateway => {
+            validate_runtime_coords(&path, read_private_runtime_coords(&path)?).await?
+        }
+    };
+    runtime_kind.matches(&coords).then_some(coords)
 }
 
 /// Tokens returned by the attach endpoint.
@@ -1038,10 +1286,13 @@ async fn ensure_managed_runtime(
     //    and did-provider (identity). These are provisioned by `elastos setup`.
     //    components.json alone is not sufficient — it's written by install.sh before
     //    any provider binaries are installed.
-    let mut missing = Vec::new();
-    for name in MANAGED_RUNTIME_REQUIRED_PROVIDERS {
+    let mut missing: Vec<&str> = Vec::new();
+    for name in MANAGED_RUNTIME_REQUIRED_NATIVE_PROVIDERS
+        .iter()
+        .chain(MANAGED_RUNTIME_REQUIRED_COMPONENTS.iter())
+    {
         if crate::binaries::find_installed_provider_binary(name).is_none() {
-            missing.push(*name);
+            missing.push(name);
         }
     }
     if !missing.is_empty() {
@@ -1107,6 +1358,7 @@ async fn ensure_managed_runtime(
             data_dir,
         );
         if let Some(child_home_dir) = child_home_dir.as_ref() {
+            sync_managed_runtime_child_components_manifest(data_dir, child_home_dir)?;
             child.env("HOME", child_home_dir).env(
                 "XDG_DATA_HOME",
                 managed_runtime_child_xdg_data_home(child_home_dir),
@@ -1221,7 +1473,10 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
 
 fn managed_runtime_dependency_sha256() -> String {
     let mut input = String::new();
-    for name in MANAGED_RUNTIME_REQUIRED_PROVIDERS {
+    for name in MANAGED_RUNTIME_REQUIRED_NATIVE_PROVIDERS
+        .iter()
+        .chain(MANAGED_RUNTIME_REQUIRED_COMPONENTS.iter())
+    {
         input.push_str(name);
         input.push('\n');
         match crate::binaries::find_installed_provider_binary(name) {
@@ -1439,23 +1694,54 @@ mod tests {
         );
     }
 
+    /// `ELASTOS_RUNTIME_COORDS_FILE` is process-global, so the tests that set
+    /// it cannot run beside each other: without this they read whichever
+    /// tempdir the other one set, and fail on a path that looks unrelated.
+    static COORDS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ScopedCoordsEnv {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedCoordsEnv {
+        fn set(value: impl Into<std::ffi::OsString>) -> Self {
+            let previous = std::env::var_os("ELASTOS_RUNTIME_COORDS_FILE");
+            std::env::set_var("ELASTOS_RUNTIME_COORDS_FILE", value.into());
+            Self { previous }
+        }
+    }
+
+    impl Drop for ScopedCoordsEnv {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("ELASTOS_RUNTIME_COORDS_FILE", value),
+                None => std::env::remove_var("ELASTOS_RUNTIME_COORDS_FILE"),
+            }
+        }
+    }
+
     #[test]
     fn home_runtime_coord_path_uses_data_dir_and_not_env_override() {
+        let _guard = COORDS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(
-            "ELASTOS_RUNTIME_COORDS_FILE",
-            tmp.path().join("override.json"),
+        let _coords = ScopedCoordsEnv::set(tmp.path().join("override.json"));
+
+        assert_eq!(
+            home_runtime_coord_path(tmp.path()),
+            tmp.path().join("home-runtime-coords.json")
         );
-        let actual = home_runtime_coord_path(tmp.path());
-        std::env::remove_var("ELASTOS_RUNTIME_COORDS_FILE");
-        assert_eq!(actual, tmp.path().join("home-runtime-coords.json"));
     }
 
     #[test]
     fn managed_home_runtime_uses_home_coord_path() {
+        let _guard = COORDS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let override_path = tmp.path().join("override.json");
-        std::env::set_var("ELASTOS_RUNTIME_COORDS_FILE", &override_path);
+        let _coords = ScopedCoordsEnv::set(&override_path);
 
         assert_eq!(
             managed_runtime_coord_path(tmp.path(), RUNTIME_KIND_MANAGED_HOME),
@@ -1465,8 +1751,6 @@ mod tests {
             managed_runtime_coord_path(tmp.path(), RUNTIME_KIND_MANAGED_CHAT),
             override_path
         );
-
-        std::env::remove_var("ELASTOS_RUNTIME_COORDS_FILE");
     }
 
     #[test]
@@ -1480,6 +1764,84 @@ mod tests {
             managed_runtime_child_xdg_data_home(&home),
             home.join(".local/share")
         );
+        assert_eq!(
+            managed_runtime_child_data_dir_for_os(&home, "linux"),
+            home.join(".local/share/elastos")
+        );
+        assert_eq!(
+            managed_runtime_child_data_dir_for_os(&home, "macos"),
+            home.join("Library/Application Support/elastos")
+        );
+    }
+
+    #[test]
+    fn subordinate_managed_runtime_copies_parent_components_manifest_into_child_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
+        let manifest_bytes = write_managed_runtime_parent_support_artifacts(tmp.path());
+
+        sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap();
+
+        let child_data_dir = managed_runtime_child_data_dir(&home);
+        assert_eq!(
+            std::fs::read(child_data_dir.join("components.json")).unwrap(),
+            manifest_bytes
+        );
+        for name in MANAGED_RUNTIME_REQUIRED_NATIVE_PROVIDERS {
+            let expected_bytes = format!("{name}-binary").into_bytes();
+            let child_binary = child_data_dir.join("bin").join(name);
+            assert_eq!(std::fs::read(&child_binary).unwrap(), expected_bytes);
+            assert_eq!(
+                crate::binaries::resolve_verified_native_provider_binary_with_data_dir(
+                    &child_data_dir,
+                    name
+                )
+                .unwrap(),
+                Some(child_binary)
+            );
+        }
+        let shell_binary = child_data_dir.join("bin").join("shell");
+        assert_eq!(std::fs::read(&shell_binary).unwrap(), b"shell-binary");
+        crate::binaries::verify_component_binary_with_data_dir(
+            &child_data_dir,
+            "shell",
+            &shell_binary,
+        )
+        .unwrap();
+        assert!(
+            crate::binaries::resolve_verified_native_provider_binary_with_data_dir(
+                &child_data_dir,
+                "shell"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn subordinate_managed_runtime_requires_parent_components_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
+
+        let error = sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("managed home runtime requires installed manifest"));
+        assert!(error.to_string().contains("components.json"));
+    }
+
+    #[test]
+    fn subordinate_managed_runtime_requires_verified_parent_provider_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
+        write_managed_runtime_parent_support_artifacts(tmp.path());
+        std::fs::remove_file(tmp.path().join("bin/shell")).unwrap();
+
+        let error = sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("managed home runtime requires verified 'shell' install"));
     }
 
     #[test]
@@ -1520,6 +1882,68 @@ mod tests {
         };
 
         assert!(gateway_owner_allows_subordinate_managed_runtime(&owner));
+    }
+
+    fn write_managed_runtime_parent_support_artifacts(data_dir: &Path) -> Vec<u8> {
+        let platform = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => "linux-amd64",
+            ("linux", "aarch64") => "linux-arm64",
+            ("macos", "aarch64") => "darwin-arm64",
+            (os, arch) => panic!("unsupported test platform {os}-{arch}"),
+        };
+        let bin_dir = data_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let mut external = serde_json::Map::new();
+        for (name, provides) in [
+            ("localhost-provider", "localhost://*"),
+            ("did-provider", "elastos://did/*"),
+        ] {
+            let binary_bytes = format!("{name}-binary").into_bytes();
+            std::fs::write(bin_dir.join(name), &binary_bytes).unwrap();
+            external.insert(
+                name.to_string(),
+                serde_json::json!({
+                    "install_path": format!("bin/{name}"),
+                    "provider_runtime": {
+                        "role": "provider",
+                        "substrate": "native",
+                        "runtime_abi": "elastos.provider-stdio/v1",
+                        "execution": "native-provider",
+                        "provides": provides
+                    },
+                    "platforms": {
+                        platform: {
+                            "checksum": format!("sha256:{}", sha256_bytes(&binary_bytes)),
+                            "install_path": format!("bin/{name}")
+                        }
+                    }
+                }),
+            );
+        }
+        let shell_bytes = b"shell-binary".to_vec();
+        std::fs::write(bin_dir.join("shell"), &shell_bytes).unwrap();
+        external.insert(
+            "shell".to_string(),
+            serde_json::json!({
+                "install_path": "bin/shell",
+                "platforms": {
+                    platform: {
+                        "checksum": format!("sha256:{}", sha256_bytes(&shell_bytes)),
+                        "install_path": "bin/shell"
+                    }
+                }
+            }),
+        );
+
+        let manifest_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "external": external,
+            "capsules": {},
+            "profiles": {}
+        }))
+        .unwrap();
+        std::fs::write(data_dir.join("components.json"), &manifest_bytes).unwrap();
+        manifest_bytes
     }
 
     #[test]

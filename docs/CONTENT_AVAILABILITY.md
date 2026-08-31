@@ -67,8 +67,8 @@ IPLD can identify and traverse a CID graph. It does not decide:
 - who pays volunteer or professional storage providers
 - who may decrypt sealed content
 
-Those are Runtime, Carrier, availability, dDRM, key-provider, decrypt-provider,
-and blockchain responsibilities.
+Those are Runtime, Carrier, availability, rights, custody, decrypt, and Chain
+provider responsibilities.
 
 ## Capsule-Facing Contract
 
@@ -88,6 +88,15 @@ elastos://content/unpublish
 The content provider may use local Kubo, Elacity APIs, IPFS Cluster-like
 replication, volunteer nodes, or future paid storage networks underneath. The
 capsule contract stays the same.
+
+The planned content-distribution contract treats games and model files as
+content capsules. Home `Get` will resolve their signed bundle CID through
+Runtime and the content provider. A CID proves
+content identity but not current availability, so a normally Gettable entry
+also needs an honest availability basis. The trusted publisher may be the only
+bootstrap source while replication matures without changing the CID or creating
+an HTTP fallback identity. See
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
 
 `elastos://ipfs/*` remains only because current code already uses it as the
 low-level provider/backend surface for system services and explicit operator
@@ -584,21 +593,25 @@ bounded byte-range slicing on the provider response, and returns the typed
 transport, range, and progress metadata in the fetch response. This is still a
 bounded JSON/base64 byte path, not the final streaming ABI.
 
-Carrier now has a typed internal
+Carrier has a typed internal
 `content_fetch` byte operation on its file ALPN: a connected Runtime peer can
 request a CID/path and the serving Runtime reads bytes through its local
 `ipfs-provider`. That operation is still Runtime-internal; normal capsules do
 not receive raw Carrier tickets, peer handles, or Kubo authority. It remains a
 narrow compatibility/bootstrap path.
 
-Internal `content-provider` calls now use the Runtime provider-to-provider
+Internal `content-provider` calls use the Runtime provider-to-provider
 invocation envelope for IPFS and availability effects. The envelope validates
 source, target, operation, transfer class, byte range, and progress receipt
-metadata. The provider plane now has explicit local and Carrier transports:
+metadata. The provider plane has explicit local and Carrier transports:
 Carrier `provider_invoke` runs over the Carrier ALPN with the same
-`elastos.provider.invocation/v1` envelope, hides raw connect tickets from
-receipts, and only dispatches to service providers (`content`, `availability`,
-`rights`, `key`, `decrypt`, `drm`) rather than raw backends.
+`elastos.provider.invocation/v1` envelope and hides raw connect tickets from
+receipts. Its current provider target allowlist includes `content`,
+`availability`, and the provisional `rights`, `key`, `decrypt`, and `drm`
+labels. It does not yet include a custody route. The target cutover will retain
+the envelope while replacing the provisional protected-content labels with
+Runtime-selected `rights`, `custody`, and `decrypt` providers rather than raw
+backends.
 `ProviderTransfer::Stream` now carries validated
 `elastos.provider.stream/v1` base64 chunks with range/progress receipts, and
 `content-provider` fetch opens that stream envelope as a Runtime-owned session
@@ -640,24 +653,28 @@ dashboard rows.
 Runtime-owned fields; source providers cannot predeclare or spoof them in the
 target request.
 
-## dDRM and Protected Content
+## Protected Content
 
 Availability stores bytes. Rights decide who may use them.
 
 Protected content should be encrypted before it is published. IPFS, Elacity,
-supernodes, and volunteers can safely store encrypted blocks. The dDRM or
-ElastOS-native rights provider verifies ownership, subscription, access token,
-or license state. The `drm-provider` owns the protected-content open contract
-and should delegate to rights, key, and decrypt providers. The key provider
-releases a short-lived decryption capability only after Runtime authority and
-rights checks pass.
+supernodes, and volunteers can store encrypted blocks. In the intended open
+path, Runtime will own the operation. It will verify the authenticated request,
+ask `rights-provider` for typed policy evidence, select custody providers for
+recipient-encrypted contributions, and create a scoped `decrypt-provider`
+session. Carrier will transport only Runtime-selected endpoint traffic.
+
+The current Library path still uses the provisional
+`drm-provider -> rights-provider -> key-provider -> decrypt-provider` sequence.
+Those providers remain fail closed without configured backends. They do not
+implement or verify the intended custody path.
 
 That keeps the core invariant simple:
 
 ```text
 public CID can expose encrypted bytes
-valid rights holder gets decrypt capability
-unauthorized opener gets no key
+	valid rights holder gets scoped output
+	unauthorized opener gets no decrypt session
 ```
 
 ## Default SmartWeb Sync
@@ -745,21 +762,21 @@ verifies/summarizes remote content availability receipts when present, and other
 `carrier_announced` or `repair_needed`; if Carrier is unavailable, publish
 remains honestly local or `repair_needed`. Public gateway
 installer publishing now also uses `elastos://content/publish` instead of
-direct IPFS. The
-protected-content
-foundation now adds shared sealed-object schemas, a fail-closed `drm-provider`
-for `elastos://drm/open`, a fail-closed `rights-provider` for typed access
-questions, a fail-closed `key-provider` for key release, a fail-closed
-`decrypt-provider` for decrypt/render sessions, a canonical
-`drm-provider.status.required_sequence` for protected-content opens, a
-machine-readable fail-closed `open` response that repeats that sequence,
-Runtime-owned receipt/audit steps in that sequence, and typed `chain-provider`
-rights reads. The content provider now validates
+direct IPFS. Protected content composes Runtime coordination, typed rights
+evidence, signed recipient authorization, immutable custody epochs,
+recipient-encrypted node contributions, threshold reconstruction, node-local
+claims and exact encrypted result replay. [Protected content](PROTECTED_CONTENT.md)
+owns that contract; [state.md](../state.md) owns source and installed proof.
+Provisional DRM, rights, key and decrypt capsules remain a separate retirement
+surface. The content provider validates
 `sealed` object publishes against the sealed descriptor, required graph links,
 and protected-content algorithm allowlists. The
 remaining work is:
 
-- Wire sealed-object publish/open to rights, PQ-hybrid key release, and decrypt/render providers without exposing raw CEKs or backend SDKs to app capsules.
+- Replace the provisional protected-content DTO/provider surface atomically with
+  Runtime-owned rights, custody, and decrypt orchestration. Do not expose raw
+  CEKs, custody shares, provider routes, network locations, or backend SDKs to
+  app capsules.
 - Move remaining release artifact uploads off explicit operator IPFS tooling when the release pipeline can use the same content-provider contract without losing install compatibility or build/release proof.
 - MicroVM materialization paths should consult availability state and repair/fetch through explicit operator/provider-plane tooling.
 - Promote the first Carrier remote proof path into production-grade storage policy: production independent provider-network quota-ledger federation beyond the configured bounded endpoint quorum, repair-fleet worker attestations/SLA/settlement beyond the configured external dispatch endpoint quorum, live market pricing/escrow/settlement beyond the configured storage-market endpoint-quorum admission gate and current storage-settlement policy-status receipt, actual federated network abuse throttles/banlists/abuse ledgers beyond the configured bounded abuse-control endpoint quorum, richer remote storage receipt policy, production peer reputation trust policy/third-party attestations/revocation beyond the configured Carrier peer-attestation endpoint quorum, and live federated dashboard/UI/peer-health subscriptions beyond the current provider-local dashboard plus configured alert-exchange endpoint.

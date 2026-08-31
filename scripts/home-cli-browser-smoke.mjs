@@ -380,6 +380,15 @@ assert(
   "home-cli did not enter attached Runtime terminal mode",
   { body: body.dataset, panel: terminalPanel.dataset },
 );
+assert(
+  parentMessages.some(({ message, origin }) => (
+    message?.type === "home:shell-ready" &&
+      message?.homeToken === "cli-token" &&
+      origin === "http://localhost:61180"
+  )),
+  "home-cli did not tell Home when the real shell became ready",
+  parentMessages,
+);
 
 const activeEventSource = eventSources[0];
 const activeInputSocket = webSockets[0];
@@ -395,6 +404,19 @@ assert(
     !activeInputSocket.url.includes("home_token="),
   "home-cli terminal input did not use its scoped Runtime WebSocket ticket",
   activeInputSocket,
+);
+
+activeEventSource.emit("terminal", {
+  schema: "elastos.home-cli.terminal-event/v1",
+  session_id: "term-other",
+  stream: "stdout",
+  data: "stale terminal bytes\n",
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert(
+  !xtermMount.textContent.includes("stale terminal bytes"),
+  "home-cli accepted terminal output from another Runtime session",
+  xtermMount.textContent,
 );
 
 activeEventSource.emitError();

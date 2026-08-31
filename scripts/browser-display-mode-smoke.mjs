@@ -333,8 +333,30 @@ assert(
   "Browser must keep one fixed 1920x1080 DPR-1 guest raster and never drive it from the Home panel",
 );
 assert(
-  homeGuiWindowsSource.includes(`syncBrowserWindow(entry, launched);
+  homeGuiWindowsSource.includes("fitLaunchedWindow(entry);") &&
+    homeGuiWindowsSource.includes(`function fitLaunchedWindow(entry) {
+  if (!entry || entry.kind !== "browser") {
+    return;
+  }`) &&
+    homeGuiWindowsSource.includes(`launched.title = canonicalTargetTitle(launched.target, launched.title);
+      entry.title = launched.title;
+      fitLaunchedWindow(entry);
+      if (entry.browserCloseRequest) {`) &&
+    homeGuiWindowsSource.includes(`syncBrowserWindow(entry, launched);
+  if (restoredPlacement) {
+    applyFullscreenStageFromPlacement(entry, restoredPlacement);
+  }
   if (entry.targetId === "browser") {
+    fitLaunchedWindow(entry);
+  }`) &&
+    homeGuiWindowsSource.includes(`if (entry.kind === "browser") {
+    rememberRecentTarget(entry.targetId);
+    fitLaunchedWindow(entry);
+  }`) &&
+    homeGuiWindowsSource.includes(`for (const entry of shellState.windows.values()) {
+    if (entry.kind !== "browser") {
+      continue;
+    }
     fitLaunchedWindow(entry);
   }`) &&
     homeGuiWindowsSource.includes("fitWindowToLargestBrowserAspect") &&

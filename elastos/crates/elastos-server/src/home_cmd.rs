@@ -364,8 +364,6 @@ struct PeopleStatus {
     service_offer_count: usize,
     #[serde(default)]
     service_offers: Vec<serde_json::Value>,
-    #[serde(default)]
-    discovery: PeopleDiscoveryStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -397,82 +395,14 @@ struct PeopleProfileCardStatus {
     handle: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct PeopleDiscoveryStatus {
-    #[serde(default)]
-    schema: String,
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    expires_at: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    remaining_seconds: Option<u64>,
-    #[serde(default)]
-    visibility: String,
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    status_message: String,
-    #[serde(default)]
-    topic: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    local_peer_id: Option<String>,
-    #[serde(default)]
-    discovered_count: usize,
-    #[serde(default)]
-    discovered_peers: Vec<PeopleDiscoveryPeerStatus>,
-    #[serde(default)]
-    request_count: usize,
-    #[serde(default)]
-    requests: Vec<PeopleDiscoveryRequestStatus>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    changed: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    refresh_fingerprint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    next_refresh_after_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct PeopleDiscoveryPeerStatus {
-    #[serde(default)]
-    peer_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    did: Option<String>,
-    #[serde(default)]
-    display_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    handle: Option<String>,
-    #[serde(default)]
-    last_seen_at: u64,
-    #[serde(default)]
-    status: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct PeopleDiscoveryRequestStatus {
-    #[serde(default)]
-    request_id: String,
-    #[serde(default)]
-    peer_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    did: Option<String>,
-    #[serde(default)]
-    display_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    handle: Option<String>,
-    #[serde(default)]
-    created_at: u64,
-    #[serde(default)]
-    status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    invite_id: Option<String>,
-}
-
 #[derive(Debug, Clone, Deserialize, Default)]
 struct HomeSummaryFactsProjection {
     #[serde(default)]
     runtime: Option<RuntimeStatus>,
+    #[serde(default)]
+    identity: Option<HomeIdentityProjection>,
+    #[serde(default)]
+    authority: Option<HomeAuthorityProjection>,
     #[serde(default)]
     active_shell: Option<serde_json::Value>,
     #[serde(default)]
@@ -487,6 +417,30 @@ struct HomeSummaryFactsProjection {
     capsule_interfaces: Option<serde_json::Value>,
     #[serde(default)]
     targets: Vec<HomeTargetStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct HomeIdentityProjection {
+    #[serde(default)]
+    profile_setup_display_name: Option<String>,
+    #[serde(default)]
+    profile: Option<HomeProfileProjection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct HomeProfileProjection {
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    handle: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct HomeAuthorityProjection {
+    #[serde(default)]
+    signed_in: bool,
+    #[serde(default)]
+    principal_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1033,6 +987,36 @@ fn home_terminal_host_intent_for_action(
         }));
     }
 
+    if let Some(notification_id) = action_id
+        .strip_prefix("inbox-review-notification:")
+        .map(str::trim)
+    {
+        if notification_id.is_empty() || snapshot.session.mode != "browser_pty" {
+            return None;
+        }
+        let inbox_target_available = snapshot
+            .targets
+            .iter()
+            .any(|target| target.target == "inbox" && target.target_kind == "app");
+        let desktop_launchable = snapshot.active_shell["candidates"]
+            .as_array()
+            .map(|candidates| {
+                candidates.iter().any(|candidate| {
+                    candidate["name"] == "home-gui" && candidate["launchable"] == true
+                })
+            })
+            .unwrap_or(false);
+        if !inbox_target_available || !desktop_launchable {
+            return None;
+        }
+        return Some(serde_json::json!({
+            "schema": "elastos.home.terminal-host-intent/v1",
+            "action": "switch-shell-open-target",
+            "action_id": action_id,
+            "target": "inbox",
+        }));
+    }
+
     let target = action_id.strip_prefix("shell-switch:")?.trim();
     if target != "home-gui" {
         return None;
@@ -1219,11 +1203,31 @@ async fn gather_snapshot_with_site_preview(
     site_local_url: Option<&str>,
 ) -> anyhow::Result<HomeSnapshot> {
     let data_dir = default_data_dir();
-    let did = load_existing_did(&data_dir);
+    let gateway_owned = gateway_owned_home_terminal();
     let source = load_default_source(&data_dir)?;
     let local_runtime = gather_runtime_status(&data_dir).await;
     let home_summary_projection =
         gather_home_summary_projection(&data_dir, local_runtime.api_url.as_deref()).await?;
+    gather_snapshot_from_parts(
+        &data_dir,
+        gateway_owned,
+        source,
+        local_runtime,
+        home_summary_projection,
+        site_local_url,
+    )
+    .await
+}
+
+async fn gather_snapshot_from_parts(
+    data_dir: &Path,
+    gateway_owned: bool,
+    source: Option<SourceStatus>,
+    local_runtime: RuntimeStatus,
+    home_summary_projection: Option<HomeSummaryFactsProjection>,
+    site_local_url: Option<&str>,
+) -> anyhow::Result<HomeSnapshot> {
+    let session = gather_home_cli_session_status();
     let runtime = home_summary_projection
         .as_ref()
         .and_then(|projection| projection.runtime.clone())
@@ -1231,42 +1235,77 @@ async fn gather_snapshot_with_site_preview(
     let capsule_catalog = home_summary_projection
         .as_ref()
         .and_then(|projection| projection.capsule_catalog.clone())
-        .unwrap_or_else(|| elastos_server::api::gateway::capsule_catalog_snapshot(&data_dir));
+        .unwrap_or_else(|| elastos_server::api::gateway::capsule_catalog_snapshot(data_dir));
     let capsule_interfaces = if let Some(interfaces) = home_summary_projection
         .as_ref()
         .and_then(|projection| projection.capsule_interfaces.clone())
     {
         interfaces
     } else {
-        gather_capsule_interface_snapshot(&data_dir, runtime.api_url.as_deref()).await?
+        gather_capsule_interface_snapshot(data_dir, runtime.api_url.as_deref()).await?
     };
     let people = home_summary_projection
         .as_ref()
         .map(|projection| projection.people.clone())
         .unwrap_or_default();
-    let active_shell = if let Some(active_shell) = home_summary_projection
+    if gateway_owned {
+        require_gateway_owned_home_summary_authority(home_summary_projection.as_ref())?;
+    }
+    let active_shell = if gateway_owned {
+        if let Some(active_shell) = home_summary_projection
+            .as_ref()
+            .and_then(|projection| projection.active_shell.clone())
+        {
+            active_shell
+        } else {
+            gather_active_shell_snapshot(data_dir)?
+        }
+    } else if let Some(active_shell) = home_summary_projection
         .as_ref()
         .and_then(|projection| projection.active_shell.clone())
     {
         active_shell
     } else {
-        gather_active_shell_snapshot(&data_dir)?
+        gather_active_shell_snapshot(data_dir)?
     };
-    let site_root = my_website_root_path(&data_dir);
-    let site_head = load_site_head_summary(&data_dir);
-    let release_count = count_site_releases(&data_dir);
-    let nickname = load_runtime_nickname(&data_dir).await;
-    let room_summary = elastos_server::room_service::load_summary(&data_dir).unwrap_or_default();
-    let _ = elastos_server::notifications::sync_room_notifications(&data_dir, &room_summary);
-    let notification_summary =
-        elastos_server::notifications::load_summary(&data_dir).unwrap_or_default();
+    let site_root = my_website_root_path(data_dir);
+    let site_head = load_site_head_summary(data_dir);
+    let release_count = count_site_releases(data_dir);
+    let room_summary = elastos_server::room_service::load_summary(data_dir).unwrap_or_default();
+    let native_notification_summary = if home_summary_projection.is_some() {
+        None
+    } else {
+        let _ = elastos_server::notifications::sync_room_notifications(data_dir, &room_summary);
+        Some(elastos_server::notifications::load_summary(data_dir).unwrap_or_default())
+    };
+    let nickname = if gateway_owned {
+        required_projected_home_display_name(home_summary_projection.as_ref())?
+    } else if let Some(display_name) = projected_home_display_name(home_summary_projection.as_ref())
+    {
+        Some(display_name)
+    } else {
+        load_runtime_nickname(data_dir).await
+    };
+    let did = if gateway_owned {
+        Some(required_projected_home_identity(
+            home_summary_projection.as_ref(),
+        )?)
+    } else {
+        projected_home_identity(home_summary_projection.as_ref())
+            .or_else(|| load_existing_did(data_dir))
+    };
+    let user = if gateway_owned {
+        required_projected_home_user_label(home_summary_projection.as_ref())?
+    } else {
+        projected_home_user_label(home_summary_projection.as_ref()).unwrap_or_else(current_user)
+    };
 
     let mut snapshot = HomeSnapshot {
         version: LOBBY_VERSION.to_string(),
-        user: current_user(),
+        user,
         nickname,
         did,
-        session: gather_home_cli_session_status(),
+        session,
         data_dir: data_dir.display().to_string(),
         source,
         runtime,
@@ -1277,7 +1316,7 @@ async fn gather_snapshot_with_site_preview(
             .and_then(|projection| projection.services.clone())
             .or_else(|| {
                 Some(elastos_server::api::gateway::home_services_snapshot(
-                    &data_dir,
+                    data_dir,
                 ))
             }),
         active_shell,
@@ -1287,7 +1326,7 @@ async fn gather_snapshot_with_site_preview(
             .filter(|targets| !targets.is_empty())
             .unwrap_or_else(|| {
                 serde_json::from_value(elastos_server::api::gateway::home_targets_snapshot(
-                    &data_dir,
+                    data_dir,
                 ))
                 .unwrap_or_default()
             }),
@@ -1400,10 +1439,12 @@ async fn gather_snapshot_with_site_preview(
         notifications: home_summary_projection
             .as_ref()
             .map(|projection| projection.notifications.clone())
-            .unwrap_or_else(|| notification_status_from_summary(notification_summary)),
-        roots: gather_roots(&data_dir),
-        components: gather_components(&data_dir),
-        cached_capsules: gather_cached_capsules(&data_dir),
+            .unwrap_or_else(|| {
+                notification_status_from_summary(native_notification_summary.unwrap_or_default())
+            }),
+        roots: gather_roots(data_dir),
+        components: gather_components(data_dir),
+        cached_capsules: gather_cached_capsules(data_dir),
         capsule_catalog: Some(capsule_catalog),
         capsule_interfaces: Some(capsule_interfaces),
         command_groups: COMMAND_GROUPS
@@ -1418,13 +1459,10 @@ async fn gather_snapshot_with_site_preview(
     };
 
     snapshot.system_services = gather_system_services(&snapshot.components);
-
-    // Core + site actions from the hardcoded list.
     snapshot.actions = CORE_ACTIONS
         .iter()
         .filter_map(|action| {
             let readiness = action_readiness(action.id, &snapshot);
-            // Hide non-core actions when their prerequisites are not installed.
             if !action.core && matches!(readiness, ActionReadiness::Blocked(_)) {
                 return None;
             }
@@ -1442,7 +1480,6 @@ async fn gather_snapshot_with_site_preview(
         })
         .collect();
 
-    // The catalog projection is the only source for dynamic Home CLI actions.
     if let Some(catalog) = snapshot.capsule_catalog.as_ref() {
         snapshot.actions.extend(gather_capsule_actions(catalog));
     }
@@ -1452,6 +1489,127 @@ async fn gather_snapshot_with_site_preview(
         .extend(gather_notification_host_actions(&snapshot));
 
     Ok(snapshot)
+}
+
+fn projected_home_display_name(projection: Option<&HomeSummaryFactsProjection>) -> Option<String> {
+    projection
+        .and_then(|projection| projection.identity.as_ref())
+        .and_then(|identity| {
+            identity
+                .profile
+                .as_ref()
+                .map(|profile| profile.display_name.trim())
+                .filter(|display_name| !display_name.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    identity
+                        .profile_setup_display_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|display_name| !display_name.is_empty())
+                        .map(str::to_string)
+                })
+        })
+}
+
+fn projected_home_identity(projection: Option<&HomeSummaryFactsProjection>) -> Option<String> {
+    projection.and_then(|projection| {
+        projection
+            .identity
+            .as_ref()
+            .and_then(|identity| {
+                identity
+                    .profile
+                    .as_ref()
+                    .and_then(|profile| profile.handle.as_deref())
+                    .map(str::trim)
+                    .filter(|handle| !handle.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                projection
+                    .authority
+                    .as_ref()
+                    .map(|authority| authority.principal_id.trim())
+                    .filter(|principal_id| !principal_id.is_empty())
+                    .map(str::to_string)
+            })
+    })
+}
+
+fn projected_home_user_label(projection: Option<&HomeSummaryFactsProjection>) -> Option<String> {
+    projected_home_display_name(projection).or_else(|| {
+        projection.and_then(|projection| {
+            projection
+                .authority
+                .as_ref()
+                .map(|authority| authority.principal_id.trim())
+                .filter(|principal_id| !principal_id.is_empty())
+                .map(str::to_string)
+        })
+    })
+}
+
+fn required_projected_home_display_name(
+    projection: Option<&HomeSummaryFactsProjection>,
+) -> anyhow::Result<Option<String>> {
+    let Some(projection) = projection else {
+        anyhow::bail!("gateway-owned Home CLI summary unavailable: missing Home summary facts");
+    };
+    if let Some(display_name) = projected_home_display_name(Some(projection)) {
+        return Ok(Some(display_name));
+    }
+    if projection.identity.is_some() || projection.authority.is_some() {
+        return Ok(None);
+    }
+    anyhow::bail!("gateway-owned Home CLI summary unavailable: missing identity projection");
+}
+
+fn required_projected_home_identity(
+    projection: Option<&HomeSummaryFactsProjection>,
+) -> anyhow::Result<String> {
+    let Some(projection) = projection else {
+        anyhow::bail!("gateway-owned Home CLI summary unavailable: missing Home summary facts");
+    };
+    projected_home_identity(Some(projection)).ok_or_else(|| {
+        anyhow::anyhow!("gateway-owned Home CLI summary unavailable: missing identity projection")
+    })
+}
+
+fn required_projected_home_user_label(
+    projection: Option<&HomeSummaryFactsProjection>,
+) -> anyhow::Result<String> {
+    let Some(projection) = projection else {
+        anyhow::bail!("gateway-owned Home CLI summary unavailable: missing Home summary facts");
+    };
+    projected_home_user_label(Some(projection)).ok_or_else(|| {
+        anyhow::anyhow!("gateway-owned Home CLI summary unavailable: missing identity projection")
+    })
+}
+
+fn require_gateway_owned_home_summary_authority(
+    projection: Option<&HomeSummaryFactsProjection>,
+) -> anyhow::Result<()> {
+    let Some(projection) = projection else {
+        anyhow::bail!("gateway-owned Home CLI summary unavailable: missing Home summary facts");
+    };
+    let expected_principal =
+        std::env::var(elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .context("gateway-owned Home CLI summary unavailable: missing principal context")?;
+    let actual_principal = projection
+        .authority
+        .as_ref()
+        .filter(|authority| authority.signed_in)
+        .map(|authority| authority.principal_id.trim())
+        .filter(|principal_id| !principal_id.is_empty())
+        .context("gateway-owned Home CLI summary unavailable: missing admitted authority")?;
+    if actual_principal != expected_principal {
+        anyhow::bail!("gateway-owned Home CLI summary unavailable: admitted principal mismatch");
+    }
+    Ok(())
 }
 
 fn notification_status_from_summary(
@@ -1769,51 +1927,6 @@ async fn dispatch_action(
             None => Ok("That Chat web guest session is already gone.".to_string()),
         };
     }
-    if let Some(invite_id) = action_id.strip_prefix("room-accept-invite:") {
-        let actor_did = snapshot.room.local_runtime_did.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "local ElastOS identity is not available for ElastOS user invite acceptance"
-            )
-        })?;
-        let member = elastos_server::room_service::accept_room_invite(
-            &default_data_dir(),
-            elastos_server::room_service::RoomInviteAcceptInput {
-                actor_did,
-                invite_id: invite_id.to_string(),
-            },
-        )?;
-        return Ok(format!("Joined Chat as {}.", member.member_did));
-    }
-    if let Some(invite_id) = action_id.strip_prefix("room-revoke-invite:") {
-        let actor_did = require_room_admin_actor(snapshot)?;
-        return match elastos_server::room_service::revoke_room_invite(
-            &default_data_dir(),
-            &actor_did,
-            invite_id,
-        )? {
-            Some(invite) => Ok(format!(
-                "Canceled ElastOS user invite for {}.",
-                invite.invited_did
-            )),
-            None => Ok("That ElastOS user invite is already gone.".to_string()),
-        };
-    }
-    if let Some(member_did) = action_id.strip_prefix("room-remove-member:") {
-        let actor_did = require_room_admin_actor(snapshot)?;
-        return match elastos_server::room_service::remove_room_member(
-            &default_data_dir(),
-            elastos_server::room_service::RoomMemberRemoveInput {
-                actor_did,
-                member_did: member_did.to_string(),
-            },
-        )? {
-            Some(member) => Ok(format!(
-                "Removed trusted participant {} from Chat.",
-                member.member_did
-            )),
-            None => Ok("That trusted participant is already gone.".to_string()),
-        };
-    }
     if let Some(source) = action_id.strip_prefix("site-stage:") {
         let source = source.trim();
         if source.is_empty() {
@@ -1927,50 +2040,6 @@ async fn dispatch_people_action(
 }
 
 fn people_api_action(action_id: &str) -> Option<anyhow::Result<PeopleApiAction>> {
-    if action_id == "people-discovery-enable" {
-        return Some(Ok(PeopleApiAction {
-            path: "/api/apps/people/discovery".to_string(),
-            body: serde_json::json!({ "enabled": true }),
-            success_message: "People discovery is on.",
-        }));
-    }
-    if action_id == "people-discovery-disable" {
-        return Some(Ok(PeopleApiAction {
-            path: "/api/apps/people/discovery".to_string(),
-            body: serde_json::json!({ "enabled": false }),
-            success_message: "People discovery is off.",
-        }));
-    }
-    if action_id == "people-discovery-refresh" {
-        return Some(Ok(PeopleApiAction {
-            path: "/api/apps/people/discovery/refresh".to_string(),
-            body: serde_json::json!({}),
-            success_message: "People discovery refreshed.",
-        }));
-    }
-    if let Some(peer_id) = action_id.strip_prefix("people-request-peer:") {
-        if peer_id.trim().is_empty() {
-            return Some(Err(anyhow::anyhow!("People peer id is missing")));
-        }
-        return Some(Ok(PeopleApiAction {
-            path: "/api/apps/people/discovery/requests".to_string(),
-            body: serde_json::json!({ "peer_id": peer_id }),
-            success_message: "People request sent.",
-        }));
-    }
-    if let Some(request_id) = action_id.strip_prefix("people-accept-request:") {
-        if request_id.trim().is_empty() {
-            return Some(Err(anyhow::anyhow!("People request id is missing")));
-        }
-        return Some(Ok(PeopleApiAction {
-            path: format!(
-                "/api/apps/people/discovery/requests/{}/accept",
-                percent_encode_path_segment(request_id)
-            ),
-            body: serde_json::json!({}),
-            success_message: "People request accepted.",
-        }));
-    }
     if let Some(contact_id) = action_id.strip_prefix("people-remove-contact:") {
         if contact_id.trim().is_empty() {
             return Some(Err(anyhow::anyhow!("People contact id is missing")));
@@ -2038,19 +2107,6 @@ fn people_contact_display_name(contact: &PeopleContactStatus, fallback: &str) ->
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(fallback)
         .to_string()
-}
-
-fn percent_encode_path_segment(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(*byte as char)
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
 }
 
 async fn dispatch_capsule_action(
@@ -3566,31 +3622,6 @@ fn action_readiness(action_id: &str, snapshot: &HomeSnapshot) -> ActionReadiness
                 )
             }
         }
-        _ if action_id.starts_with("room-revoke-invite:") => {
-            if room_admin_role(snapshot) {
-                ActionReadiness::Ready
-            } else {
-                ActionReadiness::Blocked(
-                    "only conversation managers may cancel ElastOS user invites".to_string(),
-                )
-            }
-        }
-        _ if action_id.starts_with("room-remove-member:") => {
-            if room_admin_role(snapshot) {
-                ActionReadiness::Ready
-            } else {
-                ActionReadiness::Blocked(
-                    "only conversation managers may remove trusted participants".to_string(),
-                )
-            }
-        }
-        _ if action_id.starts_with("room-accept-invite:") => {
-            if snapshot.room.local_runtime_did.is_some() {
-                ActionReadiness::Ready
-            } else {
-                ActionReadiness::Blocked("local ElastOS identity is not available yet".to_string())
-            }
-        }
         _ => ActionReadiness::Blocked("unknown action".to_string()),
     }
 }
@@ -3649,50 +3680,6 @@ fn gather_room_actions(snapshot: &HomeSnapshot) -> Vec<ActionInfo> {
             reason: None,
         });
     }
-    if let Some(local_runtime_did) = snapshot.room.local_runtime_did.as_deref() {
-        for invite in &snapshot.room.pending_invites {
-            if invite.invited_did == local_runtime_did {
-                actions.push(ActionInfo {
-                    id: format!("room-accept-invite:{}", invite.invite_id),
-                    label: "Join trusted conversation".to_string(),
-                    description: "Accept this ElastOS user invite on the local Home.".to_string(),
-                    command: "home: accept this ElastOS user invite on the local Home".to_string(),
-                    ready: true,
-                    reason: None,
-                });
-            }
-        }
-    }
-    if room_admin_role(snapshot) {
-        for invite in &snapshot.room.pending_invites {
-            actions.push(ActionInfo {
-                id: format!("room-revoke-invite:{}", invite.invite_id),
-                label: format!("Revoke invite for {}", invite.invited_did),
-                description: "Cancel this pending ElastOS user invite.".to_string(),
-                command: "home: cancel this specific ElastOS user invite".to_string(),
-                ready: true,
-                reason: None,
-            });
-        }
-        for member in &snapshot.room.members {
-            if member.role == "owner" {
-                continue;
-            }
-            if snapshot.room.local_runtime_did.as_deref() == Some(member.member_did.as_str()) {
-                continue;
-            }
-            if can_manage_member(snapshot, member) {
-                actions.push(ActionInfo {
-                    id: format!("room-remove-member:{}", member.member_did),
-                    label: format!("Remove {}", member.member_did),
-                    description: "Remove this trusted participant from Chat.".to_string(),
-                    command: "home: remove this trusted participant from Chat".to_string(),
-                    ready: true,
-                    reason: None,
-                });
-            }
-        }
-    }
     for request in &snapshot.room.pending_requests {
         actions.push(ActionInfo {
             id: format!("room-approve-request:{}", request.request_id),
@@ -3735,14 +3722,6 @@ fn room_admin_role(snapshot: &HomeSnapshot) -> bool {
         snapshot.room.local_runtime_role.as_deref(),
         Some("owner" | "admin")
     )
-}
-
-fn can_manage_member(snapshot: &HomeSnapshot, member: &RoomMemberStatus) -> bool {
-    match snapshot.room.local_runtime_role.as_deref() {
-        Some("owner") => member.role != "owner",
-        Some("admin") => member.role == "member",
-        _ => false,
-    }
 }
 
 fn require_room_admin_actor(snapshot: &HomeSnapshot) -> anyhow::Result<String> {
@@ -3908,7 +3887,9 @@ mod tests {
 
         let _guard = HOME_CMD_ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -3969,6 +3950,239 @@ mod tests {
             .unwrap();
 
         assert!(projection.is_none());
+    }
+
+    #[tokio::test]
+    async fn gateway_owned_home_snapshot_uses_admitted_summary_shared_facts() {
+        let _guard = HOME_CMD_ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let _owned =
+            ScopedEnvVar::set(crate::runtime_control::GATEWAY_OWNED_HOME_TERMINAL_ENV, "1");
+        let _principal = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV,
+            "person:v07-admin",
+        );
+        let _session = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_SESSION_ID_ENV,
+            "session-v07-admin",
+        );
+        let _proof = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID_ENV,
+            "",
+        );
+        let _grant = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_GRANT_ID_ENV,
+            "grant-v07-admin",
+        );
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        write_home_cmd_test_capsule(&data_dir, "home-gui", "shell", Vec::new());
+        write_home_cmd_test_capsule(&data_dir, "home-cli", "shell", Vec::new());
+        write_home_cmd_active_shell_state(&data_dir, "person:v07-admin", "home-gui");
+
+        let projection: HomeSummaryFactsProjection = serde_json::from_value(serde_json::json!({
+            "runtime": {
+                "running": true,
+                "kind": "managed-home",
+                "version": "0.7.0-dev",
+                "api_url": "http://127.0.0.1:65123",
+                "pid": 42,
+                "running_capsules": ["home-cli"],
+                "note": "ready"
+            },
+            "identity": {
+                "profile": {
+                    "display_name": "v0.7 Admin",
+                    "handle": "person:v07-admin"
+                }
+            },
+            "authority": {
+                "signed_in": true,
+                "principal_id": "person:v07-admin"
+            },
+            "active_shell": {
+                "schema": "elastos.home.active-shell/v1",
+                "active": "home-cli"
+            },
+            "notifications": {
+                "unread_count": 1,
+                "attention_count": 1,
+                "entries": [{
+                    "id": "notice-a",
+                    "source_app": "inbox",
+                    "kind": "inbox.pending",
+                    "title": "Pending request",
+                    "body": "One pending request needs review",
+                    "severity": "attention",
+                    "read": false,
+                    "created_at": 1
+                }]
+            },
+            "capsule_catalog": {
+                "schema": "elastos.capsules.catalog/v1",
+                "capsules": [{"name": "home-gui"}, {"name": "home-cli"}]
+            },
+            "capsule_interfaces": {
+                "schema": "elastos.capsules.interfaces/v1",
+                "interfaces": []
+            },
+            "targets": []
+        }))
+        .unwrap();
+        let snapshot = gather_snapshot_from_parts(
+            &data_dir,
+            true,
+            None,
+            RuntimeStatus::default(),
+            Some(projection),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(snapshot.user, "v0.7 Admin");
+        assert_eq!(snapshot.nickname.as_deref(), Some("v0.7 Admin"));
+        assert_eq!(snapshot.did.as_deref(), Some("person:v07-admin"));
+        assert!(snapshot.runtime.running);
+        assert_eq!(
+            snapshot.runtime.api_url.as_deref(),
+            Some("http://127.0.0.1:65123")
+        );
+        assert_eq!(snapshot.notifications.unread_count, 1);
+        assert_eq!(snapshot.notifications.attention_count, 1);
+        assert_eq!(snapshot.active_shell["active"], "home-cli");
+    }
+
+    #[tokio::test]
+    async fn gateway_owned_home_snapshot_rejects_unsigned_summary_authority() {
+        let _guard = HOME_CMD_ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let _owned =
+            ScopedEnvVar::set(crate::runtime_control::GATEWAY_OWNED_HOME_TERMINAL_ENV, "1");
+        let _principal = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV,
+            "person:v07-admin",
+        );
+        let _session = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_SESSION_ID_ENV,
+            "session-v07-admin",
+        );
+        let _proof = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID_ENV,
+            "",
+        );
+        let _grant = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_GRANT_ID_ENV,
+            "grant-v07-admin",
+        );
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let projection: HomeSummaryFactsProjection = serde_json::from_value(serde_json::json!({
+            "authority": {
+                "signed_in": false,
+                "principal_id": "person:v07-admin"
+            },
+            "active_shell": {
+                "schema": "elastos.home.active-shell/v1",
+                "active": "home-cli"
+            },
+            "notifications": {
+                "unread_count": 0,
+                "attention_count": 0,
+                "entries": []
+            },
+            "capsule_catalog": {
+                "schema": "elastos.capsules.catalog/v1",
+                "capsules": []
+            },
+            "capsule_interfaces": {
+                "schema": "elastos.capsules.interfaces/v1",
+                "interfaces": []
+            },
+            "targets": []
+        }))
+        .unwrap();
+
+        let err = gather_snapshot_from_parts(
+            &data_dir,
+            true,
+            None,
+            RuntimeStatus::default(),
+            Some(projection),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("gateway-owned Home CLI summary unavailable"));
+        assert!(err.contains("missing admitted authority"));
+    }
+
+    #[tokio::test]
+    async fn gateway_owned_home_snapshot_rejects_mismatched_summary_authority() {
+        let _guard = HOME_CMD_ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let _owned =
+            ScopedEnvVar::set(crate::runtime_control::GATEWAY_OWNED_HOME_TERMINAL_ENV, "1");
+        let _principal = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV,
+            "person:v07-admin",
+        );
+        let _session = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_SESSION_ID_ENV,
+            "session-v07-admin",
+        );
+        let _proof = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID_ENV,
+            "",
+        );
+        let _grant = ScopedEnvVar::set(
+            elastos_server::api::gateway::HOME_CLI_AUTH_CONTEXT_GRANT_ID_ENV,
+            "grant-v07-admin",
+        );
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let projection: HomeSummaryFactsProjection = serde_json::from_value(serde_json::json!({
+            "authority": {
+                "signed_in": true,
+                "principal_id": "person:other"
+            },
+            "active_shell": {
+                "schema": "elastos.home.active-shell/v1",
+                "active": "home-cli"
+            },
+            "notifications": {
+                "unread_count": 0,
+                "attention_count": 0,
+                "entries": []
+            },
+            "capsule_catalog": {
+                "schema": "elastos.capsules.catalog/v1",
+                "capsules": []
+            },
+            "capsule_interfaces": {
+                "schema": "elastos.capsules.interfaces/v1",
+                "interfaces": []
+            },
+            "targets": []
+        }))
+        .unwrap();
+
+        let err = gather_snapshot_from_parts(
+            &data_dir,
+            true,
+            None,
+            RuntimeStatus::default(),
+            Some(projection),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("gateway-owned Home CLI summary unavailable"));
+        assert!(err.contains("admitted principal mismatch"));
     }
 
     fn sample_snapshot_with_components(names: &[&str]) -> HomeSnapshot {
@@ -4208,6 +4422,16 @@ mod tests {
                 "running_capsules": [],
                 "note": null
             },
+            "identity": {
+                "profile": {
+                    "display_name": "Anders",
+                    "handle": "person:anders"
+                }
+            },
+            "authority": {
+                "signed_in": true,
+                "principal_id": "person:anders"
+            },
             "active_shell": {
                 "schema": "elastos.home.active-shell/v1",
                 "active": "home-cli"
@@ -4223,15 +4447,7 @@ mod tests {
                     "can_message": true
                 }],
                 "service_offer_count": 2,
-                "service_offers": [{"offer_id": "offer-a"}, {"offer_id": "offer-b"}],
-                "discovery": {
-                    "schema": "elastos.people.discovery/v1",
-                    "enabled": true,
-                    "visibility": "trusted",
-                    "status": "ready",
-                    "status_message": "ready",
-                    "topic": "__elastos_internal/people-discovery-v1"
-                }
+                "service_offers": [{"offer_id": "offer-a"}, {"offer_id": "offer-b"}]
             },
             "services": {
                 "schema": "elastos.runtime.services/v1",
@@ -4278,6 +4494,22 @@ mod tests {
         assert_eq!(projection.people.contact_count, 1);
         assert_eq!(projection.people.service_offers.len(), 2);
         assert!(projection.runtime.as_ref().unwrap().running);
+        assert_eq!(
+            projection
+                .identity
+                .as_ref()
+                .unwrap()
+                .profile
+                .as_ref()
+                .unwrap()
+                .display_name,
+            "Anders"
+        );
+        assert_eq!(
+            projection.authority.as_ref().unwrap().principal_id,
+            "person:anders"
+        );
+        assert!(projection.authority.as_ref().unwrap().signed_in);
         assert_eq!(
             projection.active_shell.as_ref().unwrap()["active"],
             "home-cli"
@@ -4367,38 +4599,11 @@ mod tests {
 
     #[test]
     fn people_actions_map_to_runtime_people_routes() {
-        let cases = [
-            (
-                "people-discovery-enable",
-                "/api/apps/people/discovery",
-                serde_json::json!({ "enabled": true }),
-            ),
-            (
-                "people-discovery-disable",
-                "/api/apps/people/discovery",
-                serde_json::json!({ "enabled": false }),
-            ),
-            (
-                "people-discovery-refresh",
-                "/api/apps/people/discovery/refresh",
-                serde_json::json!({}),
-            ),
-            (
-                "people-request-peer:peer-1",
-                "/api/apps/people/discovery/requests",
-                serde_json::json!({ "peer_id": "peer-1" }),
-            ),
-            (
-                "people-accept-request:req 1",
-                "/api/apps/people/discovery/requests/req%201/accept",
-                serde_json::json!({}),
-            ),
-            (
-                "people-remove-contact:contact-1",
-                "/api/apps/people/contacts/remove",
-                serde_json::json!({ "contact_id": "contact-1" }),
-            ),
-        ];
+        let cases = [(
+            "people-remove-contact:contact-1",
+            "/api/apps/people/contacts/remove",
+            serde_json::json!({ "contact_id": "contact-1" }),
+        )];
 
         for (action_id, path, body) in cases {
             let action = people_api_action(action_id)
@@ -4408,8 +4613,8 @@ mod tests {
             assert_eq!(action.body, body);
         }
         assert!(people_api_action("people-message:contact-1").is_none());
-        assert!(people_api_action("people-request-peer:")
-            .expect("request action should parse")
+        assert!(people_api_action("people-remove-contact:")
+            .expect("remove action should parse")
             .is_err());
     }
 
@@ -4599,6 +4804,11 @@ mod tests {
             );
         }
         assert!(home_terminal_host_intent_for_action("open-gui:home-cli", &snapshot).is_none());
+        assert!(home_terminal_host_intent_for_action(
+            "inbox-review-notification:wallet-approval-request:wallet-approval:test",
+            &snapshot
+        )
+        .is_none());
 
         let shell_intent =
             home_terminal_host_intent_for_action("shell-switch:home-gui", &snapshot).unwrap();
@@ -4630,6 +4840,42 @@ mod tests {
         let mut native_snapshot = browser_snapshot;
         native_snapshot.session.mode = "native_terminal".to_string();
         assert!(home_terminal_host_intent_for_action("auth-sign-out", &native_snapshot).is_none());
+    }
+
+    #[test]
+    fn unresolved_inbox_review_requests_become_desktop_inbox_handoffs() {
+        let mut snapshot = sample_snapshot_with_components(&[]);
+        snapshot.session.mode = "browser_pty".to_string();
+        snapshot.active_shell = serde_json::json!({
+            "schema": "elastos.home.active-shell/v1",
+            "active": "home-cli",
+            "candidates": [{
+                "name": "home-gui",
+                "launchable": true
+            }]
+        });
+        snapshot.targets.push(HomeTargetStatus {
+            target: "inbox".to_string(),
+            title: "Inbox".to_string(),
+            description: "Review pending requests.".to_string(),
+            role: "app".to_string(),
+            target_kind: "app".to_string(),
+            ..HomeTargetStatus::default()
+        });
+
+        assert_eq!(
+            home_terminal_host_intent_for_action(
+                "inbox-review-notification:wallet-approval-request:wallet-approval:test",
+                &snapshot
+            )
+            .unwrap(),
+            serde_json::json!({
+                "schema": "elastos.home.terminal-host-intent/v1",
+                "action": "switch-shell-open-target",
+                "action_id": "inbox-review-notification:wallet-approval-request:wallet-approval:test",
+                "target": "inbox",
+            })
+        );
     }
 
     #[test]
@@ -4895,6 +5141,53 @@ mod tests {
         assert!(labels.contains(&"Close public join requests".to_string()));
         assert!(labels.contains(&"Open ElastOS user invites".to_string()));
         assert!(labels.contains(&"Restrict web guest approvals".to_string()));
+    }
+
+    #[test]
+    fn room_actions_do_not_expose_unauthenticated_membership_commands() {
+        let mut snapshot = sample_snapshot_with_components(&[]);
+        snapshot.room.local_runtime_role = Some("owner".to_string());
+        snapshot.room.members = vec![
+            RoomMemberStatus {
+                member_did: "did:key:z6owner".to_string(),
+                role: "owner".to_string(),
+            },
+            RoomMemberStatus {
+                member_did: "did:key:z6member".to_string(),
+                role: "member".to_string(),
+            },
+        ];
+        snapshot.room.pending_invites = vec![RoomInviteStatus {
+            invite_id: "invite-1".to_string(),
+            invited_did: "did:key:z6pending".to_string(),
+            role: "member".to_string(),
+        }];
+        snapshot.room.pending_invite_count = snapshot.room.pending_invites.len();
+
+        let action_ids: Vec<String> = gather_room_actions(&snapshot)
+            .into_iter()
+            .map(|action| action.id)
+            .collect();
+        assert!(!action_ids
+            .iter()
+            .any(|action_id| action_id.starts_with("room-accept-invite:")));
+        assert!(!action_ids
+            .iter()
+            .any(|action_id| action_id.starts_with("room-revoke-invite:")));
+        assert!(!action_ids
+            .iter()
+            .any(|action_id| action_id.starts_with("room-remove-member:")));
+
+        for action_id in [
+            "room-accept-invite:invite-1",
+            "room-revoke-invite:invite-1",
+            "room-remove-member:did:key:z6member",
+        ] {
+            assert!(matches!(
+                action_readiness(action_id, &snapshot),
+                ActionReadiness::Blocked(reason) if reason == "unknown action"
+            ));
+        }
     }
 
     #[test]

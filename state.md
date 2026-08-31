@@ -1,66 +1,252 @@
 # State
 
-Last updated: 2026-07-31 UTC
+Last updated: 2026-08-31 UTC
 
-This file records public-safe current truth for the 0.5.0 baseline, the 0.6.0
-release candidate, and active feature branches. Historical
-local proof logs, private SSH aliases, tunnel ports, operator usernames, key
-paths, worktree paths, and target backup paths are intentionally not tracked in
-the public repository.
+This file records public-safe current truth for released 0.6.0 and active
+development work. Private operator paths, credentials, target identities, and
+volatile proof logs remain outside the repository.
 
 ## Release Posture
 
-- `main` is the 0.5.0 baseline. Active feature branches must state whether they
-  are preserving 0.5.0 behavior or intentionally moving the product architecture.
-- `fix/elastos-shell-protocol-browser-wallet-consolidation` is the published
-  0.6.0 review line. It is based on `feat/elastos-shell-protocol`, which
-  descends from `upstream/0.6-dev`; it includes the reviewed ESP, Wallet,
-  Recovery, and Browser continuation and keeps the accepted implementation
-  history intact. It is not merged to `main`.
-- Carrier reconciliation, shell UI redesign, and extended AI UI work are not
-  included in 0.6.0. Carrier moves to 0.7; the UI work requires an independent
-  compatibility and product review before a later release.
-- The Runtime implements the WASM Component Model path through
-  `elastos.component/v1` and the Runtime-mediated `elastos:bus@v1` authority
-  contract. The conformance fixture and authoring template exercise it; all 18
-  shipped first-party UI Apps still use `elastos.runtime-projection/v1` web
-  projections. WASI Preview 1 is rejected at product capsule admission.
-- Source/review proof must cite concrete reusable commands: `git diff --check`,
-  `node scripts/home-entropy-check.mjs`, `node scripts/browser-entropy-check.mjs`,
-  `bash scripts/check-wci-alignment.sh`, `just candidate-command-audit`, and the
-  touched-surface Rust/capsule tests.
-- Component ABI proof also includes
-  `node scripts/check-first-party-wasi-gate.mjs`, which reports every
-  first-party WASI Preview 1 capsule finding and fails on unclassified product
-  WASI usage.
-- ElastOS Bus v1 deliberately omits streams because no shared
-  capability/audit/lifecycle implementation exists yet. Its checked-in WIT hash
-  is `7a026e0a641c8c04214576dc85a677e0b52c9f02866d231119f9a3ba609d49e2`;
-  the conformance fixture and Component authoring template are bound to that
-  hash. No shipped first-party product Component proves adoption end to end.
-- [docs/CAPSULE_AUTHORING.md](docs/CAPSULE_AUTHORING.md),
-  [templates/capsules](templates/capsules), and `elastos init` are the canonical
-  capsule authoring paths. Their manifests are validated by repository gates;
-  generated product capsules have no WASI, ambient environment, preopen,
-  socket, FIFO, or direct provider authority.
-- People is a standalone first-party web-projection capsule under
-  `capsules/people`. Home launches `/apps/people/` with a People-scoped token;
-  People owns its UI and calls only its Runtime-mediated app routes.
-- Release publishing validates every discovered capsule manifest and rejects
-  missing descriptions, missing authors, and scaffold placeholder authors.
-- Target proof is operator-supplied. It must name target roles and exact command
-  lines without committing private host aliases, SSH keys, tunnel ports, local
-  data roots, or local worktree paths.
-- Private proof logs stay outside this repo. Public release notes should claim
-  only proof that can be reproduced from the reviewed source or from
-  explicitly supplied target evidence.
+- A fresh fetch records `main` at `d358dedb` as the released 0.6 source and
+  `origin/upstream/0.7-dev` at `e481b153` as the current 0.7 integration line.
+- The local 0.7.0 release-preparation commit on top of `e481b153` sets the
+  coordinated workspace version to `0.7.0`, gives every capsule manifest
+  changed since 0.6.0 a minor bump (new capsules keep their initial manifest
+  versions), cuts the `0.7.0` changelog entry, and refreshes
+  `elastos/Cargo.lock`. Installed artifacts report `0.7.0` only after the
+  checked publish flow stamps `ELASTOS_RELEASE_VERSION`; unstamped source
+  builds report `0.7.0-dev`.
+- Published feature evidence is
+  `origin/feat/protected-content-runtime-lifecycle@854d9dc9`,
+  `origin/feat/protected-content-uiux-reconstruction` (PR39),
+  `origin/feat/0.7-uiux-candidate@8b547590`,
+  `origin/feat/dkms-esp-port@27d85c6f`, and
+  `origin/feat/0.7-product-documentation@74cd4e42`.
+- The published protected-content stack is contracts `0c56c56a`, custody
+  `2f844cef`, key reconstruction `467a6c03`, custody provider `1b7fa732`, Wallet
+  rights `c9e82e75`, Runtime `a8ac6dc8`, and rights `3627da01`. Every tip is an
+  ancestor of the published lifecycle and is already present in the active
+  integration. The latest published protected-branch repairs need no new
+  extraction.
+- PR39 includes the Home audit fixes, the named principal-root write policy,
+  checkout-bound test fixtures and the privacy-reviewed audit workbook at
+  `d06d64f3`. All seven CI jobs pass on that revision, including macOS,
+  both Linux source-home targets and the release build. New local inclusions
+  require CI on their exact revision; installed product acceptance stays separate.
+- The local source includes the CPU watcher optimization from `e4d897f6`.
+  Unchanged executable metadata skips binary hashing; a changed stamp triggers
+  a streamed digest. Focused tests cover idle ticks, replacement and deletion.
+  Installed CPU measurement remains open.
+- The source-merge scope preserves reviewed history and includes the exact
+  PR43 commit `58ebfb23`. PR39 then feeds `upstream/0.7-dev`, which feeds
+  `main`; fetching refs establishes the current heads before each step. A
+  merge commit preserves the original commits rather than squashing them.
+  Main integration, release publication and installed cutover are separate
+  actions. The deferred scope remains explicit in [TASKS.md](TASKS.md).
+- The published audit changes include Home and Terminal repairs, create-only
+  Library writes, document close protection, Assistant and model-init repairs,
+  declared-content icons, private diagnostics, socket-root protection, and Mac
+  restart safety.
+  The history review preserved the product tree and incorporated the published
+  CI/setup changes. Installed acceptance still belongs to exact artifact
+  receipts and recorded GUI outcomes.
+- Upstream `90bbe15b` records Irzhy's verified Base 8453 evidence and changes
+  Chain provider source, tests and protected-content documentation.
+  The branch preserves the published
+  protected-content repairs and includes that evidence once. It also retains
+  upstream collaboration and Browser local-exit orphan cleanup.
+- Irzhy's updated PR43 repair, `58ebfb23`, is included in the local source.
+  Runtime adopts fully completed mint records after a lost intent completion
+  mark. Ambiguous or partial records fail closed; partial custody cleanup and
+  installed mint/restart acceptance remain open. The current named-policy
+  helper already resolves the auth lint warning; the updated PR43 drops its
+  earlier lint suppression.
+- The protected-content source path remains inactive. Installed proof and one
+  atomic cutover remain open.
+- Commits `3026992b`, `ed7a8bfc`, and `7f6e47f9` provide portable listing
+  publication and import, buyer purchase, and buyer open, read, and close
+  without creator Runtime mint state. The package binds the public custody
+  identity to Chain-committed metadata and uses one immutable listing
+  projection on each Runtime.
+- Commits `ba7f6cea` and `84569da5` complete exact buyer Runtime rights admission
+  and the two-Runtime source journey. Runtime A keeps provisioning authority for
+  the real process-backed 2-of-3 custody nodes. Runtime B imports the listing,
+  buys it, and completes open, read, and close with its own Profile, Wallet,
+  device identity, state, and signed release operation.
+- Playback reconstructs from the authenticated release operation, verified
+  signed epoch, released contributions and terminal receipt, recipient
+  possession, and public CEK commitment. Provisioning still uses
+  `CustodyEnvelopeV1`; Runtime stores no playback copy of the custody envelope.
+- The combined protected-content gateway proof uses private Runtime targets for
+  protect, media, custody, and decrypt. Carrier supplies authenticated endpoint
+  transport before the Runtime-selected custody target handles the request.
+  Public provider projection excludes these targets.
+
+## Branch Hygiene
+
+- Local UIUX subgroup branches are extraction scaffolding already contained in
+  the published UIUX candidate and active integration. They need no separate
+  publication.
+- Local accepted protected-content labels whose tips are ancestors of the
+  published lifecycle or upstream need no separate publication.
+- Retained donor branches and dirty worktrees remain under the operator
+  ledger's preservation rules. The August review carried useful content,
+  Recovery/Profile, Windows and operator documentation into this candidate.
+  Older Assistant and migration donors retain explicit deferred tasks.
+  Preserve unique history and original dirty files until their owners approve
+  cleanup; published source does not make every older hunk equivalent.
+
+## Integrated Source Truth
+
+Runtime retains `tracing`. Irzhy postponed the replacement `elastos-logger`
+on August 30; its absence is an intentional decision, not an omitted release
+feature. Its useful VM-payload privacy repair is included independently in
+`74ed3bc9` and has a log-capture regression test.
+
+The older July Carrier branch contains framing, deadline and protocol work
+that needs an adapted integration: the current incoming request handler still
+has an unbounded line read, while the donor's whole protocol would disable
+provider invocation used by the current protected-content path. This remains
+an explicit source-integration decision in [TASKS.md](TASKS.md). Inclusion of
+all retained work requires a behavior-level comparison, not only commit counts.
+
+Older Assistant attachment, knowledge/search/citation and advanced Studio
+implementations remain retained donors for the open work in [TASKS.md](TASKS.md).
+The PR15 legacy-auth migration also remains separate because it replaces
+unchained audit history. Current signed-checkpoint policy owns compatibility;
+retaining those donors does not mean their behavior is in the candidate.
+
+The reviewed content-distribution, Recovery/Profile and WSL-first documents
+are included. The catalog currently projects installed capsules; signed network
+discovery, Home Get and model-content packaging remain planned work. WSL
+packaging and native Windows support also remain unproved product targets.
+
+Runtime owns authenticated principal and session authority, capability
+admission, provider selection, lifecycle, durable operation identity, Wallet
+and Chain coordination, audit, and settlement. Providers own their typed
+operation semantics. Carrier transports only Runtime-selected endpoint traffic.
+Capsules own presentation and app behavior and receive bounded read models and
+opaque selectors only.
+
+The integrated source includes these durable facts:
+
+- Collaboration identifies people by Profile DID and uses endpoint DIDs for
+  private Runtime routing. People and Chat consume typed Runtime projections.
+- Home owns shell chrome, launch framing, focus, fullscreen, clipboard
+  mediation, notifications, and sign-out. Capsules own their content and icons.
+- Wallet owns accounts, approvals, signatures, and transaction effects. Runtime
+  binds protected-content creator and buyer operations to the verified Wallet
+  account and configured Chain authority.
+- Assistant is a capsule. Runtime selects one model offer through
+  `ProviderRegistry`, and `model-provider` owns model execution. Assistant
+  renders bounded, sanitized markdown and math from typed output.
+- Library prepares, protects, lists, and opens video through typed Runtime
+  operations. Marketplace reads immutable listing projections and submits only
+  the mint identity for buy or open. `elacity-player` owns video presentation.
+- Runtime keeps the canonical protect, media, custody, and protected-content
+  decrypt providers on reserved private targets. Public capsule lookup,
+  interface projection, and provider routes exclude these targets.
+- Protected publication requests exactly three replicas. The repair task keeps
+  the same requirement. Purchase and open both require fresh signed
+  availability bound to the exact protected object.
+- Protected Chain configuration is an owner-only
+  `protected-content/chain-provider.json` file. It contains one versioned
+  `protected_content_network`; Runtime supplies its operation issuer
+  separately. Node-local rights evaluation uses 2-5 explicit private RPC
+  sources and requires two exact agreeing finalized results.
+- `scripts/protected-content-installed-static-audit.py` reads installed
+  artifacts and emits
+  `elastos.protected-content.installed-static-audit/v1`. It reports source and
+  static artifact failures, operator configuration prerequisites, and active
+  installed proof prerequisites separately. `ready_for_active_proof` is a
+  static admission result, not product readiness.
+- Full `scripts/setup-source-home.sh` installs one stable Runtime at the
+  platform data root under `bin/elastos`. It writes the owner-only
+  `receipts/source-home-installation.json` receipt after components, native
+  providers, capsule trees, and source-home capsule metadata are final. The
+  receipt binds source commit/tree/clean state and exact artifact hashes.
+  Setup requires at least 10% free space on both source and data volumes before
+  builds. Its private install stage is removed on success, copy failure and
+  installer failure, as verified by the isolated installation smoke. Source
+  setup and Browser target refresh each retain one default VM backup set.
+- `scripts/mac-source-home-restart.sh` and
+  `scripts/linux-source-home-restart.sh` select only that stable Runtime.
+  Each owns one exact PID file, stops only the identity-bound prior Runtime,
+  retains at most one bounded principal-root rollback, and writes an owner-only
+  restart receipt. Mac default mode uses the existing installation; `--init`
+  also requires current clean source and artifact parity. Mac dry-run validates
+  without stopping the Runtime, including with `--down`. Runtime owns provider
+  shutdown.
+- The macOS replacement-restart path is proven in its fixture on this host,
+  including a live prior Runtime after atomic binary replacement. Linux dry-run
+  and fixture proof is source evidence; active `/proc`, listener, and binary
+  replacement behavior still requires Linux target evidence.
+
+## Protected-content Contract Truth
+
+KID and `EncryptedContentIdentityV1` are separate identities. The bytes16 CENC
+KID is the deployed AuthorityGateway access key. The full encrypted-content
+identity binds the protected object and media contract.
+
+The active local branch preserves the verified deployed read behavior:
+
+- `AuthorityGateway.hasAccessByContentId(address,bytes16) -> bool` owns the
+  access read.
+- `CentralStorage.ipReference(bytes16)` resolves the KID for that read.
+- An unknown KID reverts with `UnboundContentId(bytes16)`; a bound KID without
+  access returns `false`.
+
+`origin/upstream/0.7-dev@90bbe15b` records Irzhy's deployed Base 8453 probe
+evidence, already included in this branch:
+
+- `CentralStorage.bindIP(bytes16,address,uint256)` accepts acknowledged
+  contracts only and is called by `AssetFactory.registerNewAsset`.
+- Native `AuthorityGateway.buyAccess` uses selector `0xf7580ad9`.
+- ERC20 `AuthorityGateway.buyAccess` uses selector `0x0ede2294`; Wallet approval
+  targets each operative `paymentProcessor()`.
+- EventHub emits mint events.
+- Upstream records bound-KID allow, deny, and unbound evidence.
+
+The exact funded buy receipt and event remain installed proof items. Deployed
+`View` and `Download` still map to one boolean Chain access result, so signed
+Runtime policy owns the action distinction until contract evidence defines it.
+
+The canonical source path keeps Runtime journals limited to identities, state,
+receipts, and settlement. Protect, custody, and decrypt providers keep clear
+media, ciphertext staging, CEKs, and shares inside their private process
+boundaries. Each custody node owns one independent share and its node-local
+rights check. Runtime and capsules do not receive private provider, storage,
+Chain, RPC, or Carrier topology.
+
+## PR15 Extraction Ledger
+
+PR #15 / `feat/dkms-esp-port` is source evidence, not a merge target. The
+integrated source adapted these useful parts to the typed Runtime path:
+
+- `6d2e9083`: player/viewer behavior and Library-open UX now use typed Runtime
+  launch, read, and close operations.
+- `c5aed9db`: Creator UX now appears as the Library protect-and-list flow.
+- `57974479`: the grant journey maps to current Profile, session, Wallet, and
+  Runtime authority.
+- `ffea5998`: useful Create, mint, and open failure cases are covered by the
+  current typed paths.
+- `e148218b`: applicable CI lessons remain in the focused source and platform
+  gates.
+
+Current video opens in `elacity-player`. Document and 3D viewers remain later
+typed-viewer scope. External cryptographic review remains open before public
+dKMS or production confidentiality claims. Global listing discovery and public
+custody governance remain later work. The shared listing link, portable import,
+buyer Runtime rights admission, and exact two-Runtime 2-of-3 source journey are
+complete. Installed proof and the atomic authority cutover remain open.
 
 ## Capsule Execution Truth
 
 - [docs/CAPSULE_MODEL.md](docs/CAPSULE_MODEL.md#isolation-boundary)
   defines the cross-branch isolated-execution contract. It is a 0.6
-  architecture requirement, not an additional product claim for the 0.5.0
-  `main` line.
+  architecture requirement introduced by 0.6, not proof that every first-party
+  app is already a Component.
 - The ESP branch proves a useful substrate slice: the Component runner and
   conformance fixture use no linked WASI, environment, filesystem preopen,
   FIFO, raw socket, or gateway authority, and every guest effect is linked
@@ -82,6 +268,10 @@ the public repository.
   routes, frames, cookies, and placement are not the capsule ABI or authority,
   and the repo must not claim that every visible first-party app is already a
   self-contained executable Component.
+- Verified on `b07160cf` on 2026-08-16: the generic
+  `POST /api/provider/:scheme/:op` route remains a live host adapter used by
+  current web projections and control surfaces. It is not the Component ABI or
+  a capsule contract, and new capsule code must not treat it as one.
 - Runtime auth audit history is currently SHA-256-linked and Ed25519-signed with
   retained-chain anchoring. BLAKE3 is not the canonical audit hash in this
   branch; any future algorithm change requires an explicit schema version,
@@ -106,6 +296,24 @@ the public repository.
   can request accounts, but the page receives no selected address until the
   Runtime-mediated request is approved through the trusted review path.
 
+## Consequence-aware effect truth
+
+- The manifest schema includes `AffordanceRisk::Actuator`, and Runtime maps it
+  to the `execute` capability action. The generic catalog invocation path still
+  rejects actuator, payment, rights, and privileged affordances because its
+  explicit user-approval dispatch is not enabled.
+- No shipped capsule manifest declares `actuator`. This branch has no general
+  sensor-observation envelope, installed physical-actuator provider proof, or
+  hard real-time safety claim.
+- Wallet transactions have durable effect IDs and uncertain-outcome
+  reconciliation. Browser launch has bounded `DidNotAct` reconciliation, and
+  remote service contracts forbid blind retry after uncertain dispatch. These
+  are provider-specific proofs, not a shipped universal effect state machine.
+- [Consequence-aware effects](docs/CONSEQUENCE_AWARE_EFFECTS.md) defines the
+  shared target contract. Physical effects still require an operation-specific
+  provider, destination admission, local interlock proof, truthful settlement,
+  and installed-target evidence before any readiness claim.
+
 ## Proof Path Ledger
 
 - Installed operator/update proof path: `public-install-operator-smoke.sh`.
@@ -113,16 +321,18 @@ the public repository.
   `local-identity-profile-smoke.sh`, depending on target role.
 - Public Linux runtime portability proof path:
   `audit-linux-runtime-portability.sh`.
-- Protected-content provider journey proof path:
-  `protected-content-provider-contract-smoke.sh`.
+- Provisional protected-content provider retirement guard:
+  `protected-content-provider-contract-smoke.sh`. It does not verify the
+  canonical v1 custody or Runtime path.
 
 ## Browser Truth
 
 - Browser is included in 0.6.0 as a bounded Runtime Browser, not as a fully
   reliable general-purpose Browser claim.
-- Accepted localhost evidence covers the installed macOS VZ candidate's launch,
-  decoded display, navigation through Runtime-only networking, and injected
-  provider availability.
+- Browser launch, TURN/media-relay connection, Runtime-mediated traffic, exact
+  terminal close, and zero-residue behavior require fresh target evidence for
+  the exact integrated commit. Human-visible video, input, scrolling, and audio
+  remain manual proof gates.
 - Deterministic proof confirmed `window.ethereum`, one EIP-6963 provider,
   `isElastOS=true`, `isMetaMask=true`, the Runtime Wallet binding, chain `0x14`,
   and exactly one `eth_requestAccounts` handoff producing one pending Wallet
@@ -146,9 +356,19 @@ the public repository.
 
 - Browser architecture is coherent enough to preserve, but the objective still
   fails product audio proof and hash-bound manual UX evidence.
+- Verified on `b07160cf` on 2026-08-16: Browser projection code still selects
+  `display_mode`, preferring `webrtc_remote_display` when the selected engine
+  advertises it. This is an open authority-placement gap. The target contract
+  has Browser request a display capability while Runtime selects the display
+  path and engine adapter.
 - Docker/Selkies is only `managed_baseline_not_final_product`; the hosted Selkies/GStreamer service is a managed baseline, not accepted as the final Browser.
-- The hosted baseline is single-session; active pages are a serialization blocker.
+- Hosted tooling supports per-launch targets. Each engine/control service keeps
+  its declared page capacity; concurrent product sessions require their own
+  installed capacity and cleanup proof.
 - This server is not a product native-browser proof target because it lacks a real host compositor/display, host audio service, and working network namespace support.
+- Verified on the public seed on 2026-08-16: `test -e /dev/kvm` returned 1. The
+  seed is a bootstrap and gateway host and may consume a remote Browser Engine;
+  it is not a person's Home or a local crosvm/KVM Browser target.
 - Kasm Workspaces, BrowserBox, or KasmVNC cannot replace Selkies until the
   operator_control_socket not provisioned blocker and their operator evidence
   requirements are cleared.
@@ -186,10 +406,41 @@ the public repository.
   disposable Chromium: opaque `Origin: null` topology, parent DOM denial,
   changing nonzero framebuffer writes, trusted keyboard input, nonzero emulator
   audio output, on-screen controls, save/reload persistence, and process cleanup.
-- Installed macOS proof covers uCity and Library `.gba` launch, moving frames,
-  keyboard/on-screen input, user-enabled audio, save/reload, source-installed-
-  served artifact parity, and view cleanup. GBA remains outside the default
-  profile and is installed only by explicit `demo` or `full` profiles.
+- The GBA source catalog contains exactly `gba-nonogram` and `gba-ucity`.
+  Shared visual tokens remain inside the GBA capsule. GBA stays outside the
+  default profile and belongs only to explicit `demo` or `full` profiles.
+  Installation, target media, input, save/reload, and cleanup proof remain
+  separate gates.
+
+## Model And Assistant Truth
+
+- `model-provider` is the single active model execution path. Runtime registers
+  it as a verified native provider and authorizes only the typed
+  `offers_list`, `runs_create`, `runs_get`, `runs_events`, and `runs_cancel`
+  operations.
+- The operator-owned model-provider config lives under the Runtime data root at
+  `providers/model-provider/config.json`. Runtime validates the fixed path and
+  file security, passes only the raw top-level offers value through Init, and
+  keeps backend URLs, credentials, and adapter details below the provider
+  boundary.
+- A missing installed components manifest or model-provider entry leaves the
+  provider unconfigured and unavailable. Runtime does not select a fallback.
+- Missing model-provider config is an honest zero-offer state: Runtime may
+  start/register the provider with no offers, writes no config file, and
+  Assistant shows that no model offers are available.
+- `model-provider` now accepts the Runtime Init envelope fields
+  `base_path`, `allowed_paths`, `read_only`, `encryption_key`, and `extra`
+  without weakening strict unknown-field handling. The zero-offer stdio Init
+  test passes with the Runtime envelope in source tests.
+- Assistant is a standalone first-party capsule. Chat, Build, and Studio use
+  only typed Runtime model resources and the protected Assistant workspace;
+  transcript copy goes only through the trusted Home Clipboard path.
+- Assistant model messages render a self-contained safe markdown subset with
+  escaped HTML, inert links, headings/lists/blockquotes/tables, fenced and
+  inline code, and inline/display math through vendored KaTeX 0.18.3. Focused
+  source proof lives in `scripts/assistant-shell-smoke.mjs`. The Home audit
+  records observed UI behavior separately; configured model-run and advanced
+  workflow acceptance remain open.
 
 ## System Truth
 
@@ -224,8 +475,8 @@ the public repository.
   app, viewer, shell, connector, content, and provider surfaces. Home-facing
   descriptors cover `home` host facts, `home-gui`, `home-cli`, `browser`,
   `wallet`, wallet connectors, `inbox`, `services`, `system`, `library`, `documents`,
-  `archive-manager`, `chat-room`, `chat` terminal, `agent`,
-  `marketplace`, `gba-emulator`, and `gba-ucity`; provider-role capsules now
+  `archive-manager`, `chat-room`, `assistant`,
+  `marketplace`, `gba-emulator`, `gba-ucity`, and `gba-nonogram`; provider-role capsules now
   project authority metadata for service-plane inspection. These descriptors
   are projected as facts for shells and System; Runtime gates, approval, launch
   tokens, providers, and audit remain authoritative.
@@ -311,8 +562,8 @@ the public repository.
   live in `capsules/home-gui/browser/shell-core.js`. A normal Home CLI action
   stays in CLI; opening a GUI-only target requires an explicit, launch-token-
   gated `switch shell and open` intent.
-- The Home shell implementation, source gates, and machine smokes pass for the
-  current working tree. The origin-isolation change requires a fresh
+- The Home shell source gates assert these ownership rules. The
+  origin-isolation change requires a fresh
   commit-bound operator pass covering passkey sign-in, System switching to
   `home-cli`, CLI ownership of the full viewport, no desktop first-paint or
   hidden GUI bleed-through, hard reload into the selected shell, and return to
@@ -320,7 +571,125 @@ the public repository.
 - `scripts/home-shell-objective-audit.mjs` remains the fail-closed completion
   audit. Manual evidence is commit-bound and intentionally not stored in the
   repository; any later Home shell behavior change requires a new or re-reviewed
-  report against the exact candidate commit.
+  report against the exact reviewed commit.
+- Home first-run onboarding now honors the existing `settings=security`
+  deep-link, focuses the recovery action when verified readiness becomes
+  available, and refreshes Home summary state after Recovery Kit export. People
+  setup prefills the suggested first Profile name as editable text, preserves
+  unfocused edits across refresh, and still requires explicit create or
+  confirm.
+- Declared content icons stay capsule-owned and serve only manifest-declared
+  icon variants. Nested content entrypoints resolve icons from their matching
+  serving root, and declared icon requests reject ROM bytes, traversal, and
+  symlinked targets.
+- Fresh desktop placement seeds only visible targets on first run. Saved hidden
+  target positions remain intact after later reloads.
+- Current source proof for the onboarding slice is focused and local:
+  `recovery_readiness_change_emits_home_summary_event_only`,
+  `test_recovery_readiness_and_first_profile_gate_share_one_recovery_rule`,
+  `scripts/people-discovery-smoke.mjs`, and
+  `scripts/home-shell-regression-smoke.mjs` pass. The Home audit keeps installed
+  outcomes separate from those source tests. Empty-machine recovery coverage
+  for a first kit that predates the later random Profile key remains open.
+  Manual GUI acceptance still requires the exact installed artifact.
+- A fresh Recovery Kit export is now truthful about included People identity.
+  Source still needs a separate repair for empty-machine recovery when the first
+  kit predates the later random Profile key.
+
+## Collaboration Truth
+
+- Collaboration represents a person through a signed Profile DID. The human
+  actor, local principal, signed Profile, and Device DID remain separate. The
+  Profile authorizes Carrier endpoint DIDs for routing and scoped signer DIDs
+  for application authorship. Neither role is a display name, contact key, or
+  browser-visible selector.
+- Runtime owns identity derivation, protected state, and Carrier/provider
+  mediation. Capsules receive bounded read models and opaque selectors only.
+- `chat-room` is the sole Chat product in manifests, demos, build, and
+  supported release profiles. The old terminal `capsules/chat` and
+  `capsules/agent` source trees are retired and cannot return as a raw-peer
+  compatibility path.
+- Chat and People use Runtime-mediated collaboration services selected by a
+  signed network profile. Runtime owns their registration, workers, shutdown,
+  and the long-lived Carrier endpoint. The seed and profile signer are
+  bootstrap and configuration authority only, never person, contact, or
+  message authority.
+- Collaboration messages identify the sender Profile and either a Profile or
+  conversation recipient. Runtime routing and Carrier transport no longer
+  replace those product identities. A generic acceptance receipt proves only
+  that the named endpoint durably accepted the exact envelope; it is not a
+  person delivery or read receipt. For direct messages, contact revocations,
+  and Profile updates, the receiving Runtime derives the source endpoint from
+  the authenticated Carrier connection and checks it independently from the
+  Profile-authorized application signer. Shared-room gossip still requires its
+  signer to be endpoint-authorized because that admission path does not yet
+  receive an equivalent authenticated transport-source fact.
+- Peer-DID provider routing resolves through the long-lived Runtime Carrier
+  endpoint. The resolved endpoint identity must match the requested DID, and a
+  route with no verified peer reports the peer as unavailable before any
+  provider effect.
+- Verified on `b07160cf` on 2026-08-16: a same-endpoint Peer DID stays on the
+  Carrier provider plane and enters authenticated admission through the local
+  registry without a network dial. Direct messages settle the same signed
+  envelope and signed acceptance receipt used by the remote contract. This was
+  implemented by `8dd54706`; it was not an open gap in that snapshot.
+- Discovery is explicit, opt-in, bounded, and temporary. Accepted contacts are
+  derived from signed request and decision chains, and Inbox is the only
+  Accept/Decline authority surface.
+- Direct conversations are permitted only between accepted Profile contacts.
+  The conversation ID is derived from the two Profile DIDs and the network ID
+  and is a selector, not authority.
+- Direct delivery is durable on the sender and point-to-point with no relay.
+  `send_text_with_context` persists the signed envelope before the first
+  delivery attempt, and `retry_pending` re-delivers on the 15-second sync
+  cadence until the envelope's 24-hour TTL expires, surviving sender restarts
+  (`durable_pending_restarts_with_the_exact_envelope_and_settles_once`). The
+  recipient does not need to be online at send time; it needs to become
+  reachable within the TTL while the sender's Runtime is running. The real gap
+  is a sender that goes offline before the recipient returns: there is no
+  third-party store-and-forward, and an expired envelope is abandoned and
+  reads `expired`, never `pending`. The seed never sees message plaintext.
+  The shared room has the matching reach limit: gossip topic buffers are
+  in-memory on whichever peer holds them, so a peer offline past that
+  buffer's retention, or across a restart of the holding peer, misses that
+  interval; whatever arrives is ingested durably. Profile update catch-up is
+  bounded by the 8-revision announcement ring. A contact further behind
+  fails closed with an explicit refusal and needs a fresh approval.
+- A Profile authorizes exactly one device today. The signed document supports
+  several, but the product path always writes the current local device, so
+  Profile update delivery covers renaming and carrying a data root to another
+  machine rather than pairing a second concurrent device.
+- Recovery restores the collaboration identity. The Full Recovery Bundle
+  carries the Profile signing seed, its retained revision ring, and the signed
+  contact store; a fresh-machine import keeps the Profile DID, authorizes the
+  new device through the normal signed-revision path, and accepted contacts
+  learn the rebound endpoint from one announcement. An import whose identity
+  restore fails is reported incomplete and never claims a complete account
+  recovery.
+- Historical verification at `b07160cf` records a disposable, fixture-owned
+  two-Runtime collaboration journey. Current localhost and public-seed product
+  claims require fresh artifact and target evidence for the exact integrated
+  commit.
+- Bilateral signed contact removal is implemented with the complete People
+  states: a pair-scoped signed revocation delivered over the direct channel
+  with durable retry, visible removed state on both sides, retained heads as
+  the signed name source, and history readable under the declared policy.
+- Shared-room attribution is implemented: configured-room rows are named from
+  signed Profile truth (own Profile authority, accepted and retained heads,
+  membership profile cards) or rendered explicitly unverified; presence is
+  liveness-only and durable history is untouched.
+- Signed Profile update delivery is implemented: renames travel as an exact
+  bounded signed chain over the dedicated `collaboration-profile` provider,
+  apply under strict next-revision and chain-hash rules, and re-announce
+  idempotently after restart. The two-runtime proof surfaced and fixed a real
+  wire gap: the Carrier peer provider plane had never admitted the profile
+  provider. Design and boundaries live in
+  [docs/COLLABORATION_HANDOFF.md](docs/COLLABORATION_HANDOFF.md); the
+  strict fixture-owned two-Runtime source proof covers Recovery,
+  distinct Runtime/Profile evidence, opt-in Discovery, exact Inbox approval,
+  direct messages both ways, rename, bilateral removal, re-add, shared-room
+  continuity, restart continuity, Clipboard, narrow UI, and final People/Chat
+  identity scans all passed on two fresh loopback Homes.
 
 ## Remote Carrier Exit Evidence
 
@@ -343,13 +712,13 @@ the public repository.
 - Branch-override public smokes require a staged or published 0.6.0-compatible
   manifest with the current `home` profile and checksummed artifacts.
 - Source/local Carrier setup proof stays in `scripts/local-carrier-setup-smoke.sh`.
-- Public install proof for this candidate requires a staged or published
+- Public install proof for an integrated candidate requires a staged or published
   0.6.0-compatible manifest with the current `home` profile and checksummed
   artifacts.
 - Set `ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1` only when the publisher relay
   path itself is under review.
-- Final public installed-path proof waits for publishing the 0.6.0
-  binary/artifact set.
+- Integrated 0.7 installed-path proof waits for one reviewed source tree and
+  matching stable installation receipts on each target role.
 
 ## Open Blockers
 

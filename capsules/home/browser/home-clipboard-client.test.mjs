@@ -34,7 +34,7 @@ function fakeTimers() {
   };
 }
 
-function fixture(targetId = "browser") {
+function fixture(targetId = "browser", { autoReady = true } = {}) {
   const posts = [];
   const listeners = new Map();
   const timers = fakeTimers();
@@ -98,7 +98,9 @@ function fixture(targetId = "browser") {
     ...fields,
   });
   client.start();
-  client.handleMessage(event(ready()));
+  if (autoReady) {
+    client.handleMessage(event(ready()));
+  }
   return {
     client,
     event,
@@ -139,6 +141,38 @@ test("client registers before requesting and never asserts its target", async ()
   assert.equal(f.timers.size(), 0);
 });
 
+test("first-party write re-registers when readiness is missing and still fails closed without it", async () => {
+  const readyMissing = fixture("wallet", { autoReady: false });
+  const write = readyMissing.client.writeText("0x1950", {
+    purpose: "wallet.address",
+  });
+  assert.deepEqual(
+    readyMissing.posts.map(({ message }) => message.type),
+    ["home:app-ready", "home:app-ready"],
+  );
+  readyMissing.client.handleMessage(readyMissing.event(readyMissing.ready()));
+  await Promise.resolve();
+  assert.equal(
+    readyMissing.posts.at(-1).message.type,
+    "home:clipboard-request",
+  );
+  readyMissing.client.handleMessage(
+    readyMissing.event(
+      readyMissing.result("request-1", "write", "wallet.address"),
+    ),
+  );
+  assert.equal(await write, true);
+  assert.equal(readyMissing.timers.size(), 0);
+
+  const unavailable = fixture("wallet", { autoReady: false });
+  const unavailableWrite = unavailable.client.writeText("0x1950", {
+    purpose: "wallet.address",
+  });
+  unavailable.timers.fireDelay(HOME_CLIPBOARD_CLIENT_TIMEOUT_MS);
+  await assert.rejects(unavailableWrite, /unavailable/);
+  assert.equal(unavailable.posts.length, 2);
+});
+
 test("only Browser can read and exact matching text/plain result settles it", async () => {
   const f = fixture();
   const read = f.client.readText();
@@ -168,6 +202,7 @@ test("client accepts the closed first-party write purposes", async () => {
     ["library", "resource.uri", "object:private/document-1"],
     ["library", "resource.identifier", "bafy-library-content"],
     ["documents", "resource.uri", "elastos://bafy-document"],
+    ["assistant", "transcript.markdown", "# Assistant transcript\n\n## User\n\nHello"],
   ];
   for (const [targetId, purpose, text] of cases) {
     const f = fixture(targetId);

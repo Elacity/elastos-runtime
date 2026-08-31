@@ -1,9 +1,10 @@
 import {
   BALANCE_NETWORKS,
+  isEvmChainNamespace,
   parseBalanceValue,
   readText,
   unitsToNumber,
-} from "./wallet-format.js?v=wallet-20260523a";
+} from "./wallet-format.js?v=wallet-20260819f";
 
 export function createWalletStateLoader({ fetchJson, shellHeaders }) {
   async function loadPrices() {
@@ -34,7 +35,7 @@ export function createWalletStateLoader({ fetchJson, shellHeaders }) {
       if (!address) {
         continue;
       }
-      const namespaces = account.chain_namespace?.startsWith("eip155:")
+      const namespaces = isEvmChainNamespace(account.chain_namespace)
         ? Object.keys(BALANCE_NETWORKS).filter((namespace) => namespace.startsWith("eip155:"))
         : [account.chain_namespace];
       for (const namespace of namespaces) {

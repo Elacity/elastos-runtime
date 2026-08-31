@@ -1435,6 +1435,9 @@ mod tests {
         host_headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
         let state = GatewayState {
             provider_registry: None,
+            collaboration_chat_product_port: None,
+            collaboration_presence_product_port: None,
+            collaboration_discovery_service: None,
             identity_manager: Arc::new(OnceLock::new()),
             cache_dir: data_dir.path().join("cache"),
             data_dir: data_dir.path().to_path_buf(),

@@ -52,11 +52,15 @@ async fn resolve_bound_site_root(
     state: &GatewayState,
     headers: &HeaderMap,
 ) -> Result<ResolvedSiteRoot, StatusCode> {
-    let Some(host) = request_host(headers) else {
-        return Ok(ResolvedSiteRoot {
-            target: MY_WEBSITE_URI.to_string(),
-            explicit_binding: false,
-        });
+    let host = match request_host(headers) {
+        Ok(Some(host)) => host,
+        Ok(None) => {
+            return Ok(ResolvedSiteRoot {
+                target: MY_WEBSITE_URI.to_string(),
+                explicit_binding: false,
+            });
+        }
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
     };
     let binding_path = edge_binding_path(&state.data_dir, &host);
     let Ok(bytes) = tokio::fs::read(&binding_path).await else {
@@ -76,23 +80,11 @@ async fn resolve_bound_site_root(
     })
 }
 
-pub(super) fn request_host(headers: &HeaderMap) -> Option<String> {
-    let raw = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get("host"))?
-        .to_str()
-        .ok()?
-        .trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    if raw.is_empty() {
-        return None;
+pub(super) fn request_host(headers: &HeaderMap) -> anyhow::Result<Option<String>> {
+    if headers.get("host").is_none() {
+        return Ok(None);
     }
-    if let Some(stripped) = raw.strip_prefix('[') {
-        let end = stripped.find(']')?;
-        return Some(stripped[..end].to_string());
-    }
-    Some(raw.split(':').next().unwrap_or("").to_string())
+    Ok(Some(validated_gateway_host(headers)?))
 }
 
 pub(super) async fn healthz() -> &'static str {
@@ -166,21 +158,14 @@ pub(super) async fn serve_install_script(
         // automatically embeds this gateway for future `elastos update`.
         let script = String::from_utf8_lossy(&bytes);
         let stamped = if script.contains("__PUBLISHER_GATEWAY__") {
-            if let Some(host) = headers
-                .get("x-forwarded-host")
-                .or_else(|| headers.get("host"))
-                .and_then(|v| v.to_str().ok())
-            {
-                let scheme = headers
-                    .get("x-forwarded-proto")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("https");
-                let gateway_url = format!("{}://{}", scheme, host.trim_end_matches('/'));
-                script
-                    .replace("__PUBLISHER_GATEWAY__", &gateway_url)
-                    .into_bytes()
-            } else {
-                bytes
+            match effective_gateway_origin(&headers) {
+                Ok(origin) => script
+                    .replace("__PUBLISHER_GATEWAY__", origin.origin())
+                    .into_bytes(),
+                Err(_) if headers.get("host").is_none() => bytes,
+                Err(_) => {
+                    return (StatusCode::BAD_REQUEST, "invalid gateway origin").into_response();
+                }
             }
         } else {
             bytes

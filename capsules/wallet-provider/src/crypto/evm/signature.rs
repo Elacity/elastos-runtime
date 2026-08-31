@@ -50,6 +50,24 @@ pub(crate) fn recover_evm_address_from_hash(
     Ok(format!("0x{}", hex::encode(&digest[12..])))
 }
 
+pub(crate) fn canonicalize_evm_signature(signature_hex: &str) -> Result<Vec<u8>, String> {
+    let signature_hex = signature_hex.strip_prefix("0x").unwrap_or(signature_hex);
+    let bytes =
+        hex::decode(signature_hex).map_err(|err| format!("invalid signature hex: {err}"))?;
+    if bytes.len() != 65 {
+        return Err("EVM signature must be 65 bytes".to_string());
+    }
+    let signature = EcdsaSignature::try_from(&bytes[..64])
+        .map_err(|err| format!("invalid EVM signature: {err}"))?;
+    if signature.normalize_s().is_some() {
+        return Err("EVM signature must use canonical low-S form".to_string());
+    }
+    let recovery_id = normalize_evm_recovery_id(bytes[64])?;
+    let mut canonical = signature.to_bytes().to_vec();
+    canonical.push(recovery_id.to_byte());
+    Ok(canonical)
+}
+
 pub(crate) fn normalize_evm_recovery_id(v: u8) -> Result<RecoveryId, String> {
     let id = match v {
         0 | 1 => v,

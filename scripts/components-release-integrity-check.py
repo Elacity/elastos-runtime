@@ -446,6 +446,24 @@ def run_self_test():
             source_home_stamped,
         ):
             raise AssertionError("source-home stamped capsule should not require release archive checksum")
+        source_home_kubo_manifest = {
+            "external": {
+                "kubo": {
+                    "platforms": {
+                        "linux-amd64": {
+                            "url": "https://dist.example/kubo.tar.gz",
+                            "checksum": "sha512:" + "1" * 128,
+                            "extract_path": "kubo/ipfs",
+                            "install_path": "bin/kubo",
+                        }
+                    }
+                }
+            },
+            "profiles": {"source-home": {"components": ["kubo"]}},
+        }
+        selected_kubo = selected_profile_components(source_home_kubo_manifest, ["source-home"])
+        if audit_manifest(source_home_kubo_manifest, ["linux-amd64"], selected_kubo):
+            raise AssertionError("source-home Kubo selection should retain verified archive metadata")
         bad = json.loads(json.dumps(good))
         bad["capsules"]["component-demo"]["entrypoint_sha256"] = "sha256:" + "0" * 64
         if audit_capsule_artifact_metadata(bad, root) != [

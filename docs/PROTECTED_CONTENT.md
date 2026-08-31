@@ -1,212 +1,210 @@
-# Protected Content Provider
+# Protected content
 
-Protected content is Runtime-mediated. App, viewer, and content capsules ask to
-open an object; they do not receive raw wallet, chain, IPFS, Elacity, or key
-authority.
+Protected content is Runtime-mediated. Library and Marketplace own the creator
+and buyer experience, and `elacity-player` owns video presentation. Runtime
+owns authority, durable operations, provider selection, Wallet and Chain
+coordination, lifecycle, audit, and settlement.
 
-The contract is:
+The intended content-distribution contract gives free and protected content
+the same package identity and availability path. Protected content adds rights,
+key release, and decryption. See
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md) for the planned
+catalog and Get contract.
 
-`capsule -> runtime capability -> elastos://drm/open -> drm-provider -> rights/key/decrypt providers`
+The canonical source path is implemented but inactive. Source tests cover
+same-Runtime and two-Runtime journeys. The installed product still selects the
+provisional `drm`, `rights`, `key`, and `decrypt` authority surfaces until the
+installed proof and atomic cutover are complete.
 
-## Current Slice
+## Canonical path
 
-The repo now has the contract and fail-closed boundary, not production DRM:
+The source path has one operation sequence:
 
-- shared protected-content schemas in `elastos-common`
-- `drm-provider` registered as `elastos://drm/*`
-- `rights-provider` registered as `elastos://rights/*`
-- `key-provider` registered as `elastos://key/*`
-- `decrypt-provider` registered as `elastos://decrypt/*`
-- `status` advertises the blocked raw-authority list and canonical open
-  sequence, including Runtime-owned receipt and audit steps
-- `open` validates sealed-object requests and fails closed with the same
-  machine-readable required sequence until rights, key, and decrypt providers
-  exist
-- `open` rejects key envelopes without approved algorithm metadata
-- `rights-provider` validates typed access/subscription questions and fails
-  closed until a dDRM/chain policy backend is configured
-- `chain-provider` exposes typed `has_access_by_content_id` reads that validate
-  inputs and only call configured contract selectors
-- `key-provider` validates key-release requests and algorithm-agile key
-  envelopes, then fails closed until a dKMS backend is configured
-- `decrypt-provider` validates scoped decrypt/render session requests and fails
-  closed until decrypt/render backends are configured
-- `content-provider` rejects incomplete `sealed` object publishes before IPFS:
-  `sealed.json`, payload, rights policy, availability receipt, provenance, and
-  approved key-envelope algorithms are required
+1. Library submits a typed source object and the permitted product terms.
+2. Runtime creates the durable operation identity and selects the private
+   `media-provider`.
+3. `media-provider` prepares bounded clear fMP4 in Runtime-authorized private
+   staging. It owns probe and transcode process behavior.
+4. The private protect provider encrypts the prepared media, provisions the
+   immutable 2-of-3 custody envelope, and returns bounded identities and
+   receipts.
+5. Runtime publishes the encrypted object through the normal
+   `elastos://content` path with an exact three-replica requirement. The
+   existing repair task keeps that same requirement after replica loss.
+6. Runtime binds creator mint and listing effects to the verified Wallet
+   account and operator Chain configuration. It projects a listing only after
+   the exact effect and finalized evidence agree.
+7. Marketplace reads bounded immutable listings. A buy request contains only
+   the mint identity; Runtime derives the buyer, account, effect, and Chain
+   authority.
+8. Before buy or open, Runtime verifies one fresh signed availability receipt
+   for the exact mint, content identity, CID, publisher, provider, policy,
+   replica count, and freshness window.
+9. Library or Marketplace asks Home to launch `elacity-player` with an opaque,
+   short-lived launch authority. Runtime binds the open to the principal,
+   object, accepted viewer, launch, decrypt session, and token.
+10. Three independent custody nodes evaluate rights locally. Any two approved
+    nodes return recipient-encrypted contributions.
+11. The private protected-content decrypt provider reconstructs and uses the
+    CEK inside its process. It serves bounded ordered media reads to the exact
+    viewer session and settles open, read, and close ownership.
 
-This is intentional. The first safe step is to make the authority boundary
-unambiguous before adding dDRM contract reads or ElastOS dKMS.
+Source tests cover this sequence across two Runtimes with separate principals,
+Wallets, device identities and state. The creator exports an immutable listing
+package; the buyer imports and verifies it before purchase and playback. Custody
+release authenticates the buyer Runtime issuer declared by the signed operation
+and bound by the buyer Profile. The creator Runtime retains provisioning
+authority. The funded installed localhost-to-seed journey remains open.
+Shared listing links work independently of global listing discovery.
 
-PC2's dDRM contracts and WASM decrypt/render/media crates are useful
-implementation references. They should enter Runtime only as provider-internal
-backends behind `rights-provider`, `key-provider`, and `decrypt-provider`; they
-must not give app or viewer capsules raw CEK, wallet, chain, IPFS, or Elacity
-authority.
+Runtime journals identities, state, receipts, and settlement. Providers keep
+clear media, ciphertext staging, CEKs, shares, process details, and private
+routes inside their owned boundaries. Carrier transports only
+Runtime-selected remote custody traffic. Storage, provider, Carrier, and Chain
+topology stays private.
 
-## dDRM Decrypt Rail Options And Recommendation
+## Private providers
 
-The v0.4.0 provider chain intentionally proves the fail-closed sockets:
+`ProviderRegistry` owns four reserved Runtime-only targets:
 
-`drm-provider -> rights-provider -> key-provider -> decrypt-provider`
+- `protect`
+- `media`
+- `custody`
+- `protected-content-decrypt`
 
-The remaining architecture decision is how the live CEK reaches the decrypt
-boundary once real decryption is wired. The recommended default is a
-sealed-material rail:
+Capsule URI lookup, public provider proxying, interface projection, and route
+lists exclude all four targets. Runtime registers a target only after the
+provider returns the exact successful identity, version, configured state,
+schema, and ordered operation set. Rejected startup settles and reaps the child
+before it returns an error.
 
-- Runtime orchestrates the normal provider chain through `drm`, `rights`, and
-  `key`.
-- `decrypt-provider` creates a per-session one-time public key for the decrypt
-  sandbox.
-- `key-provider` or the dKMS release backend seals the CEK to that one-time
-  decrypt-session public key, using the approved PQ-hybrid envelope profile.
-- The decrypt step receives sealed material in the decrypt-session request,
-  unwraps it inside the sandbox, decrypts/renders, zeroizes the live CEK, and
-  returns only scoped output.
-- `decrypt-provider` does not pull keys by making outbound capability calls.
-  The component that briefly sees the live CEK must have the smallest possible
-  authority surface.
+Protect, media, and decrypt run as local native provider processes. Custody can
+use Carrier to reach a Runtime-selected remote endpoint. Runtime keeps signed
+operation authority, provider selection, policy, and response verification.
 
-This keeps the rights/key/decrypt separation while avoiding an outbound
-authority grant to the highest-risk boundary. It also explains the current
-schema gap: `ReleaseReceiptV1` proves authorization, but it intentionally carries
-no key material; the next contract addition should add a sealed decrypt material
-envelope to the key/decrypt handoff instead of sending a raw CEK or letting
-decrypt fetch one.
+## Identity and rights
 
-Other options were considered and rejected as the normal Runtime path:
+The CENC KID and `EncryptedContentIdentityV1` are separate:
 
-| Option | Shape | Assessment |
-|--------|-------|------------|
-| Decrypt pulls keys | `decrypt-provider` calls `key-provider` or a key backend after authorization | Flexible, but grants outbound authority to the boundary that briefly holds live CEK. Keep only for controlled diagnostics or explicit capability-gated adapters. |
-| One combined key/decrypt provider | Key release and decrypt/render run in one provider | Simpler CEK path, but collapses authority separation and increases blast radius. Useful for tests, not the target trust boundary. |
-| Runtime relays raw CEK | Runtime receives CEK and passes it to decrypt | Not acceptable. Runtime would become a key-material holder instead of an orchestrator. |
-| Runtime relays sealed material | Runtime passes a sealed envelope without being able to open it | Acceptable if the envelope is transcript-bound and Runtime never sees raw CEK. This is the practical form of the recommended rail. |
-| dKMS direct-to-decrypt sealing | dKMS seals directly to the one-time decrypt-session key | Best target when available. `key-provider` brokers policy and receipts without seeing raw CEK. |
-| Lit/Chipotle backend | Vendor-backed key release returns a CEK envelope, as PC2 does today | Useful compatibility backend only. The Runtime contract must remain backend-neutral and must also support an ElastOS-native dKMS path. |
+- The KID is the exact bytes16 value used by the deployed rights read.
+- The encrypted-content identity binds the complete protected object and media
+  contract.
 
-Before live decrypt is enabled, the sealed material envelope must bind the full
-transcript: principal, session, object, action, viewer interface, output kind,
-expiry, release receipt hash, decrypt-session public key, envelope algorithm,
-and provider identity. It must use nonce-safe authenticated encryption, signature
-verification, replay rejection, short expiry, zeroization, and audit. PC2's
-current `ddrm-decrypt` WASM pattern proves the containment invariant, but its
-P-256 and Lit/Chipotle details are implementation references rather than
-Runtime product truth.
+Verified deployed read behavior is:
 
-## Protected Object Shape
+- `AuthorityGateway.hasAccessByContentId(address,bytes16) -> bool` owns access
+  reads.
+- `CentralStorage.ipReference(bytes16)` is the proven KID read resolution.
+- Unknown KIDs revert with `UnboundContentId(bytes16)`; a bound KID without
+  access returns `false`.
 
-New protected objects should publish as sealed SmartWeb objects:
+The configured Base 8453 contract uses these operations. Deployed verification
+evidence belongs in [state.md](../state.md):
 
-```json
-{
-  "schema": "elastos.sealed.object/v1",
-  "payload_cid": "bafy...",
-  "rights_policy_cid": "bafy...",
-  "availability_receipt_cid": "bafy...",
-  "key_envelope": {
-    "scheme": "elastos-pq-hybrid-threshold-v0",
-    "kid": "...",
-    "wrapped_cek": "...",
-    "policy_hash": "sha256:...",
-    "algorithms": {
-      "cipher": "aes-256-gcm",
-      "signature": ["ed25519", "ml-dsa-65"],
-      "kem": ["x25519", "ml-kem-768"],
-      "share_scheme": "shamir-t-of-n"
-    }
-  },
-  "viewer": {
-    "required_interface": "elastos.viewer/document@1"
-  }
-}
-```
+- `CentralStorage.bindIP(bytes16,address,uint256)` accepts acknowledged
+  contracts only and is called by `AssetFactory.registerNewAsset`.
+- Native `AuthorityGateway.buyAccess` uses selector `0xf7580ad9`.
+- ERC20 `AuthorityGateway.buyAccess` uses selector `0x0ede2294`; Wallet first
+  approves the operative `paymentProcessor()`.
+- EventHub is the mint event emitter.
+- A deployed bound KID has recorded allowed, denied, and unbound results.
 
-`payload_cid` can be publicly reachable because protected payload bytes must be
-encrypted before replication. Access is enforced by rights checks and key release,
-not by hiding CIDs.
+The exact funded buy receipt and event remain installed proof. Deployed access
+is one boolean per holder and KID, so signed Runtime policy owns the View and
+Download action distinction.
 
-## Crypto Agility And dKMS Direction
+The operator supplies one owner-only
+`protected-content/chain-provider.json` with one versioned
+`protected_content_network`. Runtime supplies its operation issuer identity
+separately. Each custody node uses its own node-host Chain provider, reads 2-5
+explicit private RPC sources, and requires two exact agreeing finalized
+results. Generic Chain configuration remains separate and is not a
+protected-content fallback.
 
-FROST is a threshold Schnorr protocol, so it is classical ECC security, not a
-post-quantum root. ElastOS may use FROST for short/medium-term receipt or cohort
-signing, but new dKMS content must not depend on FROST as the long-term key
-security foundation.
+## Custody and decryption
 
-New protected content should use algorithm-agile sealed objects:
+The source policy is exactly 2-of-3 across distinct operators and failure
+domains. Each custody node stores one share and checks the exact signed Runtime
+operation, Wallet subject, KID, full encrypted-content identity, action,
+custody epoch, policy, finalized rights evidence, recipient authorization, and
+time window.
 
-- Encrypt payload bytes with AES-256-GCM or ChaCha20-Poly1305.
-- Split the AES-256 CEK into `t-of-n` shares.
-- Wrap each share to an approved dKMS node with hybrid X25519 + ML-KEM-768.
-- Sign release receipts with classical + PQ signatures where practical, starting
-  with Ed25519 plus ML-DSA; use SLH-DSA for conservative hash-based signatures
-  where size and speed are acceptable.
-- Reconstruct the CEK only inside the key/decrypt provider boundary, then return
-  scoped render/decrypt output to the viewer instead of raw CEKs.
-- When the decrypt engine is wired, prefer dKMS-direct sealing to the decrypt
-  session key. If an intermediate key-provider re-seal is used during migration,
-  it must remain provider-internal, signed, auditable, and short-lived.
+`CustodyEnvelopeV1` is private Runtime provisioning material. Runtime can
+carry the envelope but cannot open the node-sealed shares. Public metadata
+contains bounded identities, threshold and epoch facts, the CEK commitment,
+and signatures.
 
-Current EVM/BTC/ELA wallet proofs and dDRM chain state are still classical. They
-are useful authorization inputs today, but they should not be the only permanent
-identity or access root for long-lived encrypted assets.
+The decrypt provider generates each operation-scoped recipient key and keeps
+the secret behind an opaque handle. The authenticated Profile authorizes the
+exact public key. Reconstruction uses the authenticated release operation,
+verified signed epoch, released contributions and terminal receipt, recipient
+possession, and public CEK commitment. Runtime stores no playback custody
+envelope or sealed-share bytes. Close expires the launch authority and settles
+Runtime, decrypt, viewer, and staging ownership.
 
-References: [NIST PQC standards announcement](https://www.nist.gov/news-events/news/2024/08/nist-releases-first-3-finalized-post-quantum-encryption-standards),
-[FIPS 203 ML-KEM](https://csrc.nist.gov/pubs/fips/203/final),
-[FIPS 204 ML-DSA](https://csrc.nist.gov/pubs/fips/204/final),
-[FIPS 205 SLH-DSA](https://csrc.nist.gov/pubs/fips/205/final),
-and [RFC 9591 FROST](https://www.rfc-editor.org/rfc/rfc9591).
+The current confidentiality suite is
+`elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1` for new protected content.
+External cryptographic review remains open before public dKMS or production
+confidentiality claims.
 
-## Provider Boundary
+## Capsule boundary
 
-Normal capsules must not see:
-
-- raw CEKs
-- wallet RPC or private keys
-- arbitrary chain RPC
-- Kubo/IPFS APIs
-- Elacity SDK or pinning credentials
-
-The provider plane should expose typed questions instead:
-
-- `elastos://drm/open`
-- `elastos://rights/access/has_access_by_content_id`
-- `elastos://rights/subscription/is_subscription_active`
-- `elastos://rights/content/can_stream`
-- `elastos://rights/content/can_download`
-- `elastos://chain/<network>/rights/has_access_by_content_id`
-- `elastos://key/release`
-- `elastos://decrypt/session/open`
-- `elastos://decrypt/render`
-
-## Remaining Sequence
-
-1. Wire real `elastos://drm/open` orchestration behind the declared sequence:
-   content status/fetch, typed rights checks, rights-bound key release,
-   release-receipt-bound decrypt/render sessions, sealed decrypt material, and
-   signed release receipts.
-2. Wire `key-provider` to an ElastOS PQ-hybrid threshold release backend.
-3. Wire `decrypt-provider` to a real decrypt/render backend that keeps CEKs
-   inside the provider boundary.
-4. Wire real protected-content producers to the existing sealed-object publish
-   contract after payload encryption, rights policy, availability receipt,
-   provenance, key-envelope, and viewer-interface generation exist.
-5. Add a permissioned ElastOS PQ-hybrid dKMS v0 for new content only.
+Capsules receive typed object identities, product terms, progress, immutable
+listing projections, opaque launch authority, and bounded media output. Runtime
+derives the principal, Wallet account, Chain authority, provider selection,
+availability decision, rights evidence, and effect identity.
 
 Visible protected-content UI may ship only as a disabled/read-only readiness
-rail until fail-closed provider tests and capability-resource checks cover the
-full open path. The current Library rail can show Provider Chain/status
-receipts and a disabled `Encrypted recipients` option, but it must not claim
-production encrypted-recipient sharing, dDRM completion, or generic decrypt/
-render readiness.
+rail until the installed path and atomic cutover pass. Source behavior alone is
+not installed or live product evidence.
 
-## Executable Proof
+## Installed source contract
 
-Run `scripts/protected-content-provider-contract-smoke.sh` after changing
-protected-content provider capsules. It exercises the real provider binaries
-over their JSON line protocol and verifies the current journey contract:
+Full `scripts/setup-source-home.sh` installs the stable Runtime under the
+platform data root at `bin/elastos`. It writes the owner-only
+`receipts/source-home-installation.json` receipt after components, native
+providers, capsule trees, and source-home capsule metadata are final.
 
-- status exposes blocked raw authority
-- valid requests fail closed until backends are configured
-- invalid raw-authority requests are rejected
-- `drm-provider.open` reports the declared provider/runtime sequence
+Run `scripts/protected-content-installed-static-audit.py` with explicit source
+root, installed data root, installed Runtime, platform, profile, and role. Its
+bounded redacted receipt separates:
+
+- source and static artifact failures;
+- operator configuration prerequisites; and
+- active installed proof prerequisites.
+
+`ready_for_active_proof` means the static artifacts and supplied operator
+configuration passed admission. Runtime startup, signed custody validation,
+live Chain evidence, replication and repair, and mint-buy-play remain active
+proof.
+
+The macOS and Linux source-home restart helpers validate the installation
+receipt and current clean source before any stop or migration. They select only
+the stable installed Runtime, own one exact PID file, stop only the proven
+prior Runtime, preserve one bounded principal-root rollback, and write one
+owner-only restart receipt.
+
+## Remaining work
+
+The ordered release proof is in [TASKS.md](../TASKS.md). The protected-content
+part requires:
+
+1. final combined-source review and CI;
+2. matching localhost, seed and third-node installation receipts;
+3. one signed owner-only 2-of-3 custody composition across distinct operators;
+4. private multi-source Chain configuration and deployed Base evidence;
+5. bound-KID allow/deny/unbound reads, CentralStorage binding and the exact
+   funded `AuthorityGateway.buyAccess` receipt/event;
+6. three replicas plus repair after one replica is lost;
+7. the installed two-Runtime mint-list-deny-buy-open-play-close journey,
+   including restart, replay, tamper rejection, settlement and cleanup;
+8. the manual UIUX matrix in `TASKS.md`; and
+9. one atomic cutover that removes the provisional authority surfaces.
+
+The cutover activates the Runtime-owned path and removes provisional startup,
+registration, resources, packaging, tests, and docs in the same reviewable
+change. It keeps one registry, supervisor, coordinator, journal, and
+protected-content path.
+
+Global listing discovery, public custody governance, and document or 3D typed
+viewers are separate later work.

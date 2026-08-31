@@ -6,7 +6,7 @@
 //! - Writes JSON responses to process stdin
 //!
 //! This is not the public capsule-kernel ABI. Ordinary app capsules use the
-//! `elastos-guest` Carrier bridge.
+//! `elastos-guest` resource bridge.
 
 // Used by lib crate (tests, API handlers) but not directly by main.rs binary
 

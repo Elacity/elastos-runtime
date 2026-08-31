@@ -3,19 +3,31 @@ const peopleShell = document.getElementById("people-shell");
 const statusNode = document.getElementById("people-status");
 const profileForm = document.getElementById("profile-form");
 const profileInput = document.getElementById("profile-name");
+const profileTitle = document.getElementById("profile-title");
+const profileDescription = document.getElementById("profile-description");
+const profileSubmit = document.getElementById("profile-submit");
 const peopleList = document.getElementById("people-list");
-const discoveredList = document.getElementById("discovered-list");
-const requestList = document.getElementById("request-list");
-const toggleDiscoveryButton = document.getElementById("toggle-discovery");
-const refreshDiscoveryButton = document.getElementById("refresh-discovery");
-const discoveryCountdown = document.getElementById("discovery-countdown");
+const discoveryList = document.getElementById("discovery-list");
+const discoveryRequestsList = document.getElementById("discovery-requests-list");
+const discoveryStatusNode = document.getElementById("discovery-status");
+const discoveryToggleButton = document.getElementById("discovery-toggle");
+const discoveryRefreshButton = document.getElementById("discovery-refresh");
+const peopleCountNode = document.getElementById("people-count");
+const discoveryVisibleCountNode = document.getElementById("discovery-visible-count");
+const discoveryRequestsCountNode = document.getElementById("discovery-requests-count");
+const pageTitle = document.querySelector(".people-page-title");
 const launchParams = new URLSearchParams(window.location.search);
 const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
 const homeParentOrigin = launchParams.get("home_origin") || "";
-const AUTO_REFRESH_MS = 15_000;
+const DISCOVERY_SCHEMA = "elastos.people.discovery/v1";
+const SECTION_TITLES = {
+  people: "People",
+  discovery: "Discovery",
+};
 
-let currentSummary = null;
-let refreshTimer = 0;
+let refreshGeneration = 0;
+let profileDraftDirty = false;
+let profileDraftValue = "";
 
 announceReady();
 
@@ -39,32 +51,75 @@ async function boot() {
 function announceReady() {
   if (homeToken && homeParentOrigin && window.top !== window) {
     window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);
+    window.top.postMessage({
+      type: "home:menu-manifest",
+      homeToken,
+      menus: [
+        {
+          title: "File",
+          items: [{ label: "Close Window", cmd: "__close-window" }],
+        },
+        {
+          title: "View",
+          items: [{ label: "Refresh", cmd: "refresh" }],
+        },
+      ],
+    }, homeParentOrigin);
   }
 }
 
 function bindNavigation() {
   for (const button of document.querySelectorAll("[data-section-target]")) {
     button.addEventListener("click", () => {
-      const target = readText(button.dataset.sectionTarget);
-      document.getElementById(target)?.scrollIntoView({ block: "start", behavior: "smooth" });
-      for (const item of document.querySelectorAll("[data-section-target]")) {
-        item.classList.toggle("active", item === button);
-      }
+      activateSection(readText(button.dataset.sectionTarget));
     });
+  }
+  activateSection("people");
+}
+
+// The sidebar reads as tabs, so it behaves as tabs: one section at a time,
+// with the page title naming the one you are looking at.
+function activateSection(targetId) {
+  if (!SECTION_TITLES[targetId]) {
+    return;
+  }
+  for (const item of document.querySelectorAll("[data-section-target]")) {
+    const selected = readText(item.dataset.sectionTarget) === targetId;
+    item.classList.toggle("active", selected);
+    if (selected) {
+      item.setAttribute("aria-current", "page");
+    } else {
+      item.removeAttribute("aria-current");
+    }
+  }
+  for (const section of document.querySelectorAll(".people-section[id]")) {
+    section.hidden = section.id !== targetId;
+  }
+  if (pageTitle) {
+    pageTitle.textContent = SECTION_TITLES[targetId];
   }
 }
 
 function bindActions() {
   profileForm?.addEventListener("submit", (event) => {
     event.preventDefault();
-    saveProfile().catch((error) => showStatus(publicError(error, "Could not save profile."), "error"));
+    saveProfile().catch((error) => showStatus(profileSaveFailureMessage(error), "error"));
   });
-  toggleDiscoveryButton?.addEventListener("click", () => {
-    updateDiscovery(currentSummary?.people?.discovery?.enabled !== true)
-      .catch((error) => showStatus(publicError(error, "Could not update discovery."), "error"));
+  profileInput?.addEventListener("input", () => {
+    profileDraftDirty = true;
+    profileDraftValue = profileInput.value;
   });
-  refreshDiscoveryButton?.addEventListener("click", () => {
-    refreshDiscovery().catch((error) => showStatus(publicError(error, "Could not refresh discovery."), "error"));
+  window.addEventListener("message", (event) => {
+    if (event.origin !== "null" || event.source !== window.parent) {
+      return;
+    }
+    const message = event.data;
+    if (message?.type !== "elastos:menu-command" || readText(message.cmd) !== "refresh") {
+      return;
+    }
+    refreshPeople().catch((error) => {
+      showStatus(publicError(error, "People could not load."), "error");
+    });
   });
   document.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target.closest("[data-action]") : null;
@@ -75,30 +130,10 @@ function bindActions() {
       showStatus(publicError(error, "Could not complete that action."), "error");
     });
   });
-  window.addEventListener("beforeunload", stopAutoRefresh);
 }
 
 async function handleAction(button) {
   const action = readText(button.dataset.action);
-  if (action === "request") {
-    await mutatePeople("/api/apps/people/discovery/requests", {
-      peer_id: readText(button.dataset.peerId),
-    }, "Request sent.", button);
-    return;
-  }
-  if (action === "accept") {
-    const requestId = readText(button.dataset.requestId);
-    if (!requestId) {
-      throw new Error("This request is no longer available.");
-    }
-    await mutatePeople(
-      `/api/apps/people/discovery/requests/${encodeURIComponent(requestId)}/accept`,
-      null,
-      "Request accepted.",
-      button,
-    );
-    return;
-  }
   if (action === "remove") {
     const contactId = readText(button.dataset.contactId);
     const label = readText(button.dataset.contactName) || "this person";
@@ -114,17 +149,62 @@ async function handleAction(button) {
     return;
   }
   if (action === "chat") {
-    openChat(readText(button.dataset.contactRoute));
+    openChat(readText(button.dataset.conversationId));
+    return;
+  }
+  if (action === "discovery-toggle") {
+    const enabled = button.dataset.enabled === "true";
+    await mutateDiscovery(
+      "/api/apps/people/discovery",
+      { enabled: !enabled },
+      !enabled ? "Discovery is on." : "Discovery is off.",
+      button,
+    );
+    return;
+  }
+  if (action === "discovery-refresh") {
+    await mutateDiscovery(
+      "/api/apps/people/discovery/refresh",
+      {},
+      "Refresh requested.",
+      button,
+    );
+    return;
+  }
+  if (action === "discovery-request") {
+    const advertisementId = readText(button.dataset.advertisementId);
+    if (!advertisementId) {
+      throw new Error("Discovery person is unavailable.");
+    }
+    await mutateDiscovery(
+      "/api/apps/people/discovery/requests",
+      { advertisement_id: advertisementId },
+      "Contact request queued.",
+      button,
+    );
+    return;
+  }
+  if (action === "open-inbox") {
+    window.top.postMessage({
+      type: "home:open-target",
+      target: "inbox",
+      query: {},
+      homeToken,
+    }, homeParentOrigin);
   }
 }
 
 async function refreshPeople({ quiet = false } = {}) {
+  const generation = ++refreshGeneration;
   if (!quiet) {
     setBusy(true);
   }
   try {
     const summary = await fetchJson("/api/apps/people/summary");
-    renderPeople(summary);
+    if (generation === refreshGeneration) {
+      renderSummary(summary);
+    }
+    return summary;
   } finally {
     if (!quiet) {
       setBusy(false);
@@ -132,89 +212,295 @@ async function refreshPeople({ quiet = false } = {}) {
   }
 }
 
-function renderPeople(summary) {
-  currentSummary = summary;
+function renderSummary(summary) {
   const identity = objectValue(summary?.identity);
   const people = objectValue(summary?.people);
-  const contacts = arrayValue(people.contacts);
-  const discovery = objectValue(people.discovery);
-  const peers = filterDiscoveredPeople(arrayValue(discovery.discovered_peers), contacts);
-  const requests = arrayValue(discovery.requests).filter(requestIsVisible);
+  renderProfile(identity);
+  renderPeople(people);
+  renderDiscovery(summary?.discovery);
+}
 
+function renderProfile(identity) {
+  const profile = objectValue(identity?.profile);
+  const readiness = objectValue(identity?.profile_readiness);
+  const displayName = readText(profile.display_name);
+  const setupSuggestion = readText(identity?.profile_setup_display_name);
+  const readinessStatus = readiness.schema === "elastos.profile.readiness/v1"
+    ? readText(readiness.status)
+    : "unavailable";
+  const hasProfile = readinessStatus === "ready" && Boolean(displayName);
+  const unavailable = readinessStatus === "unavailable"
+    || (readinessStatus === "ready" && !displayName);
+  const createState = !hasProfile && !unavailable;
+  if (hasProfile) {
+    profileDraftDirty = false;
+    profileDraftValue = displayName;
+  } else if (!profileDraftDirty) {
+    profileDraftValue = createState ? setupSuggestion : "";
+  }
   if (document.activeElement !== profileInput) {
-    profileInput.value = profileDisplayName(identity);
+    profileInput.value = hasProfile ? displayName : profileDraftValue;
+    profileInput.placeholder = "Your name";
+  }
+  if (profileTitle) {
+    profileTitle.textContent = hasProfile
+      ? "My Profile"
+      : (unavailable ? "Profile unavailable" : "Create your Profile");
+  }
+  if (profileDescription) {
+    profileDescription.textContent = hasProfile
+      ? "Shown to people you connect with."
+      : (unavailable
+        ? "Profile could not be verified. Use System Recovery before continuing."
+        : "Your Profile is your signed identity for People and Chat.");
+  }
+  if (profileSubmit) {
+    profileSubmit.textContent = hasProfile
+      ? "Save"
+      : (unavailable ? "Recovery required" : "Create Profile");
+  }
+  if (profileForm) {
+    profileForm.dataset.profileState = hasProfile ? "saved" : (unavailable ? "unavailable" : "create");
+  }
+}
+
+function renderPeople(people) {
+  const contacts = arrayValue(people?.contacts).filter(isValidContact);
+  if (peopleCountNode) {
+    peopleCountNode.textContent = `${contacts.length} contact${contacts.length === 1 ? "" : "s"}`;
   }
   peopleList.innerHTML = contacts.length
     ? contacts.map(contactMarkup).join("")
-    : emptyMarkup("No people yet", "Turn on Discovery to find another ElastOS home and send a request.");
-  discoveredList.innerHTML = peers.length
-    ? peers.map(discoveredPeerMarkup).join("")
-    : emptyMarkup("No visible people yet", "Keep Discovery on while another ElastOS home is discoverable.");
-  requestList.innerHTML = requests.length
-    ? requests.map(requestMarkup).join("")
-    : emptyMarkup("No requests", "Requests to add people will appear here.");
+    : emptyMarkup("No contacts yet", "Accepted contacts appear here.");
+}
 
-  const remaining = remainingSeconds(discovery);
-  const enabled = discovery.enabled === true && remaining > 0;
-  toggleDiscoveryButton.textContent = enabled ? "Stop" : "Turn On";
-  discoveryCountdown.hidden = !enabled;
-  discoveryCountdown.textContent = enabled ? `Discoverable for ${remainingText(remaining)}` : "";
-  scheduleAutoRefresh(enabled);
+function renderDiscovery(discovery) {
+  const safeDiscovery = normalizeDiscoverySummary(discovery);
+  const configured = safeDiscovery.configured;
+  const enabled = safeDiscovery.enabled;
+  if (discoveryVisibleCountNode) {
+    discoveryVisibleCountNode.textContent =
+      `${safeDiscovery.discoveredPeers.length} visible`;
+  }
+  if (discoveryRequestsCountNode) {
+    discoveryRequestsCountNode.textContent =
+      `${safeDiscovery.pendingRequestCount} request${safeDiscovery.pendingRequestCount === 1 ? "" : "s"}`;
+  }
+  if (discoveryStatusNode) {
+    discoveryStatusNode.textContent = safeDiscovery.statusMessage;
+  }
+  if (discoveryToggleButton) {
+    discoveryToggleButton.hidden = !configured;
+    discoveryToggleButton.dataset.enabled = enabled ? "true" : "false";
+    discoveryToggleButton.textContent = enabled ? "Turn Off" : "Turn On";
+  }
+  if (discoveryRefreshButton) {
+    discoveryRefreshButton.hidden = !configured;
+    discoveryRefreshButton.disabled = !configured;
+  }
+
+  discoveryList.innerHTML = safeDiscovery.discoveredPeers.length
+    ? safeDiscovery.discoveredPeers.map(discoveryPeerMarkup).join("")
+    : emptyMarkup(
+        safeDiscovery.emptyTitle,
+        safeDiscovery.emptyCopy,
+      );
+  discoveryRequestsList.innerHTML = safeDiscovery.pendingRequestCount > 0
+    ? personCard({
+      name: `${safeDiscovery.pendingRequestCount} request${safeDiscovery.pendingRequestCount === 1 ? "" : "s"} waiting`,
+      details: "<span>Contact requests for your Profile are decided in Inbox.</span>",
+      actions: '<button type="button" data-action="open-inbox">Open Inbox</button>',
+    })
+    : emptyMarkup(
+        "No requests",
+        configured
+          ? "Contact requests for your Profile are decided in Inbox."
+          : "Discovery requests are unavailable until collaboration is configured.",
+      );
+}
+
+function normalizeDiscoverySummary(discovery) {
+  if (discovery?.schema !== DISCOVERY_SCHEMA || typeof discovery?.configured !== "boolean") {
+    return {
+      configured: false,
+      enabled: false,
+      status: "unavailable",
+      statusMessage: "Discovery is unavailable.",
+      discoveredPeers: [],
+      pendingRequestCount: 0,
+      emptyTitle: "Discovery unavailable",
+      emptyCopy: "Discovery isn’t available here yet.",
+    };
+  }
+  const configured = discovery.configured;
+  const enabled = discovery.enabled === true;
+  const status = readText(discovery.status);
+  const remainingSeconds = readPositiveInteger(discovery.remaining_seconds);
+  const remoteVisibilityRemainingSeconds =
+    readPositiveInteger(discovery.remote_visibility_remaining_seconds);
+  return {
+    configured,
+    enabled,
+    status,
+    statusMessage: normalizeDiscoveryStatusMessage(
+      status,
+      readText(discovery.status_message),
+      remainingSeconds,
+      remoteVisibilityRemainingSeconds,
+    ),
+    discoveredPeers: arrayValue(discovery.discovered_peers).filter((peer) => {
+      return peer && typeof peer === "object" && readText(peer.display_name) && readText(peer.advertisement_id);
+    }),
+    pendingRequestCount: Math.max(0, Number(discovery.request_count || 0)),
+    ...discoveryEmptyState(status, configured, enabled),
+  };
+}
+
+function normalizeDiscoveryStatusMessage(status, runtimeMessage, remainingSeconds, remoteVisibilityRemainingSeconds) {
+  if (status === "visible") {
+    if (remainingSeconds === null) {
+      return "Discovery is on. Visibility lasts up to ten minutes, and both people must be visible at the same time.";
+    }
+    return `Discovery is on. Visibility lasts up to ten minutes. This window has ${remainingSeconds} seconds left, and both people must be visible at the same time.`;
+  }
+  if (status === "off_pending_expiry") {
+    if (runtimeMessage) {
+      return runtimeMessage;
+    }
+    if (remoteVisibilityRemainingSeconds !== null) {
+      return `Discovery is off on this Home. It stopped advertising locally, but may remain visible for another ${remoteVisibilityRemainingSeconds} seconds.`;
+    }
+    return "Discovery is off on this Home. It stopped advertising locally, but may remain visible for a short time.";
+  }
+  if (status === "off") {
+    return "Discovery is off.";
+  }
+  return runtimeMessage || "Discovery is unavailable.";
+}
+
+function discoveryEmptyState(status, configured, enabled) {
+  if (!configured) {
+    return {
+      emptyTitle: "Discovery unavailable",
+      emptyCopy: "Discovery is not configured on this Home.",
+    };
+  }
+  if (status === "visible") {
+    return {
+      emptyTitle: "No one visible right now",
+      emptyCopy: "People appear here only while your visibility windows overlap.",
+    };
+  }
+  if (status === "off_pending_expiry") {
+    return {
+      emptyTitle: "Visibility is expiring",
+      emptyCopy: "Your last visibility window is closing.",
+    };
+  }
+  if (status === "off") {
+    return {
+      emptyTitle: "Discovery is off",
+      emptyCopy: "Turn Discovery on when you want a ten-minute visibility window.",
+    };
+  }
+  if (enabled) {
+    return {
+      emptyTitle: "Discovery unavailable",
+      emptyCopy: "Runtime will retry when Discovery is unavailable.",
+    };
+  }
+  return {
+    emptyTitle: "Discovery unavailable",
+    emptyCopy: "Discovery isn’t available here yet.",
+  };
+}
+
+/* The Runtime emits exactly these today. A state this build does not know is
+   a state it cannot describe, so it says so rather than picking the friendliest
+   reading — presenting an unrecognised relationship as "connected" would tell
+   someone they are still connected to a person they may not be. */
+const KNOWN_RELATIONSHIPS = new Map([
+  ["connected", "Connected"],
+  ["conversation", "In conversation"],
+  ["requested", "Request sent"],
+  ["declined", "Declined"],
+  // Removal is symmetric and visible: both sides keep the relationship
+  // rather than letting it vanish, and each side sees who ended it.
+  ["removed", "Removed"],
+  ["removed_you", "No longer connected"],
+]);
+
+function relationshipLabel(value) {
+  const relationship = readText(value);
+  if (!relationship) {
+    return "Unknown state";
+  }
+  return KNOWN_RELATIONSHIPS.get(relationship) || `Unknown state (${relationship})`;
+}
+
+/* Presence-derived, tri-state on purpose: true and false are answers from an
+   unexpired heartbeat window; absence of the field means the Runtime has no
+   presence basis, and no basis is not the same fact as offline. */
+function reachabilityLabel(contact) {
+  if (contact?.reachable === true) {
+    return "Online now";
+  }
+  if (contact?.reachable === false) {
+    return "Offline";
+  }
+  return "";
 }
 
 function contactMarkup(contact) {
-  const name = displayName(contact, "Person");
-  const relationship = readText(contact?.relationship) || "connected";
+  const name = readText(contact?.display_name);
+  const relationship = relationshipLabel(contact?.relationship);
   const handle = readText(contact?.handle);
-  const device = readText(contact?.device_label);
-  const details = [relationship, handle !== name ? handle : "", device !== name ? device : ""]
+  const details = [relationship, reachabilityLabel(contact), handle && handle !== name ? handle : ""]
     .filter(Boolean)
     .map((value) => `<span>${escapeHtml(value)}</span>`)
     .join("");
-  const route = readText(contact?.route);
-  const chat = contact?.can_message === true && route
-    ? `<button type="button" data-action="chat" data-contact-route="${escapeHtml(route)}">Chat</button>`
+  const conversationId = readText(contact?.conversation_id);
+  const chat = contact?.can_message === true && conversationId
+    ? `<button type="button" data-action="chat" data-conversation-id="${escapeHtml(conversationId)}">Message</button>`
+    : "";
+  // Remove ends an accepted relationship; the other states have nothing to
+  // end. Removed pairs stay visible read-only until a fresh request through
+  // Inbox reopens them.
+  const remove = readText(contact?.relationship) === "connected"
+    ? `<button class="danger" type="button" data-action="remove" data-contact-id="${escapeHtml(readText(contact?.contact_id))}" data-contact-name="${escapeHtml(name)}">Remove</button>`
     : "";
   return personCard({
     name,
     details,
-    actions: `${chat}<button class="danger" type="button" data-action="remove" data-contact-id="${escapeHtml(readText(contact?.contact_id))}" data-contact-name="${escapeHtml(name)}">Remove</button>`,
+    actions: `${chat}${remove}`,
   });
 }
 
-function discoveredPeerMarkup(peer) {
-  const name = displayName(peer, "Visible person");
-  const handle = readText(peer?.handle);
-  const status = readText(peer?.status) || "visible";
-  const peerId = readText(peer?.peer_id);
-  return personCard({
-    name,
-    details: `<span>${escapeHtml(handle && handle !== name ? handle : "Discoverable")}</span><span>${escapeHtml(status)}</span>`,
-    actions: `<button type="button" data-action="request" data-peer-id="${escapeHtml(peerId)}" ${peerId ? "" : "disabled"}>Request</button>`,
-  });
+function isValidContact(contact) {
+  return Boolean(readText(contact?.contact_id) && readText(contact?.display_name));
 }
 
-function requestMarkup(request) {
-  const name = displayName(request, "Person");
-  const status = readText(request?.status) || "requested";
-  const requestId = readText(request?.request_id);
-  const action = status === "incoming"
-    ? `<button type="button" data-action="accept" data-request-id="${escapeHtml(requestId)}" ${requestId ? "" : "disabled"}>Accept</button>`
-    : '<span class="requested">Requested</span>';
+function discoveryPeerMarkup(person) {
+  const name = readText(person.display_name);
+  const handle = readText(person.handle);
   return personCard({
     name,
-    details: `<span>${escapeHtml(status)}</span>`,
-    actions: action,
+    details: `<span>${escapeHtml(handle && handle !== name ? handle : "Visible now")}</span>`,
+    actions: `<button type="button" data-action="discovery-request" data-advertisement-id="${escapeHtml(readText(person.advertisement_id))}">Add contact</button>`,
   });
 }
 
 function personCard({ name, details, actions }) {
+  const displayName = readText(name);
+  if (!displayName) {
+    return "";
+  }
   return `
     <article class="person-card">
-      <div class="person-avatar" aria-hidden="true">${escapeHtml(name.slice(0, 1).toUpperCase() || "E")}</div>
+      <div class="person-avatar" aria-hidden="true">${escapeHtml(displayName.slice(0, 1).toUpperCase())}</div>
       <div class="person-copy">
-        <h4>${escapeHtml(name)}</h4>
-        <p>${details}</p>
+        <h4>${escapeHtml(displayName)}</h4>
+        <p class="person-details">${details}</p>
       </div>
       <div class="person-actions">${actions}</div>
     </article>
@@ -226,49 +512,56 @@ function emptyMarkup(title, copy) {
 }
 
 async function saveProfile() {
-  const handle = profileInput.value.trim();
+  if (profileForm?.dataset.profileState === "recovery_required") {
+    window.top.postMessage({
+      type: "home:open-target",
+      target: "system",
+      query: {},
+      homeToken,
+    }, homeParentOrigin);
+    profileForm.dataset.profileState = "retry";
+    profileSubmit.textContent = "Retry Create Profile";
+    setBusy(false);
+    showStatus("Complete Recovery in System, then retry creating your Profile.", "error");
+    return;
+  }
+  const displayName = profileInput.value.trim();
   setBusy(true);
   try {
-    await fetchJson("/api/apps/people/profile-card", {
+    await fetchJson("/api/apps/people/profile", {
       method: "POST",
-      body: JSON.stringify({ handle }),
+      body: JSON.stringify({ display_name: displayName }),
     });
-    showStatus("Profile saved.", "ok");
+    showStatus(profileForm?.dataset.profileState === "saved" ? "Profile saved." : "Profile created.", "ok");
     await refreshPeople({ quiet: true });
+  } catch (error) {
+    if (error.status === 409
+      && error.schema === "elastos.people.profile-protection-required/v1"
+      && error.resultStatus === "recovery_required"
+      && error.actionTarget === "system") {
+      profileForm.dataset.profileState = "recovery_required";
+      profileTitle.textContent = "Recovery required";
+      profileDescription.textContent = readText(error.message)
+        || "Open System, choose Security, and download Recovery. Then retry creating your Profile.";
+      profileSubmit.textContent = "Open System";
+      showStatus(profileDescription.textContent, "error");
+      return;
+    }
+    throw error;
   } finally {
     setBusy(false);
   }
 }
 
-async function updateDiscovery(enabled) {
-  setBusy(true);
-  try {
-    await fetchJson("/api/apps/people/discovery", {
-      method: "POST",
-      body: JSON.stringify({ enabled }),
-    });
-    showStatus(enabled ? "Discovery is on." : "Discovery is off.", "ok");
-    await refreshPeople({ quiet: true });
-  } finally {
-    setBusy(false);
+function profileSaveFailureMessage(error) {
+  const fallback = profileForm?.dataset.profileState === "saved"
+    ? "Could not save your Profile. Try again."
+    : "Could not create your Profile. Try again.";
+  const message = readText(error?.message);
+  if (!message || /\b(did:|device|endpoint|route|provider|carrier|schema|projection|launch token|unauthorized|forbidden|[45]\d\d)\b/i.test(message)) {
+    return fallback;
   }
-}
-
-async function refreshDiscovery({ quiet = false } = {}) {
-  if (!quiet) {
-    setBusy(true);
-  }
-  try {
-    await fetchJson("/api/apps/people/discovery/refresh", { method: "POST" });
-    if (!quiet) {
-      showStatus("Discovery refreshed.", "ok");
-    }
-    await refreshPeople({ quiet: true });
-  } finally {
-    if (!quiet) {
-      setBusy(false);
-    }
-  }
+  return message;
 }
 
 async function mutatePeople(path, body, message, button) {
@@ -276,7 +569,7 @@ async function mutatePeople(path, body, message, button) {
   try {
     await fetchJson(path, {
       method: "POST",
-      body: body === null ? undefined : JSON.stringify(body),
+      body: JSON.stringify(body),
     });
     showStatus(message, "ok");
     await refreshPeople({ quiet: true });
@@ -285,93 +578,41 @@ async function mutatePeople(path, body, message, button) {
   }
 }
 
-function openChat(route) {
-  let target = "";
+async function mutateDiscovery(path, body, message, button) {
+  button.disabled = true;
   try {
-    const url = new URL(route, window.location.origin);
-    const match = url.pathname.match(/^\/apps\/([^/]+)\/?$/);
-    target = match ? decodeURIComponent(match[1]) : "";
-  } catch (_error) {
-    target = "";
+    const discovery = await fetchJson(path, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    renderDiscovery(discovery);
+    await refreshPeople({ quiet: true });
+    showStatus(message, "ok");
+  } finally {
+    button.disabled = false;
   }
-  if (target !== "chat-room") {
+}
+
+function openChat(conversationId) {
+  const selector = readText(conversationId);
+  if (!selector) {
     throw new Error("Chat is not available for this person yet.");
   }
   window.top.postMessage({
     type: "home:open-target",
-    target,
-    query: {},
+    target: "chat-room",
+    query: { conversation_id: selector },
     homeToken,
   }, homeParentOrigin);
   showStatus("Opening Chat.", "ok");
 }
 
-function scheduleAutoRefresh(enabled) {
-  stopAutoRefresh();
-  if (!enabled) {
-    return;
-  }
-  refreshTimer = window.setTimeout(() => {
-    refreshDiscovery({ quiet: true }).catch(() => {
-      scheduleAutoRefresh(true);
-    });
-  }, AUTO_REFRESH_MS);
-}
-
-function stopAutoRefresh() {
-  window.clearTimeout(refreshTimer);
-  refreshTimer = 0;
-}
-
-function filterDiscoveredPeople(peers, contacts) {
-  const connected = new Set();
-  for (const contact of contacts) {
-    const device = readText(contact?.device_label);
-    if (device) {
-      connected.add(device);
-    }
-    const route = readText(contact?.route);
-    if (route.startsWith("elastos://peer/")) {
-      connected.add(route.slice("elastos://peer/".length));
-    }
-  }
-  return peers.filter((peer) => !connected.has(readText(peer?.peer_id)));
-}
-
-function requestIsVisible(request) {
-  const status = readText(request?.status) || "requested";
-  return status === "incoming" || status === "requested";
-}
-
-function profileDisplayName(identity) {
-  const profile = objectValue(identity?.profile_card);
-  return readText(profile.display_name) || readText(identity?.handle);
-}
-
-function displayName(person, fallback) {
-  const profile = objectValue(person?.profile_card);
-  const name = readText(profile.display_name) || readText(person?.display_name);
-  const handle = readText(profile.handle) || readText(person?.handle);
-  const peer = readText(person?.device_label) || readText(person?.peer_id);
-  return name && name !== "ElastOS user" ? name : handle || peer || fallback;
-}
-
-function remainingSeconds(discovery) {
-  const value = Number(discovery?.remaining_seconds || 0);
-  return Number.isFinite(value) && value > 0 ? Math.ceil(value) : 0;
-}
-
-function remainingText(seconds) {
-  if (seconds >= 60) {
-    return `${Math.ceil(seconds / 60)} min`;
-  }
-  return `${Math.max(0, seconds)} sec`;
-}
-
 function setBusy(busy) {
-  for (const control of [profileInput, profileForm?.querySelector("button"), toggleDiscoveryButton, refreshDiscoveryButton]) {
+  for (const control of [profileInput, profileSubmit]) {
     if (control) {
-      control.disabled = busy;
+      control.disabled = busy
+        || profileForm?.dataset.profileState === "unavailable"
+        || (control === profileInput && profileForm?.dataset.profileState === "recovery_required");
     }
   }
 }
@@ -397,7 +638,12 @@ async function fetchJson(path, options = {}) {
     payload = null;
   }
   if (!response.ok) {
-    throw new Error(readText(payload?.error) || readText(payload?.message) || text || "Request failed.");
+    const error = new Error(readText(payload?.error) || readText(payload?.message) || text || "Request failed.");
+    error.status = response.status;
+    error.schema = readText(payload?.schema);
+    error.resultStatus = readText(payload?.status);
+    error.actionTarget = readText(payload?.action_target);
+    throw error;
   }
   return payload;
 }
@@ -415,6 +661,11 @@ function objectValue(value) {
 
 function arrayValue(value) {
   return Array.isArray(value) ? value : [];
+}
+
+function readPositiveInteger(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 ? number : null;
 }
 
 function readText(value) {

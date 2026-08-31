@@ -124,6 +124,7 @@ pub(in crate::api::gateway) async fn wallet_send_transaction(
         state,
         authority,
         RuntimeTransactionLookup::EffectId(&approval.effect_id),
+        None,
         Some(RuntimeManagedTransactionApproval {
             context,
             reason: "Approved in Wallet send flow",

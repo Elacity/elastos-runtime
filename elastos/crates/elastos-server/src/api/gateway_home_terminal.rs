@@ -1,10 +1,10 @@
 use super::*;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -30,9 +30,15 @@ const HOME_TERMINAL_EVENT_KEEPALIVE_SECS: u64 = 15;
 const HOME_TERMINAL_EVENT_DISCONNECT_GRACE_SECS: u64 = 3;
 const HOME_TERMINAL_PENDING_ATTACH_TIMEOUT_SECS: u64 = 20;
 const HOME_TERMINAL_EXIT_AUTH_GRACE_MS: u64 = 2_000;
+const HOME_TERMINAL_REPLAY_RETENTION_SECS: u64 = 30;
 const HOME_TERMINAL_MAX_ACTIVE_SESSIONS: usize = 8;
 const HOME_TERMINAL_MAX_SESSIONS_PER_PRINCIPAL: usize = 4;
 const HOME_TERMINAL_MAX_SESSIONS_PER_AUTH_SESSION: usize = 1;
+const HOME_TERMINAL_REPLAY_MAX_EVENTS: usize = 64;
+const HOME_TERMINAL_REPLAY_MAX_BYTES: usize = 64 * 1024;
+const HOME_TERMINAL_ARCHIVED_REPLAY_MAX_SESSIONS: usize = 8;
+const HOME_TERMINAL_ARCHIVED_REPLAY_MAX_BYTES: usize = HOME_TERMINAL_REPLAY_MAX_BYTES * 8;
+const HOME_TERMINAL_INBOX_REVIEW_ACTION_PREFIX: &str = "inbox-review-notification:";
 pub(super) const HOME_TERMINAL_INPUT_MAX_BYTES: usize = 16 * 1024;
 pub(super) const HOME_TERMINAL_INTENT_MAX_BYTES: usize = 8 * 1024;
 const HOME_TERMINAL_PROGRAM_ENV: &str = "ELASTOS_HOME_CLI_TERMINAL_PROGRAM";
@@ -45,6 +51,8 @@ const HOME_TERMINAL_MAX_COLS: u16 = 180;
 const HOME_TERMINAL_MAX_ROWS: u16 = 80;
 
 static HOME_TERMINAL_SESSIONS: OnceLock<Mutex<HashMap<String, Arc<HomeTerminalSession>>>> =
+    OnceLock::new();
+static HOME_TERMINAL_ARCHIVED_REPLAYS: OnceLock<StdMutex<HomeTerminalArchivedReplayStore>> =
     OnceLock::new();
 
 #[derive(Debug, Deserialize)]
@@ -130,7 +138,8 @@ struct HomeTerminalSession {
     created_at_ms: u64,
     input: Mutex<Option<HomeTerminalInput>>,
     child: Mutex<Child>,
-    events: broadcast::Sender<HomeTerminalEvent>,
+    events: broadcast::Sender<HomeTerminalBroadcastEvent>,
+    replay: StdMutex<HomeTerminalReplayLog>,
     event_stream_generation: AtomicU64,
     input_stream_generation: AtomicU64,
     pty_reader_drained: AtomicBool,
@@ -197,6 +206,82 @@ struct HomeTerminalEvent {
     exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct HomeTerminalBroadcastEvent {
+    id: u64,
+    payload: HomeTerminalEvent,
+}
+
+#[derive(Debug, Clone)]
+struct HomeTerminalReplayEntry {
+    id: u64,
+    payload: HomeTerminalEvent,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct HomeTerminalReplayLog {
+    next_event_id: u64,
+    events: VecDeque<HomeTerminalReplayEntry>,
+    total_bytes: usize,
+}
+
+struct HomeTerminalArchivedReplay {
+    stream_ticket: String,
+    expires_at_ms: u64,
+    replay: VecDeque<HomeTerminalReplayEntry>,
+    total_bytes: usize,
+}
+
+#[derive(Default)]
+struct HomeTerminalArchivedReplayStore {
+    replays: HashMap<String, HomeTerminalArchivedReplay>,
+    insertion_order: VecDeque<String>,
+    total_bytes: usize,
+}
+
+impl HomeTerminalArchivedReplayStore {
+    fn insert(&mut self, session_id: String, replay: HomeTerminalArchivedReplay, now_ms: u64) {
+        self.retain_unexpired(now_ms);
+        self.remove(&session_id);
+        self.total_bytes = self.total_bytes.saturating_add(replay.total_bytes);
+        self.insertion_order.push_back(session_id.clone());
+        self.replays.insert(session_id, replay);
+        while self.replays.len() > HOME_TERMINAL_ARCHIVED_REPLAY_MAX_SESSIONS
+            || self.total_bytes > HOME_TERMINAL_ARCHIVED_REPLAY_MAX_BYTES
+        {
+            let Some(oldest_session_id) = self.insertion_order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.replays.remove(&oldest_session_id) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.total_bytes);
+            }
+        }
+    }
+
+    fn retain_unexpired(&mut self, now_ms: u64) {
+        self.insertion_order.retain(|session_id| {
+            let keep = self
+                .replays
+                .get(session_id)
+                .is_some_and(|replay| replay.expires_at_ms >= now_ms);
+            if !keep {
+                if let Some(removed) = self.replays.remove(session_id) {
+                    self.total_bytes = self.total_bytes.saturating_sub(removed.total_bytes);
+                }
+            }
+            keep
+        });
+    }
+
+    fn remove(&mut self, session_id: &str) -> Option<HomeTerminalArchivedReplay> {
+        self.insertion_order.retain(|entry| entry != session_id);
+        let removed = self.replays.remove(session_id)?;
+        self.total_bytes = self.total_bytes.saturating_sub(removed.total_bytes);
+        Some(removed)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -318,66 +403,69 @@ pub(super) async fn home_cli_terminal_start(
 
 pub(super) async fn home_cli_terminal_events(
     Path(session_id): Path<String>,
+    headers: HeaderMap,
     Query(query): Query<HomeTerminalStreamQuery>,
 ) -> Response {
     cleanup_stale_home_terminal_sessions(now_unix_ms()).await;
+    cleanup_expired_home_terminal_archived_replays(now_unix_ms());
+    let last_event_id = home_terminal_last_event_id(&headers);
     let session = match home_terminal_session(&session_id).await {
         Some(session) => session,
-        None => return (StatusCode::NOT_FOUND, "terminal session not found").into_response(),
+        None => {
+            return archived_home_terminal_events_response(
+                &session_id,
+                query.ticket.as_deref(),
+                last_event_id,
+                now_unix_ms(),
+            )
+            .unwrap_or_else(|| {
+                (StatusCode::NOT_FOUND, "terminal session not found").into_response()
+            });
+        }
     };
     if query.ticket.as_deref() != Some(session.stream_ticket.as_str()) {
         return (StatusCode::FORBIDDEN, "invalid terminal stream ticket").into_response();
     }
     let receiver = session.events.subscribe();
+    let replay = home_terminal_replay_after(&session, last_event_id);
     let generation = session
         .event_stream_generation
         .fetch_add(1, Ordering::AcqRel)
         + 1;
     let state = HomeTerminalEventStreamState {
         receiver,
+        replay,
+        last_delivered_event_id: last_event_id.unwrap_or(0),
         _guard: HomeTerminalEventStreamGuard {
             session_id: session_id.clone(),
             generation,
         },
     };
     let stream = futures_lite::stream::unfold(state, |mut state| async move {
-        loop {
-            match state.receiver.recv().await {
-                Ok(event) => {
-                    let data = serde_json::to_string(&event).unwrap_or_else(|err| {
-                        serde_json::json!({
-                            "schema": HOME_TERMINAL_EVENT_SCHEMA,
-                            "stream": "error",
-                            "message": err.to_string()
-                        })
-                        .to_string()
-                    });
-                    let event = SseEvent::default().event("terminal").data(data);
-                    return Some((Ok::<SseEvent, Infallible>(event), state));
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return None,
-            }
+        if let Some(event) = next_home_terminal_stream_event(
+            &mut state.replay,
+            &mut state.last_delivered_event_id,
+            &mut state.receiver,
+        )
+        .await
+        {
+            return Some((
+                Ok::<SseEvent, Infallible>(home_terminal_sse_event(event)),
+                state,
+            ));
         }
+        None
     });
 
-    let mut response = Sse::new(stream)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(HOME_TERMINAL_EVENT_KEEPALIVE_SECS))
-                .text("keepalive"),
-        )
-        .into_response();
-    let headers = response.headers_mut();
-    headers.insert(
-        axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-cache, no-transform"),
-    );
-    headers.insert(
-        axum::http::HeaderName::from_static("x-accel-buffering"),
-        axum::http::HeaderValue::from_static("no"),
-    );
-    response
+    home_terminal_sse_response(
+        Sse::new(stream)
+            .keep_alive(
+                KeepAlive::new()
+                    .interval(Duration::from_secs(HOME_TERMINAL_EVENT_KEEPALIVE_SECS))
+                    .text("keepalive"),
+            )
+            .into_response(),
+    )
 }
 
 pub(super) async fn home_cli_terminal_input_socket(
@@ -614,6 +702,7 @@ async fn start_home_terminal_session(
         input: Mutex::new(Some(pty.input)),
         child: Mutex::new(child),
         events,
+        replay: StdMutex::new(HomeTerminalReplayLog::default()),
         event_stream_generation: AtomicU64::new(0),
         input_stream_generation: AtomicU64::new(0),
         pty_reader_drained: AtomicBool::new(false),
@@ -623,14 +712,17 @@ async fn start_home_terminal_session(
     spawn_home_terminal_pty_reader(session.clone(), pty.reader);
     spawn_home_terminal_waiter(session.clone());
     spawn_home_terminal_attach_watchdog(session.clone());
-    let _ = session.events.send(HomeTerminalEvent {
-        schema: HOME_TERMINAL_EVENT_SCHEMA,
-        session_id: session.session_id.clone(),
-        stream: "lifecycle",
-        data: None,
-        exit_code: None,
-        message: Some("started".to_string()),
-    });
+    emit_home_terminal_event(
+        &session,
+        HomeTerminalEvent {
+            schema: HOME_TERMINAL_EVENT_SCHEMA,
+            session_id: session.session_id.clone(),
+            stream: "lifecycle",
+            data: None,
+            exit_code: None,
+            message: Some("started".to_string()),
+        },
+    );
     Ok(session)
 }
 
@@ -796,14 +888,17 @@ fn spawn_home_terminal_pty_reader(session: Arc<HomeTerminalSession>, mut reader:
                     }
                 }
                 Err(err) => {
-                    let _ = session.events.send(HomeTerminalEvent {
-                        schema: HOME_TERMINAL_EVENT_SCHEMA,
-                        session_id: session.session_id.clone(),
-                        stream: "error",
-                        data: None,
-                        exit_code: None,
-                        message: Some(format!("PTY read failed: {err}")),
-                    });
+                    emit_home_terminal_event(
+                        &session,
+                        HomeTerminalEvent {
+                            schema: HOME_TERMINAL_EVENT_SCHEMA,
+                            session_id: session.session_id.clone(),
+                            stream: "error",
+                            data: None,
+                            exit_code: None,
+                            message: Some(format!("PTY read failed: {err}")),
+                        },
+                    );
                     break;
                 }
             }
@@ -868,14 +963,17 @@ impl HomeTerminalUtf8Decoder {
 }
 
 fn send_home_terminal_stdout(session: &HomeTerminalSession, data: String) {
-    let _ = session.events.send(HomeTerminalEvent {
-        schema: HOME_TERMINAL_EVENT_SCHEMA,
-        session_id: session.session_id.clone(),
-        stream: "stdout",
-        data: Some(data),
-        exit_code: None,
-        message: None,
-    });
+    emit_home_terminal_event(
+        session,
+        HomeTerminalEvent {
+            schema: HOME_TERMINAL_EVENT_SCHEMA,
+            session_id: session.session_id.clone(),
+            stream: "stdout",
+            data: Some(data),
+            exit_code: None,
+            message: None,
+        },
+    );
 }
 
 fn spawn_home_terminal_waiter(session: Arc<HomeTerminalSession>) {
@@ -890,16 +988,21 @@ fn spawn_home_terminal_waiter(session: Arc<HomeTerminalSession>) {
             Ok(status) => (status.code(), "exited".to_string()),
             Err(err) => (None, format!("wait failed: {err}")),
         };
-        let _ = session.events.send(HomeTerminalEvent {
-            schema: HOME_TERMINAL_EVENT_SCHEMA,
-            session_id: session.session_id.clone(),
-            stream: "lifecycle",
-            data: None,
-            exit_code,
-            message: Some(message),
-        });
+        emit_home_terminal_event(
+            &session,
+            HomeTerminalEvent {
+                schema: HOME_TERMINAL_EVENT_SCHEMA,
+                session_id: session.session_id.clone(),
+                stream: "lifecycle",
+                data: None,
+                exit_code,
+                message: Some(message),
+            },
+        );
         tokio::time::sleep(Duration::from_millis(HOME_TERMINAL_EXIT_AUTH_GRACE_MS)).await;
-        remove_home_terminal_session(&session.session_id).await;
+        if let Some(removed) = remove_home_terminal_session(&session.session_id).await {
+            store_archived_home_terminal_replay(&removed, now_unix_ms());
+        }
     });
 }
 
@@ -937,7 +1040,9 @@ fn spawn_home_terminal_attach_watchdog(session: Arc<HomeTerminalSession>) {
 }
 
 struct HomeTerminalEventStreamState {
-    receiver: broadcast::Receiver<HomeTerminalEvent>,
+    receiver: broadcast::Receiver<HomeTerminalBroadcastEvent>,
+    replay: VecDeque<HomeTerminalBroadcastEvent>,
+    last_delivered_event_id: u64,
     _guard: HomeTerminalEventStreamGuard,
 }
 
@@ -1182,14 +1287,227 @@ async fn close_home_terminal_session_handle(session: Arc<HomeTerminalSession>, m
         input_handle.take();
     }
     kill_home_terminal_process(session.child_pid);
-    let _ = session.events.send(HomeTerminalEvent {
-        schema: HOME_TERMINAL_EVENT_SCHEMA,
-        session_id,
-        stream: "lifecycle",
-        data: None,
-        exit_code: None,
-        message: Some(message.to_string()),
+    emit_home_terminal_event(
+        &session,
+        HomeTerminalEvent {
+            schema: HOME_TERMINAL_EVENT_SCHEMA,
+            session_id,
+            stream: "lifecycle",
+            data: None,
+            exit_code: None,
+            message: Some(message.to_string()),
+        },
+    );
+    store_archived_home_terminal_replay(&session, now_unix_ms());
+}
+
+fn home_terminal_last_event_id(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn emit_home_terminal_event(session: &HomeTerminalSession, payload: HomeTerminalEvent) {
+    emit_home_terminal_broadcast_event(&session.replay, &session.events, payload);
+}
+
+fn emit_home_terminal_broadcast_event(
+    replay: &StdMutex<HomeTerminalReplayLog>,
+    events: &broadcast::Sender<HomeTerminalBroadcastEvent>,
+    payload: HomeTerminalEvent,
+) {
+    let mut replay = replay.lock().unwrap_or_else(|poison| poison.into_inner());
+    replay.next_event_id = replay.next_event_id.saturating_add(1);
+    let event = HomeTerminalBroadcastEvent {
+        id: replay.next_event_id,
+        payload,
+    };
+    record_home_terminal_replay(&mut replay, &event);
+    let _ = events.send(event);
+}
+
+fn record_home_terminal_replay(
+    replay: &mut HomeTerminalReplayLog,
+    event: &HomeTerminalBroadcastEvent,
+) {
+    let bytes = estimated_home_terminal_event_bytes(&event.payload);
+    replay.events.push_back(HomeTerminalReplayEntry {
+        id: event.id,
+        payload: event.payload.clone(),
+        bytes,
     });
+    replay.total_bytes = replay.total_bytes.saturating_add(bytes);
+    while replay.events.len() > HOME_TERMINAL_REPLAY_MAX_EVENTS
+        || replay.total_bytes > HOME_TERMINAL_REPLAY_MAX_BYTES
+    {
+        let Some(removed) = replay.events.pop_front() else {
+            break;
+        };
+        replay.total_bytes = replay.total_bytes.saturating_sub(removed.bytes);
+    }
+}
+
+fn home_terminal_replay_after(
+    session: &HomeTerminalSession,
+    last_event_id: Option<u64>,
+) -> VecDeque<HomeTerminalBroadcastEvent> {
+    let replay = session
+        .replay
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    replay
+        .events
+        .iter()
+        .filter(|entry| entry.id > last_event_id.unwrap_or(0))
+        .map(|entry| HomeTerminalBroadcastEvent {
+            id: entry.id,
+            payload: entry.payload.clone(),
+        })
+        .collect()
+}
+
+fn archived_home_terminal_events_response(
+    session_id: &str,
+    ticket: Option<&str>,
+    last_event_id: Option<u64>,
+    now_ms: u64,
+) -> Option<Response> {
+    let replay = archived_home_terminal_replay(session_id, ticket, last_event_id, now_ms)?;
+    let stream = futures_lite::stream::iter(
+        replay
+            .into_iter()
+            .map(|event| Ok::<SseEvent, Infallible>(home_terminal_sse_event(event))),
+    );
+    Some(home_terminal_sse_response(Sse::new(stream).into_response()))
+}
+
+fn archived_home_terminal_replay(
+    session_id: &str,
+    ticket: Option<&str>,
+    last_event_id: Option<u64>,
+    now_ms: u64,
+) -> Option<VecDeque<HomeTerminalBroadcastEvent>> {
+    let mut archived = home_terminal_archived_replays()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    archived.retain_unexpired(now_ms);
+    let replay = archived.replays.get(session_id)?;
+    if replay.expires_at_ms < now_ms || ticket != Some(replay.stream_ticket.as_str()) {
+        return None;
+    }
+    Some(
+        replay
+            .replay
+            .iter()
+            .filter(|entry| entry.id > last_event_id.unwrap_or(0))
+            .map(|entry| HomeTerminalBroadcastEvent {
+                id: entry.id,
+                payload: entry.payload.clone(),
+            })
+            .collect(),
+    )
+}
+
+fn store_archived_home_terminal_replay(session: &HomeTerminalSession, now_ms: u64) {
+    let replay = {
+        let replay = session
+            .replay
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        replay.events.clone()
+    };
+    if replay.is_empty() {
+        return;
+    }
+    home_terminal_archived_replays()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(
+            session.session_id.clone(),
+            HomeTerminalArchivedReplay {
+                stream_ticket: session.stream_ticket.clone(),
+                expires_at_ms: now_ms
+                    .saturating_add(HOME_TERMINAL_REPLAY_RETENTION_SECS.saturating_mul(1_000)),
+                total_bytes: replay.iter().map(|entry| entry.bytes).sum(),
+                replay,
+            },
+            now_ms,
+        );
+}
+
+fn cleanup_expired_home_terminal_archived_replays(now_ms: u64) {
+    home_terminal_archived_replays()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .retain_unexpired(now_ms);
+}
+
+fn home_terminal_archived_replays() -> &'static StdMutex<HomeTerminalArchivedReplayStore> {
+    HOME_TERMINAL_ARCHIVED_REPLAYS
+        .get_or_init(|| StdMutex::new(HomeTerminalArchivedReplayStore::default()))
+}
+
+fn estimated_home_terminal_event_bytes(event: &HomeTerminalEvent) -> usize {
+    event.data.as_ref().map_or(0, String::len)
+        + event.message.as_ref().map_or(0, String::len)
+        + event.session_id.len()
+        + event.stream.len()
+        + 64
+}
+
+async fn next_home_terminal_stream_event(
+    replay: &mut VecDeque<HomeTerminalBroadcastEvent>,
+    last_delivered_event_id: &mut u64,
+    receiver: &mut broadcast::Receiver<HomeTerminalBroadcastEvent>,
+) -> Option<HomeTerminalBroadcastEvent> {
+    if let Some(event) = replay.pop_front() {
+        *last_delivered_event_id = (*last_delivered_event_id).max(event.id);
+        return Some(event);
+    }
+    loop {
+        match receiver.recv().await {
+            Ok(event) => {
+                if event.id <= *last_delivered_event_id {
+                    continue;
+                }
+                *last_delivered_event_id = event.id;
+                return Some(event);
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+    }
+}
+
+fn home_terminal_sse_event(event: HomeTerminalBroadcastEvent) -> SseEvent {
+    let data = serde_json::to_string(&event.payload).unwrap_or_else(|err| {
+        serde_json::json!({
+            "schema": HOME_TERMINAL_EVENT_SCHEMA,
+            "stream": "error",
+            "message": err.to_string()
+        })
+        .to_string()
+    });
+    SseEvent::default()
+        .id(event.id.to_string())
+        .event("terminal")
+        .data(data)
+}
+
+fn home_terminal_sse_response(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache, no-transform"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-accel-buffering"),
+        axum::http::HeaderValue::from_static("no"),
+    );
+    response
 }
 
 fn kill_home_terminal_process(child_pid: Option<u32>) {
@@ -1277,7 +1595,8 @@ fn authorize_home_terminal_host_intent(
         });
     }
 
-    if action != "open-target" {
+    let switch_shell_open_target = action == "switch-shell-open-target";
+    if action != "open-target" && !switch_shell_open_target {
         return Err("unsupported terminal host intent action");
     }
     if target == HOME_CLI_CAPSULE_ID || target == "home-gui" {
@@ -1300,6 +1619,37 @@ fn authorize_home_terminal_host_intent(
             contact_id: None,
             route: None,
             query: None,
+        });
+    }
+
+    if let Some(notification_id) = action_id
+        .strip_prefix(HOME_TERMINAL_INBOX_REVIEW_ACTION_PREFIX)
+        .map(str::trim)
+    {
+        let notification_id = notification_id.to_string();
+        if target != "inbox" {
+            return Err("terminal Inbox handoff target does not match action_id");
+        }
+        if notification_id.is_empty() {
+            return Err("terminal Inbox handoff is missing a notification id");
+        }
+        if intent.query.is_some() {
+            return Err("terminal Inbox handoff query is not authorized");
+        }
+        if intent.source.is_some() || intent.contact_id.is_some() || intent.route.is_some() {
+            return Err("terminal Inbox handoff has unsupported fields");
+        }
+        return Ok(HomeTerminalAuthorizedIntent {
+            schema: HOME_TERMINAL_HOST_INTENT_SCHEMA,
+            action,
+            target,
+            action_id,
+            source: None,
+            contact_id: None,
+            route: None,
+            query: Some(serde_json::json!({
+                "notification_id": notification_id
+            })),
         });
     }
 
@@ -1418,12 +1768,12 @@ mod tests {
         let open =
             authorize_home_terminal_host_intent(test_terminal_host_intent(serde_json::json!({
                 "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
-                "action": "open-target",
+                "action": "switch-shell-open-target",
                 "action_id": "open-gui:browser",
                 "target": "browser"
             })))
             .expect("explicit open-gui action should be authorized");
-        assert_eq!(open.action, "open-target");
+        assert_eq!(open.action, "switch-shell-open-target");
         assert_eq!(open.action_id, "open-gui:browser");
         assert_eq!(open.target, "browser");
         assert!(open.query.is_none());
@@ -1465,6 +1815,44 @@ mod tests {
         assert_eq!(people.action_id, "people-message:contact-alice");
         assert_eq!(people.source.as_deref(), Some("people-contact"));
         assert_eq!(people.contact_id.as_deref(), Some("contact-alice"));
+
+        let inbox =
+            authorize_home_terminal_host_intent(test_terminal_host_intent(serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "switch-shell-open-target",
+                "action_id": "inbox-review-notification:wallet-approval-request:wallet-approval:test",
+                "target": "inbox"
+            })))
+            .expect("Inbox review handoff should be authorized");
+        assert_eq!(inbox.action, "switch-shell-open-target");
+        assert_eq!(
+            inbox.query,
+            Some(serde_json::json!({
+                "notification_id": "wallet-approval-request:wallet-approval:test"
+            }))
+        );
+    }
+
+    #[test]
+    fn terminal_host_intent_accepts_captured_inbox_handoff_payload() {
+        let captured = r#"{
+            "schema":"elastos.home.terminal-host-intent/v1",
+            "action":"switch-shell-open-target",
+            "action_id":"inbox-review-notification:wallet-approval-request:wallet-approval:test",
+            "target":"inbox"
+        }"#;
+        let authorized = authorize_home_terminal_host_intent(
+            serde_json::from_str(captured).expect("captured payload should deserialize"),
+        )
+        .expect("gateway should accept the captured Home CLI Inbox handoff payload");
+        assert_eq!(authorized.action, "switch-shell-open-target");
+        assert_eq!(authorized.target, "inbox");
+        assert_eq!(
+            authorized.query,
+            Some(serde_json::json!({
+                "notification_id": "wallet-approval-request:wallet-approval:test"
+            }))
+        );
     }
 
     #[test]
@@ -1483,13 +1871,13 @@ mod tests {
             }),
             serde_json::json!({
                 "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
-                "action": "open-target",
+                "action": "switch-shell-open-target",
                 "action_id": "open-gui:wallet",
                 "target": "browser"
             }),
             serde_json::json!({
                 "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
-                "action": "open-target",
+                "action": "switch-shell-open-target",
                 "action_id": "open-gui:home-cli",
                 "target": "home-cli"
             }),
@@ -1507,7 +1895,7 @@ mod tests {
             }),
             serde_json::json!({
                 "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
-                "action": "open-target",
+                "action": "switch-shell-open-target",
                 "action_id": "people-message:contact-alice",
                 "target": "wallet",
                 "source": "people-contact",
@@ -1516,10 +1904,23 @@ mod tests {
             }),
             serde_json::json!({
                 "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
-                "action": "open-target",
+                "action": "switch-shell-open-target",
                 "action_id": "open-gui:browser",
                 "target": "browser",
                 "query": { "debug": "1" }
+            }),
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "switch-shell-open-target",
+                "action_id": "inbox-review-notification:wallet-approval-request:wallet-approval:test",
+                "target": "wallet"
+            }),
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "switch-shell-open-target",
+                "action_id": "inbox-review-notification:wallet-approval-request:wallet-approval:test",
+                "target": "inbox",
+                "query": { "notification_id": "other" }
             }),
         ];
 
@@ -1680,6 +2081,221 @@ mod tests {
         }
     }
 
+    #[test]
+    fn terminal_replay_log_stays_bounded() {
+        let mut replay = HomeTerminalReplayLog::default();
+        for index in 0..(HOME_TERMINAL_REPLAY_MAX_EVENTS + 8) {
+            record_home_terminal_replay(
+                &mut replay,
+                &HomeTerminalBroadcastEvent {
+                    id: index as u64 + 1,
+                    payload: test_terminal_event("term", "stdout", Some("x".repeat(2_048)), None),
+                },
+            );
+        }
+
+        assert!(replay.events.len() <= HOME_TERMINAL_REPLAY_MAX_EVENTS);
+        assert!(replay.total_bytes <= HOME_TERMINAL_REPLAY_MAX_BYTES);
+    }
+
+    #[test]
+    fn archived_terminal_replay_store_stays_bounded_and_evicts_oldest() {
+        let mut store = HomeTerminalArchivedReplayStore::default();
+        let now_ms = 5_000;
+        let entry_bytes = (HOME_TERMINAL_ARCHIVED_REPLAY_MAX_BYTES
+            / HOME_TERMINAL_ARCHIVED_REPLAY_MAX_SESSIONS)
+            .max(1);
+
+        for index in 0..=HOME_TERMINAL_ARCHIVED_REPLAY_MAX_SESSIONS {
+            let session_id = format!("archived-term-{index}");
+            store.insert(
+                session_id.clone(),
+                HomeTerminalArchivedReplay {
+                    stream_ticket: format!("ticket-{index}"),
+                    expires_at_ms: now_ms
+                        + HOME_TERMINAL_REPLAY_RETENTION_SECS.saturating_mul(1_000),
+                    replay: VecDeque::from([HomeTerminalReplayEntry {
+                        id: 1,
+                        payload: test_terminal_event(
+                            &session_id,
+                            "stdout",
+                            Some("x".repeat(entry_bytes.saturating_sub(64).max(1))),
+                            None,
+                        ),
+                        bytes: entry_bytes,
+                    }]),
+                    total_bytes: entry_bytes,
+                },
+                now_ms,
+            );
+        }
+
+        assert!(store.replays.len() <= HOME_TERMINAL_ARCHIVED_REPLAY_MAX_SESSIONS);
+        assert!(store.total_bytes <= HOME_TERMINAL_ARCHIVED_REPLAY_MAX_BYTES);
+        assert!(!store.replays.contains_key("archived-term-0"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_replay_skips_duplicate_live_event_after_reconnect() {
+        let replay = StdMutex::new(HomeTerminalReplayLog::default());
+        let (events, _) = broadcast::channel(8);
+
+        emit_home_terminal_broadcast_event(
+            &replay,
+            &events,
+            test_terminal_event("term", "stdout", Some("first".to_string()), None),
+        );
+        let mut receiver = events.subscribe();
+        emit_home_terminal_broadcast_event(
+            &replay,
+            &events,
+            test_terminal_event("term", "stdout", Some("second".to_string()), None),
+        );
+        let mut replay_events = {
+            let replay = replay.lock().unwrap_or_else(|poison| poison.into_inner());
+            replay
+                .events
+                .iter()
+                .filter(|entry| entry.id > 1)
+                .map(|entry| HomeTerminalBroadcastEvent {
+                    id: entry.id,
+                    payload: entry.payload.clone(),
+                })
+                .collect::<VecDeque<_>>()
+        };
+        emit_home_terminal_broadcast_event(
+            &replay,
+            &events,
+            test_terminal_event("term", "stdout", Some("third".to_string()), None),
+        );
+
+        let mut last_delivered_event_id = 1;
+        let replayed = next_home_terminal_stream_event(
+            &mut replay_events,
+            &mut last_delivered_event_id,
+            &mut receiver,
+        )
+        .await
+        .expect("replayed terminal event");
+        let live = next_home_terminal_stream_event(
+            &mut replay_events,
+            &mut last_delivered_event_id,
+            &mut receiver,
+        )
+        .await
+        .expect("next live terminal event");
+
+        assert_eq!(replayed.id, 2);
+        assert_eq!(replayed.payload.data.as_deref(), Some("second"));
+        assert_eq!(live.id, 3);
+        assert_eq!(live.payload.data.as_deref(), Some("third"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_publish_order_stays_monotonic_under_concurrent_producers() {
+        let replay = std::sync::Arc::new(StdMutex::new(HomeTerminalReplayLog::default()));
+        let (events, _) = broadcast::channel(32);
+        let mut receiver = events.subscribe();
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let replay = replay.clone();
+            let events = events.clone();
+            let gate = gate.clone();
+            workers.push(std::thread::spawn(move || {
+                gate.wait();
+                emit_home_terminal_broadcast_event(
+                    &replay,
+                    &events,
+                    test_terminal_event("term", "stdout", Some(format!("event-{index}")), None),
+                );
+            }));
+        }
+        gate.wait();
+        for worker in workers {
+            worker.join().expect("concurrent terminal event producer");
+        }
+
+        let mut ids = Vec::new();
+        for _ in 0..8 {
+            ids.push(receiver.recv().await.expect("terminal broadcast event").id);
+        }
+        let replay_ids = {
+            let replay = replay.lock().unwrap_or_else(|poison| poison.into_inner());
+            replay
+                .events
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(ids, replay_ids);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn archived_terminal_replay_remains_available_after_live_session_grace() {
+        let session = test_terminal_session_with_quick_exit()
+            .await
+            .expect("test terminal session");
+        let session_id = session.session_id.clone();
+        let stream_ticket = session.stream_ticket.clone();
+        insert_home_terminal_session(session.clone()).await;
+
+        emit_home_terminal_event(
+            &session,
+            test_terminal_event(&session_id, "lifecycle", None, Some("started".to_string())),
+        );
+        emit_home_terminal_event(
+            &session,
+            test_terminal_event(
+                &session_id,
+                "stdout",
+                Some("fatal configuration mismatch".to_string()),
+                None,
+            ),
+        );
+        spawn_home_terminal_waiter(session.clone());
+
+        let replay = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(replay) = archived_home_terminal_replay(
+                    &session_id,
+                    Some(stream_ticket.as_str()),
+                    Some(1),
+                    now_unix_ms(),
+                ) {
+                    break replay;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("archived replay before timeout");
+
+        assert!(home_terminal_session(&session_id).await.is_none());
+        assert_eq!(replay.front().map(|event| event.id), Some(2));
+        assert_eq!(
+            replay
+                .front()
+                .and_then(|event| event.payload.data.as_deref()),
+            Some("fatal configuration mismatch")
+        );
+        assert!(
+            archived_home_terminal_replay(&session_id, Some("wrong"), None, now_unix_ms(),)
+                .is_none()
+        );
+        assert!(archived_home_terminal_replay(
+            &session_id,
+            Some(stream_ticket.as_str()),
+            None,
+            now_unix_ms() + HOME_TERMINAL_REPLAY_RETENTION_SECS.saturating_mul(1_000) + 1,
+        )
+        .is_none());
+
+        test_cleanup_terminal_artifacts(&session_id).await;
+    }
+
     fn test_home_terminal_context(
         principal_id: &str,
         session_id: &str,
@@ -1713,5 +2329,59 @@ mod tests {
 
     fn test_terminal_host_intent(value: serde_json::Value) -> HomeTerminalHostIntentRequest {
         serde_json::from_value(value).expect("test terminal host intent")
+    }
+
+    fn test_terminal_event(
+        session_id: &str,
+        stream: &'static str,
+        data: Option<String>,
+        message: Option<String>,
+    ) -> HomeTerminalEvent {
+        HomeTerminalEvent {
+            schema: HOME_TERMINAL_EVENT_SCHEMA,
+            session_id: session_id.to_string(),
+            stream,
+            data,
+            exit_code: None,
+            message,
+        }
+    }
+
+    async fn test_cleanup_terminal_artifacts(session_id: &str) {
+        let _ = remove_home_terminal_session(session_id).await;
+        home_terminal_archived_replays()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(session_id);
+    }
+
+    async fn test_terminal_session_with_quick_exit() -> anyhow::Result<Arc<HomeTerminalSession>> {
+        let child = Command::new(std::env::current_exe()?)
+            .arg("--help")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        let child_pid = child.id();
+        let (events, _receiver) = broadcast::channel(32);
+        Ok(Arc::new(HomeTerminalSession {
+            session_id: format!("term-test-{}", random_hex_token()),
+            stream_ticket: format!("ticket-test-{}", random_hex_token()),
+            input_ticket: format!("input-test-{}", random_hex_token()),
+            principal_id: "principal-test".to_string(),
+            auth_session_id: "session-test".to_string(),
+            grant_id: "grant-test".to_string(),
+            child_pid,
+            created_at_ms: now_unix_ms(),
+            input: Mutex::new(None),
+            child: Mutex::new(child),
+            events,
+            replay: StdMutex::new(HomeTerminalReplayLog::default()),
+            event_stream_generation: AtomicU64::new(0),
+            input_stream_generation: AtomicU64::new(0),
+            pty_reader_drained: AtomicBool::new(true),
+            pty_reader_drained_notify: Notify::new(),
+        }))
     }
 }

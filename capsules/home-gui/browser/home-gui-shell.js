@@ -6,19 +6,20 @@ import {
   relaunchHomeGuiWindowForToken,
   renewHomeGuiBrowserWindowAuthority,
   restoreHomeGuiSession,
+  setHomeGuiMenuManifest,
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
-} from "./home-gui.js?v=home-20260731b";
+} from "./home-gui.js?v=home-20260813a";
 import {
   acceptHomeBrowserContextId,
   hasHomeBrowserContextId,
   setHomeGuiLaunchToken,
-} from "./shell-core.js?v=home-20260725a";
+} from "./shell-core.js?v=home-20260813a";
 import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
-} from "./home-gui-authority.js?v=home-20260731b";
+} from "./home-gui-authority.js?v=home-20260813a";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
@@ -100,6 +101,22 @@ function settleRequest(message) {
   return true;
 }
 
+window.addEventListener("elastos:ui-preference-changed", (event) => {
+  const detail = event?.detail || {};
+  const key = typeof detail.key === "string" ? detail.key.trim() : "";
+  const value = typeof detail.value === "string" ? detail.value.trim() : "";
+  if (!key || !value) {
+    return;
+  }
+  requestHome("home:ui-preference", {
+    action: "write",
+    key,
+    value,
+  }).catch((error) => {
+    console.error("home-gui appearance preference update failed", error);
+  });
+});
+
 async function applySummary(summary, options = {}) {
   projectHomeGuiAuthority(document.body, summary);
   const previous = currentSummary;
@@ -146,6 +163,15 @@ function handleGuiCommand(message) {
   if (command === "attach-authorized-target") {
     return attachAuthorizedHomeGuiTarget(
       consumeAuthorizedAttachmentDescriptor(message),
+    );
+  }
+  if (command === "set-menu-manifest") {
+    if (!hasExactKeys(message, ["type", "command", "homeToken", "menus"])) {
+      return false;
+    }
+    return setHomeGuiMenuManifest(
+      typeof message.homeToken === "string" ? message.homeToken.trim() : "",
+      message.menus,
     );
   }
   if (command === "show-desktop") {

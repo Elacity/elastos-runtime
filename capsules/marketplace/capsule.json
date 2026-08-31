@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "marketplace",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Browse apps, viewers, services, and content available in ElastOS",
   "role": "app",
   "type": "wasm",
@@ -11,6 +11,7 @@
   "projections": ["web", "facts", "affordances", "gates"],
   "author": "elastos",
   "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
   "interfaces": [
     {
       "id": "elastos.marketplace.catalog",

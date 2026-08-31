@@ -4,25 +4,26 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Archive - ElastOS</title>
+  <script src="./elastos-theme.js"></script>
+  <link rel="stylesheet" href="./elastos-ui.css">
   <style>
     :root {
-      color-scheme: light;
-      --bg: #f6f7f9;
-      --panel: #ffffff;
-      --panel-soft: #f3f4f6;
-      --line: rgba(60, 60, 67, 0.14);
-      --line-strong: rgba(60, 60, 67, 0.26);
-      --ink: #1d1d1f;
-      --muted: #6b6b6b;
-      --accent: #007aff;
-      --accent-soft: rgba(0, 122, 255, 0.11);
-      --brand: #f6921a;
-      --good: #2f8f68;
-      --warn: #b57918;
-      --danger: #b14c5a;
-      --mono: "SFMono-Regular", "SF Mono", "Cascadia Code", "JetBrains Mono", monospace;
+      --bg: var(--el-bg);
+      --panel: var(--el-surface-raised);
+      --panel-soft: var(--el-inset);
+      --line: var(--el-hairline);
+      --line-strong: var(--el-hairline-strong);
+      --ink: var(--el-text);
+      --muted: var(--el-muted);
+      --accent: var(--el-accent);
+      --accent-soft: var(--el-accent-faint);
+      --brand: var(--el-brand);
+      --good: var(--el-ok);
+      --warn: var(--el-brand-strong);
+      --danger: var(--el-danger);
+      --mono: var(--el-font-mono);
       --archive-list-columns: 30px minmax(280px, 1fr) 92px 150px;
-      font-family: "Segoe UI", "Inter", "Helvetica Neue", sans-serif;
+      font-family: var(--el-font);
     }
 
     * {
@@ -64,7 +65,7 @@
       display: grid;
       place-items: center;
       padding: 28px;
-      background: var(--panel);
+      background: var(--bg);
     }
 
     .empty-card {
@@ -75,7 +76,7 @@
       padding: 18px;
       border: 0;
       border-radius: 0;
-      background: #fff;
+      background: var(--panel);
     }
 
     .empty-card p,
@@ -99,7 +100,7 @@
       gap: 10px;
       border: 1px solid var(--line);
       border-radius: 9px;
-      background: #fff;
+      background: var(--panel);
       padding: 12px 14px;
       text-align: left;
       cursor: pointer;
@@ -116,7 +117,7 @@
     }
 
     .journey-button:hover {
-      border-color: rgba(0, 122, 255, 0.42);
+      border-color: color-mix(in srgb, var(--accent) 45%, transparent);
       background: var(--accent-soft);
     }
 
@@ -137,7 +138,7 @@
       gap: 12px;
       padding: 7px 10px;
       border-bottom: 1px solid var(--line);
-      background: #fafafa;
+      background: var(--panel-soft);
     }
 
     .title-group,
@@ -163,13 +164,13 @@
       text-overflow: ellipsis;
       white-space: nowrap;
       font-size: 1.34rem;
-      letter-spacing: -0.04em;
+      letter-spacing: 0;
       line-height: 1.2;
     }
 
     h2 {
       font-size: 1rem;
-      letter-spacing: -0.02em;
+      letter-spacing: 0;
     }
 
     h3 {
@@ -177,7 +178,7 @@
       color: var(--muted);
       font-size: 0.72rem;
       font-weight: 700;
-      letter-spacing: 0.08em;
+      letter-spacing: 0;
       text-transform: uppercase;
     }
 
@@ -185,10 +186,10 @@
     .destination-input,
     .select {
       min-width: 0;
-      border: 1px solid var(--line);
-      border-radius: 7px;
-      background: #fff;
-      padding: 7px 9px;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      background: var(--el-inset);
+      padding: 7px 12px;
       color: var(--ink);
       outline: none;
       font-size: 0.84rem;
@@ -201,15 +202,15 @@
     .search:focus,
     .destination-input:focus,
     .select:focus {
-      border-color: rgba(0, 122, 255, 0.45);
-      box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.11);
+      border-color: color-mix(in srgb, var(--accent) 48%, transparent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
     }
 
     .btn {
-      border: 1px solid var(--line);
-      border-radius: 7px;
-      background: rgba(255, 255, 255, 0.88);
-      padding: 6px 10px;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      background: var(--el-inset);
+      padding: 6px 12px;
       cursor: pointer;
       font-size: 0.84rem;
       font-weight: 600;
@@ -217,18 +218,18 @@
     }
 
     .btn:hover:not(:disabled) {
-      border-color: var(--line-strong);
-      background: #fff;
+      border-color: transparent;
+      background: var(--el-lift);
     }
 
     .btn-primary {
       border-color: transparent;
-      background: var(--ink);
-      color: #f8fbff;
+      background: var(--el-accent);
+      color: var(--el-accent-ink);
     }
 
     .btn-primary:hover:not(:disabled) {
-      background: #333438;
+      background: var(--el-accent-strong);
     }
 
     .btn:disabled {
@@ -253,14 +254,14 @@
     }
 
     .status-chip.safe {
-      border-color: rgba(47, 143, 104, 0.22);
-      background: rgba(47, 143, 104, 0.12);
+      border-color: color-mix(in srgb, var(--good) 30%, transparent);
+      background: color-mix(in srgb, var(--good) 12%, transparent);
       color: var(--good);
     }
 
     .status-chip.blocked {
-      border-color: rgba(181, 121, 24, 0.24);
-      background: rgba(181, 121, 24, 0.14);
+      border-color: color-mix(in srgb, var(--warn) 30%, transparent);
+      background: color-mix(in srgb, var(--warn) 14%, transparent);
       color: var(--warn);
     }
 
@@ -276,7 +277,7 @@
       min-height: 0;
       display: grid;
       grid-template-rows: auto minmax(0, 1fr);
-      border-right: 0.5px solid #ccc;
+      border-right: 0.5px solid var(--line-strong);
     }
 
     .list-toolbar {
@@ -286,8 +287,8 @@
       justify-content: space-between;
       gap: 8px;
       padding: 8px 10px;
-      border-bottom: 1px solid var(--line);
-      background: #fff;
+      border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+      background: var(--bg);
     }
 
     .list-title {
@@ -326,11 +327,11 @@
       z-index: 1;
       height: 30px;
       border-bottom: 1px solid var(--line);
-      background: #f8f8f9;
+      background: var(--panel-soft);
       color: var(--muted);
       font-size: 0.72rem;
       font-weight: 700;
-      letter-spacing: 0.04em;
+      letter-spacing: 0;
       text-transform: uppercase;
     }
 
@@ -346,14 +347,14 @@
 
     .entry-row {
       min-height: 39px;
-      border-bottom: 1px solid rgba(60, 60, 67, 0.08);
+      border-bottom: 1px solid var(--line);
       background: transparent;
       cursor: default;
       user-select: none;
     }
 
     .entry-row:hover {
-      background: rgba(0, 0, 0, 0.035);
+      background: var(--el-lift);
     }
 
     .entry-row.selected {
@@ -362,11 +363,11 @@
 
     .entry-row.blocked {
       color: var(--muted);
-      background: rgba(181, 121, 24, 0.08);
+      background: color-mix(in srgb, var(--warn) 8%, transparent);
     }
 
     .entry-row:focus {
-      outline: 2px solid rgba(0, 122, 255, 0.28);
+      outline: 2px solid var(--el-focus);
       outline-offset: -2px;
     }
 
@@ -390,7 +391,7 @@
       place-items: center;
       border: 1px solid var(--line);
       border-radius: 3px;
-      background: linear-gradient(180deg, #fff, #eef1f5);
+      background: var(--panel-soft);
       color: var(--accent);
       font-size: 0.68rem;
       font-weight: 800;
@@ -461,7 +462,7 @@
     .card {
       border: 1px solid var(--line);
       border-radius: 7px;
-      background: #fff;
+      background: var(--panel);
       padding: 10px;
     }
 
@@ -475,7 +476,7 @@
       padding: 12px;
       border: 1px dashed var(--line-strong);
       border-radius: 6px;
-      background: #fbfbfc;
+      background: var(--panel-soft);
     }
 
     .preview-body {
@@ -504,7 +505,7 @@
       gap: 8px;
       padding: 10px;
       border-top: 1px solid var(--line);
-      background: #fafafa;
+      background: var(--panel-soft);
     }
 
     .root-picker {
@@ -518,7 +519,7 @@
     .root-picker button {
       border: 1px solid var(--line);
       border-radius: 999px;
-      background: #fff;
+      background: var(--panel);
       padding: 4px 9px;
       cursor: pointer;
       font-size: 0.78rem;
@@ -545,7 +546,7 @@
       color: var(--muted);
       font-size: 0.68rem;
       font-weight: 700;
-      letter-spacing: 0.08em;
+      letter-spacing: 0;
       text-transform: uppercase;
     }
 
@@ -684,6 +685,8 @@
     let objectUri = params.get("objectUri") || params.get("uri") || "";
     const objectName = params.get("name") || objectUri.split("/").pop() || "Archive";
     const launchPolicy = parseArchiveSupport(params.get("archiveSupport"));
+    let homeChromeReady = false;
+    let lastHomeMenuManifestSignature = "";
     const state = {
       name: objectName,
       uri: objectUri,
@@ -702,25 +705,10 @@
       extracting: false,
     };
 
-    if (homeToken && homeParentOrigin && window.top !== window) {
-      window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);
-    }
-
     document.querySelector("#open-existing-archive").addEventListener("click", () => openLibraryPicker("open"));
     document.querySelector("#make-new-archive").addEventListener("click", () => openLibraryPicker("create"));
     document.querySelector("#open-archive-button").addEventListener("click", () => openLibraryPicker("open"));
     document.querySelector("#new-archive-button").addEventListener("click", () => openLibraryPicker("create"));
-    window.addEventListener("message", (event) => {
-      if (event.origin !== homeParentOrigin || event.source !== window.top) return;
-      const data = event.data || {};
-      if (data.type !== "archive:open-library-object") return;
-      openLibraryObject(data.object).catch((error) => {
-        showWorkspace();
-        state.entryStatus = "Could not open this Library archive: " + error.message;
-        state.entries = [];
-        renderEntries();
-      });
-    });
     document.querySelector("#entry-search").addEventListener("input", (event) => {
       state.entryQuery = event.target.value || "";
       renderEntries();
@@ -767,7 +755,9 @@
         renderExtractControls();
       });
     });
+    window.addEventListener("message", handleTrustedHomeMessage);
 
+    announceHomeChrome();
     render(state);
     if (!objectUri) {
       showEmptyState();
@@ -779,6 +769,87 @@
         state.entries = [];
         renderEntries();
       });
+    }
+
+    function canAnnounceHomeChrome() {
+      return !!(homeToken && homeParentOrigin && window.top && window.top !== window);
+    }
+
+    function announceHomeChrome() {
+      if (!canAnnounceHomeChrome()) return;
+      if (!homeChromeReady) {
+        window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);
+        homeChromeReady = true;
+      }
+      syncHomeMenuManifest();
+    }
+
+    function syncHomeMenuManifest() {
+      if (!canAnnounceHomeChrome() || !homeChromeReady) return;
+      const manifest = {
+        type: "home:menu-manifest",
+        homeToken,
+        menus: [
+          {
+            title: "File",
+            items: [
+              { label: "Open Archive...", cmd: "open-archive" },
+              { label: "New Archive...", cmd: "new-archive" },
+              "-",
+              { label: "Close Window", cmd: "__close-window" },
+            ],
+          },
+          {
+            title: "Edit",
+            items: [
+              { label: "Select All Safe Files", cmd: "select-all-safe" },
+              { label: "Clear Selection", cmd: "clear-selection" },
+            ],
+          },
+        ],
+      };
+      const signature = JSON.stringify(manifest.menus);
+      if (signature === lastHomeMenuManifestSignature) return;
+      lastHomeMenuManifestSignature = signature;
+      window.top.postMessage(manifest, homeParentOrigin);
+    }
+
+    function isTrustedHomeMessage(event) {
+      return event.origin === "null" && event.source === window.parent;
+    }
+
+    function handleTrustedHomeMessage(event) {
+      if (!isTrustedHomeMessage(event)) return;
+      const data = event.data || {};
+      if (data.type === "archive:open-library-object") {
+        openLibraryObject(data.object).catch((error) => {
+          showWorkspace();
+          state.entryStatus = "Could not open this Library archive: " + error.message;
+          state.entries = [];
+          renderEntries();
+        });
+        return;
+      }
+      if (data.type !== "elastos:menu-command" || typeof data.cmd !== "string") return;
+      handleHomeMenuCommand(data.cmd);
+    }
+
+    function handleHomeMenuCommand(command) {
+      switch (command) {
+        case "open-archive":
+          document.querySelector("#open-archive-button").click();
+          return;
+        case "new-archive":
+          document.querySelector("#new-archive-button").click();
+          return;
+        case "select-all-safe":
+          document.querySelector("#select-all-safe").click();
+          return;
+        case "clear-selection":
+          document.querySelector("#clear-selection").click();
+          return;
+        default:
+      }
     }
 
     function showEmptyState() {
@@ -809,7 +880,10 @@
       for (const [key, value] of Object.entries(query)) {
         if (value) url.searchParams.set(key, value);
       }
-      window.location.assign(url.pathname + url.search);
+      if (homeToken) {
+        url.hash = new URLSearchParams({ home_token: homeToken }).toString();
+      }
+      window.location.assign(url.pathname + url.search + url.hash);
     }
 
     async function openLibraryObject(object) {
@@ -837,6 +911,7 @@
       await hydrateDestinationRoots().catch(() => {});
       await hydrateStatOnly();
       await hydrateArchiveEntries();
+      announceHomeChrome();
     }
 
     async function hydrateStatOnly() {

@@ -4,18 +4,23 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>ElastOS Browser</title>
-    <link rel="stylesheet" href="./style.css?v=browser-20260626a" />
+    <script src="./elastos-theme.js"></script>
+    <link rel="stylesheet" href="./elastos-ui.css">
+    <link rel="stylesheet" href="./style.css?v=browser-20260819a" />
   </head>
   <body data-shell-window-fit="fixed">
     <main class="browser-shell">
       <section class="browser-chrome" aria-label="Browser controls">
-        <button id="browser-back" class="browser-nav-button" type="button" aria-label="Back" disabled>
-          &larr;
-        </button>
-        <button id="browser-forward" class="browser-nav-button" type="button" aria-label="Forward" disabled>
-          &rarr;
-        </button>
-        <button id="browser-refresh" class="browser-nav-button" type="button" aria-label="Refresh" disabled>
+        <div class="browser-nav-group" role="group" aria-label="History">
+          <button id="browser-back" class="browser-nav-button" type="button" aria-label="Back" disabled>
+            &larr;
+          </button>
+          <span class="browser-nav-divider" aria-hidden="true"></span>
+          <button id="browser-forward" class="browser-nav-button" type="button" aria-label="Forward" disabled>
+            &rarr;
+          </button>
+        </div>
+        <button id="browser-refresh" class="browser-nav-button browser-nav-lone" type="button" aria-label="Refresh" disabled>
           &#8635;
         </button>
         <form id="browser-form" class="browser-address-row">
@@ -30,9 +35,11 @@
             value="https://ela.city/"
           />
         </form>
-        <button id="browser-settings" class="browser-nav-button" type="button" aria-label="Browser settings" title="Browser settings" aria-controls="browser-settings-panel" aria-expanded="false">
-          &#9881;
-        </button>
+        <div class="browser-util-group" role="group" aria-label="Browser tools">
+          <button id="browser-settings" class="browser-nav-button" type="button" aria-label="Browser settings" title="Browser settings" aria-controls="browser-settings-panel" aria-expanded="false">
+            &#9881;
+          </button>
+        </div>
       </section>
       <section id="browser-settings-panel" class="browser-settings-panel" aria-label="Browser settings" hidden>
         <div class="browser-settings-head">

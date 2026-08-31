@@ -525,7 +525,7 @@ pub fn validate_did_recovery_proof(proof: &DidRecoveryProofV1) -> Result<(), Str
     validate_auth_token_like_id(&proof.nonce, "did_recovery_proof.nonce")?;
     if proof.signature.is_empty()
         || proof.signature.len() > 4096
-        || proof.signature.len() % 2 != 0
+        || !proof.signature.len().is_multiple_of(2)
         || !proof.signature.chars().all(|ch| ch.is_ascii_hexdigit())
     {
         return Err("did_recovery_proof.signature must be hex encoded".to_string());

@@ -184,6 +184,7 @@ fn catalog_capsule_summary(
     };
 
     let provides = manifest.provides;
+    let icon = capsule_icon_variants(&name, &manifest.entrypoint, manifest.icon.as_deref());
     let viewer = manifest.viewer;
     let viewer_title = viewer.as_ref().map(|viewer| {
         launch_targets
@@ -251,6 +252,7 @@ fn catalog_capsule_summary(
         projection,
         viewer,
         viewer_title,
+        icon,
         accepted_content,
         cid,
         cid_state: cid_state.to_string(),
@@ -303,7 +305,6 @@ fn capsule_category(role: &CapsuleRole) -> &'static str {
 
 fn capsule_title(name: &str) -> String {
     let service_title = match name {
-        "ai-provider" => Some("AI"),
         "availability-provider" => Some("Content Availability"),
         "browser-engine-adapter" => Some("Browser Engine"),
         "chain-provider" => Some("Chains"),
@@ -314,7 +315,6 @@ fn capsule_title(name: &str) -> String {
         "exit-provider" => Some("Browser Exit"),
         "ipfs-provider" => Some("Content Storage"),
         "key-provider" => Some("Key Access"),
-        "llama-provider" => Some("Local AI"),
         "net-provider" => Some("Network"),
         "object-provider" => Some("Storage"),
         "operator-drive-adapter" => Some("Drive"),
@@ -727,6 +727,10 @@ pub(in crate::api::gateway) struct CapsuleSummary {
     pub(in crate::api::gateway) viewer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::api::gateway) viewer_title: Option<String>,
+    /// Capsule asset routes for the icon this capsule declares, empty when it
+    /// declares none. Resolved by the Runtime; the bytes stay with the capsule.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::api::gateway) icon: Vec<CapsuleIconVariant>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(in crate::api::gateway) accepted_content: Vec<CapsuleAcceptedContentSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]

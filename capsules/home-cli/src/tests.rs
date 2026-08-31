@@ -31,9 +31,9 @@ fn storage_read_bytes_accepts_utf8_provider_body() {
 }
 
 #[test]
-fn storage_read_bytes_accepts_runtime_carrier_result_body() {
+fn storage_read_bytes_accepts_runtime_resource_result_body() {
     let body = serde_json::json!({
-        "type": "carrier_result",
+        "type": "resource_result",
         "result": {
             "status": "ok",
             "data": {
@@ -50,7 +50,7 @@ fn storage_read_bytes_accepts_runtime_carrier_result_body() {
 fn storage_read_bytes_accepts_wrapped_runtime_response() {
     let body = serde_json::json!({
         "response": {
-            "type": "carrier_result",
+            "type": "resource_result",
             "result": {
                 "status": "ok",
                 "data": "hi"
@@ -64,7 +64,7 @@ fn storage_read_bytes_accepts_wrapped_runtime_response() {
 #[test]
 fn storage_read_bytes_reports_provider_error() {
     let body = serde_json::json!({
-        "type": "carrier_result",
+        "type": "resource_result",
         "result": {
             "status": "error",
             "code": "read_failed",
@@ -511,43 +511,9 @@ fn people_line_mode_emits_snapshot_backed_people_actions() {
             can_message: true,
             ..PeopleContactStatus::default()
         }],
-        discovery: PeopleDiscoveryStatus {
-            enabled: true,
-            remaining_seconds: Some(60),
-            discovered_peers: vec![PeopleDiscoveryPeerStatus {
-                peer_id: "peer-bob".to_string(),
-                display_name: "Bob".to_string(),
-                status: "visible".to_string(),
-                ..PeopleDiscoveryPeerStatus::default()
-            }],
-            requests: vec![PeopleDiscoveryRequestStatus {
-                request_id: "request-carol".to_string(),
-                peer_id: "peer-carol".to_string(),
-                display_name: "Carol".to_string(),
-                status: "incoming".to_string(),
-                ..PeopleDiscoveryRequestStatus::default()
-            }],
-            ..PeopleDiscoveryStatus::default()
-        },
         ..PeopleStatus::default()
     };
 
-    assert_eq!(
-        people_line_action("people discovery off", &snapshot).unwrap(),
-        Some("people-discovery-disable".to_string())
-    );
-    assert_eq!(
-        people_line_action("discovery refresh", &snapshot).unwrap(),
-        Some("people-discovery-refresh".to_string())
-    );
-    assert_eq!(
-        people_line_action("people request peer-bob", &snapshot).unwrap(),
-        Some("people-request-peer:peer-bob".to_string())
-    );
-    assert_eq!(
-        people_line_action("people accept request-carol", &snapshot).unwrap(),
-        Some("people-accept-request:request-carol".to_string())
-    );
     assert_eq!(
         people_line_action("people message contact-alice", &snapshot).unwrap(),
         Some("people-message:contact-alice".to_string())
@@ -556,10 +522,10 @@ fn people_line_mode_emits_snapshot_backed_people_actions() {
         people_line_action("people remove contact-alice", &snapshot).unwrap(),
         Some("people-remove-contact:contact-alice".to_string())
     );
-    assert!(people_line_action("people request missing", &snapshot)
-        .unwrap_err()
-        .to_string()
-        .contains("not available"));
+    assert_eq!(
+        people_line_action("people request missing", &snapshot).unwrap(),
+        None
+    );
     assert_eq!(people_line_action("people", &snapshot).unwrap(), None);
 }
 
@@ -887,7 +853,6 @@ fn sample_snapshot() -> HomeSnapshot {
         room: RoomStatus {
             room_slug: "chat-room".to_string(),
             title: "Room".to_string(),
-            owner_did: Some("did:key:z6Mkowner".to_string()),
             current_key_epoch: 1,
             admin_count: 1,
             member_count: 3,
@@ -908,11 +873,6 @@ fn sample_snapshot() -> HomeSnapshot {
             active_participants: Vec::new(),
             pending_requests: Vec::new(),
             active_sessions: Vec::new(),
-            members: vec![RoomMemberStatus {
-                member_did: "did:key:z6MkhExample".to_string(),
-                role: "owner".to_string(),
-            }],
-            pending_invites: Vec::new(),
         },
         people: PeopleStatus::default(),
         notifications: NotificationStatus::default(),
@@ -1499,29 +1459,6 @@ fn inspect_approval_inbox_fixture() -> InboxFixtureScenario {
     }
 }
 
-fn people_request_inbox_fixture() -> InboxFixtureScenario {
-    InboxFixtureScenario {
-        name: "people request",
-        entry: inbox_entry(
-            "people-request:people-req-1",
-            "people",
-            "people_request",
-            "Bob wants to connect",
-            "Bob from peer-bob sent a People request.",
-            "attention",
-            ("people", "people-accept-request:people-req-1"),
-        ),
-        primary_action: inbox_action(
-            "people-accept-request:people-req-1",
-            "Accept Bob",
-            "Accept this People request.",
-            "home: accept People request",
-        ),
-        extra_actions: Vec::new(),
-        primary_action_id: "people-accept-request:people-req-1",
-    }
-}
-
 fn chat_guest_inbox_fixture() -> InboxFixtureScenario {
     InboxFixtureScenario {
         name: "chat guest request",
@@ -1577,7 +1514,6 @@ fn inbox_fixture_scenarios() -> Vec<InboxFixtureScenario> {
     vec![
         wallet_signing_inbox_fixture(),
         inspect_approval_inbox_fixture(),
-        people_request_inbox_fixture(),
         chat_guest_inbox_fixture(),
         generic_capsule_inbox_fixture(),
     ]
@@ -1985,35 +1921,6 @@ fn people_tab_uses_people_model_and_keeps_transport_in_debug() {
             last_seen_at: Some(10),
         }],
         service_offer_count: 0,
-        discovery: PeopleDiscoveryStatus {
-            schema: "elastos.people.discovery/v1".to_string(),
-            enabled: true,
-            remaining_seconds: Some(120),
-            visibility: "visible".to_string(),
-            status: "ready".to_string(),
-            status_message: "Discovery is ready.".to_string(),
-            topic: "__elastos_internal/people-discovery-v1".to_string(),
-            local_peer_id: Some("peer-local".to_string()),
-            discovered_peers: vec![PeopleDiscoveryPeerStatus {
-                peer_id: "peer-bob".to_string(),
-                did: Some("did:key:bob".to_string()),
-                display_name: "Bob".to_string(),
-                handle: Some("@bob".to_string()),
-                last_seen_at: 20,
-                status: "visible".to_string(),
-            }],
-            requests: vec![PeopleDiscoveryRequestStatus {
-                request_id: "request-carol".to_string(),
-                peer_id: "peer-carol".to_string(),
-                did: Some("did:key:carol".to_string()),
-                display_name: "Carol".to_string(),
-                handle: Some("@carol".to_string()),
-                created_at: 30,
-                status: "incoming".to_string(),
-                invite_id: None,
-            }],
-            next_refresh_after_ms: None,
-        },
     };
 
     let ids: Vec<String> = people_actions(&snapshot)
@@ -2023,10 +1930,6 @@ fn people_tab_uses_people_model_and_keeps_transport_in_debug() {
     assert_eq!(
         ids,
         vec![
-            "people-discovery-disable",
-            "people-discovery-refresh",
-            "people-accept-request:request-carol",
-            "people-request-peer:peer-bob",
             "people-message:contact-alice",
             "people-remove-contact:contact-alice",
         ]
@@ -2036,16 +1939,11 @@ fn people_tab_uses_people_model_and_keeps_transport_in_debug() {
     render_people_tab(&mut buf, &snapshot, &TuiState::default(), 120);
     assert!(buf.contains("My Profile"));
     assert!(buf.contains("People"));
-    assert!(buf.contains("Discovery"));
-    assert!(buf.contains("Add People"));
-    assert!(buf.contains("Requests"));
+    assert!(buf.contains("Online"));
+    assert!(buf.contains("Open People from Home to see signed online presence."));
     assert!(buf.contains("Alice"));
-    assert!(buf.contains("Bob"));
-    assert!(buf.contains("Carol"));
     assert!(buf.contains("Message  people message contact-alice"));
     assert!(buf.contains("Remove   people remove contact-alice"));
-    assert!(buf.contains("Add: people request peer-bob"));
-    assert!(buf.contains("Accept: people accept request-carol"));
     assert!(buf.contains("Chat with Alice"));
     assert!(!buf.contains("direct contact threads are not available yet"));
     assert!(buf.contains("Remove Alice"));
@@ -2075,11 +1973,8 @@ fn people_tab_uses_people_model_and_keeps_transport_in_debug() {
     assert!(debug.contains("RoomReqs"));
     assert!(debug.contains("RoomWeb"));
     assert!(debug.contains("ContactsSchema"));
-    assert!(debug.contains("DiscoverySchema"));
     assert!(debug.contains("Source"));
     assert!(debug.contains("Services"));
-    assert!(debug.contains("LocalPeer"));
-    assert!(debug.contains("__elastos_internal/people-discovery-v1"));
 }
 
 #[test]
@@ -2088,7 +1983,6 @@ fn room_control_details_remain_available_to_debug_helpers() {
     snapshot.room.title = "Room".to_string();
     snapshot.room.room_slug = "chat-room".to_string();
     snapshot.room.local_runtime_role = Some("owner".to_string());
-    snapshot.room.owner_did = Some("did:key:z6Mkowner".to_string());
     snapshot.room.current_key_epoch = 3;
     snapshot.room.admin_count = 1;
     snapshot.room.member_count = 4;
@@ -2099,24 +1993,11 @@ fn room_control_details_remain_available_to_debug_helpers() {
         device_label: "Phone".to_string(),
     }];
     snapshot.room.pending_invite_count = 1;
-    snapshot.room.pending_invites = vec![RoomInviteStatus {
-        invited_did: "did:key:z6invitee".to_string(),
-    }];
     snapshot.room.active_session_count = 1;
     snapshot.room.active_sessions = vec![RoomSessionStatus {
         display_name: "Bob".to_string(),
         device_label: "Safari".to_string(),
     }];
-    snapshot.room.members = vec![
-        RoomMemberStatus {
-            member_did: "did:key:z6Mkowner".to_string(),
-            role: "owner".to_string(),
-        },
-        RoomMemberStatus {
-            member_did: "did:key:z6member".to_string(),
-            role: "member".to_string(),
-        },
-    ];
 
     let entry = chat_room_app_entry(&snapshot).expect("room entry missing");
 
@@ -2126,10 +2007,10 @@ fn room_control_details_remain_available_to_debug_helpers() {
         .any(|line| line.contains("Public URL https://elastos.elacitylabs.com/apps/chat-room/")));
     assert!(detail_lines
         .iter()
-        .any(|line| line.contains("Invite     did:key:z6invitee pending")));
+        .any(|line| line.contains("Invites    1 pending")));
     assert!(detail_lines
         .iter()
-        .any(|line| line.contains("Person     did:key:z6member (trusted participant)")));
+        .any(|line| line.contains("People     4 trusted participant(s)")));
 }
 
 #[test]
@@ -2143,18 +2024,12 @@ fn targeted_room_controls_do_not_appear_as_default_apps() {
         device_label: "Phone".to_string(),
     }];
     snapshot.room.pending_invite_count = 1;
-    snapshot.room.pending_invites = vec![RoomInviteStatus {
-        invited_did: "did:key:z6member".to_string(),
-    }];
     snapshot.room.active_session_count = 1;
     snapshot.room.active_sessions = vec![RoomSessionStatus {
         display_name: "Bob".to_string(),
         device_label: "Safari".to_string(),
     }];
-    snapshot.room.members.push(RoomMemberStatus {
-        member_did: "did:key:z6member".to_string(),
-        role: "member".to_string(),
-    });
+    snapshot.room.member_count = 1;
     snapshot.actions.push(ActionInfo {
         id: "room-policy-toggle-guests".to_string(),
         label: "Close public join requests".to_string(),
@@ -2237,6 +2112,17 @@ fn targeted_room_controls_do_not_appear_as_default_apps() {
     assert!(controls
         .iter()
         .any(|entry| entry.label == "Disconnect Bob on Safari" && entry.is_control));
+    for removed_membership_control in [
+        "Revoke invite for did:key:z6member",
+        "Remove did:key:z6member",
+    ] {
+        assert!(
+            !controls
+                .iter()
+                .any(|entry| entry.label == removed_membership_control),
+            "removed room membership control leaked into Chat controls: {removed_membership_control}",
+        );
+    }
 }
 
 #[test]
@@ -2387,6 +2273,89 @@ fn inbox_selected_index_controls_mark_dismiss_and_open() {
         state.activate(&snapshot),
         Some("open-gui:documents".to_string())
     );
+}
+
+#[test]
+fn unresolved_inbox_review_request_surfaces_desktop_handoff() {
+    let mut snapshot = sample_snapshot();
+    snapshot.notifications.unread_count = 1;
+    snapshot.notifications.attention_count = 1;
+    snapshot.targets.push(HomeTargetStatus {
+        target: "inbox".to_string(),
+        title: "Inbox".to_string(),
+        description: "Review pending requests.".to_string(),
+        role: "app".to_string(),
+        target_kind: "app".to_string(),
+        viewer: None,
+        viewer_title: None,
+    });
+    snapshot.notifications.entries = vec![NotificationEntryStatus {
+        id: "wallet-approval-request:wallet-approval:test".to_string(),
+        source_app: "wallet".to_string(),
+        kind: "wallet_approval_request".to_string(),
+        title: "Wallet approval requested".to_string(),
+        body: "Wallet needs a review in Inbox.".to_string(),
+        action_ref: Some(NotificationActionRefStatus {
+            app: "wallet".to_string(),
+            action_id: "wallet-review-request:wallet-approval:test".to_string(),
+        }),
+        read: false,
+        severity: "attention".to_string(),
+    }];
+
+    let action = selected_notification_action(&snapshot, 0).expect("Inbox handoff action");
+    assert_eq!(
+        action.id,
+        "inbox-review-notification:wallet-approval-request:wallet-approval:test"
+    );
+    assert_eq!(action.label, "Open Inbox on Desktop");
+    assert!(action.ready);
+
+    let state = TuiState {
+        tab: Tab::Inbox,
+        ..TuiState::default()
+    };
+    assert_eq!(
+        state.activate(&snapshot),
+        Some("inbox-review-notification:wallet-approval-request:wallet-approval:test".to_string())
+    );
+
+    let mut buf = String::new();
+    render_inbox_tab(&mut buf, &snapshot, &state, 120);
+    assert!(buf.contains("Action     Open Inbox on Desktop"));
+    assert!(buf.contains("ActionUse  ready"));
+    assert!(buf.contains("Enter      open Desktop Inbox for review"));
+}
+
+#[test]
+fn stale_direct_request_stays_unavailable_in_inbox() {
+    let mut snapshot = sample_snapshot();
+    snapshot.notifications.unread_count = 1;
+    snapshot.notifications.attention_count = 1;
+    snapshot.notifications.entries = vec![NotificationEntryStatus {
+        id: "room-pair-request:req-1".to_string(),
+        source_app: "chat-room".to_string(),
+        kind: "room_pair_request".to_string(),
+        title: "Alice wants to join Chat".to_string(),
+        body: "Alice on Phone wants to join Chat.".to_string(),
+        action_ref: Some(NotificationActionRefStatus {
+            app: "chat-room".to_string(),
+            action_id: "room-approve-request:req-1".to_string(),
+        }),
+        read: false,
+        severity: "attention".to_string(),
+    }];
+
+    let state = TuiState {
+        tab: Tab::Inbox,
+        ..TuiState::default()
+    };
+    assert!(selected_notification_action(&snapshot, 0).is_none());
+    assert_eq!(state.activate(&snapshot), None);
+
+    let mut buf = String::new();
+    render_inbox_tab(&mut buf, &snapshot, &state, 120);
+    assert!(buf.contains("Action     no longer available"));
 }
 
 #[test]

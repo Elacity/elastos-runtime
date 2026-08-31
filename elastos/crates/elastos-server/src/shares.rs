@@ -351,7 +351,7 @@ pub fn load_or_create_share_key_at(
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
         eprintln!("Generated share signing key: {}", path.display());
-        eprintln!("  DID: {}", encode_did_key(&verifying_key));
+        eprintln!("  DID: {}", encode_did_key(&verifying_key)?);
         Ok(signing_key)
     }
 }
@@ -399,7 +399,7 @@ pub fn create_provenance(
     signing_key: &signature::SigningKey,
 ) -> anyhow::Result<Vec<u8>> {
     let verifying_key = signing_key.verifying_key();
-    let builder_did = encode_did_key(&verifying_key);
+    let builder_did = encode_did_key(&verifying_key)?;
 
     let payload = ProvenancePayload {
         schema: "elastos.share.provenance/v1".to_string(),
@@ -515,7 +515,7 @@ pub fn create_channel_head(
     signing_key: &signature::SigningKey,
 ) -> anyhow::Result<Vec<u8>> {
     let verifying_key = signing_key.verifying_key();
-    let signer_did = encode_did_key(&verifying_key);
+    let signer_did = encode_did_key(&verifying_key)?;
 
     let payload = ChannelHeadPayload {
         schema: "elastos.share.head/v1".to_string(),
@@ -867,7 +867,7 @@ mod tests {
     #[test]
     fn test_encode_decode_did_key_roundtrip() {
         let (_, vk) = generate_keypair();
-        let did = encode_did_key(&vk);
+        let did = encode_did_key(&vk).unwrap();
         assert!(did.starts_with("did:key:z"));
         let decoded = decode_did_key(&did).unwrap();
         assert_eq!(vk.as_bytes(), decoded.as_bytes());
@@ -972,7 +972,7 @@ mod tests {
             schema: "elastos.share.provenance/v1".to_string(),
             subject_cid: TEST_CIDV0.to_string(),
             content_digest: "sha256:abc".to_string(),
-            builder_did: encode_did_key(&sk.verifying_key()),
+            builder_did: crate::crypto::encode_signing_key_did(&sk),
             built_at: 1000,
             tool_version: "test".to_string(),
         };
@@ -992,7 +992,7 @@ mod tests {
             latest_version: 1,
             status: ChannelStatus::Active,
             updated_at: 1000,
-            signer_did: encode_did_key(&sk.verifying_key()),
+            signer_did: crate::crypto::encode_signing_key_did(&sk),
             provenance_cid: None,
             prev_head_cid: None,
             revoke_reason: None,
@@ -1088,7 +1088,7 @@ mod tests {
         .unwrap();
         let mut head: ChannelHead = serde_json::from_slice(&head_bytes).unwrap();
         let (sk2, _) = generate_keypair();
-        head.payload.signer_did = encode_did_key(&sk2.verifying_key());
+        head.payload.signer_did = crate::crypto::encode_signing_key_did(&sk2);
         let modified = serde_json::to_vec(&head).unwrap();
         assert!(verify_channel_head(&modified).is_err());
     }
@@ -1297,7 +1297,7 @@ mod tests {
     fn test_verify_release_envelope_valid() {
         use crate::crypto::verify_release_envelope;
         let (sk, _) = generate_keypair();
-        let did = encode_did_key(&sk.verifying_key());
+        let did = crate::crypto::encode_signing_key_did(&sk);
         let payload = serde_json::json!({
             "schema": "elastos.release.head/v1",
             "version": "0.10.0",
@@ -1315,7 +1315,7 @@ mod tests {
         use crate::crypto::verify_release_envelope;
         let (sk, _) = generate_keypair();
         let (_, other_vk) = generate_keypair();
-        let wrong_did = encode_did_key(&other_vk);
+        let wrong_did = encode_did_key(&other_vk).unwrap();
         let payload = serde_json::json!({
             "schema": "elastos.release.head/v1",
             "version": "0.10.0",
@@ -1333,7 +1333,7 @@ mod tests {
     fn test_verify_release_envelope_accepts_any_trusted_did() {
         use crate::crypto::verify_release_envelope_against_dids;
         let (sk, _) = generate_keypair();
-        let did = encode_did_key(&sk.verifying_key());
+        let did = crate::crypto::encode_signing_key_did(&sk);
         let (_, other_vk) = generate_keypair();
         let payload = serde_json::json!({
             "schema": "elastos.release.head/v1",
@@ -1343,7 +1343,7 @@ mod tests {
         let result = verify_release_envelope_against_dids(
             &envelope,
             "elastos.release.head.v1",
-            &[encode_did_key(&other_vk), did.clone()],
+            &[encode_did_key(&other_vk).unwrap(), did.clone()],
         );
         assert!(result.is_ok());
         let (_, signer) = result.unwrap();
@@ -1354,7 +1354,7 @@ mod tests {
     fn test_verify_release_envelope_tampered() {
         use crate::crypto::verify_release_envelope;
         let (sk, _) = generate_keypair();
-        let did = encode_did_key(&sk.verifying_key());
+        let did = crate::crypto::encode_signing_key_did(&sk);
         let payload = serde_json::json!({
             "schema": "elastos.release.head/v1",
             "version": "0.10.0",
@@ -1375,7 +1375,7 @@ mod tests {
     fn test_verify_release_envelope_wrong_domain() {
         use crate::crypto::verify_release_envelope;
         let (sk, _) = generate_keypair();
-        let did = encode_did_key(&sk.verifying_key());
+        let did = crate::crypto::encode_signing_key_did(&sk);
         let payload = serde_json::json!({
             "schema": "elastos.release/v1",
             "version": "0.10.0",

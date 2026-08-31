@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "chain-provider",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Typed chain provider for production Elastos, Base, and Bitcoin operations",
   "author": "elastos",
   "role": "provider",
@@ -14,7 +14,7 @@
       {
         "resource": "elastos://chain/*",
         "actions": ["read", "write", "admin"],
-        "operations": ["networks", "status", "block_number", "sync_health", "balance", "transaction", "receipt", "has_access_by_content_id", "proof", "erc1271_is_valid_signature", "prepare_transaction", "broadcast_transaction", "node_lifecycle"]
+        "operations": ["networks", "status", "block_number", "sync_health", "balance", "transaction", "receipt", "proof", "erc1271_is_valid_signature", "prepare_transaction", "broadcast_transaction", "node_lifecycle"]
       }
     ],
     "audit_events": ["chain.read", "chain.status", "chain.rights_read", "chain.proof", "chain.broadcast", "chain.node_lifecycle"]
@@ -87,15 +87,6 @@
           "audit": "summary",
           "resource": "elastos://chain/*",
           "operation": "receipt"
-        },
-        {
-          "id": "has_access_by_content_id",
-          "description": "Request has access by content id through the chain-provider Runtime provider boundary for elastos://chain/*.",
-          "risk": "rights",
-          "approval": "runtime_policy",
-          "audit": "event",
-          "resource": "elastos://chain/*",
-          "operation": "has_access_by_content_id"
         },
         {
           "id": "proof",

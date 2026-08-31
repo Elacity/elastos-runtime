@@ -103,6 +103,16 @@ pub struct CapsuleManifest {
     #[serde(default)]
     pub providers: Option<std::collections::HashMap<String, String>>,
 
+    /// Capsule-relative directory holding this capsule's own app icon set.
+    ///
+    /// A capsule owns its icon the same way it owns its entrypoint: the shell
+    /// does not keep a central icon table keyed by capsule name. The directory
+    /// must contain `icon-32.png`, `icon-64.png`, `icon-128.png` and
+    /// `icon-256.png`; the runtime turns this into a bounded read model of
+    /// asset routes and never reads the bytes on the capsule's behalf.
+    #[serde(default)]
+    pub icon: Option<String>,
+
     /// Viewer capsule: path or CID of a capsule that can display this data capsule
     #[serde(default)]
     pub viewer: Option<String>,
@@ -297,6 +307,21 @@ impl CapsuleManifest {
             ));
         }
 
+        if let Some(icon) = &self.icon {
+            let icon = icon.trim();
+            if icon.is_empty() {
+                return Err("icon must not be empty when declared".to_string());
+            }
+            if icon.contains("..") {
+                return Err(format!(
+                    "icon \"{icon}\" contains path traversal (\"..\" is not allowed)"
+                ));
+            }
+            if icon.starts_with('/') || icon.starts_with('\\') {
+                return Err(format!("icon \"{icon}\" must be a relative path"));
+            }
+        }
+
         if self.name.trim().is_empty() {
             return Err("manifest name must not be empty".to_string());
         }
@@ -313,9 +338,9 @@ impl CapsuleManifest {
                     self.role.as_str()
                 ));
             }
-            if self.permissions.carrier {
+            if self.permissions.host_process {
                 return Err(format!(
-                    "{} capsules cannot request carrier host execution; use a provider capsule for host services",
+                    "{} capsules cannot request host-process execution; use a provider capsule for host services",
                     self.role.as_str()
                 ));
             }
@@ -357,11 +382,11 @@ impl CapsuleManifest {
                 ));
             }
         }
-        if self.permissions.carrier
+        if self.permissions.host_process
             && (self.role != CapsuleRole::Provider || self.provides.is_none())
         {
             return Err(
-                "carrier host execution requires a provider capsule with an explicit provides namespace"
+                "host-process execution requires a provider capsule with an explicit provides namespace"
                     .to_string(),
             );
         }
@@ -873,10 +898,10 @@ fn default_cpu() -> u32 {
 /// Permissions requested by a capsule
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Permissions {
-    /// Carrier-plane service: runs as a host process (not in a VM).
+    /// Host-process provider execution: runs as a host process (not in a VM).
     /// Used by WebSpace providers that need real network/system access.
     #[serde(default)]
-    pub carrier: bool,
+    pub host_process: bool,
 
     /// Request explicit guest IP networking (TAP) for the microVM.
     /// Default: false — capsules use the serial Carrier bridge (rootless).
@@ -1822,11 +1847,11 @@ mod tests {
     fn test_v1_with_gpu() {
         let json = r#"{
             "schema": "elastos.capsule/v1",
-            "name": "llama-provider",
+            "name": "gpu-provider",
             "version": "0.1.0",
             "role": "provider",
             "type": "microvm",
-            "entrypoint": "llama-provider",
+            "entrypoint": "gpu-provider",
             "resources": { "memory_mb": 4096, "gpu": true }
         }"#;
 
@@ -2072,8 +2097,8 @@ mod tests {
     }
 
     #[test]
-    fn test_app_capsule_is_carrier_only() {
-        // Regular app capsule: no provides, no guest_network → Carrier-only
+    fn test_app_capsule_is_bridge_only() {
+        // Regular app capsule: no provides, no guest_network, no host_process
         let json = r#"{
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
@@ -2088,10 +2113,10 @@ mod tests {
         let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
         assert!(
             !manifest.permissions.guest_network,
-            "app capsules are Carrier-only by default"
+            "app capsules do not request guest networking by default"
         );
         assert!(
-            !manifest.permissions.carrier,
+            !manifest.permissions.host_process,
             "app capsules don't run on the host"
         );
         assert!(manifest.validate().is_ok());
@@ -2168,7 +2193,7 @@ mod tests {
     }
 
     #[test]
-    fn test_viewer_capsule_carrier_permission_rejected() {
+    fn test_viewer_capsule_host_process_permission_rejected() {
         let json = r#"{
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
@@ -2177,12 +2202,12 @@ mod tests {
             "type": "wasm",
             "entrypoint": "viewer.wasm",
             "permissions": {
-                "carrier": true
+                "host_process": true
             }
         }"#;
         let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
         let err = manifest.validate().unwrap_err();
-        assert!(err.contains("viewer capsules cannot request carrier host execution"));
+        assert!(err.contains("viewer capsules cannot request host-process execution"));
     }
 
     #[test]
@@ -2202,7 +2227,7 @@ mod tests {
     }
 
     #[test]
-    fn test_carrier_permission_requires_provider_with_namespace() {
+    fn test_host_process_permission_requires_provider_with_namespace() {
         let json = r#"{
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
@@ -2211,12 +2236,12 @@ mod tests {
             "type": "microvm",
             "entrypoint": "rootfs.ext4",
             "permissions": {
-                "carrier": true
+                "host_process": true
             }
         }"#;
         let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
         let err = manifest.validate().unwrap_err();
-        assert!(err.contains("carrier host execution requires a provider capsule"));
+        assert!(err.contains("host-process execution requires a provider capsule"));
     }
 
     #[test]

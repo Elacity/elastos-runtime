@@ -11,7 +11,7 @@ Start with `elastos init` for a small Component or content capsule. Use
 viewer/content pair, or provider contract.
 
 The Component path is implemented and conformance-tested, but no shipped
-first-party product App uses it yet. The 18 shipped first-party UI Apps are
+first-party product App uses it yet. First-party UI Apps are
 `elastos.runtime-projection/v1` web projections. Treat the Component scaffold
 as the supported authoring contract, not as evidence of product adoption.
 
@@ -110,6 +110,14 @@ themselves. Same-origin access grants no authority.
 A content capsule uses `role=content` and `type=data`. Its `entrypoint` names
 the data entry. It has no executable ABI. Add `viewer` only when one installed
 viewer is part of the content contract.
+
+The published CID should identify the complete immutable capsule closure, not
+only the entrypoint file. A game capsule declares its viewer and packages the
+licensed ROM, artwork, metadata, and notices. A model capsule packages the GGUF
+and declares its format, quantization, base model and provenance, resource
+requirements, license, and compatible provider interface. Do not put a mutable
+web URL in either manifest as the content identity. See
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
 
 ## Keep optional declarations honest
 

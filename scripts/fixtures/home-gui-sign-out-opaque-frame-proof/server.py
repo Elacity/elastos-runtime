@@ -46,7 +46,16 @@ HARNESS = r"""<!doctype html>
         }],
       },
       app: { id: "home", route: "/apps/home/" },
-      appearance: {},
+      appearance: {
+        schema: "elastos.home.appearance/v1",
+        revision: 0,
+        theme: "dark",
+        accent: "blue",
+        accent_custom: "#4f7fff",
+        dock_auto_hide: false,
+        sounds: false,
+        focus_mode: false,
+      },
       browser_state: {
         principal_id: "principal:home-gui-sign-out-proof",
         layout: {
@@ -187,7 +196,7 @@ HARNESS = r"""<!doctype html>
       await waitFor(async () => {
         const state = await inspect(validFrame);
         observations.trusted_signed = state;
-        return state.authority === "signed" && state.display === "flex";
+        return state.authority === "signed" && state.hidden === false;
       }, "trusted signed summary projection");
 
       validFrame.contentWindow.postMessage({
@@ -197,7 +206,7 @@ HARNESS = r"""<!doctype html>
       await waitFor(async () => {
         const state = await inspect(validFrame);
         observations.trusted_signed_out = state;
-        return state.authority === "unsigned" && state.display === "none";
+        return state.authority === "unsigned" && state.hidden === true;
       }, "trusted signed-out summary projection");
 
       wrongOriginFrame.contentWindow.postMessage({
@@ -214,7 +223,7 @@ HARNESS = r"""<!doctype html>
       await waitFor(async () => {
         const state = await inspect(validFrame);
         observations.before_click = state;
-        return state.authority === "signed" && state.display === "flex";
+        return state.authority === "signed" && state.hidden === false;
       }, "signed projection before click");
       validFrame.contentWindow.postMessage({ type: "proof:click-sign-out" }, "*");
       await waitFor(
@@ -264,17 +273,18 @@ CHILD = r"""<!doctype html>
     const proofOrigin = route.searchParams.get("proof_origin") || "";
 
     function sendState(requestId) {
-      const button = document.querySelector("#toolbar-sign-out");
+      const button = document.querySelector("#identity-menu-sign-out");
       window.parent.postMessage({
         type: "proof:state",
         requestId,
         authority: document.body.dataset.homeAuthority || "",
+        hidden: button ? button.hidden : null,
         display: button ? window.getComputedStyle(button).display : "missing",
       }, proofOrigin);
     }
 
     function announceReady() {
-      if (!document.querySelector("#toolbar-sign-out")) {
+      if (!document.querySelector("#identity-menu-sign-out")) {
         window.setTimeout(announceReady, 10);
         return;
       }
@@ -289,7 +299,7 @@ CHILD = r"""<!doctype html>
       if (data?.type === "proof:inspect") {
         sendState(data.requestId);
       } else if (data?.type === "proof:click-sign-out") {
-        document.querySelector("#toolbar-sign-out")?.click();
+        document.querySelector("#identity-menu-sign-out")?.click();
       }
     });
 

@@ -135,24 +135,57 @@ The contract and its limits live in
 
 ### 3. Build Runtime-mediated protected content
 
-Protected content uses the same effect path as ordinary content:
+The target protected-content design uses the same effect path as ordinary
+content:
 
-`viewer -> Runtime capability -> protected-content coordinator -> providers`
+`viewer -> Runtime -> rights provider -> custody providers -> decrypt provider`
 
-The coordinator resolves the content object, checks availability, verifies
-rights, requests key release, creates a decrypt or render session, and records
-the result. Each dependency has a typed contract and fails closed. Viewers
-receive scoped output or a scoped session, not content keys, chain RPC, wallet
-authority, storage APIs, or provider credentials.
+Runtime will resolve the content object, check availability, verify rights,
+request recipient-encrypted custody contributions, create a scoped decrypt or
+render session, and record the result. Each dependency will have a typed
+contract and fail closed. Viewers will receive scoped output or a scoped
+session, not content keys, custody shares, chain RPC, Wallet authority, storage
+APIs, provider routes, network locations, or credentials.
+
+The dependency order is contracts and cryptographic review, private provider
+protocols, Wallet/Chain authority, durable Runtime coordination, then installed
+mint-to-play acceptance. Activation requires evidence for the exact installed
+artifacts, signed custody composition, deployed Chain reads and purchase,
+replication and repair, restart, replay, tamper rejection and cleanup.
+
+The creator Runtime owns provisioning. A buyer Runtime must import and verify
+an immutable listing and complete purchase and playback with its own Profile,
+Wallet and device identity. Shared listing links precede global discovery and
+public custody governance.
+
+PQ-hybrid confidentiality does not establish quantum-safe authority signatures.
+Authorization policy and external cryptographic review are separate activation
+gates. Current implementation evidence and outstanding decisions belong in
+[state.md](state.md) and [TASKS.md](TASKS.md).
+
+Carrier remains transport only throughout that sequence. It carries
+Runtime-selected traffic, but it does not define rights authority, custody
+policy, or capsule-visible contract meaning.
 
 New protected objects should carry encrypted payload identity, rights policy,
-algorithm metadata, key envelopes, provenance, availability receipts, and a
-declared viewer interface. Cryptographic upgrades use versioned envelopes and
-migration rules. A permissioned key service can precede a public network, but
-production claims require independent review and operational evidence.
+algorithm metadata, provenance, availability receipts, declared viewer
+interface, CEK commitment, and object-bound pool/epoch/committee-authorization
+identities. Public metadata must not carry custody shares. `CustodyEnvelopeV1`
+remains a private ephemeral provisioning bundle; durable custody storage is one
+node-sealed share per selected custody node. The first product proof must use
+three distinct custody provider identities and state roots for a 2-of-3
+committee. First minted objects use PQ-hybrid envelopes. Later cryptographic
+successors use versioned envelopes and migration rules rather than creating
+classical-only objects for later migration.
+A permissioned key service can precede a public network, but production claims
+require independent review and operational evidence.
 
-See [Protected content](docs/PROTECTED_CONTENT.md) and the provider-specific
-contracts for rights, key release, and decryption.
+The canonical contracts and acceptance requirements are in
+[Protected-content v1 contracts](docs/PROTECTED_CONTENT_CONTRACTS_V1.md),
+[Protected content](docs/PROTECTED_CONTENT.md) and
+[the acceptance checklist](docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md).
+Installed proof must connect Runtime, providers, Library, Wallet, Chain,
+custody, decrypt output and the viewer through one authority path.
 
 ### 4. Add wallet, DID, and node proofs behind Runtime authority
 
@@ -232,6 +265,16 @@ Executable capsule isolation remains governed by
 [Principle 18](PRINCIPLES.md#18-executable-capsules-are-isolated-execution-environments)
 and [Capsule model](docs/CAPSULE_MODEL.md).
 
+The gateway already serves read-only content by CID at `/s/<cid>/`. Once
+capsule packages are signed and content-addressed, opening a capsule's CID
+should load the capsule itself: the gateway resolves the package, verifies
+it, and boots it with whatever host it declares — a game capsule loads its
+emulator, and the Home GUI capsule loads the Home host first, the same way
+today's launch path binds a viewer to its executable actor. A capsule's CID
+then works as a shareable link to the running thing, not just to its files.
+This depends on the signed package contract above; an unsigned directory
+served by CID must stay inert content.
+
 ### 7. Keep Home as the Runtime-owned front door
 
 Home is the default user surface. Runtime owns identity, object access,
@@ -307,11 +350,21 @@ operator commands; current acceptance and known limits belong in
 
 People is the trust surface for profiles, contacts, requests, device bindings,
 and service discovery. Chat owns direct, group, and public conversations.
-Inbox owns review of contact, pairing, conversation, and capability requests.
+Inbox owns review of contact, conversation, and capability requests.
+
+The identity split must stay explicit:
+
+- passkeys authorize a local principal; they are never the network identity;
+- a principal-owned Profile DID is the stable person/contact identity;
+- a device DID is endpoint and signing identity only;
+- signed profile documents authorize the current delivery device bindings and
+  must be retained by highest accepted revision plus previous-hash linkage;
+- direct conversations are scoped to Profile DIDs, not to device rotation.
 
 The product must distinguish people from devices and contacts from
 conversations. Discovery is opt-in and describes its actual network scope.
-Deterministic signed invites remain available when discovery is unavailable.
+Deterministic signed invites remain available as an explicit alternate
+onboarding path.
 Stable transport identifiers stay out of ordinary UI.
 
 Service offers can arrive through trusted People and Carrier relationships, but
@@ -325,15 +378,28 @@ Direct messages cannot be presented as private unless their transport and
 storage enforce that claim. Local composition and reading should remain usable
 without waiting for remote transport.
 
+Profile identity and transport routing must not drift:
+
+- the signed public profile document is the public identity truth;
+- older or conflicting profile revisions must fail closed once a newer accepted
+  revision is retained;
+- device revocation becomes effective when the newer signed profile revision is
+  observed, not by transport metadata alone;
+- direct messages need both proofs: the device signature proves the sending
+  endpoint, and the retained signed profile document proves that device is
+  currently authorized for the participant Profile DID;
+- Carrier/bootstrap configuration remains connectivity only and never becomes
+  person, contact, or conversation authority.
+
 The target contract carries authenticated messages, object updates, presence,
 and attachments between runtimes. Runtime must verify the sender, capability,
 replay policy, and destination object. Unauthenticated raw gossip does not meet
 that contract. Compatibility bridges may map external systems into the target
 contract, but they do not define the native model.
 
-See [People and conversations](docs/PEOPLE_CONVERSATIONS.md) for implemented
-behavior and [Tasks](TASKS.md#collaboration-and-messaging) for open
-outcomes.
+See [People and conversations](docs/PEOPLE_CONVERSATIONS.md) for the target
+model and ordered implementation slices, and
+[Tasks](TASKS.md#collaboration-and-messaging) for open outcomes.
 
 ### 10. Keep release, install, share, and sites on truthful paths
 
@@ -369,6 +435,13 @@ Use Linux as the full-runtime baseline until another platform earns equivalent
 evidence. macOS, Windows, mobile, and remote hosts can support useful subsets
 without claiming Linux or KVM parity.
 
+The first Windows product should be WSL2, not a rushed native Runtime. Keep the
+Linux Runtime and provider stack inside WSL, add a small signed Windows launcher
+for start, stop, update, health checks, and Home opening, and keep Runtime
+state in the Linux filesystem with explicit storage budgets and cleanup.
+Native Windows remains later host-adapter work behind the same Runtime and
+Browser contracts.
+
 ### Native object model and content-first design
 
 Packaging existing web apps helps bring software into ElastOS, but the native
@@ -390,6 +463,13 @@ extension, or manifest field never grants authority.
 Marketplace is a catalog over signed capsule packages. Remote mutation waits
 for package identity, publisher trust, interface compatibility, applicable
 rights, and rollback receipts.
+
+Free games, GGUF models, and similar downloads should enter as signed content
+capsules identified by bundle CID. A community-controlled ElastOS catalog can
+index those CIDs while availability providers retain and replicate the bytes.
+External repositories such as Hugging Face belong behind optional gateway
+provider capsules that import approved artifacts into the same native content
+path. They must not become direct Home URLs or a parallel install system.
 
 ### Identity evolution
 

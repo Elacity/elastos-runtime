@@ -80,6 +80,7 @@ fn microvm_manifest(name: &str) -> CapsuleManifest {
             persistent_storage_mb: None,
         }),
         providers: None,
+        icon: None,
         viewer: None,
         signature: None,
     }

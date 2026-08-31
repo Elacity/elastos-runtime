@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260725a";
+const moduleVersion = "home-20260802a";
 const requests = [];
 const originalConsoleError = console.error;
 console.error = (...args) => {
@@ -249,10 +249,26 @@ globalThis.fetch = async (url, init = {}) => {
   if (url === "/api/apps/home/summary") {
     return jsonResponse(summary);
   }
+  if (url === "/api/auth/sessions/refresh") {
+    return jsonResponse({ home_token: "host-token" });
+  }
   if (url === "/api/apps/home/launch") {
     assert(body?.target === "home-cli", "alternate shell launch target drifted", body);
     assert(body?.query?.shell_mode === "root", "alternate shell must launch in root mode", body);
     return failedResponse(500, "Internal Server Error", "simulated root shell launch failure");
+  }
+  if (url === "/api/apps/home/active-shell") {
+    assert(body?.active === "home-gui", "failed launch recovery requested the wrong active shell", body);
+    assert(
+      init.headers?.["x-elastos-home-token"] === "host-token",
+      "failed launch recovery did not use the trusted Home host token",
+      init.headers,
+    );
+    return jsonResponse({
+      schema: "elastos.home.active-shell/v1",
+      active: "home-gui",
+      candidates: [],
+    });
   }
   return jsonResponse({ ok: true });
 };
@@ -289,9 +305,9 @@ assert(recovery.hidden === false, "host recovery panel did not show after failed
 assert(recovery.dataset.host === "home-shell-host", "host recovery did not advertise host ownership", recovery.dataset);
 assert(recovery.dataset.target === "home-cli", "host recovery target drifted", recovery.dataset);
 assert(recoveryTitle.textContent.includes("Terminal"), "recovery title did not name failed shell", recoveryTitle.textContent);
-assert(recoveryCopy.textContent.includes("Reload"), "recovery copy did not expose reload path", recoveryCopy.textContent);
+assert(/reload/i.test(recoveryCopy.textContent), "recovery copy did not expose reload path", recoveryCopy.textContent);
 assert(recoveryDetail.textContent === "A Home service failed while loading.", "recovery detail exposed an internal launch error", recoveryDetail.textContent);
-assert(recoveryHome.disabled === true, "switchback button must fail closed without a launch token");
+assert(recoveryHome.disabled === false, "Desktop recovery should stay available with trusted Home host authority");
 assert((recoveryHome.listeners.get("click") || []).length === 1, "home-gui recovery control was not wired");
 assert((recoveryReload.listeners.get("click") || []).length === 1, "reload recovery control was not wired");
 assert((recoverySignOut.listeners.get("click") || []).length === 1, "sign-out recovery control was not wired");
@@ -302,5 +318,25 @@ assert((launcherSearch.listeners.get("input") || []).length === 0, "Home GUI lau
 assert((workspace.listeners.get("contextmenu") || []).length === 0, "Home GUI desktop context menu was bound before failed alternate shell settled");
 assert((desktop.listeners.get("pointerdown") || []).length === 0, "Home GUI desktop input was bound before failed alternate shell settled");
 assert(!requests.some((request) => request.url === "/api/apps/home/active-shell"), "failed launch recovery must not switch shell using ambient state", requests);
+
+for (const listener of recoveryHome.listeners.get("click") || []) {
+  listener();
+}
+for (let attempt = 0; attempt < 20; attempt += 1) {
+  if (requests.some((request) => request.url === "/api/apps/home/active-shell")) {
+    break;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  requests.some(
+    (request) =>
+      request.url === "/api/apps/home/active-shell"
+      && request.headers["x-elastos-home-token"] === "host-token"
+      && request.body?.active === "home-gui",
+  ),
+  "failed launch recovery did not drive Desktop activation with trusted Home host authority",
+  requests,
+);
 
 console.log("[home-shell-recovery] PASS");

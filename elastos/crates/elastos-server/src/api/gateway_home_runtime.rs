@@ -41,6 +41,57 @@ pub(super) async fn home_launch(
         ));
     };
 
+    // Launch is the authenticated mutation boundary for state that used to
+    // be changed by the target's first summary GET. Existing-only Profile
+    // registration starts Runtime-owned contact sync without creating
+    // identity, Profile, device, or contact state. Inbox launch retains the
+    // legacy Services mailbox behavior while keeping Inbox summary pure.
+    let data_dir = state.data_dir.clone();
+    let launch_context = context.clone();
+    let sync_services = target_summary.target == INBOX_CAPSULE_ID;
+    let services_sync_error = tokio::task::spawn_blocking(move || {
+        super::gateway_home_system::migrate_legacy_services_peer_contacts(
+            &data_dir,
+            &launch_context,
+        )?;
+        Ok::<_, anyhow::Error>(sync_services.then(|| {
+            super::gateway_home_system::home_services_sync_access_requests(
+                &data_dir,
+                &launch_context,
+            )
+            .err()
+            .map(|error| error.to_string())
+        }))
+    })
+    .await
+    .map_err(|err| gateway_internal_error(anyhow::anyhow!(err)))?
+    .map_err(gateway_internal_error)?
+    .flatten();
+    if let Some(error) = services_sync_error {
+        tracing::warn!(
+            error,
+            "Inbox launch could not sync Services access requests"
+        );
+    }
+    if let Some(service) = state.collaboration_discovery_service.as_ref() {
+        if let Some(authority) =
+            super::gateway_home_system::load_configured_contact_authority_for_context(
+                &state.data_dir,
+                &context,
+                Some(service),
+            )
+            .map_err(gateway_internal_error)?
+        {
+            super::gateway_home_system::register_configured_contact_sync_for_context(
+                service,
+                &context,
+                &authority,
+                now_ts(),
+            )
+            .map_err(gateway_internal_error)?;
+        }
+    }
+
     let launch = launch_runtime_backed_home_target(
         &state.data_dir,
         target_summary.target.as_str(),
@@ -125,6 +176,53 @@ fn append_home_launch_token_to_route(
     Ok(format!("{route}#{}", fragment.finish()))
 }
 
+/// Sizes every capsule that declares an icon must ship.
+const CAPSULE_ICON_SIZES: [u32; 4] = [32, 64, 128, 256];
+
+/// Turns a manifest's declared icon directory into capsule asset routes.
+///
+/// The Runtime resolves the routes; it never reads or re-hosts the bytes. A
+/// capsule that declares no icon gets an empty list, and the shell draws its
+/// own generic glyph instead of guessing at a path.
+///
+/// The asset route serves paths relative to the entrypoint's directory (for a
+/// `browser/index.html` capsule the serving root is `browser/`), while the
+/// manifest declares the icon capsule-relative like the entrypoint itself. So
+/// the declared directory must sit under the entrypoint's directory, and the
+/// route carries the remainder. An icon outside the serving root has no
+/// servable route, and pretending otherwise would hand the shell a 404.
+pub(in crate::api) fn capsule_icon_variants(
+    name: &str,
+    entrypoint: &str,
+    icon: Option<&str>,
+) -> Vec<CapsuleIconVariant> {
+    let Some(dir) = icon.map(str::trim).filter(|dir| !dir.is_empty()) else {
+        return Vec::new();
+    };
+    let dir = dir.trim_end_matches('/');
+    let entry_dir = match entrypoint.rsplit_once('/') {
+        Some((parent, _file)) => parent,
+        None => "",
+    };
+    let served = if entry_dir.is_empty() {
+        dir
+    } else if let Some(rest) = dir
+        .strip_prefix(entry_dir)
+        .and_then(|rest| rest.strip_prefix('/'))
+    {
+        rest
+    } else {
+        return Vec::new();
+    };
+    CAPSULE_ICON_SIZES
+        .iter()
+        .map(|size| CapsuleIconVariant {
+            size: *size,
+            route: format!("/apps/{name}/{served}/icon-{size}.png"),
+        })
+        .collect()
+}
+
 pub(super) fn home_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
     let catalog = capsule_catalog_summary(data_dir);
     home_targets_from_catalog(&catalog)
@@ -154,6 +252,7 @@ pub(super) fn home_targets_from_catalog(
                 },
                 viewer: capsule.viewer.clone(),
                 viewer_title: capsule.viewer_title.clone(),
+                icon: capsule.icon.clone(),
             })
         })
         .collect::<Vec<_>>();
@@ -194,6 +293,7 @@ fn home_browser_targets(data_dir: &std::path::Path, visible_only: bool) -> Vec<H
                 route: format!("/apps/{}/", app.name),
                 title: app_shell_title(&app.name),
                 description: app_shell_description(&app.name, app.description),
+                icon: capsule_icon_variants(&app.name, &app.entrypoint, app.icon.as_deref()),
                 target: app.name,
                 attach_kind: "iframe".to_string(),
                 role: app.role,
@@ -211,6 +311,8 @@ fn home_viewer_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
         .into_iter()
         .map(|capsule| {
             let viewer_title = app_shell_title(&capsule.viewer);
+            let icon =
+                capsule_icon_variants(&capsule.name, &capsule.entrypoint, capsule.icon.as_deref());
             HomeTargetSummary {
                 route: format!("/apps/{}/?capsule={}", capsule.viewer, capsule.name),
                 title: viewer_object_shell_title(&capsule.name, capsule.description.as_deref()),
@@ -222,6 +324,10 @@ fn home_viewer_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
                 attach_kind: "iframe".to_string(),
                 role: CapsuleRole::Content,
                 target_kind: HomeTargetKind::Object,
+                // A content capsule may ship its own icon; when it does not,
+                // the shell draws the object glyph rather than borrowing the
+                // viewer app's identity for a document.
+                icon,
                 viewer: Some(capsule.viewer),
                 viewer_title: Some(viewer_title),
             }
@@ -238,36 +344,41 @@ pub(super) fn is_home_visible_target(name: &str) -> bool {
     )
 }
 
-pub(super) fn load_gateway_identity_summary(data_dir: &std::path::Path) -> HomeIdentitySummary {
-    HomeIdentitySummary {
-        device_did: load_gateway_device_did(data_dir),
-        handle: None,
-        profile_card: None,
-    }
+fn load_gateway_device_did(data_dir: &std::path::Path) -> anyhow::Result<Option<String>> {
+    crate::collaboration_profile_authority::load_existing_device_did(data_dir)
 }
 
-fn load_gateway_device_did(data_dir: &std::path::Path) -> Option<String> {
-    let device_did = elastos_identity::load_or_create_did(data_dir)
-        .ok()
-        .map(|(_, did)| did)
-        .filter(|did| !did.trim().is_empty());
-    device_did
+impl HomeIdentitySummary {
+    /// The capsule-facing shape: identity facts minus the device identity.
+    /// System alone renders the device DID; Home and People have no consumer
+    /// for it, so they never receive it.
+    pub(super) fn without_device_identity(mut self) -> Self {
+        self.device_did = None;
+        self
+    }
 }
 
 pub(super) fn load_gateway_identity_summary_for_context(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
-) -> HomeIdentitySummary {
-    let profile_card = home_profile_card_summary_for_context(data_dir, context);
-    let handle = profile_card
-        .as_ref()
-        .map(|card| card.display_name.clone())
-        .or_else(|| principal_display_name_for_context(data_dir, context));
-    HomeIdentitySummary {
-        device_did: load_gateway_device_did(data_dir),
-        handle,
-        profile_card,
-    }
+) -> anyhow::Result<HomeIdentitySummary> {
+    let recovery_readiness =
+        super::gateway_home_system::recovery_readiness_for_context(data_dir, context);
+    let (profile_readiness, profile) =
+        super::gateway_home_system::home_profile_readiness_projection_for_context(
+            data_dir, context,
+        );
+    Ok(HomeIdentitySummary {
+        device_did: load_gateway_device_did(data_dir)?,
+        profile_readiness: Some(profile_readiness.clone()),
+        recovery_readiness: Some(recovery_readiness),
+        profile_setup_display_name: if profile_readiness.status == "setup_required" {
+            principal_display_name_for_context(data_dir, context)
+        } else {
+            None
+        },
+        profile,
+    })
 }
 
 fn principal_display_name_for_context(
@@ -812,7 +923,6 @@ pub(super) fn home_state(data_dir: &std::path::Path) -> HomeState {
     }
     let people = home_people_summary(&room_summary, identity.did.as_deref());
     let services = home_services_summary(data_dir, &room_summary, &people);
-    let _ = crate::notifications::sync_room_notifications(data_dir, &room_summary);
     let notifications = crate::notifications::load_summary(data_dir).unwrap_or_default();
 
     HomeState {
@@ -912,29 +1022,34 @@ fn home_people_summary(
         .members
         .iter()
         .filter(|member| local_did != Some(member.member_did.as_str()))
-        .enumerate()
-        .map(|(index, member)| {
+        .map(|member| {
             let active = active_by_member.get(&member.member_did);
             let profile_card = member
                 .profile_card
                 .clone()
                 .map(home_profile_card_from_room_profile);
+            // A conversation member is named by its signed profile card or is
+            // explicitly unverified. Session self-claims and invented role
+            // names are not identity sources.
             let display_name = profile_card
                 .as_ref()
                 .map(|card| card.display_name.clone())
-                .or_else(|| active.map(|participant| participant.display_name.clone()))
-                .unwrap_or_else(|| home_people_fallback_display_name(&member.role, index));
+                .unwrap_or_else(|| HOME_PEOPLE_UNVERIFIED_MEMBER_NAME.to_string());
             HomePeopleContactSummary {
                 contact_id: home_people_contact_id(&member.member_did),
+                remote_profile_did: profile_card.as_ref().map(|card| card.profile_id.clone()),
                 added_at: member.added_at,
+                conversation_id: None,
                 display_name,
                 handle: profile_card.as_ref().and_then(|card| card.handle.clone()),
                 relationship: "conversation".to_string(),
-                route: format!("/apps/{CHAT_ROOM_CAPSULE_ID}/"),
                 can_message: true,
                 device_label: active.map(|participant| participant.device_label.clone()),
                 profile_card,
                 last_seen_at: active.map(|participant| participant.last_seen_at),
+                // Room membership rows have no presence basis of their own; a
+                // room participant with an active session is the signal here.
+                reachable: None,
             }
         })
         .collect::<Vec<_>>();
@@ -1405,17 +1520,13 @@ fn home_profile_card_from_room_profile(
     }
 }
 
+/// The one honest name for a member row with no signed profile card. Chat
+/// renders the same marker for `profile_verified: false` rows.
+pub(super) const HOME_PEOPLE_UNVERIFIED_MEMBER_NAME: &str = "Unverified device";
+
 pub(super) fn home_people_contact_id(member_did: &str) -> String {
     let digest = Sha256::digest(format!("elastos.people.contact.v1:{member_did}").as_bytes());
     format!("contact:{}", hex::encode(&digest[..12]))
-}
-
-fn home_people_fallback_display_name(role: &crate::room_service::RoomRole, index: usize) -> String {
-    match role {
-        crate::room_service::RoomRole::Owner => "Conversation host".to_string(),
-        crate::room_service::RoomRole::Admin => "Conversation manager".to_string(),
-        crate::room_service::RoomRole::Member => format!("Conversation member {}", index + 1),
-    }
 }
 
 fn home_room_role_label(role: crate::room_service::RoomRole) -> String {
@@ -1427,7 +1538,7 @@ fn home_room_role_label(role: crate::room_service::RoomRole) -> String {
     .to_string()
 }
 
-fn home_notifications_summary(
+pub(super) fn home_notifications_summary(
     summary: crate::notifications::NotificationSummary,
 ) -> HomeNotificationsSummary {
     HomeNotificationsSummary {
@@ -1609,6 +1720,87 @@ async fn home_list_runtime_capsules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_capsule_icon_resolves_to_that_capsule_own_asset_routes() {
+        // The asset route serves relative to the entrypoint's directory, so a
+        // browser/index.html capsule serves browser/icons at /icons.
+        let variants = capsule_icon_variants("people", "browser/index.html", Some("browser/icons"));
+
+        let routes = variants
+            .iter()
+            .map(|variant| (variant.size, variant.route.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            routes,
+            vec![
+                (32, "/apps/people/icons/icon-32.png"),
+                (64, "/apps/people/icons/icon-64.png"),
+                (128, "/apps/people/icons/icon-128.png"),
+                (256, "/apps/people/icons/icon-256.png"),
+            ],
+            "each route must point at the declaring capsule, never at a shell icon table"
+        );
+
+        // A flat capsule (entrypoint at the root) serves its icon dir as-is.
+        let flat = capsule_icon_variants("viewer", "index.html", Some("icons"));
+        assert_eq!(flat[0].route, "/apps/viewer/icons/icon-32.png");
+    }
+
+    #[test]
+    fn a_capsule_that_declares_no_icon_gets_no_route_to_guess_at() {
+        assert!(capsule_icon_variants("people", "browser/index.html", None).is_empty());
+        assert!(capsule_icon_variants("people", "browser/index.html", Some("   ")).is_empty());
+    }
+
+    #[test]
+    fn an_icon_outside_the_serving_root_gets_no_route_rather_than_a_broken_one() {
+        // Declared beside — not under — the entrypoint's directory: the asset
+        // route cannot serve it, so the shell must get nothing, not a 404.
+        assert!(
+            capsule_icon_variants("people", "browser/index.html", Some("assets/icons")).is_empty()
+        );
+        assert!(
+            capsule_icon_variants("people", "browser/index.html", Some("browserx/icons"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_declared_icon_directory_may_not_escape_the_capsule() {
+        // The manifest rejects traversal before the runtime ever resolves a
+        // route, so the shell can trust every route it is handed.
+        let mut manifest = sample_icon_manifest();
+        manifest.icon = Some("../home-gui/browser/icons".to_string());
+        let error = manifest.validate().expect_err("traversal must be rejected");
+        assert!(
+            error.contains("path traversal"),
+            "unexpected error: {error}"
+        );
+
+        manifest.icon = Some("/etc/icons".to_string());
+        let error = manifest
+            .validate()
+            .expect_err("absolute paths must be rejected");
+        assert!(error.contains("relative path"), "unexpected error: {error}");
+
+        manifest.icon = Some("browser/icons".to_string());
+        manifest
+            .validate()
+            .expect("a capsule-relative icon is valid");
+    }
+
+    fn sample_icon_manifest() -> elastos_common::CapsuleManifest {
+        serde_json::from_value(serde_json::json!({
+            "schema": "elastos.capsule/v1",
+            "name": "people",
+            "version": "0.1.0",
+            "role": "app",
+            "type": "wasm",
+            "entrypoint": "browser/index.html",
+        }))
+        .expect("sample manifest parses")
+    }
 
     #[test]
     fn append_home_launch_token_keeps_authority_out_of_the_request_url() {

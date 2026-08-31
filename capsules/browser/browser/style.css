@@ -1,16 +1,20 @@
+/* Browser chrome — Safari-inspired unified toolbar.
+   Shell owns traffic lights (unified-toolbar); menubar owns the app name.
+   Page stage stays white — content ground, not chrome. */
 :root {
-  color-scheme: light;
-  --bg: #f7f3ea;
-  --surface: rgba(255, 255, 255, 0.88);
-  --surface-strong: #ffffff;
-  --ink: #16130e;
-  --ink-soft: rgba(22, 19, 14, 0.66);
-  --ink-mute: rgba(22, 19, 14, 0.44);
-  --line: rgba(22, 19, 14, 0.12);
-  --line-strong: rgba(22, 19, 14, 0.22);
-  --accent: #d46f24;
-  --accent-soft: rgba(212, 111, 36, 0.14);
-  --shadow: 0 10px 34px rgba(38, 29, 18, 0.1);
+  --bg: var(--el-bg);
+  --surface: var(--el-surface);
+  --surface-strong: var(--el-surface-raised);
+  --ink: var(--el-text);
+  --ink-soft: var(--el-muted);
+  --ink-mute: var(--el-soft);
+  --line: var(--el-hairline);
+  --line-strong: var(--el-hairline-strong);
+  --accent: var(--el-accent);
+  --accent-soft: var(--el-accent-soft);
+  --shadow: var(--el-shadow-2);
+  --chrome-pill: color-mix(in srgb, var(--el-lift) 88%, transparent);
+  --chrome-pill-stroke: color-mix(in srgb, var(--line) 55%, transparent);
 }
 
 * {
@@ -28,7 +32,8 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--ink);
-  font: 13px/1.4 "Geist", "Inter Tight", ui-sans-serif, system-ui, sans-serif;
+  font: 13px/1.4 var(--el-font);
+  -webkit-font-smoothing: antialiased;
 }
 
 button,
@@ -49,47 +54,68 @@ select {
 .browser-shell {
   position: relative;
   display: grid;
-  grid-template-rows: 46px minmax(0, 1fr);
+  grid-template-rows: 52px minmax(0, 1fr);
   width: 100%;
   height: 100%;
   min-height: 0;
-  background: var(--surface-strong);
+  background: var(--bg);
   overflow: hidden;
 }
 
+/* One tool band under shell lights — pad leading for traffic lights. */
 .browser-chrome {
   display: grid;
-  grid-template-columns: 34px 34px 34px minmax(0, 1fr) 34px;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 6px;
-  border-bottom: 1px solid var(--line);
-  background: var(--surface);
-  padding: 6px;
-  backdrop-filter: blur(14px);
+  gap: 8px;
+  min-height: 52px;
+  padding: 8px 10px 8px var(--window-chrome-safe-leading, 96px);
+  border-bottom: 0;
+  background: var(--bg);
+}
+
+.browser-nav-group,
+.browser-util-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  min-height: 28px;
+  padding: 2px;
+  border: 1px solid var(--chrome-pill-stroke);
+  border-radius: 999px;
+  background: var(--chrome-pill);
+}
+
+.browser-nav-divider {
+  width: 1px;
+  height: 14px;
+  margin: 0 1px;
+  background: var(--chrome-pill-stroke);
 }
 
 .browser-nav-button {
   display: grid;
   place-items: center;
-  width: 34px;
-  height: 34px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.72);
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
   color: var(--ink);
   cursor: pointer;
-  font-size: 16px;
-  font-weight: 650;
-  transition:
-    background 140ms ease,
-    border-color 140ms ease,
-    opacity 140ms ease;
+  font-size: 14px;
+  font-weight: 600;
+  transition: background 140ms ease, opacity 140ms ease;
+}
+
+.browser-nav-lone {
+  border: 1px solid var(--chrome-pill-stroke);
+  background: var(--chrome-pill);
 }
 
 .browser-nav-button:hover,
 .browser-nav-button:focus-visible {
-  border-color: var(--line-strong);
-  background: var(--accent-soft);
+  background: var(--el-lift-strong);
   outline: none;
 }
 
@@ -100,17 +126,41 @@ select {
 
 .browser-address-row {
   min-width: 0;
+  justify-self: stretch;
+}
+
+.browser-address {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  border: 1px solid var(--chrome-pill-stroke);
+  border-radius: 999px;
+  background: var(--chrome-pill);
+  color: var(--ink);
+  padding: 0 14px;
+  outline: none;
+  font-family: var(--el-font);
+  font-size: 12px;
+  font-weight: 500;
+  text-align: center;
+}
+
+.browser-address:focus {
+  border-color: var(--el-focus);
+  background: var(--el-inset);
+  box-shadow: 0 0 0 3px rgba(246, 146, 26, 0.15);
+  text-align: left;
 }
 
 .browser-settings-panel {
   position: absolute;
-  top: 52px;
+  top: 56px;
   right: 8px;
   z-index: 20;
   width: min(280px, calc(100% - 16px));
   border: 1px solid var(--line);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.96);
+  border-radius: 12px;
+  background: var(--surface-strong);
   box-shadow: var(--shadow);
   padding: 10px;
 }
@@ -128,9 +178,9 @@ select {
   place-items: center;
   width: 26px;
   height: 26px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface-strong);
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--el-inset);
   color: var(--ink);
   cursor: pointer;
   font-size: 16px;
@@ -139,8 +189,7 @@ select {
 
 .browser-settings-close:hover,
 .browser-settings-close:focus-visible {
-  border-color: var(--line-strong);
-  background: var(--accent-soft);
+  background: var(--el-lift);
   outline: none;
 }
 
@@ -149,7 +198,7 @@ select {
   margin-bottom: 5px;
   color: var(--ink-soft);
   font-size: 12px;
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .browser-settings-label-spaced {
@@ -162,8 +211,8 @@ select {
   min-width: 0;
   height: 34px;
   border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.82);
+  border-radius: 999px;
+  background: var(--el-inset);
   color: var(--ink);
   padding: 0 26px 0 10px;
   outline: none;
@@ -172,8 +221,8 @@ select {
 
 .browser-select:focus,
 .browser-exit-select:focus {
-  border-color: var(--line-strong);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  border-color: var(--el-focus);
+  box-shadow: 0 0 0 3px rgba(246, 146, 26, 0.15);
 }
 
 .browser-settings-hint {
@@ -187,11 +236,11 @@ select {
   min-height: 34px;
   margin-top: 12px;
   border: 1px solid var(--line);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.82);
+  border-radius: 999px;
+  background: var(--el-inset);
   color: var(--ink);
   cursor: pointer;
-  font-weight: 650;
+  font-weight: 600;
   text-align: center;
 }
 
@@ -208,31 +257,50 @@ select {
 }
 
 .browser-settings-danger {
-  color: #7f1d1d;
+  color: var(--el-danger);
 }
 
 .browser-settings-danger:hover,
 .browser-settings-danger:focus-visible {
-  background: rgba(239, 68, 68, 0.1);
+  background: color-mix(in srgb, var(--el-danger) 12%, transparent);
 }
 
-.browser-address {
-  width: 100%;
-  min-width: 0;
-  height: 34px;
-  border: 1px solid var(--line);
+.browser-settings-confirm {
+  margin-top: 12px;
+  border: 1px solid color-mix(in srgb, var(--el-danger) 40%, transparent);
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.82);
+  background: color-mix(in srgb, var(--el-danger) 8%, transparent);
+  padding: 10px;
+}
+
+.browser-settings-confirm[hidden] {
+  display: none;
+}
+
+.browser-settings-confirm p {
+  margin: 0 0 10px;
   color: var(--ink);
-  padding: 0 12px;
-  outline: none;
-  font-family: "Geist Mono", "JetBrains Mono", ui-monospace, monospace;
   font-size: 12px;
 }
 
-.browser-address:focus {
-  border-color: var(--line-strong);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+.browser-settings-confirm-row {
+  display: flex;
+  gap: 8px;
+}
+
+.browser-settings-confirm-row .browser-settings-action {
+  margin-top: 0;
+}
+
+.browser-settings-confirm-commit {
+  border-color: transparent;
+  background: var(--el-danger);
+  color: var(--el-bg);
+}
+
+.browser-settings-confirm-commit:hover,
+.browser-settings-confirm-commit:focus-visible {
+  background: color-mix(in srgb, var(--el-danger) 84%, var(--el-text));
 }
 
 .browser-stage {
@@ -240,7 +308,7 @@ select {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: var(--surface-strong);
+  background: var(--bg);
 }
 
 .browser-render-panel {
@@ -303,7 +371,7 @@ select {
   max-width: min(520px, calc(100% - 24px));
   border: 1px solid var(--line);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.94);
+  background: var(--surface-strong);
   box-shadow: var(--shadow);
   color: var(--ink-soft);
   display: inline-flex;
@@ -361,11 +429,11 @@ select {
   max-width: min(720px, calc(100% - 24px));
   border: 1px solid var(--line);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.9);
+  background: var(--surface-strong);
   box-shadow: var(--shadow);
   color: var(--ink-soft);
   padding: 6px 10px;
-  font-family: "Geist Mono", "JetBrains Mono", ui-monospace, monospace;
+  font-family: var(--el-font-mono);
   font-size: 11px;
   white-space: nowrap;
   overflow: hidden;
@@ -379,42 +447,20 @@ body[data-loading="true"] .browser-address {
 
 @media (max-width: 640px) {
   .browser-shell {
-    grid-template-rows: 42px minmax(0, 1fr);
+    grid-template-rows: 48px minmax(0, 1fr);
   }
 
   .browser-chrome {
-    grid-template-columns: 30px 30px 30px minmax(0, 1fr) 30px;
-    gap: 5px;
-    padding: 5px;
-  }
-
-  .browser-nav-button,
-  .browser-address {
-    height: 30px;
-    border-radius: 9px;
-  }
-
-  .browser-nav-button {
-    width: 30px;
-    font-size: 14px;
+    min-height: 48px;
+    gap: 6px;
+    padding: 6px 8px 6px var(--window-chrome-safe-leading, 96px);
   }
 
   .browser-address {
-    padding: 0 9px;
     font-size: 11px;
   }
 
-  .browser-status {
-    right: 8px;
-    bottom: 8px;
-    max-width: calc(100% - 16px);
-    border-radius: 12px;
-  }
-
-  .browser-metrics {
-    left: 8px;
-    bottom: 8px;
-    max-width: calc(100% - 16px);
-    border-radius: 12px;
+  .browser-settings-panel {
+    top: 52px;
   }
 }

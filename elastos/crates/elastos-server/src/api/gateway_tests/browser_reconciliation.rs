@@ -4,7 +4,6 @@ use crate::api::browser_engine_protocol::{
     BROWSER_ENGINE_PROVIDER_ID,
 };
 use crate::api::gateway::gateway_browser::*;
-use std::sync::atomic::Ordering;
 
 fn browser_lifecycle(owner_launch_id: &str) -> BrowserLaunchLifecycle {
     BrowserLaunchLifecycle {
@@ -88,35 +87,6 @@ async fn record_active_page(
     reservation
 }
 
-async fn yield_until_atomic(counter: &std::sync::atomic::AtomicUsize, expected: usize) {
-    for _ in 0..100_000 {
-        if counter.load(Ordering::SeqCst) >= expected {
-            return;
-        }
-        tokio::task::yield_now().await;
-    }
-    panic!(
-        "counter did not reach {expected}; observed {}",
-        counter.load(Ordering::SeqCst)
-    );
-}
-
-async fn yield_until_close_count(
-    close_calls: &Arc<TokioMutex<Vec<serde_json::Value>>>,
-    expected: usize,
-) {
-    for _ in 0..10_000 {
-        if close_calls.lock().await.len() >= expected {
-            return;
-        }
-        tokio::task::yield_now().await;
-    }
-    panic!(
-        "close calls did not reach {expected}; observed {}",
-        close_calls.lock().await.len()
-    );
-}
-
 async fn yield_until_cleanup_obligation_count(state: &GatewayState, expected: usize) {
     for _ in 0..10_000 {
         if browser_engine_cleanup_obligation_count(&state.data_dir).await == expected {
@@ -136,19 +106,37 @@ async fn finish_current_reconciliation_sweep() {
     }
 }
 
-async fn advance_until_atomic(
-    counter: &std::sync::atomic::AtomicUsize,
+async fn settle_sweep_without_virtual_time_autoadvance(
+    reconciler: &BrowserLifecycleReconciler,
+    expected_completed_sweeps: usize,
+) {
+    tokio::select! {
+        biased;
+        _ = reconciler.wait_for_completed_sweeps(expected_completed_sweeps) => {}
+        _ = async {
+            for _ in 0..5_000_000 {
+                tokio::task::yield_now().await;
+            }
+        } => panic!(
+            "reconciler sweep {expected_completed_sweeps} did not settle under a paused clock \
+             without a real-clock timeout"
+        ),
+    }
+}
+
+async fn advance_until_reconciliation_call_count(
+    calls: &BrowserReconciliationCallRecorder,
     expected: usize,
     step: Duration,
 ) {
     for _ in 0..10 {
-        if counter.load(Ordering::SeqCst) >= expected {
+        if calls.count() >= expected {
             return;
         }
         tokio::time::advance(step).await;
         finish_current_reconciliation_sweep().await;
     }
-    yield_until_atomic(counter, expected).await;
+    calls.wait_for_count(expected).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -174,19 +162,19 @@ async fn runtime_restart_scans_pending_launch_and_closes_late_success_without_an
 
     let first_runtime =
         start_browser_lifecycle_reconciler(state.clone()).expect("first Runtime reconciler");
-    yield_until_atomic(&reconciliation_calls, 1).await;
+    reconciliation_calls.wait_for_count(1).await;
     assert_eq!(
         browser_launch_reconciliation_obligation_count(&state.data_dir).await,
         1
     );
-    assert!(close_calls.lock().await.is_empty());
+    assert!(close_calls.snapshot().await.is_empty());
     first_runtime.cancel();
     first_runtime.join().await.expect("first Runtime shutdown");
 
     let restarted_runtime =
         start_browser_lifecycle_reconciler(state.clone()).expect("restarted Runtime reconciler");
-    yield_until_atomic(&reconciliation_calls, 2).await;
-    yield_until_close_count(&close_calls, 1).await;
+    reconciliation_calls.wait_for_count(2).await;
+    close_calls.wait_for_count(1).await;
     assert_eq!(
         browser_launch_reconciliation_obligation_count(&state.data_dir).await,
         0
@@ -195,7 +183,7 @@ async fn runtime_restart_scans_pending_launch_and_closes_late_success_without_an
         browser_engine_cleanup_obligation_count(&state.data_dir).await,
         0
     );
-    let calls = close_calls.lock().await;
+    let calls = close_calls.snapshot().await;
     assert_eq!(calls.len(), 1);
     assert_eq!(
         calls[0]["runtime_cleanup"]["generation"],
@@ -241,13 +229,13 @@ async fn newly_committed_launch_obligation_wakes_reconciler_without_time_advance
     )
     .await;
 
-    yield_until_atomic(&reconciliation_calls, 1).await;
-    yield_until_close_count(&close_calls, 1).await;
+    reconciliation_calls.wait_for_count(1).await;
+    close_calls.wait_for_count(1).await;
     assert_eq!(
         browser_launch_reconciliation_obligation_count(&state.data_dir).await,
         0
     );
-    assert_eq!(close_calls.lock().await.len(), 1);
+    assert_eq!(close_calls.snapshot().await.len(), 1);
     reconciler.cancel();
     reconciler.join().await.expect("Runtime shutdown");
 }
@@ -388,7 +376,7 @@ async fn periodic_stale_cleanup_retries_exact_binding_and_blocks_replacement_fai
 async fn stale_stream_timeout_releases_exact_claim_for_retry_without_restart() {
     let dir = tempfile::tempdir().unwrap();
     let engine_close_calls = Arc::new(TokioMutex::new(Vec::new()));
-    let exit_close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    let exit_close_calls = BrowserCloseCallRecorder::new();
     let exit_close_started = Arc::new(tokio::sync::Notify::new());
     let state = browser_engine_retrying_close_test_state(
         dir.path(),
@@ -446,7 +434,7 @@ async fn stale_stream_timeout_releases_exact_claim_for_retry_without_restart() {
     );
 
     let mut completed_sweeps = 2;
-    for _ in 0..4 {
+    for _ in 0..64 {
         if browser_engine_cleanup_obligation_count(&state.data_dir).await == 0
             && browser_stream_cleanup_obligation_count(&state.data_dir).await == 0
         {
@@ -455,9 +443,20 @@ async fn stale_stream_timeout_releases_exact_claim_for_retry_without_restart() {
         notify_browser_lifecycle_reconciler(&state.data_dir);
         reconciler.resume_sweeps();
         completed_sweeps += 1;
-        reconciler.wait_for_completed_sweeps(completed_sweeps).await;
+        settle_sweep_without_virtual_time_autoadvance(&reconciler, completed_sweeps).await;
     }
-    let calls = exit_close_calls.lock().await;
+    assert_eq!(
+        browser_engine_cleanup_obligation_count(&state.data_dir).await,
+        0,
+        "exact engine cleanup obligations must drain to 0 via retry sweeps"
+    );
+    assert_eq!(
+        browser_stream_cleanup_obligation_count(&state.data_dir).await,
+        0,
+        "exact stream cleanup obligations must drain to 0 via retry sweeps"
+    );
+    exit_close_calls.wait_for_count(2).await;
+    let calls = exit_close_calls.snapshot().await;
     assert!(calls.len() >= 2);
     assert!(calls.iter().all(|call| {
         call["stream_id"] == "stream:launch:stale-stream-timeout"
@@ -488,7 +487,7 @@ async fn stale_stream_timeout_releases_exact_claim_for_retry_without_restart() {
 async fn hanging_stream_timeout_releases_exact_claim_for_retry_without_restart() {
     let dir = tempfile::tempdir().unwrap();
     let engine_close_calls = Arc::new(TokioMutex::new(Vec::new()));
-    let exit_close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    let exit_close_calls = BrowserCloseCallRecorder::new();
     let exit_close_started = Arc::new(tokio::sync::Notify::new());
     let state = browser_engine_retrying_close_test_state(
         dir.path(),
@@ -537,17 +536,35 @@ async fn hanging_stream_timeout_releases_exact_claim_for_retry_without_restart()
         1
     );
 
+    // Sweeps drive the retry, but the settled obligation is not the signal to
+    // read close calls by: it can settle before the retry's close call has been
+    // appended. Drive sweeps, then wait for the committed close count directly.
+    // Sweeps drive both the retry close call and the obligation settlement, so
+    // drive until each is actually ready rather than for a fixed number of
+    // rounds. The bound is only a deadlock guard: a fixed round budget can
+    // expire with the obligation still outstanding. A settled obligation is
+    // also not on its own a signal to read close calls by, because it can
+    // settle before the retry's close call has been appended, so wait for the
+    // committed close count directly before reading the calls.
     let mut completed_sweeps = 1;
-    for _ in 0..4 {
-        if browser_stream_cleanup_obligation_count(&state.data_dir).await == 0 {
+    for _ in 0..64 {
+        if exit_close_calls.count() >= 2
+            && browser_stream_cleanup_obligation_count(&state.data_dir).await == 0
+        {
             break;
         }
         notify_browser_lifecycle_reconciler(&state.data_dir);
         reconciler.resume_sweeps();
         completed_sweeps += 1;
-        reconciler.wait_for_completed_sweeps(completed_sweeps).await;
+        settle_sweep_without_virtual_time_autoadvance(&reconciler, completed_sweeps).await;
     }
-    let calls = exit_close_calls.lock().await;
+    assert_eq!(
+        browser_stream_cleanup_obligation_count(&state.data_dir).await,
+        0,
+        "exact stream cleanup obligations must drain to 0 via retry sweeps"
+    );
+    exit_close_calls.wait_for_count(2).await;
+    let calls = exit_close_calls.snapshot().await;
     assert!(calls.len() >= 2);
     assert!(calls.iter().all(|call| {
         call["stream_id"].as_str() == Some(stream_cleanup.stream_id.as_str())
@@ -587,15 +604,16 @@ async fn transient_reconciliation_failure_retries_with_backoff_and_retains_owner
     .await;
     let reconciler = start_browser_lifecycle_reconciler(state.clone()).expect("Runtime reconciler");
 
-    yield_until_atomic(&reconciliation_calls, 1).await;
+    reconciliation_calls.wait_for_count(1).await;
     assert_eq!(
         browser_launch_reconciliation_obligation_count(&state.data_dir).await,
         1
     );
-    assert!(close_calls.lock().await.is_empty());
+    assert!(close_calls.snapshot().await.is_empty());
     finish_current_reconciliation_sweep().await;
-    advance_until_atomic(&reconciliation_calls, 2, Duration::from_millis(100)).await;
-    yield_until_close_count(&close_calls, 1).await;
+    advance_until_reconciliation_call_count(&reconciliation_calls, 2, Duration::from_millis(100))
+        .await;
+    close_calls.wait_for_count(1).await;
     assert_eq!(
         browser_launch_reconciliation_obligation_count(&state.data_dir).await,
         0
@@ -622,12 +640,12 @@ async fn reconciliation_timeout_retains_exact_ownership_until_late_terminal_clea
     .await;
     let reconciler = start_browser_lifecycle_reconciler(state.clone()).expect("Runtime reconciler");
 
-    yield_until_atomic(&reconciliation_calls, 1).await;
+    reconciliation_calls.wait_for_count(1).await;
     assert_eq!(
         browser_launch_reconciliation_obligation_count(&state.data_dir).await,
         1
     );
-    assert!(close_calls.lock().await.is_empty());
+    assert!(close_calls.snapshot().await.is_empty());
 
     tokio::time::advance(Duration::from_secs(31)).await;
     finish_current_reconciliation_sweep().await;
@@ -635,10 +653,11 @@ async fn reconciliation_timeout_retains_exact_ownership_until_late_terminal_clea
         browser_launch_reconciliation_obligation_count(&state.data_dir).await,
         1
     );
-    assert!(close_calls.lock().await.is_empty());
+    assert!(close_calls.snapshot().await.is_empty());
 
-    advance_until_atomic(&reconciliation_calls, 2, Duration::from_millis(100)).await;
-    yield_until_close_count(&close_calls, 1).await;
+    advance_until_reconciliation_call_count(&reconciliation_calls, 2, Duration::from_millis(100))
+        .await;
+    close_calls.wait_for_count(1).await;
     assert_eq!(
         browser_launch_reconciliation_obligation_count(&state.data_dir).await,
         0
@@ -647,7 +666,7 @@ async fn reconciliation_timeout_retains_exact_ownership_until_late_terminal_clea
         browser_engine_cleanup_obligation_count(&state.data_dir).await,
         0
     );
-    let calls = close_calls.lock().await;
+    let calls = close_calls.snapshot().await;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["page_id"], calls[0]["runtime_cleanup"]["page_id"]);
     assert_eq!(
@@ -690,11 +709,11 @@ async fn unavailable_reconciliation_is_capped_and_blocks_replacement_fail_closed
     .await;
     let reconciler = start_browser_lifecycle_reconciler(state.clone()).expect("Runtime reconciler");
 
-    yield_until_atomic(&reconciliation_calls, 1).await;
+    reconciliation_calls.wait_for_count(1).await;
     for _ in 0..100 {
         tokio::task::yield_now().await;
     }
-    assert_eq!(reconciliation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(reconciliation_calls.count(), 1);
     for delay in [
         Duration::from_millis(100),
         Duration::from_millis(200),
@@ -704,7 +723,7 @@ async fn unavailable_reconciliation_is_capped_and_blocks_replacement_fail_closed
         tokio::time::advance(delay).await;
         tokio::task::yield_now().await;
     }
-    assert!(reconciliation_calls.load(Ordering::SeqCst) <= 5);
+    assert!(reconciliation_calls.count() <= 5);
     assert_eq!(
         browser_launch_reconciliation_obligation_count(&state.data_dir).await,
         1
@@ -739,7 +758,7 @@ async fn shutdown_cancels_active_reconciliation_and_releases_its_durable_claim()
     .await;
     let reconciler = start_browser_lifecycle_reconciler(state.clone()).expect("Runtime reconciler");
 
-    yield_until_atomic(&reconciliation_calls, 1).await;
+    reconciliation_calls.wait_for_count(1).await;
     reconciler.cancel();
     reconciler.join().await.expect("prompt Runtime shutdown");
     assert_eq!(
@@ -771,7 +790,7 @@ async fn exact_cleanup_ownership_remains_until_typed_terminal_receipt() {
         .expect("controlled Runtime reconciler");
 
     reconciler.wait_for_completed_sweeps(1).await;
-    let close_calls_guard = close_calls.lock().await;
+    let close_calls_guard = close_calls.snapshot().await;
     assert_eq!(
         browser_launch_reconciliation_obligation_count(&state.data_dir).await,
         0
@@ -804,7 +823,7 @@ async fn exact_cleanup_ownership_remains_until_typed_terminal_receipt() {
         browser_engine_cleanup_obligation_count(&state.data_dir).await,
         0
     );
-    let calls = close_calls.lock().await;
+    let calls = close_calls.snapshot().await;
     assert_eq!(calls.len(), 3);
     assert!(calls
         .windows(2)

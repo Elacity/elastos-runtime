@@ -15,6 +15,299 @@ Do not add new product surface area until the `Now` section is materially tighte
 Read this section as strict priority order for this branch. Do not start a lower
 section if a higher section is incoherent, unverified, or too large to review.
 
+Active priority index:
+
+- current priority: publish the reviewed final candidate and pass full CI on
+  its exact revision before the separately approved main merge. Preserve
+  reviewed history. The deferred source work below stays outside this merge;
+  installed acceptance and protected-content cutover remain separate gates
+- release versioning is prepared in the local 0.7.0 release commit: workspace
+  `0.7.0`, minor-bumped changed capsule manifests, and the cut changelog
+  entry. Still open before the main merge: tag the released 0.6 `main` as
+  `v0.6.0` before it moves, pass CI on the exact release revision, refresh
+  the journey-audit snapshot on that same revision, and record an explicit
+  release disposition for the open P1 findings (F-01, F-43, F-44, F-54).
+  Publication then stamps `ELASTOS_RELEASE_VERSION=0.7.0` through the checked
+  publish flow and tags `v0.7.0`
+- separately authorized after localhost: install the same reviewed tree on the
+  seed and the third custody node with matching stable receipts
+- integrated UIUX source evidence: published
+  `origin/feat/0.7-uiux-candidate` at `8b547590`; this ref is donor evidence,
+  not installed, live, or release truth
+- current protected-content integration source line: published
+  `origin/feat/protected-content-uiux-reconstruction` (PR39), including the
+  exact PR43 mint-adoption commit `58ebfb23`. The earlier `d06d64f3` revision
+  passed all seven CI jobs. The final revision needs its own CI result.
+  The audit fixes retain mixed source and installed evidence. Each
+  remaining GUI gate needs its own verdict
+- all other work remains queued below
+
+### Integrated UIUX and protected-content proof
+
+Verified integrated source truth is in [state.md](state.md). The following
+gates are the remaining path to installation and cutover.
+
+Open gates, in order:
+
+1. [ ] Pass all CI jobs on the corrected PR39 revision. Include both Linux
+   architectures, the clean macOS installation and the x86_64 release build.
+2. [ ] Install and retest the exact reviewed tree on isolated localhost with
+   matching stable Runtime, component, capsule metadata, provider, static
+   audit, installation, and platform restart receipts.
+3. [ ] After separate authorization, install the same reviewed tree on the
+   seed and the third custody node with matching stable Runtime, component,
+   capsule metadata, provider, static audit, installation, and platform
+   restart receipts.
+4. [ ] Provision one real signed owner-only 2-of-3 custody composition across
+   three distinct operators and failure domains.
+5. [ ] Install the private multi-RPC Chain configuration and verify the exact
+   deployed Base network, contract, token, emitter, and finality authority.
+6. [ ] Prove exactly three protected-content replicas and repair after one
+   replica is lost.
+7. [ ] Fund the creator and buyer Base accounts, then run the Brave two-Runtime
+   journey: mint, list, and share on localhost; import, deny, buy, open, play,
+   and close on the seed. Prove one bound KID with allowed, denied, and unbound
+   reads, the CentralStorage binding, the exact `AuthorityGateway.buyAccess`
+   receipt and event, restart, replay, tamper rejection, settlement, cleanup,
+   and zero unresolved state.
+8. [ ] Complete the installed manual UIUX matrix for Home windows, focus,
+    fullscreen, and launcher; People, Chat, Inbox, and Clipboard; Wallet and
+    connectors; Library, Marketplace, and `elacity-player`; Assistant
+    model-offer states; GBA; and Browser.
+9. [ ] Make one atomic cutover that selects the Runtime-owned protected-content
+   path and removes the provisional `drm`, `rights`, `key`, and `decrypt`
+   authority surfaces from startup, registration, resources, packaging, tests,
+   and docs.
+
+The operator-owned model-provider configuration remains a separate installed
+Assistant proof item. Missing configuration is an honest zero-offer state.
+
+### Home audit follow-up
+
+- [ ] Diagnose and prove direct Desktop/Terminal switching on the installed
+  Home. Host-authority and startup-replay repairs have source coverage, but
+  an installed transition can still leave a blank shell. Verify the exact
+  Inbox handoff through that transition and native Terminal Chat separately.
+- [ ] Prove recovery coverage when a Profile is created after the first
+  recovery-kit download, plus clean first-run Profile and window placement.
+- [ ] Complete Browser input ordering, lifecycle and accepted media proof on
+  the target installation. Source checks cover only their stated contracts.
+- [ ] Finish document-dialog keyboard focus and the remaining app-by-app
+  acceptance matrix. Preserve failed, partial and prerequisite-blocked results
+  as separate outcomes; a visible control alone is a partial observation.
+- [ ] Verify completed-mint adoption after a restart on the installed path.
+  Reconcile partial settled mint records and their custody cleanup obligations;
+  the source adoption repair only rolls forward fully completed records.
+- [ ] Turn the journey audit register into an automated pre-release gate:
+  extract Journey Matrix rows with complete verdicts into scripted checks that
+  run before every release, following the existing smoke-script pattern.
+  Journeys whose proof needs installed evidence stay manual and keep their
+  register verdicts authoritative.
+- [ ] Review Irzhy's PR15 follow-up on pinning the canonical
+  `has_access_by_content_id` selector (`0x54d42821`). Current configuration
+  validates its shape. Use a gated channel for deny proofs; a permissive
+  token-threshold configuration is a separate operator choice.
+
+## Later
+
+### Deferred source integration
+
+The August 31 source-merge scope leaves these items open. Their donor work is
+preserved; an older implementation is not evidence that it fits current contracts.
+
+- [ ] Adapt Carrier's incoming request size and deadline limits from the
+  retained Carrier work without changing current provider-invocation semantics.
+  Cover oversized, slow and incomplete frames plus valid protected-content
+  calls. Review the broader signed-protocol and peer-budget work separately.
+- [ ] Review the retained native-component interoperability design as a
+  separate proposal. COMO adoption needs its own feasibility and isolation proof.
+- [ ] Adapt advanced Assistant workflows under
+  [Deferred Sash UIUX work](#deferred-sash-uiux-work).
+- [ ] Resolve legacy-auth migration under
+  [Operator and audit hardening](#operator-and-audit-hardening), preserving
+  historical audit evidence and existing identity state.
+
+### Content distribution and Windows
+
+- [ ] Implement the signed content-capsule catalog and typed Get contract in
+  [docs/CONTENT_CAPSULE_DISTRIBUTION.md](docs/CONTENT_CAPSULE_DISTRIBUTION.md).
+  Use the complete bundle CID, publisher verification, availability evidence,
+  atomic admission, install/removal receipts and partial-download cleanup.
+  Keep large model bytes outside Git and external repositories behind providers.
+- [ ] Prove the WSL-first strategy in [docs/WINDOWS.md](docs/WINDOWS.md) on a
+  fresh Windows machine, including stable localhost/passkey origin, Recovery
+  Kit, Profile, Wallet, People, Chat, restart, update and cleanup. Native Windows
+  remains later adapter work; preserve the known Unix portability gaps.
+
+### Consequence-aware effects
+
+- [ ] Before shipping a physical or retry-sensitive provider, define its typed
+  observation or actuation contract and provider operation classification.
+  Runtime must enforce or strengthen that classification. Also define the
+  effect-ID and reconciliation policy, deadlines, settlement evidence, and
+  local safety owner. Prove that capsule metadata cannot downgrade the policy,
+  remote authority cannot bypass a destination interlock, and reconnect or
+  timeout cannot repeat an uncertain effect. Keep field buses, controller
+  protocols, peers, host paths, backends, and credentials below the provider
+  boundary. Do not add a separate OT authority stack or claim Runtime is a hard
+  real-time controller.
+
+### Collaboration identity and Carrier boundary
+
+- [ ] Define and prove multi-device Profile pairing after installed
+  collaboration acceptance.
+- [ ] Add direct-message attachments through the typed Runtime contract after
+  installed text-message acceptance.
+- [ ] Define the wider-rollout rendezvous and abuse-control plan for People
+  discovery without weakening the current source guarantees: discovery stays
+  opt-in and bounded to `Visible now`, seeds remain configuration/rendezvous
+  authority only, isolated and alternate networks stay possible, accepted
+  contacts continue without the seed online, and today's fixed-cap relay proves
+  bounds rather than a global roster or 100k-user scale.
+- [ ] Treat the provisioned shared conversation as an explicit onboarding room,
+  not the architecture for all group Chat. Direct conversations are between
+  accepted Profile identities. User-created groups need their own stable
+  conversation identity, signed membership/grants, bounded discovery, and
+  durable catch-up. Joining one collaboration network must never enumerate or
+  subscribe a person to every user or every group on that network.
+
+#### Offline delivery
+
+- [ ] Implement encrypted mailbox delivery per the boundary recorded under
+  "Later work" in
+  [docs/COLLABORATION_HANDOFF.md](docs/COLLABORATION_HANDOFF.md), after
+  the installed two-runtime acceptance. The design fixes the holder model (any
+  Runtime via Services
+  offers, seed never special), sealed-envelope deposits with receipts
+  travelling symmetrically, unchanged delivery truth and end-of-life, the
+  named holder metadata, holder-enforced retention, and the
+  `collaboration-mailbox` provider running on `collaboration_delivery.rs`.
+- [ ] Implement app-declared data retention when a second consumer exists.
+  Designed: the declared-policy pattern Chat already ships
+  (`DECLARED_DIRECT_HISTORY_POLICY`) generalizes to a per-app, per-object-class
+  declaration the Runtime enforces at the read model — `SurvivesRelationship`
+  (direct history today), `GatedByRelationship` (the contacts-derived refusal),
+  and `RevocableEncrypted` (the future `elastos://vault` class). Refusing a
+  read stays a capability an app declares, never an emergent side effect.
+  Chat is the only consumer today, so the generalization waits for the second
+  one rather than abstracting from a single case.
+- [ ] Implement silent block after installed acceptance. Decided: block is a
+  separate verb from remove, not a variant. Remove stays the honest signed
+  default that tells the other side. Block is local-only: no wire artifact is
+  minted (silence is the feature), a local flag on the relationship record
+  stops both delivery directions after verification, no receipt is returned so
+  the blocked sender sees ordinary non-delivery indistinguishable from
+  offline, and the People state machine reserves `blocked` beside the removed
+  states. Unblock clears the flag locally with nothing to re-announce.
+
+#### Deferred Sash UIUX work
+
+- [ ] Add a People-owned ambient indication while opt-in discovery is active,
+  without giving Home read access to People's private discovery state.
+- [ ] Define a typed, attributed capsule-rendered compact panel surface only if
+  the product needs app-owned controls inside system chrome. This is future
+  surface work, not a migration shortcut.
+- [ ] Add advanced Assistant workflows only after typed Runtime contracts and
+  accepted product scope exist for them: desktop attachment, knowledge/citation
+  and search flows, rich media preview/open, and advanced Studio
+  inputs/workflows.
+  Retain the August harness and Studio donors as implementation evidence:
+  `origin/feat/home-agent-harness`, `origin/feat/home-agent-harness-rebuild` and
+  `origin/experiment/home-studio-h3-dogfood`. Their retained source is separate
+  from inclusion in the standalone Assistant. Port the useful behavior through
+  typed resources; preserve the existing offer, run and workspace contracts.
+
+#### First run on a clean Home
+
+- [ ] Complete the clean macOS Browser installation path. Source-home setup
+  already installs provider/helper components and generates Browser config;
+  a fresh target still needs the matching VM substrate and installed product
+  proof. Define their package/profile ownership and use
+  `browser-vm-engine-preflight.sh` to identify missing artifacts before launch.
+- [ ] Scope the Browser VM control socket and root to the Home. The adapter
+  config generator derives both from the platform alone —
+  `/tmp/elastos-browser-vm-control-darwin-arm64.sock` and `/tmp/evzs` — so
+  every Home on one machine writes the same two paths, and a second Home
+  either attaches to the first Home's VM control plane or clobbers it.
+  Anyone running a test Home beside a real one hits this, and it presents as
+  Browser breaking for no reason. Derive both from the data dir.
+- [ ] Re-read the first-run copy once the above lands. "Create your
+  Profile / Create a Profile to use People." says the same thing twice and
+  explains nothing about what a Profile is for. The product review below
+  should own this, but it needs a Home where the journey completes.
+
+#### Additional product proof
+
+- [ ] Run the app-window matrix somewhere. `just product-ui-virtual-auth` is
+  now the explicit operator command, but it has not yet run on an installed
+  Home. The completed source-side receipt is in place: the shell now records
+  `load` versus `timeout` reveal cause, the portable Home regression smoke
+  asserts `load`, and the real app-window matrix checks effective ancestor
+  visibility plus occlusion instead of only the iframe's own style.
+- [ ] Delete the plaintext left behind by protecting a root. A successful
+  migration keeps its owner-only backup of the original unencrypted bytes
+  under the Home's backups directory forever. That is a reviewable artifact
+  on the offline upgrade an operator runs deliberately; on the automatic
+  path it means every Home that protects a root ships an unencrypted twin
+  of what it just encrypted, with nothing telling anyone it is there.
+- [ ] Roll back, or refuse earlier, when protecting a root half-applies.
+  Protection is stored before the objects under it can be encrypted, so a
+  migration that fails afterwards leaves a protected root with plaintext
+  beside it, which the next boot refuses to start on. The count that made
+  this reachable is now checked before the first write, but an I/O failure
+  mid-migration still lands there, and the online path — unlike the offline
+  one — neither rolls back nor treats a recovered journal as fatal.
+- [ ] Compare the whole launch token, not just its context, when a header
+  and cookie disagree. Both must verify independently and the cookie wins,
+  which is the right direction, but equality covers principal, session,
+  proof binding and grant only — so two tokens for the same session with
+  different launch contexts compare equal and the cookie's launch id
+  silently wins the audit trail.
+
+#### Later collaboration follow-up, blocks no release gate above
+- [ ] Review the unchanged power-user `elastos chat` and remote `room` CLI
+  paths from released `main`. The packaged Chat and Agent capsules and their
+  direct Carrier callers are removed in this candidate, but these operator CLI
+  commands remain. Either bind them to the same typed Runtime collaboration
+  resources or retire them in a separate change; do not add another Chat state
+  or transport path during candidate closeout.
+- [ ] Decide what presence means, now that a Home can announce without a
+  person present. Announcing from the Runtime obeys the Discovery opt-in,
+  so nobody is broadcast who did not ask to be — but the meaning of the
+  signal changed underneath the switch: it used to say "someone is using
+  this Home" and now says "this Home is running", and it reaches everyone
+  on the collaboration network rather than only accepted contacts. Decide
+  whether a person wants contacts to see a machine that is merely up, and
+  whether presence belongs to contacts rather than the whole network. The
+  answer likely splits one signal into two.
+- [ ] Reach the Telegram bar for offline people, in both direct and group
+  conversations. A message sent to someone who is not there should arrive
+  when they return, and a member who was away should come back to what the
+  group said. Neither holds today: a direct envelope ends terminal and
+  visible after a 24-hour lifetime, so a longer absence loses it rather
+  than delaying it, and group messages ride a gossip topic buffer that
+  lives only in memory per peer and is discarded on restart, so what a
+  member missed survives only while some peer happens to still hold it.
+  The shape that closes it is a Runtime that is always there — a person's
+  own Home where it is always on, and a backup Runtime holding for them
+  where it is not. That is the accepted encrypted mailbox
+  (the "Later work" section in `COLLABORATION_HANDOFF.md`), which must stay a holder of sealed
+  envelopes it cannot read rather than becoming a special server. For group
+  catch-up, decide between carrying it in the mailbox too and giving each
+  member a durable append-only signed log a returning peer can request
+  ranges from, the model Hypercore and Pears use, which fits the signed
+  objects this Runtime already has and answers "what did I miss" after a
+  restart, which the buffer cannot.
+#### Housekeeping, blocks nothing above
+- [ ] Prove the old `codex/0.6-release-hardening`,
+  `feat/collaboration-network-profile`, and
+  `fix/collaboration-chat-session-bootstrap` lines are contained by patch or
+  ancestry, then remove their clean worktrees and local branches.
+- [ ] Inventory the remaining historical branches, archive refs, worktrees, and
+  stale remote-tracking namespaces. Bundle or retain unique evidence; remove only
+  clean, proven duplicates. Do not mix pre-0.6 archive work into this post-0.6
+  product branch.
+
 ### 0.6 release follow-up boundary
 
 - [ ] Keep Browser included but explicitly limited: address intermittent
@@ -31,31 +324,33 @@ section if a higher section is incoherent, unverified, or too large to review.
   durable child/process identities and idempotent terminal cleanup receipts.
   Restart recovery must settle exact obligations from explicit retained
   identity, not process-list, port-availability, or socket-inactivity inference.
-- [ ] Review `feat/shell-ui-esp-on-protocol` as a post-0.6 product line. Do not
-  replay its obsolete protocol/auth history or extended AI work; require small,
-  independently testable UI commits against the released ESP contracts.
+- [ ] Preserve the remaining `feat/shell-ui-esp-on-protocol` donor work until
+  its deferred Assistant scope is reviewed. The reviewed shell and UIUX work is
+  included in PR39; any further extraction needs a source comparison against
+  the current ESP contracts.
 - [ ] Resume Carrier reconciliation for 0.7 only after its provider generation,
   multi-node physical evidence, cleanup, and release boundaries are reviewed.
 
 ### 0. Branch readiness and reviewability
-- [ ] Keep branch assumptions current: `main` is the 0.5.0 baseline and
-  `fix/elastos-shell-protocol-browser-wallet-consolidation` is the published
-  0.6.0 review line based on `feat/elastos-shell-protocol`, which descends from
-  `upstream/0.6-dev`. It is not merged or released; review its ordered commits
-  and release matrix before either action.
+
+Branch assumptions: `main` contains the released 0.6 source. PR39 is the current
+0.7 source candidate over `upstream/0.7-dev`. Use [state.md](state.md) and fetched
+refs for exact checkpoints. Published source, installed behavior and public-live
+behavior require separate evidence.
+
 - [ ] Keep this branch reviewable: split changes into coherent commit slices with no corrective commits, no hidden migrations, and no unrelated local artifacts.
 - [ ] Keep oversized-file cleanup frozen unless branch review exposes a concrete no-behavior blocker. The existing Browser/Wallet/provider cleanup is already split into focused sibling modules: Browser gateway, Wallet gateway, Wallet UI send/receive/create/request/state/preference flows, wallet-provider EVM crypto, and wallet-provider approval test groups. Keep those seams stable and verified. Do not split `capsules/browser/browser/browser.js` further unless a diagnostic-frame/session seam is proven mechanical and behavior-free. Treat `gateway_tests/room.rs`, `gateway_room.rs`, `gateway_tests/home_system.rs`, `room_service.rs`, `auth_gateway.rs`, and `home_cmd.rs` as later cleanup unless they become direct release-review blockers. Keep `scripts/home-entropy-check.mjs` as a broad alignment gate for now, but do not let it accumulate new product logic. Each future split must be no-behavior, separately testable, and covered by the narrow Rust/JS smoke commands for that surface.
 - [ ] Review this branch in authority-bound slices, not as one Browser mega-diff: content availability/protected content providers, chain provider core, auth/recovery core, Wallet authority surface, Home/System UX, Chat/Carrier updates, capsule authority manifests, Browser ABI/adapter, Browser proof tooling, shared runtime/gateway, then release/registry/docs. Each slice must be a coherent commit with its own verification commands. Shared runtime/gateway hunks require manual hunk-level review because they cross provider boundaries. Keep `chain_provider_core` separate from Browser: typed proof, prepare, broadcast, sync health, and node lifecycle are blockchain-quadrant provider work, even when Browser consumes them through Wallet. Keep `auth_recovery_core` separate from route wiring: passkey/WebAuthn verification, proof-bound sessions, principal roots, and Recovery Kit helpers are authority primitives consumed by Home/System/Wallet gateway routes. The Wallet authority surface should be reviewed as provider authority core, Wallet app and connector capsules, then gateway/Inbox/audit wiring only after shared gateway hunks are isolated. For Home/System UX, run `node scripts/home-passkey-virtual-auth-smoke.mjs` on loopback Home to prove signed passkey journeys without a human cookie, then run the Camofox smokes for layout coverage. For Browser ABI/provider work, run the Browser Rust tests, `scripts/check-wci-alignment.sh`, `node scripts/home-entropy-check.mjs`, `node scripts/browser-display-mode-smoke.mjs`, `scripts/browser-wallet-bridge-smoke.sh`, and `scripts/browser-glide-wallet-smoke.sh`. Browser proof tooling must keep provider decision reports, objective audits, and runbooks structured and fail closed while product media/manual evidence is missing. Each slice must name its verification commands and must not claim Browser completion unless `scripts/browser-objective-audit.mjs` passes with accepted product media plus matching manual UX evidence.
-- [ ] Keep the accepted 0.6 reconciliation closed and reviewable: ESP, Wallet,
-  Recovery, Home authority, GBA, and the bounded Browser continuation are
-  reconciled in [state.md](state.md). Carrier reconciliation, the shell UI
-  redesign, and extended AI UI work remain excluded. Before claiming
+- [ ] Do not reopen the accepted 0.6 reconciliation except for a newly proven
+  released-line defect with a named owner and verification command. ESP,
+  Wallet, Recovery, Home authority, GBA, and the bounded Browser continuation
+  are reconciled in [state.md](state.md). The reviewed shell/UIUX is included;
+  broader Carrier reconciliation and advanced Assistant workflows remain
+  deferred. Before claiming
   completeness, run `git diff --check`, the Home and Browser entropy checks,
   WCI alignment, `just candidate-command-audit`, and touched-surface tests.
-  Reopen a slice only for a newly proven release-candidate defect with a named
-  owner and verification command.
 - [ ] Treat Remote Carrier Exit as part of the Carrier slice: two-runtime evidence must cite the exact source/exit runtime DIDs and endpoint evidence; the installed artifact readiness report and route-readiness report must be hash-bound; evidence for route readiness, installed artifact readiness, discovery, policy, accounting, stream transport, Browser proof, and cleanup must cite reviewed route nouns; the local Browser machine-proof artifact must cite the reviewed route target or target host; local artifacts must stay redacted, and remote paths need an explicit digest and review trail. Compose Inspector, typed Runtime authority, installed artifact readiness, route-readiness, operator evidence, Browser handoff, manual UX, performance/zoom, and clean-worktree proof before any full-goal claim.
-- [ ] Keep the verification gate green after each slice: run Rust workspace commands from `elastos/` such as `cargo fmt --all -- --check`, the narrow Rust tests for touched crates, `cargo check` for changed capsules, `git diff --check`, `scripts/check-wci-alignment.sh`, `scripts/protected-content-provider-contract-smoke.sh` where protected-content providers are touched, `node scripts/home-entropy-check.mjs` where Home UI is touched, `scripts/auth-wallet-focus-smoke.sh` after auth/wallet/chain changes, `scripts/installed-provider-verify.sh <provider>` after installed provider binary changes, and a live `/apps/home/` proof before handing browser-visible changes back for testing.
+- [ ] Keep the verification gate green after each slice: run Rust workspace commands from `elastos/` such as `cargo fmt --all -- --check`, the narrow Rust tests for touched crates, `cargo check` for changed capsules, `git diff --check`, `scripts/check-wci-alignment.sh`, `scripts/protected-content-provider-contract-smoke.sh` only as the provisional provider retirement guard where those old capsules are touched, `node scripts/home-entropy-check.mjs` where Home UI is touched, `scripts/auth-wallet-focus-smoke.sh` after auth/wallet/chain changes, `scripts/installed-provider-verify.sh <provider>` after installed provider binary changes, and a live `/apps/home/` proof before handing browser-visible changes back for testing.
 - [ ] Do not add visible UI, protocol surface, provider behavior, or blockchain hooks unless the runtime capability path, fail-closed behavior, and docs contract are already explicit.
 - [ ] Keep first-party capsule projection validation covered by
   `first_party_capsules_have_complete_projection_contract`; extend the same
@@ -65,9 +360,9 @@ section if a higher section is incoherent, unverified, or too large to review.
 - [ ] Keep the Browser provider proof language explicit: Selkies is the current self-hosted baseline, not the acceptance answer. Native/browser-product proof must stay tied to `browser-native-supervisor-smoke.sh`, `browser-native-proxy-engine-smoke.sh`, `browser-native-supervisor-proxy-smoke.sh`, `browser-native-operator-config.mjs`, and `browser-native-target-preflight.sh`; Browser wallet connector effects must keep `wallet-connector-transaction-smoke.mjs` in the verification set.
 - [ ] Keep protected-content release claims exact: `scripts/browser-ela-city-protected-content-open-smoke.sh` proves that Runtime Browser can open the known `ela.city` protected-content route and cleanly release the page session, and the current branch has a funded live purchase/playback proof for the known test path. Release notes may cite that current user journey, but must not claim arbitrary protected-content readiness, production dDRM completeness, dKMS readiness, or generic decrypt/render provider completion.
 
-### 0.6.0 release-candidate preservation
-- [ ] Review execution order for preserving the accepted 0.6.0 candidate on
-  its `upstream/0.6-dev` base:
+### Released 0.6.x product-proof and follow-up debt
+- [ ] Review execution order for maintaining and rechecking released 0.6.x
+  follow-up evidence and product-proof debt against released `main`:
   1. Keep reusable source/review gates green on this branch:
      `git diff --check`, `node scripts/home-entropy-check.mjs`,
      `node scripts/browser-entropy-check.mjs`,
@@ -89,11 +384,12 @@ section if a higher section is incoherent, unverified, or too large to review.
      and close at least one app, then return Home cleanly. Source-home proof does
      not close this item.
   5. Keep source/local Carrier setup proof green with
-     `scripts/local-carrier-setup-smoke.sh` before a candidate gateway exists.
-     Candidate public install proof with the branch binary needs a staged or
-     published 0.6.0-compatible manifest with the current `home` profile and
-     checksummed artifacts; then rerun `scripts/public-install-identity-smoke.sh`
-     and `scripts/public-install-home-frontdoor-smoke.sh` with
+     `scripts/local-carrier-setup-smoke.sh` before a staged or published
+     gateway exists for branch-override install proof. Branch-override public
+     install proof with the branch binary needs a staged or published
+     0.6.0-compatible manifest with the current `home` profile and checksummed
+     artifacts; then rerun `scripts/public-install-identity-smoke.sh` and
+     `scripts/public-install-home-frontdoor-smoke.sh` with
      `ELASTOS_PUBLISHER_GATEWAY=<candidate-url>` and the branch binary override.
      After final publish, rerun both without overrides.
   6. If Browser product readiness is in scope, keep
@@ -107,17 +403,19 @@ section if a higher section is incoherent, unverified, or too large to review.
 - [ ] Target maintenance slice: keep `scripts/browser-vm-target-refresh.sh` as the renewable, idempotent target-refresh path before release handoff. It refreshes installed Browser VM helpers and guest initrd/rootfs script artifacts without requiring a full Rust build toolchain, preserves `browser-vm/initrd` and `browser-vm/rootfs.ext4` symlinks, creates timestamped backups, and supports `--verify-only` drift detection. The optional `--guest-control-bridge-bin` path can refresh a prebuilt Linux guest-control bridge binary inside rootfs; broader compiled guest changes still require `scripts/setup-source-home.sh` or a rebuilt/restaged Browser VM rootfs. After any Linux full setup or binary replacement, restart/prove the source-home front door with `scripts/linux-source-home-restart.sh` so the gateway does not remain down after stale-host exit; Linux source-home setup must also install session TURN credentials when the Browser VM uses WebRTC remote display and must preserve an existing remote Browser VM control config on non-KVM gateway hosts. Prove it with the local fixture, `scripts/setup-source-home-browser-config-smoke.sh`, target `--verify-only`, `scripts/linux-source-home-restart-smoke.sh`, and `scripts/jetson-browser-runtime-audit.mjs` with explicit target arguments.
 - [ ] Browser runtime proof slice: prove the same WebRTC-only Browser contract through Mac VZ and Jetson crosvm adapters. Source-home generated VM control capacity is still one active page per control service; simultaneous local/remote Browser use must be proved through separate runtime/control-service lanes, not by treating one VM service as multi-page. The older two-open proof was a capacity-rejection/orphan-cleanup gate, not true VM concurrency. Current hardening adds VM control lifecycle status, pending-launch cleanup, warm idle/hibernated VM status, autostart/prewarm proof, and longer control request budgets. Required remaining evidence is deliberate multi-page VM capacity if that becomes a release requirement, long-hold sessions, frame continuity, page/control heartbeat, reconnect behavior, explicit close/orphan cleanup, Home-authorized active Jetson page/crosvm evidence, and operator capacity/status/resource receipts. The 2026-06-25 direct Jetson VM-control proof succeeded for `https://ela.city/` with Runtime-only networking plus `audio=true` and `video=true`, and the strict Jetson runtime audit passed while that page was active; this is a substrate/runtime proof, not a Home-authorized product Browser journey. The non-KVM server is now restored as a gateway/remote-engine consumer through the Mac `browser-vm-remote-vz-launcher`, and `scripts/browser-ela-city-protected-content-open-smoke.sh` passes against `https://elastos.elacitylabs.com/apps/home/` for the known protected `ela.city` route; this proves open/close and advertised audio/video, not decoded-frame continuity or manual audible audio. This server must not grow a non-KVM local-browser fallback that bypasses the contract.
 - [ ] Browser remote-engine media slice: remote Browser Engines must resolve media through a trusted Service/Carrier path before returning a WebRTC display session. The Browser UI can choose Browser Engine and Browser Exit services, but it must never expose or require engine-local IP/TURN endpoint reasoning. The 2026-06-26 server-to-Mac proof shows answer signaling works. The server-owned TURN experiment proved only the browser-client side could gather relay candidates; the Mac engine still returned zero engine candidates, so the unused server TURN daemon was stopped and remote-VZ source-home config now refuses to inherit local VM ICE/media env. The live server labels the configured remote-VZ adapter honestly through safe `backing_substrate` metadata and no longer hides it behind a generic automatic engine label, but that is only identity/UX cleanup; it does not create a provider-backed People/Services Browser Engine route or solve first-frame media.
+- [ ] Make the Browser remote-Exit stream reuse a Runtime-owned Carrier endpoint, or close any separately owned endpoint explicitly before it is dropped. `open_browser_carrier_stream` still creates a short-lived endpoint, unlike the corrected provider invocation path. Keep this in the Browser transport slice; it does not belong in collaboration closeout.
 - [ ] Browser Mac/server simultaneous-use slice: one Browser page on this server through the Mac Browser Engine and one Browser page on Mac must be able to run at the same time. Current intended topology is one active page per runtime control service, not one global Mac Browser limit: this server uses its remote-VZ control service and the normal Mac data dir, while Mac-local Home uses `elastos-mac-test-home` with its own control service. Both Mac data dirs must share the same Mac runtime TURN env instead of racing two TURN daemons on port `3478`; `setup-source-home.sh` now honors `ELASTOS_BROWSER_RUNTIME_TURN_ENV` for that. Remaining proof requires Playwright or an equivalent Mac-local product smoke plus a held server-remote open after the cross-runtime media bridge exists.
 - [ ] Browser wallet/product UX slice: prove Browser wallet dapp flows through Runtime-mediated Wallet/Inbox authority, including the known `ela.city` buy-result mismatch, EIP-1193 `eth_sendTransaction` return/receipt shape, account discovery/chain switching, and explicit audio/video/input manual evidence. Run `scripts/auth-wallet-focus-smoke.sh`, Browser wallet smokes, and the manual UX report before any Browser product-readiness claim.
   Current source smokes must be rerun before release proof; manual audio/video/input UX evidence remains open.
 - [ ] Installed Home/device proof slice: prove installed `elastos -> Home -> app -> Home` on Mac and Jetson, including live `/apps/home/`, app launch/focus/close, return-home behavior, provider manifest availability, and no source-tree-only assumptions. Keep host adapters behind Runtime contracts instead of branching product behavior per machine.
-- [ ] Release package/registry slice: stamp or verify provider component checksums, keep the current `home` publish preflight/dry-run receipt valid, verify installed provider manifests on the target data dirs, decide whether Browser VM helper/rootfs/initrd artifacts remain source-home generated via `scripts/setup-source-home.sh` plus `scripts/browser-vm-target-refresh.sh` or become explicit `components.json` release components, publish the 0.6.0 binary/artifact set so no-override public installed-path smokes use current code, and make changelog/release claims match only the proofs that passed on real target hosts.
+- [ ] Release package/registry slice: stamp or verify provider component checksums, keep the current `home` publish preflight/dry-run receipt valid, verify installed provider manifests on the target data dirs, decide whether Browser VM helper/rootfs/initrd artifacts remain source-home generated via `scripts/setup-source-home.sh` plus `scripts/browser-vm-target-refresh.sh` or become explicit `components.json` release components, publish the approved version's binary/artifact set so no-override public installed-path smokes use current code, and make changelog/release claims match only the proofs that passed on real target hosts.
 - [ ] Final entropy slice: remove only proven-unused reconciliation leftovers, stale display paths, stale work logs, duplicate truth surfaces, generated artifacts, and target backups after they are either archived or intentionally retained. Do not add compatibility shims for removed `runtime_frame`, `diagnostic_frame`, screenshot, image-polling, or host-specific browser paths unless a current shipped caller is proven.
 
 ### 1. Blockchain quadrant: identity, wallet, auth, node capsules
 - [ ] Enforce the blockchain quadrant contract in code before UI: runtime principal, verified proof bindings, short-lived session grants, scoped capabilities, provider-mediated effects, signed audit, and fail-closed behavior.
 - [ ] Keep `scripts/wallet-product-safety-smoke.sh` green before release publish. It is the product-level Wallet safety gate for MetaMask multi-account link/remove, passkey-gated built-in account delete and recovery-key export/import, WalletConnect disabled without pinned operator config, Ledger hidden until implemented, and no hosted Browser UniSat injection path.
 - [ ] Make recovery semantics impossible to misunderstand before release publish: System's `Download Recovery Kit` must export one password-protectable full bundle containing the principal-owned Home/user data root plus every recoverable built-in Wallet key for that principal. Individual `elastos.wallet.recovery-key/v1` export/import remains an advanced per-account escape hatch. External wallets such as MetaMask, WalletConnect, Ledger, Essentials, and UniSat can only restore links/metadata because their private keys live outside ElastOS. Deleting a built-in wallet must warn when no full bundle or individual Wallet key has been saved, and the main Wallet view must offer both `Create account` and `Import Wallet key` without sending users to Settings.
+- [ ] Keep first-run recovery honest across both states: a fresh Recovery Kit can unlock a surviving root immediately, but empty-machine recovery for a kit created before the later random Profile key exists still needs a separate source repair.
 - [ ] Keep the capsule boundary canonical: capsules invoke typed ElastOS Bus
   resources for Wallet, DID, Chain, and other effects. Carrier is an optional
   authenticated transport adapter behind those resources, not the capsule API.
@@ -150,7 +448,9 @@ section if a higher section is incoherent, unverified, or too large to review.
 - [ ] Prove one truthful `Home -> System -> app -> focus/close -> Home` manual loop, then decide the first non-browser attachment contract.
 - [ ] Keep the default Home path compatible with macOS and Windows by avoiding KVM-only assumptions.
 - [ ] Remove remaining donor/KVM-only assumptions from scripts and runtime special cases.
-- [ ] Replace the current `route + attach_kind` launch payload with a runtime-issued launch grant that is transport-agnostic and non-delegatable.
+- [ ] Complete the launch ingress parity review. Runtime already issues signed,
+  non-delegatable launch grants; route and attachment fields describe the
+  projection. Verify that each ingress derives authority from the grant.
 - [ ] Add an explicit runtime/manifest exposure contract for Home, gateway, and shared surfaces so internal-only and external-only objects do not depend on name-based filtering.
 
 ### 3. Home front-door boringness
@@ -159,6 +459,17 @@ section if a higher section is incoherent, unverified, or too large to review.
 - [ ] Keep unfinished surfaces out of the main live path unless they launch from Home and return cleanly.
 - [ ] Rehearse and simplify the Home/People/Spaces/System story so the front door feels useful without internal-runtime narration.
 - [ ] Extend `elastos.runtime.services/v1` beyond local configured-provider cards and conversation offers: remote Exit, storage, relay, model, and hosting offers must arrive as provider-backed `elastos.service.offer/v1` records through People/Carrier, and enabling one must create/select a principal-scoped provider grant instead of giving capsules direct People-state authority.
+  - [ ] Model Provider subtask: the local typed model service now exists behind
+    the verified `model-provider` Runtime path and Assistant uses only typed
+    offers and runs. The remaining open work is the later remote
+    service-offer path: provider-backed model offers through People/Carrier,
+    principal-scoped provider grants, and the same typed invoke/stream/cancel
+    contract across local and remote providers. Runtime uses Carrier below its
+    own routing decision, and capsules receive no backend URL, credential,
+    topology, endpoint DID, or Carrier peer. Keep a full Runtime on
+    Spark/Jetson as the first supported remote host and define
+    a smaller provider host only after it has identity, lifecycle, update,
+    audit, and recovery parity.
 - [ ] Promote principal-owned Appearance state into a DID-anchored profile/settings object that syncs through Carrier/provider policy and projects back into `localhost://Users/<principal-root>/.AppData/ElastOS/Home/Appearance/...` per trusted device.
 - [ ] Keep `Apps` as the public catalog term and `capsules` as the internal/runtime term; do not expose both as competing public nouns.
 - [ ] Keep settings in `System`; keep files, documents, and provider-backed storage in their owning apps instead of recreating a generic System Storage section.
@@ -228,7 +539,10 @@ section if a higher section is incoherent, unverified, or too large to review.
 - [ ] Move Browser profile persistence into principal-owned `localhost://` state: cookies, localStorage, IndexedDB, service workers, permissions, bookmarks, history, and downloads must live under `localhost://Users/<principal>/BrowserProfiles/<profile>/...` or an equivalent provider-owned encrypted root, never a shared hosted-Chromium/container profile. This must preserve dapp sessions across refresh/restart, prevent admin/guest leakage, support Recovery Kit/migration, and be covered by tests proving two principals cannot read or mutate each other's browser profile state.
 - [ ] Define the Net/Exit provider contract separately from browser UI before improving the visible Browser surface. Runtime must validate Browser stream requests through Net, hand them to Exit only through explicit capability policy, keep HTTP-fetch proxying as a constrained compatibility/diagnostic capability, block LAN/private IP access by default, and hide private adapter/relay IPC descriptors from Browser UI responses.
 - [ ] Treat the current `browser` capsule as a Runtime Browser proof, not a final general-purpose browser. It may render public HTTPS pages through an operator-configured Exit policy, but it must not claim final native/microVM isolation, raw wallet compatibility, general off-box Browser support, or product-quality media until those proofs land.
-- [ ] Keep the visible Browser on the stream/engine path, not host iframe or host tab browsing. Address requests must call `/api/apps/browser/open`; Runtime reserves streams through Net/Exit; Browser UI receives only a page id plus frame/input routes; `elastos://net/http` remains compatibility/diagnostic-only.
+- [ ] Keep the visible Browser on the WebRTC engine path. Address requests call
+  `/api/apps/browser/open`; Runtime reserves streams through Net/Exit and gives
+  the Browser projection page-scoped WebRTC session and control handles.
+  `elastos://net/http` remains diagnostic-only.
 - [ ] Finish the Browser Engine Adapter behind the internal `elastos://browser-engine/*` contract. Engine adapters must use operator-approved supervisor commands, Runtime-mediated Exit streams, no direct host TCP/DNS/HTTP, no wallet injection, no chain RPC, no raw host-network authority, and fail-closed display/input proofs.
 - [ ] Keep `browser-playwright-engine` diagnostic-only. It may exercise Runtime Exit, display-session, input, and wallet-bridge contracts, but it must never be treated as product Browser runtime or allowed to claim product audio/video acceptance.
 - [ ] Keep product Browser providers behind one `elastos.browser.display-session/v1` product-compositor contract. A candidate must prove audio, video, display coordinate size for datachannel input, navigation, wallet mediation, `direct_network=false`, cleanup, media stress, and manual UX through [docs/BROWSER_PROVIDER_BAKEOFF.md](docs/BROWSER_PROVIDER_BAKEOFF.md). Browser wallet chain selection must come from Runtime Wallet defaults, never website hostnames or dapp-specific rules.
@@ -236,7 +550,7 @@ section if a higher section is incoherent, unverified, or too large to review.
 - [ ] Generalize Browser/capsule effect governance after the current Browser open/read audit slice: every external effect must emit request/completion audit records, and any standing, time-bound, or permanent approval must be represented as a scoped Runtime capability/grant instead of an app-owned bypass. Browser opens/read-only chain calls, Wallet external HTTP price fetches, and System-triggered chain node lifecycle control now have audit coverage; continue the same pattern for provider installs and future approval grants.
 - [ ] Add Browser viewport-resize acceptance proof before calling the Browser normal-browser-equivalent. The proof must fail closed unless the remote display adopts the requested compositor size, preserves page ratio, keeps input coordinates aligned, and avoids stretch/letterbox artifacts at common Home window sizes.
 - [ ] Add a Runtime-owned Browser tab/session model before exposing real multi-tab UX. Until then, popup and `_blank` navigation must stay in the current Browser page so the user is never moved into a hidden hosted-engine target. The eventual tab strip must switch explicit Runtime page ids, keep each page's wallet/profile/session state principal-scoped, and preserve Browser/Carrier/provider mediation for every tab.
-- [ ] Replace remaining fixed-interval app polling with one Runtime/provider subscription or stream per signed Home session where the app needs realtime behavior. Home now prefers one Runtime-owned SSE stream at `/api/apps/home/events/stream`, with `/api/apps/home/events` kept as a compatibility long-poll fallback. Home forwards scoped events into child app frames; Wallet, Inbox, and Home-launched Chat Room refresh from those events with in-flight guards. Scoped provider events must not force full Home summary refreshes unless they change shell-visible state: Wallet request/approval events refresh Home summary for the top-nav attention badge, while ordinary Wallet balance/activity updates, Browser state, and Chat changes go to their frames. Home summary refresh is reserved for boot, shell-relevant Home/Inbox/Wallet approval events, foreground visibility, and session refresh only. Home must not run a periodic `/summary` poll. Inbox's safety poll is now 5 minutes, not a realtime mechanism. Chat Room shell mode now uses a 30s safety poll instead of the old 1.2s loop, while public/gateway Chat keeps a shorter fallback because it has no signed Home event channel. Event cursors must remain scoped and non-volatile: heartbeat fields such as Chat `last_seen_at` must not emit app-change events or cause refresh feedback loops. The durable contract should evolve this into provider-backed scoped events such as wallet request created/completed, inbox changed, Browser page state changed/lost, balance changed, system policy changed, and chat room changed. Browser heartbeat may remain as low-rate liveness only; it must not become UI-state transport. Any remaining generated app loops still need the same subscription/stream pass so desktop dragging and multi-window use are not penalized by background polling.
+- [ ] Replace remaining fixed-interval app polling with one Runtime/provider subscription or stream per signed Home session where the app needs realtime behavior. Home prefers one Runtime-owned SSE stream at `/api/apps/home/events/stream`, with `/api/apps/home/events` kept as a compatibility long-poll fallback, and forwards scoped events into child app frames. Wallet and Inbox consume that path. Chat Room does not yet consume Home events and still polls every second in shell mode; do not claim the planned 30-second safety poll until the event-driven refresh path is implemented and tested. Scoped provider events must not force full Home summary refreshes unless they change shell-visible state: Wallet request/approval events refresh Home summary for the top-nav attention badge, while ordinary Wallet balance/activity updates, Browser state, and Chat changes go to their frames. Home summary refresh is reserved for boot, shell-relevant Home/Inbox/Wallet approval events, foreground visibility, and session refresh only. Home must not run a periodic `/summary` poll. Inbox's safety poll is 5 minutes, not a realtime mechanism. Event cursors must remain scoped and non-volatile: heartbeat fields such as Chat `last_seen_at` must not emit app-change events or cause refresh feedback loops. The durable contract should evolve this into provider-backed scoped events such as wallet request created/completed, inbox changed, Browser page state changed/lost, balance changed, system policy changed, and chat room changed. Browser heartbeat may remain as low-rate liveness only; it must not become UI-state transport. Any remaining generated app loops still need the same subscription/stream pass so desktop dragging and multi-window use are not penalized by background polling.
 - [ ] Keep Selkies bounded as the current hosted proof path. The live host now uses per-launch Selkies targets instead of the old singleton service, but product completion still requires `scripts/browser-objective-audit.mjs`, provider bake-off evidence, media evidence, and manual UX evidence before Browser/audio can be called complete.
 - [ ] Keep `scripts/browser-objective-audit.mjs` as the Browser completion gate. It must pass architecture checks, no-fake-media checks, accepted hosted or native product-provider evidence, and hash-bound manual UX evidence before Browser/audio can be called complete.
 - [ ] Keep YouTube/audio readiness as a product stress gate, not a fixture-only proof. Product acceptance requires audible playback, address-bar stability, typing, scrolling/click fidelity, wallet connect, no raw authority, cleanup, and arbitrary-site behavior through the selected provider.
@@ -272,7 +586,7 @@ section if a higher section is incoherent, unverified, or too large to review.
   2. Runtime: signed bundle identity, whole-package verification, interface/version contracts, install receipts, update policy
   3. Carrier: package/update distribution and peer discovery for trusted sources
   4. Blockchain: publisher identity, provenance receipts, and optional license/payment hooks without making token mechanics the core model
-- [ ] Keep Marketplace remote install/update/uninstall gated until the signed install contract exists. Marketplace may browse installed and verified Runtime apps, show details, and open installed Home launch targets, but remote actions need signed app manifests, publisher identity, install/update/removal receipts, provider policy, payment receipts where required, dDRM rights/key/decrypt policy, and Home/capsule change events before one-click install is exposed. Loose repo/dev folders can remain Home/dev targets, but they must not be presented as remotely installable Marketplace apps.
+- [ ] Keep Marketplace remote install/update/uninstall gated until the signed install contract exists. Marketplace may browse installed and verified Runtime apps, show details, and open installed Home launch targets, but remote actions need signed app manifests, publisher identity, install/update/removal receipts, provider policy, payment receipts where required, protected-content rights/custody/decrypt policy, and Home/capsule change events before one-click install is exposed. Loose repo/dev folders can remain Home/dev targets, but they must not be presented as remotely installable Marketplace apps.
 - [ ] Do not prioritize rich DRM economics, DeFi/BtcFi, Android box specifics, or literal Capsule-NFT mechanics before the package identity, principal, space, and provider contracts are real.
 
 ### Runtime primitives missing for the PC2 world-computer model
@@ -299,7 +613,11 @@ section if a higher section is incoherent, unverified, or too large to review.
 
 ### Collaboration and messaging
 - [ ] Earn IRC only as an explicit packaged path with honest runtime prerequisites and proof.
-- [ ] Build toward a first-class collaboration provider instead of letting compatibility bridges define the architecture.
+- [ ] Keep the old Services remote-Exit social/contact path isolated as a separate legacy migration; it must never feed People identity or contact authority.
+- [ ] Split People/Contacts from Services offers in the later read-model slice; `HomePeopleSummary` still carries Services offer fields today, but the Profile-backed People path should keep them empty rather than treating them as contact truth.
+- [ ] Complete the canonical collaboration blockers and installed journey in
+  `Now` before adding another messaging surface. Do not reopen a parallel
+  Profile, discovery, delivery, or acceptance checklist here.
 
 ### Documents and Library
 - [ ] Add import/fork flows for immutable `elastos://<cid>` document revisions through the same provider contract.
@@ -321,20 +639,28 @@ section if a higher section is incoherent, unverified, or too large to review.
 - [ ] Extract the shared capsule token block into a versioned support asset once capsule packaging can import shared CSS without coupling style to runtime authority.
 
 ### Trusted content and access rights
-- [ ] Define one trust contract for installable capsules and published objects: DID/CID/hash/signature identify the thing before it is opened, executed, or decrypted.
-- [ ] Wire real `elastos://drm/open` orchestration behind the declared fail-closed sequence: content status/fetch, typed rights checks, key release, decrypt/render session, release receipt, and audit. It must remain fail-closed until every dependency is present.
-- [ ] Add reviewed production dDRM rights-method configuration for the approved ESC/Elacity contracts only after contract addresses, selectors, and ABI fixtures are pinned in tests.
-- [ ] Wire `rights-provider` to approved dDRM/chain policy backends through typed `chain-provider` reads; do not put license logic in app UI or gateway-only checks.
-- [ ] Wire `key-provider` to an ElastOS PQ-hybrid threshold release backend; apps must never receive raw CEKs or key-backend authority.
-- [ ] Wire `decrypt-provider` to a real decrypt/render backend that returns scoped rendered output or decrypt sessions to the viewer instead of broad raw key access.
-- [ ] Evaluate PC2 WASM decrypt/render/media helper crates as provider-internal implementation candidates only after the fail-closed protected-content sequence is wired and tests prove no app receives raw key, IPFS, chain, or wallet authority.
-- [ ] Wire real protected-content producers to the existing `sealed` content object contract after payload encryption, rights policy, availability receipt, provenance, key-envelope, and viewer-interface generation exist.
-- [ ] Add permissioned ElastOS PQ-hybrid dKMS v0 for new protected content only after the provider contracts and tests are stable enough to review cryptographic assumptions. Do not use FROST as the long-term dKMS root; FROST is only a classical helper for receipts or cohort decisions.
-- [ ] Keep Carrier responsible for encrypted blob transport and remote update delivery, not for replacing capability and policy enforcement.
-- [ ] Prove one honest protected-content flow end to end: resolve object by stable identity, verify trust material, authorize access, decrypt for the rightful user, open in the correct viewer/app, and fail closed for everyone else.
+
+Current protected-content source status lives in [state.md](state.md).
+The contract is in [Protected content](docs/PROTECTED_CONTENT.md).
+The single acceptance sequence is
+[Integrated UIUX and protected-content proof](#integrated-uiux-and-protected-content-proof).
+External cryptographic review remains open before public dKMS or production
+confidentiality claims.
+
+PR #15 is source evidence, not a merge target. The retained extraction ledger
+covers threshold crypto, recipient-sealed contributions, CEK commitment,
+node-local custody, typed player and Creator UX, grant authority, failure cases,
+and applicable CI lessons. Current video uses `elacity-player`; document and
+3D viewers remain later typed-viewer work.
 
 ### Operator and audit hardening
-- [ ] Keep the existing SHA-256 audit chain canonical for 0.6 unless an explicit
+- [ ] Review the legacy-auth migration from PR15 (`0b43da8c`) as a separate
+  compatibility decision. It preserves identity records but clears unchained
+  audit history and starts a new chain. The current signed-checkpoint policy
+  in `docs/AUTH_AUDIT_CHAIN.md` remains canonical. Any replacement must bind
+  an explicit operator decision, verified input, retained historical evidence
+  and crash-safe recovery before it can change an existing data root.
+- [ ] Keep the existing SHA-256 audit chain canonical unless an explicit
   versioned migration is approved. BLAKE3 may remain a content/cache/transport
   choice, but an audit migration must add an algorithm id, canonical encoding,
   golden vectors, a signed transition from the retained SHA-256 head, and
@@ -342,18 +668,23 @@ section if a higher section is incoherent, unverified, or too large to review.
   already implemented.
 - [ ] Keep `verify`, `command-smoke`, `installed-command-audit`, and related gates honest and fail-closed.
 - [ ] Continue the systematic crate audit through the remaining runtime crates.
-- [ ] Track the security/platform work intentionally left out of the earlier CVE hygiene pass as explicit follow-up, not hidden release debt: migrate `bincode 1.3.x` to `bincode 2.x` with versioned serialization compatibility tests; coordinate the `iroh`/Hickory fix as a Carrier-generation upgrade with Rust/MSRV/toolchain proof instead of force-overriding transitive DNS crates; review Sash's macOS VZ / `elastos-crosvm` Darwin substrate branch as a separate platform decision; and keep any temporary Hickory audit ignores documented until the Carrier upgrade closes them.
+- [ ] Review remaining security advisories after the coordinated Iroh 1.0.2
+  upgrade, including the status of any retained Hickory exceptions. Keep the
+  `bincode 1.3.x` migration as a versioned serialization change with compatibility
+  tests. Review Sash's macOS VZ / `elastos-crosvm` Darwin substrate work against
+  the current host adapter before any further platform integration.
+- [ ] Bound the I/O bridge while reading capsule request frames, before its
+  existing parse-size check. Cover oversized and incomplete input and bounded
+  cancellation; keep this distinct from the Carrier request framing task.
 
 ### Dead code cleanup
 - [ ] Re-audit `provider/registry.rs` from current source, not from the stale dead-code list that existed before the 2026-03-31 cleanup. Only remove API surface that is now proven unused on the installed path.
 - [ ] Continue the crate-by-crate orphaned-code audit with the same fail-closed rule: delete only after proving the installed path does not use it.
 
-## Later
+## Long term
 
 - [ ] Evaluate WebAuthn PRF and passkey-derived wallet keys only after passkeys are stable as runtime-session and wallet-provider approval gates.
 - [ ] Define the browser host-adapter model without faking Linux parity, using the Browser/Net/Exit ABI above so server, desktop, mobile, and kiosk hosts expose the same capability contract.
-- [ ] Introduce the dedicated browser capsule only after the runtime launch/object contract and Net/Exit provider contract are stable; it should be one dangerous-but-contained app with explicit outbound network capability, not the platform.
 - [ ] Decide the longer-term operator packaging path for Codex and related AI/agent surfaces.
-- [ ] Add a hosted-key AI provider behind a stable runtime contract.
 - [ ] Evaluate public dKMS only after permissioned dKMS has release receipts, share rotation, monitoring, node admission policy, staking/slashing assumptions, and external crypto review.
 - [ ] Consider renaming `elastos-server` crate to `elastos-cli`. It is the CLI binary + all commands, not just a server. The current name misleads new developers about what the crate does.

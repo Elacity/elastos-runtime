@@ -8,9 +8,11 @@ automatically a stable end-user command.
 
 - `build.sh` builds Runtime and capsules.
 - `install.sh` runs the signed installer.
-- `setup-source-home.sh` builds and provisions a source Home.
+- `setup-source-home.sh` builds and provisions a source Home. Full mode
+  installs one stable Runtime under the platform data root and writes the
+  versioned source-home installation receipt.
 - `home-demo-local.sh` and `chat-demo-local.sh` start disposable local demos.
-- `agent.sh`, `chat.sh`, and `share-demo.sh` run focused demos.
+- `share-demo.sh` runs the focused sharing demo.
 - `setup-crosvm.sh` installs VM prerequisites.
 - `publish-release.sh` is the low-level release publisher.
 - `vendor-walletconnect-adapter.sh` refreshes the pinned WalletConnect asset.
@@ -24,9 +26,10 @@ just verify-release
 
 `just verify` is the source gate. It runs documentation and product alignment,
 versioning, WIT and template checks, Home and Browser entropy checks, command
-audits, formatting, Clippy, and workspace tests. `just verify-release` adds the
-local Carrier setup and Home front-door proofs. Publishing trust and signer
-verification are separate release gates.
+audits, formatting, Clippy, Runtime workspace tests, own-workspace capsule
+tests, and the separate Browser local-exit checks. `just verify-release` adds
+browser-based UI source checks, local Carrier setup and Home front-door proofs.
+Publishing trust and signer verification are separate release gates.
 
 ## Public-install proof
 
@@ -51,7 +54,7 @@ Before a candidate gateway exists, use
 relay-health check.
 
 The full release order and manual target pass are in the
-[0.6.0 acceptance runbook](../docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md).
+[source integration and release checklist](../docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md).
 
 ## Focused proof
 
@@ -71,13 +74,17 @@ Common branch gates include:
 - `wallet-product-safety-smoke.sh` for product Wallet release safety
 - `wallet-connector-transaction-smoke.mjs` for fake-DOM, fake-provider
   connector handoff source proof, not hosted Browser acceptance
-- `protected-content-provider-contract-smoke.sh` for rights, key, decrypt, and
-  DRM provider boundaries
+- `protected-content-provider-contract-smoke.sh` as the fail-closed retirement
+  guard for the provisional rights, key, decrypt, and DRM providers; it does not
+  verify the canonical v1 custody path
 - `people-conversations-local-smoke.sh` for profile, discovery, contacts, and
   Chat handoff
 - `capsule-inspector-act-check.sh` for Inspector scope and Inbox approval
 - `installed-provider-verify.sh` for an installed provider manifest and binary
 - `source-home-capsule-inventory-smoke.py` for source-home capsule finalization
+- `protected-content-installed-static-audit.py` for a bounded read-only audit
+  of source identity, installed artifacts, private provider declarations, and
+  operator prerequisites; `ready_for_active_proof` is not product readiness
 
 `public-copy-entropy-check.mjs` checks selected public manifests, static HTML,
 accessibility labels, and Home CLI command copy for Home, People, Spaces,
@@ -111,9 +118,13 @@ ports, and data roots belong in local operator notes.
 
 ## Live and recovery helpers
 
-`linux-source-home-restart.sh` restarts a Linux source-home gateway after setup
-has installed the new binary. It checks the Home and Services artifacts before
-reporting success.
+`mac-source-home-restart.sh` and `linux-source-home-restart.sh` restart only the
+stable source-home Runtime after they validate the installation receipt,
+exact prior process, bounded rollback, and served artifact parity. Mac default
+mode uses the existing installation; `--init` also requires current clean
+source and artifact parity. Linux writes
+`receipts/linux-source-home-restart.json` under the stable data root and has no
+receipt-output argument.
 
 `recovery-kit-live-smoke.sh` requires a signed Home or System session through
 `ELASTOS_HOME_TOKEN`, a Cookie header, or a cookie jar. Export also requires a

@@ -4,70 +4,6 @@ fn home_action_indices(snapshot: &HomeSnapshot) -> Vec<usize> {
 
 fn people_actions(snapshot: &HomeSnapshot) -> Vec<PeopleAction> {
     let mut actions = Vec::new();
-    let discovery = &snapshot.people.discovery;
-    if discovery.enabled && discovery.remaining_seconds.unwrap_or(0) > 0 {
-        actions.push(PeopleAction {
-            id: "people-discovery-disable".to_string(),
-            label: "Stop discovery".to_string(),
-            description: "Stop advertising this Home as discoverable to nearby ElastOS homes."
-                .to_string(),
-            command: "people discovery off".to_string(),
-            ready: true,
-            reason: None,
-        });
-    } else {
-        actions.push(PeopleAction {
-            id: "people-discovery-enable".to_string(),
-            label: "Turn on discovery".to_string(),
-            description: "Make this Home discoverable for a short window so another ElastOS home can request contact."
-                .to_string(),
-            command: "people discovery on".to_string(),
-            ready: true,
-            reason: None,
-        });
-    }
-    actions.push(PeopleAction {
-        id: "people-discovery-refresh".to_string(),
-        label: "Refresh discovery".to_string(),
-        description:
-            "Refresh visible people and pending People requests through the Runtime People route."
-                .to_string(),
-        command: "people discovery refresh".to_string(),
-        ready: true,
-        reason: None,
-    });
-    for request in people_visible_requests(snapshot)
-        .into_iter()
-        .filter(|request| request.status == "incoming")
-    {
-        if request.request_id.trim().is_empty() {
-            continue;
-        }
-        let name = people_request_display_name(request, "Person");
-        actions.push(PeopleAction {
-            id: format!("people-accept-request:{}", request.request_id),
-            label: format!("Accept {name}"),
-            description: "Accept this incoming People request and add the person to People."
-                .to_string(),
-            command: format!("people accept {}", request.request_id),
-            ready: true,
-            reason: None,
-        });
-    }
-    for peer in people_visible_peers(snapshot) {
-        if peer.peer_id.trim().is_empty() {
-            continue;
-        }
-        let name = people_peer_display_name(peer, "Visible person");
-        actions.push(PeopleAction {
-            id: format!("people-request-peer:{}", peer.peer_id),
-            label: format!("Request {name}"),
-            description: "Send a People request to this visible ElastOS home.".to_string(),
-            command: format!("people request {}", peer.peer_id),
-            ready: true,
-            reason: None,
-        });
-    }
     for contact in &snapshot.people.contacts {
         let name = people_contact_display_name(contact, "Person");
         if people_contact_message_target(contact).is_some() && !contact.contact_id.trim().is_empty()
@@ -169,57 +105,6 @@ fn selected_system_action(snapshot: &HomeSnapshot, selected: usize) -> Option<Sy
         .cloned()
 }
 
-fn people_visible_peers(snapshot: &HomeSnapshot) -> Vec<&PeopleDiscoveryPeerStatus> {
-    let mut contact_peer_ids = std::collections::BTreeSet::new();
-    let mut contact_dids = std::collections::BTreeSet::new();
-    for contact in &snapshot.people.contacts {
-        if let Some(device) = contact
-            .device_label
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            contact_peer_ids.insert(device.to_string());
-        }
-        if contact.route.starts_with("elastos://peer/") {
-            contact_peer_ids.insert(
-                contact
-                    .route
-                    .trim_start_matches("elastos://peer/")
-                    .to_string(),
-            );
-        }
-        if let Some(handle) = contact
-            .handle
-            .as_deref()
-            .filter(|value| value.starts_with("did:"))
-        {
-            contact_dids.insert(handle.to_string());
-        }
-    }
-    snapshot
-        .people
-        .discovery
-        .discovered_peers
-        .iter()
-        .filter(|peer| {
-            let peer_id = peer.peer_id.trim();
-            let did = peer.did.as_deref().unwrap_or("").trim();
-            (peer_id.is_empty() || !contact_peer_ids.contains(peer_id))
-                && (did.is_empty() || !contact_dids.contains(did))
-        })
-        .collect()
-}
-
-fn people_visible_requests(snapshot: &HomeSnapshot) -> Vec<&PeopleDiscoveryRequestStatus> {
-    snapshot
-        .people
-        .discovery
-        .requests
-        .iter()
-        .filter(|request| matches!(request.status.as_str(), "incoming" | "requested"))
-        .collect()
-}
-
 fn home_app_target_from_route(route: &str) -> Option<String> {
     let rest = route.trim().strip_prefix("/apps/")?;
     let target = rest.split(['/', '?', '#']).next().unwrap_or("").trim();
@@ -276,31 +161,6 @@ fn people_contact_lookup_key(value: &str) -> String {
     value.strip_prefix('@').unwrap_or(value).to_lowercase()
 }
 
-fn people_discovery_state_label(discovery: &PeopleDiscoveryStatus) -> String {
-    if discovery.enabled && discovery.remaining_seconds.unwrap_or(0) > 0 {
-        format!(
-            "on for {}",
-            people_discovery_remaining_text(discovery.remaining_seconds.unwrap_or(0))
-        )
-    } else if !discovery.visibility.trim().is_empty() && discovery.visibility != "off" {
-        discovery.visibility.clone()
-    } else if !discovery.status.trim().is_empty() {
-        discovery.status.clone()
-    } else {
-        "off".to_string()
-    }
-}
-
-fn people_discovery_remaining_text(seconds: u64) -> String {
-    if seconds == 0 {
-        "0 sec".to_string()
-    } else if seconds >= 60 {
-        format!("{} min", seconds.div_ceil(60))
-    } else {
-        format!("{seconds} sec")
-    }
-}
-
 fn people_contact_display_name(contact: &PeopleContactStatus, fallback: &str) -> String {
     let profile = contact.profile_card.as_ref();
     let display_name = profile
@@ -320,45 +180,6 @@ fn people_contact_display_name(contact: &PeopleContactStatus, fallback: &str) ->
         .or(contact.device_label.as_deref())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(fallback)
-        .to_string()
-}
-
-fn people_peer_display_name(peer: &PeopleDiscoveryPeerStatus, fallback: &str) -> String {
-    let display_name = peer.display_name.trim();
-    if !display_name.is_empty() && display_name != "ElastOS user" {
-        return display_name.to_string();
-    }
-    peer.handle
-        .as_deref()
-        .or(peer.did.as_deref())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            if peer.peer_id.trim().is_empty() {
-                fallback
-            } else {
-                peer.peer_id.as_str()
-            }
-        })
-        .to_string()
-}
-
-fn people_request_display_name(request: &PeopleDiscoveryRequestStatus, fallback: &str) -> String {
-    let display_name = request.display_name.trim();
-    if !display_name.is_empty() && display_name != "ElastOS user" {
-        return display_name.to_string();
-    }
-    request
-        .handle
-        .as_deref()
-        .or(request.did.as_deref())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            if request.peer_id.trim().is_empty() {
-                fallback
-            } else {
-                request.peer_id.as_str()
-            }
-        })
         .to_string()
 }
 
@@ -416,13 +237,57 @@ fn selected_notification_dismiss_action(
     Some(format!("notification-dismiss:{}", entry.id))
 }
 
-fn selected_notification_action(snapshot: &HomeSnapshot, selected: usize) -> Option<&ActionInfo> {
+fn selected_notification_action(snapshot: &HomeSnapshot, selected: usize) -> Option<ActionInfo> {
     let entry = selected_notification(snapshot, selected)?;
-    let action_id = entry
-        .action_ref
-        .as_ref()
-        .map(|action_ref| action_ref.action_id.as_str())?;
-    action_by_id(snapshot, action_id)
+    let action_ref = entry.action_ref.as_ref()?;
+    let action_id = action_ref.action_id.trim();
+    if let Some(action) = action_by_id(snapshot, action_id) {
+        return Some(action.clone());
+    }
+    inbox_review_handoff_action(snapshot, entry, action_ref)
+}
+
+fn inbox_review_handoff_action(
+    snapshot: &HomeSnapshot,
+    entry: &NotificationEntryStatus,
+    action_ref: &NotificationActionRefStatus,
+) -> Option<ActionInfo> {
+    if !notification_action_uses_inbox_review(action_ref.action_id.trim()) {
+        return None;
+    }
+    let notification_id = entry.id.trim();
+    if notification_id.is_empty() {
+        return None;
+    }
+    let ready = snapshot.session.mode.trim() == "browser_pty"
+        && active_shell_candidate_launchable(snapshot, "home-gui")
+        && snapshot
+            .targets
+            .iter()
+            .any(|target| target.target == INBOX_TARGET_ID && target.target_kind == "app");
+    Some(ActionInfo {
+        id: format!("{INBOX_NOTIFICATION_HANDOFF_ACTION_PREFIX}{notification_id}"),
+        label: "Open Inbox on Desktop".to_string(),
+        description: "Open Inbox on the Home Desktop to review this pending request.".to_string(),
+        command: "home: open Inbox".to_string(),
+        ready,
+        reason: (!ready).then(|| {
+            "Open Inbox from the Home Desktop to review this pending request.".to_string()
+        }),
+    })
+}
+
+fn notification_action_uses_inbox_review(action_id: &str) -> bool {
+    [
+        "contact-accept-request:",
+        "wallet-approve-request:",
+        "wallet-review-request:",
+        "capability-approve-request:",
+        "inspect-approve-request:",
+        "wallet-price-http-approve:",
+    ]
+    .iter()
+    .any(|prefix| action_id.starts_with(prefix))
 }
 
 fn selected_app_action(snapshot: &HomeSnapshot, selected: usize) -> Option<&ActionInfo> {
@@ -954,9 +819,6 @@ fn room_control_entries(snapshot: &HomeSnapshot) -> Vec<AppEntry> {
         let is_room_control = action.id.starts_with("room-approve-request:")
             || action.id.starts_with("room-deny-request:")
             || action.id.starts_with("room-revoke-session:")
-            || action.id.starts_with("room-accept-invite:")
-            || action.id.starts_with("room-revoke-invite:")
-            || action.id.starts_with("room-remove-member:")
             || matches!(
                 action.id.as_str(),
                 "room-policy-toggle-guests"
@@ -1055,34 +917,16 @@ fn chat_room_app_detail_lines(
             "Invites    {} pending",
             snapshot.room.pending_invite_count
         ));
-        for invite in snapshot.room.pending_invites.iter().take(3) {
-            details.push(format!(
-                "Invite     {} pending",
-                truncate(&invite.invited_did, width.saturating_sub(18).max(16)),
-            ));
-        }
     } else {
         details.push("Invites    no ElastOS user invites pending".to_string());
     }
-    if snapshot.room.owner_did.is_none() {
-        details.push("Advanced   elastos room seed --title \"Chat\"".to_string());
-    } else if matches!(
-        snapshot.room.local_runtime_role.as_deref(),
-        Some("owner") | Some("admin")
-    ) {
-        details.push("Advanced   elastos room invite <did:key:...>".to_string());
-    }
-
-    if snapshot.room.members.is_empty() {
+    if snapshot.room.member_count == 0 {
         details.push("People     no trusted ElastOS users yet".to_string());
     } else {
-        for member in snapshot.room.members.iter().take(4) {
-            details.push(format!(
-                "Person     {} ({})",
-                truncate(&member.member_did, width.saturating_sub(18).max(16)),
-                conversation_role_label(&member.role)
-            ));
-        }
+        details.push(format!(
+            "People     {} trusted participant(s)",
+            snapshot.room.member_count
+        ));
     }
 
     if !snapshot.room.browser_access_allowed {

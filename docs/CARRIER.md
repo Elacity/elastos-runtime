@@ -1,4 +1,4 @@
-# Elastos Carrier in This Runtime
+# Elastos Carrier in this Runtime
 
 > Supplemental terminology note.
 >
@@ -9,10 +9,10 @@
 > levels, use [../state.md](../state.md), [COMMAND_MATRIX.md](COMMAND_MATRIX.md), and
 > [RUNTIME_REPO_USER_STORY_CHECKLIST.md](RUNTIME_REPO_USER_STORY_CHECKLIST.md).
 
-## What Carrier Is
+## Carrier
 
-**Carrier is the endpoint-authenticated off-box communication and content transport of
-an ElastOS node.** It can carry peer discovery, messaging, streams,
+Carrier is the endpoint-authenticated off-box communication and content
+transport of an ElastOS node. It can carry peer discovery, messaging, streams,
 replication, and peer-to-peer content transfer when Runtime routing selects it.
 
 Carrier is not the whole Runtime, the capsule API, or the authority system. The
@@ -21,7 +21,7 @@ audit around it. Carrier endpoint authentication proves the transport peer; it
 does not by itself prove who authored an application message. The transport
 implementation may change without changing capsule code.
 
-## Capsule Model
+## Capsule model
 
 A capsule requests a typed Runtime resource operation. It does not call Carrier
 or select a transport. Runtime may satisfy the request locally, dispatch it to a
@@ -33,43 +33,43 @@ implementations. Remote failure must stay visible as a typed operation result;
 it must not become transparent remote-object behavior or a silent local
 fallback.
 
-### Trusted-Source Room Bootstrap
+Signed private-network membership and named-service discovery may inform route
+selection, but neither grants service access. The source and destination
+Runtimes still authorize the exact operation. See
+[PRIVATE_NETWORK.md](PRIVATE_NETWORK.md).
 
-Chat Room sync normally uses the Runtime peer provider. The install/update
-trusted-source path has one reviewed exception: the Runtime-owned
-trusted-source Room bootstrap exception may read the configured publisher
-Carrier ticket and use it to seed the internal Room gossip topic. This is a
-Runtime transport bootstrap, not a capsule capability. The raw trusted-source
-ticket, decoded endpoints, and direct Carrier socket authority must not appear
-in Home/Room summaries, ordinary capsule payloads, or user-facing receipts.
+### Signed collaboration bootstrap
+
+A verified signed collaboration-network profile supplies bounded bootstrap
+peers and authenticates the content-addressed default-conversation grant. The
+Runtime collaboration service constructs one durable core and transport driver.
+The driver hands Carrier only opaque signed envelopes and treats broadcast as a
+transport observation, never product acceptance. Configured Chat and People
+receive typed projections through Runtime-owned product ports. They never
+receive tickets, decoded endpoints, raw sockets, or Carrier topics.
 
 ```
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│  chat (TUI)  │  │ chat-room    │  │  agent       │
-│  (ratatui)   │  │ (web)        │  │  (headless)  │
-└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-       │                 │                 │
-       └────────┬────────┴────────┬────────┘
-                │  Runtime APIs   │
-                │  same policy    │
-                ▼                 ▼
-┌────────────────────────────────────────────────────┐
-│  Runtime (one per machine)                         │
-│  ├── Carrier (one iroh endpoint, one DID)          │
-│  │   └── Gossip buffer (shared by all capsules)    │
-│  ├── Providers (did, peer, ai, localhost, ipfs*)   │
-│  └── Capabilities + Sessions + Audit               │
-└────────────────────────────────────────────────────┘
+People / Inbox / Chat projections
+             |
+             | typed Runtime product ports
+             v
+Runtime collaboration services
+             |
+             | opaque signed envelopes
+             v
+Carrier admission buffer or off-box peer route
 ```
 
 `ipfs*` is the current low-level content backend, not the intended app-facing
 content contract.
 
 **Same machine:** Chat surfaces share one runtime, one Carrier node, and one
-gossip buffer. Messages between native Chat and Chat Room on the same machine
-go through the shared Runtime buffer, not a separate network path.
+admission buffer. Same-endpoint work goes through the Runtime-owned buffer, not
+a separate network path.
 
-**Cross machine:** Each machine has its own runtime and Carrier node with its own DID. Messages travel via iroh gossip mesh (QUIC + DHT + relay). From the capsule's perspective, this is invisible — `peer/gossip_send` works the same way.
+**Cross machine:** Each machine has its own Runtime and Carrier endpoint with a
+Device DID. Messages use the configured Iroh transport. Product surfaces still
+call the same typed Runtime operation and receive a typed result.
 
 ```
 Jetson                    WSL                     Laptop
@@ -81,7 +81,7 @@ Carrier (iroh)            Carrier (iroh)          Carrier (iroh)
                      iroh gossip mesh
 ```
 
-## Technical Detail
+## Technical detail
 
 ```
 ElastOS Node
@@ -98,11 +98,14 @@ ElastOS Node
     └── capsule-facing `elastos://` and `localhost://` contracts
 ```
 
-### Carrier vs. Elastos Carrier Native / Boson
+### Historical Carrier and Boson systems
 
-The Elastos Foundation's Carrier (v1: C SDK, v2: DHT+services) and Boson (permissionless fork) are the closest historical analogs. In this runtime's model they are candidate backend implementations for the Carrier substrate. The contract stays stable; the transport can change.
+The Elastos Foundation's Carrier v1 and v2 and the Boson fork are historical
+and adjacent transport systems. They may inform a Carrier backend, but this
+document does not claim interoperability. The Runtime resource contract stays
+stable if the transport changes.
 
-### Carrier vs. `elastos://`
+### Carrier and `elastos://`
 
 `elastos://` is the native namespace exposed to capsules and users.
 
@@ -110,15 +113,13 @@ Carrier is not identical to `elastos://`:
 
 - Carrier gives decentralized peer/content semantics to the relevant parts of `elastos://`
 - the runtime routes and authorizes `elastos://` operations
-- providers define the meaning of subspaces such as `elastos://peer/`, `elastos://did/`, `elastos://chain/`, and `elastos://ai/`
+- providers define the meaning of subspaces such as `elastos://peer/`, `elastos://did/`, `elastos://chain/`, and `elastos://model/`
 
-Clean mental model:
+`elastos://` is the namespace and contract surface. Carrier is one substrate
+behind selected peer and content operations. Runtime hosts the authority,
+routing, lifecycle, and audit boundary.
 
-- `elastos://` = namespace / contract surface
-- Carrier = decentralized substrate behind peer/content operations
-- runtime = trusted node core that hosts Carrier and enforces policy
-
-### Carrier vs. IPLD, IPFS, and Availability
+### Carrier, IPLD, IPFS, and availability
 
 IPLD is not Carrier. IPLD is the content-addressed object graph/data model used
 to represent linked SmartWeb objects, manifests, signed heads, provenance, and
@@ -127,7 +128,7 @@ availability receipts.
 IPFS/Kubo is not Carrier either. It is the first block/CID backend used by the
 current `ipfs-provider`.
 
-The clean content model is:
+The content path is:
 
 ```text
 capsule -> runtime capability -> elastos://content/* provider
@@ -140,24 +141,56 @@ Carrier should make content exchange feel like one SmartWeb, but it should not
 own all storage policy. The content provider owns publish/fetch/status/repair
 semantics and availability receipts. Carrier owns secure peer discovery,
 messaging, relay, and peer/object transport. IPLD gives the traversable CID graph
-shape. Rights/decryption remain in the access provider and dDRM layer.
+shape. In the target protected-content cutover, rights, custody, and decryption
+remain in Runtime-selected providers.
+
+Downloadable games and GGUF models follow that same path as content capsules.
+Their identity is the complete immutable capsule CID, not a publisher URL or an
+external repository URL. Carrier may transport the bytes locally or across the
+network, but it does not decide package identity, admission, licensing, or
+installation. Those boundaries and the bootstrap path are defined in
+[CONTENT_CAPSULE_DISTRIBUTION.md](CONTENT_CAPSULE_DISTRIBUTION.md).
 
 Provider-to-provider Carrier invocation follows the same boundary. Runtime adds
-an `elastos.provider.invocation/v1` envelope, selects `carrier-provider-plane`,
-and sends a generic Carrier `provider_invoke` message only between service
-providers such as `content`, `availability`, `rights`, `key`, `decrypt`, and
-`drm`. Raw connect tickets stay inside Runtime transport state and are not
-returned in app-visible receipts. Raw backend providers such as `ipfs` or
-`localhost` remain local implementation details, not remote Carrier authorities.
+an `elastos.provider.invocation/v1` envelope and selects
+`carrier-provider-plane`. The current Carrier provider target allowlist includes
+`content`, `availability`, and the provisional `rights`, `key`, `decrypt`, and
+`drm` labels. It does not yet include a custody route. The target cutover keeps
+the same transport envelope but replaces the provisional protected-content
+surface with Runtime-selected `rights`, `custody`, and `decrypt` providers. Raw
+connect tickets stay inside Runtime transport state and are not returned in
+app-visible receipts. Raw backend providers such as `ipfs` or `localhost` remain
+local implementation details, not remote Carrier authorities.
 If the provider transfer is `stream`, the Carrier side also validates the
 target-visible `elastos.provider.stream/v1` base64-chunk contract before
 dispatching the request. Carrier availability fetches use that path for remote
 `content/fetch` calls and decode the returned stream envelope inside the
 availability provider.
 
+The receiving Runtime and provider independently authorize the remote
+operation. They verify the transport source, selected service, operation policy,
+and any application signature, delegation, freshness, or replay contract. A
+source capability string and an endpoint-authenticated Carrier connection do
+not transfer source-side authority to the destination.
+
+### dKMS over Carrier
+
+The key and dKMS resource contract is placement-neutral. Same-node calls use a
+private Runtime-owned adapter. When a first-party production dKMS operation
+crosses an ElastOS machine boundary, Carrier is the canonical off-box transport
+instead of a parallel app-visible TCP, HTTP, or VPN contract.
+
+Carrier remains an untrusted byte-and-envelope carrier from the dKMS protocol's
+perspective. dKMS nodes still perform end-to-end node authorization, hybrid
+encryption, signing, freshness and replay checks, rights binding, and threshold
+policy. Raw CEKs never pass through Runtime, Carrier, or an ordinary capsule;
+only sealed shares, sealed session material, and bounded receipts may cross the
+transport boundary. Running every quorum member on one machine is useful for
+development and contract tests, but is not evidence of distributed custody.
+
 See [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md).
 
-### Where HTTP Fits
+### Where HTTP fits
 
 HTTP is not Carrier. In this repo it plays three supporting roles:
 
@@ -173,9 +206,9 @@ HTTP is not Carrier. In this repo it plays three supporting roles:
    - `tunnel-provider` and similar components can expose services over HTTP(S) to the public web.
    - That is an interoperability edge, not the definition of Carrier.
 
-### Where Browser Networking Fits
+### Where Browser networking fits
 
-A real browser capsule should not receive raw internet authority. The browser
+A Browser capsule should not receive raw internet authority. The browser
 engine adapter may use local IPC, vsock, stdio, or loopback to talk to the
 Runtime, but the capsule-facing contract remains the typed Runtime
 Browser/Net/Exit resource model:
@@ -253,7 +286,8 @@ copies candidates to a server-side staging directory before install, labels
 which commands run on the operator workstation versus the public server, rejects
 non-Linux or non-`x86_64` candidates such as local macOS Mach-O builds, and
 keeps `mutation_allowed=false` until an operator explicitly approves deployment.
-For the current public server, candidates must be Linux x86_64 ELF binaries:
+This planner targets Linux x86_64 ELF binaries. Verify the destination platform
+before using it:
 
 ```bash
 node scripts/remote-carrier-exit-public-live-plan.mjs \
@@ -414,7 +448,7 @@ not the default browser model. Dapp wallet access should go through
 `elastos://wallet/*` and Wallet/Inbox approval, not through app-owned
 wallet SDK state. See [BROWSER_CAPSULE.md](BROWSER_CAPSULE.md).
 
-### Identity: Device DID (not account identity)
+### Device identity
 
 Carrier node identity is a device DID: an Ed25519 key encoded as
 `did:key:z6Mk...`. The DID is deterministically derived from the device key via
@@ -427,9 +461,9 @@ or EID proofs. Chat sessions use ephemeral DIDs (random SigningKey per
 session). The seed node and `elastos serve` use stable DIDs derived from the
 persisted device key.
 
-## Node Planes
+## Node planes
 
-### 1. Node Core / Control Plane (host ↔ capsule)
+### 1. Node core and control plane (host to capsule)
 
 The trusted orchestration layer around Carrier. Manages capsule lifecycle, capability grants, session auth, provider dispatch, and audit.
 
@@ -445,17 +479,19 @@ plumbing, not Carrier or the capsule contract.
 
 HTTP here is a control-plane protocol. It is not the Carrier substrate.
 
-### 2. Carrier Network + Content Plane (node ↔ world)
+### 2. Carrier network and content plane (node to world)
 
 Peer discovery, gossip messaging, relay, and peer-to-peer content transfer. Built into the runtime as `carrier.rs`.
 
 **Current implementation:**
-- Built-in Carrier node using **iroh** (QUIC, gossip, mDNS, relay)
+- Built-in Carrier node using **Iroh 1.0.2** with iroh-gossip 0.101.0,
+  distributed-topic-tracker 0.3.5, mDNS, and relay support
 - `tunnel-provider` capsule using **cloudflared** (HTTP tunnel to public internet)
 
-**Transport:** iroh (QUIC + pkarr + relay). Target: interoperability with Elastos Carrier Native / Boson when those ecosystems mature.
+**Transport:** Iroh (QUIC + N0 DNS discovery + relay), with mainline DHT topic
+discovery through `distributed-topic-tracker` and mDNS on the local network.
 
-### 3. Data Plane (host ↔ VM networking)
+### 3. Data plane (host to VM networking)
 
 The physical network plumbing connecting each VM to the host.
 
@@ -468,7 +504,7 @@ The physical network plumbing connecting each VM to the host.
 Otherwise the substrate adapter communicates with Runtime without granting the
 guest ambient network authority.
 
-## Naming in Code
+## Naming in code
 
 The codebase currently uses "Carrier" in a broader way than this document recommends. Specific usages:
 
@@ -480,7 +516,7 @@ The codebase currently uses "Carrier" in a broader way than this document recomm
 | "Carrier control link" | legacy name for host↔VM control plumbing (now serial bridge by default, TAP only for explicit guest-network cases) | Data / Control Plane |
 | `CarrierServiceBridge` | Host-native provider process (stdio JSON) | Node Core / Control Plane |
 | `CapsuleBackend::Carrier` | Capsule runs on host (not in VM) | Node Core / Control Plane |
-| `permissions.carrier: true` | Capsule needs host-level network access | Control + Network |
+| `permissions.host_process: true` | Capsule needs Runtime-owned host-process provider execution with host-level network/system access | Control + Network |
 | `tunnel-provider` | Public HTTP tunnel via cloudflared | Network Plane |
 
 Recommended reading:
@@ -488,20 +524,17 @@ Recommended reading:
 - terms like `CarrierNode` still fit the historical/network meaning
 - terms like "Carrier control link" are implementation legacy and should be read as node-control/data-plane plumbing, not as the definition of Carrier itself
 
-## Why Carrier Is Built-In (Not a Capsule)
+## Why Carrier is built in today
 
-The ElastOS principle says "everything is a capsule." Carrier is the exception because it does two things:
+The current Runtime owns one Carrier endpoint because bootstrap, peer
+admission, and collaboration delivery need a shared device identity and
+lifecycle. Keeping one endpoint also avoids giving ordinary capsules transport
+credentials or raw peer topology. The retired `peer-provider` source capsule is
+not an alternate compatibility path.
 
-1. **Bootstrap transport** — file serving, trusted source discovery, and update fetch. These must work BEFORE any capsule infrastructure is available. A capsule can't provide the transport needed to download itself.
-
-2. **Gossip provider** — the `elastos://peer/*` scheme for chat and agent. This shares the same iroh endpoint as the bootstrap transport. Extracting it to a capsule would mean either two iroh endpoints (wasteful) or a shared-endpoint mechanism between runtime and capsule (complex).
-
-The earlier `peer-provider` capsule was the capsule form of this. It was superseded when Carrier was integrated into the runtime for reliability and simplicity, and it is no longer part of the active tree.
-
-**Future:** When the gossip protocol stabilizes, the gossip provider portion of Carrier could be extracted back into a capsule, using the runtime's iroh endpoint via a shared-endpoint API. This is tracked as a later task, not a current priority.
-
-## Open Questions
-
-1. **Inter-capsule communication.** VMs currently cannot talk to each other — only to the host. Carrier should eventually provide capsule-to-capsule channels mediated by the runtime (capability-gated, audited).
-
-2. **Convergence with Carrier Native v2.** The DHT+services model of Carrier v2 maps well to the provider model here. But no integration work has started. Is this a priority?
+This placement is an implementation choice, not a rule that all Carrier
+protocol logic belongs in the trusted core. A later adapter may move protocol
+work behind a private host contract if Runtime continues to own endpoint
+admission, routing, lifecycle, capabilities, and audit. Open implementation and
+research work belongs in [`TASKS.md`](../TASKS.md) and
+[`ROADMAP.md`](../ROADMAP.md).

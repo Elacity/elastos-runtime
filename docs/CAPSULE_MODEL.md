@@ -36,6 +36,18 @@ published with a CID, that revision is immutable. It becomes a distributable
 data capsule when sealed with capsule metadata and provenance. A viewer binding
 is optional and belongs in the content contract only when required.
 
+Games, GGUF models, and similar downloadable data use the same rule. Their
+canonical package identity is the CID of the complete manifest-and-payload
+closure. A signed catalog entry points to that CID, an availability receipt
+states who retains it, and an installed inventory records local admission.
+Those records must not become competing package identities.
+
+Content distribution is distinct from service discovery. A GGUF content capsule
+does not publish `elastos.service.offer/v1`; a running model provider may publish
+an inference offer after Runtime admits the model. The full Get, bootstrap, and
+external-gateway contract is in
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
+
 ## Isolation boundary
 
 Runtime admits an executable artifact for a session and binds the instance to
@@ -71,9 +83,8 @@ Web projections and other substrates use their own narrow Runtime
 adapters. They remain under the same authority model but do not inherit the
 Component WIT interface.
 
-The 0.6 tree implements and conformance-tests this Component path. Its shipped
-first-party UI Apps remain web projections, so the fixture and authoring
-template must not be presented as completed product migration.
+The Component fixture and authoring template test this contract. Product App
+migration requires its own evidence, recorded in [state.md](../state.md).
 
 The current Component ABI is checked against
 [`elastos-bus-v1.wit`](../elastos/wit/elastos-bus-v1.wit). Exact ABI fields,

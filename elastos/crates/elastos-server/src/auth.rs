@@ -1,14 +1,12 @@
 //! Runtime-owned authentication state for proof-bound sessions.
 
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
-    io::{ErrorKind, Write},
+    io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
-
-#[cfg(test)]
-use std::collections::HashMap;
 
 #[cfg(unix)]
 use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
@@ -72,6 +70,46 @@ const MAX_MIGRATION_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 static AUTH_STATE_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static AUDIT_CHAIN_ACTIVATION_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static PRINCIPAL_ROOT_OBJECT_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static VERIFIED_AUTH_STATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, VerifiedAuthStateCacheEntry>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static VERIFY_AUDIT_CHAIN_CALLS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+static VERIFIED_AUTH_STATE_CACHE_FILL_HOOKS: OnceLock<
+    Mutex<HashMap<PathBuf, VerifiedAuthStateCacheBoundaryHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static VERIFIED_AUTH_STATE_CACHE_HIT_HOOKS: OnceLock<
+    Mutex<HashMap<PathBuf, VerifiedAuthStateCacheBoundaryHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+struct VerifiedAuthStateCacheBoundaryHook {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegularFileIdentity {
+    dev: u64,
+    ino: u64,
+    mtime_secs: i64,
+    mtime_nanos: i64,
+    ctime_secs: i64,
+    ctime_nanos: i64,
+    len: u64,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedAuthStateCacheEntry {
+    auth_state_identity: Option<RegularFileIdentity>,
+    activation_identity: Option<RegularFileIdentity>,
+    runtime_device_key_identity: Option<RegularFileIdentity>,
+    state: AuthState,
+}
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +244,242 @@ fn audit_chain_activation_mutation_lock() -> &'static Mutex<()> {
 
 fn principal_root_object_mutation_lock() -> &'static Mutex<()> {
     PRINCIPAL_ROOT_OBJECT_MUTATION_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn verified_auth_state_cache() -> &'static Mutex<HashMap<PathBuf, VerifiedAuthStateCacheEntry>> {
+    VERIFIED_AUTH_STATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn auth_state_cache_key(data_dir: &Path) -> PathBuf {
+    std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf())
+}
+
+fn regular_file_identity_from_metadata(
+    metadata: &std::fs::Metadata,
+    label: &str,
+) -> anyhow::Result<RegularFileIdentity> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("{label} must be a regular non-symlink file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(RegularFileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            mtime_secs: metadata.mtime(),
+            mtime_nanos: metadata.mtime_nsec(),
+            ctime_secs: metadata.ctime(),
+            ctime_nanos: metadata.ctime_nsec(),
+            len: metadata.len(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        use std::time::{Duration, UNIX_EPOCH};
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        let duration = modified
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0));
+        Ok(RegularFileIdentity {
+            dev: 0,
+            ino: 0,
+            mtime_secs: duration.as_secs() as i64,
+            mtime_nanos: duration.subsec_nanos() as i64,
+            ctime_secs: 0,
+            ctime_nanos: 0,
+            len: metadata.len(),
+        })
+    }
+}
+
+fn observe_optional_regular_file_identity(
+    path: &Path,
+    label: &str,
+) -> anyhow::Result<Option<RegularFileIdentity>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {label} {path:?}"));
+        }
+    };
+    Ok(Some(regular_file_identity_from_metadata(&metadata, label)?))
+}
+
+fn observe_auth_state_file_identity(
+    data_dir: &Path,
+) -> anyhow::Result<Option<RegularFileIdentity>> {
+    observe_optional_regular_file_identity(&auth_state_path(data_dir)?, "auth state")
+}
+
+fn observe_audit_chain_activation_file_identity(
+    data_dir: &Path,
+) -> anyhow::Result<Option<RegularFileIdentity>> {
+    observe_optional_regular_file_identity(
+        &audit_chain_activation_path(data_dir)?,
+        "audit chain activation record",
+    )
+}
+
+fn observe_runtime_device_key_file_identity(
+    data_dir: &Path,
+) -> anyhow::Result<Option<RegularFileIdentity>> {
+    observe_optional_regular_file_identity(
+        &elastos_identity::device_key_path(data_dir),
+        "runtime device key",
+    )
+}
+
+fn invalidate_verified_auth_state_cache(data_dir: &Path) {
+    let key = auth_state_cache_key(data_dir);
+    if let Ok(mut cache) = verified_auth_state_cache().lock() {
+        cache.remove(&key);
+    }
+}
+
+fn store_verified_auth_state_cache(
+    data_dir: &Path,
+    auth_state_identity: Option<RegularFileIdentity>,
+    activation_identity: Option<RegularFileIdentity>,
+    runtime_device_key_identity: Option<RegularFileIdentity>,
+    state: &AuthState,
+) {
+    let key = auth_state_cache_key(data_dir);
+    if let Ok(mut cache) = verified_auth_state_cache().lock() {
+        cache.insert(
+            key,
+            VerifiedAuthStateCacheEntry {
+                auth_state_identity,
+                activation_identity,
+                runtime_device_key_identity,
+                state: state.clone(),
+            },
+        );
+    }
+}
+
+fn take_verified_auth_state_cache_hit(
+    data_dir: &Path,
+    auth_state_identity: Option<RegularFileIdentity>,
+    activation_identity: Option<RegularFileIdentity>,
+    runtime_device_key_identity: Option<RegularFileIdentity>,
+) -> Option<AuthState> {
+    let key = auth_state_cache_key(data_dir);
+    let cache = verified_auth_state_cache().lock().ok()?;
+    let entry = cache.get(&key)?;
+    if entry.auth_state_identity == auth_state_identity
+        && entry.activation_identity == activation_identity
+        && entry.runtime_device_key_identity == runtime_device_key_identity
+    {
+        Some(entry.state.clone())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn verify_audit_chain_call_count(data_dir: &Path) -> usize {
+    let key = auth_state_cache_key(data_dir);
+    VERIFY_AUDIT_CHAIN_CALLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|calls| calls.get(&key).copied())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn record_verify_audit_chain_call(data_dir: &Path) {
+    let key = auth_state_cache_key(data_dir);
+    if let Ok(mut calls) = VERIFY_AUDIT_CHAIN_CALLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        *calls.entry(key).or_insert(0) += 1;
+    }
+}
+
+#[cfg(test)]
+fn install_verified_auth_state_cache_fill_hook(
+    data_dir: &Path,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let key = auth_state_cache_key(data_dir);
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    VERIFIED_AUTH_STATE_CACHE_FILL_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("cache-fill hook lock")
+        .insert(
+            key,
+            VerifiedAuthStateCacheBoundaryHook {
+                reached: reached_tx,
+                resume: resume_rx,
+            },
+        );
+    (reached_rx, resume_tx)
+}
+
+#[cfg(test)]
+fn run_verified_auth_state_cache_fill_hook(data_dir: &Path) -> anyhow::Result<()> {
+    let key = auth_state_cache_key(data_dir);
+    let hook = VERIFIED_AUTH_STATE_CACHE_FILL_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| anyhow!("cache-fill hook lock poisoned"))?
+        .remove(&key);
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+    hook.reached
+        .send(())
+        .map_err(|_| anyhow!("cache-fill test observer closed"))?;
+    hook.resume
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| anyhow!("cache-fill test resume timed out"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn install_verified_auth_state_cache_hit_hook(
+    data_dir: &Path,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let key = auth_state_cache_key(data_dir);
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    VERIFIED_AUTH_STATE_CACHE_HIT_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("cache-hit hook lock")
+        .insert(
+            key,
+            VerifiedAuthStateCacheBoundaryHook {
+                reached: reached_tx,
+                resume: resume_rx,
+            },
+        );
+    (reached_rx, resume_tx)
+}
+
+#[cfg(test)]
+fn run_verified_auth_state_cache_hit_hook(data_dir: &Path) -> anyhow::Result<()> {
+    let key = auth_state_cache_key(data_dir);
+    let hook = VERIFIED_AUTH_STATE_CACHE_HIT_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| anyhow!("cache-hit hook lock poisoned"))?
+        .remove(&key);
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+    hook.reached
+        .send(())
+        .map_err(|_| anyhow!("cache-hit test observer closed"))?;
+    hook.resume
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| anyhow!("cache-hit test resume timed out"))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,18 +680,13 @@ pub struct PrincipalRecord {
     pub updated_at: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimePrincipalRole {
+    // Existing local runtimes with a single pre-role passkey remain recoverable.
+    #[default]
     Admin,
     Guest,
-}
-
-impl Default for RuntimePrincipalRole {
-    fn default() -> Self {
-        // Existing local runtimes with a single pre-role passkey remain recoverable.
-        Self::Admin
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -469,7 +738,7 @@ struct AuditChainCheckpointV1 {
     anchor_hash: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct AuditChainActivationV2 {
     schema: String,
@@ -785,7 +1054,7 @@ fn persist_audit_chain_activation_unlocked(
     data_dir: &Path,
     activated_at: u64,
     checkpoint: &AuditChainCheckpointV1,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RegularFileIdentity> {
     let path = audit_chain_activation_path(data_dir)?;
     if let Some(parent) = path.parent() {
         ensure_regular_auth_parent(data_dir, parent)?;
@@ -803,7 +1072,18 @@ fn persist_audit_chain_activation_unlocked(
         signer_did,
         signature,
     };
-    write_secret_json_atomic(&path, &activation)
+    write_secret_json_atomic(&path, &activation)?;
+    let identity_before = observe_audit_chain_activation_file_identity(data_dir)?
+        .ok_or_else(|| anyhow!("audit chain activation disappeared after persistence"))?;
+    let persisted = load_audit_chain_activation_unlocked(data_dir)?
+        .ok_or_else(|| anyhow!("audit chain activation disappeared after persistence"))?;
+    let identity_after = observe_audit_chain_activation_file_identity(data_dir)?
+        .ok_or_else(|| anyhow!("audit chain activation disappeared after persistence"))?;
+    if identity_before != identity_after || persisted != activation {
+        anyhow::bail!("audit chain activation changed concurrently during persistence");
+    }
+    invalidate_verified_auth_state_cache(data_dir);
+    Ok(identity_after)
 }
 
 fn validate_checkpoint_progress(
@@ -881,51 +1161,111 @@ fn write_secret_json_atomic(path: &Path, value: &impl Serialize) -> anyhow::Resu
 
 pub fn load_auth_state(data_dir: &Path) -> anyhow::Result<AuthState> {
     with_audit_chain_activation_lock(data_dir, || {
-        let stored_state = load_auth_state_unverified(data_dir)?;
-        let state_was_present = stored_state.is_some();
-        let mut state = stored_state.unwrap_or_default();
-        let activation = load_audit_chain_activation_unlocked(data_dir)?;
-        match (state.audit_chain_state.as_ref(), activation.as_ref()) {
-            (Some(chain_state), Some(activation)) => {
-                verify_audit_chain(data_dir, &state)?;
-                if chain_state.activated_at != activation.activated_at {
-                    anyhow::bail!("audit chain state does not match its activation record");
-                }
-                let checkpoint = audit_chain_checkpoint(&state)?
-                    .expect("audit chain state must produce a checkpoint");
-                if validate_checkpoint_progress(&activation.checkpoint, &checkpoint)? {
-                    persist_audit_chain_activation_unlocked(
-                        data_dir,
-                        chain_state.activated_at,
-                        &checkpoint,
-                    )?;
-                }
+        for _ in 0..2 {
+            if let Some(state) = load_auth_state_locked_once(data_dir)? {
+                return Ok(state);
             }
-            (Some(chain_state), None) => {
-                verify_audit_chain(data_dir, &state)
-                    .context("cannot recover audit activation from invalid signed chain state")?;
-                let checkpoint = audit_chain_checkpoint(&state)?
-                    .expect("audit chain state must produce a checkpoint");
-                persist_audit_chain_activation_unlocked(
+        }
+        anyhow::bail!("auth state changed concurrently while it was being verified")
+    })
+}
+
+fn load_auth_state_locked_once(data_dir: &Path) -> anyhow::Result<Option<AuthState>> {
+    let initial_auth_state_identity = observe_auth_state_file_identity(data_dir)?;
+    let mut expected_activation_identity = observe_audit_chain_activation_file_identity(data_dir)?;
+    let initial_runtime_device_key_identity = observe_runtime_device_key_file_identity(data_dir)?;
+    if let Some(cached) = take_verified_auth_state_cache_hit(
+        data_dir,
+        initial_auth_state_identity,
+        expected_activation_identity,
+        initial_runtime_device_key_identity,
+    ) {
+        #[cfg(test)]
+        run_verified_auth_state_cache_hit_hook(data_dir)?;
+        let final_auth_state_identity = observe_auth_state_file_identity(data_dir)?;
+        let final_activation_identity = observe_audit_chain_activation_file_identity(data_dir)?;
+        let final_runtime_device_key_identity = observe_runtime_device_key_file_identity(data_dir)?;
+        if final_auth_state_identity != initial_auth_state_identity
+            || final_activation_identity != expected_activation_identity
+            || final_runtime_device_key_identity != initial_runtime_device_key_identity
+        {
+            invalidate_verified_auth_state_cache(data_dir);
+            return Ok(None);
+        }
+        let mut state = cached;
+        prune_auth_state(&mut state, now_ts());
+        return Ok(Some(state));
+    }
+
+    let stored_state = load_auth_state_unverified(data_dir)?;
+    let state_was_present = stored_state.is_some();
+    let mut state = stored_state.unwrap_or_default();
+    let activation = load_audit_chain_activation_unlocked(data_dir)?;
+    let mut verified_in_match = false;
+    match (state.audit_chain_state.as_ref(), activation.as_ref()) {
+        (Some(chain_state), Some(activation)) => {
+            verify_audit_chain(data_dir, &state)?;
+            verified_in_match = true;
+            if chain_state.activated_at != activation.activated_at {
+                anyhow::bail!("audit chain state does not match its activation record");
+            }
+            let checkpoint = audit_chain_checkpoint(&state)?
+                .expect("audit chain state must produce a checkpoint");
+            if validate_checkpoint_progress(&activation.checkpoint, &checkpoint)? {
+                expected_activation_identity = Some(persist_audit_chain_activation_unlocked(
                     data_dir,
                     chain_state.activated_at,
                     &checkpoint,
-                )?;
+                )?);
             }
-            (None, Some(_)) => {
-                anyhow::bail!("audit chain state is required after activation");
-            }
-            (None, None) if state_was_present && auth_state_requires_audit_chain(&state) => {
-                anyhow::bail!(
-                    "unchained auth state is unsupported; preserve and back up the existing data root, then use a fresh data root; no automatic migration or offline migration script is provided"
-                );
-            }
-            (None, None) => {}
         }
+        (Some(chain_state), None) => {
+            verify_audit_chain(data_dir, &state)
+                .context("cannot recover audit activation from invalid signed chain state")?;
+            verified_in_match = true;
+            let checkpoint = audit_chain_checkpoint(&state)?
+                .expect("audit chain state must produce a checkpoint");
+            expected_activation_identity = Some(persist_audit_chain_activation_unlocked(
+                data_dir,
+                chain_state.activated_at,
+                &checkpoint,
+            )?);
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("audit chain state is required after activation");
+        }
+        (None, None) if state_was_present && auth_state_requires_audit_chain(&state) => {
+            anyhow::bail!(
+                "unchained auth state is unsupported; preserve and back up the existing data root, then use a fresh data root; no automatic migration or offline migration script is provided"
+            );
+        }
+        (None, None) => {}
+    }
+    if !verified_in_match {
         verify_audit_chain(data_dir, &state)?;
-        prune_auth_state(&mut state, now_ts());
-        Ok(state)
-    })
+    }
+    #[cfg(test)]
+    run_verified_auth_state_cache_fill_hook(data_dir)?;
+
+    let final_auth_state_identity = observe_auth_state_file_identity(data_dir)?;
+    let final_activation_identity = observe_audit_chain_activation_file_identity(data_dir)?;
+    let final_runtime_device_key_identity = observe_runtime_device_key_file_identity(data_dir)?;
+    if final_auth_state_identity != initial_auth_state_identity
+        || final_activation_identity != expected_activation_identity
+        || final_runtime_device_key_identity != initial_runtime_device_key_identity
+    {
+        invalidate_verified_auth_state_cache(data_dir);
+        return Ok(None);
+    }
+    store_verified_auth_state_cache(
+        data_dir,
+        initial_auth_state_identity,
+        expected_activation_identity,
+        initial_runtime_device_key_identity,
+        &state,
+    );
+    prune_auth_state(&mut state, now_ts());
+    Ok(Some(state))
 }
 
 fn auth_state_requires_audit_chain(state: &AuthState) -> bool {
@@ -1010,6 +1350,7 @@ pub(crate) fn save_auth_state(data_dir: &Path, state: &AuthState) -> anyhow::Res
                 )?;
             }
         }
+        invalidate_verified_auth_state_cache(data_dir);
         Ok(())
     })
 }
@@ -1377,6 +1718,99 @@ pub fn begin_declarative_principal_root_protection_activation(
     Ok(PrincipalRootProtectionActivationGuard { _guard: guard })
 }
 
+pub(crate) struct PrincipalRootProtectionActivationWithPlaintext {
+    pub(crate) guard: PrincipalRootProtectionActivationGuard,
+    pub(crate) plaintext_objects: Vec<PrincipalRootMigrationSelectionV1>,
+}
+
+/// First-time activation cannot demand an already-clean root: the shell
+/// writes declared objects (Home browser state, for one) before a person can
+/// reach Recovery, so the export flow captures the surviving plaintext here
+/// and migrates it under this same guard once the root's protection exists.
+/// Declared encrypted envelopes are still verified against the stored
+/// protection exactly as in the strict entry above.
+pub(crate) fn begin_declarative_principal_root_protection_activation_migrating_plaintext(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    inventory: &[PrincipalRootProtectedObjectDeclarationV1],
+) -> anyhow::Result<PrincipalRootProtectionActivationWithPlaintext> {
+    validate_principal_root_object_binding(principal_id, localhost_root, localhost_root)?;
+    let guard = principal_root_object_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
+    let protection = load_principal_root_protection(data_dir, principal_id, localhost_root)?;
+    let classified = classify_declared_principal_root_objects(
+        data_dir,
+        principal_id,
+        localhost_root,
+        inventory,
+    )?;
+    verify_classified_principal_root_objects_with_stored_protection(
+        data_dir,
+        protection.as_ref(),
+        &classified,
+    )?;
+    Ok(PrincipalRootProtectionActivationWithPlaintext {
+        guard: PrincipalRootProtectionActivationGuard { _guard: guard },
+        plaintext_objects: classified.plaintext_objects,
+    })
+}
+
+/// Can the online path finish what protecting this root would start?
+///
+/// Protecting a root stores the protection before it can encrypt anything
+/// under it, so a migration that fails afterwards leaves exactly the pair
+/// the boot check refuses to start on: a protected root with plaintext
+/// still beside it. The plan validator caps one migration far below the
+/// inventory ceiling, so an ordinary Documents folder can exceed it. Ask
+/// while refusing still costs nothing, and leave the larger migration to
+/// the offline command, which can hold the Home still while it works.
+pub(crate) fn ensure_online_plaintext_migration_is_possible(
+    plaintext_objects: &[PrincipalRootMigrationSelectionV1],
+) -> anyhow::Result<()> {
+    if plaintext_objects.len() > MAX_MIGRATION_OBJECTS {
+        anyhow::bail!(
+            "migration_required: {} unprotected objects exceed the {} this can move while the \
+             Home is running; run the offline principal-root upgrade first",
+            plaintext_objects.len(),
+            MAX_MIGRATION_OBJECTS,
+        );
+    }
+    Ok(())
+}
+
+/// Migrate the plaintext selections captured at activation begin, under the
+/// held activation guard, once the root's protection is stored. Runs the same
+/// journaled plan machinery as the offline command; the backup lands under
+/// the Home's own backups directory.
+pub(crate) fn migrate_principal_root_plaintext_objects_under_activation(
+    _activation: &PrincipalRootProtectionActivationGuard,
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    selections: Vec<PrincipalRootMigrationSelectionV1>,
+) -> anyhow::Result<PrincipalRootMigrationReceiptV1> {
+    let plan = PrincipalRootMigrationPlanV1 {
+        schema: PRINCIPAL_ROOT_MIGRATION_PLAN_SCHEMA.to_string(),
+        principal_id: principal_id.to_string(),
+        localhost_root: localhost_root.to_string(),
+        objects: selections,
+    };
+    validate_principal_root_migration_plan(&plan)?;
+    let plan_bytes = serde_json::to_vec(&plan)?;
+    let plan_sha256 = sha256_label(&plan_bytes);
+    let backups_parent = data_dir.join("backups");
+    ensure_safe_backup_parent(&backups_parent)?;
+    let backup_dir = backups_parent.join(format!(
+        "principal-root-migration-{}-{}",
+        &plan_sha256["sha256:".len()..][..16],
+        now_ts(),
+    ));
+    recover_principal_root_migration_journal(data_dir)?;
+    migrate_principal_root_objects_plan_locked(data_dir, &plan, &plan_sha256, &backup_dir)
+}
+
 pub(crate) fn begin_declarative_principal_root_protection_activation_with_candidate(
     data_dir: &Path,
     candidate: &PrincipalRootProtectionV1,
@@ -1457,7 +1891,7 @@ pub fn read_principal_root_object(
     let _guard = principal_root_object_mutation_lock()
         .lock()
         .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
-    let bytes = std::fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
+    let bytes = read_principal_root_object_bytes(path)?;
     let Some(protection) = load_principal_root_protection(data_dir, principal_id, localhost_root)?
     else {
         return Ok(bytes);
@@ -1488,6 +1922,30 @@ pub fn read_principal_root_object(
     .with_context(|| format!("failed to decrypt protected principal-root object: {object_uri}"))
 }
 
+fn read_principal_root_object_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Err(err).with_context(|| format!("failed to read {path:?}"));
+        }
+        Err(err) => return Err(err).with_context(|| format!("failed to read {path:?}")),
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {path:?}"))?;
+    if !metadata.is_file() {
+        anyhow::bail!("principal-root object must be a regular file");
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {path:?}"))?;
+    Ok(bytes)
+}
+
 pub fn write_principal_root_object(
     data_dir: &Path,
     principal_id: &str,
@@ -1496,11 +1954,87 @@ pub fn write_principal_root_object(
     path: &Path,
     plaintext: &[u8],
 ) -> anyhow::Result<()> {
+    write_principal_root_object_inner(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        path,
+        plaintext,
+        PrincipalRootObjectWriteOptions {
+            require_protection: false,
+            create_only: false,
+        },
+    )
+}
+
+pub(crate) fn create_principal_root_object(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &Path,
+    plaintext: &[u8],
+) -> anyhow::Result<()> {
+    write_principal_root_object_inner(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        path,
+        plaintext,
+        PrincipalRootObjectWriteOptions {
+            require_protection: false,
+            create_only: true,
+        },
+    )
+}
+
+pub(crate) fn write_protected_principal_root_object(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &Path,
+    plaintext: &[u8],
+) -> anyhow::Result<()> {
+    write_principal_root_object_inner(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        path,
+        plaintext,
+        PrincipalRootObjectWriteOptions {
+            require_protection: true,
+            create_only: false,
+        },
+    )
+}
+
+struct PrincipalRootObjectWriteOptions {
+    require_protection: bool,
+    create_only: bool,
+}
+
+fn write_principal_root_object_inner(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &Path,
+    plaintext: &[u8],
+    options: PrincipalRootObjectWriteOptions,
+) -> anyhow::Result<()> {
     validate_principal_root_object_binding(principal_id, localhost_root, object_uri)?;
+    validate_principal_root_object_path(data_dir, object_uri, path)?;
     let _guard = principal_root_object_mutation_lock()
         .lock()
         .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
     let protection = load_principal_root_protection(data_dir, principal_id, localhost_root)?;
+    if options.require_protection && protection.is_none() {
+        anyhow::bail!("protected principal-root object requires active principal-root protection");
+    }
     let bytes = if let Some(protection) = protection {
         let data_key = principal_root_data_key_from_protection(data_dir, &protection)?;
         let mut nonce = [0u8; 12];
@@ -1525,6 +2059,17 @@ pub fn write_principal_root_object(
     } else {
         plaintext.to_vec()
     };
+    if options.require_protection {
+        ensure_protected_principal_root_object_parent(data_dir, path)?;
+    }
+    if options.create_only {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_owner_only_new_file(path, &bytes)?;
+        sync_parent_directory(path)?;
+        return Ok(());
+    }
     atomic_write(path, &bytes)
 }
 
@@ -2366,6 +2911,8 @@ fn require_runtime_audit_signer(
 }
 
 fn verify_audit_chain(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> {
+    #[cfg(test)]
+    record_verify_audit_chain_call(data_dir);
     if state.audit.is_empty()
         && state.audit_chain.is_empty()
         && state.audit_chain_state.is_none()
@@ -2567,6 +3114,19 @@ fn validate_principal_root_object_binding(
             .is_some_and(|rest| rest.starts_with('/'));
     if !under_root {
         anyhow::bail!("principal-root object URI is outside the principal root");
+    }
+    Ok(())
+}
+
+fn validate_principal_root_object_path(
+    data_dir: &Path,
+    object_uri: &str,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let expected = rooted_localhost_fs_path(data_dir, object_uri)
+        .ok_or_else(|| anyhow!("principal-root object URI has no canonical filesystem path"))?;
+    if path != expected {
+        anyhow::bail!("principal-root object path does not match its canonical URI path")
     }
     Ok(())
 }
@@ -3867,6 +4427,56 @@ fn create_owner_only_dir(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Create a principal-root directory and every missing parent owner-only.
+///
+/// Protected writes refuse a parent anyone else can read, and rightly so — a
+/// loose directory can mean the objects under it were already exposed. That
+/// makes it the writer's job to never create one: `create_dir_all` follows
+/// the process umask, so a Home whose shell saved its state before any
+/// protection existed left a world-readable root behind and locked the person
+/// out of ever saving a Profile.
+pub(crate) fn create_owner_only_dir_all(data_dir: &Path, path: &Path) -> anyhow::Result<()> {
+    // Only ever create or narrow inside this Home's own data directory. The
+    // path above it belongs to the person's machine, not to us.
+    if !path.starts_with(data_dir) || path == data_dir {
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("failed to create directory {path:?}"))?;
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        create_owner_only_dir_all(data_dir, parent)?;
+    }
+    if !path.is_dir() {
+        if let Err(err) = create_owner_only_dir(path) {
+            if !path.is_dir() {
+                return Err(err)
+                    .with_context(|| format!("failed to create owner-only directory {path:?}"));
+            }
+        }
+    }
+    // A directory that already exists may predate this rule — earlier writers
+    // used the process umask — so bring our own tree up to it rather than
+    // leave a person permanently unable to save. This does not soften the
+    // check that refuses a loose parent at write time; it stops the Runtime
+    // from creating the loose parent at all, and only ever narrows access on
+    // a directory this process owns.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect owner-only directory {path:?}"))?;
+        if !metadata.file_type().is_symlink()
+            && metadata.is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o077 != 0
+        {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("failed to restrict {path:?} to owner-only"))?;
+        }
+    }
+    Ok(())
+}
+
 fn durable_atomic_replace(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
     let parent = path
         .parent()
@@ -3925,6 +4535,94 @@ fn ensure_no_symlink_components(data_dir: &Path, path: &Path) -> anyhow::Result<
     Ok(())
 }
 
+fn ensure_protected_principal_root_object_parent(
+    data_dir: &Path,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("protected principal-root object path has no parent"))?;
+    let relative = parent.strip_prefix(data_dir).map_err(|_| {
+        anyhow!("protected principal-root object path escapes the Runtime data root")
+    })?;
+    ensure_auth_owner_only_directory(data_dir)?;
+    let mut current = data_dir.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        ensure_auth_owner_only_directory(&current)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn auth_owner_only_directory_matches_uid(
+    metadata: &std::fs::Metadata,
+    expected_uid: libc::uid_t,
+) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    metadata.is_dir()
+        && metadata.uid() == expected_uid
+        && metadata.permissions().mode() & 0o077 == 0
+}
+
+/// Ensures an auth-owned parent directory is an owner-only real directory.
+///
+/// Protected principal-root objects contain secrets, so this intentionally
+/// differs from the generic unprotected-object writer: it creates each missing
+/// component with 0700 and rejects an existing symlink, non-directory, foreign
+/// owner, or group/world-accessible directory before any object write.
+fn ensure_auth_owner_only_directory(path: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("failed to create protected parent {path:?}"))
+                }
+            }
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect protected parent {path:?}"))
+        }
+    }
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect protected parent {path:?}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("protected principal-root parent must be a real directory")
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        let directory = options
+            .open(path)
+            .with_context(|| format!("failed to open protected parent {path:?}"))?;
+        let metadata = directory
+            .metadata()
+            .with_context(|| format!("failed to inspect opened protected parent {path:?}"))?;
+        if !auth_owner_only_directory_matches_uid(&metadata, unsafe { libc::geteuid() }) {
+            anyhow::bail!("protected principal-root parent must be owner-only: {path:?}")
+        }
+    }
+    Ok(())
+}
+
 fn write_owner_only_new_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
@@ -3961,14 +4659,25 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         ".{file_name}.{:016x}.tmp",
         rand::thread_rng().next_u64()
     ));
-    if let Err(err) = std::fs::write(&temp, bytes) {
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
         let _ = std::fs::remove_file(&temp);
-        return Err(err.into());
+        return Err(err);
     }
     if let Err(err) = std::fs::rename(&temp, path) {
         let _ = std::fs::remove_file(&temp);
         return Err(err.into());
     }
+    sync_parent_directory(path)?;
     Ok(())
 }
 
@@ -4075,6 +4784,396 @@ pub(crate) fn store_test_principal_root_protection(
 mod tests {
     use super::*;
     use elastos_runtime::auth::PasskeyWebAuthnBinding;
+
+    #[test]
+    fn verified_auth_state_cache_returns_equivalent_state_on_unchanged_dir() {
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+
+        let verifies_before_first = verify_audit_chain_call_count(data_dir.path());
+        let first = load_auth_state(data_dir.path()).unwrap();
+        let verifies_after_first = verify_audit_chain_call_count(data_dir.path());
+        assert!(
+            verifies_after_first > verifies_before_first,
+            "first load should verify the audit chain"
+        );
+
+        let second = load_auth_state(data_dir.path()).unwrap();
+        assert_eq!(
+            verify_audit_chain_call_count(data_dir.path()),
+            verifies_after_first,
+            "cache hit must not re-verify"
+        );
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap()
+        );
+        assert!(second.guest_registration_enabled);
+    }
+
+    #[test]
+    fn verified_auth_state_cache_invalidates_after_save_mutation() {
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        let enabled = load_auth_state(data_dir.path()).unwrap();
+        assert!(enabled.guest_registration_enabled);
+
+        set_guest_registration_enabled(data_dir.path(), false, 30).unwrap();
+        let disabled = load_auth_state(data_dir.path()).unwrap();
+        assert!(!disabled.guest_registration_enabled);
+        assert_eq!(disabled.audit.len(), enabled.audit.len() + 1);
+    }
+
+    #[test]
+    fn verified_auth_state_cache_does_not_return_stale_after_external_rewrite() {
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        let auth_path = auth_state_path(data_dir.path()).unwrap();
+        let activation_path = audit_chain_activation_path(data_dir.path()).unwrap();
+        let enabled_auth_bytes = std::fs::read(&auth_path).unwrap();
+        let enabled_activation_bytes = std::fs::read(&activation_path).unwrap();
+        let enabled = load_auth_state(data_dir.path()).unwrap();
+        assert!(enabled.guest_registration_enabled);
+
+        set_guest_registration_enabled(data_dir.path(), false, 30).unwrap();
+        let disabled = load_auth_state(data_dir.path()).unwrap();
+        assert!(!disabled.guest_registration_enabled);
+
+        // External rewrite restores prior auth-state + activation without save_auth_state.
+        // Changing only auth-state.json would trip activation rollback detection; both must move.
+        std::fs::write(&auth_path, &enabled_auth_bytes).unwrap();
+        std::fs::write(&activation_path, &enabled_activation_bytes).unwrap();
+        let restored = load_auth_state(data_dir.path()).unwrap();
+        assert!(
+            restored.guest_registration_enabled,
+            "external rewrite must bypass the process-local cache"
+        );
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&enabled).unwrap()
+        );
+    }
+
+    #[test]
+    fn verified_auth_state_cache_retries_when_files_change_before_cache_fill() {
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        let auth_path = auth_state_path(data_dir.path()).unwrap();
+        let activation_path = audit_chain_activation_path(data_dir.path()).unwrap();
+        let enabled_auth_bytes = std::fs::read(&auth_path).unwrap();
+        let enabled_activation_bytes = std::fs::read(&activation_path).unwrap();
+
+        set_guest_registration_enabled(data_dir.path(), false, 30).unwrap();
+        let disabled_auth_bytes = std::fs::read(&auth_path).unwrap();
+        let disabled_activation_bytes = std::fs::read(&activation_path).unwrap();
+
+        std::fs::write(&auth_path, &enabled_auth_bytes).unwrap();
+        std::fs::write(&activation_path, &enabled_activation_bytes).unwrap();
+        invalidate_verified_auth_state_cache(data_dir.path());
+        let verifies_before = verify_audit_chain_call_count(data_dir.path());
+        let (verified, resume) = install_verified_auth_state_cache_fill_hook(data_dir.path());
+        let loader_data_dir = data_dir.path().to_path_buf();
+        let loader = std::thread::spawn(move || load_auth_state(&loader_data_dir));
+
+        verified
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("load reached the cache-fill boundary");
+        std::fs::write(&auth_path, &disabled_auth_bytes).unwrap();
+        std::fs::write(&activation_path, &disabled_activation_bytes).unwrap();
+        resume.send(()).unwrap();
+
+        let loaded = loader.join().unwrap().unwrap();
+        assert!(
+            !loaded.guest_registration_enabled,
+            "verified enabled state must not be cached under the disabled file identities"
+        );
+        let verifies_after_retry = verify_audit_chain_call_count(data_dir.path());
+        assert!(verifies_after_retry >= verifies_before + 2);
+
+        let cached = load_auth_state(data_dir.path()).unwrap();
+        assert!(!cached.guest_registration_enabled);
+        assert_eq!(
+            verify_audit_chain_call_count(data_dir.path()),
+            verifies_after_retry,
+            "the retry result should be cached only under its own file identities"
+        );
+    }
+
+    #[test]
+    fn verified_auth_state_cache_retries_when_files_change_before_cache_hit_return() {
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        let auth_path = auth_state_path(data_dir.path()).unwrap();
+        let activation_path = audit_chain_activation_path(data_dir.path()).unwrap();
+        let enabled_auth_bytes = std::fs::read(&auth_path).unwrap();
+        let enabled_activation_bytes = std::fs::read(&activation_path).unwrap();
+
+        set_guest_registration_enabled(data_dir.path(), false, 30).unwrap();
+        let disabled_auth_bytes = std::fs::read(&auth_path).unwrap();
+        let disabled_activation_bytes = std::fs::read(&activation_path).unwrap();
+
+        std::fs::write(&auth_path, &enabled_auth_bytes).unwrap();
+        std::fs::write(&activation_path, &enabled_activation_bytes).unwrap();
+        invalidate_verified_auth_state_cache(data_dir.path());
+        assert!(
+            load_auth_state(data_dir.path())
+                .unwrap()
+                .guest_registration_enabled
+        );
+        let verifies_after_prime = verify_audit_chain_call_count(data_dir.path());
+        let (hit_observed, resume) = install_verified_auth_state_cache_hit_hook(data_dir.path());
+        let loader_data_dir = data_dir.path().to_path_buf();
+        let loader = std::thread::spawn(move || load_auth_state(&loader_data_dir));
+
+        hit_observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("load reached the cache-hit return boundary");
+        std::fs::write(&auth_path, &disabled_auth_bytes).unwrap();
+        std::fs::write(&activation_path, &disabled_activation_bytes).unwrap();
+        resume.send(()).unwrap();
+
+        let loaded = loader.join().unwrap().unwrap();
+        assert!(
+            !loaded.guest_registration_enabled,
+            "cache hit must not return enabled state after both files changed to disabled"
+        );
+        let verifies_after_retry = verify_audit_chain_call_count(data_dir.path());
+        assert!(verifies_after_retry > verifies_after_prime);
+
+        let cached = load_auth_state(data_dir.path()).unwrap();
+        assert!(!cached.guest_registration_enabled);
+        assert_eq!(
+            verify_audit_chain_call_count(data_dir.path()),
+            verifies_after_retry,
+            "the changed state should be cached only after full verification"
+        );
+    }
+
+    #[test]
+    fn verified_auth_state_cache_retries_when_runtime_device_key_changes_before_cache_fill() {
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        invalidate_verified_auth_state_cache(data_dir.path());
+        let (verified, resume) = install_verified_auth_state_cache_fill_hook(data_dir.path());
+        let device_key_path = elastos_identity::device_key_path(data_dir.path());
+        let replacement = [7_u8; 32];
+        let loader_data_dir = data_dir.path().to_path_buf();
+        let loader = std::thread::spawn(move || load_auth_state(&loader_data_dir));
+
+        verified
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("load reached the cache-fill boundary");
+        std::fs::write(&device_key_path, replacement).unwrap();
+        resume.send(()).unwrap();
+
+        let error = loader
+            .join()
+            .unwrap()
+            .expect_err("runtime device key replacement must fail closed");
+        assert!(!error.to_string().is_empty());
+        let repeat_error = load_auth_state(data_dir.path())
+            .expect_err("changed runtime device key must not retain a cached verified state");
+        assert!(!repeat_error.to_string().is_empty());
+    }
+
+    #[test]
+    fn verified_auth_state_cache_retries_when_runtime_device_key_changes_before_cache_hit_return() {
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        invalidate_verified_auth_state_cache(data_dir.path());
+        assert!(
+            load_auth_state(data_dir.path())
+                .unwrap()
+                .guest_registration_enabled
+        );
+        let (hit_observed, resume) = install_verified_auth_state_cache_hit_hook(data_dir.path());
+        let device_key_path = elastos_identity::device_key_path(data_dir.path());
+        let replacement = [9_u8; 32];
+        let loader_data_dir = data_dir.path().to_path_buf();
+        let loader = std::thread::spawn(move || load_auth_state(&loader_data_dir));
+
+        hit_observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("load reached the cache-hit return boundary");
+        std::fs::write(&device_key_path, replacement).unwrap();
+        resume.send(()).unwrap();
+
+        let error = loader
+            .join()
+            .unwrap()
+            .expect_err("runtime device key replacement must fail closed");
+        assert!(!error.to_string().is_empty());
+        let repeat_error = load_auth_state(data_dir.path())
+            .expect_err("cache hit must be invalidated after runtime device key replacement");
+        assert!(!repeat_error.to_string().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_auth_state_cache_detects_same_size_rewrite_with_restored_mtime() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        let auth_path = auth_state_path(data_dir.path()).unwrap();
+        let original = std::fs::read(&auth_path).unwrap();
+        let original_metadata = std::fs::metadata(&auth_path).unwrap();
+        let original_identity =
+            regular_file_identity_from_metadata(&original_metadata, "auth state").unwrap();
+
+        let verifies_before_prime = verify_audit_chain_call_count(data_dir.path());
+        assert!(
+            load_auth_state(data_dir.path())
+                .unwrap()
+                .guest_registration_enabled
+        );
+        let verifies_after_prime = verify_audit_chain_call_count(data_dir.path());
+        assert!(verifies_after_prime > verifies_before_prime);
+
+        let mut tampered = original.clone();
+        let marker = b"\"signature\":";
+        let marker_start = tampered
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("stored AuthState has a signed audit entry");
+        let signature_start = tampered[marker_start + marker.len()..]
+            .iter()
+            .position(|byte| *byte == b'\"')
+            .map(|offset| marker_start + marker.len() + offset + 1)
+            .expect("signature value is a JSON string");
+        tampered[signature_start] = if tampered[signature_start] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        assert_eq!(tampered.len(), original.len());
+
+        let mut file = OpenOptions::new().write(true).open(&auth_path).unwrap();
+        file.write_all(&tampered).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let path = CString::new(auth_path.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: original_identity.mtime_secs as libc::time_t,
+                tv_nsec: original_identity.mtime_nanos as libc::c_long,
+            },
+        ];
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+
+        let rewritten_identity = regular_file_identity_from_metadata(
+            &std::fs::metadata(&auth_path).unwrap(),
+            "auth state",
+        )
+        .unwrap();
+        assert_eq!(rewritten_identity.dev, original_identity.dev);
+        assert_eq!(rewritten_identity.ino, original_identity.ino);
+        assert_eq!(rewritten_identity.len, original_identity.len);
+        assert_eq!(
+            (
+                rewritten_identity.mtime_secs,
+                rewritten_identity.mtime_nanos
+            ),
+            (original_identity.mtime_secs, original_identity.mtime_nanos)
+        );
+        assert_ne!(
+            (
+                rewritten_identity.ctime_secs,
+                rewritten_identity.ctime_nanos
+            ),
+            (original_identity.ctime_secs, original_identity.ctime_nanos)
+        );
+
+        let error = load_auth_state(data_dir.path())
+            .expect_err("ctime change must prevent returning the cached verified state");
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_auth_state_cache_detects_same_size_runtime_device_key_replacement_with_restored_mtime(
+    ) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        let device_key_path = elastos_identity::device_key_path(data_dir.path());
+        let original = std::fs::read(&device_key_path).unwrap();
+        let original_metadata = std::fs::metadata(&device_key_path).unwrap();
+        let original_identity =
+            regular_file_identity_from_metadata(&original_metadata, "runtime device key").unwrap();
+
+        let verifies_before_prime = verify_audit_chain_call_count(data_dir.path());
+        assert!(
+            load_auth_state(data_dir.path())
+                .unwrap()
+                .guest_registration_enabled
+        );
+        let verifies_after_prime = verify_audit_chain_call_count(data_dir.path());
+        assert!(verifies_after_prime > verifies_before_prime);
+
+        let replacement = vec![original[0].wrapping_add(1); original.len()];
+        assert_eq!(replacement.len(), original.len());
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&device_key_path)
+            .unwrap();
+        file.write_all(&replacement).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let path = CString::new(device_key_path.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: original_identity.mtime_secs as libc::time_t,
+                tv_nsec: original_identity.mtime_nanos as libc::c_long,
+            },
+        ];
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+
+        let rewritten_identity = regular_file_identity_from_metadata(
+            &std::fs::metadata(&device_key_path).unwrap(),
+            "runtime device key",
+        )
+        .unwrap();
+        assert_eq!(rewritten_identity.dev, original_identity.dev);
+        assert_eq!(rewritten_identity.ino, original_identity.ino);
+        assert_eq!(rewritten_identity.len, original_identity.len);
+        assert_eq!(
+            (
+                rewritten_identity.mtime_secs,
+                rewritten_identity.mtime_nanos
+            ),
+            (original_identity.mtime_secs, original_identity.mtime_nanos)
+        );
+        assert_ne!(
+            (
+                rewritten_identity.ctime_secs,
+                rewritten_identity.ctime_nanos
+            ),
+            (original_identity.ctime_secs, original_identity.ctime_nanos)
+        );
+
+        let error = load_auth_state(data_dir.path())
+            .expect_err("ctime change on runtime device key must prevent returning cached state");
+        assert!(!error.to_string().is_empty());
+    }
 
     fn test_audit_event(index: u64) -> RuntimeAuditEventV1 {
         RuntimeAuditEventV1 {
@@ -4859,6 +5958,30 @@ mod tests {
                 .count(),
             1
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn atomic_write_cleans_up_a_staged_file_when_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(atomic_write(&path, b"replacement").is_err());
+        assert!(path.is_dir());
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -4868,6 +5991,17 @@ mod tests {
         let localhost_root = principal_localhost_root(principal_id);
         let object_uri = format!("{localhost_root}/Documents/plain.md");
         let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::set_permissions(
+                path.parent().unwrap(),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
 
         write_principal_root_object(
             data_dir.path(),
@@ -4880,6 +6014,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), b"plain body");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+        }
         assert_eq!(
             read_principal_root_object(
                 data_dir.path(),
@@ -4931,6 +6078,235 @@ mod tests {
     }
 
     #[test]
+    fn protected_principal_root_create_only_preserves_encrypted_bytes_on_collision() {
+        let data_dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(data_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let principal_id = "person:local:protected-create-only";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!(
+            "{}/.AppData/ElastOS/People/contact-state.json",
+            protection.localhost_root
+        );
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+
+        write_principal_root_object_inner(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &path,
+            br#"{"profile":"first"}"#,
+            PrincipalRootObjectWriteOptions {
+                require_protection: true,
+                create_only: true,
+            },
+        )
+        .unwrap();
+
+        let stored_before = std::fs::read(&path).unwrap();
+        let envelope: PrincipalRootObjectEnvelopeV1 =
+            serde_json::from_slice(&stored_before).unwrap();
+        assert_eq!(envelope.schema, PRINCIPAL_ROOT_OBJECT_SCHEMA);
+        assert_eq!(envelope.principal_id, principal_id);
+        assert_eq!(envelope.object_uri, object_uri);
+        assert!(!String::from_utf8_lossy(&stored_before).contains("first"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            read_principal_root_object(
+                data_dir.path(),
+                principal_id,
+                &protection.localhost_root,
+                &object_uri,
+                &path,
+            )
+            .unwrap(),
+            br#"{"profile":"first"}"#
+        );
+
+        let error = write_principal_root_object_inner(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &path,
+            br#"{"profile":"second"}"#,
+            PrincipalRootObjectWriteOptions {
+                require_protection: true,
+                create_only: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(|value| value.kind()),
+            Some(ErrorKind::AlreadyExists)
+        );
+
+        let stored_after = std::fs::read(&path).unwrap();
+        assert_eq!(stored_after, stored_before);
+        assert_eq!(
+            read_principal_root_object(
+                data_dir.path(),
+                principal_id,
+                &protection.localhost_root,
+                &object_uri,
+                &path,
+            )
+            .unwrap(),
+            br#"{"profile":"first"}"#
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_directory_policy_rejects_foreign_owner() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = std::fs::symlink_metadata(directory.path()).unwrap();
+        let owner_uid = metadata.uid();
+        let foreign_uid = owner_uid ^ 1;
+
+        assert!(auth_owner_only_directory_matches_uid(&metadata, owner_uid));
+        assert!(!auth_owner_only_directory_matches_uid(
+            &metadata,
+            foreign_uid
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_principal_root_writes_create_owner_only_parents() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(data_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let principal_id = "person:local:protected-owner-only";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!(
+            "{}/.AppData/ElastOS/People/contact-state.json",
+            protection.localhost_root
+        );
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+
+        write_protected_principal_root_object(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &path,
+            b"protected",
+        )
+        .unwrap();
+
+        let relative_parent = path
+            .parent()
+            .unwrap()
+            .strip_prefix(data_dir.path())
+            .unwrap();
+        let mut current = data_dir.path().to_path_buf();
+        assert_eq!(
+            std::fs::metadata(&current).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for component in relative_parent.components() {
+            current.push(component.as_os_str());
+            assert_eq!(
+                std::fs::metadata(&current).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{} is not owner-only",
+                current.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_principal_root_writes_reject_insecure_or_symlink_parents_without_writing() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        for parent_kind in ["insecure", "symlink"] {
+            let data_dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(data_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let principal_id = format!("person:local:protected-parent-{parent_kind}");
+            let protection = store_test_principal_root_protection(data_dir.path(), &principal_id);
+            let object_uri = format!(
+                "{}/.AppData/ElastOS/People/contact-state.json",
+                protection.localhost_root
+            );
+            let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+            let users = data_dir.path().join("Users");
+
+            if parent_kind == "insecure" {
+                std::fs::create_dir(&users).unwrap();
+                std::fs::set_permissions(&users, std::fs::Permissions::from_mode(0o755)).unwrap();
+            } else {
+                let outside = tempfile::tempdir().unwrap();
+                symlink(outside.path(), &users).unwrap();
+            }
+
+            let error = write_protected_principal_root_object(
+                data_dir.path(),
+                &principal_id,
+                &protection.localhost_root,
+                &object_uri,
+                &path,
+                b"protected",
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("protected principal-root parent"));
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn principal_root_write_rejects_a_path_that_does_not_match_its_uri() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:protected-wrong-path";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!("{}/Documents/expected.md", protection.localhost_root);
+        let escaped = data_dir
+            .path()
+            .join("outside")
+            .join("..")
+            .join("escaped")
+            .join("wrong.md");
+
+        let error = write_protected_principal_root_object(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &escaped,
+            b"protected",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match its canonical URI path"));
+        assert!(!data_dir.path().join("escaped").exists());
+    }
+
+    #[test]
     fn principal_root_object_rejects_plaintext_when_root_is_protected() {
         let data_dir = tempfile::tempdir().unwrap();
         let principal_id = "person:local:protected-plaintext";
@@ -4954,6 +6330,44 @@ mod tests {
         assert!(err
             .to_string()
             .contains("protected principal-root object is not encrypted"));
+    }
+
+    #[test]
+    fn principal_root_object_read_rejects_symlink_and_non_regular_paths() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:protected-read-path";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!("{}/Documents/read-check.md", protection.localhost_root);
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(data_dir.path().join("missing-object"), &path).unwrap();
+            let err = read_principal_root_object(
+                data_dir.path(),
+                principal_id,
+                &protection.localhost_root,
+                &object_uri,
+                &path,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("failed to read"));
+            std::fs::remove_file(&path).unwrap();
+        }
+
+        std::fs::create_dir_all(&path).unwrap();
+        let err = read_principal_root_object(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &path,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("regular file"));
     }
 
     #[test]
@@ -4998,6 +6412,63 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn recovery_activation_migrates_first_run_plaintext_under_new_protection() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:first-run-shell-state";
+        let localhost_root = principal_localhost_root(principal_id);
+        // The shell persists Home browser state before a person can reach
+        // Recovery — the exact object that used to deadlock first-run
+        // activation (activation demanded a clean root, migration demanded
+        // existing protection).
+        let object_uri = format!("{localhost_root}/.AppData/ElastOS/Home/browser-state.json");
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"{"schema":"home-state","windows":[]}"#).unwrap();
+        let inventory = [PrincipalRootProtectedObjectDeclarationV1::exact(
+            object_uri.clone(),
+        )];
+
+        let activation =
+            begin_declarative_principal_root_protection_activation_migrating_plaintext(
+                data_dir.path(),
+                principal_id,
+                &localhost_root,
+                &inventory,
+            )
+            .expect("first-run plaintext must not block migrating activation");
+        assert_eq!(activation.plaintext_objects.len(), 1);
+        assert_eq!(activation.plaintext_objects[0].object_uri, object_uri);
+
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        assert_eq!(protection.localhost_root, localhost_root);
+
+        let receipt = migrate_principal_root_plaintext_objects_under_activation(
+            &activation.guard,
+            data_dir.path(),
+            principal_id,
+            &localhost_root,
+            activation.plaintext_objects.clone(),
+        )
+        .expect("plaintext migrates online under the activation guard");
+        assert_eq!(receipt.object_count, 1);
+        drop(activation);
+
+        let migrated = std::fs::read(&path).unwrap();
+        assert!(
+            looks_like_principal_root_object_envelope(&migrated),
+            "migrated object must be an envelope"
+        );
+
+        begin_declarative_principal_root_protection_activation(
+            data_dir.path(),
+            principal_id,
+            &localhost_root,
+            &inventory,
+        )
+        .expect("strict activation passes once the root is clean");
     }
 
     #[test]

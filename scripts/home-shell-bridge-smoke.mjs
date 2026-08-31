@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260725a";
+const moduleVersion = "home-20260802a";
 const requests = [];
 const injectedProviderCalls = [];
 let extraWindowOpenCount = 0;
@@ -194,6 +194,16 @@ function assert(condition, message, details = null) {
   }
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((nextResolve, nextReject) => {
+    resolve = nextResolve;
+    reject = nextReject;
+  });
+  return { promise, resolve, reject };
+}
+
 const summary = {
   authority: { signed_in: true },
   active_shell: {
@@ -204,7 +214,19 @@ const summary = {
     ],
   },
   app: { id: "home", route: "/apps/home/" },
-  appearance: {},
+  appearance: {
+    schema: "elastos.home.appearance/v1",
+    revision: 0,
+    theme: "dark",
+    accent: "blue",
+    accent_custom: "#4f7fff",
+    dock_auto_hide: false,
+    sounds: false,
+    focus_mode: false,
+    background_image_url: null,
+    background_overlay_enabled: true,
+    background_overlay_opacity: 0.2,
+  },
   browser_state: {
     principal_id: "principal:home-shell-bridge",
     layout: { desktop: {}, taskbar: [], desktopHidden: [], desktopIconsVisible: true },
@@ -221,11 +243,13 @@ const summary = {
   targets: [
     { target: "browser", title: "Browser", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "inbox", title: "Inbox", attach_kind: "iframe", role: "app", target_kind: "app" },
+    { target: "people", title: "People", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "system", title: "System", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "wallet", title: "Wallet", attach_kind: "iframe", role: "app", target_kind: "app" },
   ],
 };
 let activeShellName = "home-cli";
+const pendingAppearanceResponses = [];
 const renewalBrowserInstance = "browser:authority-renewal-bridge";
 let renewalBrowserLaunchCount = 0;
 let passkeyCompleted = false;
@@ -428,8 +452,8 @@ globalThis.fetch = async (url, init = {}) => {
   if (url === "/api/apps/home/active-shell") {
     assert(body?.active === "home-gui", "root shell app-open must switch back to home-gui", body);
     assert(
-      init.headers?.["x-elastos-home-token"] === "root-token",
-      "home-gui switchback did not use the shell launch token",
+      init.headers?.["x-elastos-home-token"] === "host-token",
+      "home-gui switchback did not use the trusted Home host token",
       init.headers,
     );
     activeShellName = "home-gui";
@@ -488,6 +512,14 @@ globalThis.fetch = async (url, init = {}) => {
         title: "System",
       });
     }
+    if (body?.target === "people") {
+      return jsonResponse({
+        attach_kind: "iframe",
+        route: "/apps/people/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=people-token",
+        target: "people",
+        title: "People",
+      });
+    }
     if (body?.target === "wallet") {
       return jsonResponse({
         attach_kind: "iframe",
@@ -513,6 +545,26 @@ globalThis.fetch = async (url, init = {}) => {
       });
     }
     throw new Error(`unexpected launch target: ${body?.target || "missing"}`);
+  }
+  if (url === "/api/apps/home/appearance/preferences") {
+    assert(init.method === "POST", "appearance preferences must write through POST", init);
+    assert(
+      Object.keys(body || {}).length === 1,
+      "appearance preferences must send exactly one field",
+      body,
+    );
+    summary.appearance = {
+      ...summary.appearance,
+      ...body,
+      schema: "elastos.home.appearance/v1",
+      revision: summary.appearance.revision + 1,
+    };
+    const response = JSON.parse(JSON.stringify(summary.appearance));
+    const gate = pendingAppearanceResponses.shift();
+    if (gate) {
+      await gate.promise;
+    }
+    return jsonResponse(response);
   }
   if (url === "/api/apps/home/wallet-connector/evm/link/challenge") {
     assert(body?.connector_id === "wallet-metamask", "EVM bridge changed connector", body);
@@ -743,6 +795,38 @@ assert(
   "unauthorized shell message signed out Home",
   requests,
 );
+const cliAppearanceWritesBefore = requests.filter(
+  (request) => request.url === "/api/apps/home/appearance/preferences",
+).length;
+const cliAppearanceSummariesBefore = shellMessages.filter(
+  (message) => message.payload?.type === "home:shell-summary",
+).length;
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:ui-preference",
+  requestId: "appearance-home-cli",
+  homeToken: "root-token",
+  action: "write",
+  key: "theme",
+  value: "light",
+});
+const cliAppearanceReply = await waitForShellResponse(shellMessages, "appearance-home-cli");
+assert(
+  String(cliAppearanceReply.payload?.error || "").includes("denied"),
+  "Home CLI did not receive the exact appearance denial",
+  cliAppearanceReply,
+);
+assert(
+  requests.filter((request) => request.url === "/api/apps/home/appearance/preferences").length ===
+    cliAppearanceWritesBefore,
+  "Home CLI reached the canonical appearance preference writer",
+  requests,
+);
+assert(
+  shellMessages.filter((message) => message.payload?.type === "home:shell-summary").length ===
+    cliAppearanceSummariesBefore,
+  "Home CLI appearance write changed the canonical Home summary",
+  shellMessages,
+);
 for (const listener of windowListeners.get("message") || []) {
   listener({
     origin: "null",
@@ -823,7 +907,7 @@ assert(
 );
 assert(
   requests.some((request) => request.url === "/api/apps/home/active-shell"),
-  "explicit graphical action did not switch active shell with the shell token",
+  "explicit graphical action did not switch active shell with the trusted Home host token",
   requests,
 );
 assert(
@@ -837,6 +921,201 @@ function sendChildMessage(origin, source, data) {
     listener({ origin, source, data });
   }
 }
+
+async function waitForShellResponse(messages, requestId) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const reply = messages.find(
+      (message) =>
+        message.payload?.type === "home:shell-response" &&
+        message.payload?.requestId === requestId,
+    );
+    if (reply) {
+      return reply;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  throw new Error(`timed out waiting for Home shell response ${requestId}`);
+}
+
+const peopleLaunchesBeforeAuthorityProof = requests.filter(
+  (request) => request.url === "/api/apps/home/launch" && request.body?.target === "people",
+).length;
+const peopleCommandsBeforeAuthorityProof = shellMessages.filter(
+  (message) =>
+    message.payload?.type === "home:gui-command" &&
+    message.payload?.command === "open-target" &&
+    message.payload?.target === "people",
+).length;
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:open-target",
+  target: "people",
+  query: {},
+  homeToken: "gui-token",
+});
+for (
+  let attempt = 0;
+  attempt < 50 && shellMessages.filter(
+    (message) =>
+      message.payload?.type === "home:gui-command" &&
+      message.payload?.command === "open-target" &&
+      message.payload?.target === "people",
+  ).length === peopleCommandsBeforeAuthorityProof;
+  attempt += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  shellMessages.filter(
+    (message) =>
+      message.payload?.type === "home:gui-command" &&
+      message.payload?.command === "open-target" &&
+      message.payload?.target === "people",
+  ).length === peopleCommandsBeforeAuthorityProof + 1,
+  "Home did not hand the People action to the established Home GUI",
+  shellMessages,
+);
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:launch-target",
+  requestId: "launch-people-authority-proof",
+  target: "people",
+  query: {},
+  homeToken: "gui-token",
+});
+for (
+  let attempt = 0;
+  attempt < 50 && requests.filter(
+    (request) => request.url === "/api/apps/home/launch" && request.body?.target === "people",
+  ).length === peopleLaunchesBeforeAuthorityProof;
+  attempt += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  requests.filter(
+    (request) => request.url === "/api/apps/home/launch" && request.body?.target === "people",
+  ).length === peopleLaunchesBeforeAuthorityProof + 1,
+  "The established Home GUI could not launch People for the authority proof",
+  requests,
+);
+for (
+  let attempt = 0;
+  attempt < 50 && !shellMessages.some(
+    (message) => message.payload?.requestId === "launch-people-authority-proof",
+  );
+  attempt += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  shellMessages.some((message) =>
+    message.payload?.type === "home:shell-response" &&
+    message.payload?.requestId === "launch-people-authority-proof" &&
+    message.payload?.result?.route?.includes("#home_token=people-token")
+  ),
+  "Home GUI did not complete the People launch before its frame attached",
+  shellMessages,
+);
+const peopleFrameWindow = { postMessage() {} };
+sendChildMessage("null", peopleFrameWindow, {
+  type: "home:app-ready",
+  homeToken: "people-token",
+});
+const systemLaunchesBeforePeopleAction = requests.filter(
+  (request) => request.url === "/api/apps/home/launch" && request.body?.target === "system",
+).length;
+const systemCommandsBeforePeopleAction = shellMessages.filter(
+  (message) =>
+    message.payload?.type === "home:gui-command" &&
+    message.payload?.command === "open-target" &&
+    message.payload?.target === "system",
+).length;
+sendChildMessage("null", peopleFrameWindow, {
+  type: "home:open-target",
+  target: "system",
+  query: {},
+  homeToken: "people-token",
+});
+for (
+  let attempt = 0;
+  attempt < 50 && shellMessages.filter(
+    (message) =>
+      message.payload?.type === "home:gui-command" &&
+      message.payload?.command === "open-target" &&
+      message.payload?.target === "system",
+  ).length === systemCommandsBeforePeopleAction;
+  attempt += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  shellMessages.filter(
+    (message) =>
+      message.payload?.type === "home:gui-command" &&
+      message.payload?.command === "open-target" &&
+      message.payload?.target === "system",
+  ).length === systemCommandsBeforePeopleAction + 1,
+  "The attached People frame could not hand its System action to Home GUI",
+  shellMessages,
+);
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:launch-target",
+  requestId: "launch-system-from-people",
+  target: "system",
+  query: {},
+  homeToken: "gui-token",
+});
+for (
+  let attempt = 0;
+  attempt < 50 && requests.filter(
+    (request) => request.url === "/api/apps/home/launch" && request.body?.target === "system",
+  ).length === systemLaunchesBeforePeopleAction;
+  attempt += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+const peopleSystemLaunch = requests.filter(
+  (request) => request.url === "/api/apps/home/launch" && request.body?.target === "system",
+).at(-1);
+assert(
+  peopleSystemLaunch &&
+    requests.filter(
+      (request) => request.url === "/api/apps/home/launch" && request.body?.target === "system",
+    ).length === systemLaunchesBeforePeopleAction + 1 &&
+    JSON.stringify(peopleSystemLaunch.body?.query) === JSON.stringify({
+      home_origin: "http://localhost:61180",
+    }),
+  "People could not open System through its exact bounded Home authority",
+  requests,
+);
+const walletLaunchesBeforeDeniedPeopleAction = requests.filter(
+  (request) => request.url === "/api/apps/home/launch" && request.body?.target === "wallet",
+).length;
+const walletCommandsBeforeDeniedPeopleAction = shellMessages.filter(
+  (message) =>
+    message.payload?.type === "home:gui-command" &&
+    message.payload?.command === "open-target" &&
+    message.payload?.target === "wallet",
+).length;
+sendChildMessage("null", peopleFrameWindow, {
+  type: "home:open-target",
+  target: "wallet",
+  query: {},
+  homeToken: "people-token",
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert(
+  shellMessages.filter(
+    (message) =>
+      message.payload?.type === "home:gui-command" &&
+      message.payload?.command === "open-target" &&
+      message.payload?.target === "wallet",
+  ).length === walletCommandsBeforeDeniedPeopleAction &&
+  requests.filter(
+    (request) => request.url === "/api/apps/home/launch" && request.body?.target === "wallet",
+  ).length === walletLaunchesBeforeDeniedPeopleAction,
+  "People gained unrelated Home open-target authority",
+  requests,
+);
 
 function announceProvider(rdns, uuid, provider) {
   dispatchWindowEvent({
@@ -1386,6 +1665,18 @@ assert(
   shellContextMessage,
 );
 assert(
+  shellSummaryMessage?.payload?.summary?.appearance?.schema === "elastos.home.appearance/v1" &&
+    shellSummaryMessage.payload.summary.appearance.revision === 0 &&
+    shellSummaryMessage.payload.summary.appearance.theme === "dark" &&
+    shellSummaryMessage.payload.summary.appearance.accent === "blue" &&
+    shellSummaryMessage.payload.summary.appearance.accent_custom === "#4f7fff" &&
+    shellSummaryMessage.payload.summary.appearance.dock_auto_hide === false &&
+    shellSummaryMessage.payload.summary.appearance.sounds === false &&
+    shellSummaryMessage.payload.summary.appearance.focus_mode === false,
+  "Home did not deliver the full canonical appearance summary to Home GUI",
+  shellSummaryMessage,
+);
+assert(
   localStorageValues.get("elastos.home.browser-context-id") ===
     shellContextMessage.payload.browserContextId,
   "Home did not durably retain its browser-profile correlation",
@@ -1402,6 +1693,226 @@ assert(
     .every((message) => message.payload.browserContextId === firstBrowserContextId),
   "same Home browser profile regenerated its correlation",
   shellMessages.filter((message) => message.payload?.type === "home:shell-context"),
+);
+const appearanceWritesBefore = requests.filter(
+  (request) => request.url === "/api/apps/home/appearance/preferences",
+).length;
+const appearanceSummaryMessagesBefore = shellMessages.filter(
+  (message) => message.payload?.type === "home:shell-summary",
+).length;
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:ui-preference",
+  requestId: "appearance-theme",
+  homeToken: "gui-token",
+  action: "write",
+  key: "theme",
+  value: "light",
+});
+const appearanceThemeReply = await waitForShellResponse(shellMessages, "appearance-theme");
+assert(
+  requests.filter((request) => request.url === "/api/apps/home/appearance/preferences").length ===
+    appearanceWritesBefore + 1,
+  "authorized Home GUI appearance write did not make exactly one Runtime request",
+  requests,
+);
+const appearanceWriteRequest = requests.findLast(
+  (request) => request.url === "/api/apps/home/appearance/preferences",
+);
+assert(
+  JSON.stringify(appearanceWriteRequest?.body) === JSON.stringify({ theme: "light" }),
+  "Home GUI appearance write did not use the exact one-field request body",
+  appearanceWriteRequest,
+);
+assert(
+  appearanceThemeReply.payload?.result?.revision === 1 &&
+  appearanceThemeReply.payload?.result?.theme === "light" &&
+    appearanceThemeReply.payload?.result?.accent === "blue" &&
+    appearanceThemeReply.payload?.result?.accentCustom === "#4f7fff" &&
+    appearanceThemeReply.payload?.result?.dockAutoHide === "off" &&
+    appearanceThemeReply.payload?.result?.sounds === "off" &&
+    appearanceThemeReply.payload?.result?.focusMode === "off",
+  "Home GUI appearance write did not receive the canonical Runtime-backed result",
+  appearanceThemeReply,
+);
+assert(
+  shellMessages.filter((message) => message.payload?.type === "home:shell-summary").length ===
+    appearanceSummaryMessagesBefore + 1,
+  "Home did not relay the updated canonical appearance summary to Home GUI",
+  shellMessages,
+);
+const updatedAppearanceSummary = shellMessages
+  .filter((message) => message.payload?.type === "home:shell-summary")
+  .at(-1);
+assert(
+  updatedAppearanceSummary?.payload?.summary?.appearance?.revision === 1 &&
+    updatedAppearanceSummary.payload.summary.appearance.theme === "light" &&
+    updatedAppearanceSummary.payload.summary.appearance.accent === "blue",
+  "Home relayed a non-canonical appearance summary after the authorized write",
+  updatedAppearanceSummary,
+);
+const deniedAppearanceWritesBefore = requests.filter(
+  (request) => request.url === "/api/apps/home/appearance/preferences",
+).length;
+const deniedAppearanceSummaryMessagesBefore = shellMessages.filter(
+  (message) => message.payload?.type === "home:shell-summary",
+).length;
+for (const invalidMessage of [
+  {
+    origin: "http://evil.invalid",
+    source: shellFrameWindow,
+    data: {
+      type: "home:ui-preference",
+      requestId: "appearance-wrong-origin",
+      homeToken: "gui-token",
+      action: "write",
+      key: "theme",
+      value: "dark",
+    },
+  },
+  {
+    origin: "null",
+    source: { postMessage() {} },
+    data: {
+      type: "home:ui-preference",
+      requestId: "appearance-wrong-source",
+      homeToken: "gui-token",
+      action: "write",
+      key: "theme",
+      value: "dark",
+    },
+  },
+  {
+    origin: "null",
+    source: shellFrameWindow,
+    data: {
+      type: "home:ui-preference",
+      requestId: "appearance-wrong-token",
+      homeToken: "wrong-token",
+      action: "write",
+      key: "theme",
+      value: "dark",
+    },
+  },
+  {
+    origin: "null",
+    source: shellFrameWindow,
+    data: {
+      type: "home:ui-preference",
+      requestId: "appearance-extra-field",
+      homeToken: "gui-token",
+      action: "write",
+      key: "theme",
+      value: "dark",
+      extra: true,
+    },
+  },
+  {
+    origin: "null",
+    source: shellFrameWindow,
+    data: {
+      type: "home:ui-preference",
+      requestId: "appearance-unknown-key",
+      homeToken: "gui-token",
+      action: "write",
+      key: "wallpaper",
+      value: "dark",
+    },
+  },
+  {
+    origin: "null",
+    source: shellFrameWindow,
+    data: {
+      type: "home:ui-preference",
+      requestId: "appearance-unknown-value",
+      homeToken: "gui-token",
+      action: "write",
+      key: "theme",
+      value: "neon",
+    },
+  },
+]) {
+  sendChildMessage(invalidMessage.origin, invalidMessage.source, invalidMessage.data);
+}
+for (let attempt = 0; attempt < 5; attempt += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  requests.filter((request) => request.url === "/api/apps/home/appearance/preferences").length ===
+    deniedAppearanceWritesBefore,
+  "unauthorized or malformed appearance messages reached the Runtime preference store",
+  requests,
+);
+assert(
+  shellMessages.filter((message) => message.payload?.type === "home:shell-summary").length ===
+    deniedAppearanceSummaryMessagesBefore,
+  "unauthorized or malformed appearance messages changed the canonical Home GUI summary",
+  shellMessages,
+);
+const firstOutOfOrderWrite = deferred();
+const secondOutOfOrderWrite = deferred();
+pendingAppearanceResponses.push(firstOutOfOrderWrite, secondOutOfOrderWrite);
+const outOfOrderSummariesBefore = shellMessages.filter(
+  (message) => message.payload?.type === "home:shell-summary",
+).length;
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:ui-preference",
+  requestId: "appearance-out-of-order-first",
+  homeToken: "gui-token",
+  action: "write",
+  key: "accent",
+  value: "purple",
+});
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:ui-preference",
+  requestId: "appearance-out-of-order-second",
+  homeToken: "gui-token",
+  action: "write",
+  key: "focusMode",
+  value: "on",
+});
+secondOutOfOrderWrite.resolve();
+const outOfOrderSecondReply = await waitForShellResponse(
+  shellMessages,
+  "appearance-out-of-order-second",
+);
+assert(
+  outOfOrderSecondReply.payload?.result?.revision === 3 &&
+    outOfOrderSecondReply.payload?.result?.accent === "purple" &&
+    outOfOrderSecondReply.payload?.result?.focusMode === "on",
+  "Home did not keep the newer canonical appearance result when responses arrived out of order",
+  outOfOrderSecondReply,
+);
+firstOutOfOrderWrite.resolve();
+const outOfOrderFirstReply = await waitForShellResponse(
+  shellMessages,
+  "appearance-out-of-order-first",
+);
+assert(
+  outOfOrderFirstReply.payload?.result?.revision === 3 &&
+    outOfOrderFirstReply.payload?.result?.accent === "purple" &&
+    outOfOrderFirstReply.payload?.result?.focusMode === "on",
+  "Home returned stale appearance state after an out-of-order response",
+  outOfOrderFirstReply,
+);
+const outOfOrderSummaryMessages = shellMessages
+  .filter((message) => message.payload?.type === "home:shell-summary")
+  .slice(outOfOrderSummariesBefore);
+assert(
+  outOfOrderSummaryMessages.some(
+    (message) =>
+      message.payload?.summary?.appearance?.revision === 3 &&
+      message.payload.summary.appearance.accent === "purple" &&
+      message.payload.summary.appearance.focus_mode === true,
+  ),
+  "Home did not relay the newer canonical appearance summary during out-of-order writes",
+  outOfOrderSummaryMessages,
+);
+assert(
+  outOfOrderSummaryMessages.every(
+    (message) => message.payload?.summary?.appearance?.revision >= 3,
+  ),
+  "Home relayed a stale canonical appearance summary after an out-of-order response",
+  outOfOrderSummaryMessages,
 );
 sendChildMessage("null", shellFrameWindow, {
   type: "home:launch-target",
@@ -1636,9 +2147,14 @@ assert(
 );
 
 let passkeyReply = null;
+const systemFrameMessages = [];
 const systemFrameWindow = {
   postMessage(payload, origin) {
-    passkeyReply = { origin, payload };
+    const message = { origin, payload };
+    systemFrameMessages.push(message);
+    if (payload?.type === "elastos.home.passkey-step-up.result/v1") {
+      passkeyReply = message;
+    }
   },
 };
 sendChildMessage("null", systemFrameWindow, {
@@ -1659,7 +2175,10 @@ sendChildMessage("null", systemFrameWindow, {
 await new Promise((resolve) => setTimeout(resolve, 0));
 assert(
   requests.filter((request) => request.url === "/api/auth/passkey-step-up/begin").length ===
-    stepUpBeginsBeforeClosedMessage && !passkeyReply,
+    stepUpBeginsBeforeClosedMessage &&
+    !systemFrameMessages.some(
+      (message) => message.payload?.type === "elastos.home.passkey-step-up.result/v1",
+    ),
   "Home accepted a passkey step-up message with an extra field",
   requests,
 );

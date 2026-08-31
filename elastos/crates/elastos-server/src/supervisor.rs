@@ -150,9 +150,9 @@ enum CapsuleBackend {
     /// crosvm microVM. Carrier owns the private control network used for guest
     /// runtime API access and VM-backed provider RPC.
     Vm(Box<RunningVm>),
-    /// Carrier-plane host process (for `permissions.carrier: true`).
+    /// Runtime-owned host process (for `permissions.host_process: true`).
     /// These are explicit runtime-owned providers, not ordinary app capsules.
-    Carrier,
+    HostProcess,
 }
 
 struct RunningCapsule {
@@ -199,7 +199,16 @@ pub struct Supervisor {
     session_registry: Option<Arc<SessionRegistry>>,
     /// Runtime provider registry for VM-backed provider route registration.
     provider_registry: Option<Arc<ProviderRegistry>>,
-    /// Capability manager for minting real tokens in the microVM Carrier bridge.
+    /// Opaque port from the Runtime-owned collaboration service, if configured.
+    collaboration_chat_product_port:
+        Option<crate::collaboration_product::CollaborationChatProductPort>,
+    /// Opaque presence port from the same Runtime-owned collaboration service.
+    collaboration_presence_product_port:
+        Option<crate::collaboration_presence::CollaborationPresenceProductPort>,
+    /// Opaque discovery service from the same Runtime-owned collaboration service.
+    collaboration_discovery_service:
+        Option<crate::collaboration_discovery_runtime::CollaborationDiscoveryService>,
+    /// Capability manager for minting real tokens in the microVM resource bridge.
     capability_manager: Option<Arc<elastos_runtime::capability::CapabilityManager>>,
     /// Pending capability request store for shell-mediated approval.
     pending_store: Option<Arc<elastos_runtime::capability::pending::PendingRequestStore>>,
@@ -373,6 +382,9 @@ impl Supervisor {
             api_addr: None,
             session_registry: None,
             provider_registry: None,
+            collaboration_chat_product_port: None,
+            collaboration_presence_product_port: None,
+            collaboration_discovery_service: None,
             capability_manager: None,
             pending_store: None,
             gateway: Arc::new(RwLock::new(None)),
@@ -398,7 +410,42 @@ impl Supervisor {
         self.provider_registry = Some(provider_registry);
     }
 
-    /// Attach capability manager for real token minting in the microVM Carrier bridge.
+    pub fn set_collaboration_chat_product_port(
+        &mut self,
+        port: crate::collaboration_product::CollaborationChatProductPort,
+    ) {
+        self.collaboration_chat_product_port = Some(port);
+    }
+
+    pub fn set_collaboration_presence_product_port(
+        &mut self,
+        port: crate::collaboration_presence::CollaborationPresenceProductPort,
+    ) {
+        self.collaboration_presence_product_port = Some(port);
+    }
+
+    pub fn set_collaboration_discovery_service(
+        &mut self,
+        service: crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    ) {
+        self.collaboration_discovery_service = Some(service);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_collaboration_chat_product_port(
+        &self,
+    ) -> Option<&crate::collaboration_product::CollaborationChatProductPort> {
+        self.collaboration_chat_product_port.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_collaboration_presence_product_port(
+        &self,
+    ) -> Option<&crate::collaboration_presence::CollaborationPresenceProductPort> {
+        self.collaboration_presence_product_port.as_ref()
+    }
+
+    /// Attach capability manager for real token minting in the microVM resource bridge.
     pub fn set_capability_manager(
         &mut self,
         capability_manager: Arc<elastos_runtime::capability::CapabilityManager>,
@@ -416,7 +463,9 @@ impl Supervisor {
 
     /// Handle a supervisor request from the shell.
     pub async fn handle_request(&self, req: SupervisorRequest) -> SupervisorResponse {
-        self.reap_dead_capsules().await;
+        if let Err(error) = self.reap_dead_capsules().await {
+            return SupervisorResponse::err(format!("reap_dead_capsules failed: {error}"));
+        }
         match req {
             SupervisorRequest::EnsureCapsule { name } => match self.ensure_capsule(&name).await {
                 Ok(path) => SupervisorResponse::ok_with_path(path.display().to_string()),
@@ -614,22 +663,26 @@ impl Supervisor {
         }
     }
 
-    async fn unregister_provider_route(&self, route: &ProviderRoute) {
+    async fn unregister_provider_route(&self, route: &ProviderRoute) -> Result<()> {
         let Some(registry) = &self.provider_registry else {
-            return;
+            return Ok(());
         };
         match route {
             ProviderRoute::SubProvider(sub) => {
-                registry.unregister_sub_provider(sub).await;
+                registry
+                    .unregister_sub_provider(sub)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("sub-provider unregister failed: {error}"))?;
             }
             ProviderRoute::Scheme(scheme) => {
                 registry.unregister(scheme).await;
             }
         }
+        Ok(())
     }
 
-    async fn reap_dead_capsules(&self) {
-        let mut dead: Vec<(String, Option<ProviderRoute>)> = Vec::new();
+    async fn reap_dead_capsules(&self) -> Result<()> {
+        let mut dead: Vec<(String, RunningCapsule)> = Vec::new();
         {
             let mut running = self.running.write().await;
             let dead_handles: Vec<String> = running
@@ -637,7 +690,7 @@ impl Supervisor {
                 .filter_map(|(handle, capsule)| {
                     let alive = match &capsule.backend {
                         CapsuleBackend::Vm(vm) => vm.is_running(),
-                        CapsuleBackend::Carrier => true, // managed by carrier service bridge
+                        CapsuleBackend::HostProcess => true, // managed by carrier service bridge
                     };
                     if alive {
                         None
@@ -648,14 +701,18 @@ impl Supervisor {
                 .collect();
             for handle in dead_handles {
                 if let Some(capsule) = running.remove(&handle) {
-                    dead.push((handle, capsule.provider_route));
+                    dead.push((handle, capsule));
                 }
             }
         }
 
-        for (handle, route) in dead {
-            if let Some(route) = route.as_ref() {
-                self.unregister_provider_route(route).await;
+        for (handle, capsule) in dead {
+            if let Some(route) = capsule.provider_route.as_ref() {
+                if let Err(error) = self.unregister_provider_route(route).await {
+                    let mut running = self.running.write().await;
+                    running.insert(handle, capsule);
+                    return Err(error);
+                }
             }
             let overlay_path = self
                 .crosvm_config
@@ -668,6 +725,7 @@ impl Supervisor {
                 handle
             );
         }
+        Ok(())
     }
 
     async fn load_capsule_manifest(
@@ -900,7 +958,7 @@ impl Supervisor {
 
         // Carrier-plane services run as host processes, not VMs.
         // Skip if the provider is already registered (e.g., built-in Carrier gossip).
-        if manifest.permissions.carrier && manifest.provides.is_some() {
+        if manifest.permissions.host_process && manifest.provides.is_some() {
             // Skip if built-in Carrier already provides this (e.g., peer-provider → carrier-gossip)
             if name == "peer-provider" && self.provider_registry.is_some() {
                 tracing::debug!("peer-provider handled by built-in Carrier");
@@ -964,7 +1022,7 @@ impl Supervisor {
         let vm_id = vm_config.vm_id.clone();
 
         // TAP networking only when explicitly requested via permissions.guest_network.
-        // Default: app capsules use the virtio-console Carrier bridge (rootless, no sudo).
+        // Default: app capsules use the virtio-console resource bridge (rootless, no sudo).
         // Provider capsules that need guest IP set guest_network: true in capsule.json.
         let needs_tap = manifest.permissions.guest_network;
         if needs_tap {
@@ -1025,7 +1083,7 @@ impl Supervisor {
                     vm_config = vm_config.with_session(t, &guest_api_addr);
                 } else {
                     // No TAP: pass token via boot args only.
-                    // The capsule uses the microVM Carrier bridge, not HTTP.
+                    // The capsule uses the microVM resource bridge, not HTTP.
                     vm_config.boot_args = format!("{} elastos.token={}", vm_config.boot_args, t);
                 }
             }
@@ -1065,7 +1123,7 @@ impl Supervisor {
         tokio::fs::create_dir_all(socket_dir).await?;
         let socket_path = socket_dir.join(format!("{}.sock", handle));
 
-        // Carrier bridge: add a virtio-console-backed Unix socket for
+        // resource bridge: add a virtio-console-backed Unix socket for
         // guest↔runtime provider communication without TAP networking.
         let carrier_socket = socket_dir.join(format!("{}-carrier.sock", handle));
         vm_config.carrier_socket_path = Some(carrier_socket.clone());
@@ -1084,7 +1142,7 @@ impl Supervisor {
 
         let provides = manifest.provides.clone();
 
-        // Spawn the microVM Carrier bridge BEFORE starting the VM.
+        // Spawn the microVM resource bridge BEFORE starting the VM.
         // The bridge listens on the Unix socket; crosvm connects to it on launch.
         if let Some(ref registry) = self.provider_registry {
             let session_token = self.shell_token.clone().unwrap_or_default();
@@ -1092,7 +1150,7 @@ impl Supervisor {
             // When None (gateway/infrastructure path), the bridge denies capability
             // requests — infrastructure capsules run under service authority.
             let bridge_ctx = match (&self.capability_manager, &self.pending_store) {
-                (Some(cap_mgr), Some(pending)) => Some(crate::carrier_bridge::BridgeContext {
+                (Some(cap_mgr), Some(pending)) => Some(crate::resource_bridge::BridgeContext {
                     provider_registry: registry.clone(),
                     capability_manager: cap_mgr.clone(),
                     pending_store: pending.clone(),
@@ -1103,7 +1161,7 @@ impl Supervisor {
                 }),
                 _ => None,
             };
-            if let Err(e) = crate::carrier_bridge::spawn_carrier_bridge(
+            if let Err(e) = crate::resource_bridge::spawn_resource_bridge(
                 &carrier_socket,
                 registry.clone(),
                 session_token,
@@ -1111,7 +1169,7 @@ impl Supervisor {
             )
             .await
             {
-                tracing::warn!("Carrier bridge failed for '{}': {}", name, e);
+                tracing::warn!("resource bridge failed for '{}': {}", name, e);
             }
         }
 
@@ -1154,7 +1212,7 @@ impl Supervisor {
         Ok((handle, cid))
     }
 
-    /// Launch a Carrier-plane service as a host process (for `permissions.carrier: true`).
+    /// Launch a Carrier-plane service as a host process (for `permissions.host_process: true`).
     ///
     /// Instead of running in a crosvm VM, the provider binary runs directly on the host
     /// as part of the Carrier plane. This gives it real network/system access (iroh P2P,
@@ -1220,7 +1278,7 @@ impl Supervisor {
                     vsock_cid: cid,
                     started_at: std::time::Instant::now(),
                     provider_route,
-                    backend: CapsuleBackend::Carrier,
+                    backend: CapsuleBackend::HostProcess,
                 },
             );
         }
@@ -1249,13 +1307,19 @@ impl Supervisor {
 
     /// Stop a running capsule.
     async fn stop_capsule(&self, handle: &str) -> Result<()> {
-        let mut running = self.running.write().await;
-        let capsule = running
-            .remove(handle)
-            .ok_or_else(|| anyhow::anyhow!("no capsule with handle '{handle}'"))?;
+        let capsule = {
+            let mut running = self.running.write().await;
+            running
+                .remove(handle)
+                .ok_or_else(|| anyhow::anyhow!("no capsule with handle '{handle}'"))?
+        };
 
         if let Some(route) = capsule.provider_route.as_ref() {
-            self.unregister_provider_route(route).await;
+            if let Err(error) = self.unregister_provider_route(route).await {
+                let mut running = self.running.write().await;
+                running.insert(handle.to_string(), capsule);
+                return Err(error);
+            }
         }
 
         match capsule.backend {
@@ -1272,7 +1336,7 @@ impl Supervisor {
                     .join(format!("{}.ext4", handle));
                 let _ = tokio::fs::remove_file(&overlay_path).await;
             }
-            CapsuleBackend::Carrier => {
+            CapsuleBackend::HostProcess => {
                 // Carrier service child process is killed when CarrierServiceProvider
                 // is dropped (via CarrierServiceBridge::drop). Unregistering the
                 // provider route above drops the last Arc reference.
@@ -1295,7 +1359,11 @@ impl Supervisor {
         };
 
         if let Some(route) = capsule.provider_route.as_ref() {
-            self.unregister_provider_route(route).await;
+            if let Err(error) = self.unregister_provider_route(route).await {
+                let mut running = self.running.write().await;
+                running.insert(handle.to_string(), capsule);
+                return Err(error);
+            }
         }
 
         let exit_code = match capsule.backend {
@@ -1327,7 +1395,7 @@ impl Supervisor {
                 let _ = tokio::fs::remove_file(&overlay_path).await;
                 code
             }
-            CapsuleBackend::Carrier => {
+            CapsuleBackend::HostProcess => {
                 // Carrier services are background services — they don't "exit".
                 // Waiting on them is a no-op; they run until stopped.
                 eprintln!(
@@ -1357,7 +1425,7 @@ impl Supervisor {
                             "stopped"
                         }
                     }
-                    CapsuleBackend::Carrier => "running",
+                    CapsuleBackend::HostProcess => "running",
                 };
 
                 Ok(SupervisorResponse {
@@ -1453,19 +1521,28 @@ impl Supervisor {
             .map(PathBuf::from)
             .unwrap_or_else(|| self.data_dir.join("gateway-cache"));
         std::fs::create_dir_all(&cache_path)?;
+        let collaboration_chat_product_port = self.collaboration_chat_product_port.clone();
+        let collaboration_presence_product_port = self.collaboration_presence_product_port.clone();
+        let collaboration_discovery_service = self.collaboration_discovery_service.clone();
 
         let task = tokio::spawn({
             let listen_addr = listen_addr.clone();
             let cache_path = cache_path.clone();
             let data_dir = self.data_dir.clone();
             async move {
-                if let Err(e) = crate::api::gateway::start_gateway_server(
-                    &listen_addr,
-                    Some(registry),
-                    cache_path,
-                    data_dir,
-                )
-                .await
+                if let Err(e) =
+                    crate::api::gateway::start_gateway_server_with_collaboration_context(
+                        &listen_addr,
+                        Some(registry),
+                        crate::api::gateway::GatewayCollaborationContext {
+                            chat_product_port: collaboration_chat_product_port,
+                            presence_product_port: collaboration_presence_product_port,
+                            discovery_service: collaboration_discovery_service,
+                        },
+                        cache_path,
+                        data_dir,
+                    )
+                    .await
                 {
                     tracing::error!("Gateway server exited with error: {}", e);
                 }
@@ -1493,7 +1570,10 @@ mod tests {
         Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse,
     };
     use sha2::Digest;
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     #[test]
     fn test_supervisor_request_serialization() {
@@ -1641,10 +1721,6 @@ mod tests {
             Some(ProviderRoute::SubProvider("did".to_string()))
         );
         assert_eq!(
-            Supervisor::parse_provider_route_from_provides("elastos://ai/chat"),
-            Some(ProviderRoute::SubProvider("ai".to_string()))
-        );
-        assert_eq!(
             Supervisor::parse_provider_route_from_provides("localhost://Users/*"),
             Some(ProviderRoute::Scheme("localhost".to_string()))
         );
@@ -1691,6 +1767,11 @@ mod tests {
         response: serde_json::Value,
     }
 
+    #[derive(Default)]
+    struct RetryOnceShutdownProvider {
+        attempts: AtomicUsize,
+    }
+
     #[async_trait::async_trait]
     impl Provider for MockIpfsProvider {
         async fn handle(
@@ -1718,6 +1799,34 @@ mod tests {
                 Some(TEST_SUPERVISOR_CID)
             );
             Ok(self.response.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RetryOnceShutdownProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("not used in this test".into()))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            vec![]
+        }
+
+        fn name(&self) -> &'static str {
+            "retry-once-shutdown-provider"
+        }
+
+        async fn shutdown(&self) -> Result<(), ProviderError> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(ProviderError::Provider(
+                    "unclean shutdown receipt after child exit".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1762,8 +1871,62 @@ mod tests {
             repository: None,
             size_mb: None,
             description: None,
+            provider_runtime: None,
             platforms,
         }
+    }
+
+    fn test_capsule_manifest(name: &str) -> elastos_common::CapsuleManifest {
+        serde_json::from_value(serde_json::json!({
+            "schema": "elastos.capsule/v1",
+            "name": name,
+            "version": "0.1.0",
+            "role": "provider",
+            "type": "microvm",
+            "entrypoint": "rootfs.ext4",
+        }))
+        .unwrap()
+    }
+
+    fn dead_vm_capsule(handle: &str, route: ProviderRoute) -> RunningCapsule {
+        let capsule_dir = tempfile::tempdir().unwrap().keep();
+        let socket_dir = tempfile::tempdir().unwrap().keep();
+        let manifest = test_capsule_manifest("storage-provider");
+        let vm = RunningVm::new(
+            VmConfig::from_manifest(&manifest, &capsule_dir, &capsule_dir.join("vmlinux")),
+            manifest.clone(),
+            socket_dir.join(format!("{handle}.sock")),
+        );
+        RunningCapsule {
+            name: "storage-provider".to_string(),
+            handle: handle.to_string(),
+            vsock_cid: 0,
+            started_at: std::time::Instant::now(),
+            provider_route: Some(route),
+            backend: CapsuleBackend::Vm(Box::new(vm)),
+        }
+    }
+
+    fn host_process_capsule(handle: &str, route: ProviderRoute) -> RunningCapsule {
+        RunningCapsule {
+            name: "storage-provider".to_string(),
+            handle: handle.to_string(),
+            vsock_cid: 0,
+            started_at: std::time::Instant::now(),
+            provider_route: Some(route),
+            backend: CapsuleBackend::HostProcess,
+        }
+    }
+
+    async fn supervisor_with_retrying_subprovider() -> (Supervisor, Arc<ProviderRegistry>) {
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_sub_provider("storage", Arc::new(RetryOnceShutdownProvider::default()))
+            .await
+            .unwrap();
+        let mut supervisor = make_test_supervisor();
+        supervisor.set_provider_registry(Arc::clone(&registry));
+        (supervisor, registry)
     }
 
     fn write_installed_manifest(
@@ -2073,5 +2236,81 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("kubo not found"));
+    }
+
+    #[tokio::test]
+    async fn test_stop_capsule_retains_retry_ownership_until_unregister_succeeds() {
+        let (supervisor, registry) = supervisor_with_retrying_subprovider().await;
+        let handle = "host-storage-stop";
+        {
+            let mut running = supervisor.running.write().await;
+            running.insert(
+                handle.to_string(),
+                host_process_capsule(handle, ProviderRoute::SubProvider("storage".to_string())),
+            );
+        }
+
+        let first = supervisor.stop_capsule(handle).await.unwrap_err();
+        assert!(first.to_string().contains("sub-provider unregister failed"));
+        assert!(supervisor.running.read().await.contains_key(handle));
+        assert!(registry
+            .register_sub_provider("storage", Arc::new(RetryOnceShutdownProvider::default()))
+            .await
+            .is_err());
+
+        supervisor.stop_capsule(handle).await.unwrap();
+        assert!(!supervisor.running.read().await.contains_key(handle));
+        registry
+            .register_sub_provider("storage", Arc::new(RetryOnceShutdownProvider::default()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_exit_retains_retry_ownership_until_unregister_succeeds() {
+        let (supervisor, registry) = supervisor_with_retrying_subprovider().await;
+        let handle = "host-storage-wait";
+        {
+            let mut running = supervisor.running.write().await;
+            running.insert(
+                handle.to_string(),
+                host_process_capsule(handle, ProviderRoute::SubProvider("storage".to_string())),
+            );
+        }
+
+        let first = supervisor.wait_for_exit(handle).await.unwrap_err();
+        assert!(first.to_string().contains("sub-provider unregister failed"));
+        assert!(supervisor.running.read().await.contains_key(handle));
+        assert!(registry
+            .register_sub_provider("storage", Arc::new(RetryOnceShutdownProvider::default()))
+            .await
+            .is_err());
+
+        assert_eq!(supervisor.wait_for_exit(handle).await.unwrap(), 0);
+        assert!(!supervisor.running.read().await.contains_key(handle));
+    }
+
+    #[tokio::test]
+    async fn test_reap_dead_capsules_retains_retry_ownership_until_unregister_succeeds() {
+        let (supervisor, registry) = supervisor_with_retrying_subprovider().await;
+        let handle = "vm-storage-reap";
+        {
+            let mut running = supervisor.running.write().await;
+            running.insert(
+                handle.to_string(),
+                dead_vm_capsule(handle, ProviderRoute::SubProvider("storage".to_string())),
+            );
+        }
+
+        let first = supervisor.reap_dead_capsules().await.unwrap_err();
+        assert!(first.to_string().contains("sub-provider unregister failed"));
+        assert!(supervisor.running.read().await.contains_key(handle));
+        assert!(registry
+            .register_sub_provider("storage", Arc::new(RetryOnceShutdownProvider::default()))
+            .await
+            .is_err());
+
+        supervisor.reap_dead_capsules().await.unwrap();
+        assert!(!supervisor.running.read().await.contains_key(handle));
     }
 }
