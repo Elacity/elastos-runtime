@@ -32,8 +32,8 @@ pub const OPERATOR_RUNTIME_REQUIRED_MESSAGE: &str =
     "This command requires a running runtime.\n\n  elastos serve\n\nThen run this command again.";
 pub const GATEWAY_OWNED_HOME_TERMINAL_ENV: &str = "ELASTOS_GATEWAY_OWNED_HOME_TERMINAL";
 const CARRIER_MDNS_ENV: &str = "ELASTOS_CARRIER_MDNS";
-const MANAGED_RUNTIME_REQUIRED_PROVIDERS: &[&str] =
-    &["localhost-provider", "shell", "did-provider"];
+const MANAGED_RUNTIME_REQUIRED_NATIVE_PROVIDERS: &[&str] = &["localhost-provider", "did-provider"];
+const MANAGED_RUNTIME_REQUIRED_COMPONENTS: &[&str] = &["shell"];
 
 enum ManagedRuntimeStart {
     Owner(ManagedRuntimeStartGuard),
@@ -491,6 +491,75 @@ fn managed_runtime_child_home_dir(data_dir: &Path, runtime_kind: &str) -> PathBu
 
 fn managed_runtime_child_xdg_data_home(child_home: &Path) -> PathBuf {
     child_home.join(".local").join("share")
+}
+
+fn managed_runtime_child_data_dir_for_os(child_home: &Path, os: &str) -> PathBuf {
+    match os {
+        "macos" => child_home
+            .join("Library")
+            .join("Application Support")
+            .join("elastos"),
+        _ => managed_runtime_child_xdg_data_home(child_home).join("elastos"),
+    }
+}
+
+fn managed_runtime_child_data_dir(child_home: &Path) -> PathBuf {
+    managed_runtime_child_data_dir_for_os(child_home, std::env::consts::OS)
+}
+
+fn sync_managed_runtime_child_components_manifest(
+    parent_data_dir: &Path,
+    child_home: &Path,
+) -> anyhow::Result<()> {
+    let parent_manifest = parent_data_dir.join("components.json");
+    let manifest_bytes = std::fs::read(&parent_manifest).map_err(|error| {
+        anyhow::anyhow!(
+            "managed home runtime requires installed manifest at {}: {}",
+            parent_manifest.display(),
+            error
+        )
+    })?;
+    let mut verified_binaries = Vec::with_capacity(
+        MANAGED_RUNTIME_REQUIRED_NATIVE_PROVIDERS.len() + MANAGED_RUNTIME_REQUIRED_COMPONENTS.len(),
+    );
+    for name in MANAGED_RUNTIME_REQUIRED_NATIVE_PROVIDERS {
+        let parent_binary = crate::binaries::resolve_verified_native_provider_binary_with_data_dir(
+            parent_data_dir,
+            name,
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "managed home runtime requires verified '{}' install at {}",
+                name,
+                parent_data_dir.join(format!("bin/{name}")).display()
+            )
+        })?;
+        verified_binaries.push((*name, parent_binary));
+    }
+    for name in MANAGED_RUNTIME_REQUIRED_COMPONENTS {
+        let parent_binary = parent_data_dir.join(format!("bin/{name}"));
+        crate::binaries::verify_component_binary_with_data_dir(
+            parent_data_dir,
+            name,
+            &parent_binary,
+        )
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "managed home runtime requires verified '{}' install at {}",
+                name,
+                parent_binary.display()
+            )
+        })?;
+        verified_binaries.push((*name, parent_binary));
+    }
+    let child_data_dir = managed_runtime_child_data_dir(child_home);
+    let child_bin_dir = child_data_dir.join("bin");
+    std::fs::create_dir_all(&child_bin_dir)?;
+    std::fs::write(child_data_dir.join("components.json"), manifest_bytes)?;
+    for (name, parent_binary) in verified_binaries {
+        std::fs::copy(parent_binary, child_bin_dir.join(name))?;
+    }
+    Ok(())
 }
 
 pub fn write_runtime_coords(path: &Path, coords: &RuntimeCoords) -> anyhow::Result<()> {
@@ -1217,10 +1286,13 @@ async fn ensure_managed_runtime(
     //    and did-provider (identity). These are provisioned by `elastos setup`.
     //    components.json alone is not sufficient — it's written by install.sh before
     //    any provider binaries are installed.
-    let mut missing = Vec::new();
-    for name in MANAGED_RUNTIME_REQUIRED_PROVIDERS {
+    let mut missing: Vec<&str> = Vec::new();
+    for name in MANAGED_RUNTIME_REQUIRED_NATIVE_PROVIDERS
+        .iter()
+        .chain(MANAGED_RUNTIME_REQUIRED_COMPONENTS.iter())
+    {
         if crate::binaries::find_installed_provider_binary(name).is_none() {
-            missing.push(*name);
+            missing.push(name);
         }
     }
     if !missing.is_empty() {
@@ -1286,6 +1358,7 @@ async fn ensure_managed_runtime(
             data_dir,
         );
         if let Some(child_home_dir) = child_home_dir.as_ref() {
+            sync_managed_runtime_child_components_manifest(data_dir, child_home_dir)?;
             child.env("HOME", child_home_dir).env(
                 "XDG_DATA_HOME",
                 managed_runtime_child_xdg_data_home(child_home_dir),
@@ -1400,7 +1473,10 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
 
 fn managed_runtime_dependency_sha256() -> String {
     let mut input = String::new();
-    for name in MANAGED_RUNTIME_REQUIRED_PROVIDERS {
+    for name in MANAGED_RUNTIME_REQUIRED_NATIVE_PROVIDERS
+        .iter()
+        .chain(MANAGED_RUNTIME_REQUIRED_COMPONENTS.iter())
+    {
         input.push_str(name);
         input.push('\n');
         match crate::binaries::find_installed_provider_binary(name) {
@@ -1688,6 +1764,84 @@ mod tests {
             managed_runtime_child_xdg_data_home(&home),
             home.join(".local/share")
         );
+        assert_eq!(
+            managed_runtime_child_data_dir_for_os(&home, "linux"),
+            home.join(".local/share/elastos")
+        );
+        assert_eq!(
+            managed_runtime_child_data_dir_for_os(&home, "macos"),
+            home.join("Library/Application Support/elastos")
+        );
+    }
+
+    #[test]
+    fn subordinate_managed_runtime_copies_parent_components_manifest_into_child_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
+        let manifest_bytes = write_managed_runtime_parent_support_artifacts(tmp.path());
+
+        sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap();
+
+        let child_data_dir = managed_runtime_child_data_dir(&home);
+        assert_eq!(
+            std::fs::read(child_data_dir.join("components.json")).unwrap(),
+            manifest_bytes
+        );
+        for name in MANAGED_RUNTIME_REQUIRED_NATIVE_PROVIDERS {
+            let expected_bytes = format!("{name}-binary").into_bytes();
+            let child_binary = child_data_dir.join("bin").join(name);
+            assert_eq!(std::fs::read(&child_binary).unwrap(), expected_bytes);
+            assert_eq!(
+                crate::binaries::resolve_verified_native_provider_binary_with_data_dir(
+                    &child_data_dir,
+                    name
+                )
+                .unwrap(),
+                Some(child_binary)
+            );
+        }
+        let shell_binary = child_data_dir.join("bin").join("shell");
+        assert_eq!(std::fs::read(&shell_binary).unwrap(), b"shell-binary");
+        crate::binaries::verify_component_binary_with_data_dir(
+            &child_data_dir,
+            "shell",
+            &shell_binary,
+        )
+        .unwrap();
+        assert!(
+            crate::binaries::resolve_verified_native_provider_binary_with_data_dir(
+                &child_data_dir,
+                "shell"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn subordinate_managed_runtime_requires_parent_components_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
+
+        let error = sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("managed home runtime requires installed manifest"));
+        assert!(error.to_string().contains("components.json"));
+    }
+
+    #[test]
+    fn subordinate_managed_runtime_requires_verified_parent_provider_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
+        write_managed_runtime_parent_support_artifacts(tmp.path());
+        std::fs::remove_file(tmp.path().join("bin/shell")).unwrap();
+
+        let error = sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("managed home runtime requires verified 'shell' install"));
     }
 
     #[test]
@@ -1728,6 +1882,68 @@ mod tests {
         };
 
         assert!(gateway_owner_allows_subordinate_managed_runtime(&owner));
+    }
+
+    fn write_managed_runtime_parent_support_artifacts(data_dir: &Path) -> Vec<u8> {
+        let platform = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => "linux-amd64",
+            ("linux", "aarch64") => "linux-arm64",
+            ("macos", "aarch64") => "darwin-arm64",
+            (os, arch) => panic!("unsupported test platform {os}-{arch}"),
+        };
+        let bin_dir = data_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let mut external = serde_json::Map::new();
+        for (name, provides) in [
+            ("localhost-provider", "localhost://*"),
+            ("did-provider", "elastos://did/*"),
+        ] {
+            let binary_bytes = format!("{name}-binary").into_bytes();
+            std::fs::write(bin_dir.join(name), &binary_bytes).unwrap();
+            external.insert(
+                name.to_string(),
+                serde_json::json!({
+                    "install_path": format!("bin/{name}"),
+                    "provider_runtime": {
+                        "role": "provider",
+                        "substrate": "native",
+                        "runtime_abi": "elastos.provider-stdio/v1",
+                        "execution": "native-provider",
+                        "provides": provides
+                    },
+                    "platforms": {
+                        platform: {
+                            "checksum": format!("sha256:{}", sha256_bytes(&binary_bytes)),
+                            "install_path": format!("bin/{name}")
+                        }
+                    }
+                }),
+            );
+        }
+        let shell_bytes = b"shell-binary".to_vec();
+        std::fs::write(bin_dir.join("shell"), &shell_bytes).unwrap();
+        external.insert(
+            "shell".to_string(),
+            serde_json::json!({
+                "install_path": "bin/shell",
+                "platforms": {
+                    platform: {
+                        "checksum": format!("sha256:{}", sha256_bytes(&shell_bytes)),
+                        "install_path": "bin/shell"
+                    }
+                }
+            }),
+        );
+
+        let manifest_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "external": external,
+            "capsules": {},
+            "profiles": {}
+        }))
+        .unwrap();
+        std::fs::write(data_dir.join("components.json"), &manifest_bytes).unwrap();
+        manifest_bytes
     }
 
     #[test]
