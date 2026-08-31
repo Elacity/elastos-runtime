@@ -408,6 +408,117 @@ def test_untrusted_built_runtime(temp_root):
         raise AssertionError("untrusted built Runtime published an installed artifact")
 
 
+def test_setup_stage_cleanup(temp_root):
+    setup = SETUP.read_text(encoding="utf-8")
+    start = 'built_runtime="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)"'
+    end = '\n\ncat <<EOF'
+    if start not in setup or end not in setup:
+        raise AssertionError("setup staging block is unavailable")
+    block = start + setup.split(start, 1)[1].split(end, 1)[0]
+
+    fixture = temp_root / "setup-stage-cleanup"
+    fixture.mkdir(mode=0o700)
+    source = fixture / "source"
+    data = fixture / "installed"
+    built = fixture / "build/elastos"
+    initialize_source(source)
+    initialize_data(data)
+    write(built, b"runtime-v1\n", 0o700)
+    built_bytes = built.read_bytes()
+    built_inode = built.stat().st_ino
+
+    fake_python = fixture / "fake-python3"
+    write(
+        fake_python,
+        (
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "import pathlib\n"
+            "import sys\n"
+            "log = pathlib.Path(os.environ['FIXTURE_STAGE_LOG'])\n"
+            "mode = os.environ['FIXTURE_STAGE_MODE']\n"
+            "expected_installer = os.environ['FIXTURE_EXPECTED_INSTALLER']\n"
+            "args = sys.argv[1:]\n"
+            "if args[:1] != [expected_installer]:\n"
+            "    raise SystemExit('unexpected installer path')\n"
+            "stage = pathlib.Path(args[args.index('--built-runtime') + 1])\n"
+            "built = pathlib.Path(os.environ['FIXTURE_BUILT_RUNTIME'])\n"
+            "log.write_text(log.read_text(encoding='utf-8') + f'python:{stage}\\n', encoding='utf-8')\n"
+            "if stage.read_bytes() != built.read_bytes():\n"
+            "    raise SystemExit('staged runtime bytes mismatch')\n"
+            "if mode == 'installer_failure':\n"
+            "    raise SystemExit(61)\n"
+        ).encode("utf-8"),
+        0o700,
+    )
+
+    wrapper = fixture / "run-setup-stage.sh"
+    write(
+        wrapper,
+        (
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "ROOT=\"$1\"\n"
+            "DATA_DIR=\"$2\"\n"
+            "PLATFORM=\"$3\"\n"
+            "FIXTURE_BUILT_RUNTIME=\"$4\"\n"
+            "export FIXTURE_BUILT_RUNTIME\n"
+            "cargo_built_binary_path() {\n"
+            "  printf '%s\\n' \"$FIXTURE_BUILT_RUNTIME\"\n"
+            "}\n"
+            "install() {\n"
+            "  if [[ \"${FIXTURE_STAGE_MODE:-}\" == \"copy_failure\" && \"$1\" == \"-m\" && \"$2\" == \"0700\" ]]; then\n"
+            "    printf 'copy:%s\\n' \"$4\" >> \"$FIXTURE_STAGE_LOG\"\n"
+            "    return 71\n"
+            "  fi\n"
+            "  command install \"$@\"\n"
+            "}\n"
+            "python3() {\n"
+            "  \"$FIXTURE_FAKE_PY\" \"$@\"\n"
+            "}\n"
+            + block
+            + "\n"
+        ).encode("utf-8"),
+        0o700,
+    )
+
+    base_env = os.environ.copy()
+    base_env["FIXTURE_FAKE_PY"] = str(fake_python)
+    base_env["FIXTURE_EXPECTED_INSTALLER"] = str(source / "scripts/install-source-home-runtime.py")
+
+    for mode, expected_exit in (("success", 0), ("copy_failure", 71), ("installer_failure", 61)):
+        log = fixture / f"{mode}.log"
+        write(log, b"", 0o600)
+        result = subprocess.run(
+            ["bash", str(wrapper), str(source), str(data), "linux-amd64", str(built)],
+            env={**base_env, "FIXTURE_STAGE_MODE": mode, "FIXTURE_STAGE_LOG": str(log)},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != expected_exit:
+            raise AssertionError(
+                f"setup stage wrapper returned {result.returncode} for {mode}, expected {expected_exit}: stdout={result.stdout!r} stderr={result.stderr!r}"
+            )
+        log_text = log.read_text(encoding="utf-8")
+        if mode == "copy_failure":
+            if "python:" in log_text:
+                raise AssertionError("setup continued to the installer after a staging copy failure")
+        elif not log_text.startswith("python:"):
+            raise AssertionError(f"setup {mode} did not reach the installer with the staged Runtime")
+        leftovers = sorted(
+            path.name
+            for path in built.parent.iterdir()
+            if path.is_dir() and path.name.startswith("install-stage.")
+        )
+        if leftovers:
+            raise AssertionError(f"setup left staged directories after {mode}: {leftovers}")
+        if built.read_bytes() != built_bytes or built.stat().st_ino != built_inode:
+            raise AssertionError(f"setup changed the built Runtime during {mode}")
+
+
 def assert_setup_orchestration():
     setup = SETUP.read_text(encoding="utf-8")
     call = 'python3 "${ROOT}/scripts/install-source-home-runtime.py"'
@@ -431,6 +542,15 @@ def assert_setup_orchestration():
     ):
         if binding not in main:
             raise AssertionError(f"setup stable Runtime binding missing: {binding}")
+    stage_block = setup.split('built_runtime="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)"', 1)[1].split('\n\ncat <<EOF', 1)[0]
+    if 'trap \'rm -rf "${runtime_stage_dir}"\' EXIT' not in stage_block:
+        raise AssertionError("setup stage cleanup trap is missing")
+    if not (
+        stage_block.index('runtime_stage_dir="$(mktemp -d "$(dirname "${built_runtime}")/install-stage.XXXXXX")"')
+        < stage_block.index('trap \'rm -rf "${runtime_stage_dir}"\' EXIT')
+        < stage_block.index('install -m 0700 "${built_runtime}" "${runtime_stage_dir}/elastos"')
+    ):
+        raise AssertionError("setup stage cleanup trap is not positioned before staging copy")
 
 
 def main():
@@ -445,6 +565,7 @@ def main():
         test_runtime_publication_restores_pair(fixture)
         test_unsafe_destinations(fixture)
         test_untrusted_built_runtime(fixture)
+        test_setup_stage_cleanup(fixture)
         unexpected = [path for path in outer.iterdir() if path.name != "fixture"]
         if unexpected:
             raise AssertionError(f"installer left residue outside the fixture: {unexpected}")

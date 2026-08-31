@@ -21,7 +21,7 @@ Configure tool paths with:
   ELASTOS_BROWSER_VM_RUNTIME_RELAY_BIN
   ELASTOS_BROWSER_VM_GUEST_CONTROL_BRIDGE_BIN
   ELASTOS_BROWSER_VM_ARTIFACT_DATA_DIR
-  ELASTOS_BROWSER_VM_BACKUP_RETENTION (default: 2, range: 1..10)
+  ELASTOS_BROWSER_VM_BACKUP_RETENTION (must be 1)
 
 To target a non-default runtime root, set HOME or XDG_DATA_HOME before running.
 ELASTOS_DATA_DIR is intentionally not accepted as a gateway data-root override.
@@ -455,14 +455,9 @@ clone_or_copy_file() {
 }
 
 browser_vm_backup_retention() {
-    local retention="${ELASTOS_BROWSER_VM_BACKUP_RETENTION:-2}"
-    if [[ ! "$retention" =~ ^[1-9][0-9]*$ ]]; then
-        echo "ELASTOS_BROWSER_VM_BACKUP_RETENTION must be from 1 to 10" >&2
-        exit 2
-    fi
-    retention=$((10#$retention))
-    if (( retention > 10 )); then
-        echo "ELASTOS_BROWSER_VM_BACKUP_RETENTION must be from 1 to 10" >&2
+    local retention="${ELASTOS_BROWSER_VM_BACKUP_RETENTION:-1}"
+    if [[ "$retention" != "1" ]]; then
+        echo "ELASTOS_BROWSER_VM_BACKUP_RETENTION must be 1" >&2
         exit 2
     fi
     printf '%s\n' "$retention"
@@ -507,6 +502,31 @@ prune_file_backups() {
         unset "backups[$oldest_index]"
         backups=("${backups[@]}")
     done
+}
+
+require_minimum_free_space() {
+    local path="$1"
+    local minimum_percent=10
+    local blocks
+    local available
+    local free_percent
+
+    read -r blocks available < <(df -Pk "$path" | awk 'NR == 2 {print $2, $4}')
+    if [[ ! "$blocks" =~ ^[0-9]+$ || ! "$available" =~ ^[0-9]+$ ]]; then
+        echo "Could not determine free space for source-home volume: ${path}" >&2
+        exit 1
+    fi
+    if (( blocks == 0 )); then
+        echo "Source-home volume reported zero usable blocks: ${path}" >&2
+        exit 1
+    fi
+    free_percent=$((available * 100 / blocks))
+    if (( available * 100 < blocks * minimum_percent )); then
+        echo "Source-home setup requires at least ${minimum_percent}% free space; ${path} has ${free_percent}%." >&2
+        echo "Reconcile worktrees, Cargo targets, VM state, and rollback artifacts before building." >&2
+        exit 1
+    fi
+    echo "[setup-source-home] free-space gate: ${free_percent}% available"
 }
 
 DEFAULT_DATA_DIR="$(default_data_dir)"
@@ -1735,6 +1755,10 @@ if [[ "${SETUP_SOURCE_HOME_CONFIG_ONLY:-0}" == "1" ]]; then
     exit 0
 fi
 
+browser_vm_backup_retention >/dev/null
+require_minimum_free_space "${ROOT}"
+require_minimum_free_space "${DATA_DIR}"
+
 CONFIG_TOML="${DATA_DIR}/config.toml"
 touch "${CONFIG_TOML}"
 if ! grep -Eq '^[[:space:]]*dev_mode[[:space:]]*=' "${CONFIG_TOML}"; then
@@ -1839,14 +1863,16 @@ install_collaboration_startup_config
 # defense, st_nlink must be 1). Hand it a private single-link copy staged
 # next to the built binary instead of relaxing the gate.
 built_runtime="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)"
-runtime_stage_dir="$(mktemp -d "$(dirname "${built_runtime}")/install-stage.XXXXXX")"
-install -m 0700 "${built_runtime}" "${runtime_stage_dir}/elastos"
-python3 "${ROOT}/scripts/install-source-home-runtime.py" \
-    --source-root "${ROOT}" \
-    --data-dir "${DATA_DIR}" \
-    --built-runtime "${runtime_stage_dir}/elastos" \
-    --platform "${PLATFORM}"
-rm -rf "${runtime_stage_dir}"
+(
+    runtime_stage_dir="$(mktemp -d "$(dirname "${built_runtime}")/install-stage.XXXXXX")"
+    trap 'rm -rf "${runtime_stage_dir}"' EXIT
+    install -m 0700 "${built_runtime}" "${runtime_stage_dir}/elastos"
+    python3 "${ROOT}/scripts/install-source-home-runtime.py" \
+        --source-root "${ROOT}" \
+        --data-dir "${DATA_DIR}" \
+        --built-runtime "${runtime_stage_dir}/elastos" \
+        --platform "${PLATFORM}"
+)
 
 cat <<EOF
 [setup-source-home] artifacts installed; offline principal-root upgrade and restart are required before readiness

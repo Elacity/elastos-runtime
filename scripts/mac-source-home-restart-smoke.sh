@@ -150,6 +150,7 @@ def static_contract():
         "pkill",
         "killall",
         "pgrep",
+        "remove_verified_restart_rollbacks",
         "--gateway-bin",
         "--pid-file",
         "target/release/elastos",
@@ -163,6 +164,8 @@ def static_contract():
         raise AssertionError("restart must select one stable gateway identity")
     if source.count("start_gateway_process()") != 1:
         raise AssertionError("restart must have one detached launcher")
+    if source.index("check_no_existing_rollback") > source.index('stop_verified_gateway "$old_gateway_pid" "$old_gateway_start"'):
+        raise AssertionError("restart must reject an existing rollback before stopping the owned gateway")
 
 
 class Fixture:
@@ -709,6 +712,23 @@ def run_smoke(temp_root):
     if len(list((main.data / "backups").glob("principal-root-upgrade-*"))) != 1:
         raise AssertionError("blocked restart created a second rollback")
 
+    existing_backup = Fixture(temp_root, "existing-backup")
+    existing_old = existing_backup.start_gateway()
+    existing_backup.write_pid(existing_old.pid)
+    retained = existing_backup.data / "backups" / "principal-root-upgrade-preexisting"
+    retained.mkdir(mode=0o700, parents=True, exist_ok=False)
+    (retained / "rollback.json").write_text('{"schema":"fixture.rollback/v1"}\n', encoding="utf-8")
+    (retained / "rollback.json").chmod(0o600)
+    existing_result = existing_backup.run(ok=False)
+    if "rollback reconciliation" not in existing_result.stderr:
+        raise AssertionError("restart accepted a pre-existing rollback")
+    if not process_alive(existing_old.pid):
+        raise AssertionError("existing rollback rejection stopped the owned gateway")
+    if len(list((existing_backup.data / "backups").glob("principal-root-upgrade-*"))) != 1:
+        raise AssertionError("existing rollback rejection changed retained recovery data")
+    if (retained / "rollback.json").read_text(encoding="utf-8") != '{"schema":"fixture.rollback/v1"}\n':
+        raise AssertionError("existing rollback rejection altered retained recovery bytes")
+
     failed = Fixture(temp_root, "failed")
     failed_old = failed.start_gateway()
     failed.write_pid(failed_old.pid)
@@ -768,6 +788,7 @@ def run_smoke(temp_root):
     dead_stale.cleanup()
     unrelated.cleanup()
     failed.cleanup()
+    existing_backup.cleanup()
     unsafe_fifo.cleanup()
     unsafe_hardlink.cleanup()
 
