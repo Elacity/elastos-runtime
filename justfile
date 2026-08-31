@@ -93,6 +93,26 @@ ci-test-capsules:
             (cd \$capsule && cargo test --target-dir target) || exit 1; \
         done"'
 
+# Accurate local replica of the CI source-home-linux job. arch selects the
+# matrix leg: arm64 = ubuntu-24.04-arm (native on Apple silicon),
+# amd64 = ubuntu-latest (emulated, much slower).
+ci-source-home-linux arch='arm64':
+    tar --no-xattrs --no-mac-metadata --no-fflags --exclude='.git' --exclude='target' --exclude='*/target' --exclude='capsules/*/target' -cf - . | \
+      docker run --rm -i --platform linux/{{arch}} -e CARGO_TERM_COLOR=never rust:1.91-bookworm bash -c '\
+        mkdir /w && tar -xf - -C /w && cd /w && \
+        apt-get update -qq >/dev/null && apt-get install -y -qq coturn e2fsprogs ffmpeg nodejs git jq >/dev/null && \
+        rustup target add wasm32-unknown-unknown "$(uname -m)-unknown-linux-musl" >/dev/null 2>&1 && \
+        useradd -m ci && chown -R ci:ci /w && \
+        su -s /bin/bash ci -c "set -euo pipefail && \
+        export PATH=/usr/local/cargo/bin:\$PATH RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/home/ci/.cargo && \
+        cd /w && git init -q && git add -A && git -c user.email=ci@local -c user.name=ci commit -qm ci-replica && \
+        export ELASTOS_COLLABORATION_STARTUP_MODE=isolated && \
+        SOURCE_HOME=/home/ci/rtemp/elastos-source-home && mkdir -p \$SOURCE_HOME && \
+        export HOME=\$SOURCE_HOME XDG_DATA_HOME=\$SOURCE_HOME/.local/share && \
+        scripts/setup-source-home.sh && \
+        ELASTOS_DATA_DIR=\$XDG_DATA_HOME/elastos scripts/installed-provider-verify.sh && \
+        scripts/local-carrier-setup-smoke.sh"'
+
 # Test a single crate (fastest iteration)
 test-crate crate *args:
     cd elastos && cargo test -p {{crate}} {{args}}

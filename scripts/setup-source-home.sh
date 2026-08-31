@@ -1834,11 +1834,19 @@ install_browser_runtime_helpers
 start_browser_runtime_turn
 install_browser_source_home_config
 install_collaboration_startup_config
+# On Linux cargo hardlinks target/release/elastos to its deps/ twin, and the
+# installer's artifact gate rejects any multi-link source (hardlink-swap
+# defense, st_nlink must be 1). Hand it a private single-link copy staged
+# next to the built binary instead of relaxing the gate.
+built_runtime="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)"
+runtime_stage_dir="$(mktemp -d "$(dirname "${built_runtime}")/install-stage.XXXXXX")"
+install -m 0700 "${built_runtime}" "${runtime_stage_dir}/elastos"
 python3 "${ROOT}/scripts/install-source-home-runtime.py" \
     --source-root "${ROOT}" \
     --data-dir "${DATA_DIR}" \
-    --built-runtime "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)" \
+    --built-runtime "${runtime_stage_dir}/elastos" \
     --platform "${PLATFORM}"
+rm -rf "${runtime_stage_dir}"
 
 cat <<EOF
 [setup-source-home] artifacts installed; offline principal-root upgrade and restart are required before readiness

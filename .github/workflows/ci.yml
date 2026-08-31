@@ -194,6 +194,22 @@ jobs:
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-elastos
+      # dist.ipfs.tech is intermittently slow or unreachable from GitHub's
+      # macOS runners, and setup's downloader makes a single 600s attempt.
+      # Cache the verified release tarball and pre-seed bin/kubo so setup
+      # skips the download entirely (ELACITY-2308).
+      - name: cache kubo release
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/kubo-cache
+          key: kubo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('components.json') }}
+      - name: seed kubo into the test HOME
+        run: |
+          set -euo pipefail
+          scripts/seed-kubo-cache.sh \
+            "${RUNNER_TEMP}/kubo-cache" \
+            "${RUNNER_TEMP}/elastos-mac-test-home/Library/Application Support/elastos" \
+            darwin-arm64
       - name: require 10 percent free disk
         run: |
           set -euo pipefail
