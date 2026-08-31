@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "ipfs-provider",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "IPFS operations via managed Kubo daemon",
   "author": "elastos",
   "role": "provider",

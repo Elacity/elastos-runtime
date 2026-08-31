@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "wallet-unisat",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Connect UniSat as an optional Bitcoin approval method",
   "author": "elastos",
   "role": "app",

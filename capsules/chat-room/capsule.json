@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "chat-room",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Runtime-launched Chat capsule with a typed web surface adapter",
   "role": "app",
   "type": "wasm",

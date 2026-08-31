@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-auth"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "hex",
@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-identity"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-protected-content-contracts"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "curve25519-dalek 5.0.0",
  "ed25519-dalek",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-protected-content-custody"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-protected-content-provider-contracts"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "elastos-protected-content-contracts",
  "serde",
@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-protected-content-rights"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ed25519-dalek",
  "elastos-protected-content-contracts",

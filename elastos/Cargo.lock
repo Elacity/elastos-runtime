@@ -1552,7 +1552,7 @@ checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 
 [[package]]
 name = "elastos-auth"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "hex",
@@ -1565,7 +1565,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-common"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "hex",
  "serde",
@@ -1576,7 +1576,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-compute"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "elastos-common",
@@ -1591,7 +1591,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-crosvm"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "elastos-common",
@@ -1619,7 +1619,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-identity"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1653,7 +1653,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-namespace"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -1673,7 +1673,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-protected-content-contracts"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "curve25519-dalek 5.0.0",
  "ed25519-dalek 2.2.0",
@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-protected-content-custody"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1721,7 +1721,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-protected-content-provider-contracts"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "elastos-auth",
@@ -1736,7 +1736,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-protected-content-rights"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "elastos-auth",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-protected-content-runtime"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "ed25519-dalek 2.2.0",
@@ -1776,7 +1776,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-runtime"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1804,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-server"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1875,7 +1875,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-storage"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "dirs",
@@ -1896,7 +1896,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-tls"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum-server",
@@ -1910,7 +1910,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-vz"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "base64",

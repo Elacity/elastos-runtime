@@ -9,7 +9,14 @@ volatile proof logs remain outside the repository.
 ## Release Posture
 
 - A fresh fetch records `main` at `d358dedb` as the released 0.6 source and
-  `origin/upstream/0.7-dev` at `90bbe15b` as the current 0.7 integration line.
+  `origin/upstream/0.7-dev` at `e481b153` as the current 0.7 integration line.
+- The local 0.7.0 release-preparation commit on top of `e481b153` sets the
+  coordinated workspace version to `0.7.0`, gives every capsule manifest
+  changed since 0.6.0 a minor bump (new capsules keep their initial manifest
+  versions), cuts the `0.7.0` changelog entry, and refreshes
+  `elastos/Cargo.lock`. Installed artifacts report `0.7.0` only after the
+  checked publish flow stamps `ELASTOS_RELEASE_VERSION`; unstamped source
+  builds report `0.7.0-dev`.
 - Published feature evidence is
   `origin/feat/protected-content-runtime-lifecycle@854d9dc9`,
   `origin/feat/protected-content-uiux-reconstruction` (PR39),

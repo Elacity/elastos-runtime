@@ -91,8 +91,8 @@
       ],
       "install_path": "capsules/wallet-walletconnect",
       "entrypoint": "browser/index.html",
-      "entrypoint_sha256": "sha256:6e18e94f36708b7a7b9ee1fa672cc69db871ffb7d6130062de8b99cd8ced906b",
-      "entrypoint_size": 1389,
+      "entrypoint_sha256": "sha256:b5fc187eef3396671ff204cd0ba7291f8af6739b6fd6b964689f29160e082865",
+      "entrypoint_size": 1480,
       "runtime_abi": "elastos.runtime-projection/v1",
       "execution": "web-projection",
       "bus_contract": "elastos.runtime-projection/v1",
@@ -106,13 +106,13 @@
       "browser_assets": [
         {
           "path": "browser/index.html",
-          "sha256": "sha256:6e18e94f36708b7a7b9ee1fa672cc69db871ffb7d6130062de8b99cd8ced906b",
-          "size": 1389
+          "sha256": "sha256:b5fc187eef3396671ff204cd0ba7291f8af6739b6fd6b964689f29160e082865",
+          "size": 1480
         },
         {
           "path": "browser/style.css",
-          "sha256": "sha256:3bafe2b1f9e88a5c474acdd7e3a2053ed4fd0848b6e624acd5098a0cbb639387",
-          "size": 4606
+          "sha256": "sha256:4a0374a4dc24d660c3cef462159de484aaaba9ad97f9f2d802fdee2083e1452c",
+          "size": 4704
         },
         {
           "path": "browser/wallet-walletconnect.js",

@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "people",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Manage profile details and contacts, and view signed online presence",
   "author": "elastos",
   "role": "app",

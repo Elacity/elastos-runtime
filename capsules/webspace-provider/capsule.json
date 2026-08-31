@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "webspace-provider",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Dynamic WebSpace resolver for localhost://WebSpaces/<moniker>/...",
   "author": "elastos",
   "role": "provider",

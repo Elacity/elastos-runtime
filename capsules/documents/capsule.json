@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "documents",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Create, edit, and publish markdown documents",
   "role": "viewer",
   "type": "wasm",

@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "chain-provider",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Typed chain provider for production Elastos, Base, and Bitcoin operations",
   "author": "elastos",
   "role": "provider",

@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "gba-ucity",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "uCity - open-source city builder for GBA",
   "role": "content",
   "type": "data",

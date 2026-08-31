@@ -4,6 +4,15 @@ All notable changes to the public ElastOS Runtime repository.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-31
+
+The coordinated workspace version moves to `0.7.0`. Capsule manifests changed
+since 0.6.0 take a minor bump (`0.1.0` to `0.2.0`; `wallet-provider` to
+`0.3.0`); capsules new in this release keep their initial manifest versions.
+Installed artifacts report `0.7.0` only when built through the checked publish
+flow with `ELASTOS_RELEASE_VERSION`; unstamped source builds report
+`0.7.0-dev`.
+
 ### Added
 - The 0.7 source candidate integrates the reviewed protected-content
   lifecycle with collaboration, Home/platform, Wallet, GBA, model-provider,
@@ -34,7 +43,18 @@ All notable changes to the public ElastOS Runtime repository.
   It records findings and test coverage; prerequisite-blocked and partial
   observations remain separate from completed tests.
 
+### Added (release tooling)
+- `scripts/publish-release.sh --dry-run` rehearses a publish entirely
+  locally: no network reads or writes, no IPNS publish, no public URL,
+  and the `last-release-*` publish state stays untouched. `--key` becomes
+  optional; an ephemeral throwaway key signs the rehearsal artifacts.
+
 ### Fixed
+- The release publisher now stamps `model-provider`, `assistant`,
+  `elacity-player`, and `gba-nonogram` direct assets; their
+  `components.json` release entries previously stayed without checksums.
+  The drifted `wallet-walletconnect` entrypoint and stylesheet hashes in
+  `components.json` are restamped from the current source bytes.
 - Runtime's executable watcher skips whole-binary hashing while the file's
   metadata is unchanged. Startup and changed-file checks still verify the hash.
 - A mint retry adopts a fully completed durable record after a crash loses its

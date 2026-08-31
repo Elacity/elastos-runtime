@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "system",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Manage your account, appearance, security, apps, and device",
   "author": "elastos",
   "role": "app",

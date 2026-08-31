@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "archive-manager",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Browse and extract supported archive contents through Library",
   "role": "viewer",
   "type": "wasm",

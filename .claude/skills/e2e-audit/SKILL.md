@@ -1,6 +1,7 @@
 ---
 name: e2e-audit
-description: Use when preparing, reviewing, or merging any PR, planning or cutting a release, changing product or GUI behavior, or assessing stability, correctness, or regression risk in this repo — before declaring work done or release-ready.
+description: On-demand only — invoke with /e2e-audit. Journey-audit register reference for PR review, release gating, and stability/regression assessment in this repo.
+disable-model-invocation: true
 ---
 
 # Journey Audit Register

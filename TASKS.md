@@ -21,6 +21,14 @@ Active priority index:
   its exact revision before the separately approved main merge. Preserve
   reviewed history. The deferred source work below stays outside this merge;
   installed acceptance and protected-content cutover remain separate gates
+- release versioning is prepared in the local 0.7.0 release commit: workspace
+  `0.7.0`, minor-bumped changed capsule manifests, and the cut changelog
+  entry. Still open before the main merge: tag the released 0.6 `main` as
+  `v0.6.0` before it moves, pass CI on the exact release revision, refresh
+  the journey-audit snapshot on that same revision, and record an explicit
+  release disposition for the open P1 findings (F-01, F-43, F-44, F-54).
+  Publication then stamps `ELASTOS_RELEASE_VERSION=0.7.0` through the checked
+  publish flow and tags `v0.7.0`
 - separately authorized after localhost: install the same reviewed tree on the
   seed and the third custody node with matching stable receipts
 - integrated UIUX source evidence: published

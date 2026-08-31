@@ -1,7 +1,7 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "shell",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "ElastOS shell - orchestrates capability grants and capsule lifecycle",
   "author": "elastos",
   "role": "shell",
