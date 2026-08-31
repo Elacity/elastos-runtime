@@ -993,7 +993,10 @@ async fn test_browser_open_launches_engine_with_attached_stream_receipt() {
     let runtime_stream_path = browser_runtime_stream_socket_path(dir.path(), stream_id).unwrap();
     #[cfg(unix)]
     {
-        assert!(runtime_stream_path.starts_with("/tmp/elastos-browser-streams"));
+        let expected_root = format!("/tmp/elastos-browser-streams-{}/", unsafe {
+            libc::geteuid()
+        });
+        assert!(runtime_stream_path.starts_with(expected_root));
         assert!(
             runtime_stream_path.to_string_lossy().len() < 100,
             "runtime stream socket path must fit conservative Unix sun_path budget: {}",
