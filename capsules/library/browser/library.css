@@ -51,8 +51,7 @@
       background: var(--el-lift-strong);
     }
 
-    :root[data-el-theme="light"] .toolbar,
-    :root[data-el-theme="light"] .statusbar {
+    :root[data-el-theme="light"] .toolbar {
       background: color-mix(in srgb, var(--bg) 92%, transparent);
     }
 
@@ -229,7 +228,7 @@
 
     .eyebrow {
       margin: 0 0 5px;
-      color: var(--muted);
+      color: var(--ink);
       font-size: 0.68rem;
       font-weight: 700;
       letter-spacing: 0.12em;
@@ -254,7 +253,7 @@
 
     .subtitle,
     .muted {
-      color: var(--muted);
+      color: var(--ink);
       line-height: 1.45;
     }
 
@@ -1000,7 +999,7 @@
       color: var(--muted);
       font-size: 13px;
       min-width: 0;
-      background: #fafafa;
+      background: var(--panel-soft);
       user-select: none;
     }
 
@@ -1164,7 +1163,8 @@
       padding: 0;
       display: block;
       overflow: hidden;
-      background: rgb(241 242 246);
+      border: 1px solid var(--line);
+      background: var(--panel);
       border-radius: 6px;
     }
 
@@ -1175,11 +1175,11 @@
       justify-content: space-between;
       gap: 12px;
       padding: 8px 10px;
-      color: #1d1d1f;
+      color: var(--ink);
       font-size: 0.83rem;
       font-weight: 600;
-      border-bottom: 1px solid rgba(60, 60, 67, 0.16);
-      background: linear-gradient(180deg, #f8f8f9, #eceef3);
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
     }
 
     .properties-window-title button {
@@ -1187,10 +1187,10 @@
       height: 22px;
       display: grid;
       place-items: center;
-      border: 1px solid rgba(60, 60, 67, 0.2);
+      border: 1px solid var(--line);
       border-radius: 999px;
-      background: #fff;
-      color: #3f4650;
+      background: var(--panel-soft);
+      color: var(--ink);
       cursor: pointer;
       line-height: 1;
     }
@@ -1214,15 +1214,15 @@
       margin-top: -1px;
       padding: 5px 10px;
       overflow: auto;
-      border: 1px solid #ccc;
+      border: 1px solid var(--line);
       border-radius: 3px;
-      background: #fff;
-      color: #333;
+      background: var(--panel-soft);
+      color: var(--ink);
     }
 
     .item-props-tab-content-selected {
       display: block;
-      background: #fff;
+      background: var(--panel-soft);
     }
 
     .item-props-tab-btn {
@@ -1234,21 +1234,21 @@
       border: 1px solid transparent;
       border-top-left-radius: 3px;
       border-top-right-radius: 3px;
-      color: #374653;
+      color: var(--muted);
       font-size: 0.84rem;
     }
 
     .item-props-tab-btn:hover {
-      color: #1a1a1a;
+      color: var(--ink);
     }
 
     .item-props-tab-selected {
       position: relative;
       margin-bottom: -1px;
-      border: 1px solid #ccc;
+      border: 1px solid var(--line);
       border-bottom: none;
-      background: #fff;
-      color: #000;
+      background: var(--panel-soft);
+      color: var(--ink);
     }
 
     .item-props-tbl {
@@ -1289,7 +1289,7 @@
     .props-copy-text {
       flex: 1;
       min-width: 0;
-      color: #1f2933;
+      color: var(--ink);
       font-family: var(--mono);
       font-size: 11px;
       line-height: 1.45;
@@ -1303,15 +1303,15 @@
       display: inline-grid;
       flex: 0 0 auto;
       place-items: center;
-      border: 1px solid #d1d5db;
+      border: 1px solid var(--line);
       border-radius: 3px;
-      background: #fff;
-      color: #374151;
+      background: var(--panel-soft);
+      color: var(--ink);
       cursor: pointer;
     }
 
     .props-copy-btn:hover {
-      background: #f3f4f6;
+      background: var(--el-lift);
     }
 
     .props-copy-btn.copied {

@@ -33,6 +33,42 @@ function assert(condition, message) {
   }
 }
 
+function parseColor(color) {
+  const match = /^rgba?\((\d+), (\d+), (\d+)(?:, ([0-9.]+))?\)$/.exec(color);
+  if (!match) return null;
+  return {
+    r: Number.parseInt(match[1], 10),
+    g: Number.parseInt(match[2], 10),
+    b: Number.parseInt(match[3], 10),
+    a: match[4] == null ? 1 : Number.parseFloat(match[4]),
+  };
+}
+
+function flattenColor(foreground, background) {
+  const fg = parseColor(foreground);
+  const bg = parseColor(background);
+  if (!fg) return null;
+  if (!bg || fg.a >= 1) {
+    return [fg.r, fg.g, fg.b];
+  }
+  return [
+    Math.round((fg.a * fg.r) + ((1 - fg.a) * bg.r)),
+    Math.round((fg.a * fg.g) + ((1 - fg.a) * bg.g)),
+    Math.round((fg.a * fg.b) + ((1 - fg.a) * bg.b)),
+  ];
+}
+
+function colorDistance(left, right, base = null) {
+  const a = flattenColor(left, base || left);
+  const b = flattenColor(right, base || right);
+  if (!a || !b) return 0;
+  return Math.sqrt(
+    ((a[0] - b[0]) ** 2)
+    + ((a[1] - b[1]) ** 2)
+    + ((a[2] - b[2]) ** 2),
+  );
+}
+
 function object(uri, name, kind) {
   return {
     schema: "elastos.library.object/v1",
@@ -159,6 +195,61 @@ async function assertNoHorizontalOverflow(page, label) {
   assert(overflow.body <= 1, `${label}: document overflowed horizontally (${overflow.body}px)`);
   assert(overflow.shell <= 1, `${label}: shell overflowed horizontally (${overflow.shell}px)`);
   assert(overflow.main <= 1, `${label}: main overflowed horizontally (${overflow.main}px)`);
+}
+
+async function openProperties(page, name) {
+  await page.locator(".item").filter({ hasText: name }).first().click({ button: "right" });
+  await page.locator("#context-menu:not(.hidden)").waitFor();
+  await page.locator("#context-menu .menu-item").filter({ hasText: "Properties" }).first().click();
+  await page.locator(".window-item-properties").filter({ hasText: `${name} properties` }).first().waitFor();
+}
+
+async function readThemeSnapshot(page) {
+  return page.evaluate(() => {
+    const read = (selector) => {
+      const element = document.querySelector(selector);
+      if (!element) {
+        return { backgroundColor: "", color: "" };
+      }
+      const style = getComputedStyle(element);
+      return {
+        backgroundColor: style.backgroundColor,
+        color: style.color,
+      };
+    };
+    return {
+      activeTab: document.querySelector(".item-props-tab-selected")?.textContent?.trim() || "",
+      body: read("body"),
+      statusbar: read(".statusbar"),
+      card: read(".window-item-properties"),
+      title: read(".properties-window-title"),
+      panel: read(".item-props-tab-content-selected"),
+      label: read(".item-prop-label"),
+      value: read(".item-prop-val"),
+      copyButton: read(".props-copy-btn"),
+    };
+  });
+}
+
+function assertReadableTheme(snapshot, label) {
+  assert(snapshot.activeTab.length > 0, `${label}: Properties tab did not stay selected.`);
+  assert(
+    colorDistance(snapshot.statusbar.backgroundColor, snapshot.statusbar.color, snapshot.body.backgroundColor) > 40,
+    `${label}: footer text lost readable contrast.`,
+  );
+  assert(colorDistance(snapshot.title.backgroundColor, snapshot.title.color) > 40, `${label}: Properties title lost readable contrast.`);
+  assert(
+    colorDistance(snapshot.panel.backgroundColor, snapshot.panel.color, snapshot.card.backgroundColor) > 40,
+    `${label}: Properties panel lost readable contrast.`,
+  );
+  assert(
+    colorDistance(snapshot.panel.backgroundColor, snapshot.label.color, snapshot.card.backgroundColor) > 40,
+    `${label}: Properties labels lost readable contrast.`,
+  );
+  assert(
+    colorDistance(snapshot.panel.backgroundColor, snapshot.value.color, snapshot.card.backgroundColor) > 40,
+    `${label}: Properties values lost readable contrast.`,
+  );
 }
 
 async function run() {
@@ -292,6 +383,29 @@ async function run() {
 
     await page.locator('.content[data-view="list"] .item').first().waitFor();
     await assertNoHorizontalOverflow(page, "wide list");
+
+    await openProperties(page, "Alpha.txt");
+    const darkGeneral = await readThemeSnapshot(page);
+    assert(darkGeneral.activeTab === "General", "Properties must open on the General tab.");
+    assertReadableTheme(darkGeneral, "dark general");
+    await page.locator(".item-props-tab-btn").filter({ hasText: "Technical" }).first().click();
+    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').waitFor();
+    const darkTechnical = await readThemeSnapshot(page);
+    assert(darkTechnical.activeTab === "Technical", "Properties must switch to the Technical tab.");
+    assertReadableTheme(darkTechnical, "dark technical");
+    await page.evaluate(() => {
+      document.documentElement.setAttribute("data-el-theme", "light");
+    });
+    const lightTechnical = await readThemeSnapshot(page);
+    assertReadableTheme(lightTechnical, "light technical");
+    await page.locator(".item-props-tab-btn").filter({ hasText: "General" }).first().click();
+    await page.locator('.item-props-tab-content-selected[data-tab="general"]').waitFor();
+    const lightGeneral = await readThemeSnapshot(page);
+    assert(lightGeneral.activeTab === "General", "Properties must return to the General tab.");
+    assertReadableTheme(lightGeneral, "light general");
+    assert(darkGeneral.statusbar.backgroundColor !== lightGeneral.statusbar.backgroundColor, "Library footer must react to theme changes.");
+    assert(darkGeneral.panel.backgroundColor !== lightGeneral.panel.backgroundColor, "Library Properties panel must react to theme changes.");
+    await page.locator(".properties-window-actions [data-dialog-close]").click();
 
     await page.fill("#search", "missing");
     await page.locator(".empty").waitFor();
