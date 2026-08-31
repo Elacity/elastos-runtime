@@ -44,6 +44,9 @@ const MINT_INTENT_REQUEST_ID_DOMAIN: &[u8] =
 const MINT_INTENT_SOURCE_BINDING_DOMAIN: &[u8] =
     b"elastos.protected-content.runtime-mint-intent-source-binding/v1";
 const MAX_STORE_FILE_BYTES: usize = 64 * 1024;
+// Adoption lookups scan the store directory; refuse stores grown beyond any
+// plausible single-owner journal instead of walking them unbounded.
+const MAX_RECORD_SCAN_ENTRIES: usize = 65_536;
 const REQUIRED_NODES: usize = 3;
 const MAX_AVAILABILITY_TEXT_BYTES: usize = 256;
 
@@ -835,6 +838,15 @@ impl RuntimeMintIntent {
         matches!(
             self.protect_state,
             RuntimeMintIntentProtectState::SettledBeforeDraft(_)
+        )
+    }
+
+    pub const fn protect_settled_closed_before_draft(&self) -> bool {
+        matches!(
+            self.protect_state,
+            RuntimeMintIntentProtectState::SettledBeforeDraft(
+                RuntimeMintIntentProtectSettlement::Closed
+            )
         )
     }
 
@@ -1670,6 +1682,46 @@ impl RuntimeMintJournal {
         self.read_intent(request_id)
     }
 
+    /// Locate the persisted mint record that belongs to `request_id`'s intent
+    /// through their shared content-access identity and custody selection.
+    ///
+    /// The intent never records a mint id before completion (the mint id is
+    /// content-derived and only exists once a draft is bound), so a crash
+    /// between draft persistence and `mark_intent_completed` leaves a finished
+    /// record the intent cannot name. This scan re-establishes that link.
+    /// Ambiguity and unreadable records fail closed.
+    pub fn find_mint_record_for_intent(
+        &self,
+        request_id: Digest32,
+    ) -> Result<Option<PersistedRuntimeMint>, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let intent = self.read_intent(request_id)?;
+        let entries =
+            fs::read_dir(&self.root_dir).map_err(|_| RuntimeMintJournalError::Unavailable)?;
+        let mut matched: Option<PersistedRuntimeMint> = None;
+        let mut scanned = 0usize;
+        for entry in entries {
+            let entry = entry.map_err(|_| RuntimeMintJournalError::Unavailable)?;
+            let Some(mint_id) = mint_id_from_record_file_name(&entry.file_name()) else {
+                continue;
+            };
+            scanned += 1;
+            if scanned > MAX_RECORD_SCAN_ENTRIES {
+                return Err(RuntimeMintJournalError::Unavailable);
+            }
+            let record = self.read_record(mint_id)?;
+            if !record_matches_intent(&record, &intent) {
+                continue;
+            }
+            if matched.is_some() {
+                return Err(RuntimeMintJournalError::Conflict);
+            }
+            matched = Some(record);
+        }
+        Ok(matched)
+    }
+
     pub fn persist_media_preparation(
         &self,
         preparation: &RuntimeMediaPreparationRecord,
@@ -2421,6 +2473,30 @@ fn encode_record(record: &PersistedRuntimeMint) -> Result<Vec<u8>, RuntimeMintJo
     out.extend_from_slice(&digest);
     out.extend_from_slice(&payload);
     Ok(out)
+}
+
+fn mint_id_from_record_file_name(name: &std::ffi::OsStr) -> Option<Digest32> {
+    // Record files are exactly the canonical lowercase hex of the mint id;
+    // intent-/prepare-/tmp/lock files never match this shape.
+    let name = name.to_str()?;
+    if name.len() != 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let bytes: [u8; 32] = hex::decode(name).ok()?.try_into().ok()?;
+    Some(Digest32::new(bytes))
+}
+
+fn record_matches_intent(record: &PersistedRuntimeMint, intent: &RuntimeMintIntent) -> bool {
+    let draft = &record.draft;
+    draft.content_access_id == intent.content_access_id
+        && draft.nodes == intent.nodes
+        && draft.pool() == intent.custody_pool
+        && draft.epoch() == intent.custody_epoch
+        && draft.committee() == intent.custody_committee_authorization
 }
 
 fn decode_record(bytes: &[u8]) -> Result<PersistedRuntimeMint, RuntimeMintJournalError> {
@@ -3694,6 +3770,139 @@ mod tests {
             .load_intent(request_id)
             .unwrap();
         assert_eq!(reloaded, completed);
+    }
+
+    fn draft_with(media_seed: u8, access_seed: u8, pool_seed: u8) -> RuntimeMintDraft {
+        let nodes = nodes();
+        let threshold = ThresholdV1::new(2, 3).unwrap();
+        let media = test_media::media_identity(media_seed);
+        let (init_segment, encrypted_segments, mime_type, codecs) =
+            test_media::media_components(media_seed);
+        let node_set = NodeSetV1::new(
+            threshold,
+            nodes.iter().map(|node| node.node_public_key()).collect(),
+        )
+        .unwrap();
+        let key_envelope = KeyEnvelopeIdentityV1::new(
+            media.encrypted_content().clone(),
+            digest(0x22),
+            512,
+            node_set.node_set_id().unwrap(),
+            threshold,
+            CustodyPoolIdentityV1::new(digest(pool_seed), 512).unwrap(),
+            CustodyEpochIdentityV1::new(digest(0x33), 512).unwrap(),
+            CustodyCommitteeAuthorizationIdentityV1::new(digest(0x36), 512).unwrap(),
+        )
+        .unwrap();
+        RuntimeMintDraft::new(
+            &init_segment,
+            &encrypted_segments,
+            mime_type,
+            codecs,
+            content_access_id(access_seed),
+            key_envelope,
+            RightsPolicyIdentityV1::new(digest(0x44), 384).unwrap(),
+            digest(0x19),
+            threshold,
+            nodes,
+        )
+        .unwrap()
+    }
+
+    fn settled_closed_intent(journal: &RuntimeMintJournal) -> RuntimeMintIntent {
+        let intent = intent();
+        journal.persist_intent(&intent).unwrap();
+        journal
+            .mark_intent_protect_effect_started(intent.request_id())
+            .unwrap();
+        journal
+            .mark_intent_protect_closed_before_draft(intent.request_id())
+            .unwrap()
+    }
+
+    #[test]
+    fn find_mint_record_for_intent_links_settled_intent_to_its_record() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let settled = settled_closed_intent(&journal);
+        assert!(settled.protect_settled_closed_before_draft());
+        // Decoy record for unrelated content in the same store.
+        custody_provision_all(&journal, &draft());
+        // The intent fixture's content-access id is 0x52; this record shares it
+        // along with the custody selection.
+        let matching = draft_with(0x21, 0x52, 0x35);
+        custody_provision_all(&journal, &matching);
+
+        let found = journal
+            .find_mint_record_for_intent(settled.request_id())
+            .unwrap()
+            .expect("record sharing access id and custody selection must be found");
+        assert_eq!(found.draft().mint_id(), matching.mint_id());
+        assert_eq!(
+            found.custody_terminal(),
+            Some(RuntimeCustodyTerminalKind::CustodyProvisioned)
+        );
+    }
+
+    #[test]
+    fn find_mint_record_for_intent_ignores_foreign_custody_selection() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let settled = settled_closed_intent(&journal);
+        // Same content-access id, different custody pool identity.
+        custody_provision_all(&journal, &draft_with(0x21, 0x52, 0x75));
+
+        assert_eq!(
+            journal
+                .find_mint_record_for_intent(settled.request_id())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn find_mint_record_for_intent_fails_closed_on_ambiguity() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let settled = settled_closed_intent(&journal);
+        custody_provision_all(&journal, &draft_with(0x21, 0x52, 0x35));
+        custody_provision_all(&journal, &draft_with(0x27, 0x52, 0x35));
+
+        assert_eq!(
+            journal.find_mint_record_for_intent(settled.request_id()),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_mint_record_for_intent_fails_closed_on_unreadable_record() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let root = owner_only_journal_root(&temp);
+        let journal = RuntimeMintJournal::new(&root);
+        let settled = settled_closed_intent(&journal);
+        let bogus = root.join(hex::encode([0x5a; 32]));
+        fs::write(&bogus, b"not a journal record").unwrap();
+        fs::set_permissions(&bogus, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(
+            journal.find_mint_record_for_intent(settled.request_id()),
+            Err(RuntimeMintJournalError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn find_mint_record_for_intent_requires_the_intent() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        custody_provision_all(&journal, &draft());
+
+        assert_eq!(
+            journal.find_mint_record_for_intent(digest(0x5b)),
+            Err(RuntimeMintJournalError::NotFound)
+        );
     }
 
     #[test]

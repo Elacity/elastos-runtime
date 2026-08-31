@@ -52,10 +52,10 @@ use elastos_protected_content_runtime::{
     close_viewer_session_with_result, open_viewer_session, prepare_recipient,
     read_viewer_media_part, resolve_runtime_mint_selected_nodes, PersistedRuntimeMint,
     PersistedRuntimeReleaseOperation, RuntimeContentAvailabilityRequirement,
-    RuntimeDecryptProvider, RuntimeMediaPreparationRecord, RuntimeMediaPreparationState,
-    RuntimeMintConfiguredCustodyProvider, RuntimeMintCoordinator, RuntimeMintCoordinatorError,
-    RuntimeMintCoordinatorOutcome, RuntimeMintCreatorTerminalEvidence, RuntimeMintDraft,
-    RuntimeMintIntent, RuntimeMintJournal, RuntimeOpenViewerSessionInput,
+    RuntimeCustodyTerminalKind, RuntimeDecryptProvider, RuntimeMediaPreparationRecord,
+    RuntimeMediaPreparationState, RuntimeMintConfiguredCustodyProvider, RuntimeMintCoordinator,
+    RuntimeMintCoordinatorError, RuntimeMintCoordinatorOutcome, RuntimeMintCreatorTerminalEvidence,
+    RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal, RuntimeOpenViewerSessionInput,
     RuntimePreparedRecipientCancelResult, RuntimeProtectedContentPurchaseIntent,
     RuntimePurchaseEffectAuthority, RuntimeReleaseAuditRecord, RuntimeReleaseCoordinator,
     RuntimeReleaseCoordinatorOutcome, RuntimeReleaseJournal, RuntimeReleaseJournalError,
@@ -1069,6 +1069,47 @@ fn load_completed_runtime_mint_facts(
         &content_id,
         evidence,
     ))
+}
+
+/// A crash between the protect session's close settlement and
+/// `mark_intent_completed` leaves the intent at `SettledBeforeDraft(Closed)`
+/// while every durable mint step may already have finished; the deterministic
+/// intent identity then bricks the source object permanently (ELACITY-2307).
+/// Adopt the finished record when one exists: return its mint id after
+/// completing the intent. A record that is not fully terminal cannot be rolled
+/// forward (the content key material is gone), so it fails closed for cleanup
+/// reconciliation with the orphaned custody evidence logged. No record means
+/// nothing durable survived the crash and the terminal abort stands.
+fn adopt_settled_runtime_mint_record(
+    journal: &RuntimeMintJournal,
+    mint_intent: &RuntimeMintIntent,
+) -> anyhow::Result<Option<Digest32>> {
+    let record = journal
+        .find_mint_record_for_intent(mint_intent.request_id())
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    let fully_terminal = record.custody_terminal()
+        == Some(RuntimeCustodyTerminalKind::CustodyProvisioned)
+        && record.content_availability().is_some();
+    if fully_terminal {
+        let mint_id = record.draft().mint_id();
+        journal
+            .mark_intent_completed(mint_intent.request_id(), mint_id)
+            .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+        return Ok(Some(mint_id));
+    }
+    tracing::warn!(
+        request_id = %hex::encode(mint_intent.request_id().as_bytes()),
+        mint_id = %hex::encode(record.draft().mint_id().as_bytes()),
+        custody_terminal = ?record.custody_terminal(),
+        content_availability_recorded = record.content_availability().is_some(),
+        node_effects_started = record.any_effect_started(),
+        node_receipts_accepted = record.accepted_orphans().len(),
+        "settled runtime custody mint record is not fully terminal; orphaned custody state requires cleanup reconciliation"
+    );
+    anyhow::bail!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE);
 }
 
 pub fn list_unresolved_runtime_releases(
@@ -3827,6 +3868,11 @@ pub(crate) async fn publish_runtime_custody_library_object(
     )?;
     if let Some(mint_id) = mint_intent.completed_mint_id() {
         return load_completed_runtime_mint_facts(&mint_journal, &input, mint_id);
+    }
+    if mint_intent.protect_settled_closed_before_draft() {
+        if let Some(mint_id) = adopt_settled_runtime_mint_record(&mint_journal, &mint_intent)? {
+            return load_completed_runtime_mint_facts(&mint_journal, &input, mint_id);
+        }
     }
     let protected =
         protect_runtime_custody_media(&registry, &mint_journal, &composition, &input, &mint_intent)

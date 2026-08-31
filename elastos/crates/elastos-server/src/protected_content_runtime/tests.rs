@@ -8540,6 +8540,209 @@ async fn runtime_custody_library_publish_fails_closed_without_chain_policy() {
     );
 }
 
+/// Seed the exact ELACITY-2307 crash state: a mint intent settled at
+/// `SettledBeforeDraft(Closed)` alongside the durable mint work the completion
+/// mark never named. `complete` selects the fully terminal record (custody
+/// provisioned, availability recorded) or a partial-provision window.
+/// Returns the seeded record's mint id.
+#[cfg(unix)]
+fn seed_settled_runtime_custody_mint_record(
+    data_dir: &Path,
+    input: &RuntimeCustodyLibraryPublishInput,
+    complete: bool,
+) -> Digest32 {
+    let (node_bindings, pool_identity, epoch_identity, committee_identity) =
+        library_publish_test_mint_composition(data_dir);
+    let journal = runtime_mint_journal(data_dir);
+    let (protected_init_segment, protected_segments) = media_components(0x41);
+    let threshold = ThresholdV1::new(2, 3).unwrap();
+    let node_set = elastos_protected_content_contracts::NodeSetV1::new(
+        threshold,
+        node_bindings
+            .iter()
+            .map(|node| node.node_public_key())
+            .collect(),
+    )
+    .unwrap();
+    let key_envelope = elastos_protected_content_contracts::KeyEnvelopeIdentityV1::new(
+        media_identity(0x41).encrypted_content().clone(),
+        digest(0x52),
+        256,
+        node_set.node_set_id().unwrap(),
+        threshold,
+        pool_identity,
+        epoch_identity,
+        committee_identity,
+    )
+    .unwrap();
+    let policy =
+        elastos_protected_content_contracts::RightsPolicyIdentityV1::new(digest(0x56), 128)
+            .unwrap();
+    let draft = RuntimeMintDraft::new(
+        &protected_init_segment,
+        &protected_segments,
+        input.mime_type.clone(),
+        input.codecs.clone(),
+        ContentAccessIdV1::new([0x51; 16]).unwrap(),
+        key_envelope,
+        policy,
+        digest(0x61),
+        threshold,
+        node_bindings.clone(),
+    )
+    .unwrap();
+    let intent = RuntimeMintIntent::new(
+        input.principal_id.clone(),
+        &input.object_uri,
+        &input.source_storage,
+        input.wallet_account_id.clone(),
+        input.wallet_account_address.clone(),
+        input.creator_mint_source_digest,
+        input.mime_type.clone(),
+        input.codecs.clone(),
+        &input.clear_init_segment,
+        &input.clear_segments,
+        draft.content_access_id(),
+        draft.pool(),
+        draft.epoch(),
+        draft.committee(),
+        node_bindings.clone(),
+    )
+    .unwrap();
+    let request_id = intent.request_id();
+    journal.persist_intent(&intent).unwrap();
+    journal
+        .mark_intent_protect_effect_started(request_id)
+        .unwrap();
+    journal
+        .mark_intent_protect_closed_before_draft(request_id)
+        .unwrap();
+    journal.persist_bound(&draft).unwrap();
+    if !complete {
+        journal
+            .mark_node_effect_started(draft.mint_id(), node_bindings[0].node_public_key())
+            .unwrap();
+        return draft.mint_id();
+    }
+    for (index, node) in node_bindings.iter().enumerate() {
+        journal
+            .mark_node_effect_started(draft.mint_id(), node.node_public_key())
+            .unwrap();
+        journal
+            .mark_node_receipt(
+                draft.mint_id(),
+                RuntimeMintNodeReceipt::new(
+                    node.node_public_key(),
+                    RuntimeCustodyProvisioningIdV1::new(digest(0x71 + index as u8)).unwrap(),
+                    CustodyNodeProvisioningRecordIdentityV1::new(
+                        digest(0x81 + index as u8),
+                        128 + index as u32,
+                    )
+                    .unwrap(),
+                    node.owner_state_root(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    journal.mark_custody_provisioned(draft.mint_id()).unwrap();
+    let content_id = runtime_protected_content_id(draft.encrypted_content()).unwrap();
+    let requirement = RuntimeContentAvailabilityRequirement::new(
+        "did:key:z6Mkhq7f4c4QAEgwRByrEsmGu3RJRYvpP5UGcWvqBjGW4YRe",
+        content_id.clone(),
+        "did:key:z6Mkhq7f4c4QAEgwRByrEsmGu3RJRYvpP5UGcWvqBjGW4YRe#publisher",
+        "protected-content-replication/v1",
+        3,
+        600,
+        60,
+    )
+    .unwrap();
+    let evidence = elastos_protected_content_runtime::RuntimeVerifiedContentAvailability::new(
+        "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        content_id,
+        "did:key:z6Mkhq7f4c4QAEgwRByrEsmGu3RJRYvpP5UGcWvqBjGW4YRe#publisher",
+        &requirement,
+        3,
+        crate::auth::now_ts(),
+        digest(0xa1),
+        draft.encrypted_content().clone(),
+        draft.media_identity().media_manifest_root(),
+    )
+    .unwrap();
+    journal
+        .mark_content_available(draft.mint_id(), &requirement, evidence)
+        .unwrap();
+    draft.mint_id()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_publish_adopts_completed_mint_after_lost_completion_mark() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    write_device_key(&data_dir, 0x21);
+    let input = library_publish_test_input("person:local:runtime-custody-lost-completion-mark");
+    let request_id = library_publish_request_id(&input);
+    let expected_mint_id = seed_settled_runtime_custody_mint_record(&data_dir, &input, true);
+
+    // No providers registered: adoption must resolve from the journal alone.
+    let facts =
+        publish_runtime_custody_library_object(&data_dir, Arc::new(ProviderRegistry::new()), input)
+            .await
+            .expect(
+                "a crash after completed mint work must adopt the record, not brick the source",
+            );
+    assert_eq!(facts.mint_id, expected_mint_id);
+
+    let intent = runtime_mint_journal(&data_dir)
+        .load_intent(request_id)
+        .unwrap();
+    assert_eq!(intent.completed_mint_id(), Some(expected_mint_id));
+
+    let replay = publish_runtime_custody_library_object(
+        &data_dir,
+        Arc::new(ProviderRegistry::new()),
+        library_publish_test_input("person:local:runtime-custody-lost-completion-mark"),
+    )
+    .await
+    .expect("an adopted completion must replay as completed facts");
+    assert_eq!(replay.mint_id, expected_mint_id);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_publish_requires_reconciliation_for_partial_settled_mint() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    write_device_key(&data_dir, 0x21);
+    let input = library_publish_test_input("person:local:runtime-custody-partial-settled");
+    let request_id = library_publish_request_id(&input);
+    let mint_id = seed_settled_runtime_custody_mint_record(&data_dir, &input, false);
+
+    let error =
+        publish_runtime_custody_library_object(&data_dir, Arc::new(ProviderRegistry::new()), input)
+            .await
+            .expect_err(
+                "partially provisioned settled mint work must fail closed for reconciliation",
+            );
+    assert!(
+        error
+            .to_string()
+            .contains(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE),
+        "{error}"
+    );
+
+    let intent = runtime_mint_journal(&data_dir)
+        .load_intent(request_id)
+        .unwrap();
+    assert!(intent.protect_terminal_before_draft());
+    assert_eq!(intent.completed_mint_id(), None);
+    let record = runtime_mint_journal(&data_dir).load(mint_id).unwrap();
+    assert_eq!(record.custody_terminal(), None);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn runtime_custody_library_publish_retries_exactly_when_protect_never_dispatches() {
