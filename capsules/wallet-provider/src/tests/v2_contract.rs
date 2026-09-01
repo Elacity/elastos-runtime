@@ -778,8 +778,8 @@ fn failed_pre_v2_migration_save_leaves_provider_uninitialized() {
 #[test]
 fn manifest_is_consistently_versioned_and_status_only() {
     let manifest: Value = serde_json::from_str(include_str!("../../capsule.json")).unwrap();
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
-    assert_eq!(manifest["version"], "0.2.0");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.0");
+    assert_eq!(manifest["version"], "0.3.0");
     assert_eq!(manifest["provides"], "elastos://wallet/meta/status");
     assert_eq!(manifest["interfaces"][0]["version"], "0.6.0");
     assert_eq!(

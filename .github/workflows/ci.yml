@@ -89,6 +89,19 @@ jobs:
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-elastos-test
+      # The three provider workspaces are release-built from cold on every
+      # run otherwise; with the cache restored, cargo only re-fingerprints
+      # the workspace members and reuses every dependency artifact.
+      - name: cache provider build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            capsules/protected-content-protect-provider/target
+            capsules/protected-content-decrypt-provider/target
+            capsules/custody-provider/target
+          key: providers-target-${{ runner.os }}-${{ hashFiles('capsules/protected-content-protect-provider/Cargo.lock', 'capsules/protected-content-decrypt-provider/Cargo.lock', 'capsules/custody-provider/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            providers-target-${{ runner.os }}-
       - name: build provider process binaries for tests
         run: |
           cargo build --release --manifest-path capsules/protected-content-protect-provider/Cargo.toml --target-dir capsules/protected-content-protect-provider/target
@@ -118,20 +131,34 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          # The capsule workspaces cannot be enumerated here; key the shared
-          # registry cache off the elastos workspace, whose dependency set
-          # overlaps the capsules almost entirely.
+          # Registry/index cache only: this job never builds the elastos
+          # workspace, and the capsule build artifacts live in the shared
+          # target-capsules dir cached below.
           workspaces: elastos
           prefix-key: ${{ runner.os }}-capsules
+          cache-targets: false
+      # The capsule workspaces overlap almost entirely in dependencies, so
+      # `just test-capsules` builds them into one shared target dir; caching
+      # it turns every warm run's dependency builds into fingerprint checks.
+      # The key rotates with any capsule lockfile or toolchain change, which
+      # bounds stale-artifact growth under the restore-keys fallback.
+      - name: cache capsule build artifacts
+        uses: actions/cache@v4
+        with:
+          path: target-capsules
+          key: capsules-target-${{ runner.os }}-${{ hashFiles('capsules/*/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            capsules-target-${{ runner.os }}-
       # The elastos workspace suite never builds or tests own-workspace
       # capsules; this mirrors `just test-capsules`.
       - name: test own-workspace capsules
         run: |
           set -euo pipefail
+          root="$PWD"
           for lock in capsules/*/Cargo.lock; do
               capsule="$(dirname "$lock")"
               echo "== testing $capsule =="
-              (cd "$capsule" && cargo test --target-dir target)
+              (cd "$capsule" && cargo test --target-dir "${root}/target-capsules")
           done
 
   # The source-home jobs run only once the test phase is green, in parallel
@@ -161,11 +188,11 @@ jobs:
         with:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-${{ runner.arch }}-elastos
-      - name: require 10 percent free disk
+      - name: require 16 GiB free disk
         run: |
           set -euo pipefail
           df -Pk .
-          df -Pk . | awk 'NR == 2 { if ($4 * 100 < $2 * 10) exit 1 }'
+          df -Pk . | awk 'NR == 2 { if ($4 < 16 * 1024 * 1024) exit 1 }'
       - name: install host prerequisites
         run: |
           sudo apt-get update
@@ -247,11 +274,11 @@ jobs:
             "${RUNNER_TEMP}/kubo-cache" \
             "${RUNNER_TEMP}/elastos-mac-test-home/Library/Application Support/elastos" \
             darwin-arm64
-      - name: require 10 percent free disk
+      - name: require 16 GiB free disk
         run: |
           set -euo pipefail
           df -Pk .
-          df -Pk . | awk 'NR == 2 { if ($4 * 100 < $2 * 10) exit 1 }'
+          df -Pk . | awk 'NR == 2 { if ($4 < 16 * 1024 * 1024) exit 1 }'
       - name: install host prerequisites
         run: |
           brew install e2fsprogs coturn ffmpeg

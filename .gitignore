@@ -1,5 +1,6 @@
 # Rust
 **/target/
+/target-capsules/
 **/*.rs.bk
 # Main Cargo.lock committed for reproducible builds; negate the ignore
 !elastos/Cargo.lock

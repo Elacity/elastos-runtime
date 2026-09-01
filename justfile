@@ -51,10 +51,15 @@ test-elastos *args: prepare-providers
 test-capsules:
     #!/usr/bin/env bash
     set -euo pipefail
+    # One shared target dir: the capsule workspaces overlap almost entirely in
+    # dependencies, so sharing compiles each dep once instead of ~25 times and
+    # gives CI a single cacheable path. Cargo fingerprints keep per-workspace
+    # correctness; the loop is sequential, so there is no lock contention.
+    root="$PWD"
     for lock in capsules/*/Cargo.lock; do
         capsule="$(dirname "$lock")"
         echo "== testing $capsule =="
-        (cd "$capsule" && cargo test --target-dir target)
+        (cd "$capsule" && cargo test --target-dir "${root}/target-capsules")
     done
 
 # Run the workspace suite and every own-workspace capsule suite
@@ -65,7 +70,7 @@ test: test-elastos test-capsules
 # nodejs matches the ubuntu-latest runner, where node is preinstalled and
 # elastos-server integration tests spawn it.
 ci-test-elastos:
-    tar --no-xattrs --no-mac-metadata --no-fflags --exclude='.git' --exclude='target' --exclude='*/target' --exclude='capsules/*/target' -cf - . | \
+    tar --no-xattrs --no-mac-metadata --no-fflags --exclude='.git' --exclude='target' --exclude='target-capsules' --exclude='*/target' --exclude='capsules/*/target' -cf - . | \
       docker run --rm -i -e RUSTFLAGS="-D warnings" -e CARGO_TERM_COLOR=always rust:1.91-bookworm bash -c '\
         mkdir /w && tar -xf - -C /w && cd /w && cargo --version >/dev/null && \
         apt-get update -qq >/dev/null && apt-get install -y -qq nodejs >/dev/null && node --version && \
@@ -82,7 +87,7 @@ ci-test-elastos:
 
 # Accurate local replica of the CI test-capsules job (same container recipe).
 ci-test-capsules:
-    tar --no-xattrs --no-mac-metadata --no-fflags --exclude='.git' --exclude='target' --exclude='*/target' --exclude='capsules/*/target' -cf - . | \
+    tar --no-xattrs --no-mac-metadata --no-fflags --exclude='.git' --exclude='target' --exclude='target-capsules' --exclude='*/target' --exclude='capsules/*/target' -cf - . | \
       docker run --rm -i -e RUSTFLAGS="-D warnings" -e CARGO_TERM_COLOR=always rust:1.91-bookworm bash -c '\
         mkdir /w && tar -xf - -C /w && cd /w && cargo --version >/dev/null && \
         useradd -m ci && chown -R ci:ci /w && \
@@ -90,14 +95,14 @@ ci-test-capsules:
         for lock in capsules/*/Cargo.lock; do \
             capsule=\$(dirname \$lock); \
             echo \"== testing \$capsule ==\"; \
-            (cd \$capsule && cargo test --target-dir target) || exit 1; \
+            (cd \$capsule && cargo test --target-dir /w/target-capsules) || exit 1; \
         done"'
 
 # Accurate local replica of the CI source-home-linux job. arch selects the
 # matrix leg: arm64 = ubuntu-24.04-arm (native on Apple silicon),
 # amd64 = ubuntu-latest (emulated, much slower).
 ci-source-home-linux arch='arm64':
-    tar --no-xattrs --no-mac-metadata --no-fflags --exclude='.git' --exclude='target' --exclude='*/target' --exclude='capsules/*/target' -cf - . | \
+    tar --no-xattrs --no-mac-metadata --no-fflags --exclude='.git' --exclude='target' --exclude='target-capsules' --exclude='*/target' --exclude='capsules/*/target' -cf - . | \
       docker run --rm -i --platform linux/{{arch}} -e CARGO_TERM_COLOR=never rust:1.91-bookworm bash -c '\
         mkdir /w && tar -xf - -C /w && cd /w && \
         apt-get update -qq >/dev/null && apt-get install -y -qq coturn e2fsprogs ffmpeg nodejs git jq >/dev/null && \

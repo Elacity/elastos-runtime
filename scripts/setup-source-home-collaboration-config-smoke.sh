@@ -166,39 +166,42 @@ if env PATH="$fake_bin_dir:$PATH" ELASTOS_BROWSER_VM_BACKUP_RETENTION=2 "$retent
 fi
 grep -q "ELASTOS_BROWSER_VM_BACKUP_RETENTION must be 1" "$tmp_dir/retention.err"
 
+# The gate is absolute (16 GiB), independent of volume size. Available
+# figures below are KiB: 17 GiB passes, exactly 16 GiB passes, 15 GiB fails.
 if ! env \
   PATH="$fake_bin_dir:$PATH" \
-  ELASTOS_SMOKE_DF_OUTPUT=$'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/fake 100 89 11 89% /fixture' \
+  ELASTOS_SMOKE_DF_OUTPUT=$'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/fake 33554432 15728640 17825792 47% /fixture' \
   "$space_runner" "$functions_file" "$repo_root" "$data_dir" >"$tmp_dir/space-ok.out"; then
   echo "setup-source-home rejected adequate free space" >&2
   exit 1
 fi
-grep -q "free-space gate: 11% available" "$tmp_dir/space-ok.out"
+grep -q "free-space gate: 17 GiB available" "$tmp_dir/space-ok.out"
 if ! env \
   PATH="$fake_bin_dir:$PATH" \
-  ELASTOS_SMOKE_DF_OUTPUT=$'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/fake 100 90 10 90% /fixture' \
+  ELASTOS_SMOKE_DF_OUTPUT=$'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/fake 33554432 16777216 16777216 50% /fixture' \
   "$space_runner" "$functions_file" "$repo_root" "$data_dir" >"$tmp_dir/space-boundary.out"; then
-  echo "setup-source-home rejected exactly 10% free space" >&2
+  echo "setup-source-home rejected exactly 16 GiB free space" >&2
   exit 1
 fi
 if env \
   PATH="$fake_bin_dir:$PATH" \
-  ELASTOS_SMOKE_DF_OUTPUT=$'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/fake 100 91 9 91% /fixture' \
+  ELASTOS_SMOKE_DF_OUTPUT=$'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/fake 33554432 17825792 15728640 53% /fixture' \
   "$space_runner" "$functions_file" "$repo_root" "$data_dir" >/dev/null 2>"$tmp_dir/space-low.err"; then
   echo "setup-source-home accepted a low-space source-home volume" >&2
   exit 1
 fi
-grep -q "requires at least 10% free space; ${data_dir} has 9%" "$tmp_dir/space-low.err"
+grep -q "requires at least 16 GiB free space; ${data_dir} has 15 GiB" "$tmp_dir/space-low.err"
 
-# Shared-volume usage can omit other volumes; compare free space with full capacity.
+# A large volume must not satisfy the gate through sheer capacity: 1 TiB
+# total with only 8 GiB available still fails.
 if env \
   PATH="$fake_bin_dir:$PATH" \
-  ELASTOS_SMOKE_DF_OUTPUT=$'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/fake 1000 100 80 55% /fixture' \
+  ELASTOS_SMOKE_DF_OUTPUT=$'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/fake 1073741824 1065353216 8388608 99% /fixture' \
   "$space_runner" "$functions_file" "$repo_root" "$data_dir" >/dev/null 2>"$tmp_dir/space-shared.err"; then
-  echo "setup-source-home accepted low space on a shared-capacity volume" >&2
+  echo "setup-source-home accepted low absolute space on a large volume" >&2
   exit 1
 fi
-grep -q "requires at least 10% free space; ${data_dir} has 8%" "$tmp_dir/space-shared.err"
+grep -q "requires at least 16 GiB free space; ${data_dir} has 8 GiB" "$tmp_dir/space-shared.err"
 
 if run_install configured; then
   echo "setup-source-home accepted configured mode without a signed startup config input" >&2

@@ -506,27 +506,28 @@ prune_file_backups() {
 
 require_minimum_free_space() {
     local path="$1"
-    local minimum_percent=10
-    local blocks
+    # A full cold setup measures roughly 10 GiB across the workspace release
+    # build, the capsule builds, the cargo registry, and the installed data
+    # root; 16 GiB leaves headroom for architecture variance, staging, and
+    # the VM backup set. The gate is absolute because a percentage scales
+    # with volume size and demands space setup never uses on large disks.
+    local minimum_gib=16
+    local minimum_kib=$((minimum_gib * 1024 * 1024))
     local available
-    local free_percent
+    local available_gib
 
-    read -r blocks available < <(df -Pk "$path" | awk 'NR == 2 {print $2, $4}')
-    if [[ ! "$blocks" =~ ^[0-9]+$ || ! "$available" =~ ^[0-9]+$ ]]; then
+    available="$(df -Pk "$path" | awk 'NR == 2 {print $4}')"
+    if [[ ! "$available" =~ ^[0-9]+$ ]]; then
         echo "Could not determine free space for source-home volume: ${path}" >&2
         exit 1
     fi
-    if (( blocks == 0 )); then
-        echo "Source-home volume reported zero usable blocks: ${path}" >&2
-        exit 1
-    fi
-    free_percent=$((available * 100 / blocks))
-    if (( available * 100 < blocks * minimum_percent )); then
-        echo "Source-home setup requires at least ${minimum_percent}% free space; ${path} has ${free_percent}%." >&2
+    available_gib=$((available / 1024 / 1024))
+    if (( available < minimum_kib )); then
+        echo "Source-home setup requires at least ${minimum_gib} GiB free space; ${path} has ${available_gib} GiB." >&2
         echo "Reconcile worktrees, Cargo targets, VM state, and rollback artifacts before building." >&2
         exit 1
     fi
-    echo "[setup-source-home] free-space gate: ${free_percent}% available"
+    echo "[setup-source-home] free-space gate: ${available_gib} GiB available"
 }
 
 DEFAULT_DATA_DIR="$(default_data_dir)"
