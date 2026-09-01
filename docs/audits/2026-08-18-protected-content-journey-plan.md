@@ -3,11 +3,11 @@
 Status: proposal. This plan describes how to take the canonical protected-content
 extraction (`feat/protected-content-*`) from a trust-core foundation to the full
 end-to-end user journey — **mint → sell → buy → play** — with first-class design and
-UI/UX, coherent with [PRINCIPLES.md](../PRINCIPLES.md) and the canonical architecture in
-[PROTECTED_CONTENT.md](PROTECTED_CONTENT.md).
+UI/UX, coherent with [PRINCIPLES.md](../../PRINCIPLES.md) and the canonical architecture in
+[PROTECTED_CONTENT.md](../PROTECTED_CONTENT.md).
 
 It is written to complement, not replace, the "PR #15 disposition" already recorded in
-[PROTECTED_CONTENT.md](PROTECTED_CONTENT.md): PR #15 (`feat/dkms-esp-port`) is research and
+[PROTECTED_CONTENT.md](../PROTECTED_CONTENT.md): PR #15 (`feat/dkms-esp-port`) is research and
 behavior evidence; this plan is how the canonical line reaches the same user-visible
 capability on the ESP substrate without inheriting PR #15's rejected patterns.
 
@@ -35,7 +35,7 @@ DKG/rotation/revocation, PQ-hybrid custody) is explicitly deferred and named in 
 
 ## 2. Vision alignment (this is the coherence contract)
 
-Every stage below is designed against [PRINCIPLES.md](../PRINCIPLES.md). The mapping is the
+Every stage below is designed against [PRINCIPLES.md](../../PRINCIPLES.md). The mapping is the
 acceptance criterion for "aligned with the ElastOS vision", not decoration:
 
 | Principle | How this journey honors it |
@@ -58,7 +58,7 @@ wrong.
 
 ## 3. Architecture spine (reused, not reinvented)
 
-The canonical path from [PROTECTED_CONTENT.md](PROTECTED_CONTENT.md) is the backbone for
+The canonical path from [PROTECTED_CONTENT.md](../PROTECTED_CONTENT.md) is the backbone for
 all four stages:
 
 ```
@@ -288,7 +288,7 @@ multi-node production custody topology.
 
 ## 8. Disposition vs PR #15 (reuse / re-derive / reject)
 
-Consistent with the "PR #15 disposition" in [PROTECTED_CONTENT.md](PROTECTED_CONTENT.md):
+Consistent with the "PR #15 disposition" in [PROTECTED_CONTENT.md](../PROTECTED_CONTENT.md):
 
 - **Adopt and harden (UI/flows, re-anchored on canonical authority):** `creator`,
   consolidated `marketplace`/`marketplace-content` → Store, `elacity-player`,
