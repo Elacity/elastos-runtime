@@ -563,6 +563,7 @@ function commitTaskbarLayoutChange() {
     return;
   }
   renderTaskbar(shellState.currentSummary);
+  refreshLauncherIfVisible();
 }
 
 function rerenderShellLayout() {
@@ -571,6 +572,7 @@ function rerenderShellLayout() {
   }
   renderDesktop(shellState.currentSummary);
   renderTaskbar(shellState.currentSummary);
+  refreshLauncherIfVisible();
 }
 
 function updateTaskbarButton(button, targetId) {
@@ -650,15 +652,21 @@ export function renderLauncher(summary) {
 }
 
 function launcherSections(summary) {
-  const runningIds = runningLauncherTargetIds(summary);
+  /* Shelf pins live in the dock row under the face — never duplicate them. */
+  const notOnShelf = (targetId) => !isTargetPinnedToTaskbar(targetId);
+  const runningIds = runningLauncherTargetIds(summary).filter(notOnShelf);
   const runningSet = new Set(runningIds);
   const recentIds = shellState.recentTargetIds.filter(
-    (targetId) => !runningSet.has(targetId) && targetById(summary, targetId),
+    (targetId) =>
+      notOnShelf(targetId) && !runningSet.has(targetId) && targetById(summary, targetId),
   );
   const recentSet = new Set(recentIds);
   const allIds = allVisibleTargets(summary)
     .map((app) => app.target)
-    .filter((targetId) => !runningSet.has(targetId) && !recentSet.has(targetId));
+    .filter(
+      (targetId) =>
+        notOnShelf(targetId) && !runningSet.has(targetId) && !recentSet.has(targetId),
+    );
   const allTargets = allIds.map((targetId) => targetById(summary, targetId)).filter(Boolean);
   return [
     {
