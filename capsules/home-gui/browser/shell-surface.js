@@ -448,10 +448,77 @@ function easeDockPillWidth(fromW, durationName = "--dock-width-ms") {
   window.setTimeout(finish, durationMs + 60);
 }
 
+/* Slots are keyed by target so a re-render can tell moved icons from new ones. */
+function dockSlotElements() {
+  return document.querySelectorAll(".taskbar-primary > .taskbar-item, #taskbar-targets > .taskbar-entry");
+}
+
+function dockSlotKey(element) {
+  const item = element.matches(".taskbar-item") ? element : element.querySelector(".taskbar-item");
+  return item?.dataset.target || item?.dataset.label || item?.id || "";
+}
+
+function snapshotDockSlots() {
+  const slots = new Map();
+  for (const element of dockSlotElements()) {
+    const key = dockSlotKey(element);
+    if (key) {
+      slots.set(key, element.getBoundingClientRect().left);
+    }
+  }
+  return slots;
+}
+
+/* Icons already on the dock start where they were and glide to their new slot
+   in step with the pill's edges, so none is ever outside the pill; an icon that
+   is new to the dock settles into its slot once the pill has made room. */
+function glideDockSlots(slotsBefore) {
+  const taskbar = dockPillElement();
+  if (!taskbar || !slotsBefore || dockReducedMotion()) {
+    return;
+  }
+  const durationMs = dockMotionMs(taskbar, "--dock-width-ms", 260);
+  for (const element of dockSlotElements()) {
+    const key = dockSlotKey(element);
+    if (!key) {
+      continue;
+    }
+    const previousLeft = slotsBefore.get(key);
+    if (previousLeft === undefined) {
+      element.classList.add("dock-slot-arriving");
+      void element.offsetWidth;
+      element.classList.add("dock-slot-arrived");
+      window.setTimeout(() => {
+        element.classList.remove("dock-slot-arriving", "dock-slot-arrived");
+      }, durationMs + 520);
+      continue;
+    }
+    const dx = previousLeft - element.getBoundingClientRect().left;
+    if (Math.abs(dx) < 0.5) {
+      continue;
+    }
+    element.style.transition = "none";
+    element.style.transform = `translateX(${dx}px)`;
+    void element.offsetWidth;
+    element.style.transition = `transform ${durationMs}ms var(--shelf-face-ease)`;
+    element.style.transform = "translateX(0)";
+    window.setTimeout(() => {
+      element.style.removeProperty("transition");
+      element.style.removeProperty("transform");
+    }, durationMs + 60);
+  }
+}
+
 export function renderTaskbar(summary) {
-  const dockWidthBefore = measureDockPillWidth();
+  // Motion only between two populated docks (pin/unpin, running set). The
+  // first population on load renders at its final width: easing from the
+  // empty pill would slide the icons in from outside it.
+  const populated = taskbarTargets.childElementCount > 0;
+  const slotsBefore = populated ? snapshotDockSlots() : null;
+  const dockWidthBefore = populated ? measureDockPillWidth() : 0;
   renderTaskbarEntries(summary);
   easeDockPillWidth(dockWidthBefore);
+  glideDockSlots(slotsBefore);
 }
 
 function renderTaskbarEntries(summary) {

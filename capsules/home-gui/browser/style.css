@@ -3639,6 +3639,20 @@ body.dock-autohide::after {
     max-width 180ms cubic-bezier(0.2, 0, 0, 1);
 }
 
+/* An icon new to the dock settles into its slot once the pill has made room. */
+.taskbar-entry.dock-slot-arriving {
+  opacity: 0;
+  transform: scale(0.86);
+}
+
+.taskbar-entry.dock-slot-arriving.dock-slot-arrived {
+  opacity: 1;
+  transform: scale(1);
+  transition:
+    opacity 360ms var(--shelf-face-ease) calc(var(--dock-width-ms) * 0.45),
+    transform 420ms var(--shelf-face-ease) calc(var(--dock-width-ms) * 0.45);
+}
+
 .dock-reorder-spacer {
   flex: 0 0 auto;
   pointer-events: none;
