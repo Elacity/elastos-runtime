@@ -52,6 +52,11 @@
   --taskbar-offset: 12px;
   --dock-icon-slot: 58px;
   --dock-icon-pad: 5px;
+  /* Dock motion: the pill glides (ease-in-out, long) rather than pops. The
+     Apps face grows up out of the dock at the dock's own width. */
+  --dock-width-ms: 780ms;
+  --shelf-face-ms: 950ms;
+  --shelf-face-ease: cubic-bezier(0.42, 0, 0.58, 1);
   --desktop-wallpaper: url("./wallpaper.webp");
   /* Shell chrome motion — water, not switches. */
   --shell-motion-enter: 160ms;
@@ -3352,11 +3357,19 @@ body.dock-autohide::after {
 }
 
 .taskbar.is-launcher-face {
-  width: min(720px, calc(100vw - 32px));
-  max-width: min(720px, calc(100vw - 32px));
+  /* The face is the dock's own width (locked in px by shell-surface at open,
+     since the idle width is max-content); the grid adapts to it. */
+  width: var(--shelf-face-w, min(720px, calc(100vw - 32px)));
+  max-width: calc(100vw - 32px);
   height: auto;
   padding-top: 10px;
   padding-bottom: 10px;
+}
+
+/* Dock-width faces are narrower than a 720 popup — denser tiles. */
+.taskbar.is-launcher-face .launcher-group-grid {
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: 8px 4px;
 }
 
 .taskbar.is-launcher-face .taskbar-inner {
@@ -3631,7 +3644,7 @@ body.dock-autohide::after {
 .taskbar.is-dock-width-easing {
   transition:
     transform 220ms cubic-bezier(0.2, 0, 0, 1),
-    width var(--dock-width-ms, 260ms) cubic-bezier(0.22, 1, 0.36, 1),
+    width var(--dock-width-ms) var(--shelf-face-ease),
     max-width 180ms cubic-bezier(0.2, 0, 0, 1);
 }
 
@@ -3654,7 +3667,7 @@ body.dock-autohide::after {
 }
 
 body.dock-reordering .taskbar-entry:not(.dock-reorder-parked) {
-  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+  transition: transform 180ms var(--shelf-face-ease);
 }
 
 /* The spacer is the drop cue while reordering; the plate would fight it. */
@@ -4227,8 +4240,8 @@ body.dragging-target {
      revealed by the clip rather than faded in (opacity only guards the
      first frames). Width eases in step from shell-surface. */
   transition:
-    max-height 420ms cubic-bezier(0.22, 1, 0.36, 1),
-    opacity 140ms cubic-bezier(0.2, 0, 0, 1);
+    max-height var(--shelf-face-ms) var(--shelf-face-ease),
+    opacity 160ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .taskbar .launcher[hidden] {

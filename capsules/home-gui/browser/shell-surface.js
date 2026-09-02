@@ -378,8 +378,7 @@ function notificationCountsBySourceApp(summary) {
    interpolate, so width changes (pin, unpin, launch, Apps face) are eased as
    a pixel FLIP: lock the old width, reflow, ease to the new one, unlock. One
    Shelf-face state throughout — only the pill's geometry moves. */
-const DOCK_WIDTH_MS = 260;
-const DOCK_FACE_WIDTH_MS = 420;
+const SHELF_FACE_MIN_W = 320;
 let dockWidthGeneration = 0;
 
 function dockPillElement() {
@@ -391,11 +390,27 @@ function measureDockPillWidth() {
   return taskbar ? taskbar.getBoundingClientRect().width : 0;
 }
 
-function easeDockPillWidth(fromW, durationMs = DOCK_WIDTH_MS) {
+function dockMotionMs(taskbar, name, fallback) {
+  const value = parseFloat(window.getComputedStyle?.(taskbar)?.getPropertyValue?.(name));
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/* The Apps face keeps the dock's own width so it grows up, not out. */
+function lockShelfFaceWidth(taskbar, idleWidth) {
+  if (!taskbar) {
+    return;
+  }
+  const maxW = Math.max(SHELF_FACE_MIN_W, window.innerWidth - 32);
+  const w = Math.round(Math.min(maxW, Math.max(SHELF_FACE_MIN_W, idleWidth || 0)));
+  taskbar.style.setProperty("--shelf-face-w", `${w}px`);
+}
+
+function easeDockPillWidth(fromW, durationName = "--dock-width-ms") {
   const taskbar = dockPillElement();
   if (!taskbar || !(fromW > 0) || dockReducedMotion()) {
     return;
   }
+  const durationMs = dockMotionMs(taskbar, durationName, 260);
   dockWidthGeneration += 1;
   const generation = dockWidthGeneration;
   taskbar.classList.remove("is-dock-width-easing");
@@ -1765,8 +1780,13 @@ function syncLauncherVisibility(isVisible) {
     prepareSurfaceOpen(launcher);
   }
   const dockWidthBefore = measureDockPillWidth();
+  if (isVisible) {
+    lockShelfFaceWidth(taskbar, dockWidthBefore);
+  } else {
+    taskbar?.style.removeProperty("--shelf-face-w");
+  }
   taskbar?.classList.toggle("is-launcher-face", isVisible);
-  easeDockPillWidth(dockWidthBefore, DOCK_FACE_WIDTH_MS);
+  easeDockPillWidth(dockWidthBefore, "--shelf-face-ms");
   setOverlayOpen(launcher, isVisible, {
     invoker: launcherToggleButton,
     focusEl: isVisible && shouldFocusLauncherSearch() ? launcherSearch : undefined,
