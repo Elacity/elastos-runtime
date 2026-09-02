@@ -11967,6 +11967,156 @@ async fn runtime_custody_viewer_restart_reconciliation_rejects_invalid_active_re
     assert!(error.to_string().contains("invalid"));
 }
 
+/// The boot hook must delegate to the restart reconciliation once decrypt
+/// registration succeeds; the per-lifecycle settlement semantics are covered
+/// by the `runtime_custody_viewer_restart_reconciliation_*` tests.
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_decrypt_boot_settles_open_pending_record_after_registration() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-decrypt-boot";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &load_profile_did_for_test(&harness.data_dir, principal_id),
+        crate::auth::now_ts(),
+    );
+    persist_runtime_custody_open_pending_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x36),
+        crate::auth::now_ts() + 60,
+    );
+    let registry = Arc::new(ProviderRegistry::new());
+    let decrypt = SequencedProvider::new(
+        "decrypt",
+        vec![
+            Ok(ok_provider_response(
+                serde_json::to_value(
+                    DecryptProviderResponseV1::new_viewer_session_already_absent(
+                        RuntimeReleaseAuditIdV1::new(digest(0x91)).unwrap(),
+                        opaque_handle(0x36),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )),
+            Ok(ok_provider_response(
+                serde_json::to_value(
+                    DecryptProviderResponseV1::new_cancelled_prepared_recipient(
+                        RuntimeReleaseAuditIdV1::new(digest(0x91)).unwrap(),
+                        opaque_handle(0x36),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )),
+        ],
+    );
+    registry
+        .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt)
+        .await
+        .unwrap();
+
+    super::reconcile_runtime_custody_viewers_after_decrypt_boot(&harness.data_dir, registry).await;
+
+    let record = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        record.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
+    );
+}
+
+/// The boot hook swallows the reconcile's hard failure into a warning so boot
+/// keeps serving; the underlying `Err` path is proven by
+/// `runtime_custody_viewer_restart_reconciliation_rejects_invalid_active_record`.
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_decrypt_boot_keeps_serving_when_reconciliation_fails_closed() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-decrypt-boot-invalid";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    persist_runtime_custody_active_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x32),
+        crate::auth::now_ts() + 60,
+    );
+    let mut record = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    record.viewer_session_handle = hex::encode([0u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1]);
+    super::persist_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+        &record,
+    )
+    .unwrap();
+
+    super::reconcile_runtime_custody_viewers_after_decrypt_boot(
+        &harness.data_dir,
+        Arc::new(ProviderRegistry::new()),
+    )
+    .await;
+
+    let persisted = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        persisted.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::Active
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn runtime_custody_viewer_lifecycle_guard_serializes_same_key_and_leaves_other_keys_independent(
