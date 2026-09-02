@@ -3626,6 +3626,62 @@ body.dock-autohide::after {
   height: var(--dock-icon-slot);
 }
 
+/* Dock motion: pixel-FLIP width easing (idle width is max-content, which
+   cannot interpolate) and live reorder while a drag hovers the strip. */
+.taskbar.is-dock-width-easing {
+  transition:
+    transform 220ms cubic-bezier(0.2, 0, 0, 1),
+    width var(--dock-width-ms, 260ms) cubic-bezier(0.22, 1, 0.36, 1),
+    max-width 180ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.dock-reorder-spacer {
+  flex: 0 0 auto;
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.taskbar-entry.dock-reorder-parked {
+  position: absolute;
+  flex: 0 0 0;
+  width: 0;
+  min-width: 0;
+  height: 0;
+  margin: 0;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+
+body.dock-reordering .taskbar-entry:not(.dock-reorder-parked) {
+  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* The spacer is the drop cue while reordering; the plate would fight it. */
+body.dock-reordering .taskbar-sortable.drop-active {
+  background: transparent;
+  box-shadow: none;
+}
+
+/* While the strip is reordering, whatever is in the hand rides above the
+   dock (the ghost's stage z-index would otherwise put it under the pill). */
+body.dock-reordering .desktop-shortcut-ghost {
+  z-index: 100160;
+}
+
+/* A pin in the hand is just its icon. */
+.desktop-shortcut-ghost.dock-reorder-ghost {
+  width: auto;
+  padding: 0;
+  background: transparent;
+  backdrop-filter: none;
+  filter: drop-shadow(0 12px 22px rgba(0, 0, 0, 0.38));
+}
+
+.desktop-shortcut-ghost.dock-reorder-ghost .desktop-shortcut-title {
+  display: none;
+}
+
 /* Window-count lives inside .taskbar-icon so magnification lift/scale owns it. */
 .taskbar-window-count {
   position: absolute;
@@ -4167,9 +4223,12 @@ body.dragging-target {
   opacity: 0;
   overflow: hidden;
   pointer-events: none;
+  /* The pill grows up into the Apps face: height leads, the content is
+     revealed by the clip rather than faded in (opacity only guards the
+     first frames). Width eases in step from shell-surface. */
   transition:
-    max-height 180ms cubic-bezier(0.2, 0, 0, 1),
-    opacity 180ms cubic-bezier(0.2, 0, 0, 1);
+    max-height 420ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 140ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .taskbar .launcher[hidden] {

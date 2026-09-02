@@ -374,7 +374,72 @@ function notificationCountsBySourceApp(summary) {
   return counts;
 }
 
+/* Dock motion. The idle pill is width:max-content, which no browser can
+   interpolate, so width changes (pin, unpin, launch, Apps face) are eased as
+   a pixel FLIP: lock the old width, reflow, ease to the new one, unlock. One
+   Shelf-face state throughout — only the pill's geometry moves. */
+const DOCK_WIDTH_MS = 260;
+const DOCK_FACE_WIDTH_MS = 420;
+let dockWidthGeneration = 0;
+
+function dockPillElement() {
+  return document.querySelector(".taskbar");
+}
+
+function measureDockPillWidth() {
+  const taskbar = dockPillElement();
+  return taskbar ? taskbar.getBoundingClientRect().width : 0;
+}
+
+function easeDockPillWidth(fromW, durationMs = DOCK_WIDTH_MS) {
+  const taskbar = dockPillElement();
+  if (!taskbar || !(fromW > 0) || dockReducedMotion()) {
+    return;
+  }
+  dockWidthGeneration += 1;
+  const generation = dockWidthGeneration;
+  taskbar.classList.remove("is-dock-width-easing");
+  taskbar.style.removeProperty("width");
+  const toW = Math.round(taskbar.getBoundingClientRect().width);
+  const startW = Math.round(fromW);
+  if (!(toW > 0) || Math.abs(toW - startW) <= 1) {
+    return;
+  }
+  // Lock the start width with transitions off: the pill's own width
+  // transition would otherwise start on this flush and the target set below
+  // would reverse it at 0% progress, which the spec resolves to an instant jump.
+  taskbar.style.transition = "none";
+  taskbar.style.width = `${startW}px`;
+  void taskbar.offsetWidth;
+  taskbar.style.removeProperty("transition");
+  taskbar.style.setProperty("--dock-width-ms", `${durationMs}ms`);
+  taskbar.classList.add("is-dock-width-easing");
+  taskbar.style.width = `${toW}px`;
+  const finish = () => {
+    taskbar.removeEventListener("transitionend", onEnd);
+    if (generation !== dockWidthGeneration) {
+      return;
+    }
+    taskbar.classList.remove("is-dock-width-easing");
+    taskbar.style.removeProperty("width");
+    taskbar.style.removeProperty("--dock-width-ms");
+  };
+  const onEnd = (event) => {
+    if (event.target === taskbar && event.propertyName === "width") {
+      finish();
+    }
+  };
+  taskbar.addEventListener("transitionend", onEnd);
+  window.setTimeout(finish, durationMs + 60);
+}
+
 export function renderTaskbar(summary) {
+  const dockWidthBefore = measureDockPillWidth();
+  renderTaskbarEntries(summary);
+  easeDockPillWidth(dockWidthBefore);
+}
+
+function renderTaskbarEntries(summary) {
   taskbarTargets.replaceChildren();
   const pinnedIds = new Set(shellState.shellLayoutState.taskbar);
   const notificationCounts = notificationCountsBySourceApp(summary);
@@ -1246,6 +1311,9 @@ function startTargetDrag() {
   clearDragSelection();
   const ghost = shortcutTemplate.content.firstElementChild.cloneNode(true);
   ghost.classList.add("desktop-shortcut-ghost");
+  if (shellState.dragState.source === "taskbar") {
+    ghost.classList.add("dock-reorder-ghost");
+  }
   mountGlyph(ghost.querySelector(".desktop-shortcut-icon"), dragEntry.glyphId);
   ghost.querySelector(".desktop-shortcut-title").textContent = dragEntry.title;
   const group = shellState.dragState.groupEntryIds;
@@ -1293,10 +1361,142 @@ function updateDragTarget(clientX, clientY) {
     if (taskbarTarget) {
       taskbarTargets.classList.add("drop-active");
       shellState.dragState.dropTarget = taskbarTarget;
+      syncDockLiveReorder(taskbarTarget.index);
       return;
     }
   }
+  endDockLiveReorder();
   shellState.dragState.dropTarget = desktopDropTarget(clientX, clientY);
+}
+
+/* Live reorder: while a drag hovers the dock, an invisible spacer holds the
+   slot the item would take and the other pins slide around it (FLIP on
+   transform). A dragged pin is parked (collapsed) so the strip reads as
+   "this icon is in your hand". Nothing is committed until drop. */
+function dockPinnedEntries(excludeId) {
+  const entries = [];
+  for (const targetId of shellState.shellLayoutState.taskbar) {
+    if (targetId === excludeId || !targetById(shellState.currentSummary, targetId)) {
+      continue;
+    }
+    const button = taskbarTargets.querySelector(`[data-target="${CSS.escape(targetId)}"]`);
+    const entry = button?.closest(".taskbar-entry");
+    if (entry) {
+      entries.push(entry);
+    }
+  }
+  return entries;
+}
+
+function dockEntryForTarget(targetId) {
+  const button = taskbarTargets.querySelector(`[data-target="${CSS.escape(targetId)}"]`);
+  return button?.closest(".taskbar-entry") || null;
+}
+
+function ensureDockReorderSpacer(sourceElement) {
+  let spacer = taskbarTargets.querySelector(".dock-reorder-spacer");
+  if (!spacer) {
+    spacer = document.createElement("div");
+    spacer.className = "dock-reorder-spacer";
+    spacer.setAttribute("aria-hidden", "true");
+    taskbarTargets.appendChild(spacer);
+  }
+  // A launcher card or desktop icon is bigger than a dock slot; the slot it
+  // would take is always dock-sized.
+  const slot =
+    sourceElement.closest(".taskbar-entry") ||
+    taskbarTargets.querySelector(".taskbar-entry:not(.dock-reorder-parked)") ||
+    sourceElement;
+  const rect = slot.getBoundingClientRect();
+  const size = Math.max(36, Math.round(rect.width || rect.height));
+  spacer.style.flex = `0 0 ${size}px`;
+  spacer.style.width = `${size}px`;
+  spacer.style.height = `${Math.max(36, Math.round(rect.height || size))}px`;
+  return spacer;
+}
+
+function placeDockReorderSpacer(spacer, insertAt, draggedId) {
+  const others = dockPinnedEntries(draggedId);
+  const before = new Map(others.map((entry) => [entry, entry.getBoundingClientRect().left]));
+  const slot = Math.max(0, Math.min(insertAt, others.length));
+  let order = 1;
+  for (let index = 0; index <= others.length; index += 1) {
+    if (index === slot) {
+      spacer.style.order = String(order);
+      order += 1;
+    }
+    if (index < others.length) {
+      others[index].style.order = String(order);
+      order += 1;
+    }
+  }
+  const sourceEntry = draggedId ? dockEntryForTarget(draggedId) : null;
+  if (sourceEntry && shellState.dragState?.source === "taskbar") {
+    sourceEntry.classList.add("dock-reorder-parked");
+    sourceEntry.style.order = "0";
+  }
+  for (const child of taskbarTargets.children) {
+    if (child === spacer || child === sourceEntry || others.includes(child)) {
+      continue;
+    }
+    child.style.order = String(order + 10);
+  }
+  if (dockReducedMotion()) {
+    return;
+  }
+  for (const entry of others) {
+    const delta = before.get(entry) - entry.getBoundingClientRect().left;
+    if (Math.abs(delta) < 1) {
+      continue;
+    }
+    entry.style.transition = "none";
+    entry.style.transform = `translateX(${delta}px)`;
+    void entry.offsetWidth;
+    entry.style.transition = "";
+    entry.style.transform = "";
+  }
+}
+
+function syncDockLiveReorder(insertAt) {
+  const state = shellState.dragState;
+  if (!state || state.source === "desktop-object") {
+    return;
+  }
+  if (insertAt === state.dockInsertAt) {
+    return;
+  }
+  const opening = !state.dockSpacer;
+  const dockWidthBefore = opening ? measureDockPillWidth() : 0;
+  if (opening) {
+    state.dockSpacer = ensureDockReorderSpacer(state.sourceElement);
+    document.body.classList.add("dock-reordering");
+  }
+  state.dockInsertAt = insertAt;
+  placeDockReorderSpacer(state.dockSpacer, insertAt, state.targetId);
+  if (opening) {
+    easeDockPillWidth(dockWidthBefore);
+  }
+}
+
+function endDockLiveReorder(state = shellState.dragState) {
+  const spacer = state?.dockSpacer || taskbarTargets.querySelector(".dock-reorder-spacer");
+  if (!spacer && !document.body.classList.contains("dock-reordering")) {
+    return;
+  }
+  const dockWidthBefore = measureDockPillWidth();
+  spacer?.remove();
+  if (state) {
+    state.dockSpacer = null;
+    state.dockInsertAt = -1;
+  }
+  document.body.classList.remove("dock-reordering");
+  for (const child of taskbarTargets.children) {
+    child.style.removeProperty("order");
+    child.style.removeProperty("transform");
+    child.style.removeProperty("transition");
+    child.classList.remove("dock-reorder-parked");
+  }
+  easeDockPillWidth(dockWidthBefore);
 }
 
 function taskbarDropTarget(clientX, clientY) {
@@ -1314,13 +1514,16 @@ function taskbarDropTarget(clientX, clientY) {
   }
   return {
     kind: "taskbar",
-    index: taskbarInsertionIndex(clientX),
+    index: taskbarInsertionIndex(
+      clientX,
+      shellState.dragState?.source === "taskbar" ? shellState.dragState.targetId : null,
+    ),
   };
 }
 
-function taskbarInsertionIndex(clientX) {
+function taskbarInsertionIndex(clientX, excludeId = null) {
   const pinnedApps = shellState.shellLayoutState.taskbar.filter(
-    (targetId) => Boolean(targetById(shellState.currentSummary, targetId)),
+    (targetId) => targetId !== excludeId && Boolean(targetById(shellState.currentSummary, targetId)),
   );
   for (let index = 0; index < pinnedApps.length; index += 1) {
     const button = taskbarTargets.querySelector(`[data-target="${pinnedApps[index]}"]`);
@@ -1371,6 +1574,7 @@ export function finishTargetDrag(event) {
     return;
   }
 
+  endDockLiveReorder(state);
   state.sourceElement.classList.remove("drag-source");
   let changed = false;
   if (
@@ -1560,7 +1764,9 @@ function syncLauncherVisibility(isVisible) {
   if (isVisible) {
     prepareSurfaceOpen(launcher);
   }
+  const dockWidthBefore = measureDockPillWidth();
   taskbar?.classList.toggle("is-launcher-face", isVisible);
+  easeDockPillWidth(dockWidthBefore, DOCK_FACE_WIDTH_MS);
   setOverlayOpen(launcher, isVisible, {
     invoker: launcherToggleButton,
     focusEl: isVisible && shouldFocusLauncherSearch() ? launcherSearch : undefined,

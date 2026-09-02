@@ -55,6 +55,23 @@ class FakeClassList {
   }
 }
 
+// Plain-object style with the two CSSOM methods the shell uses for inline
+// custom properties; keys stay enumerable so rect stubs can read them.
+function fakeStyleDeclaration() {
+  const style = {};
+  Object.defineProperty(style, "setProperty", {
+    value: (name, value) => {
+      style[name] = value;
+    },
+  });
+  Object.defineProperty(style, "removeProperty", {
+    value: (name) => {
+      delete style[name];
+    },
+  });
+  return style;
+}
+
 class FakeElement {
   constructor(selector = "", withTemplateContent = true) {
     this.selector = selector;
@@ -63,7 +80,7 @@ class FakeElement {
     this.queries = new Map();
     this.listeners = new Map();
     this.dataset = {};
-    this.style = {};
+    this.style = fakeStyleDeclaration();
     this.hidden = false;
     this.inert = false;
     this.disabled = false;
