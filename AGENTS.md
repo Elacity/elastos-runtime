@@ -346,3 +346,47 @@ with Browser engine isolation or product media proof.
 Cosmopolitan Libc may be researched for small C/C++ helper binaries, but it is
 not a drop-in answer for Rust workspace packaging, Chromium, WebView, GPU/audio,
 microVM isolation, or `.dmg` distribution.
+
+## Cursor Cloud specific instructions
+
+This section is durable guidance for Cloud Agents. The startup update script
+already installs `just` (`cargo install just`) and the `wasm32-unknown-unknown`
+Rust target; do not re-document dependency installation here.
+
+- Toolchain: Rust is pinned by [rust-toolchain.toml](rust-toolchain.toml)
+  (1.91.0 with `rustfmt`/`clippy`) and `rustup` auto-syncs it on first cargo
+  use. `wasm32-unknown-unknown` is the capsule Component target; the release
+  scripts also add it on demand via `ensure_rust_target_installed`.
+- Core gate has no JS/Python package deps: the `.mjs` checks in `just verify`
+  (`home-entropy-check.mjs`, `browser-entropy-check.mjs`,
+  `browser-window-close-handshake.test.mjs`, etc.) and the Python smokes use
+  only stdlib/`node --test`. `playwright` appears only as a scanned string in
+  entropy checks and as an import in Browser/GUI headless smokes that are NOT
+  part of the core gate, so no `npm install` is needed for build/lint/test.
+- Build/lint/test run from the repo root (the recipes `cd elastos`
+  themselves): `just build`, `just lint`, `just test`. A cold `just build` is
+  slow (runtime crate ~6 min). Each provider under `capsules/` is its own cargo
+  project; `build.sh --all` and `just home-frontdoor-smoke` build per-capsule
+  `target/` dirs, while `just test-capsules` shares one `target-capsules/` dir
+  so common dependencies compile once across the capsule suites.
+- Running the app from source: stage the built `localhost-provider` into
+  `$XDG_DATA_HOME/elastos/bin/` and write a `components.json` beside the data
+  dir whose `external.localhost-provider.platforms.<platform>.checksum` matches
+  that binary's `sha256:`, then `elastos serve --addr 127.0.0.1:<port>`. The
+  runtime verifies every staged component against that checksum (no dev bypass).
+  It then comes up healthy (`/api/health` → `{"status":"ok",...}`), Carrier P2P
+  online; authenticate via `POST /api/auth/attach` using `attach_secret` from
+  `$XDG_DATA_HOME/elastos/runtime-coords.json`. Self-contained commands
+  (`elastos identity show`, `elastos identity nickname set`, `elastos init`)
+  work directly against an isolated `HOME`/`XDG_DATA_HOME`.
+- Known release-gated gap (not an environment bug): `just home-frontdoor-smoke`
+  and the `public-install-*` smokes run `scripts/install.sh`, which downloads
+  the PUBLISHED release binary from `https://elastos.elacitylabs.com`. Whenever
+  the published binary trails this dev tree's `install.sh` contract (newer
+  subcommands, setup profiles), the installed-path proofs fail;
+  [state.md](state.md) ("Public Install Truth") records the currently published
+  version and its compatibility. Use the source `elastos serve` path above to
+  run the runtime locally instead.
+- No KVM: crosvm/microVM paths (Browser VM, full-screen chat microVM) warn and
+  fail closed here, so product Browser proof and microVM chat are not runnable
+  in this environment.
