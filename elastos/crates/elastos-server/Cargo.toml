@@ -114,6 +114,7 @@ distributed-topic-tracker = "=0.3.5"
 futures-lite = "2.6"
 getrandom = "0.2"
 data-encoding = "2.6"
+custody-provider = { path = "../../../capsules/custody-provider" }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full", "test-util"] }
@@ -123,7 +124,6 @@ wasm-encoder = "=0.236.1"
 elastos-auth = { path = "../elastos-auth" }
 elastos-protected-content-custody = { path = "../elastos-protected-content-custody" }
 x-wing = { version = "=0.1.0", features = ["hazmat", "zeroize"] }
-custody-provider = { path = "../../../capsules/custody-provider" }
 
 [features]
 default = []
