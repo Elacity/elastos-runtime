@@ -62,21 +62,27 @@
 
       <section id="home-unlock" class="home-unlock" aria-labelledby="home-unlock-title" aria-hidden="true" data-surface="neutral" hidden>
         <div class="home-unlock-face" aria-hidden="true" hidden>
-          <div class="home-unlock-brand">
-            <img class="home-unlock-brand-mark" src="./elastos-home-icon.svg" alt="" draggable="false" />
-            <span class="home-unlock-brand-word">Elastos</span>
-          </div>
-          <div class="home-unlock-clock">
-            <p id="home-unlock-date" class="home-unlock-date"></p>
-            <p id="home-unlock-time" class="home-unlock-time"></p>
-          </div>
-          <div class="home-unlock-account">
-            <button id="home-unlock-person" class="home-unlock-person" type="button">
-              <span class="home-unlock-avatar" aria-hidden="true">
-                <span id="home-unlock-monogram" class="home-unlock-avatar-monogram">e</span>
+          <div class="home-unlock-ground" aria-hidden="true"></div>
+          <div class="home-unlock-vignette" aria-hidden="true"></div>
+          <div class="home-unlock-picker">
+            <div class="home-unlock-brand">
+              <span class="home-unlock-brand-mark" aria-hidden="true">
+                <img src="./elastos-logo.svg" alt="" draggable="false" />
               </span>
-            </button>
-            <p id="home-unlock-person-name" class="home-unlock-account-name" hidden></p>
+              <span class="home-unlock-brand-word">ELASTOS</span>
+            </div>
+            <div class="home-unlock-clock">
+              <p id="home-unlock-date" class="home-unlock-date"></p>
+              <p id="home-unlock-time" class="home-unlock-time"></p>
+            </div>
+            <div class="home-unlock-account">
+              <button id="home-unlock-person" class="home-unlock-person" type="button" aria-label="Unlock with passkey">
+                <span class="home-unlock-avatar" aria-hidden="true">
+                  <span id="home-unlock-monogram" class="home-unlock-avatar-monogram">e</span>
+                </span>
+              </button>
+              <p id="home-unlock-person-name" class="home-unlock-account-name" hidden></p>
+            </div>
           </div>
         </div>
         <div class="home-unlock-card" role="dialog" aria-modal="true">
