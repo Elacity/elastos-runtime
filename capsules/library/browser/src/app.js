@@ -452,8 +452,9 @@ import {
       const pickerMode = isPickerActionMode();
       const readOnly = currentFolderReadOnly();
       elements.pickerActionButton.classList.toggle("hidden", !pickerMode);
-      elements.uploadButton.classList.toggle("hidden", pickerMode || readOnly);
-      elements.newFolderButton.classList.toggle("hidden", pickerMode || readOnly);
+      // New and Upload live in the "…" menu (New ▸ Folder, Upload Here) like Sort and Refresh.
+      elements.uploadButton.classList.toggle("hidden", true);
+      elements.newFolderButton.classList.toggle("hidden", true);
       elements.sortSelect.classList.toggle("hidden", true);
       elements.refreshButton.classList.toggle("hidden", true);
       elements.moreButton.classList.toggle("hidden", false);
