@@ -178,6 +178,16 @@ configuration passed admission. Runtime startup, signed custody validation,
 live Chain evidence, replication and repair, and mint-buy-play remain active
 proof.
 
+Operator provisioning of that configuration is one explicit command surface,
+`elastos protected-content-config`. It creates the policy authority key,
+provisions each custody host's inactive state root and exports its node
+descriptor, prints the Runtime operation issuer custody hosts must trust,
+assembles and signs the owner-only 2-of-3 custody composition from three node
+descriptors, and installs the private multi-source Chain configuration. A
+generated composition or Chain configuration is proven against the Runtime
+loader before success is reported, and an installed composition can be
+re-verified in place. The installer never creates this operator state.
+
 The macOS and Linux source-home restart helpers validate the installation
 receipt and current clean source before any stop or migration. They select only
 the stable installed Runtime, own one exact PID file, stop only the proven
