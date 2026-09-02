@@ -115,6 +115,9 @@ a {
   min-height: 0;
   overflow: hidden;
   padding: 0.8rem;
+  /* Unified-sidebar chrome paints the traffic lights over this corner;
+     .page-shell already insets 0.75rem, so the remainder lands content at safe-top. */
+  padding-top: calc(var(--window-chrome-safe-top, 52px) - 0.75rem);
   background: var(--sidebar-bg);
   border-color: var(--line);
   color: var(--sidebar-text);
