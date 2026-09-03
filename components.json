@@ -979,6 +979,20 @@
         }
       }
     },
+    "home-agent": {
+      "install_path": "capsules/home-agent",
+      "description": "Home Agent capsule: the agent harness the Home Shelf morphs into",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "home-agent.tar.gz",
+          "extract_path": "home-agent",
+          "install_path": "capsules/home-agent"
+        }
+      }
+    },
     "system": {
       "install_path": "capsules/system",
       "description": "Runtime-launched System capsule for identity, runtime, storage, and appearance state",
@@ -1492,7 +1506,9 @@
         "marketplace",
         "archive-manager",
         "inbox",
-        "assistant"
+        "assistant",
+
+        "home-agent"
       ]
     },
     "demo": {
@@ -1542,7 +1558,9 @@
         "marketplace",
         "archive-manager",
         "inbox",
-        "assistant"
+        "assistant",
+
+        "home-agent"
       ]
     },
     "operator": {
@@ -1612,6 +1630,8 @@
         "archive-manager",
         "inbox",
         "assistant",
+
+        "home-agent",
         "model-provider",
         "llama-server",
         "model-qwen3.5-0.8b"
@@ -1661,6 +1681,8 @@
         "archive-manager",
         "inbox",
         "assistant",
+
+        "home-agent",
         "cloudflared"
       ]
     },
@@ -1716,6 +1738,8 @@
         "archive-manager",
         "inbox",
         "assistant",
+
+        "home-agent",
         "model-provider",
         "crosvm",
         "vmlinux",
