@@ -7,6 +7,7 @@
   "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
+  "icon": "icons",
   "provides": "elastos://net/*",
   "authority": {
     "reason": "Owns Browser/Net requests and keeps raw sockets, DNS, HTTP clients, wallet authority, and host internet access out of app capsules.",

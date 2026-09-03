@@ -2637,6 +2637,44 @@ mod tests {
     }
 
     #[test]
+    fn service_provider_capsules_are_packaged_with_capsule_owned_icons() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
+        for name in [
+            "browser-engine-adapter",
+            "chain-provider",
+            "content-block-graph-provider",
+            "did-provider",
+            "exit-provider",
+            "ipfs-provider",
+            "model-provider",
+            "net-provider",
+            "object-provider",
+            "wallet-provider",
+            "webspace-provider",
+        ] {
+            let capsule_dir = root.join("capsules").join(name);
+            let manifest: elastos_common::CapsuleManifest =
+                serde_json::from_slice(&fs::read(capsule_dir.join("capsule.json")).unwrap())
+                    .unwrap();
+            manifest
+                .validate()
+                .unwrap_or_else(|err| panic!("{name} manifest must validate: {err}"));
+            assert_eq!(manifest.role, elastos_common::CapsuleRole::Provider);
+            assert_eq!(
+                manifest.icon.as_deref(),
+                Some("icons"),
+                "{name} must own its icon"
+            );
+            for file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"] {
+                assert!(
+                    capsule_dir.join("icons").join(file).is_file(),
+                    "missing {name} icon asset {file}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn elacity_player_capsule_is_packaged_with_a_capsule_owned_icon() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
         let manifest: serde_json::Value = serde_json::from_slice(

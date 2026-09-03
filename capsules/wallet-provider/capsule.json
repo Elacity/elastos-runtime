@@ -7,6 +7,7 @@
   "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
+  "icon": "icons",
   "provides": "elastos://wallet/meta/status",
   "authority": {
     "reason": "Owns Wallet proof challenges, connector-bound account metadata, typed approval flows, and managed Recovery Kit operations behind an authenticated Runtime-local Wallet Bus.",
