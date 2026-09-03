@@ -578,6 +578,66 @@ build_packaged_capsule_archive() {
     echo "$archive"
 }
 
+provider_capsule_names() {
+    python3 - <<'PY'
+import json
+from pathlib import Path
+
+root = Path(".")
+components = json.loads(Path("components.json").read_text(encoding="utf-8"))
+for name, component in sorted((components.get("external") or {}).items()):
+    if not isinstance(component.get("provider_runtime"), dict):
+        continue
+    capsule_dir = None
+    for candidate in (root / "capsules" / name, root / "elastos" / "capsules" / name):
+        if (candidate / "capsule.json").is_file():
+            capsule_dir = candidate
+            break
+    if capsule_dir is None:
+        continue
+    manifest = json.loads((capsule_dir / "capsule.json").read_text(encoding="utf-8"))
+    if manifest.get("role") != "provider":
+        raise SystemExit(f"{name} capsule manifest role must be provider")
+    icon_dir = str(manifest.get("icon") or "").strip().strip("/")
+    if not icon_dir:
+        raise SystemExit(f"{name} provider capsule icon path is missing")
+    if ".." in Path(icon_dir).parts:
+        raise SystemExit(f"{name} provider capsule icon path escapes the capsule")
+    print(name)
+PY
+}
+
+build_packaged_provider_capsule_metadata_archive() {
+    local capsule_name="$1"
+    local capsule_dir icon_dir stage_root archive_dir archive size source
+
+    capsule_dir=$(resolve_capsule_dir "$capsule_name" || true)
+    [[ -n "$capsule_dir" ]] || die "${capsule_name} source directory not found"
+    [[ -f "${capsule_dir}/capsule.json" ]] || die "${capsule_name} capsule manifest not found at ${capsule_dir}/capsule.json"
+
+    [[ "$(capsule_manifest_field "$capsule_name" "role")" == "provider" ]] \
+        || die "${capsule_name} capsule manifest role must be provider"
+    icon_dir=$(capsule_manifest_field "$capsule_name" "icon")
+    [[ -n "$icon_dir" ]] || die "${capsule_name} provider capsule icon path is missing"
+
+    stage_root="${TMPDIR}/provider-contract-${capsule_name}"
+    archive_dir="${TMPDIR}/supported-provider-contract-archives"
+    archive="${archive_dir}/${capsule_name}-capsule-metadata.tar.gz"
+    rm -rf "$stage_root"
+    mkdir -p "${stage_root}/${capsule_name}" "$archive_dir"
+
+    cp "${capsule_dir}/capsule.json" "${stage_root}/${capsule_name}/capsule.json"
+    for size in 32 64 128 256; do
+        source="${capsule_dir}/${icon_dir}/icon-${size}.png"
+        [[ -f "$source" ]] || die "${capsule_name} provider capsule icon missing: ${icon_dir}/icon-${size}.png"
+        mkdir -p "${stage_root}/${capsule_name}/${icon_dir}"
+        cp "$source" "${stage_root}/${capsule_name}/${icon_dir}/icon-${size}.png"
+    done
+
+    create_capsule_tar "$archive" "$stage_root" "$capsule_name"
+    echo "$archive"
+}
+
 capsule_manifest_field() {
     local capsule_name="$1"
     local field="$2"
@@ -692,6 +752,42 @@ record_direct_asset() {
     fi
 }
 
+record_provider_capsule_metadata_asset() {
+    local updates_json="$1"
+    local name="$2"
+    local staged="$3"
+    local install_path="$4"
+    local release_path="$5"
+    local extract_path="$6"
+    local cid checksum size
+
+    cid=$(ipfs_add "$staged")
+    checksum=$(sha256 "$staged")
+    size=$(file_size "$staged")
+
+    echo "$updates_json" | jq \
+        --arg name "$name" \
+        --arg cid "$cid" \
+        --arg checksum "sha256:${checksum}" \
+        --arg install_path "$install_path" \
+        --arg extract_path "$extract_path" \
+        --arg release_path "$release_path" \
+        --argjson size "$size" \
+        '.external[$name].capsule_metadata = {
+            install_path: $install_path,
+            platforms: {
+                "*": {
+                    cid: $cid,
+                    checksum: $checksum,
+                    size: $size,
+                    install_path: $install_path,
+                    extract_path: $extract_path,
+                    release_path: $release_path
+                }
+            }
+        }'
+}
+
 stamp_direct_assets() {
     local platform_key="$1"
     local updates_json="$2"
@@ -785,6 +881,33 @@ build_platform_independent_direct_assets() {
     done
 
     stamp_direct_assets "*" "$updates_json"
+}
+
+build_platform_independent_provider_capsule_metadata_assets() {
+    local stage_dir updates_json provider archive staged release_path
+
+    stage_dir="${TMPDIR}/supported-provider-contracts-universal"
+    mkdir -p "$stage_dir"
+    updates_json='{}'
+
+    while IFS= read -r provider; do
+        [[ -n "$provider" ]] || continue
+        archive=$(build_packaged_provider_capsule_metadata_archive "$provider")
+        release_path="${provider}-capsule-metadata.tar.gz"
+        staged="${stage_dir}/${release_path}"
+        cp "$archive" "$staged"
+        updates_json=$(
+            record_provider_capsule_metadata_asset \
+                "$updates_json" \
+                "$provider" \
+                "$staged" \
+                "capsules/${provider}" \
+                "$release_path" \
+                "$provider"
+        )
+    done < <(provider_capsule_names)
+
+    echo "$updates_json"
 }
 
 merge_direct_assets() {
@@ -1551,6 +1674,8 @@ fi
 
 info "Publishing direct share/open support assets..."
 UNIVERSAL_DIRECT_ASSETS=$(build_platform_independent_direct_assets "$PLATFORM")
+UNIVERSAL_PROVIDER_CAPSULE_METADATA_ASSETS=$(build_platform_independent_provider_capsule_metadata_assets)
+UNIVERSAL_DIRECT_ASSETS=$(merge_direct_assets "$UNIVERSAL_DIRECT_ASSETS" "$UNIVERSAL_PROVIDER_CAPSULE_METADATA_ASSETS")
 HOST_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets "$PLATFORM" "$SETUP_PLATFORM" "$HOST_RUST_TARGET" false)
 HOST_DIRECT_ASSETS=$(merge_direct_assets "$HOST_PLATFORM_DIRECT_ASSETS" "$UNIVERSAL_DIRECT_ASSETS")
 CROSS_DIRECT_ASSETS="{}"
@@ -2033,6 +2158,10 @@ if [[ -n "${CROSS_PLATFORM:-}" && -f "${TMPDIR}/components-${CROSS_ARCH}.json" ]
 fi
 # Copy first-party support assets for Carrier-served setup fetches.
 for f in "${TMPDIR}/supported-assets-${PLATFORM}"/*; do
+    [ -f "$f" ] || continue
+    cp -f "$f" "${PUBLISHER_ARTIFACTS_DIR}/$(basename "$f")"
+done
+for f in "${TMPDIR}/supported-provider-contracts-universal"/*; do
     [ -f "$f" ] || continue
     cp -f "$f" "${PUBLISHER_ARTIFACTS_DIR}/$(basename "$f")"
 done
