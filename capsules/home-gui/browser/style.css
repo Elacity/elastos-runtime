@@ -2247,6 +2247,12 @@ body.stage-active:not(.expose-active) .stage-edge-sensor-left,
   display: block;
 }
 
+/* The Agent room is a Space too: its frame covers the floor, so the left
+   sensor stays up for the switcher back to Desktop. */
+body.stage-agent:not(.expose-active) .stage-edge-sensor-left {
+  display: block;
+}
+
 @media (prefers-reduced-motion: reduce) {
   body.stage-active:not(.expose-active) header.toolbar,
   body.stage-active:not(.expose-active) footer.taskbar {
@@ -3559,12 +3565,14 @@ body.dock-autohide::after {
   transform: scale(0.96);
 }
 
-/* Launcher has no app plate — stay fixed while neighbors magnify. */
-.taskbar-item-launcher .taskbar-icon {
+/* Launcher and Assistant have no app plate — stay fixed while neighbors magnify. */
+.taskbar-item-launcher .taskbar-icon,
+.taskbar-item-assistant .taskbar-icon {
   transform: none !important;
 }
 
-.taskbar-item-launcher {
+.taskbar-item-launcher,
+.taskbar-item-assistant {
   --dock-shift: 0px;
 }
 
@@ -4317,6 +4325,292 @@ body.dragging-target {
   .launcher-header,
   .launcher-scroll,
   .taskbar {
+    transition: none;
+  }
+}
+
+/* ---- Assistant face ----------------------------------------------------
+   The Shelf morphs into the Assistant's composer: the dock row clears (exit),
+   the pill stretches to composer geometry as empty glass (grow) while the room
+   breathes in behind it, and near the end of the stretch Home hands the pill
+   over: this glass goes clear and the capsule's identical pill shows through
+   at the same place (handover). Closing runs the legs in reverse: Home takes
+   the pill back, the room breathes out as the pill shrinks, the dock returns.
+   Home GUI owns this motion and the place only; the composer, the room and
+   everything typed belong to the capsule in the frame.
+   Phase lives on the pill as data-assistant-morph. Geometry comes from the
+   capsule (--assistant-face-w/-h/-r) so the two pills are one to the eye. */
+.taskbar.is-assistant-face {
+  height: auto;
+  min-height: var(--assistant-face-h, 92px);
+  max-height: min(72vh, 520px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  left: 0;
+  right: 0;
+  width: var(--assistant-face-w, min(720px, calc(100vw - 48px)));
+  max-width: calc(100vw - 48px);
+  margin-inline: auto;
+  padding: 14px 16px 12px;
+  border-radius: var(--assistant-face-r, 28px);
+  background-color: var(--dock-fill);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(14px) saturate(1.08);
+  -webkit-backdrop-filter: blur(14px) saturate(1.08);
+}
+
+/* Both legs of the stretch ease every dimension together; width rides the
+   dock's own pixel-FLIP (easeDockPillWidth) so idle max-content interpolates. */
+.taskbar.is-assistant-face,
+.taskbar[data-assistant-morph="shrink"] {
+  transition:
+    transform 220ms cubic-bezier(0.2, 0, 0, 1),
+    width var(--dock-width-ms, var(--shelf-face-ms)) var(--shelf-face-ease),
+    min-height var(--shelf-face-ms) var(--shelf-face-ease),
+    border-radius var(--shelf-face-ms) var(--shelf-face-ease),
+    padding var(--shelf-face-ms) var(--shelf-face-ease),
+    opacity 200ms var(--shelf-face-ease);
+}
+
+/* Handed over: the capsule's pill is the one on screen. Both legs are a
+   200ms crossfade with it (this glass sits above the capsule frame), never a
+   same-frame swap across two documents: two clocks can miss by a frame, and
+   a missed frame is a blank pill. */
+.taskbar.is-assistant-handover {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Liquid sheen washes the whole pill while it stretches or shrinks. */
+.taskbar::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  background: linear-gradient(
+    100deg,
+    transparent 0%,
+    transparent 38%,
+    rgba(255, 255, 255, 0.06) 46%,
+    rgba(255, 255, 255, 0.16) 50%,
+    rgba(255, 255, 255, 0.06) 54%,
+    transparent 62%,
+    transparent 100%
+  );
+  background-size: 220% 100%;
+  background-position: 120% 0;
+  background-repeat: no-repeat;
+}
+
+.taskbar[data-assistant-morph="grow"]::after,
+.taskbar[data-assistant-morph="shrink"]::after {
+  animation: shelf-liquid-sheen var(--shelf-face-ms) var(--shelf-face-ease) both;
+}
+
+.taskbar[data-assistant-morph="shrink"] {
+  overflow: hidden;
+}
+
+@keyframes shelf-liquid-sheen {
+  0% {
+    opacity: 0;
+    background-position: 120% 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    background-position: -40% 0;
+  }
+}
+
+/* The inner column is max-content for the dock row; the face fills the pill. */
+.taskbar.is-assistant-face .taskbar-inner {
+  width: 100%;
+}
+
+.taskbar[data-assistant-morph] .taskbar-primary {
+  transition: opacity 90ms var(--shelf-face-ease);
+}
+
+.taskbar[data-assistant-morph="exit"] .taskbar-primary {
+  opacity: 0;
+}
+
+/* The face replaces the dock row for as long as it is up, and the row stays
+   out of layout through the shrink so the pill collapses to it. */
+.taskbar.is-assistant-face .taskbar-primary,
+.taskbar[data-assistant-morph="grow"] .taskbar-primary,
+.taskbar[data-assistant-morph="enter"] .taskbar-primary,
+.taskbar[data-assistant-morph="leave"] .taskbar-primary,
+.taskbar[data-assistant-morph="shrink"] .taskbar-primary {
+  display: none;
+}
+
+.taskbar[data-assistant-morph="return"] .taskbar-primary {
+  animation: assistant-dock-return 160ms var(--shelf-face-ease) both;
+}
+
+@keyframes assistant-dock-return {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Empty glass: the face holds the pill open at the composer's height. */
+.assistant-face {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  height: 0;
+  pointer-events: none;
+  transition: height var(--shelf-face-ms) var(--shelf-face-ease);
+}
+
+.taskbar .assistant-face[hidden] {
+  display: block;
+}
+
+.taskbar.is-assistant-face .assistant-face {
+  height: calc(var(--assistant-face-h, 92px) - 26px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .taskbar.is-assistant-face,
+  .assistant-face,
+  .taskbar[data-assistant-morph] .taskbar-primary,
+  .taskbar[data-assistant-morph]::after {
+    transition: none;
+    animation: none;
+  }
+}
+
+/* ---- Assistant Space ---------------------------------------------------
+   The place the morph reveals. Home breathes: desktop, windows, backdrop and
+   menubar fade away; the frame is shown at once and the room inside it does
+   its own breathe, exactly as it always did. The frame is the capsule,
+   launched as the wallet rail launches the wallet. */
+.assistant-space {
+  position: fixed;
+  inset: 0;
+  z-index: 100085;
+  overflow: hidden;
+  background: transparent;
+  pointer-events: none;
+}
+
+.assistant-space[hidden] {
+  display: block;
+  visibility: hidden;
+}
+
+.assistant-space.is-visible {
+  pointer-events: auto;
+}
+
+/* Room is leaving: the frame plays its exit but takes no more input. */
+body.assistant-space-leaving .assistant-space {
+  pointer-events: none;
+}
+
+.assistant-space-frame {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  opacity: 0;
+}
+
+.assistant-space-frame.is-ready {
+  opacity: 1;
+}
+
+.assistant-space-error {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  gap: 10px;
+  text-align: center;
+  color: var(--text);
+  background: var(--panel);
+}
+
+.assistant-space-error[hidden] {
+  display: none;
+}
+
+.assistant-space-error-title {
+  margin: 0;
+  font-weight: 600;
+}
+
+.assistant-space-error-detail {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* The transition rides on both classes so the breathe back in is eased too;
+   shell-assistant-face holds `assistant-space-leaving` for the room's exit. */
+body.assistant-space-active .desktop-backdrop,
+body.assistant-space-active .desktop-workspace,
+body.assistant-space-active .window,
+body.assistant-space-active header.toolbar,
+body.assistant-space-leaving .desktop-backdrop,
+body.assistant-space-leaving .desktop-workspace,
+body.assistant-space-leaving .window,
+body.assistant-space-leaving header.toolbar {
+  transition:
+    opacity 720ms var(--shelf-face-ease),
+    filter 720ms var(--shelf-face-ease),
+    transform 720ms var(--shelf-face-ease);
+}
+
+body.assistant-space-active .desktop-backdrop,
+body.assistant-space-active .desktop-workspace,
+body.assistant-space-active .window {
+  opacity: 0;
+  filter: blur(8px);
+  pointer-events: none;
+}
+
+/* Full-bleed room: the menubar tucks away for as long as the room is up. */
+body.assistant-space-active header.toolbar {
+  transform: translateY(-100%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Wallet and Inbox rails are intentional popovers above the room; never ghost them. */
+body.assistant-space-active #wallet-rail,
+body.assistant-space-active #inbox-rail {
+  opacity: 1;
+  filter: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body.assistant-space-active .desktop-backdrop,
+  body.assistant-space-active .desktop-workspace,
+  body.assistant-space-active .window,
+  body.assistant-space-active header.toolbar,
+  body.assistant-space-leaving .desktop-backdrop,
+  body.assistant-space-leaving .desktop-workspace,
+  body.assistant-space-leaving .window,
+  body.assistant-space-leaving header.toolbar {
     transition: none;
   }
 }
@@ -5392,6 +5686,11 @@ body.dragging-target {
 
   .taskbar.is-launcher-face {
     width: calc(100vw - 20px);
+    max-width: calc(100vw - 20px);
+  }
+
+  .taskbar.is-assistant-face {
+    width: var(--assistant-face-w, calc(100vw - 20px));
     max-width: calc(100vw - 20px);
   }
 

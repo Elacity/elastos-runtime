@@ -25,11 +25,12 @@ import {
 import {
   addDesktopSpace,
   assignWindowToDesktop,
-  buildStageRing,
+  buildStageRing as buildFullStageRing,
   canRemoveDesktopSpace,
   desktopSpaceLabel,
   desktopStageId,
   getActiveStageId,
+  isAgentSpace,
   isDesktopSpace,
   moveSpaceInRing,
   promoteWindowToFullscreenSpace,
@@ -39,6 +40,12 @@ import {
   syncSpacePager,
   flipRectMotion,
 } from "./shell-stages.js?v=home-20260813a";
+
+/* Mission Control lays out the Spaces that hold windows. The Agent room holds
+   none and is reached from the Dock and the Space switcher, not from here. */
+function buildStageRing() {
+  return buildFullStageRing().filter((id) => !isAgentSpace(id));
+}
 function exposeReducedMotion() {
   return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
 }
