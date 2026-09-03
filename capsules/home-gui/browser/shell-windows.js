@@ -39,6 +39,7 @@ import {
   exitFullscreenStage,
   forgetClosedFullscreenSpace,
   getActiveStageId,
+  isAgentSpace,
   isDesktopSpace,
   neighborSpaceAfterClosing,
   playCloseFullscreenSpaceMotion,
@@ -250,8 +251,12 @@ export function snapshotBrowserSession() {
 /* Fullscreen Spaces are keyed by window id, which does not survive a reload.
    Persist them as fs:<target>:<instance> and remap to live ids on restore. */
 function stableSpaceKeyForId(spaceId) {
-  if (!spaceId || isDesktopSpace(spaceId)) {
-    return spaceId || desktopStageId();
+  /* The Agent room is opened by the user, never by a restored session. */
+  if (!spaceId || isAgentSpace(spaceId)) {
+    return desktopStageId();
+  }
+  if (isDesktopSpace(spaceId)) {
+    return spaceId;
   }
   const entry = shellState.windows.get(spaceId);
   if (!entry?.fullscreenStage) {
