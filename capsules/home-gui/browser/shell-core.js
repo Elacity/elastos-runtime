@@ -660,7 +660,15 @@ function normalizeTaskbarLayout(taskbar, summary) {
   return normalized;
 }
 
-const DEFAULT_TASKBAR_PINS = ["browser", "library", "wallet", "documents", "chat-room", "system"];
+const DEFAULT_TASKBAR_PINS = [
+  "browser",
+  "library",
+  "marketplace",
+  "wallet",
+  "documents",
+  "chat-room",
+  "system",
+];
 
 function defaultTaskbarPins(summary) {
   const knownTargets = new Set(allVisibleTargets(summary).map((target) => target.target));
@@ -683,10 +691,11 @@ function normalizeDesktopLabels(labels, summary) {
   return normalized;
 }
 
+/* First run: an empty desktop. Apps live in the dock and the Apps face;
+   content (games, models) is reached through Library. Anything the person
+   drags out to the desktop afterwards is respected by the saved layout. */
 function defaultHiddenDesktopTargets(summary) {
-  return allVisibleTargets(summary)
-    .filter((target) => target.target_kind !== "object")
-    .map((target) => target.target);
+  return allVisibleTargets(summary).map((target) => target.target);
 }
 
 function normalizeDesktopHiddenTargets(targetIds, summary) {
