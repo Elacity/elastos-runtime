@@ -5,6 +5,8 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::Context;
 use base64::Engine as _;
@@ -18,6 +20,10 @@ use elastos_protected_content_contracts::{
     RuntimeOperationIssuerKeyV1, ShareCoordinateV1, SignedCustodyCommitteeAuthorizationV1,
     SignedCustodyEpochV1, SignedCustodyPoolV1, ThresholdV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
     PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES,
+};
+use elastos_protected_content_provider_contracts::{
+    parse_and_verify_provisioning_output, ProvisionedCustodyProviderPublicKeys,
+    ProvisioningOutputError,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -48,6 +54,8 @@ const CUSTODY_FAILURE_DOMAIN_ID_DOMAIN: &str =
     "elastos.protected-content.custody-failure-domain-id/v1";
 const MAX_CUSTODY_NODE_LABEL_BYTES: usize = 64;
 const MAX_CUSTODY_NODE_DESCRIPTOR_BYTES: usize = 8 * 1024;
+const MAX_CUSTODY_PROVIDER_PROVISION_OUTPUT_BYTES: usize = 8 * 1024;
+const CUSTODY_PROVIDER_PROVISION_TIMEOUT: Duration = Duration::from_secs(5);
 /// The composition validators hard-code a 2-of-3 committee; the ceremony keeps
 /// the threshold in one place so a future k-of-n only changes this pair.
 const CUSTODY_THRESHOLD_REQUIRED: u8 = 2;
@@ -262,11 +270,12 @@ async fn run_protected_content_config_command_with_writer(
                     peer_did: decode_canonical_peer_did(&peer_did)?,
                 },
             };
-            let inactive_root = provisioned_inactive_custody_root(&data_dir)?;
-            let provisioned = custody_provider::provision_state_root(&inactive_root, issuer)
-                .map_err(|error| {
-                    anyhow::anyhow!("custody provider state provisioning failed: {error:?}")
-                })?;
+            let inactive_root = provisioned_inactive_custody_root(&data_dir).map_err(|_| {
+                anyhow::anyhow!("custody provider state root is unavailable or unsafe")
+            })?;
+            let provisioned =
+                provision_custody_node_with_installed_provider(&data_dir, &inactive_root, issuer)
+                    .await?;
             let descriptor = CustodyNodeDescriptorV1 {
                 schema: CUSTODY_NODE_DESCRIPTOR_SCHEMA_V1.to_string(),
                 node_public_key_hex: format!(
@@ -943,6 +952,91 @@ fn ensure_owner_only_dir(path: &Path, label: &str) -> anyhow::Result<()> {
     validate_owner_only_directory(path, label)
 }
 
+async fn provision_custody_node_with_installed_provider(
+    data_dir: &Path,
+    inactive_root: &Path,
+    issuer: RuntimeOperationIssuerKeyV1,
+) -> anyhow::Result<ProvisionedCustodyProviderPublicKeys> {
+    let Some(binary) = crate::binaries::resolve_verified_native_provider_binary_with_data_dir(
+        data_dir,
+        "custody-provider",
+    )
+    .map_err(|_| anyhow::anyhow!("verified custody provider binary is unavailable"))?
+    else {
+        anyhow::bail!("verified custody provider binary is unavailable");
+    };
+    let issuer_hex = format!("0x{}", hex::encode(issuer.as_bytes()));
+    let mut child = tokio::process::Command::new(binary)
+        .arg("provision")
+        .arg("--base-path")
+        .arg(inactive_root)
+        .arg("--trusted-runtime-issuer")
+        .arg(&issuer_hex)
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| anyhow::anyhow!("verified custody provider binary is unavailable"))?;
+    let output_result = tokio::time::timeout(CUSTODY_PROVIDER_PROVISION_TIMEOUT, async {
+        use tokio::io::AsyncReadExt as _;
+
+        let Some(stdout_handle) = child.stdout.take() else {
+            terminate_provision_child(&mut child).await;
+            anyhow::bail!("custody provider state provisioning failed");
+        };
+        let mut stdout = Vec::new();
+        if stdout_handle
+            .take((MAX_CUSTODY_PROVIDER_PROVISION_OUTPUT_BYTES + 1) as u64)
+            .read_to_end(&mut stdout)
+            .await
+            .is_err()
+        {
+            terminate_provision_child(&mut child).await;
+            anyhow::bail!("custody provider state provisioning failed");
+        }
+        if stdout.len() > MAX_CUSTODY_PROVIDER_PROVISION_OUTPUT_BYTES {
+            terminate_provision_child(&mut child).await;
+            anyhow::bail!("custody provider provisioning output is invalid");
+        }
+        let status = match child.wait().await {
+            Ok(status) => status,
+            Err(_) => {
+                terminate_provision_child(&mut child).await;
+                anyhow::bail!("custody provider state provisioning failed");
+            }
+        };
+        Ok::<_, anyhow::Error>((stdout, status))
+    })
+    .await;
+    let (stdout, status) = match output_result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return Err(error),
+        Err(_) => {
+            terminate_provision_child(&mut child).await;
+            anyhow::bail!("custody provider state provisioning failed");
+        }
+    };
+    if !status.success() {
+        anyhow::bail!("custody provider state provisioning failed");
+    }
+    let value: serde_json::Value = serde_json::from_slice(&stdout)
+        .map_err(|_| anyhow::anyhow!("custody provider provisioning output is invalid"))?;
+    parse_and_verify_provisioning_output(&value, issuer).map_err(|error| match error {
+        ProvisioningOutputError::InvalidOutput => {
+            anyhow::anyhow!("custody provider provisioning output is invalid")
+        }
+        ProvisioningOutputError::InvalidReceipt => {
+            anyhow::anyhow!("custody provider provisioning receipt is invalid")
+        }
+    })
+}
+
+async fn terminate_provision_child(child: &mut tokio::process::Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
 fn parse_runtime_issuer_hex(value: &str) -> anyhow::Result<RuntimeOperationIssuerKeyV1> {
     let hex_part = value
         .strip_prefix("0x")
@@ -1034,6 +1128,198 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn current_platform() -> &'static str {
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => "linux-amd64",
+            ("linux", "aarch64") => "linux-arm64",
+            ("macos", "aarch64") => "darwin-arm64",
+            (os, arch) => panic!("unsupported test platform {os}-{arch}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn install_verified_custody_provider(data_dir: &Path, script: &[u8]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin_dir = data_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let binary = bin_dir.join("custody-provider");
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let checksum = format!("sha256:{}", hex::encode(Sha256::digest(script)));
+        std::fs::write(
+            data_dir.join("components.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "external": {
+                    "custody-provider": {
+                        "install_path": "bin/custody-provider",
+                        "provider_runtime": {
+                            "role": "provider",
+                            "substrate": "native",
+                            "runtime_abi": "elastos.provider-stdio/v1",
+                            "execution": "native-provider",
+                            "provides": "custody",
+                            "runtime_only": true
+                        },
+                        "platforms": {
+                            current_platform(): {
+                                "checksum": checksum,
+                                "install_path": "bin/custody-provider"
+                            }
+                        }
+                    }
+                },
+                "capsules": {},
+                "profiles": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        binary
+    }
+
+    #[cfg(unix)]
+    fn provisioned_template(
+        dir: &Path,
+        issuer_hex: &str,
+        seed: u8,
+    ) -> (PathBuf, serde_json::Value) {
+        use x_wing::kem::Decapsulator as _;
+        use x_wing::KeyExport as _;
+
+        let template_root = dir.join(format!("template-{seed}"));
+        owner_only_dir(&template_root);
+        let issuer = parse_runtime_issuer_hex(issuer_hex).unwrap();
+        let node_signing_key = SigningKey::from_bytes(&[seed; 32]);
+        let node_public_key =
+            NodePublicKey::new(node_signing_key.verifying_key().to_bytes()).unwrap();
+        let node_custody_secret = [seed ^ 0x11; x_wing::DECAPSULATION_KEY_SIZE];
+        let node_custody_public_key = NodeCustodyPublicKeyV1::new(
+            x_wing::DecapsulationKey::from(node_custody_secret)
+                .encapsulation_key()
+                .to_bytes()
+                .into(),
+        )
+        .unwrap();
+        let receipt = elastos_protected_content_provider_contracts::provisioning_receipt(
+            issuer,
+            node_public_key,
+            node_custody_public_key,
+        );
+        let output = serde_json::json!({
+            "status": "ok",
+            "data": {
+                "schema": elastos_protected_content_provider_contracts::CUSTODY_PROVIDER_PROVISIONING_RECEIPT_SCHEMA_V1,
+                "provider": elastos_protected_content_provider_contracts::CUSTODY_PROVIDER_PROVISIONING_RECEIPT_PROVIDER_ID_V1,
+                "node_public_key": format!("0x{}", hex::encode(node_public_key.as_bytes())),
+                "node_custody_public_key": format!("0x{}", hex::encode(node_custody_public_key.as_bytes())),
+                "receipt": format!("0x{}", hex::encode(receipt)),
+            }
+        });
+        std::fs::write(
+            template_root.join("trusted-runtime-issuer"),
+            format!("0x{}\n", hex::encode(issuer.as_bytes())),
+        )
+        .unwrap();
+        std::fs::write(
+            template_root.join("node-signing-key"),
+            format!("0x{}\n", hex::encode(node_signing_key.to_bytes())),
+        )
+        .unwrap();
+        std::fs::write(
+            template_root.join("node-custody-secret"),
+            format!("0x{}\n", hex::encode(node_custody_secret)),
+        )
+        .unwrap();
+        owner_only_dir(&template_root.join("data"));
+        (template_root, output)
+    }
+
+    #[cfg(unix)]
+    fn install_successful_provision_script(
+        dir: &Path,
+        data_dir: &Path,
+        issuer_hex: &str,
+        seed: u8,
+    ) -> serde_json::Value {
+        let (template_root, output) = provisioned_template(dir, issuer_hex, seed);
+        let output_json = serde_json::to_string(&output).unwrap();
+        let script = format!(
+            "#!/bin/sh\nset -eu\nif [ \"$#\" -ne 5 ] || [ \"$1\" != \"provision\" ] || [ \"$2\" != \"--base-path\" ] || [ \"$4\" != \"--trusted-runtime-issuer\" ] || [ \"$5\" != \"{issuer_hex}\" ]; then\n  exit 73\nfi\nmkdir -p \"$3\"\ncp -R '{template_root}/.' \"$3/\"\nchmod 700 \"$3\" \"$3/data\"\nchmod 600 \"$3/trusted-runtime-issuer\" \"$3/node-signing-key\" \"$3/node-custody-secret\"\nprintf '%s\\n' '{output_json}'\n",
+            template_root = template_root.display(),
+        );
+        install_verified_custody_provider(data_dir, script.as_bytes());
+        output
+    }
+
+    #[cfg(unix)]
+    async fn run_provision_custody_node_for_test(
+        data_dir: PathBuf,
+        output_path: PathBuf,
+        trusted_runtime_issuer: String,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        run_protected_content_config_command_with_writer(
+            ProtectedContentConfigCommand::ProvisionCustodyNode {
+                data_dir,
+                trusted_runtime_issuer,
+                operator: "operator-a".to_string(),
+                failure_domain: "failure-domain-a".to_string(),
+                transport_peer_did: None,
+                output: output_path,
+            },
+            &mut out,
+        )
+        .await?;
+        Ok(out)
+    }
+
+    #[cfg(unix)]
+    fn write_test_custody_node_descriptor(
+        dir: &Path,
+        index: usize,
+        issuer_hex: &str,
+        transport_peer_did: Option<String>,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        use x_wing::kem::Decapsulator as _;
+        use x_wing::KeyExport as _;
+
+        let _issuer = parse_runtime_issuer_hex(issuer_hex).unwrap();
+        let node_signing_key = SigningKey::from_bytes(&[(index as u8) + 1; 32]);
+        let node_public_key =
+            NodePublicKey::new(node_signing_key.verifying_key().to_bytes()).unwrap();
+        let node_custody_secret = [((index as u8) ^ 0x51) + 1; x_wing::DECAPSULATION_KEY_SIZE];
+        let node_custody_public_key = NodeCustodyPublicKeyV1::new(
+            x_wing::DecapsulationKey::from(node_custody_secret)
+                .encapsulation_key()
+                .to_bytes()
+                .into(),
+        )
+        .unwrap();
+        let descriptor_path = dir.join(format!("node-{index}.descriptor.json"));
+        let descriptor = CustodyNodeDescriptorV1 {
+            schema: CUSTODY_NODE_DESCRIPTOR_SCHEMA_V1.to_string(),
+            node_public_key_hex: format!("0x{}", hex::encode(node_public_key.as_bytes())),
+            node_custody_public_key_hex: format!(
+                "0x{}",
+                hex::encode(node_custody_public_key.as_bytes())
+            ),
+            operator: format!("operator-{index}"),
+            failure_domain: format!("failure-domain-{index}"),
+            transport: match transport_peer_did {
+                None => CustodyNodeDescriptorTransportV1::Local,
+                Some(peer_did) => CustodyNodeDescriptorTransportV1::CarrierPeerDid { peer_did },
+            },
+        };
+        let descriptor_bytes =
+            serde_json::to_vec(&serde_json::to_value(&descriptor).unwrap()).unwrap();
+        std::fs::write(&descriptor_path, descriptor_bytes).unwrap();
+        std::fs::set_permissions(&descriptor_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        descriptor_path
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn provision_custody_node_provisions_inactive_root_and_writes_descriptor() {
         use std::os::unix::fs::PermissionsExt;
@@ -1041,19 +1327,17 @@ mod tests {
         let dir = safe_ancestor_tempdir();
         let data_dir = dir.path().join("data");
         owner_only_dir(&data_dir);
+        let expected = install_successful_provision_script(
+            dir.path(),
+            &data_dir,
+            &test_runtime_issuer_hex(),
+            0x41,
+        );
         let descriptor_path = dir.path().join("node-a.descriptor.json");
-        let mut out = Vec::new();
-
-        run_protected_content_config_command_with_writer(
-            ProtectedContentConfigCommand::ProvisionCustodyNode {
-                data_dir: data_dir.clone(),
-                trusted_runtime_issuer: test_runtime_issuer_hex(),
-                operator: "operator-a".to_string(),
-                failure_domain: "failure-domain-a".to_string(),
-                transport_peer_did: None,
-                output: descriptor_path.clone(),
-            },
-            &mut out,
+        let out = run_provision_custody_node_for_test(
+            data_dir.clone(),
+            descriptor_path.clone(),
+            test_runtime_issuer_hex(),
         )
         .await
         .unwrap();
@@ -1062,6 +1346,10 @@ mod tests {
         let metadata = std::fs::symlink_metadata(&inactive_root).unwrap();
         assert!(metadata.is_dir());
         assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert!(inactive_root.join("trusted-runtime-issuer").is_file());
+        assert!(inactive_root.join("node-signing-key").is_file());
+        assert!(inactive_root.join("node-custody-secret").is_file());
+        assert!(inactive_root.join("data").is_dir());
 
         let descriptor_bytes = std::fs::read(&descriptor_path).unwrap();
         let descriptor: serde_json::Value = serde_json::from_slice(&descriptor_bytes).unwrap();
@@ -1077,6 +1365,14 @@ mod tests {
         assert_eq!(descriptor["operator"], "operator-a");
         assert_eq!(descriptor["failure_domain"], "failure-domain-a");
         assert_eq!(descriptor["transport"]["kind"], "local");
+        assert_eq!(
+            descriptor["node_public_key_hex"],
+            expected["data"]["node_public_key"]
+        );
+        assert_eq!(
+            descriptor["node_custody_public_key_hex"],
+            expected["data"]["node_custody_public_key"]
+        );
 
         let receipt: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
@@ -1098,18 +1394,17 @@ mod tests {
         let data_dir = dir.path().join("data");
         std::fs::create_dir(&data_dir).unwrap();
         std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        install_successful_provision_script(
+            dir.path(),
+            &data_dir,
+            &test_runtime_issuer_hex(),
+            0x42,
+        );
 
-        let mut out = Vec::new();
-        run_protected_content_config_command_with_writer(
-            ProtectedContentConfigCommand::ProvisionCustodyNode {
-                data_dir: data_dir.clone(),
-                trusted_runtime_issuer: test_runtime_issuer_hex(),
-                operator: "operator-a".to_string(),
-                failure_domain: "failure-domain-a".to_string(),
-                transport_peer_did: None,
-                output: dir.path().join("node.descriptor.json"),
-            },
-            &mut out,
+        run_provision_custody_node_for_test(
+            data_dir.clone(),
+            dir.path().join("node.descriptor.json"),
+            test_runtime_issuer_hex(),
         )
         .await
         .unwrap();
@@ -1126,33 +1421,20 @@ mod tests {
         let data_dir = dir.path().join("data");
         owner_only_dir(&data_dir);
         let issuer = test_runtime_issuer_hex();
+        install_successful_provision_script(dir.path(), &data_dir, &issuer, 0x43);
 
-        let mut first_out = Vec::new();
-        run_protected_content_config_command_with_writer(
-            ProtectedContentConfigCommand::ProvisionCustodyNode {
-                data_dir: data_dir.clone(),
-                trusted_runtime_issuer: issuer.clone(),
-                operator: "operator-a".to_string(),
-                failure_domain: "failure-domain-a".to_string(),
-                transport_peer_did: None,
-                output: dir.path().join("first.descriptor.json"),
-            },
-            &mut first_out,
+        let first_out = run_provision_custody_node_for_test(
+            data_dir.clone(),
+            dir.path().join("first.descriptor.json"),
+            issuer.clone(),
         )
         .await
         .unwrap();
 
-        let mut second_out = Vec::new();
-        run_protected_content_config_command_with_writer(
-            ProtectedContentConfigCommand::ProvisionCustodyNode {
-                data_dir: data_dir.clone(),
-                trusted_runtime_issuer: issuer,
-                operator: "operator-a".to_string(),
-                failure_domain: "failure-domain-a".to_string(),
-                transport_peer_did: None,
-                output: dir.path().join("second.descriptor.json"),
-            },
-            &mut second_out,
+        let second_out = run_provision_custody_node_for_test(
+            data_dir.clone(),
+            dir.path().join("second.descriptor.json"),
+            issuer,
         )
         .await
         .unwrap();
@@ -1162,6 +1444,171 @@ mod tests {
         assert_eq!(first["node_public_key_hex"], second["node_public_key_hex"]);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provision_custody_node_rejects_missing_or_unverified_provider_binary() {
+        let dir = safe_ancestor_tempdir();
+        let data_dir = dir.path().join("data");
+        owner_only_dir(&data_dir);
+
+        let missing_error = run_provision_custody_node_for_test(
+            data_dir.clone(),
+            dir.path().join("missing.descriptor.json"),
+            test_runtime_issuer_hex(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            missing_error.to_string(),
+            "verified custody provider binary is unavailable"
+        );
+        assert!(!missing_error
+            .to_string()
+            .contains(&data_dir.display().to_string()));
+
+        install_verified_custody_provider(&data_dir, b"#!/bin/sh\nexit 0\n");
+        std::fs::write(data_dir.join("bin/custody-provider"), b"tampered").unwrap();
+
+        let unverified_error = run_provision_custody_node_for_test(
+            data_dir.clone(),
+            dir.path().join("unverified.descriptor.json"),
+            test_runtime_issuer_hex(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            unverified_error.to_string(),
+            "verified custody provider binary is unavailable"
+        );
+        assert!(!unverified_error
+            .to_string()
+            .contains(&data_dir.display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provision_custody_node_rejects_nonzero_exit_invalid_output_and_invalid_receipt() {
+        let dir = safe_ancestor_tempdir();
+        let data_dir = dir.path().join("data");
+        owner_only_dir(&data_dir);
+
+        install_verified_custody_provider(&data_dir, b"#!/bin/sh\nexit 61\n");
+        let exit_error = run_provision_custody_node_for_test(
+            data_dir.clone(),
+            dir.path().join("exit.descriptor.json"),
+            test_runtime_issuer_hex(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            exit_error.to_string(),
+            "custody provider state provisioning failed"
+        );
+
+        install_verified_custody_provider(
+            &data_dir,
+            b"#!/bin/sh\nprintf '%s\\n' '{\"status\":\"ok\"}'\n",
+        );
+        let invalid_output_error = run_provision_custody_node_for_test(
+            data_dir.clone(),
+            dir.path().join("invalid-output.descriptor.json"),
+            test_runtime_issuer_hex(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            invalid_output_error.to_string(),
+            "custody provider provisioning output is invalid"
+        );
+
+        let (_, mut wrong_receipt) =
+            provisioned_template(dir.path(), &test_runtime_issuer_hex(), 0x44);
+        wrong_receipt["data"]["receipt"] =
+            serde_json::json!(format!("0x{}", hex::encode([0x66; 32])));
+        let wrong_receipt_json = serde_json::to_string(&wrong_receipt).unwrap();
+        let script = format!("#!/bin/sh\nprintf '%s\\n' '{wrong_receipt_json}'\n");
+        install_verified_custody_provider(&data_dir, script.as_bytes());
+        let invalid_receipt_error = run_provision_custody_node_for_test(
+            data_dir.clone(),
+            dir.path().join("invalid-receipt.descriptor.json"),
+            test_runtime_issuer_hex(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            invalid_receipt_error.to_string(),
+            "custody provider provisioning receipt is invalid"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provision_custody_node_rejects_oversized_output_and_kills_timed_out_provider() {
+        let dir = safe_ancestor_tempdir();
+        let data_dir = dir.path().join("data");
+        owner_only_dir(&data_dir);
+
+        install_verified_custody_provider(
+            &data_dir,
+            b"#!/bin/sh\nawk 'BEGIN { printf \"{\\\"status\\\":\\\"ok\\\",\\\"data\\\":\\\"\"; for (i = 0; i < 9000; i++) printf \"a\"; printf \"\\\"}\" }'\n",
+        );
+        let oversized_error = run_provision_custody_node_for_test(
+            data_dir.clone(),
+            dir.path().join("oversized.descriptor.json"),
+            test_runtime_issuer_hex(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            oversized_error.to_string(),
+            "custody provider provisioning output is invalid"
+        );
+
+        let pid_path = dir.path().join("timeout.pid");
+        let timeout_script = format!(
+            "#!/bin/sh\nprintf '%s' $$ > '{}'\nexec sleep 30\n",
+            pid_path.display()
+        );
+        install_verified_custody_provider(&data_dir, timeout_script.as_bytes());
+        let timeout_error = run_provision_custody_node_for_test(
+            data_dir.clone(),
+            dir.path().join("timeout.descriptor.json"),
+            test_runtime_issuer_hex(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            timeout_error.to_string(),
+            "custody provider state provisioning failed"
+        );
+        let pid: i32 = std::fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provision_custody_node_rejects_unsafe_data_dir_before_provider_start() {
+        use std::os::unix::fs::symlink;
+
+        let dir = safe_ancestor_tempdir();
+        let real_data_dir = dir.path().join("real-data");
+        owner_only_dir(&real_data_dir);
+        let symlinked_data_dir = dir.path().join("data");
+        symlink(&real_data_dir, &symlinked_data_dir).unwrap();
+
+        let error = run_provision_custody_node_for_test(
+            symlinked_data_dir,
+            dir.path().join("unsafe.descriptor.json"),
+            test_runtime_issuer_hex(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "custody provider state root is unavailable or unsafe"
+        );
+    }
+
     /// Provision three distinct custody hosts and return their descriptor paths.
     #[cfg(unix)]
     async fn provision_three_node_descriptors(
@@ -1169,29 +1616,13 @@ mod tests {
         issuer_hex: &str,
         transports: [Option<String>; 3],
     ) -> Vec<PathBuf> {
-        let mut descriptors = Vec::new();
-        for (index, transport_peer_did) in transports.into_iter().enumerate() {
-            let host_data_dir = dir.join(format!("host-{index}/data"));
-            std::fs::create_dir_all(host_data_dir.parent().unwrap()).unwrap();
-            owner_only_dir(&host_data_dir);
-            let descriptor_path = dir.join(format!("node-{index}.descriptor.json"));
-            let mut out = Vec::new();
-            run_protected_content_config_command_with_writer(
-                ProtectedContentConfigCommand::ProvisionCustodyNode {
-                    data_dir: host_data_dir,
-                    trusted_runtime_issuer: issuer_hex.to_string(),
-                    operator: format!("operator-{index}"),
-                    failure_domain: format!("failure-domain-{index}"),
-                    transport_peer_did,
-                    output: descriptor_path.clone(),
-                },
-                &mut out,
-            )
-            .await
-            .unwrap();
-            descriptors.push(descriptor_path);
-        }
-        descriptors
+        transports
+            .into_iter()
+            .enumerate()
+            .map(|(index, transport_peer_did)| {
+                write_test_custody_node_descriptor(dir, index, issuer_hex, transport_peer_did)
+            })
+            .collect()
     }
 
     #[cfg(unix)]
