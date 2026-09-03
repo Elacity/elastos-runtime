@@ -38,6 +38,7 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
     "archive-manager",
     "inbox",
     "assistant",
+    "home-agent",
     "elacity-player",
 ];
 const DEFAULT_PUBLISH_CAPSULES: &[&str] = HOME_PUBLISH_CAPSULES;
@@ -74,6 +75,7 @@ const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
     "archive-manager",
     "inbox",
     "assistant",
+    "home-agent",
     "elacity-player",
 ];
 const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary", "jetson-test"];
