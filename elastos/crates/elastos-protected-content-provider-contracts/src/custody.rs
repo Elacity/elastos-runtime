@@ -1,10 +1,11 @@
 use elastos_protected_content_contracts::{
     AuthenticatedRuntimeCustodyProvisioningV1, AuthenticatedRuntimeReleaseOperationV1,
     CanonicalContract, ContractError, CustodyNodeProvisioningRecordIdentityV1,
-    CustodyNodeProvisioningRecordV1, Digest32, KeyReleaseError, NodePublicKey, RightsDecisionV1,
-    RuntimeCustodyProvisioningIdV1, RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1,
-    SignedNodeContributionV1, SignedNodeRightsDecisionV1, SignedRuntimeCustodyProvisioningV1,
-    SignedRuntimeReleaseOperationV1,
+    CustodyNodeProvisioningRecordV1, Digest32, KeyReleaseError, NodeCustodyPublicKeyV1,
+    NodePublicKey, RightsDecisionV1, RuntimeCustodyProvisioningIdV1, RuntimeOperationIssuerKeyV1,
+    RuntimeReleaseAuditIdV1, SignedNodeContributionV1, SignedNodeRightsDecisionV1,
+    SignedRuntimeCustodyProvisioningV1, SignedRuntimeReleaseOperationV1,
+    PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES,
 };
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -20,6 +21,9 @@ pub const CUSTODY_PROVIDER_REQUEST_SCHEMA_V1: &str =
     "elastos.protected-content.custody-provider.request/v1";
 pub const CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1: &str =
     "elastos.protected-content.custody-provider.response/v1";
+pub const CUSTODY_PROVIDER_PROVISIONING_RECEIPT_SCHEMA_V1: &str =
+    "elastos.custody-provider.provisioning-receipt/v1";
+pub const CUSTODY_PROVIDER_PROVISIONING_RECEIPT_PROVIDER_ID_V1: &str = "custody";
 
 type SignedRuntimeReleaseOperationBlobV1 =
     CanonicalBlob<MAX_SIGNED_RUNTIME_RELEASE_OPERATION_BYTES_V1>;
@@ -29,6 +33,126 @@ type SignedNodeRightsDecisionBlobV1 = CanonicalBlob<MAX_SIGNED_NODE_RIGHTS_DECIS
 type CustodyNodeProvisioningRecordBlobV1 =
     CanonicalBlob<MAX_CUSTODY_NODE_PROVISIONING_RECORD_BYTES_V1>;
 type SignedNodeContributionBlobV1 = CanonicalBlob<MAX_SIGNED_NODE_CONTRIBUTION_BYTES_V1>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionedCustodyProviderPublicKeys {
+    pub node_public_key: NodePublicKey,
+    pub node_custody_public_key: NodeCustodyPublicKeyV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisioningOutputError {
+    InvalidOutput,
+    InvalidReceipt,
+}
+
+impl std::fmt::Display for ProvisioningOutputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidOutput => "custody provider provisioning output is invalid",
+            Self::InvalidReceipt => "custody provider provisioning receipt is invalid",
+        })
+    }
+}
+
+impl std::error::Error for ProvisioningOutputError {}
+
+pub fn provisioning_receipt(
+    runtime_issuer: RuntimeOperationIssuerKeyV1,
+    node_public_key: NodePublicKey,
+    node_custody_public_key: NodeCustodyPublicKeyV1,
+) -> [u8; 32] {
+    use sha2::Digest as _;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(CUSTODY_PROVIDER_PROVISIONING_RECEIPT_SCHEMA_V1.as_bytes());
+    hasher.update(runtime_issuer.as_bytes());
+    hasher.update(node_public_key.as_bytes());
+    hasher.update(node_custody_public_key.as_bytes());
+    hasher.finalize().into()
+}
+
+pub fn parse_and_verify_provisioning_output(
+    value: &serde_json::Value,
+    expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
+) -> Result<ProvisionedCustodyProviderPublicKeys, ProvisioningOutputError> {
+    let object = value
+        .as_object()
+        .ok_or(ProvisioningOutputError::InvalidOutput)?;
+    if object.len() != 2 || object.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+        return Err(ProvisioningOutputError::InvalidOutput);
+    }
+    let data = object
+        .get("data")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(ProvisioningOutputError::InvalidOutput)?;
+    if data.len() != 5
+        || data.get("schema").and_then(serde_json::Value::as_str)
+            != Some(CUSTODY_PROVIDER_PROVISIONING_RECEIPT_SCHEMA_V1)
+        || data.get("provider").and_then(serde_json::Value::as_str)
+            != Some(CUSTODY_PROVIDER_PROVISIONING_RECEIPT_PROVIDER_ID_V1)
+    {
+        return Err(ProvisioningOutputError::InvalidOutput);
+    }
+    let node_public_key = NodePublicKey::new(parse_exact_hex_bytes::<32>(
+        data.get("node_public_key")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ProvisioningOutputError::InvalidOutput)?,
+    )?)
+    .map_err(|_| ProvisioningOutputError::InvalidOutput)?;
+    let node_custody_public_key =
+        NodeCustodyPublicKeyV1::new(parse_exact_hex_bytes::<PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES>(
+            data.get("node_custody_public_key")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ProvisioningOutputError::InvalidOutput)?,
+        )?)
+        .map_err(|_| ProvisioningOutputError::InvalidOutput)?;
+    let receipt = parse_exact_hex_bytes::<32>(
+        data.get("receipt")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ProvisioningOutputError::InvalidOutput)?,
+    )?;
+    let expected = provisioning_receipt(
+        expected_runtime_issuer,
+        node_public_key,
+        node_custody_public_key,
+    );
+    if receipt != expected {
+        return Err(ProvisioningOutputError::InvalidReceipt);
+    }
+    Ok(ProvisionedCustodyProviderPublicKeys {
+        node_public_key,
+        node_custody_public_key,
+    })
+}
+
+fn parse_exact_hex_bytes<const N: usize>(value: &str) -> Result<[u8; N], ProvisioningOutputError> {
+    let hex = value
+        .strip_prefix("0x")
+        .ok_or(ProvisioningOutputError::InvalidOutput)?;
+    if hex.len() != N * 2
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(ProvisioningOutputError::InvalidOutput);
+    }
+    let mut decoded = [0u8; N];
+    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] =
+            (hex_nibble(pair[0]).map_err(|_| ProvisioningOutputError::InvalidOutput)? << 4)
+                | hex_nibble(pair[1]).map_err(|_| ProvisioningOutputError::InvalidOutput)?;
+    }
+    Ok(decoded)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, ()> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(()),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CustodyProviderRequestOpV1 {
@@ -853,15 +977,18 @@ mod tests {
     };
 
     use crate::{
+        parse_and_verify_provisioning_output, provisioning_receipt,
         test_support::{
             custody_envelope_for_seed, digest, make_signed_node_contribution,
             make_signed_node_rights_decision, make_signed_runtime_release_operation,
-            make_signed_runtime_release_operation_for_envelope_and_seed, node_public_key,
-            runtime_operation_issuer_for_seed,
+            make_signed_runtime_release_operation_for_envelope_and_seed, node_custody_public_key,
+            node_public_key, runtime_operation_issuer_for_seed,
         },
         CustodyProviderRequestV1, CustodyProviderRequestValidationErrorV1,
         CustodyProviderResponseStatusV1, CustodyProviderResponseV1, ProviderFailureCodeV1,
-        ValidatedCustodyProviderRequestV1, CUSTODY_PROVIDER_REQUEST_SCHEMA_V1,
+        ProvisioningOutputError, ValidatedCustodyProviderRequestV1,
+        CUSTODY_PROVIDER_PROVISIONING_RECEIPT_PROVIDER_ID_V1,
+        CUSTODY_PROVIDER_PROVISIONING_RECEIPT_SCHEMA_V1, CUSTODY_PROVIDER_REQUEST_SCHEMA_V1,
     };
 
     fn provisioning_record(seed: u8, node_seed: u8) -> CustodyNodeProvisioningRecordV1 {
@@ -922,6 +1049,41 @@ mod tests {
         )
     }
 
+    fn hex_string(bytes: &[u8]) -> String {
+        let mut value = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            let _ = write!(&mut value, "{byte:02x}");
+        }
+        value
+    }
+
+    fn provisioning_output(
+        _runtime_issuer: RuntimeOperationIssuerKeyV1,
+        receipt_issuer: RuntimeOperationIssuerKeyV1,
+        seed: u8,
+    ) -> serde_json::Value {
+        let node_public_key = node_public_key(seed);
+        let node_custody_public_key = node_custody_public_key(seed);
+        serde_json::json!({
+            "status": "ok",
+            "data": {
+                "schema": CUSTODY_PROVIDER_PROVISIONING_RECEIPT_SCHEMA_V1,
+                "provider": CUSTODY_PROVIDER_PROVISIONING_RECEIPT_PROVIDER_ID_V1,
+                "node_public_key": format!("0x{}", hex_string(node_public_key.as_bytes())),
+                "node_custody_public_key": format!("0x{}", hex_string(node_custody_public_key.as_bytes())),
+                "receipt": format!(
+                    "0x{}",
+                    hex_string(&provisioning_receipt(
+                        receipt_issuer,
+                        node_public_key,
+                        node_custody_public_key,
+                    ))
+                ),
+            }
+        })
+    }
+
     #[test]
     fn custody_provision_request_and_receipt_round_trip_with_exact_binding() {
         let record = provisioning_record(0x11, 1);
@@ -977,6 +1139,32 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&request.to_json_vec().unwrap()).unwrap();
         injected["now_unix_ms"] = serde_json::json!(crate::test_support::NOW + 10);
         assert!(decode_provision_request(&serde_json::to_vec(&injected).unwrap()).is_err());
+    }
+
+    #[test]
+    fn provisioning_output_round_trips_only_for_the_exact_runtime_issuer() {
+        let runtime_issuer = runtime_operation_issuer_for_seed(0x42);
+        let output = provisioning_output(runtime_issuer, runtime_issuer, 0x31);
+        let parsed = parse_and_verify_provisioning_output(&output, runtime_issuer).unwrap();
+        assert_eq!(parsed.node_public_key, node_public_key(0x31));
+        assert_eq!(
+            parsed.node_custody_public_key,
+            node_custody_public_key(0x31)
+        );
+    }
+
+    #[test]
+    fn provisioning_output_rejects_mismatched_receipt_binding() {
+        let runtime_issuer = runtime_operation_issuer_for_seed(0x42);
+        let output = provisioning_output(
+            runtime_issuer,
+            runtime_operation_issuer_for_seed(0x43),
+            0x32,
+        );
+        assert_eq!(
+            parse_and_verify_provisioning_output(&output, runtime_issuer),
+            Err(ProvisioningOutputError::InvalidReceipt)
+        );
     }
 
     #[test]

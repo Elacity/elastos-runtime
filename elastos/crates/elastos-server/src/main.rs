@@ -312,6 +312,10 @@ enum Commands {
     #[command(subcommand)]
     CollaborationConfig(elastos_server::collaboration_config::CollaborationConfigCommand),
 
+    /// Offline operator provisioning for protected-content custody and chain prerequisites
+    #[command(subcommand)]
+    ProtectedContentConfig(elastos_server::protected_content_config::ProtectedContentConfigCommand),
+
     /// Show and manage the local DID-backed profile
     #[command(subcommand)]
     Identity(IdentityCommand),
@@ -1300,6 +1304,11 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::CollaborationConfig(cmd) => {
             elastos_server::collaboration_config::run_collaboration_config_command(cmd).await?;
+        }
+
+        Commands::ProtectedContentConfig(cmd) => {
+            elastos_server::protected_content_config::run_protected_content_config_command(cmd)
+                .await?;
         }
 
         Commands::Identity(cmd) => {

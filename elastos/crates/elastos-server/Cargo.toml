@@ -122,8 +122,8 @@ tower = { version = "0.5", features = ["util"] }
 wasm-encoder = "=0.236.1"
 elastos-auth = { path = "../elastos-auth" }
 elastos-protected-content-custody = { path = "../elastos-protected-content-custody" }
-x-wing = { version = "=0.1.0", features = ["hazmat", "zeroize"] }
 custody-provider = { path = "../../../capsules/custody-provider" }
+x-wing = { version = "=0.1.0", features = ["hazmat", "zeroize"] }
 
 [features]
 default = []
