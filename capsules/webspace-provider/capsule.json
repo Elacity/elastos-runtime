@@ -7,6 +7,7 @@
   "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
+  "icon": "icons",
   "provides": "localhost://WebSpaces/*",
   "authority": {
     "reason": "Resolves mounted WebSpace objects without exposing provider implementation or transport topology to app capsules.",

@@ -7,6 +7,7 @@
   "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
+  "icon": "icons",
   "provides": "elastos://browser-engine/*",
   "authority": {
     "reason": "Defines the internal browser-engine adapter contract without exposing raw sockets, host browser APIs, wallet injection, filesystem access, or host internet access to app capsules.",

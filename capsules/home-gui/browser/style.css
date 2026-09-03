@@ -52,6 +52,11 @@
   --taskbar-offset: 12px;
   --dock-icon-slot: 58px;
   --dock-icon-pad: 5px;
+  /* Dock motion: the pill glides (ease-in-out, long) rather than pops. The
+     Apps face grows up out of the dock at the dock's own width. */
+  --dock-width-ms: 780ms;
+  --shelf-face-ms: 950ms;
+  --shelf-face-ease: cubic-bezier(0.42, 0, 0.58, 1);
   --desktop-wallpaper: url("./wallpaper.webp");
   /* Shell chrome motion — water, not switches. */
   --shell-motion-enter: 160ms;
@@ -3296,9 +3301,13 @@ body.expose-active .expose-empty {
   margin-inline: auto;
   width: max-content;
   max-width: calc(100vw - 48px);
-  height: var(--taskbar-h);
-  padding-left: 14px;
-  padding-right: 14px;
+  /* Sized by content in both faces: the dock row plus symmetric padding is
+     exactly --taskbar-h at idle, and the Apps face grows/shrinks with the
+     launcher alone — so dropping the face class never snaps the pill while
+     the launcher is still collapsing (which pushed the row off the floor). */
+  height: auto;
+  min-height: var(--taskbar-h);
+  padding: calc((var(--taskbar-h) - var(--dock-icon-slot)) / 2) 14px;
   border-radius: 22px;
   background-color: var(--dock-fill);
   box-shadow:
@@ -3352,15 +3361,10 @@ body.dock-autohide::after {
 }
 
 .taskbar.is-launcher-face {
-  width: min(720px, calc(100vw - 32px));
-  max-width: min(720px, calc(100vw - 32px));
-  height: auto;
-  padding-top: 10px;
-  padding-bottom: 10px;
-}
-
-.taskbar.is-launcher-face .taskbar-inner {
-  gap: 10px;
+  /* The face is the dock's own width (locked in px by shell-surface at open,
+     since the idle width is max-content); the grid adapts to it. */
+  width: var(--shelf-face-w, min(720px, calc(100vw - 32px)));
+  max-width: calc(100vw - 32px);
 }
 
 /* Coarse-pointer Space pager (fine pointer uses left-edge peek). */
@@ -3624,6 +3628,76 @@ body.dock-autohide::after {
   flex: 0 0 var(--dock-icon-slot);
   width: var(--dock-icon-slot);
   height: var(--dock-icon-slot);
+}
+
+/* Dock motion: pixel-FLIP width easing (idle width is max-content, which
+   cannot interpolate) and live reorder while a drag hovers the strip. */
+.taskbar.is-dock-width-easing {
+  transition:
+    transform 220ms cubic-bezier(0.2, 0, 0, 1),
+    width var(--dock-width-ms) var(--shelf-face-ease),
+    max-width 180ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* An icon new to the dock settles into its slot once the pill has made room. */
+.taskbar-entry.dock-slot-arriving {
+  opacity: 0;
+  transform: scale(0.86);
+}
+
+.taskbar-entry.dock-slot-arriving.dock-slot-arrived {
+  opacity: 1;
+  transform: scale(1);
+  transition:
+    opacity 360ms var(--shelf-face-ease) calc(var(--dock-width-ms) * 0.45),
+    transform 420ms var(--shelf-face-ease) calc(var(--dock-width-ms) * 0.45);
+}
+
+.dock-reorder-spacer {
+  flex: 0 0 auto;
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.taskbar-entry.dock-reorder-parked {
+  position: absolute;
+  flex: 0 0 0;
+  width: 0;
+  min-width: 0;
+  height: 0;
+  margin: 0;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+
+body.dock-reordering .taskbar-entry:not(.dock-reorder-parked) {
+  transition: transform 180ms var(--shelf-face-ease);
+}
+
+/* The spacer is the drop cue while reordering; the plate would fight it. */
+body.dock-reordering .taskbar-sortable.drop-active {
+  background: transparent;
+  box-shadow: none;
+}
+
+/* While the strip is reordering, whatever is in the hand rides above the
+   dock (the ghost's stage z-index would otherwise put it under the pill). */
+body.dock-reordering .desktop-shortcut-ghost {
+  z-index: 100160;
+}
+
+/* A pin in the hand is just its icon. */
+.desktop-shortcut-ghost.dock-reorder-ghost {
+  width: auto;
+  padding: 0;
+  background: transparent;
+  backdrop-filter: none;
+  filter: drop-shadow(0 12px 22px rgba(0, 0, 0, 0.38));
+}
+
+.desktop-shortcut-ghost.dock-reorder-ghost .desktop-shortcut-title {
+  display: none;
 }
 
 /* Window-count lives inside .taskbar-icon so magnification lift/scale owns it. */
@@ -4158,36 +4232,75 @@ body.dragging-target {
   position: static;
   inset: auto;
   z-index: auto;
-  display: block;
+  /* Bottom-justified so the popover is planted on the dock row and does not
+     ride up with the pill's top edge while the height grows. */
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
   align-self: stretch;
   width: 100%;
   margin: 0;
   padding: 0;
   max-height: 0;
-  opacity: 0;
   overflow: hidden;
   pointer-events: none;
+  /* Apps face, same cadence as the Shelf: the pill grows up as empty glass
+     (height only, width locked), the content fades in where it lives near the
+     end of the stretch; closing lets the content leave first, then collapses.
+     This rule's transition is the closing leg (content leave, then height). */
+  transition: max-height var(--shelf-face-ms) var(--shelf-face-ease) 140ms;
+}
+
+.launcher-header,
+.launcher-scroll {
+  opacity: 0;
+  transform: translateY(12px) scale(0.97);
+  filter: blur(6px);
   transition:
-    max-height 180ms cubic-bezier(0.2, 0, 0, 1),
-    opacity 180ms cubic-bezier(0.2, 0, 0, 1);
+    opacity 140ms var(--shelf-face-ease),
+    transform 140ms var(--shelf-face-ease),
+    filter 140ms var(--shelf-face-ease);
+}
+
+/* Opening leg: height now, content enters at 82% of the stretch, header then grid. */
+.taskbar.is-launcher-face .launcher-header,
+.taskbar.is-launcher-face .launcher-scroll {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  filter: blur(0);
+  transition:
+    opacity 320ms var(--shelf-face-ease) calc(var(--shelf-face-ms) * 0.82),
+    transform 320ms var(--shelf-face-ease) calc(var(--shelf-face-ms) * 0.82),
+    filter 320ms var(--shelf-face-ease) calc(var(--shelf-face-ms) * 0.82);
+}
+
+.taskbar.is-launcher-face .launcher-scroll {
+  transition-duration: 360ms;
+  transition-delay: calc(var(--shelf-face-ms) * 0.82 + 70ms);
 }
 
 .taskbar .launcher[hidden] {
-  display: block;
+  display: flex;
 }
 
 .taskbar.is-launcher-face .launcher {
-  max-height: min(56vh, 520px);
-  opacity: 1;
+  /* Popover height plus its gap to the dock row; the gap lives inside the
+     clipped region so it collapses with the face instead of ticking. */
+  max-height: calc(min(56vh, 520px) + 10px);
   pointer-events: auto;
+  transition: max-height var(--shelf-face-ms) var(--shelf-face-ease) 0ms;
 }
 
 .launcher-popover {
   position: relative;
   display: flex;
   flex-direction: column;
+  /* Keeps its full height while the launcher's max-height grows, so the
+     planted content is uncovered rather than squeezed to the reveal. */
+  flex: 0 0 auto;
   width: 100%;
   height: min(56vh, 520px);
+  margin-bottom: 10px;
   padding: 0;
   overflow: hidden;
   color: var(--text);
@@ -4201,6 +4314,8 @@ body.dragging-target {
 
 @media (prefers-reduced-motion: reduce) {
   .launcher,
+  .launcher-header,
+  .launcher-scroll,
   .taskbar {
     transition: none;
   }
@@ -4344,8 +4459,9 @@ body.dragging-target {
 
 .launcher-group-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
-  gap: 12px 8px;
+  /* The face is dock-width, narrower than a 720 popup — denser tiles. */
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: 8px 4px;
 }
 
 .launcher-card {
@@ -5248,6 +5364,7 @@ body.dragging-target {
 
   .launcher-popover {
     height: min(48vh, 380px);
+    margin-bottom: 0;
   }
 
   /* Windows fill the stage between bar and dock — apps read as full-screen. */

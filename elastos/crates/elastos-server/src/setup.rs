@@ -15,6 +15,7 @@ use std::process::Command;
 const DEFAULT_SETUP_PROFILE: &str = "home";
 const CACHED_CID_FILE: &str = ".elastos-cid";
 const CACHED_ARTIFACT_SHA_FILE: &str = ".elastos-artifact-sha256";
+const PROVIDER_ICON_SIZES: [u16; 4] = [32, 64, 128, 256];
 
 // ── Manifest types ──────────────────────────────────────────────────
 
@@ -49,6 +50,15 @@ pub struct Component {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_runtime: Option<ProviderRuntime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capsule_metadata: Option<ComponentCapsuleMetadata>,
+    pub platforms: HashMap<String, PlatformInfo>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ComponentCapsuleMetadata {
+    #[serde(default)]
+    pub install_path: Option<String>,
     pub platforms: HashMap<String, PlatformInfo>,
 }
 
@@ -265,13 +275,18 @@ async fn run_with_data_dir(
     for name in &components {
         let comp = &manifest.external[name];
         let platform_info = resolve_platform_info(comp, &platform);
-        let status =
-            match component_install_state_for_name(&manifest, &data_dir, name, comp, platform_info)
-            {
-                InstallState::Installed => " [already installed]",
-                InstallState::Stale(_) => " [stale: will refresh]",
-                InstallState::Missing => "",
-            };
+        let status = match effective_component_install_state_for_name(
+            &manifest,
+            &data_dir,
+            name,
+            comp,
+            platform_info,
+            &platform,
+        ) {
+            InstallState::Installed => " [already installed]",
+            InstallState::Stale(_) => " [stale: will refresh]",
+            InstallState::Missing => "",
+        };
         let size = comp
             .size_mb
             .map(|s| format!(" (~{} MB)", s))
@@ -287,7 +302,18 @@ async fn run_with_data_dir(
         let comp = &manifest.external[name];
         let platform_info = resolve_platform_info(comp, &platform);
 
-        match component_install_state_for_name(&manifest, &data_dir, name, comp, platform_info) {
+        let binary_install_state =
+            component_install_state_for_name(&manifest, &data_dir, name, comp, platform_info);
+        let metadata_install_state =
+            provider_capsule_metadata_install_state_for_name(&data_dir, name, comp, &platform);
+        match effective_component_install_state_for_name(
+            &manifest,
+            &data_dir,
+            name,
+            comp,
+            platform_info,
+            &platform,
+        ) {
             InstallState::Installed => {
                 println!("[skip] {} — already installed", name);
                 skipped_count += 1;
@@ -299,6 +325,7 @@ async fn run_with_data_dir(
             InstallState::Missing => {}
         }
 
+        let mut changed = false;
         let platform_info = match platform_info {
             Some(info) => info,
             None => {
@@ -318,7 +345,9 @@ async fn run_with_data_dir(
             continue;
         }
 
-        if platform_info.strategy.as_deref() == Some("local-copy") {
+        if platform_info.strategy.as_deref() == Some("local-copy")
+            && !matches!(binary_install_state, InstallState::Installed)
+        {
             let source = match &platform_info.source {
                 Some(s) => PathBuf::from(s),
                 None => {
@@ -367,40 +396,60 @@ async fn run_with_data_dir(
             set_local_copy_permissions(&source, &dest);
             maybe_write_component_cache_metadata(&manifest, Some(platform_info), name, &dest)?;
             println!("  Installed: {}", dest.display());
-            installed_count += 1;
-            continue;
+            changed = true;
+        } else if !matches!(binary_install_state, InstallState::Installed) {
+            let resolved_url = match resolve_component_download_url(platform_info) {
+                Some(url) => url,
+                None => {
+                    println!("[skip] {} — no download URL or CID for {}", name, platform);
+                    skipped_count += 1;
+                    continue;
+                }
+            };
+
+            let install_path = match resolve_install_path(comp, Some(platform_info)) {
+                Some(p) => p,
+                None => {
+                    println!("[skip] {} — no install_path configured", name);
+                    skipped_count += 1;
+                    continue;
+                }
+            };
+            let dest = data_dir.join(install_path);
+            println!("[install] {} ...", name);
+            download_component(
+                &data_dir,
+                name,
+                &resolved_url,
+                platform_info,
+                &dest,
+                &ipfs_gateways,
+            )
+            .await?;
+            maybe_write_component_cache_metadata(&manifest, Some(platform_info), name, &dest)?;
+            changed = true;
         }
 
-        let resolved_url = match resolve_component_download_url(platform_info) {
-            Some(url) => url,
-            None => {
-                println!("[skip] {} — no download URL or CID for {}", name, platform);
-                skipped_count += 1;
-                continue;
-            }
-        };
+        if matches!(
+            metadata_install_state,
+            Some(InstallState::Missing | InstallState::Stale(_))
+        ) {
+            ensure_provider_capsule_metadata_component(
+                &data_dir,
+                name,
+                comp,
+                &platform,
+                &ipfs_gateways,
+            )
+            .await?;
+            changed = true;
+        }
 
-        let install_path = match resolve_install_path(comp, Some(platform_info)) {
-            Some(p) => p,
-            None => {
-                println!("[skip] {} — no install_path configured", name);
-                skipped_count += 1;
-                continue;
-            }
-        };
-        let dest = data_dir.join(install_path);
-        println!("[install] {} ...", name);
-        download_component(
-            &data_dir,
-            name,
-            &resolved_url,
-            platform_info,
-            &dest,
-            &ipfs_gateways,
-        )
-        .await?;
-        maybe_write_component_cache_metadata(&manifest, Some(platform_info), name, &dest)?;
-        installed_count += 1;
+        if changed {
+            installed_count += 1;
+        } else {
+            skipped_count += 1;
+        }
     }
 
     let stamped = write_installed_manifest(&data_dir, &manifest, &platform)?;
@@ -799,6 +848,57 @@ pub(crate) async fn ensure_capsule_component_for_home_launch(
     })
 }
 
+async fn ensure_provider_capsule_metadata_component(
+    data_dir: &Path,
+    name: &str,
+    component: &Component,
+    platform: &str,
+    ipfs_gateways: &[ElastosFetchPath],
+) -> anyhow::Result<()> {
+    let Some(metadata) = component.capsule_metadata.as_ref() else {
+        return Ok(());
+    };
+    let platform_info = resolve_component_capsule_metadata_platform_info(metadata, platform)
+        .ok_or_else(|| {
+            anyhow::anyhow!("provider capsule metadata '{name}' is not available for {platform}")
+        })?;
+    let install_path =
+        resolve_component_capsule_metadata_install_path(metadata, Some(platform_info)).ok_or_else(
+            || anyhow::anyhow!("provider capsule metadata '{name}' is missing install_path"),
+        )?;
+    validate_capsule_component_install_path(name, install_path)?;
+    if platform_info.strategy.as_deref() == Some("source-build") {
+        anyhow::bail!(
+            "provider capsule metadata '{name}' requires a source build and cannot be setup-managed"
+        );
+    }
+    if platform_info.strategy.as_deref() == Some("local-copy") {
+        anyhow::bail!(
+            "provider capsule metadata '{name}' uses local-copy and cannot be setup-managed"
+        );
+    }
+
+    let resolved_url = resolve_component_download_url(platform_info).ok_or_else(|| {
+        anyhow::anyhow!("provider capsule metadata '{name}' has no Carrier/content release path")
+    })?;
+    let dest = data_dir.join(install_path);
+    println!("[install] {} capsule metadata ...", name);
+    download_component(
+        data_dir,
+        name,
+        &resolved_url,
+        platform_info,
+        &dest,
+        ipfs_gateways,
+    )
+    .await?;
+    write_platform_cache_metadata(platform_info, &dest)?;
+    if let Some(reason) = installed_provider_capsule_metadata_stale_reason(name, &dest) {
+        anyhow::bail!("installed provider capsule metadata '{name}' failed validation: {reason}");
+    }
+    Ok(())
+}
+
 fn validate_capsule_package_identity(
     name: &str,
     entry: Option<&CapsuleEntry>,
@@ -917,6 +1017,28 @@ fn validate_capsule_component_install_path(name: &str, install_path: &str) -> an
     Ok(())
 }
 
+fn effective_component_install_state_for_name(
+    manifest: &ComponentsManifest,
+    data_dir: &Path,
+    name: &str,
+    component: &Component,
+    platform_info: Option<&PlatformInfo>,
+    platform: &str,
+) -> InstallState {
+    let state =
+        component_install_state_for_name(manifest, data_dir, name, component, platform_info);
+    if !matches!(state, InstallState::Installed) {
+        return state;
+    }
+    match provider_capsule_metadata_install_state_for_name(data_dir, name, component, platform) {
+        Some(InstallState::Installed) | None => InstallState::Installed,
+        Some(InstallState::Missing) => InstallState::Stale(
+            "provider capsule metadata missing from installed bundle".to_string(),
+        ),
+        Some(InstallState::Stale(reason)) => InstallState::Stale(reason),
+    }
+}
+
 fn component_install_state_for_name(
     manifest: &ComponentsManifest,
     data_dir: &Path,
@@ -970,6 +1092,50 @@ fn component_install_state_for_name(
     base
 }
 
+fn provider_capsule_metadata_install_state_for_name(
+    data_dir: &Path,
+    name: &str,
+    component: &Component,
+    platform: &str,
+) -> Option<InstallState> {
+    let metadata = component.capsule_metadata.as_ref()?;
+    let Some(platform_info) = resolve_component_capsule_metadata_platform_info(metadata, platform)
+    else {
+        return Some(InstallState::Stale(format!(
+            "provider capsule metadata is not available for {platform}"
+        )));
+    };
+    let install_path =
+        resolve_component_capsule_metadata_install_path(metadata, Some(platform_info))
+            .unwrap_or_default();
+    if install_path.is_empty() {
+        return Some(InstallState::Stale(
+            "provider capsule metadata install_path is missing".to_string(),
+        ));
+    }
+    if let Err(err) = validate_capsule_component_install_path(name, install_path) {
+        return Some(InstallState::Stale(format!(
+            "provider capsule metadata path is invalid: {err}"
+        )));
+    }
+
+    let install_root = data_dir.join(install_path);
+    if !install_root.exists() {
+        return Some(InstallState::Missing);
+    }
+    if !install_root.is_dir() {
+        return Some(InstallState::Stale(
+            "provider capsule metadata install path is not a directory".to_string(),
+        ));
+    }
+    if let Some(reason) = extracted_bundle_cache_stale_reason(&install_root, platform_info)
+        .or_else(|| installed_provider_capsule_metadata_stale_reason(name, &install_root))
+    {
+        return Some(InstallState::Stale(reason));
+    }
+    Some(InstallState::Installed)
+}
+
 fn installed_capsule_bundle_stale_reason(name: &str, install_root: &Path) -> Option<String> {
     let manifest_bytes = fs::read(install_root.join("capsule.json")).ok()?;
     let manifest: elastos_common::CapsuleManifest = match serde_json::from_slice(&manifest_bytes) {
@@ -994,6 +1160,62 @@ fn installed_capsule_bundle_stale_reason(name: &str, install_root: &Path) -> Opt
             "capsule entrypoint missing from installed bundle: {}",
             manifest.entrypoint
         ));
+    }
+    None
+}
+
+fn installed_provider_capsule_metadata_stale_reason(
+    name: &str,
+    install_root: &Path,
+) -> Option<String> {
+    let manifest_bytes = match fs::read(install_root.join("capsule.json")) {
+        Ok(bytes) => bytes,
+        Err(err) => return Some(format!("capsule metadata is unreadable: {err}")),
+    };
+    let manifest: elastos_common::CapsuleManifest = match serde_json::from_slice(&manifest_bytes) {
+        Ok(manifest) => manifest,
+        Err(err) => return Some(format!("capsule metadata is invalid: {err}")),
+    };
+    if let Err(err) = manifest.validate() {
+        return Some(format!("capsule metadata failed validation: {err}"));
+    }
+    if manifest.name != name {
+        return Some(format!(
+            "capsule metadata name mismatch: expected '{}', found '{}'",
+            name, manifest.name
+        ));
+    }
+    if manifest.role != elastos_common::CapsuleRole::Provider {
+        return Some("capsule metadata role must be provider".to_string());
+    }
+    let Some(icon_dir) = manifest
+        .icon
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Some("provider capsule metadata icon path is missing".to_string());
+    };
+    if Path::new(icon_dir).components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Some("provider capsule metadata icon path escapes the capsule".to_string());
+    }
+    for size in PROVIDER_ICON_SIZES {
+        let icon_path = install_root.join(icon_dir).join(format!("icon-{size}.png"));
+        if !icon_path.is_file() {
+            return Some(format!(
+                "provider capsule metadata icon asset is missing: {}",
+                icon_path
+                    .strip_prefix(install_root)
+                    .unwrap_or(&icon_path)
+                    .display()
+            ));
+        }
     }
     None
 }
@@ -1029,7 +1251,48 @@ fn maybe_write_component_cache_metadata(
     let Some(platform_info) = platform_info else {
         return Ok(());
     };
+    write_platform_cache_metadata(platform_info, dest)
+}
+
+fn extracted_bundle_cache_stale_reason(
+    install_root: &Path,
+    platform_info: &PlatformInfo,
+) -> Option<String> {
     if platform_info.extract_path.is_none() {
+        return None;
+    }
+
+    if let Some(expected_cid) = platform_info
+        .cid
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        let cached_cid = fs::read_to_string(install_root.join(CACHED_CID_FILE))
+            .ok()
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default();
+        if cached_cid != expected_cid {
+            return Some("extracted bundle CID metadata missing or stale".to_string());
+        }
+    }
+    if let Some(expected_checksum) = platform_info
+        .checksum
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        let cached_sha = fs::read_to_string(install_root.join(CACHED_ARTIFACT_SHA_FILE))
+            .ok()
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default();
+        if cached_sha != expected_checksum {
+            return Some("extracted bundle checksum metadata missing or stale".to_string());
+        }
+    }
+    None
+}
+
+fn write_platform_cache_metadata(platform_info: &PlatformInfo, dest: &Path) -> anyhow::Result<()> {
+    if !dest.is_dir() || platform_info.extract_path.is_none() {
         return Ok(());
     }
 
@@ -1205,20 +1468,14 @@ pub(crate) fn resolve_install_path<'a>(
     component: &'a Component,
     platform_info: Option<&'a PlatformInfo>,
 ) -> Option<&'a str> {
-    platform_info
-        .and_then(|p| p.install_path.as_deref())
-        .or(component.install_path.as_deref())
+    resolve_install_path_parts(component.install_path.as_deref(), platform_info)
 }
 
 pub(crate) fn resolve_platform_info<'a>(
     component: &'a Component,
     platform: &str,
 ) -> Option<&'a PlatformInfo> {
-    component
-        .platforms
-        .get(platform)
-        .or_else(|| platform_aliases(platform).find_map(|alias| component.platforms.get(alias)))
-        .or_else(|| component.platforms.get("*"))
+    resolve_platform_info_from_map(&component.platforms, platform)
 }
 
 fn resolve_platform_info_mut<'a>(
@@ -1236,6 +1493,39 @@ fn resolve_platform_info_mut<'a>(
     }
 
     component.platforms.get_mut("*")
+}
+
+fn resolve_install_path_parts<'a>(
+    component_install_path: Option<&'a str>,
+    platform_info: Option<&'a PlatformInfo>,
+) -> Option<&'a str> {
+    platform_info
+        .and_then(|p| p.install_path.as_deref())
+        .or(component_install_path)
+}
+
+fn resolve_platform_info_from_map<'a>(
+    platforms: &'a HashMap<String, PlatformInfo>,
+    platform: &str,
+) -> Option<&'a PlatformInfo> {
+    platforms
+        .get(platform)
+        .or_else(|| platform_aliases(platform).find_map(|alias| platforms.get(alias)))
+        .or_else(|| platforms.get("*"))
+}
+
+fn resolve_component_capsule_metadata_install_path<'a>(
+    component: &'a ComponentCapsuleMetadata,
+    platform_info: Option<&'a PlatformInfo>,
+) -> Option<&'a str> {
+    resolve_install_path_parts(component.install_path.as_deref(), platform_info)
+}
+
+fn resolve_component_capsule_metadata_platform_info<'a>(
+    component: &'a ComponentCapsuleMetadata,
+    platform: &str,
+) -> Option<&'a PlatformInfo> {
+    resolve_platform_info_from_map(&component.platforms, platform)
 }
 
 fn platform_aliases(platform: &str) -> impl Iterator<Item = &'static str> {
@@ -1702,7 +1992,36 @@ pub async fn refresh_installed_components_for_update(
         refreshed.push(name.clone());
     }
 
+    for (name, new_component) in &new_manifest.external {
+        let old_component = old_manifest.external.get(name);
+        if !component_capsule_metadata_changed(old_component, new_component, platform)
+            || new_component.capsule_metadata.is_none()
+            || !matches!(
+                component_install_state_for_name(
+                    &new_manifest,
+                    data_dir,
+                    name,
+                    new_component,
+                    resolve_platform_info(new_component, platform)
+                ),
+                InstallState::Installed
+            )
+        {
+            continue;
+        }
+        ensure_provider_capsule_metadata_component(
+            data_dir,
+            name,
+            new_component,
+            platform,
+            &gateways,
+        )
+        .await?;
+        refreshed.push(name.clone());
+    }
+
     refreshed.sort();
+    refreshed.dedup();
     write_installed_manifest_bytes(data_dir, new_components, platform)?;
     Ok(refreshed)
 }
@@ -1722,6 +2041,36 @@ fn component_signature(component: Option<&Component>, platform: &str) -> Option<
         platform_info.extract_path,
         platform_info.strategy,
         platform_info.source
+    ))
+}
+
+fn component_capsule_metadata_changed(
+    old_component: Option<&Component>,
+    new_component: &Component,
+    platform: &str,
+) -> bool {
+    component_capsule_metadata_signature(old_component, platform)
+        != component_capsule_metadata_signature(Some(new_component), platform)
+}
+
+fn component_capsule_metadata_signature(
+    component: Option<&Component>,
+    platform: &str,
+) -> Option<String> {
+    let metadata = component?.capsule_metadata.as_ref()?;
+    let platform_info = resolve_component_capsule_metadata_platform_info(metadata, platform)?;
+    Some(format!(
+        "component_install={:?}|platform_install={:?}|url={:?}|cid={:?}|release_path={:?}|checksum={:?}|extract={:?}|strategy={:?}|source={:?}|size={:?}",
+        metadata.install_path,
+        platform_info.install_path,
+        platform_info.url,
+        platform_info.cid,
+        platform_info.release_path,
+        platform_info.checksum,
+        platform_info.extract_path,
+        platform_info.strategy,
+        platform_info.source,
+        platform_info.size
     ))
 }
 
@@ -2637,6 +2986,44 @@ mod tests {
     }
 
     #[test]
+    fn service_provider_capsules_are_packaged_with_capsule_owned_icons() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
+        for name in [
+            "browser-engine-adapter",
+            "chain-provider",
+            "content-block-graph-provider",
+            "did-provider",
+            "exit-provider",
+            "ipfs-provider",
+            "model-provider",
+            "net-provider",
+            "object-provider",
+            "wallet-provider",
+            "webspace-provider",
+        ] {
+            let capsule_dir = root.join("capsules").join(name);
+            let manifest: elastos_common::CapsuleManifest =
+                serde_json::from_slice(&fs::read(capsule_dir.join("capsule.json")).unwrap())
+                    .unwrap();
+            manifest
+                .validate()
+                .unwrap_or_else(|err| panic!("{name} manifest must validate: {err}"));
+            assert_eq!(manifest.role, elastos_common::CapsuleRole::Provider);
+            assert_eq!(
+                manifest.icon.as_deref(),
+                Some("icons"),
+                "{name} must own its icon"
+            );
+            for file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"] {
+                assert!(
+                    capsule_dir.join("icons").join(file).is_file(),
+                    "missing {name} icon asset {file}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn elacity_player_capsule_is_packaged_with_a_capsule_owned_icon() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
         let manifest: serde_json::Value = serde_json::from_slice(
@@ -2812,6 +3199,7 @@ mod tests {
             size_mb: None,
             description: None,
             provider_runtime: None,
+            capsule_metadata: None,
             platforms: HashMap::new(),
         };
 
@@ -2863,6 +3251,7 @@ mod tests {
             size_mb: None,
             description: None,
             provider_runtime: None,
+            capsule_metadata: None,
             platforms,
         };
 
@@ -2910,6 +3299,7 @@ mod tests {
             size_mb: None,
             description: None,
             provider_runtime: None,
+            capsule_metadata: None,
             platforms,
         };
         let manifest: ComponentsManifest = serde_json::from_value(serde_json::json!({
@@ -2943,6 +3333,215 @@ mod tests {
             ),
             InstallState::Stale("extracted bundle CID metadata missing or stale".to_string())
         );
+    }
+
+    fn provider_component_with_capsule_metadata() -> Component {
+        let mut platforms = HashMap::new();
+        platforms.insert(
+            "linux-amd64".to_string(),
+            PlatformInfo {
+                url: None,
+                cid: None,
+                release_path: Some("object-provider-linux-amd64".to_string()),
+                checksum: None,
+                extract_path: None,
+                install_path: Some("bin/object-provider".to_string()),
+                strategy: None,
+                source: None,
+                note: None,
+                size: None,
+            },
+        );
+        let mut capsule_platforms = HashMap::new();
+        capsule_platforms.insert(
+            "*".to_string(),
+            PlatformInfo {
+                url: None,
+                cid: Some(
+                    "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi".to_string(),
+                ),
+                release_path: Some("object-provider-capsule-metadata.tar.gz".to_string()),
+                checksum: Some(
+                    "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                        .to_string(),
+                ),
+                extract_path: Some("object-provider".to_string()),
+                install_path: Some("capsules/object-provider".to_string()),
+                strategy: None,
+                source: None,
+                note: None,
+                size: Some(123),
+            },
+        );
+        Component {
+            version: None,
+            install_path: Some("bin/object-provider".to_string()),
+            repository: None,
+            size_mb: None,
+            description: None,
+            provider_runtime: Some(ProviderRuntime {
+                role: ProviderRuntimeRole::Provider,
+                substrate: ProviderRuntimeSubstrate::Native,
+                runtime_abi: ProviderRuntimeAbi::ProviderStdioV1,
+                execution: ProviderRuntimeExecution::NativeProvider,
+                provides: "elastos://object/*".to_string(),
+                runtime_only: false,
+            }),
+            capsule_metadata: Some(ComponentCapsuleMetadata {
+                install_path: Some("capsules/object-provider".to_string()),
+                platforms: capsule_platforms,
+            }),
+            platforms,
+        }
+    }
+
+    #[test]
+    fn installed_provider_binary_still_refreshes_missing_capsule_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let component = provider_component_with_capsule_metadata();
+        let binary_path = tmp.path().join("bin/object-provider");
+        fs::create_dir_all(binary_path.parent().unwrap()).unwrap();
+        fs::write(&binary_path, b"object-provider").unwrap();
+        let manifest = ComponentsManifest {
+            external: HashMap::new(),
+            capsules: HashMap::new(),
+            profiles: HashMap::new(),
+        };
+
+        assert_eq!(
+            component_install_state_for_name(
+                &manifest,
+                tmp.path(),
+                "object-provider",
+                &component,
+                resolve_platform_info(&component, "linux-amd64")
+            ),
+            InstallState::Installed
+        );
+        assert_eq!(
+            effective_component_install_state_for_name(
+                &manifest,
+                tmp.path(),
+                "object-provider",
+                &component,
+                resolve_platform_info(&component, "linux-amd64"),
+                "linux-amd64"
+            ),
+            InstallState::Stale(
+                "provider capsule metadata missing from installed bundle".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn provider_capsule_metadata_requires_capsule_manifest_even_with_cache_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let component = provider_component_with_capsule_metadata();
+        let install_root = tmp.path().join("capsules/object-provider");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(
+            install_root.join(CACHED_CID_FILE),
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi\n",
+        )
+        .unwrap();
+        fs::write(
+            install_root.join(CACHED_ARTIFACT_SHA_FILE),
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111\n",
+        )
+        .unwrap();
+
+        match provider_capsule_metadata_install_state_for_name(
+            tmp.path(),
+            "object-provider",
+            &component,
+            "linux-amd64",
+        ) {
+            Some(InstallState::Stale(reason)) => {
+                assert!(reason.starts_with("capsule metadata is unreadable:"));
+            }
+            other => panic!("unexpected provider capsule metadata state: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_only_component_update_does_not_refresh_provider_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary_path = tmp.path().join("bin/object-provider");
+        fs::create_dir_all(binary_path.parent().unwrap()).unwrap();
+        fs::write(&binary_path, b"unchanged-provider-binary").unwrap();
+
+        let old_component = provider_component_with_capsule_metadata();
+        let mut new_component = old_component.clone();
+        let metadata = new_component.capsule_metadata.as_mut().unwrap();
+        let metadata_platform = metadata.platforms.get_mut("*").unwrap();
+        metadata_platform.cid = None;
+        metadata_platform.release_path = None;
+        metadata_platform.checksum = Some(
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+        );
+
+        assert_eq!(
+            component_signature(Some(&old_component), "linux-amd64"),
+            component_signature(Some(&new_component), "linux-amd64")
+        );
+        assert!(component_capsule_metadata_changed(
+            Some(&old_component),
+            &new_component,
+            "linux-amd64"
+        ));
+
+        let old_manifest = ComponentsManifest {
+            external: HashMap::from([("object-provider".to_string(), old_component)]),
+            capsules: HashMap::new(),
+            profiles: HashMap::new(),
+        };
+        let new_manifest = ComponentsManifest {
+            external: HashMap::from([("object-provider".to_string(), new_component)]),
+            capsules: HashMap::new(),
+            profiles: HashMap::new(),
+        };
+        let err = refresh_installed_components_for_update(
+            tmp.path(),
+            Some(&serde_json::to_vec(&old_manifest).unwrap()),
+            &serde_json::to_vec(&new_manifest).unwrap(),
+            "linux-amd64",
+        )
+        .await
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("has no Carrier/content release path"));
+        assert_eq!(fs::read(binary_path).unwrap(), b"unchanged-provider-binary");
+    }
+
+    #[tokio::test]
+    async fn metadata_only_component_update_skips_absent_provider_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let new_component = provider_component_with_capsule_metadata();
+        let mut old_component = new_component.clone();
+        old_component.capsule_metadata = None;
+        let old_manifest = ComponentsManifest {
+            external: HashMap::from([("object-provider".to_string(), old_component)]),
+            capsules: HashMap::new(),
+            profiles: HashMap::new(),
+        };
+        let new_manifest = ComponentsManifest {
+            external: HashMap::from([("object-provider".to_string(), new_component)]),
+            capsules: HashMap::new(),
+            profiles: HashMap::new(),
+        };
+
+        let refreshed = refresh_installed_components_for_update(
+            tmp.path(),
+            Some(&serde_json::to_vec(&old_manifest).unwrap()),
+            &serde_json::to_vec(&new_manifest).unwrap(),
+            "linux-amd64",
+        )
+        .await
+        .unwrap();
+
+        assert!(refreshed.is_empty());
+        assert!(!tmp.path().join("capsules/object-provider").exists());
     }
 
     #[tokio::test]
@@ -3154,6 +3753,7 @@ mod tests {
             size_mb: None,
             description: None,
             provider_runtime: None,
+            capsule_metadata: None,
             platforms,
         };
         let manifest = ComponentsManifest {
@@ -3499,6 +4099,7 @@ mod tests {
             size_mb: None,
             description: None,
             provider_runtime: None,
+            capsule_metadata: None,
             platforms,
         };
 

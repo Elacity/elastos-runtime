@@ -112,6 +112,34 @@ def assert_release_support_inventory() -> None:
                 f"release packaging must not create protected operator state: {private_state}"
             )
 
+    support_assets = publish_text.split("build_supported_direct_assets() {", 1)[1].split(
+        "\n}\n\nbuild_platform_independent_direct_assets() {", 1
+    )[0]
+    if "updates_json='{}'" not in support_assets:
+        raise AssertionError("normal support assets must remain top-level direct updates")
+    if "updates_json='{\"external\":{}}'" in support_assets:
+        raise AssertionError("normal support assets must not add an external component wrapper")
+
+    provider_assets = publish_text.split(
+        "build_platform_independent_provider_capsule_metadata_assets() {", 1
+    )[1].split("\n}\n\nmerge_direct_assets() {", 1)[0]
+    if "supported-provider-contracts-universal" not in provider_assets:
+        raise AssertionError("provider capsule metadata must use its own staging directory")
+    if "record_provider_capsule_metadata_asset" not in provider_assets:
+        raise AssertionError("provider capsule metadata must remain under external components")
+
+    publisher_handoff = publish_text.split(
+        "# Copy first-party support assets for Carrier-served setup fetches.", 1
+    )[1].split("# Copy capsule artifacts for Carrier serving", 1)[0]
+    provider_handoff_loop = publisher_handoff.split(
+        'for f in "${TMPDIR}/supported-provider-contracts-universal"/*; do', 1
+    )
+    if len(provider_handoff_loop) != 2:
+        raise AssertionError("publisher artifacts must include provider capsule metadata archives")
+    provider_handoff_body = provider_handoff_loop[1].split("done", 1)[0]
+    if '"${PUBLISHER_ARTIFACTS_DIR}/$(basename "$f")"' not in provider_handoff_body:
+        raise AssertionError("publisher metadata archive names must match their stamped release paths")
+
 
 def assert_external_metadata(components: dict) -> None:
     capsules = components["capsules"]

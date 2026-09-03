@@ -55,6 +55,23 @@ class FakeClassList {
   }
 }
 
+// Plain-object style with the two CSSOM methods the shell uses for inline
+// custom properties; keys stay enumerable so rect stubs can read them.
+function fakeStyleDeclaration() {
+  const style = {};
+  Object.defineProperty(style, "setProperty", {
+    value: (name, value) => {
+      style[name] = value;
+    },
+  });
+  Object.defineProperty(style, "removeProperty", {
+    value: (name) => {
+      delete style[name];
+    },
+  });
+  return style;
+}
+
 class FakeElement {
   constructor(selector = "", withTemplateContent = true) {
     this.selector = selector;
@@ -63,7 +80,7 @@ class FakeElement {
     this.queries = new Map();
     this.listeners = new Map();
     this.dataset = {};
-    this.style = {};
+    this.style = fakeStyleDeclaration();
     this.hidden = false;
     this.inert = false;
     this.disabled = false;
@@ -134,6 +151,10 @@ class FakeElement {
     for (const child of children) {
       child.parentElement = this;
     }
+  }
+
+  get childElementCount() {
+    return this.children.length;
   }
 
   querySelector(selector) {
@@ -470,6 +491,8 @@ const firstRunSummary = {
 };
 
 shellCore.initializeShellLayout(firstRunSummary);
+shellCore.shellState.currentSummary = firstRunSummary;
+shellSurface.renderDesktop(firstRunSummary);
 assert(
   JSON.stringify(shellCore.shellState.shellLayoutState.taskbar) === JSON.stringify([
     "browser",
@@ -488,13 +511,14 @@ assert(
     "browser",
     "system",
     "documents",
+    "object-target",
   ]),
-  "fresh layout did not hide all non-object visible targets and keep object targets visible",
+  "fresh layout did not hide every visible target (first run is an empty desktop)",
   shellCore.shellState.shellLayoutState.desktopHidden,
 );
 assert(
-  shellCore.isTargetOnDesktop("object-target") === true,
-  "fresh layout hid an object target from the desktop",
+  shellCore.isTargetOnDesktop("object-target") === false,
+  "fresh layout left an object target on the desktop",
   shellCore.shellState.shellLayoutState.desktopHidden,
 );
 assert(
@@ -503,11 +527,17 @@ assert(
   shellCore.shellState.shellLayoutState.desktopHidden,
 );
 assert(
-  JSON.stringify(shellCore.shellState.shellLayoutState.desktop) === JSON.stringify({
-    "object-target": { x: 12, y: 12 },
-  }),
-  "fresh layout did not seed only the visible desktop entry positions",
+  JSON.stringify(shellCore.shellState.shellLayoutState.desktop) === JSON.stringify({}),
+  "fresh layout seeded desktop entry positions for an empty desktop",
   shellCore.shellState.shellLayoutState.desktop,
+);
+assert(
+  elementForSelector("#desktop-first-run-hint").hidden === false,
+  "fresh empty desktop did not show the launcher hint",
+  {
+    visibleTargets: firstRunSummary.targets.map((target) => target.target),
+    desktopChildren: elementForSelector("#desktop-shortcuts").children.length,
+  },
 );
 
 const storedEmptyTaskbarSummary = {
