@@ -17,29 +17,25 @@ section if a higher section is incoherent, unverified, or too large to review.
 
 Active priority index:
 
-- current priority: publish the reviewed final candidate and pass full CI on
-  its exact revision before the separately approved main merge. Preserve
-  reviewed history. The deferred source work below stays outside this merge;
-  installed acceptance and protected-content cutover remain separate gates
-- release versioning is prepared in the local 0.7.0 release commit: workspace
-  `0.7.0`, minor-bumped changed capsule manifests, and the cut changelog
-  entry. Still open before the main merge: tag the released 0.6 `main` as
-  `v0.6.0` before it moves, pass CI on the exact release revision, refresh
-  the journey-audit snapshot on that same revision, and record an explicit
-  release disposition for the open P1 findings (F-01, F-43, F-44, F-54).
-  Publication then stamps `ELASTOS_RELEASE_VERSION=0.7.0` through the checked
-  publish flow and tags `v0.7.0`
-- separately authorized after localhost: install the same reviewed tree on the
-  seed and the third custody node with matching stable receipts
+- current priority: prepare the 0.7.1 development line for reviewable local
+  integration on top of `origin/upstream/0.7.1-dev`. Keep each slice coherent
+  on its exact revision, preserve reviewed history, and keep installed
+  acceptance and protected-content cutover as later gates
+- released line: `origin/main@8ac18bec` is `v0.7.0`. Keep follow-up work on
+  `origin/upstream/0.7.1-dev` until the reviewed 0.7.1 line is ready. The
+  checked publish flow still owns release stamping
+- active review branches: PR52 at
+  `origin/feat/protected-content-installed-provisioning@4d688cc5` and PR54 at
+  `origin/feat/home-first-run-seed-0.7.1@2a49ea57`
 - integrated UIUX source evidence: published
   `origin/feat/0.7-uiux-candidate` at `8b547590`; this ref is donor evidence,
   not installed, live, or release truth
-- current protected-content integration source line: published
-  `origin/feat/protected-content-uiux-reconstruction` (PR39), including the
-  exact PR43 mint-adoption commit `58ebfb23`. The earlier `d06d64f3` revision
-  passed all seven CI jobs. The final revision needs its own CI result.
-  The audit fixes retain mixed source and installed evidence. Each
-  remaining GUI gate needs its own verdict
+- current protected-content source stack is already in `origin/main` and
+  `origin/upstream/0.7.1-dev`, including the exact PR43 mint-adoption commit
+  `58ebfb23`. The audit fixes retain mixed source and installed evidence.
+  Each remaining GUI gate needs its own verdict
+- separately authorized after localhost: install the same reviewed tree on the
+  seed and the third custody node with matching stable receipts
 - all other work remains queued below
 
 ### Integrated UIUX and protected-content proof
@@ -49,35 +45,44 @@ gates are the remaining path to installation and cutover.
 
 Open gates, in order:
 
-1. [ ] Pass all CI jobs on the corrected PR39 revision. Include both Linux
-   architectures, the clean macOS installation and the x86_64 release build.
-2. [ ] Install and retest the exact reviewed tree on isolated localhost with
-   matching stable Runtime, component, capsule metadata, provider, static
-   audit, installation, and platform restart receipts.
-3. [ ] After separate authorization, install the same reviewed tree on the
+1. [ ] Review and correct PR52 through one local child branch from exact PR52
+   tip `4d688cc5`. Keep the slice reviewable on the exact tip.
+2. [ ] Review and correct PR54 through one local child branch from exact PR54
+   tip `2a49ea57`. Keep the slice reviewable on the exact tip.
+3. [ ] Close the packaged provider-manifest and catalog gap on the combined
+   source line so the reviewed candidate ships one coherent installed view.
+4. [ ] Assemble one local-only 0.7.1 candidate from the exact reviewed tips.
+   Record the exact source commit set before publication is considered.
+5. [ ] Run the source gates on that exact local candidate, then install and
+   retest it on isolated localhost with matching stable Runtime, component,
+   capsule metadata, provider, static audit, installation, and platform
+   restart receipts.
+6. [ ] Complete the localhost manual Brave and UIUX journey on that same
+   installed candidate.
+7. [ ] After separate authorization, install the same reviewed tree on the
    seed and the third custody node with matching stable Runtime, component,
    capsule metadata, provider, static audit, installation, and platform
    restart receipts.
-4. [ ] Provision one real signed owner-only 2-of-3 custody composition across
+8. [ ] Provision one real signed owner-only 2-of-3 custody composition across
    three distinct operators and failure domains.
-5. [ ] Install the private multi-RPC Chain configuration and verify the exact
+9. [ ] Install the private multi-RPC Chain configuration and verify the exact
    deployed Base network, contract, token, emitter, and finality authority.
-6. [ ] Prove exactly three protected-content replicas and repair after one
-   replica is lost.
-7. [ ] Fund the creator and buyer Base accounts, then run the Brave two-Runtime
-   journey: mint, list, and share on localhost; import, deny, buy, open, play,
-   and close on the seed. Prove one bound KID with allowed, denied, and unbound
-   reads, the CentralStorage binding, the exact `AuthorityGateway.buyAccess`
-   receipt and event, restart, replay, tamper rejection, settlement, cleanup,
-   and zero unresolved state.
-8. [ ] Complete the installed manual UIUX matrix for Home windows, focus,
+10. [ ] Prove exactly three protected-content replicas and repair after one
+    replica is lost.
+11. [ ] Fund the creator and buyer Base accounts, then run the Brave
+    two-Runtime journey: mint, list, and share on localhost; import, deny,
+    buy, open, play, and close on the seed. Prove one bound KID with allowed,
+    denied, and unbound reads, the CentralStorage binding, the exact
+    `AuthorityGateway.buyAccess` receipt and event, restart, replay, tamper
+    rejection, settlement, cleanup, and zero unresolved state.
+12. [ ] Complete the installed manual UIUX matrix for Home windows, focus,
     fullscreen, and launcher; People, Chat, Inbox, and Clipboard; Wallet and
     connectors; Library, Marketplace, and `elacity-player`; Assistant
     model-offer states; GBA; and Browser.
-9. [ ] Make one atomic cutover that selects the Runtime-owned protected-content
-   path and removes the provisional `drm`, `rights`, `key`, and `decrypt`
-   authority surfaces from startup, registration, resources, packaging, tests,
-   and docs.
+13. [ ] Make one atomic cutover that selects the Runtime-owned
+    protected-content path and removes the provisional `drm`, `rights`, `key`,
+    and `decrypt` authority surfaces from startup, registration, resources,
+    packaging, tests, and docs.
 
 The operator-owned model-provider configuration remains a separate installed
 Assistant proof item. Missing configuration is an honest zero-offer state.
@@ -326,17 +331,18 @@ preserved; an older implementation is not evidence that it fits current contract
   identity, not process-list, port-availability, or socket-inactivity inference.
 - [ ] Preserve the remaining `feat/shell-ui-esp-on-protocol` donor work until
   its deferred Assistant scope is reviewed. The reviewed shell and UIUX work is
-  included in PR39; any further extraction needs a source comparison against
+  included in `main` and `origin/upstream/0.7.1-dev`; any further extraction needs a source comparison against
   the current ESP contracts.
 - [ ] Resume Carrier reconciliation for 0.7 only after its provider generation,
   multi-node physical evidence, cleanup, and release boundaries are reviewed.
 
 ### 0. Branch readiness and reviewability
 
-Branch assumptions: `main` contains the released 0.6 source. PR39 is the current
-0.7 source candidate over `upstream/0.7-dev`. Use [state.md](state.md) and fetched
-refs for exact checkpoints. Published source, installed behavior and public-live
-behavior require separate evidence.
+Branch assumptions: `origin/main@8ac18bec` contains the released `v0.7.0`
+source. `origin/upstream/0.7.1-dev@c511b133` is the active integration line.
+PR52 (`4d688cc5`) and PR54 (`2a49ea57`) are active review branches. Use
+[state.md](state.md) and fetched refs for exact checkpoints. Published source,
+installed behavior and public-live behavior require separate evidence.
 
 - [ ] Keep this branch reviewable: split changes into coherent commit slices with no corrective commits, no hidden migrations, and no unrelated local artifacts.
 - [ ] Keep oversized-file cleanup frozen unless branch review exposes a concrete no-behavior blocker. The existing Browser/Wallet/provider cleanup is already split into focused sibling modules: Browser gateway, Wallet gateway, Wallet UI send/receive/create/request/state/preference flows, wallet-provider EVM crypto, and wallet-provider approval test groups. Keep those seams stable and verified. Do not split `capsules/browser/browser/browser.js` further unless a diagnostic-frame/session seam is proven mechanical and behavior-free. Treat `gateway_tests/room.rs`, `gateway_room.rs`, `gateway_tests/home_system.rs`, `room_service.rs`, `auth_gateway.rs`, and `home_cmd.rs` as later cleanup unless they become direct release-review blockers. Keep `scripts/home-entropy-check.mjs` as a broad alignment gate for now, but do not let it accumulate new product logic. Each future split must be no-behavior, separately testable, and covered by the narrow Rust/JS smoke commands for that surface.
@@ -387,8 +393,9 @@ behavior require separate evidence.
      `scripts/local-carrier-setup-smoke.sh` before a staged or published
      gateway exists for branch-override install proof. Branch-override public
      install proof with the branch binary needs a staged or published
-     0.6.0-compatible manifest with the current `home` profile and checksummed
-     artifacts; then rerun `scripts/public-install-identity-smoke.sh` and
+     release-compatible manifest with the current `home` profile and
+     checksummed artifacts; then rerun
+     `scripts/public-install-identity-smoke.sh` and
      `scripts/public-install-home-frontdoor-smoke.sh` with
      `ELASTOS_PUBLISHER_GATEWAY=<candidate-url>` and the branch binary override.
      After final publish, rerun both without overrides.

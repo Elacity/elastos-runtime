@@ -1,69 +1,41 @@
 # State
 
-Last updated: 2026-08-31 UTC
+Last updated: 2026-09-03 UTC
 
-This file records public-safe current truth for released 0.6.0 and active
+This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
 volatile proof logs remain outside the repository.
 
 ## Release Posture
 
-- A fresh fetch records `main` at `d358dedb` as the released 0.6 source and
-  `origin/upstream/0.7-dev` at `e481b153` as the current 0.7 integration line.
-- The local 0.7.0 release-preparation commit on top of `e481b153` sets the
-  coordinated workspace version to `0.7.0`, gives every capsule manifest
-  changed since 0.6.0 a minor bump (new capsules keep their initial manifest
-  versions), cuts the `0.7.0` changelog entry, and refreshes
-  `elastos/Cargo.lock`. Installed artifacts report `0.7.0` only after the
-  checked publish flow stamps `ELASTOS_RELEASE_VERSION`; unstamped source
-  builds report `0.7.0-dev`.
-- Published feature evidence is
-  `origin/feat/protected-content-runtime-lifecycle@854d9dc9`,
-  `origin/feat/protected-content-uiux-reconstruction` (PR39),
-  `origin/feat/0.7-uiux-candidate@8b547590`,
-  `origin/feat/dkms-esp-port@27d85c6f`, and
-  `origin/feat/0.7-product-documentation@74cd4e42`.
+- A fresh fetch records `origin/main` at `8ac18bec` as the released `v0.7.0`
+  source and `origin/upstream/0.7.1-dev` at `c511b133` as the active
+  integration line.
+- Released `v0.7.0` already carries the coordinated workspace version,
+  changelog, manifest bumps, and lock refresh. Installed artifacts report
+  `0.7.0` only after the checked publish flow stamps
+  `ELASTOS_RELEASE_VERSION`; unstamped source builds report `0.7.0-dev`.
+- Active review branches are
+  `origin/feat/protected-content-installed-provisioning@4d688cc5` (PR52) and
+  `origin/feat/home-first-run-seed-0.7.1@2a49ea57` (PR54).
 - The published protected-content stack is contracts `0c56c56a`, custody
-  `2f844cef`, key reconstruction `467a6c03`, custody provider `1b7fa732`, Wallet
-  rights `c9e82e75`, Runtime `a8ac6dc8`, and rights `3627da01`. Every tip is an
-  ancestor of the published lifecycle and is already present in the active
-  integration. The latest published protected-branch repairs need no new
-  extraction.
-- PR39 includes the Home audit fixes, the named principal-root write policy,
-  checkout-bound test fixtures and the privacy-reviewed audit workbook at
-  `d06d64f3`. All seven CI jobs pass on that revision, including macOS,
-  both Linux source-home targets and the release build. New local inclusions
-  require CI on their exact revision; installed product acceptance stays separate.
-- The local source includes the CPU watcher optimization from `e4d897f6`.
-  Unchanged executable metadata skips binary hashing; a changed stamp triggers
-  a streamed digest. Focused tests cover idle ticks, replacement and deletion.
-  Installed CPU measurement remains open.
-- The source-merge scope preserves reviewed history and includes the exact
-  PR43 commit `58ebfb23`. PR39 then feeds `upstream/0.7-dev`, which feeds
-  `main`; fetching refs establishes the current heads before each step. A
-  merge commit preserves the original commits rather than squashing them.
-  Main integration, release publication and installed cutover are separate
-  actions. The deferred scope remains explicit in [TASKS.md](TASKS.md).
-- The published audit changes include Home and Terminal repairs, create-only
-  Library writes, document close protection, Assistant and model-init repairs,
-  declared-content icons, private diagnostics, socket-root protection, and Mac
-  restart safety.
-  The history review preserved the product tree and incorporated the published
-  CI/setup changes. Installed acceptance still belongs to exact artifact
-  receipts and recorded GUI outcomes.
-- Upstream `90bbe15b` records Irzhy's verified Base 8453 evidence and changes
-  Chain provider source, tests and protected-content documentation.
-  The branch preserves the published
-  protected-content repairs and includes that evidence once. It also retains
-  upstream collaboration and Browser local-exit orphan cleanup.
-- Irzhy's updated PR43 repair, `58ebfb23`, is included in the local source.
-  Runtime adopts fully completed mint records after a lost intent completion
-  mark. Ambiguous or partial records fail closed; partial custody cleanup and
-  installed mint/restart acceptance remain open. The current named-policy
-  helper already resolves the auth lint warning; the updated PR43 drops its
-  earlier lint suppression.
-- The protected-content source path remains inactive. Installed proof and one
-  atomic cutover remain open.
+  `2f844cef`, key reconstruction `467a6c03`, custody provider `1b7fa732`,
+  Wallet rights `c9e82e75`, Runtime `a8ac6dc8`, and rights `3627da01`.
+  Every tip is an ancestor of the published lifecycle and is already present
+  in the active integration. The latest published protected-branch repairs
+  need no new extraction.
+- `main` and `origin/upstream/0.7.1-dev` already include the reviewed Home
+  audit fixes, the named principal-root write policy, checkout-bound test
+  fixtures, the privacy-reviewed audit workbook, the completed-mint adoption
+  repair from `58ebfb23`, and the equivalent CPU watcher optimization at
+  `8e53174f`. The reviewed donor `e4d897f6` is the source comparison, not an
+  ancestor. New local inclusions still require CI on their exact revision;
+  installed product acceptance stays separate.
+- `origin/upstream/0.7.1-dev` also carries Irzhy's verified Base 8453 probe
+  evidence, shared build-artifact staging, upstream collaboration work, and
+  Browser local-exit orphan cleanup. The protected-content source path remains
+  inactive. Installed proof on isolated localhost, the seed and third custody
+  node, and one atomic cutover remain open.
 - Commits `3026992b`, `ed7a8bfc`, and `7f6e47f9` provide portable listing
   publication and import, buyer purchase, and buyer open, read, and close
   without creator Runtime mint state. The package binds the public custody
@@ -197,8 +169,8 @@ The active local branch preserves the verified deployed read behavior:
 - An unknown KID reverts with `UnboundContentId(bytes16)`; a bound KID without
   access returns `false`.
 
-`origin/upstream/0.7-dev@90bbe15b` records Irzhy's deployed Base 8453 probe
-evidence, already included in this branch:
+`origin/upstream/0.7.1-dev@c511b133` includes Irzhy's deployed Base 8453 probe
+evidence from `90bbe15b`, already present in this branch:
 
 - `CentralStorage.bindIP(bytes16,address,uint256)` accepts acknowledged
   contracts only and is called by `AssetFactory.registerNewAsset`.
@@ -709,12 +681,12 @@ complete. Installed proof and the atomic authority cutover remain open.
 - Public-install branch-binary smokes must pin the installer-selected components manifest.
 - Public-install branch-binary smokes prevent source checkout `components.json` from leaking into installed-path proof.
 - Public-install branch-binary smokes fail if the selected gateway lacks the current `home` setup profile.
-- Branch-override public smokes require a staged or published 0.6.0-compatible
+- Branch-override public smokes require a staged or published release-compatible
   manifest with the current `home` profile and checksummed artifacts.
 - Source/local Carrier setup proof stays in `scripts/local-carrier-setup-smoke.sh`.
-- Public install proof for an integrated candidate requires a staged or published
-  0.6.0-compatible manifest with the current `home` profile and checksummed
-  artifacts.
+- Public install proof for an integrated candidate requires a staged or
+  published release-compatible manifest with the current `home` profile and
+  checksummed artifacts.
 - Set `ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1` only when the publisher relay
   path itself is under review.
 - Integrated 0.7 installed-path proof waits for one reviewed source tree and
