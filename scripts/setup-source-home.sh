@@ -614,6 +614,7 @@ APP_CAPSULES=(
     archive-manager
     inbox
     assistant
+    home-agent
     wallet
     wallet-metamask
     wallet-unisat
