@@ -153,6 +153,10 @@ class FakeElement {
     }
   }
 
+  get childElementCount() {
+    return this.children.length;
+  }
+
   querySelector(selector) {
     if (!this.queries.has(selector)) {
       const child = new FakeElement(`${this.selector} ${selector}`);
@@ -487,6 +491,8 @@ const firstRunSummary = {
 };
 
 shellCore.initializeShellLayout(firstRunSummary);
+shellCore.shellState.currentSummary = firstRunSummary;
+shellSurface.renderDesktop(firstRunSummary);
 assert(
   JSON.stringify(shellCore.shellState.shellLayoutState.taskbar) === JSON.stringify([
     "browser",
@@ -524,6 +530,14 @@ assert(
   JSON.stringify(shellCore.shellState.shellLayoutState.desktop) === JSON.stringify({}),
   "fresh layout seeded desktop entry positions for an empty desktop",
   shellCore.shellState.shellLayoutState.desktop,
+);
+assert(
+  elementForSelector("#desktop-first-run-hint").hidden === false,
+  "fresh empty desktop did not show the launcher hint",
+  {
+    visibleTargets: firstRunSummary.targets.map((target) => target.target),
+    desktopChildren: elementForSelector("#desktop-shortcuts").children.length,
+  },
 );
 
 const storedEmptyTaskbarSummary = {

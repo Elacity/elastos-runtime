@@ -204,7 +204,7 @@ img {
 .home-unlock-brand-word {
   font-size: 15px;
   font-weight: 650;
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
 }
 
 .home-unlock .home-unlock-clock {
@@ -219,7 +219,7 @@ img {
   color: rgba(245, 245, 247, 0.94);
   font-size: clamp(22px, 3.2vw, 28px);
   font-weight: 500;
-  letter-spacing: -0.015em;
+  letter-spacing: 0;
   line-height: 1.15;
   text-shadow: 0 1px 18px rgba(0, 0, 0, 0.4);
 }
@@ -229,7 +229,7 @@ img {
   color: #f5f5f7;
   font-size: clamp(72px, 12.5vw, 112px);
   font-weight: 500;
-  letter-spacing: -0.035em;
+  letter-spacing: 0;
   line-height: 0.94;
   font-variant-numeric: tabular-nums;
   text-shadow: 0 3px 28px rgba(0, 0, 0, 0.38);
@@ -284,7 +284,7 @@ img {
   color: #fff;
   font-size: 28px;
   font-weight: 650;
-  letter-spacing: -0.04em;
+  letter-spacing: 0;
   box-shadow:
     0 0 0 1.5px rgba(96, 165, 250, 0.88),
     0 8px 28px rgba(0, 0, 0, 0.28);
@@ -302,7 +302,7 @@ img {
   color: #f5f5f7;
   font-size: 14px;
   font-weight: 600;
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
   text-align: center;
   pointer-events: none;
   text-shadow: 0 1px 10px rgba(0, 0, 0, 0.35);
@@ -459,7 +459,7 @@ img {
   color: var(--brand-strong);
   font-size: 12px;
   font-weight: 800;
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
   text-transform: uppercase;
 }
 

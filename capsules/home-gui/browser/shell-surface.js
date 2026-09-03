@@ -135,11 +135,10 @@ export function renderDesktop(summary) {
   syncDesktopFirstRunHint();
 }
 
-/* First-contact teaching (shown once per browser): after the desktop stopped
-   carrying app icons, a fresh user must still get a visible answer to "where
-   are my apps". The hint sits above the dock and retires forever the first
+/* First-contact teaching (session-only): after the desktop stopped carrying
+   app icons, a fresh user must still get a visible answer to "where are my
+   apps". The hint sits above the dock and retires for this session the first
    time the launcher opens or the hint itself is clicked. */
-const DESKTOP_HINT_KEY = "elastos.shell.desktopHintDone";
 let desktopHintBound = false;
 
 function desktopFirstRunHintNode() {
@@ -152,7 +151,10 @@ function syncDesktopFirstRunHint() {
     return;
   }
   const done = desktopHintDismissedThisSession;
-  const show = !done && allVisibleTargets(shellState.currentSummary).length === 0;
+  const show =
+    !done &&
+    allVisibleTargets(shellState.currentSummary).length > 0 &&
+    desktopShortcuts.childElementCount === 0;
   hint.hidden = !show;
   launcherToggleButton?.classList.toggle("launcher-first-run", show);
   if (show && !desktopHintBound) {
