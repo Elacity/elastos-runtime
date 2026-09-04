@@ -59,6 +59,12 @@ import {
   updateTaskbarState,
 } from "./shell-surface.js?v=home-20260813a";
 import {
+  assistantFaceActive,
+  assistantSpaceActive,
+  hideAssistantFace,
+  retireAssistantSpace,
+} from "./shell-assistant-face.js?v=home-20260813a";
+import {
   attachAuthorizedTarget,
   closeWindow,
   cleanupBeforeUnload,
@@ -268,6 +274,7 @@ export function retireHomeGuiSurface(options = {}) {
   hideControlCentre({ restoreFocus: false });
   retireWalletRail();
   retireInboxRail();
+  retireAssistantSpace();
   retireConnectorSheet();
   hideAboutOverlay({ restoreFocus: false });
   hideQuickLook();
@@ -1332,12 +1339,30 @@ export function bindHomeGuiInteractions(options = {}) {
     hideLauncher();
   });
 
+  document.addEventListener("pointerdown", (event) => {
+    // With the room up, the screen below the menubar is the Assistant; only
+    // the menubar counts as outside. Pointer events inside the frame never
+    // reach here.
+    if (
+      assistantFaceActive() &&
+      !event.target.closest("#assistant-face") &&
+      !event.target.closest("#assistant-toggle") &&
+      !(assistantSpaceActive() && event.target.closest("#assistant-space"))
+    ) {
+      hideAssistantFace();
+    }
+  });
+
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && shellState.contextMenuOpen) {
       hideDesktopContextMenu({ restoreFocus: true });
     }
     if (event.key === "Escape" && !launcher.hidden) {
       hideLauncher();
+      return;
+    }
+    if (event.key === "Escape" && assistantFaceActive()) {
+      hideAssistantFace();
       return;
     }
     if (shouldIgnoreDesktopKeydown(event)) {

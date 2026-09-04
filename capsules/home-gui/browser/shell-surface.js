@@ -50,6 +50,8 @@ import {
   mutateDesktopObject,
   formatBadgeCount,
   focusModeEnabled,
+  pushUiPreferencesToFrameWindow,
+  escapeHtml,
 } from "./shell-core.js?v=home-20260813a";
 import {
   browserWindowEntries,
@@ -59,6 +61,9 @@ import {
   browserWindowDisplayTitle,
   activeBrowserTargetId,
   openTarget,
+  launchHomeTarget,
+  iframeSandboxForLaunch,
+  iframeAllowForLaunch,
   handleTaskbarTargetClick,
   showAllTargetWindows,
   hideAllTargetWindows,
@@ -66,6 +71,10 @@ import {
   focusWindow,
 } from "./shell-windows.js?v=home-20260813a";
 import { playUiSound } from "./shell-sounds.js?v=home-20260813a";
+import {
+  bindAssistantFace,
+  syncAssistantFaceAvailability,
+} from "./shell-assistant-face.js?v=home-20260813a";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
@@ -516,6 +525,7 @@ export function renderTaskbar(summary) {
   const populated = taskbarTargets.childElementCount > 0;
   const slotsBefore = populated ? snapshotDockSlots() : null;
   const dockWidthBefore = populated ? measureDockPillWidth() : 0;
+  syncAssistantFaceAvailability(summary);
   renderTaskbarEntries(summary);
   easeDockPillWidth(dockWidthBefore);
   glideDockSlots(slotsBefore);
@@ -2680,10 +2690,12 @@ function dockMagnifyEnabled() {
 }
 
 function rebuildDockIconCache() {
-  /* Launcher has no app container — keep it static (no magnify / lift / shift).
-     App icons still get the normal dock wave. */
+  /* Launcher and Assistant have no app container — keep them static (no
+     magnify / lift / shift). App icons still get the normal dock wave. */
   dockState.icons = Array.from(
-    dockState.taskbar.querySelectorAll(".taskbar-item:not(.taskbar-item-launcher)"),
+    dockState.taskbar.querySelectorAll(
+      ".taskbar-item:not(.taskbar-item-launcher):not(.taskbar-item-assistant)",
+    ),
   ).map((item) => {
     const rect = item.getBoundingClientRect();
     return {
@@ -2975,6 +2987,16 @@ export function bindShellSurfaceDom() {
     }
   });
   desktopContextMenu?.addEventListener("keydown", handleContextMenuKeydown);
+  bindAssistantFace({
+    easeDockPillWidth,
+    targetById,
+    mountGlyph,
+    launchHomeTarget,
+    iframeSandboxForLaunch,
+    iframeAllowForLaunch,
+    pushUiPreferencesToFrameWindow,
+    escapeHtml,
+  });
   setupDock();
   syncDockAutoHide();
   bindDockAutoHideReveal();

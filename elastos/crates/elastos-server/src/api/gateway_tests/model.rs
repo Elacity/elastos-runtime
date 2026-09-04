@@ -265,6 +265,72 @@ async fn model_runs_create_injects_verified_runtime_binding() {
 }
 
 #[tokio::test]
+async fn home_agent_capsule_runs_bind_and_audit_to_its_own_capsule_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = RecordingModelProvider::default();
+    let app = gateway_router(model_test_state(dir.path(), provider.clone()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let now = crate::auth::now_ts();
+    let grant = AuthSessionGrantV1 {
+        schema: AuthSessionGrantV1::SCHEMA.to_string(),
+        grant_id: format!("grant:{}", gateway_home_token::uuid_like_token()),
+        session_id: format!("auth:{}", gateway_home_token::uuid_like_token()),
+        principal_id: authority.principal_id.clone(),
+        proof_binding_id: authority.proof_binding_id.clone(),
+        issued_at: now,
+        expires_at: now + 12 * 60 * 60,
+        apps: vec!["home-agent".to_string()],
+    };
+    crate::auth::store_session_grant(dir.path(), grant.clone()).unwrap();
+    let token = issue_home_launch_token_for_auth_grant(dir.path(), "home-agent", &grant).unwrap();
+
+    let listed = app
+        .clone()
+        .oneshot(post_model(token.clone(), "offers_list", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(post_model(
+            token,
+            "runs_create",
+            json!({
+                "offer_id": "offer:local-text",
+                "operation": "text.generate",
+                "request_id": "request-home-agent-1",
+                "input": { "schema": "elastos.model.input.text/v1", "prompt": "User: hi\n\nAssistant:" },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = provider.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    let binding: RuntimeCreateBinding =
+        serde_json::from_value(requests[1]["runtime_binding"].clone()).unwrap();
+    assert_eq!(binding.capsule_id, "home-agent");
+    assert_eq!(binding.principal_id, authority.principal_id);
+    assert_eq!(binding.grant_id, grant.grant_id);
+    drop(requests);
+
+    let auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
+    let ours: Vec<_> = auth_state
+        .audit
+        .iter()
+        .filter(|event| event.event_type.starts_with("model.run_create"))
+        .collect();
+    assert_eq!(ours.len(), 2);
+    assert!(ours
+        .iter()
+        .all(|event| event.challenge_id.as_deref() == Some("request-home-agent-1")));
+    assert!(ours
+        .iter()
+        .all(|event| event.capsule_id.as_deref() == Some("home-agent")));
+}
+
+#[tokio::test]
 async fn model_run_access_injects_verified_runtime_binding() {
     let dir = tempfile::tempdir().unwrap();
     let provider = RecordingModelProvider::default();
