@@ -434,9 +434,11 @@ complete. Installed proof and the atomic authority cutover remain open.
   boundary.
 - A missing installed components manifest or model-provider entry leaves the
   provider unconfigured and unavailable. Runtime does not select a fallback.
-- Missing model-provider config is an honest zero-offer state: Runtime may
-  start/register the provider with no offers, writes no config file, and
-  Assistant shows that no model offers are available.
+- The current localhost installation has no
+  `providers/model-provider/config.json`, so the provider reports an honest
+  zero-offer state. The current provider can call an OpenAI-compatible Chat
+  Completions backend. It does not yet own a local engine lifecycle, implement
+  an OpenAI/Codex-class Responses adapter, or publish a remote model service.
 - `model-provider` now accepts the Runtime Init envelope fields
   `base_path`, `allowed_paths`, `read_only`, `encryption_key`, and `extra`
   without weakening strict unknown-field handling. The zero-offer stdio Init

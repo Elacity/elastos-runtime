@@ -471,17 +471,28 @@ installed behavior and public-live behavior require separate evidence.
 - [ ] Keep unfinished surfaces out of the main live path unless they launch from Home and return cleanly.
 - [ ] Rehearse and simplify the Home/People/Spaces/System story so the front door feels useful without internal-runtime narration.
 - [ ] Extend `elastos.runtime.services/v1` beyond local configured-provider cards and conversation offers: remote Exit, storage, relay, model, and hosting offers must arrive as provider-backed `elastos.service.offer/v1` records through People/Carrier, and enabling one must create/select a principal-scoped provider grant instead of giving capsules direct People-state authority.
-  - [ ] Model Provider subtask: the local typed model service now exists behind
-    the verified `model-provider` Runtime path and Assistant uses only typed
-    offers and runs. The remaining open work is the later remote
-    service-offer path: provider-backed model offers through People/Carrier,
-    principal-scoped provider grants, and the same typed invoke/stream/cancel
-    contract across local and remote providers. Runtime uses Carrier below its
-    own routing decision, and capsules receive no backend URL, credential,
-    topology, endpoint DID, or Carrier peer. Keep a full Runtime on
-    Spark/Jetson as the first supported remote host and define
-    a smaller provider host only after it has identity, lifecycle, update,
-    audit, and recovery parity.
+  - [ ] Model Provider subtask: keep one typed `model-provider` contract and
+    complete it in this order:
+
+    1. evaluate Qwen3.5-9B Q4_K_M as the Mac baseline and PrismML Bonsai 8B Q1
+       as the low-memory comparison; keep Qwen3.8-27B and Bonsai 27B as later
+       benchmark candidates
+    2. install and prove the `model-provider` llama.cpp engine lifecycle on
+       macOS Metal, including verified artifacts, health, limits, stream,
+       cancel, restart, shutdown, and orphan cleanup
+    3. prove hosted adapters locally through the current Chat Completions seam,
+       then add the provider-internal Responses adapter and prove explicit
+       provider, cost, privacy, limits, requested selector, resolved model, and
+       fallback facts
+    4. add optional `elastos.service.offer/v1` publication with an
+       operator-selected offer, Runtime policy, and a principal-scoped grant
+    5. run a full Runtime on Jetson and prove the signed model service over
+       Carrier before considering a smaller provider host
+
+    Runtime keeps publication, grants, quotas, selection, routing, and audit.
+    The provider keeps backend URLs, credentials, process details, and topology
+    private. Model artifacts remain immutable content installed through the
+    content-provider path.
 - [ ] Promote principal-owned Appearance state into a DID-anchored profile/settings object that syncs through Carrier/provider policy and projects back into `localhost://Users/<principal-root>/.AppData/ElastOS/Home/Appearance/...` per trusted device.
 - [ ] Keep `Apps` as the public catalog term and `capsules` as the internal/runtime term; do not expose both as competing public nouns.
 - [ ] Keep settings in `System`; keep files, documents, and provider-backed storage in their owning apps instead of recreating a generic System Storage section.

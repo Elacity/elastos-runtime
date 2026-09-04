@@ -27,6 +27,39 @@ A tool call or effect proposal returned by a model is untrusted input. The
 Agent Host must submit it as a new typed Runtime operation under the active
 agent principal and session.
 
+## Deployment and placement
+
+ElastOS has one typed model-provider contract: `offers_list`, `runs_create`,
+`runs_get`, `runs_events`, and `runs_cancel`. A Runtime can use a configured
+offer backed by a local engine or a hosted API. Local and remote service use are
+placements of the same capability, not separate public model APIs, providers,
+or journals.
+
+An operator explicitly selects a configured capability for publication under
+Runtime policy. The owning Runtime publishes it as an
+`elastos.service.offer/v1` service and owns grants, quotas, selection, audit,
+and routing. The destination Runtime authorizes each remote request
+independently. Carrier authenticates and transports the route that Runtime
+selects; it does not grant model authority. Hosted credentials and local model
+artifacts stay inside their owning boundaries.
+
+The owning Runtime DID signs the service offer, which names the admitted
+provider capability and contains only bounded capability and policy facts. The
+provider identity remains an internal execution binding. Backend URLs,
+credentials, process details, and topology stay inside the model provider. A
+model artifact is separate immutable content. Its canonical package identity
+is the CID of the complete manifest-and-payload closure. Engine, component, and
+payload hashes are verification facts rather than package identities. Runtime
+installs the package through the content provider path described in
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
+
+A hosted web API is a provider-internal HTTPS interoperability edge on the
+Runtime that owns the credential. Mac to local model provider to hosted API is
+local configured use. Mac Runtime to Carrier to a Jetson or seed Runtime, then
+to that Runtime's model provider and backend, is service use. Ordinary capsules
+see only typed `elastos://model/*` resources. Publishing a paid hosted offer
+requires operator-owned quota, accounting, and data-policy facts.
+
 ## Selection policy
 
 A request uses one explicit selection mode:
@@ -148,6 +181,41 @@ That configuration stays behind the provider boundary. Product UI should
 show the requested selector, resolved model when known, and whether explicit
 fallback was enabled. Canonical architecture documents do not freeze a
 commercial model name or claim that a catalog entry will remain available.
+
+Hosted configuration records privacy policy, cost and rate limits, requested
+selector, resolved model when the backend reports it, and explicit fallback
+policy. Credentials start in the current owner-only provider config. Secret
+indirection can use an existing secure service when one is available; it does
+not require a new secret store.
+
+## Staged delivery path
+
+Implement and prove the path in this order:
+
+1. Evaluate Qwen3.5-9B Q4_K_M as the stable Mac baseline and PrismML Bonsai 8B
+   Q1 as an experimental low-memory comparison on an M5 Mac with 24 GB of
+   memory. Qwen3.8-27B and Bonsai 27B remain later benchmark candidates rather
+   than initial defaults.
+2. Use llama.cpp as the common first engine for macOS Metal and later Jetson
+   CUDA. Pin engine and model provenance. Runtime verifies installed artifacts;
+   the model provider owns start, health, limits, streaming, cancellation,
+   shutdown, restart, and orphan cleanup. Consider MLX only if the common
+   engine path proves insufficient.
+3. Prove hosted inference locally. Use the current OpenAI-compatible Chat
+   Completions seam where it conforms for OpenRouter, Venice, and xAI/Grok. Add
+   one provider-internal Responses adapter for OpenAI/Codex-class backends.
+4. Add optional service publication after local lifecycle and hosted paths pass.
+   Publish only an operator-selected configured capability with a signed offer
+   and principal-scoped grant.
+5. Prove remote inference with a full Runtime on Jetson, then publish a signed
+   service offer and route the granted operation through Carrier. Design a
+   smaller provider host only after the full Runtime path establishes its need.
+
+Installed acceptance covers Brave inference, ordered streaming, reconnect,
+cancellation, one terminal result, restart, engine crash and orphan cleanup,
+secret and endpoint redaction, and explicit paid provider choice. Remote proof
+also covers disconnect and reconnect. Model output and tool proposals remain
+untrusted and cannot authorize effects.
 
 ## Conformance requirements
 
