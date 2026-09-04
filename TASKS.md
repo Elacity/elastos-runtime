@@ -481,9 +481,9 @@ installed behavior and public-live behavior require separate evidence.
        macOS Metal, including verified artifacts, health, limits, stream,
        cancel, restart, shutdown, and orphan cleanup
     3. prove hosted adapters locally through the current Chat Completions seam,
-       then add the provider-internal Responses adapter and prove explicit
-       provider, cost, privacy, limits, requested selector, resolved model, and
-       fallback facts
+       then add the provider-internal OpenAI Responses API adapter and prove
+       explicit provider, cost, privacy, limits, requested selector, resolved
+       model, and fallback facts
     4. add optional `elastos.service.offer/v1` publication with an
        operator-selected offer, Runtime policy, and a principal-scoped grant
     5. run a full Runtime on Jetson and prove the signed model service over
@@ -708,6 +708,8 @@ and applicable CI lessons. Current video uses `elacity-player`; document and
 
 - [ ] Evaluate WebAuthn PRF and passkey-derived wallet keys only after passkeys are stable as runtime-session and wallet-provider approval gates.
 - [ ] Define the browser host-adapter model without faking Linux parity, using the Browser/Net/Exit ABI above so server, desktop, mobile, and kiosk hosts expose the same capability contract.
-- [ ] Decide the longer-term operator packaging path for Codex and related AI/agent surfaces.
+- [ ] Define the later Codex SDK agent-execution adapter and its operator
+  packaging. Keep it behind typed agent operations and explicit filesystem,
+  network, tool, and approval grants. Keep Codex out of model offers.
 - [ ] Evaluate public dKMS only after permissioned dKMS has release receipts, share rotation, monitoring, node admission policy, staking/slashing assumptions, and external crypto review.
 - [ ] Consider renaming `elastos-server` crate to `elastos-cli`. It is the CLI binary + all commands, not just a server. The current name misleads new developers about what the crate does.

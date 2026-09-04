@@ -438,7 +438,11 @@ complete. Installed proof and the atomic authority cutover remain open.
   `providers/model-provider/config.json`, so the provider reports an honest
   zero-offer state. The current provider can call an OpenAI-compatible Chat
   Completions backend. It does not yet own a local engine lifecycle, implement
-  an OpenAI/Codex-class Responses adapter, or publish a remote model service.
+  a provider-internal OpenAI Responses API adapter, or publish a remote model
+  service.
+- The current source does not integrate the Codex SDK. Codex remains a later
+  agent-execution adapter behind typed agent operations and explicit
+  filesystem, network, tool, and approval grants. It is not a model offer.
 - `model-provider` now accepts the Runtime Init envelope fields
   `base_path`, `allowed_paths`, `read_only`, `encryption_key`, and `extra`
   without weakening strict unknown-field handling. The zero-offer stdio Init

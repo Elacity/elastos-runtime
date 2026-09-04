@@ -60,6 +60,16 @@ to that Runtime's model provider and backend, is service use. Ordinary capsules
 see only typed `elastos://model/*` resources. Publishing a paid hosted offer
 requires operator-owned quota, accounting, and data-policy facts.
 
+The OpenAI Responses API is one provider-internal hosted model adapter. It
+creates model responses behind the same typed model-provider contract. It does
+not provide local Codex agent execution.
+
+Codex integration is a separate, later agent-execution adapter. It controls
+local Codex agent threads behind typed agent operations. Runtime admits each
+operation through explicit filesystem, network, tool, and approval grants.
+Codex can use a model internally, but it is not a model offer and does not
+appear in `offers_list`.
+
 ## Selection policy
 
 A request uses one explicit selection mode:
@@ -203,7 +213,7 @@ Implement and prove the path in this order:
    engine path proves insufficient.
 3. Prove hosted inference locally. Use the current OpenAI-compatible Chat
    Completions seam where it conforms for OpenRouter, Venice, and xAI/Grok. Add
-   one provider-internal Responses adapter for OpenAI/Codex-class backends.
+   one provider-internal OpenAI Responses API adapter.
 4. Add optional service publication after local lifecycle and hosted paths pass.
    Publish only an operator-selected configured capability with a signed offer
    and principal-scoped grant.
