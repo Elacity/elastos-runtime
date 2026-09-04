@@ -491,10 +491,23 @@ function sortedDesktopTargets(summary) {
 export function initializeShellLayout(summary) {
   syncHomeBrowserState(summary);
   const stored = shellState.homeBrowserState.layout;
+  const storedDesktop = stored && stored.desktop && typeof stored.desktop === "object"
+    ? stored.desktop
+    : {};
   const normalizedDesktopHidden = normalizeDesktopHiddenTargets(
     stored ? stored.desktopHidden : defaultHiddenDesktopTargets(summary),
     summary,
   );
+  if (stored) {
+    for (const target of allVisibleTargets(summary)) {
+      if (
+        !Object.prototype.hasOwnProperty.call(storedDesktop, target.target) &&
+        !normalizedDesktopHidden.includes(target.target)
+      ) {
+        normalizedDesktopHidden.push(target.target);
+      }
+    }
+  }
   shellState.shellLayoutState = {
     taskbar: normalizeTaskbarLayout(
       stored ? stored.taskbar : defaultTaskbarPins(summary),
@@ -513,15 +526,13 @@ export function initializeShellLayout(summary) {
       normalizedDesktopHidden,
     ) ||
     typeof stored.desktopIconsVisible !== "boolean";
-  const storedDesktop = stored && stored.desktop && typeof stored.desktop === "object"
-    ? stored.desktop
-    : {};
   const occupiedPositions = [];
-  const layoutEntries = (
-    stored
-      ? desktopLayoutEntries(summary)
-      : desktopLayoutEntries(summary).filter((entry) => desktopEntryExists(summary, entry.id))
-  );
+  const layoutEntries = stored
+    ? desktopLayoutEntries(summary).sort((left, right) => (
+      Number(Object.prototype.hasOwnProperty.call(storedDesktop, right.id)) -
+      Number(Object.prototype.hasOwnProperty.call(storedDesktop, left.id))
+    ))
+    : desktopLayoutEntries(summary).filter((entry) => desktopEntryExists(summary, entry.id));
   for (const [index, entry] of layoutEntries.entries()) {
     const defaultPosition = defaultDesktopPosition(index);
     const storedPosition = storedDesktop[entry.id];

@@ -565,8 +565,15 @@ assert(
   shellCore.shellState.shellLayoutState.taskbar,
 );
 assert(
-  JSON.stringify(shellCore.shellState.shellLayoutState.desktopHidden) === JSON.stringify(["wallet", "browser"]),
-  "stored desktopHidden changed without required normalization",
+  JSON.stringify(shellCore.shellState.shellLayoutState.desktopHidden) === JSON.stringify([
+    "wallet",
+    "browser",
+    "chat-room",
+    "system",
+    "documents",
+    "object-target",
+  ]),
+  "targets absent from an existing desktop layout did not start hidden",
   shellCore.shellState.shellLayoutState.desktopHidden,
 );
 assert(
@@ -579,6 +586,41 @@ assert(
   }),
   "stored desktop positions were not preserved for saved hidden targets",
   shellCore.shellState.shellLayoutState.desktop,
+);
+
+const upgradedLayoutSummary = {
+  authority: { signed_in: true },
+  targets: [
+    { target: "home-agent", title: "Home Agent", route: "/apps/home-agent/" },
+    { target: "wallet", title: "Wallet", route: "/apps/wallet/" },
+  ],
+  browser_state: {
+    principal_id: "principal:upgraded-layout",
+    layout: {
+      desktop: { wallet: { x: 12, y: 12 } },
+      taskbar: ["wallet"],
+      desktopHidden: [],
+      desktopIconsVisible: true,
+    },
+  },
+};
+
+shellCore.initializeShellLayout(upgradedLayoutSummary);
+assert(
+  JSON.stringify(shellCore.shellState.shellLayoutState.desktopHidden) === JSON.stringify(["home-agent"]),
+  "newly installed target became visible on an existing desktop",
+  shellCore.shellState.shellLayoutState,
+);
+assert(
+  shellCore.isTargetOnDesktop("wallet") === true &&
+    JSON.stringify(shellCore.shellState.shellLayoutState.desktop.wallet) === JSON.stringify({ x: 12, y: 12 }),
+  "existing visible desktop target or its position changed during upgrade",
+  shellCore.shellState.shellLayoutState,
+);
+assert(
+  JSON.stringify(shellCore.shellState.shellLayoutState.taskbar) === JSON.stringify(["wallet"]),
+  "saved taskbar pins changed while hiding a newly installed target",
+  shellCore.shellState.shellLayoutState.taskbar,
 );
 
 const peopleStyle = readFileSync(
@@ -1085,6 +1127,25 @@ const restored = shellWindows.normalizeRestorableSession(summary, {
   ],
 });
 
+const restoredWithHomeAgent = shellWindows.normalizeRestorableSession(
+  {
+    ...summary,
+    targets: [
+      ...summary.targets,
+      { target: "home-agent", title: "Home Agent", route: "/apps/home-agent/" },
+    ],
+  },
+  {
+    root_shell: "home-gui",
+    windows: [{ target: "home-agent", active: true }],
+  },
+);
+assert(
+  restoredWithHomeAgent.length === 0,
+  "Home Agent was restored as a normal browser window",
+  restoredWithHomeAgent,
+);
+
 const rootlessSessionRestoredIntoGui = shellWindows.normalizeRestorableSession(summary, {
   windows: [
     { target: "browser", query: { url: "https://example.com/rootless" } },
@@ -1161,6 +1222,14 @@ shellWindows.configureWindowHooks({
     };
   },
 });
+
+shellWindows.openTarget("home-agent");
+shellWindows.handleTaskbarTargetClick("home-agent");
+assert(
+  restoredBrowserLaunches.length === 0 && shellCore.shellState.windows.size === 0,
+  "Home Agent activation created a normal browser window or launch",
+  { launches: restoredBrowserLaunches, windows: [...shellCore.shellState.windows.keys()] },
+);
 
 {
   const spotlight = elementForSelector("#spotlight");

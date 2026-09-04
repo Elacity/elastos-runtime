@@ -34,6 +34,8 @@ const components = JSON.parse(read("components.json"));
 const gateway = read("elastos/crates/elastos-server/src/api/gateway.rs");
 const gatewayHomeAgent = read("elastos/crates/elastos-server/src/api/gateway_home_agent.rs");
 const homeFace = read("capsules/home-gui/browser/shell-assistant-face.js");
+const homeWindows = read("capsules/home-gui/browser/shell-windows.js");
+const homeSurface = read("capsules/home-gui/browser/shell-surface.js");
 const homeGui = read("capsules/home-gui/browser/home-gui.js");
 const shellStages = read("capsules/home-gui/browser/shell-stages.js");
 const localCarrierSetup = read("scripts/local-carrier-setup-smoke.sh");
@@ -114,6 +116,19 @@ assert.ok(
 /* ---- ownership split with Home GUI ---------------------------------------- */
 
 assert.ok(homeFace.includes('const TARGET_ID = "home-agent"'));
+assert.ok(
+  homeWindows.includes('const HOME_AGENT_TARGET_ID = "home-agent"') &&
+    (homeWindows.match(/targetId === HOME_AGENT_TARGET_ID/g) || []).length === 3 &&
+    (homeWindows.match(/showAssistantFace\(\);/g) || []).length === 2,
+  "Home Agent target activation and session restore must stay on the one Assistant face",
+);
+assert.ok(
+  /export function openSelectedLauncherTarget\(\)[\s\S]{0,180}openTarget\(shellState\.selectedLauncherTargetId\)/.test(homeSurface) &&
+    /if \(action === "open-target"\)[\s\S]{0,220}openTarget\(shellState\.contextMenuTarget\.targetId\)/.test(homeSurface) &&
+    /function attachTargetIconInteractions\(node, targetId, source\)[\s\S]{0,2600}handleTaskbarTargetClick\(targetId\)/.test(homeSurface) &&
+    /function attachTargetIconInteractions\(node, targetId, source\)[\s\S]{0,2600}openTarget\(targetId\)/.test(homeSurface),
+  "desktop, launcher, taskbar, keyboard, and context-menu activation must converge on Home target activation",
+);
 assert.ok(homeFace.includes("event.source !== frame.contentWindow"), "Home pins Agent messages to its frame");
 assert.ok(!/document\.querySelector\(/.test(harnessHost), "the host seam never reaches Home's DOM");
 assert.ok(harnessHost.includes("window.parent.postMessage(message, \"*\")"), "Home is reached by message");
