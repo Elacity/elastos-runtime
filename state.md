@@ -15,9 +15,13 @@ volatile proof logs remain outside the repository.
   changelog, manifest bumps, and lock refresh. Installed artifacts report
   `0.7.0` only after the checked publish flow stamps
   `ELASTOS_RELEASE_VERSION`; unstamped source builds report `0.7.0-dev`.
-- Active review branches are
-  `origin/feat/protected-content-installed-provisioning@4d688cc5` (PR52) and
-  `origin/feat/home-first-run-seed-0.7.1@2a49ea57` (PR54).
+- Local candidate `900d7e5c` has tree `c9a9effe` and is 30 commits ahead of
+  `origin/upstream/0.7.1-dev@c511b133`. It contains the reviewed PR52 source at
+  `origin/feat/protected-content-installed-provisioning@4d688cc5`, PR54 at
+  `origin/feat/home-first-run-seed-0.7.1@2a49ea57`, and the PR55 Home Agent
+  source from `origin/feat/home-shelf-assistant-face-0.7.1@923193bb`. PR54 and
+  PR55 remain the original feature review slices. The tested candidate still
+  needs publication and combined team review before a merge decision.
 - The published protected-content stack is contracts `0c56c56a`, custody
   `2f844cef`, key reconstruction `467a6c03`, custody provider `1b7fa732`,
   Wallet rights `c9e82e75`, Runtime `a8ac6dc8`, and rights `3627da01`.
@@ -29,8 +33,10 @@ volatile proof logs remain outside the repository.
   fixtures, the privacy-reviewed audit workbook, the completed-mint adoption
   repair from `58ebfb23`, and the equivalent CPU watcher optimization at
   `8e53174f`. The reviewed donor `e4d897f6` is the source comparison, not an
-  ancestor. New local inclusions still require CI on their exact revision;
-  installed product acceptance stays separate.
+  ancestor. The candidate source passes formatting, alignment, Home and Browser
+  entropy, Home shell, People discovery, the 26-case Browser close handshake,
+  and Home Agent shell checks. Remote CI remains separate from these local
+  checks.
 - `origin/upstream/0.7.1-dev` also carries Irzhy's verified Base 8453 probe
   evidence, shared build-artifact staging, upstream collaboration work, and
   Browser local-exit orphan cleanup. The protected-content source path remains
@@ -68,6 +74,39 @@ volatile proof logs remain outside the repository.
   Older Assistant and migration donors retain explicit deferred tasks.
   Preserve unique history and original dirty files until their owners approve
   cleanup; published source does not make every older hunk equivalent.
+
+## Installed candidate proof
+
+- The isolated localhost installation at `localhost:61380` has source commit
+  `900d7e5c` and tree `c9a9effe`. This is installed acceptance for that local
+  candidate. It is not seed, third-node, or cutover proof.
+- The manual Brave journey opened and inspected System, Home launcher and
+  windows, Profile and People, Chat, Inbox, Wallet, Marketplace, Services,
+  Library, Archive, Documents, Player, standalone Assistant, Home Agent, GBA
+  Emulator, Nonogram Advance, uCity, and Browser. Home fullscreen fills the
+  workspace and returns to the saved layout.
+- Both games render and their expected controls work. Browser opened
+  `ela.city` through the VZ adapter and closed with no per-launch supervisor or
+  TURN server residue. Startup took about 34.5 seconds. Transient TURN
+  authentication failures occurred before allocation succeeded, so startup
+  latency and those diagnostics need follow-up.
+- Home Agent opens from the desktop and from Ask Assistant into the Home-owned
+  Agent Space. The installation has no configured model offer and reports that
+  state directly. This does not prove model inference.
+- People reports discovery as unavailable because the isolated Home has no
+  collaboration configuration. The pending Wallet approval remained unchanged
+  during the journey.
+- Protected-content acceptance is blocked on one real three-node custody
+  composition, private Chain and RPC configuration, three replicas, funded
+  creator and buyer accounts, and installed two-Runtime proof. No mint, buy,
+  playback, seed, third-node, or cutover claim follows from this localhost run.
+- First-run work remains open. Recovery Kit navigation and readiness are slow
+  and indirect. Profile creation should carry the display name into the form
+  and guide the exact create action.
+- Standalone Assistant and Home Agent are both installed pending an explicit
+  product decision. The final default product should present one clear Agent
+  surface. Multiple local Brave app copies can create duplicate Dock and
+  recent-app entries; this is local operator hygiene, not product architecture.
 
 ## Integrated Source Truth
 
@@ -402,15 +441,36 @@ complete. Installed proof and the atomic authority cutover remain open.
   `base_path`, `allowed_paths`, `read_only`, `encryption_key`, and `extra`
   without weakening strict unknown-field handling. The zero-offer stdio Init
   test passes with the Runtime envelope in source tests.
-- Assistant is a standalone first-party capsule. Chat, Build, and Studio use
-  only typed Runtime model resources and the protected Assistant workspace;
-  transcript copy goes only through the trusted Home Clipboard path.
+- Assistant is a standalone first-party capsule with its own protected
+  workspace. Its tested Chat, Build, and Studio behavior uses typed model
+  offers and runs. Transcript copy goes only through the trusted Home
+  Clipboard path.
+- Home Agent is the Home-owned Agent face. Home GUI owns the Shelf transition
+  to its composer, Agent Space, and `launchHomeTarget`. `home-agent` owns
+  sessions, transcript, composer, and settings. Runtime owns the protected,
+  revisioned workspace and model-proxy binding.
+- Home Agent uses the typed `offers_list`, `runs_create`, `runs_events`, and
+  `runs_cancel` operations. Its Home message contract is pinned. The source has
+  one Shelf and one Home-owned Agent face, and the Agent room stays in the
+  Space ring. Fixes `450db538` and `900d7e5c` keep activation, message routing,
+  and saved layout upgrades on that canonical path without a duplicate generic
+  window.
+- Runtime accepts one opaque, bounded workspace envelope for this local
+  contract. Typed document schemas remain future work when a cross-authority
+  operation needs them.
 - Assistant model messages render a self-contained safe markdown subset with
   escaped HTML, inert links, headings/lists/blockquotes/tables, fenced and
   inline code, and inline/display math through vendored KaTeX 0.18.3. Focused
   source proof lives in `scripts/assistant-shell-smoke.mjs`. The Home audit
   records observed UI behavior separately; configured model-run and advanced
   workflow acceptance remain open.
+- Home Agent is the canonical Home-integrated Agent surface. Standalone
+  Assistant remains installed while the product inventories and tests its
+  distinct working behavior. It can remain as an explicitly scoped optional
+  app, or its useful behavior can move before removal. Future Home Agent tools,
+  Library reads, web search, Studio, Usage, and sampling controls require their
+  typed Runtime operations first. The zero-offer Home Agent state is installed
+  proof of honest absence, not configured inference.
 
 ## System Truth
 
