@@ -310,16 +310,16 @@ preserved; an older implementation is not evidence that it fits current contract
   ancestry, then remove their clean worktrees and local branches.
 - [ ] Inventory the remaining historical branches, archive refs, worktrees, and
   stale remote-tracking namespaces. Bundle or retain unique evidence; remove only
-  clean, proven duplicates. Do not mix pre-0.6 archive work into this post-0.6
+  clean, proven duplicates. Do not mix historical archive work into the active
   product branch.
 
-### 0.6 release follow-up boundary
+### Established product follow-up boundary
 
 - [ ] Keep Browser included but explicitly limited: address intermittent
   restart, non-retained `ela.city` login, and slow performance before claiming
   full Browser reliability. Preserve exact-once Wallet approval and
   Runtime-only networking while fixing these issues.
-- [ ] Decide the post-0.6 policy for plaintext principal roots. The current
+- [ ] Decide the policy for plaintext principal roots. The current
   hidden upgrade migrates only roots that already have protection metadata; it
   is not a general 0.5-to-0.6 data migration. Either provide an explicit,
   user-approved reset for unprotected roots or design a separately reviewed
@@ -333,7 +333,7 @@ preserved; an older implementation is not evidence that it fits current contract
   its deferred Assistant scope is reviewed. The reviewed shell and UIUX work is
   included in `main` and `origin/upstream/0.7.1-dev`; any further extraction needs a source comparison against
   the current ESP contracts.
-- [ ] Resume Carrier reconciliation for 0.7 only after its provider generation,
+- [ ] Resume Carrier reconciliation only after its provider generation,
   multi-node physical evidence, cleanup, and release boundaries are reviewed.
 
 ### 0. Branch readiness and reviewability
@@ -347,8 +347,8 @@ installed behavior and public-live behavior require separate evidence.
 - [ ] Keep this branch reviewable: split changes into coherent commit slices with no corrective commits, no hidden migrations, and no unrelated local artifacts.
 - [ ] Keep oversized-file cleanup frozen unless branch review exposes a concrete no-behavior blocker. The existing Browser/Wallet/provider cleanup is already split into focused sibling modules: Browser gateway, Wallet gateway, Wallet UI send/receive/create/request/state/preference flows, wallet-provider EVM crypto, and wallet-provider approval test groups. Keep those seams stable and verified. Do not split `capsules/browser/browser/browser.js` further unless a diagnostic-frame/session seam is proven mechanical and behavior-free. Treat `gateway_tests/room.rs`, `gateway_room.rs`, `gateway_tests/home_system.rs`, `room_service.rs`, `auth_gateway.rs`, and `home_cmd.rs` as later cleanup unless they become direct release-review blockers. Keep `scripts/home-entropy-check.mjs` as a broad alignment gate for now, but do not let it accumulate new product logic. Each future split must be no-behavior, separately testable, and covered by the narrow Rust/JS smoke commands for that surface.
 - [ ] Review this branch in authority-bound slices, not as one Browser mega-diff: content availability/protected content providers, chain provider core, auth/recovery core, Wallet authority surface, Home/System UX, Chat/Carrier updates, capsule authority manifests, Browser ABI/adapter, Browser proof tooling, shared runtime/gateway, then release/registry/docs. Each slice must be a coherent commit with its own verification commands. Shared runtime/gateway hunks require manual hunk-level review because they cross provider boundaries. Keep `chain_provider_core` separate from Browser: typed proof, prepare, broadcast, sync health, and node lifecycle are blockchain-quadrant provider work, even when Browser consumes them through Wallet. Keep `auth_recovery_core` separate from route wiring: passkey/WebAuthn verification, proof-bound sessions, principal roots, and Recovery Kit helpers are authority primitives consumed by Home/System/Wallet gateway routes. The Wallet authority surface should be reviewed as provider authority core, Wallet app and connector capsules, then gateway/Inbox/audit wiring only after shared gateway hunks are isolated. For Home/System UX, run `node scripts/home-passkey-virtual-auth-smoke.mjs` on loopback Home to prove signed passkey journeys without a human cookie, then run the Camofox smokes for layout coverage. For Browser ABI/provider work, run the Browser Rust tests, `scripts/check-wci-alignment.sh`, `node scripts/home-entropy-check.mjs`, `node scripts/browser-display-mode-smoke.mjs`, `scripts/browser-wallet-bridge-smoke.sh`, and `scripts/browser-glide-wallet-smoke.sh`. Browser proof tooling must keep provider decision reports, objective audits, and runbooks structured and fail closed while product media/manual evidence is missing. Each slice must name its verification commands and must not claim Browser completion unless `scripts/browser-objective-audit.mjs` passes with accepted product media plus matching manual UX evidence.
-- [ ] Do not reopen the accepted 0.6 reconciliation except for a newly proven
-  released-line defect with a named owner and verification command. ESP,
+- [ ] Do not reopen the accepted released-line reconciliation except for a newly
+  proven defect with a named owner and verification command. ESP,
   Wallet, Recovery, Home authority, GBA, and the bounded Browser continuation
   are reconciled in [state.md](state.md). The reviewed shell/UIUX is included;
   broader Carrier reconciliation and advanced Assistant workflows remain
@@ -366,9 +366,9 @@ installed behavior and public-live behavior require separate evidence.
 - [ ] Keep the Browser provider proof language explicit: Selkies is the current self-hosted baseline, not the acceptance answer. Native/browser-product proof must stay tied to `browser-native-supervisor-smoke.sh`, `browser-native-proxy-engine-smoke.sh`, `browser-native-supervisor-proxy-smoke.sh`, `browser-native-operator-config.mjs`, and `browser-native-target-preflight.sh`; Browser wallet connector effects must keep `wallet-connector-transaction-smoke.mjs` in the verification set.
 - [ ] Keep protected-content release claims exact: `scripts/browser-ela-city-protected-content-open-smoke.sh` proves that Runtime Browser can open the known `ela.city` protected-content route and cleanly release the page session, and the current branch has a funded live purchase/playback proof for the known test path. Release notes may cite that current user journey, but must not claim arbitrary protected-content readiness, production dDRM completeness, dKMS readiness, or generic decrypt/render provider completion.
 
-### Released 0.6.x product-proof and follow-up debt
-- [ ] Review execution order for maintaining and rechecking released 0.6.x
-  follow-up evidence and product-proof debt against released `main`:
+### Released-product proof and follow-up
+- [ ] Review execution order for maintaining and rechecking product proof against
+  released `main`:
   1. Keep reusable source/review gates green on this branch:
      `git diff --check`, `node scripts/home-entropy-check.mjs`,
      `node scripts/browser-entropy-check.mjs`,

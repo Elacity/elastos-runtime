@@ -216,9 +216,8 @@ complete. Installed proof and the atomic authority cutover remain open.
 ## Capsule Execution Truth
 
 - [docs/CAPSULE_MODEL.md](docs/CAPSULE_MODEL.md#isolation-boundary)
-  defines the cross-branch isolated-execution contract. It is a 0.6
-  architecture requirement introduced by 0.6, not proof that every first-party
-  app is already a Component.
+  defines the standing cross-branch isolated-execution contract, not proof that
+  every first-party app is already a Component.
 - The ESP branch proves a useful substrate slice: the Component runner and
   conformance fixture use no linked WASI, environment, filesystem preopen,
   FIFO, raw socket, or gateway authority, and every guest effect is linked
@@ -299,8 +298,8 @@ complete. Installed proof and the atomic authority cutover remain open.
 
 ## Browser Truth
 
-- Browser is included in 0.6.0 as a bounded Runtime Browser, not as a fully
-  reliable general-purpose Browser claim.
+- Browser is included as a bounded Runtime Browser, not as a fully reliable
+  general-purpose Browser claim.
 - Browser launch, TURN/media-relay connection, Runtime-mediated traffic, exact
   terminal close, and zero-residue behavior require fresh target evidence for
   the exact integrated commit. Human-visible video, input, scrolling, and audio
@@ -310,8 +309,7 @@ complete. Installed proof and the atomic authority cutover remain open.
   and exactly one `eth_requestAccounts` handoff producing one pending Wallet
   account-access approval.
 - One failed Browser restart followed by a successful open, lost `ela.city`
-  login state across restart, and slow performance remain explicit post-0.6
-  follow-ups.
+  login state across restart, and slow performance remain explicit follow-ups.
 - Runtime owns Browser launch settlement and exact cleanup obligations. The
   close path acknowledges authority renewal, binds close to the exact Browser
   instance, and keeps nonterminal cleanup ownership durable.
@@ -322,7 +320,7 @@ complete. Installed proof and the atomic authority cutover remain open.
   `storage_posture=principal_owned_reset_scoped_unprotected`.
 - Principal-root object protection exists for selected Home/runtime state; this does not include Browser VM Chromium profile disks yet.
 - Product-readiness claims remain gated on target-specific objective audit and
-  matching manual UX evidence; inclusion in 0.6.0 does not waive that gate.
+  matching manual UX evidence; source inclusion does not waive that gate.
 
 ## Browser Provider Evidence
 
@@ -689,7 +687,7 @@ complete. Installed proof and the atomic authority cutover remain open.
   checksummed artifacts.
 - Set `ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1` only when the publisher relay
   path itself is under review.
-- Integrated 0.7 installed-path proof waits for one reviewed source tree and
+- Integrated installed-path proof waits for one reviewed source tree and
   matching stable installation receipts on each target role.
 
 ## Open Blockers

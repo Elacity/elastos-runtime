@@ -187,11 +187,14 @@ capsules, provider config, and `components.json`.
 - Avoid volatile proof logs in durable docs. Store open work in `TASKS.md`,
   verified current truth in `state.md`, and release history in
   `elastos/CHANGELOG.md`.
-- Keep standing instructions, READMEs, contracts and roadmaps independent of
-  the current release. Branch heads, PR numbers, commit IDs, CI results and
-  installation snapshots belong in `state.md` or a dated evidence record.
-  Contract versions, dependency pins and artifact provenance stay with the
-  contract or artifact they identify.
+- Keep product documentation release-neutral. Use version numbers only for
+  exact release state, compatibility or migration, release notes or changelogs,
+  manifests, and exact Git refs or evidence. Keep standing instructions,
+  READMEs, contracts, and roadmaps independent of the current release.
+  Branch heads, PR numbers, commit IDs, CI results, and installation snapshots
+  belong in `state.md` or a dated evidence record. Contract versions,
+  dependency pins, and artifact provenance stay with the contract or artifact
+  they identify.
 
 ## Verification Gate
 
