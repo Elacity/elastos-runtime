@@ -21,7 +21,7 @@ import {
 import { stampMessageNode, contentHash, newTurnId, createTurnManifest, turnStorePut, turnStorePatch, turnStoreGet, TurnState, cheapTurnSnapshot, resolveReasoningPolicy } from "./agent-context.js";
 import { setAgentComposerProcessing } from "./agent-shelf.js";
 import { renderHarnessPage } from "./agent-configure.js";
-import { showViewerRail } from "./harness-host.js";
+import { postToHome } from "./harness-host.js";
 import {
   createProgressController,
   snapshotProgress,
@@ -356,7 +356,7 @@ function formatInlineMarkdown(escaped) {
        by a digit — keeps "costs $5 and $10" as plain text. */
     .replaceAll(/\$([^\s$](?:[^$\n]*[^\s$])?)\$(?!\d)/g, (_, tex) => renderMath(tex, false))
     .replaceAll(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, label, href) => {
-      return `<a class="agent-md-a" href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+      return `<button type="button" class="agent-md-a" data-open-browser-url="${href}">${label}</button>`;
     })
     .replaceAll(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     .replaceAll(/\*([^*\n]+)\*/g, "<em>$1</em>")
@@ -1059,7 +1059,7 @@ function paintUserMessageBody(body, text, { parts = null, modelText = "" } = {})
 export function appendMessage(
   role,
   text,
-  { streaming = false, asHtml = false, msgIndex = null, parts = null, modelText = "" } = {},
+  { streaming = false, msgIndex = null, parts = null, modelText = "" } = {},
 ) {
   const stream = host.streamEl();
   if (!stream) {
@@ -1076,9 +1076,7 @@ export function appendMessage(
 
   const body = document.createElement("div");
   body.className = "agent-msg-body";
-  if (asHtml) {
-    body.innerHTML = text;
-  } else if (role === "agent") {
+  if (role === "agent") {
     paintAgentMessageBody(body, text, { streaming });
   } else {
     paintUserMessageBody(body, text, { parts, modelText });
@@ -1155,17 +1153,20 @@ export function openCodeArtifact(code, lang = "") {
   const language = String(lang || "code").trim() || "code";
   const title = `${language} snippet`;
   const mimeType = "text/plain";
-  showViewerRail({
-    target: "documents",
-    title,
-    kind: "code",
-    query: { view: "read" },
-    deliver: {
-      type: "documents:open-chat-attachment",
-      attachmentId: `code-${Date.now()}`,
-      fileName: `snippet.${language === "code" ? "txt" : language.replace(/[^a-z0-9]/gi, "") || "txt"}`,
-      mimeType,
-      dataUrl: `data:${mimeType};base64,${utf8ToBase64(body)}`,
+  postToHome({
+    type: "home-agent:open-viewer",
+    request: {
+      target: "documents",
+      title,
+      kind: "code",
+      query: { view: "read" },
+      deliver: {
+        type: "documents:open-chat-attachment",
+        attachmentId: `code-${Date.now()}`,
+        fileName: `snippet.${language === "code" ? "txt" : language.replace(/[^a-z0-9]/gi, "") || "txt"}`,
+        mimeType,
+        dataUrl: `data:${mimeType};base64,${utf8ToBase64(body)}`,
+      },
     },
   });
 }

@@ -154,7 +154,7 @@ const OPAQUE_FRAME_TARGET = "*";
 
 await ensureHomeGuiDom();
 bindIdentityMenu();
-bindShellSurfaceDom();
+bindShellSurfaceDom({ openHomeGuiTargetWithPayload });
 bindSpotlight();
 bindNotificationCenter();
 bindSetupSheet();

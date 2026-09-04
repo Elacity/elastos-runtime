@@ -2973,7 +2973,7 @@ function setupDock() {
    lazy GUI template — these nodes do not exist at module-evaluation time. */
 let shellSurfaceDomBound = false;
 
-export function bindShellSurfaceDom() {
+export function bindShellSurfaceDom(options = {}) {
   if (shellSurfaceDomBound) {
     return;
   }
@@ -2998,6 +2998,8 @@ export function bindShellSurfaceDom() {
     iframeAllowForLaunch,
     pushUiPreferencesToFrameWindow,
     escapeHtml,
+    openTarget,
+    openHomeGuiTargetWithPayload: options.openHomeGuiTargetWithPayload,
   });
   setupDock();
   syncDockAutoHide();

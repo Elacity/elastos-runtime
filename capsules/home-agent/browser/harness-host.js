@@ -83,14 +83,6 @@ export function setActiveStage(stageId) {
 
 export function syncSpacePager() {}
 
-export function enableHarnessMenubarReveal() {
-  postToHome({ type: "home-agent:menubar-reveal", enabled: true });
-}
-
-export function clearHarnessMenubarReveal() {
-  postToHome({ type: "home-agent:menubar-reveal", enabled: false });
-}
-
 /* ---- shell-windows: workspace persistence seam ----------------------------
    The workspace is a Runtime object: /api/apps/home-agent/workspace, bound to
    this capsule's launch token, principal-root protected, revisioned. The
@@ -184,12 +176,6 @@ async function persistAgentWorkspaceNow() {
     }
   })();
   return persistInFlight;
-}
-
-/* ---- rails: Home surfaces the harness asks to open ------------------------ */
-
-export function showViewerRail(request) {
-  postToHome({ type: "home-agent:open-viewer", request: request && typeof request === "object" ? request : {} });
 }
 
 /* ---- messaging ------------------------------------------------------------- */

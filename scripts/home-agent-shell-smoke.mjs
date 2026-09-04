@@ -25,6 +25,7 @@ const capsuleScripts = readdirSync(capsuleDir)
 
 const agentLive = read("capsules/home-agent/browser/agent-live.js");
 const agentStream = read("capsules/home-agent/browser/agent-stream.js");
+const agentHarness = read("capsules/home-agent/browser/agent-harness.js");
 const harnessHost = read("capsules/home-agent/browser/harness-host.js");
 const entry = read("capsules/home-agent/browser/home-agent.js");
 const indexHtml = read("capsules/home-agent/browser/index.html");
@@ -33,6 +34,9 @@ const components = JSON.parse(read("components.json"));
 const gateway = read("elastos/crates/elastos-server/src/api/gateway.rs");
 const gatewayHomeAgent = read("elastos/crates/elastos-server/src/api/gateway_home_agent.rs");
 const homeFace = read("capsules/home-gui/browser/shell-assistant-face.js");
+const homeGui = read("capsules/home-gui/browser/home-gui.js");
+const shellStages = read("capsules/home-gui/browser/shell-stages.js");
+const localCarrierSetup = read("scripts/local-carrier-setup-smoke.sh");
 
 /* ---- typed model contract, in source ------------------------------------- */
 
@@ -100,13 +104,42 @@ assert.equal(manifest.name, "home-agent");
 const methods = manifest.interfaces.flatMap((i) => i.methods.map((m) => m.operation)).sort();
 assert.deepEqual(methods, ["offers_list", "runs_cancel", "runs_create", "runs_events"]);
 assert.ok(components.external?.["home-agent"], "components.json installs home-agent");
+assert.ok(
+  localCarrierSetup.includes('HOME_AGENT_CAPSULE_DIR="${REPO_ROOT}/capsules/home-agent"') &&
+    localCarrierSetup.includes('"home-agent": pathlib.Path(os.environ["HOME_AGENT_CAPSULE_DIR"])') &&
+    localCarrierSetup.includes('"${DATA_DIR}/capsules/home-agent/browser/index.html"'),
+  "the local Carrier setup fixture stages and verifies home-agent",
+);
 
 /* ---- ownership split with Home GUI ---------------------------------------- */
 
 assert.ok(homeFace.includes('const TARGET_ID = "home-agent"'));
+assert.ok(homeFace.includes("event.source !== frame.contentWindow"), "Home pins Agent messages to its frame");
 assert.ok(!/document\.querySelector\(/.test(harnessHost), "the host seam never reaches Home's DOM");
 assert.ok(harnessHost.includes("window.parent.postMessage(message, \"*\")"), "Home is reached by message");
 assert.ok(entry.includes("event.source === window.parent"), "messages are accepted from Home only");
+assert.ok(
+  !capsuleScripts.some(([, source]) => source.includes("home-agent:menubar-reveal")) &&
+    !homeFace.includes("home-agent:menubar-reveal") &&
+    shellStages.includes('classList.add("stage-menubar-reveal")'),
+  "the existing Home stage owns menubar reveal without a second Agent seam",
+);
+assert.ok(
+  agentStream.includes('data-open-artifact="1"') &&
+    agentStream.includes('type: "home-agent:open-viewer"') &&
+    homeFace.includes('openHomeGuiTargetWithPayload("documents", payload)') &&
+    homeGui.includes("bindShellSurfaceDom({ openHomeGuiTargetWithPayload })"),
+  "the visible code action uses Home's existing Documents delivery path",
+);
+assert.ok(
+  agentStream.includes('data-open-browser-url="${href}"') &&
+    agentHarness.includes('type: "home-agent:open-browser"') &&
+    homeFace.includes('openTarget("browser", { query: { url } })') &&
+    !agentStream.includes('target="_blank"'),
+  "HTTP links use the source-pinned Home Browser handoff instead of capsule popups",
+);
+assert.ok(!agentStream.includes("asHtml"), "appendMessage has no unused HTML option");
+assert.ok(!agentStream.includes("body.innerHTML = text"), "appendMessage has no raw HTML branch");
 assert.ok(!indexHtml.includes('data-sidebar-nav="usage"'), "Usage nav is gone");
 assert.ok(!indexHtml.includes('data-sidebar-nav="studio"'), "Studio nav is gone");
 for (const theatre of [
@@ -157,6 +190,87 @@ assert.ok(!/Planning weekend|calm weekend/.test(read("capsules/home-agent/browse
 /* ---- the pure contract module -------------------------------------------- */
 
 const contract = await import(new URL("model-contract.js", capsuleDir));
+const homeMessageContract = await import(
+  new URL("capsules/home-gui/browser/home-agent-message-contract.js", root)
+);
+
+const codeBytes = Buffer.from("const answer = 42;", "utf8").toString("base64");
+const viewerMessage = {
+  type: "home-agent:open-viewer",
+  request: {
+    target: "documents",
+    title: "javascript snippet",
+    kind: "code",
+    query: { view: "read" },
+    deliver: {
+      type: "documents:open-chat-attachment",
+      attachmentId: "code-123",
+      fileName: "snippet.js",
+      mimeType: "text/plain",
+      dataUrl: `data:text/plain;base64,${codeBytes}`,
+    },
+  },
+};
+assert.deepEqual(
+  homeMessageContract.normalizeHomeAgentViewerPayload(viewerMessage),
+  viewerMessage.request.deliver,
+);
+for (const invalid of [
+  { ...viewerMessage, extra: true },
+  { ...viewerMessage, request: { ...viewerMessage.request, target: "library" } },
+  {
+    ...viewerMessage,
+    request: {
+      ...viewerMessage.request,
+      deliver: { ...viewerMessage.request.deliver, fileName: "../secret" },
+    },
+  },
+  {
+    ...viewerMessage,
+    request: {
+      ...viewerMessage.request,
+      deliver: { ...viewerMessage.request.deliver, dataUrl: "data:text/plain;base64,***=" },
+    },
+  },
+  {
+    ...viewerMessage,
+    request: {
+      ...viewerMessage.request,
+      deliver: { ...viewerMessage.request.deliver, extra: true },
+    },
+  },
+]) {
+  assert.equal(homeMessageContract.normalizeHomeAgentViewerPayload(invalid), null);
+}
+assert.equal(
+  homeMessageContract.normalizeHomeAgentViewerPayload({
+    ...viewerMessage,
+    request: {
+      ...viewerMessage.request,
+      deliver: {
+        ...viewerMessage.request.deliver,
+        dataUrl: `data:text/plain;base64,${"A".repeat(350_000)}`,
+      },
+    },
+  }),
+  null,
+);
+assert.equal(
+  homeMessageContract.normalizeHomeAgentBrowserUrl({
+    type: "home-agent:open-browser",
+    url: "https://example.com/docs?q=agent",
+  }),
+  "https://example.com/docs?q=agent",
+);
+for (const invalid of [
+  { type: "home-agent:open-browser", url: "ftp://example.com/file" },
+  { type: "home-agent:open-browser", url: "https://user@example.com/" },
+  { type: "home-agent:open-browser", url: " https://example.com/" },
+  { type: "home-agent:open-browser", url: "https://example.com/", extra: true },
+  { type: "home-agent:open-browser", url: `https://example.com/${"x".repeat(2_048)}` },
+]) {
+  assert.equal(homeMessageContract.normalizeHomeAgentBrowserUrl(invalid), "");
+}
 
 const offersPayload = {
   status: "ok",

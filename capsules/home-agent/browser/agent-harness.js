@@ -14,10 +14,9 @@ import {
 import {
   shellState,
   desktopObjects,
+  postToHome,
 } from "./harness-host.js";
 import {
-  enableHarnessMenubarReveal,
-  clearHarnessMenubarReveal,
   agentStageId,
   desktopStageId,
   getActiveStageId,
@@ -884,9 +883,6 @@ export function showAgentHarness({
   /* Already open (e.g. Agent button while harness visible) — keep room, optional send. */
   if (active && !prompt) {
     harness.classList.add("is-visible");
-    if (document.body.classList.contains("agent-harness-settled")) {
-      enableHarnessMenubarReveal();
-    }
     if (syncStage && !isAgentSpace(getActiveStageId())) {
       setActiveStage(agentStageId(), {
         announce: false,
@@ -926,7 +922,6 @@ export function showAgentHarness({
   const motionGen = (harnessMotionGen += 1);
   active = true;
   closeHarnessDrawer();
-  clearHarnessMenubarReveal();
   document.body.classList.add("agent-harness-active");
   if (!prefersReducedMotion()) {
     document.body.classList.add("agent-harness-dropping");
@@ -1002,7 +997,6 @@ function scheduleHarnessSettled(motionGen) {
     }
     document.body.classList.remove("agent-harness-dropping");
     document.body.classList.add("agent-harness-settled");
-    enableHarnessMenubarReveal();
     syncComposerGeometry();
   }, prefersReducedMotion() ? 40 : HOME_BREATHE_MS);
 }
@@ -1014,7 +1008,6 @@ function teardownHarnessDom(motionGen) {
   }
   const harness = harnessEl();
   stopDockGeometryObserver();
-  clearHarnessMenubarReveal();
   document.body.classList.remove("agent-harness-active", "agent-harness-rising");
   /* Column CSS vars stay; the next raise measures the pill again. */
   if (harness) {
@@ -1060,7 +1053,6 @@ export function hideAgentHarness({ syncStage = true } = {}) {
 
   const harness = harnessEl();
   harness?.classList.remove("is-visible");
-  clearHarnessMenubarReveal();
   document.body.classList.remove("agent-harness-settled", "agent-harness-dropping");
   document.body.classList.add("agent-harness-rising");
 
@@ -1407,6 +1399,15 @@ export function bindAgentHarness() {
       const code = block?.querySelector("code")?.textContent || "";
       const lang = openCode.dataset.lang || "code";
       openCodeArtifact(code, lang);
+      return;
+    }
+    const webLink = event.target.closest?.("[data-open-browser-url]");
+    if (webLink) {
+      event.preventDefault();
+      postToHome({
+        type: "home-agent:open-browser",
+        url: webLink.dataset.openBrowserUrl || "",
+      });
       return;
     }
     const copyCode = event.target.closest?.(".agent-md-copy");

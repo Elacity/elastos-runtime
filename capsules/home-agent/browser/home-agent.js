@@ -14,8 +14,8 @@
      capsule → Home   home-agent:ready             module booted, frame can be shown
                       home-agent:shelf-metrics     composer pill size, so Home's pill matches
                       home-agent:close             user asks to leave from inside (Home, Esc)
-                      home-agent:menubar-reveal    harness asks Home to tuck / reveal the menubar
-                      home-agent:open-viewer       artifact to show in Home's viewer rail */
+                      home-agent:open-viewer       artifact to show in Documents
+                      home-agent:open-browser      web link to open in Browser */
 
 import { bindAgentShelf, raiseComposerFace, agentShelfFaceActive, composerInput } from "./agent-shelf.js";
 import {

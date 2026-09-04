@@ -20,7 +20,8 @@
    opaque-sandboxed so target origin is "*"):
      Home → capsule   home-agent:open | home-agent:shelf-handover {on} | home-agent:close
      capsule → Home   home-agent:ready | home-agent:shelf-metrics {width,height,radius}
-                      home-agent:close | home-agent:open-viewer */
+                      home-agent:close | home-agent:open-viewer {request}
+                      home-agent:open-browser {url} */
 
 import {
   closeOtherShellPopovers,
@@ -33,6 +34,10 @@ import {
   isAgentSpace,
   setActiveStage,
 } from "./shell-stages.js?v=home-20260813a";
+import {
+  normalizeHomeAgentBrowserUrl,
+  normalizeHomeAgentViewerPayload,
+} from "./home-agent-message-contract.js?v=home-20260813a";
 
 const FACE_ID = "assistant-face";
 const TARGET_ID = "home-agent";
@@ -358,6 +363,20 @@ function onFrameMessage(event) {
         hideAssistantFace();
       }
       break;
+    case "home-agent:open-viewer": {
+      const payload = normalizeHomeAgentViewerPayload(message);
+      if (payload && typeof deps?.openHomeGuiTargetWithPayload === "function") {
+        deps.openHomeGuiTargetWithPayload("documents", payload);
+      }
+      break;
+    }
+    case "home-agent:open-browser": {
+      const url = normalizeHomeAgentBrowserUrl(message);
+      if (url && typeof deps?.openTarget === "function") {
+        deps.openTarget("browser", { query: { url } });
+      }
+      break;
+    }
     default:
       break;
   }
