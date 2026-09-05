@@ -1,4 +1,8 @@
-use crate::contract::{validate_trimmed, OfferPolicySummary, OfferSummary, MODEL_POLICY_SCHEMA};
+use crate::contract::{
+    validate_bounded_trimmed, HostedOfferDisclosure, OfferPolicySummary, OfferSummary,
+    HOSTED_PLACEMENT, HOSTED_SELECTION_PINNED, MODEL_POLICY_SCHEMA, SINGLE_DISPATCH_NO_RETRY,
+    UPSTREAM_FALLBACK_OPERATOR_ASSERTED_DISABLED,
+};
 use anyhow::Result;
 use elastos_model_contract::model_input_hash;
 use serde::{Deserialize, Serialize};
@@ -22,6 +26,10 @@ pub const MAX_MODALITY_BYTES: usize = 64;
 pub const MAX_URL_BYTES: usize = 2 * 1024;
 pub const MAX_SECRET_BYTES: usize = 4 * 1024;
 pub const MAX_MODEL_BYTES: usize = 128;
+pub const MAX_HOSTED_PROVIDER_LABEL_BYTES: usize = 128;
+pub const MAX_HOSTED_POLICY_REF_BYTES: usize = 2 * 1024;
+pub const MAX_BACKEND_COST_BYTES: usize = 128;
+pub const MAX_BACKEND_COST_UNIT_BYTES: usize = 64;
 pub const MAX_POLL_INTERVAL_MS: u64 = 300_000;
 pub const MAX_CONCURRENCY_LIMIT: u32 = 64;
 pub const MAX_INPUT_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
@@ -143,6 +151,71 @@ pub struct LocalLlamaSettings {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostedDisclosureConfig {
+    pub backend_provider_label: String,
+    pub selection_mode: String,
+    pub privacy_policy_ref: String,
+    pub terms_ref: String,
+    pub upstream_routing_fallback_assertion: String,
+}
+
+impl HostedDisclosureConfig {
+    fn validate(&self) -> Result<()> {
+        validate_bounded_trimmed(
+            &self.backend_provider_label,
+            "hosted backend_provider_label",
+            MAX_HOSTED_PROVIDER_LABEL_BYTES,
+        )?;
+        if self.selection_mode != HOSTED_SELECTION_PINNED {
+            anyhow::bail!("hosted selection_mode must be pinned");
+        }
+        validate_bounded_trimmed(
+            &self.privacy_policy_ref,
+            "hosted privacy_policy_ref",
+            MAX_HOSTED_POLICY_REF_BYTES,
+        )?;
+        validate_bounded_trimmed(
+            &self.terms_ref,
+            "hosted terms_ref",
+            MAX_HOSTED_POLICY_REF_BYTES,
+        )?;
+        if self.upstream_routing_fallback_assertion != UPSTREAM_FALLBACK_OPERATOR_ASSERTED_DISABLED
+        {
+            anyhow::bail!(
+                "hosted upstream_routing_fallback_assertion must be operator_asserted_disabled"
+            );
+        }
+        Ok(())
+    }
+
+    fn summary(&self, requested_selector: &str) -> HostedOfferDisclosure {
+        HostedOfferDisclosure {
+            placement: HOSTED_PLACEMENT.to_string(),
+            backend_provider_label: self.backend_provider_label.clone(),
+            selection_mode: self.selection_mode.clone(),
+            requested_selector: requested_selector.to_string(),
+            privacy_policy_ref: self.privacy_policy_ref.clone(),
+            terms_ref: self.terms_ref.clone(),
+            provider_request_policy: SINGLE_DISPATCH_NO_RETRY.to_string(),
+            upstream_routing_fallback_assertion: self.upstream_routing_fallback_assertion.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_hosted_disclosure() -> HostedDisclosureConfig {
+    HostedDisclosureConfig {
+        backend_provider_label: "Fixture Provider".to_string(),
+        selection_mode: HOSTED_SELECTION_PINNED.to_string(),
+        privacy_policy_ref: "fixture:privacy:v1".to_string(),
+        terms_ref: "fixture:terms:v1".to_string(),
+        upstream_routing_fallback_assertion: UPSTREAM_FALLBACK_OPERATOR_ASSERTED_DISABLED
+            .to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdapterConfig {
     OpenAiCompatibleText {
@@ -150,6 +223,7 @@ pub enum AdapterConfig {
         #[serde(default)]
         api_key: Option<String>,
         model: String,
+        hosted: HostedDisclosureConfig,
     },
     LocalLlamaCppText {
         engine: LocalArtifactConfig,
@@ -174,12 +248,14 @@ impl AdapterConfig {
                 api_url,
                 api_key,
                 model,
+                hosted,
             } => {
                 validate_url(api_url, "openai adapter api_url")?;
                 if let Some(api_key) = api_key.as_deref() {
                     validate_bounded_trimmed(api_key, "openai adapter api_key", MAX_SECRET_BYTES)?;
                 }
                 validate_bounded_trimmed(model, "openai adapter model", MAX_MODEL_BYTES)?;
+                hosted.validate()?;
             }
             Self::LocalLlamaCppText {
                 engine,
@@ -360,6 +436,12 @@ impl ConfiguredOffer {
     }
 
     pub fn summary(&self) -> OfferSummary {
+        let hosted = match &self.adapter {
+            AdapterConfig::OpenAiCompatibleText { model, hosted, .. } => {
+                Some(hosted.summary(model))
+            }
+            _ => None,
+        };
         OfferSummary {
             id: self.id.clone(),
             title: self.title.clone(),
@@ -368,6 +450,7 @@ impl ConfiguredOffer {
             output_modalities: self.output_modalities.clone(),
             stream_output: self.adapter.stream_output(),
             policy: self.policy.summary(),
+            hosted,
         }
     }
 
@@ -507,14 +590,6 @@ fn validate_exact_modalities(actual: &[String], expected: &[&str], label: &str) 
         if actual != expected {
             anyhow::bail!("{label} must be exactly {:?}", expected);
         }
-    }
-    Ok(())
-}
-
-fn validate_bounded_trimmed(value: &str, label: &str, max_bytes: usize) -> Result<()> {
-    validate_trimmed(value, label)?;
-    if value.len() > max_bytes {
-        anyhow::bail!("{label} exceeds {max_bytes} bytes");
     }
     Ok(())
 }
@@ -691,6 +766,7 @@ mod tests {
                 api_url: "https://example.test/v1/chat/completions".to_string(),
                 api_key: Some("secret-a".to_string()),
                 model: "gpt-test".to_string(),
+                hosted: test_hosted_disclosure(),
             },
             enabled: true,
         }
@@ -869,7 +945,14 @@ mod tests {
                     "adapter": {
                         "kind": "open_ai_compatible_text",
                         "api_url": "https://user@example.test/v1/chat#frag",
-                        "model": "gpt-test"
+                        "model": "gpt-test",
+                        "hosted": {
+                            "backend_provider_label": "Fixture Provider",
+                            "selection_mode": "pinned",
+                            "privacy_policy_ref": "fixture:privacy:v1",
+                            "terms_ref": "fixture:terms:v1",
+                            "upstream_routing_fallback_assertion": "operator_asserted_disabled"
+                        }
                     }
                 }]
             }),
@@ -1028,6 +1111,19 @@ mod tests {
     fn offer_summary_redacts_adapter_secrets_and_reports_streaming_truthfully() {
         let openai_summary = base_offer().summary();
         assert!(openai_summary.stream_output);
+        assert_eq!(
+            serde_json::to_value(&openai_summary).unwrap()["hosted"],
+            json!({
+                "placement": "hosted",
+                "backend_provider_label": "Fixture Provider",
+                "selection_mode": "pinned",
+                "requested_selector": "gpt-test",
+                "privacy_policy_ref": "fixture:privacy:v1",
+                "terms_ref": "fixture:terms:v1",
+                "provider_request_policy": "single_dispatch_no_retry",
+                "upstream_routing_fallback_assertion": "operator_asserted_disabled",
+            })
+        );
         let openai_json = serde_json::to_string(&openai_summary).unwrap();
         assert!(!openai_json.contains("example.test"));
         assert!(!openai_json.contains("secret-a"));
@@ -1035,9 +1131,31 @@ mod tests {
 
         let artifact_summary = artifact_offer("video.generate").summary();
         assert!(!artifact_summary.stream_output);
+        assert!(artifact_summary.hosted.is_none());
         let artifact_json = serde_json::to_string(&artifact_summary).unwrap();
         assert!(!artifact_json.contains("jobs.example.test"));
         assert!(!artifact_json.contains("token-a"));
+    }
+
+    #[test]
+    fn hosted_disclosure_requires_pinned_selection_and_operator_fallback_assertion() {
+        let mut offer = base_offer();
+        if let AdapterConfig::OpenAiCompatibleText { hosted, .. } = &mut offer.adapter {
+            hosted.selection_mode = "provider_auto".to_string();
+        }
+        assert!(offer.validate().is_err());
+
+        if let AdapterConfig::OpenAiCompatibleText { hosted, .. } = &mut offer.adapter {
+            hosted.selection_mode = HOSTED_SELECTION_PINNED.to_string();
+            hosted.upstream_routing_fallback_assertion = "disabled".to_string();
+        }
+        assert!(offer.validate().is_err());
+
+        let mut offer = base_offer();
+        if let AdapterConfig::OpenAiCompatibleText { hosted, .. } = &mut offer.adapter {
+            hosted.backend_provider_label = "Fixture\nProvider".to_string();
+        }
+        assert!(offer.validate().is_err());
     }
 
     #[test]

@@ -330,8 +330,8 @@ mod tests {
         AdapterConfig, ConfiguredOffer, LocalArtifactConfig, LocalLlamaSettings, OfferPolicy,
     };
     use crate::contract::{
-        model_input_hash, RunEvent, RuntimeAccessBinding, RuntimeCreateBinding, RUN_EVENT_SCHEMA,
-        RUN_OUTPUT_TEXT_SCHEMA,
+        model_input_hash, RunEvent, RuntimeAccessBinding, RuntimeCreateBinding,
+        BACKEND_REPORT_SCHEMA, RUN_EVENT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
     };
     use crate::journal::{deterministic_run_id, RunJournal, StoredRun};
     use elastos_model_contract::{RUNTIME_ACCESS_BINDING_SCHEMA, RUNTIME_CREATE_BINDING_SCHEMA};
@@ -622,6 +622,7 @@ mod tests {
                 api_url: format!("{base_url}/chat"),
                 api_key: Some("sentinel-openai-key".to_string()),
                 model: "sentinel-model".to_string(),
+                hosted: crate::config::test_hosted_disclosure(),
             },
             enabled: true,
         }
@@ -1010,6 +1011,7 @@ mod tests {
                     "offer_id": offer.id,
                     "operation": offer.operation,
                 }),
+                backend_report: None,
                 terminal: false,
             },
             RunEvent {
@@ -1017,6 +1019,7 @@ mod tests {
                 sequence: 2,
                 kind: "dispatched".to_string(),
                 data: json!({ "offer_id": offer.id }),
+                backend_report: None,
                 terminal: false,
             },
         ];
@@ -2651,6 +2654,9 @@ mod tests {
             second_terminal["data"]["terminal"]["output"]["text"],
             "reply:two"
         );
+        assert!(first_terminal["data"]["terminal"]
+            .get("backend_report")
+            .is_none());
         let lines = fake_llama_events(&events);
         assert_eq!(
             lines
@@ -2668,14 +2674,16 @@ mod tests {
         assert_eq!(repeated_init["status"], "error");
         assert_eq!(repeated_init["code"], "invalid_request");
 
+        let offers = send_request(
+            &provider,
+            ProviderOperation::OffersList,
+            json!({"op":"offers_list"}),
+        );
+        assert!(offers["data"]["offers"][0].get("hosted").is_none());
         let public = serde_json::to_string(&json!({
             "first": first_terminal,
             "second": second_terminal,
-            "offers": send_request(
-                &provider,
-                ProviderOperation::OffersList,
-                json!({"op":"offers_list"}),
-            ),
+            "offers": offers,
         }))
         .unwrap();
         for private in [
@@ -3012,7 +3020,229 @@ mod tests {
             vec!["prepared", "dispatched", "text_delta", "output"]
         );
         assert_eq!(events[2]["data"], json!({"text":"hello world"}));
+        let unknown_report = json!({
+            "schema": BACKEND_REPORT_SCHEMA,
+            "resolved_model": {"status": "unknown"},
+            "usage": {"status": "unknown"},
+            "cost": {"status": "unknown"},
+        });
+        assert_eq!(
+            terminal["data"]["terminal"]["backend_report"],
+            unknown_report
+        );
+        assert_eq!(events.last().unwrap()["backend_report"], unknown_report);
 
+        provider.shutdown_on_eof();
+    }
+
+    #[test]
+    fn hosted_stream_reports_and_durably_replays_backend_evidence() {
+        let server = start_server(vec![sse_action(
+            &[
+                json!({
+                    "model": "resolved-model",
+                    "choices": [{"delta": {"content": "ready"}}],
+                })
+                .to_string(),
+                json!({
+                    "model": "resolved-model",
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 7,
+                        "completion_tokens": 1,
+                        "total_tokens": 8,
+                        "cost": 0.0125,
+                        "cost_unit": "backend-credit",
+                    },
+                })
+                .to_string(),
+            ],
+            true,
+        )]);
+        let offer = local_text_offer(&server.base_url);
+        let root = temp_root("hosted-report-replay");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let offers = send_request(
+            &provider,
+            ProviderOperation::OffersList,
+            json!({"op": "offers_list"}),
+        );
+        assert_eq!(
+            offers["data"]["offers"][0]["hosted"],
+            json!({
+                "placement": "hosted",
+                "backend_provider_label": "Fixture Provider",
+                "selection_mode": "pinned",
+                "requested_selector": "sentinel-model",
+                "privacy_policy_ref": "fixture:privacy:v1",
+                "terms_ref": "fixture:terms:v1",
+                "provider_request_policy": "single_dispatch_no_retry",
+                "upstream_routing_fallback_assertion": "operator_asserted_disabled",
+            })
+        );
+        let input = text_input("reply ready");
+        let binding = create_binding("request:hosted-report", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap().to_string();
+        let terminal = wait_for_terminal(&provider, &run_id, &access_binding(&binding));
+        let expected_report = json!({
+            "schema": BACKEND_REPORT_SCHEMA,
+            "resolved_model": {"status": "reported", "value": "resolved-model"},
+            "usage": {
+                "status": "reported",
+                "value": {"input_tokens": 7, "output_tokens": 1, "total_tokens": 8},
+            },
+            "cost": {
+                "status": "reported",
+                "value": {"value": "0.0125", "unit": "backend-credit"},
+            },
+        });
+        assert_eq!(
+            terminal["data"]["terminal"]["output"],
+            json!({"schema": RUN_OUTPUT_TEXT_SCHEMA, "text": "ready"})
+        );
+        assert_eq!(
+            terminal["data"]["terminal"]["backend_report"],
+            expected_report
+        );
+        let page = events_page(&provider, &run_id, &access_binding(&binding), 0);
+        assert_eq!(page["data"]["has_more"], false);
+        assert_eq!(
+            page["data"]["events"].as_array().unwrap().last().unwrap()["backend_report"],
+            expected_report
+        );
+        assert_no_private_leakage(
+            &[offers.to_string(), terminal.to_string(), page.to_string()],
+            &[server.base_url.as_str(), "sentinel-openai-key"],
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+
+        provider.shutdown_on_eof();
+        let mut restarted = ProviderCoordinatorHandle::start();
+        init_provider(&restarted, &root, vec![offer]);
+        assert_eq!(
+            get_run(&restarted, &run_id, &access_binding(&binding))["data"]["terminal"]
+                ["backend_report"],
+            expected_report
+        );
+        let replayed_page = events_page(&restarted, &run_id, &access_binding(&binding), 0);
+        assert_eq!(replayed_page["data"]["events"], page["data"]["events"]);
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        restarted.shutdown_on_eof();
+    }
+
+    #[test]
+    fn conflicting_hosted_stream_facts_become_unknown_without_changing_text() {
+        let server = start_server(vec![sse_action(
+            &[
+                json!({
+                    "model": "resolved-a",
+                    "choices": [{"delta": {"content": "safe"}}],
+                    "usage": {
+                        "prompt_tokens": 7,
+                        "completion_tokens": 1,
+                        "total_tokens": 8,
+                        "cost": 0.1,
+                        "cost_unit": "backend-credit",
+                    },
+                })
+                .to_string(),
+                json!({
+                    "model": "resolved-b",
+                    "choices": [{"delta": {"content": " output"}}],
+                    "usage": {
+                        "prompt_tokens": 8,
+                        "completion_tokens": 1,
+                        "total_tokens": 9,
+                        "cost": 0.2,
+                        "cost_unit": "backend-credit",
+                    },
+                })
+                .to_string(),
+            ],
+            true,
+        )]);
+        let offer = local_text_offer(&server.base_url);
+        let root = temp_root("hosted-conflicting-facts");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let input = text_input("safe output");
+        let binding = create_binding("request:conflicting-facts", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+        assert_eq!(
+            terminal["data"]["terminal"]["output"],
+            json!({"schema": RUN_OUTPUT_TEXT_SCHEMA, "text": "safe output"})
+        );
+        assert_eq!(
+            terminal["data"]["terminal"]["backend_report"],
+            serde_json::to_value(crate::contract::BackendReport::unknown()).unwrap()
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        provider.shutdown_on_eof();
+    }
+
+    #[test]
+    fn malformed_optional_hosted_facts_are_unknown_and_backend_failure_is_not_retried() {
+        let server = start_server(vec![
+            sse_action(
+                &[json!({
+                    "model": "m".repeat(crate::config::MAX_MODEL_BYTES + 1),
+                    "choices": [{"delta": {"content": "safe"}}],
+                    "usage": {
+                        "prompt_tokens": "invalid",
+                        "cost": -0.5,
+                    },
+                })
+                .to_string()],
+                true,
+            ),
+            ResponseAction {
+                status_line: "503 Service Unavailable",
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                body: br#"{"error":"unavailable"}"#.to_vec(),
+                stalled_prefix: None,
+                stalled_suffix: None,
+                hold_open: None,
+                stalled_body_started: None,
+                stalled_response_entered: None,
+            },
+        ]);
+        let offer = local_text_offer(&server.base_url);
+        let root = temp_root("hosted-optional-facts");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let input = text_input("safe");
+        let binding = create_binding("request:malformed-facts", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+        assert_eq!(
+            terminal["data"]["terminal"]["output"],
+            json!({"schema": RUN_OUTPUT_TEXT_SCHEMA, "text": "safe"})
+        );
+        assert_eq!(
+            terminal["data"]["terminal"]["backend_report"],
+            serde_json::to_value(crate::contract::BackendReport::unknown()).unwrap()
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+
+        let input = text_input("fail once");
+        let binding = create_binding("request:backend-failure", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let failed = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+        assert_eq!(failed["data"]["status"], "failed");
+        assert_eq!(
+            failed["data"]["terminal"]["backend_report"],
+            serde_json::to_value(crate::contract::BackendReport::unknown()).unwrap()
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
         provider.shutdown_on_eof();
     }
 
@@ -3180,6 +3410,7 @@ mod tests {
                 sequence: 1,
                 kind: "prepared".to_string(),
                 data: json!({}),
+                backend_report: None,
                 terminal: false,
             },
             RunEvent {
@@ -3187,6 +3418,7 @@ mod tests {
                 sequence: 2,
                 kind: "dispatched".to_string(),
                 data: json!({"offer_id": offer.id}),
+                backend_report: None,
                 terminal: false,
             },
         ];
@@ -3230,6 +3462,7 @@ mod tests {
                 "offer_id": offer.id,
                 "operation": offer.operation,
             }),
+            backend_report: None,
             terminal: false,
         }];
         run.next_sequence = 2;

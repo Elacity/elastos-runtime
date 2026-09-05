@@ -1,15 +1,18 @@
 use crate::config::{
-    MAX_CANCEL_SETTLEMENT_TIMEOUT_MS, MAX_CONCURRENCY_LIMIT, MAX_EVENT_BYTES_LIMIT,
-    MAX_INLINE_OUTPUT_BYTES_LIMIT, MAX_INPUT_BYTES_LIMIT, MAX_MODALITIES_PER_OFFER,
-    MAX_MODALITY_BYTES, MAX_OFFER_ID_BYTES, MAX_OFFER_TITLE_BYTES, MAX_OPERATION_BYTES,
-    MAX_RETENTION_SECS, MAX_RUNTIME_MS_LIMIT, MAX_RUN_EVENT_AGGREGATE_BYTES_LIMIT,
-    MAX_RUN_EVENT_COUNT_LIMIT,
+    MAX_BACKEND_COST_BYTES, MAX_BACKEND_COST_UNIT_BYTES, MAX_CANCEL_SETTLEMENT_TIMEOUT_MS,
+    MAX_CONCURRENCY_LIMIT, MAX_EVENT_BYTES_LIMIT, MAX_HOSTED_POLICY_REF_BYTES,
+    MAX_HOSTED_PROVIDER_LABEL_BYTES, MAX_INLINE_OUTPUT_BYTES_LIMIT, MAX_INPUT_BYTES_LIMIT,
+    MAX_MODALITIES_PER_OFFER, MAX_MODALITY_BYTES, MAX_MODEL_BYTES, MAX_OFFER_ID_BYTES,
+    MAX_OFFER_TITLE_BYTES, MAX_OPERATION_BYTES, MAX_RETENTION_SECS, MAX_RUNTIME_MS_LIMIT,
+    MAX_RUN_EVENT_AGGREGATE_BYTES_LIMIT, MAX_RUN_EVENT_COUNT_LIMIT,
 };
 use crate::contract::{
     hex_hash, model_input_hash, validate_bounded_trimmed, validate_input_hash, validate_run_id,
-    OfferSummary, ProviderFault, RunError, RunEvent, RunStatus, RunTerminalOutcome, RunView,
-    RuntimeCreateBinding, MAX_EVENT_SEQUENCE, MODEL_POLICY_SCHEMA, RUN_EVENT_SCHEMA,
-    RUN_OUTPUT_CONTENT_SCHEMA, RUN_OUTPUT_OBJECT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
+    BackendCost, BackendFact, BackendReport, BackendTokenUsage, OfferSummary, ProviderFault,
+    RunError, RunEvent, RunStatus, RunTerminalOutcome, RunView, RuntimeCreateBinding,
+    BACKEND_REPORT_SCHEMA, HOSTED_PLACEMENT, HOSTED_SELECTION_PINNED, MAX_EVENT_SEQUENCE,
+    MODEL_POLICY_SCHEMA, RUN_EVENT_SCHEMA, RUN_OUTPUT_CONTENT_SCHEMA, RUN_OUTPUT_OBJECT_SCHEMA,
+    RUN_OUTPUT_TEXT_SCHEMA, SINGLE_DISPATCH_NO_RETRY, UPSTREAM_FALLBACK_OPERATOR_ASSERTED_DISABLED,
 };
 use elastos_model_contract::{
     MAX_RUNTIME_BINDING_ID_BYTES, MAX_RUNTIME_OPERATION_BYTES, RUNTIME_CREATE_BINDING_SCHEMA,
@@ -91,6 +94,11 @@ impl StoredRun {
                 status: self.status.clone(),
                 output: self.output.clone(),
                 error: self.error.clone(),
+                backend_report: self
+                    .events
+                    .last()
+                    .filter(|event| event.terminal)
+                    .and_then(|event| event.backend_report.clone()),
             }),
         }
     }
@@ -509,6 +517,48 @@ fn validate_stored_offer(path: &Path, offer: &OfferSummary) -> Result<(), Provid
     )?;
     validate_modalities(path, "input", &offer.input_modalities)?;
     validate_modalities(path, "output", &offer.output_modalities)?;
+    if let Some(hosted) = offer.hosted.as_ref() {
+        if hosted.placement != HOSTED_PLACEMENT
+            || hosted.selection_mode != HOSTED_SELECTION_PINNED
+            || hosted.provider_request_policy != SINGLE_DISPATCH_NO_RETRY
+            || hosted.upstream_routing_fallback_assertion
+                != UPSTREAM_FALLBACK_OPERATOR_ASSERTED_DISABLED
+        {
+            return Err(ProviderFault::corrupt_journal(format!(
+                "model run journal hosted disclosure is invalid at {}",
+                path.display()
+            )));
+        }
+        for (value, label, max) in [
+            (
+                hosted.backend_provider_label.as_str(),
+                "backend_provider_label",
+                MAX_HOSTED_PROVIDER_LABEL_BYTES,
+            ),
+            (
+                hosted.requested_selector.as_str(),
+                "requested_selector",
+                MAX_MODEL_BYTES,
+            ),
+            (
+                hosted.privacy_policy_ref.as_str(),
+                "privacy_policy_ref",
+                MAX_HOSTED_POLICY_REF_BYTES,
+            ),
+            (
+                hosted.terms_ref.as_str(),
+                "terms_ref",
+                MAX_HOSTED_POLICY_REF_BYTES,
+            ),
+        ] {
+            validate_bounded_trimmed(value, label, max).map_err(|_| {
+                ProviderFault::corrupt_journal(format!(
+                    "model run journal hosted {label} is invalid at {}",
+                    path.display()
+                ))
+            })?;
+        }
+    }
     if offer.policy.schema != MODEL_POLICY_SCHEMA {
         return Err(ProviderFault::corrupt_journal(format!(
             "model run journal policy schema mismatch at {}",
@@ -633,6 +683,25 @@ fn validate_stored_events(path: &Path, run: &StoredRun) -> Result<(), ProviderFa
                 )));
             }
             saw_terminal = true;
+        }
+        match (
+            &event.backend_report,
+            event.terminal,
+            run.offer.hosted.is_some(),
+        ) {
+            (Some(report), true, true) => validate_backend_report(report).map_err(|_| {
+                ProviderFault::corrupt_journal(format!(
+                    "model run journal backend report is invalid at {}",
+                    path.display()
+                ))
+            })?,
+            (None, true, true) | (Some(_), false, _) | (Some(_), true, false) => {
+                return Err(ProviderFault::corrupt_journal(format!(
+                    "model run journal backend report placement is invalid at {}",
+                    path.display()
+                )))
+            }
+            (None, _, _) => {}
         }
     }
     let expected_next = if run.events.is_empty() {
@@ -767,6 +836,48 @@ fn validate_stored_terminal_state(path: &Path, run: &StoredRun) -> Result<(), Pr
 pub(crate) fn validate_run_error(error: &RunError) -> anyhow::Result<()> {
     validate_bounded_trimmed(&error.code, "error code", MAX_RUN_ERROR_CODE_BYTES)?;
     validate_bounded_trimmed(&error.message, "error message", MAX_RUN_ERROR_MESSAGE_BYTES)?;
+    Ok(())
+}
+
+pub(crate) fn validate_backend_report(report: &BackendReport) -> anyhow::Result<()> {
+    if report.schema != BACKEND_REPORT_SCHEMA {
+        anyhow::bail!("backend report schema is invalid");
+    }
+    if let BackendFact::Reported { value } = &report.resolved_model {
+        validate_bounded_trimmed(value, "resolved_model", MAX_MODEL_BYTES)?;
+    }
+    if let BackendFact::Reported { value } = &report.usage {
+        validate_backend_usage(value)?;
+    }
+    if let BackendFact::Reported { value } = &report.cost {
+        validate_backend_cost(value)?;
+    }
+    Ok(())
+}
+
+fn validate_backend_usage(usage: &BackendTokenUsage) -> anyhow::Result<()> {
+    if usage.input_tokens.is_none() && usage.output_tokens.is_none() && usage.total_tokens.is_none()
+    {
+        anyhow::bail!("reported backend usage is empty");
+    }
+    Ok(())
+}
+
+fn validate_backend_cost(cost: &BackendCost) -> anyhow::Result<()> {
+    validate_bounded_trimmed(&cost.value, "cost", MAX_BACKEND_COST_BYTES)?;
+    if cost.value.starts_with('-') {
+        anyhow::bail!("reported backend cost is negative");
+    }
+    let parsed = serde_json::from_str::<Value>(&cost.value)?;
+    let Value::Number(number) = parsed else {
+        anyhow::bail!("reported backend cost is not a number");
+    };
+    if number.to_string() != cost.value {
+        anyhow::bail!("reported backend cost is not canonical");
+    }
+    if let Some(unit) = cost.unit.as_deref() {
+        validate_bounded_trimmed(unit, "cost unit", MAX_BACKEND_COST_UNIT_BYTES)?;
+    }
     Ok(())
 }
 
@@ -1122,6 +1233,7 @@ mod tests {
                 api_url: "https://example.invalid/v1/chat/completions".to_string(),
                 api_key: None,
                 model: "gpt-test".to_string(),
+                hosted: crate::config::test_hosted_disclosure(),
             },
             enabled: true,
         }
@@ -1190,6 +1302,7 @@ mod tests {
             sequence: 1,
             kind: "output".to_string(),
             data: output,
+            backend_report: Some(BackendReport::unknown()),
             terminal: true,
         }];
         run
@@ -1224,6 +1337,7 @@ mod tests {
                 "code": "backend_failed",
                 "class": "backend_failed",
             }),
+            backend_report: Some(BackendReport::unknown()),
             terminal: true,
         }];
         run
@@ -1490,6 +1604,7 @@ mod tests {
             sequence: 2,
             kind: "progress".to_string(),
             data: serde_json::json!({"step": "late"}),
+            backend_report: None,
             terminal: false,
         });
         run.next_sequence = 3;
@@ -1647,6 +1762,17 @@ mod tests {
         let path = run_path(&root, &valid.run_id);
         journal.store_run(&valid).unwrap();
         let original_bytes = file_bytes(&path);
+
+        let mut invalid_disclosure = valid.clone();
+        invalid_disclosure
+            .offer
+            .hosted
+            .as_mut()
+            .unwrap()
+            .privacy_policy_ref = "fixture:privacy\nv1".to_string();
+        let disclosure_error = journal.store_run(&invalid_disclosure).unwrap_err();
+        assert_eq!(disclosure_error.code(), "journal_corrupt");
+        assert_eq!(file_bytes(&path), original_bytes);
 
         let mut invalid_chronology = valid.clone();
         invalid_chronology.updated_at_ms = invalid_chronology.created_at_ms.saturating_sub(1);

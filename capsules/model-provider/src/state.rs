@@ -8,10 +8,10 @@ use crate::config::{
     MAX_RUN_EVENT_AGGREGATE_BYTES_LIMIT, MAX_RUN_EVENT_COUNT_LIMIT,
 };
 use crate::contract::{
-    ok_response, validate_run_id, ErrorClass, OfferSummary, OffersListRequest, ProviderFault,
-    RunError, RunEvent, RunEventsPage, RunStatus, RunsCancelRequest, RunsCreateRequest,
-    RunsEventsRequest, RunsGetRequest, RuntimeAccessBinding, MAX_EVENT_SEQUENCE, PROVIDER_ID,
-    PROVIDER_PROTOCOL_VERSION, RUN_EVENTS_SCHEMA, RUN_EVENT_SCHEMA,
+    ok_response, validate_run_id, BackendReport, ErrorClass, OfferSummary, OffersListRequest,
+    ProviderFault, RunError, RunEvent, RunEventsPage, RunStatus, RunsCancelRequest,
+    RunsCreateRequest, RunsEventsRequest, RunsGetRequest, RuntimeAccessBinding, MAX_EVENT_SEQUENCE,
+    PROVIDER_ID, PROVIDER_PROTOCOL_VERSION, RUN_EVENTS_SCHEMA, RUN_EVENT_SCHEMA,
 };
 use crate::journal::validate_run_error;
 use crate::journal::{deterministic_run_id, now_ms, request_fingerprint, RunJournal, StoredRun};
@@ -662,6 +662,17 @@ fn append_event(
     data: Value,
     terminal: bool,
 ) -> Result<(), ProviderFault> {
+    append_event_with_backend_report(offer, run, kind, data, terminal, None)
+}
+
+fn append_event_with_backend_report(
+    offer: &impl OfferLimitsView,
+    run: &mut StoredRun,
+    kind: impl Into<String>,
+    data: Value,
+    terminal: bool,
+    backend_report: Option<BackendReport>,
+) -> Result<(), ProviderFault> {
     if run.next_sequence > MAX_EVENT_SEQUENCE {
         return Err(ProviderFault::internal(
             "model run event cursor exceeded provider limit",
@@ -672,6 +683,7 @@ fn append_event(
         sequence: run.next_sequence,
         kind: kind.into(),
         data,
+        backend_report,
         terminal,
     };
     let encoded = serde_json::to_vec(&event)
@@ -794,15 +806,47 @@ fn transition_terminal(
     output: Option<Value>,
     error: Option<RunError>,
 ) -> Result<(), ProviderFault> {
+    transition_terminal_with_backend_report(offer, run, status, output, error, None)
+}
+
+fn transition_terminal_with_backend_report(
+    offer: &impl OfferLimitsView,
+    run: &mut StoredRun,
+    status: RunStatus,
+    output: Option<Value>,
+    error: Option<RunError>,
+    backend_report: Option<BackendReport>,
+) -> Result<(), ProviderFault> {
     if run.status.is_terminal() {
         return Err(ProviderFault::internal(
             "model run attempted a second terminal transition",
         ));
     }
     let (output, error) = validate_terminal_payload(offer, &status, output, error)?;
+    let backend_report = match (run.offer.hosted.is_some(), backend_report) {
+        (true, Some(report)) => Some(report),
+        (true, None) => Some(BackendReport::unknown()),
+        (false, Some(_)) => {
+            return Err(ProviderFault::internal(
+                "local model run returned hosted backend evidence",
+            ))
+        }
+        (false, None) => None,
+    };
+    if let Some(report) = backend_report.as_ref() {
+        crate::journal::validate_backend_report(report)
+            .map_err(|_| ProviderFault::internal("invalid hosted backend report"))?;
+    }
     let (terminal_kind, terminal_data) =
         synthesize_terminal_event(status.clone(), output.as_ref(), error.as_ref())?;
-    append_event(offer, run, &terminal_kind, terminal_data, true)?;
+    append_event_with_backend_report(
+        offer,
+        run,
+        &terminal_kind,
+        terminal_data,
+        true,
+        backend_report,
+    )?;
     if run.events.last().map(|event| event.terminal) != Some(true) {
         return Err(ProviderFault::internal(
             "model run terminal transition missing terminal event",
@@ -931,9 +975,17 @@ fn apply_reconcile_result(
                 status,
                 output,
                 error,
+                backend_report,
             } => {
                 collect_non_terminal_events(offer, staged, events)?;
-                transition_terminal(offer, staged, status, output, error)?;
+                transition_terminal_with_backend_report(
+                    offer,
+                    staged,
+                    status,
+                    output,
+                    error,
+                    backend_report.map(|report| *report),
+                )?;
             }
         }
         Ok(())
@@ -1295,6 +1347,7 @@ mod tests {
                 api_url: "https://example.invalid/v1/chat/completions".to_string(),
                 api_key: None,
                 model: "gpt-test".to_string(),
+                hosted: crate::config::test_hosted_disclosure(),
             },
             enabled: true,
         }
@@ -1822,6 +1875,7 @@ mod tests {
             api_url,
             api_key,
             model,
+            ..
         } = &mut changed_offer.adapter
         {
             *api_url = "https://sentinel.example.test:8443/private-route".to_string();
@@ -2402,6 +2456,7 @@ mod tests {
                         code: "context_rejected".to_string(),
                         message: "model run could not continue".to_string(),
                     }),
+                    backend_report: None,
                 },
             )
             .unwrap();
@@ -2464,6 +2519,7 @@ mod tests {
                         "text": "wrong",
                     })),
                     error: None,
+                    backend_report: None,
                 },
             )
             .unwrap();
@@ -2538,6 +2594,7 @@ mod tests {
                         code: "backend_failed".to_string(),
                         message: "model backend failed".to_string(),
                     }),
+                    backend_report: None,
                 },
             )
             .unwrap();
@@ -2596,6 +2653,7 @@ mod tests {
                         code: "cancelled".to_string(),
                         message: "model run was cancelled".to_string(),
                     }),
+                    backend_report: None,
                 },
             )
             .unwrap();
@@ -3606,6 +3664,7 @@ mod tests {
                         code: "cancelled".to_string(),
                         message: "model run was cancelled".to_string(),
                     }),
+                    backend_report: None,
                 }),
             ])),
             reserve_cancel_results: Arc::new(Mutex::new(vec![Ok(CancelReservation {
@@ -3726,6 +3785,7 @@ mod tests {
                     code: "settlement_unknown".to_string(),
                     message: "model backend settlement is unknown".to_string(),
                 }),
+                backend_report: None,
             })])),
             ..Default::default()
         };

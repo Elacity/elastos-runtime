@@ -1,6 +1,10 @@
-use crate::config::{AdapterConfig, ConfiguredOffer, LocalArtifactConfig, LocalLlamaSettings};
+use crate::config::{
+    AdapterConfig, ConfiguredOffer, LocalArtifactConfig, LocalLlamaSettings,
+    MAX_BACKEND_COST_BYTES, MAX_BACKEND_COST_UNIT_BYTES, MAX_MODEL_BYTES,
+};
 use crate::contract::{
-    ErrorClass, RunError, RunStatus, RuntimeCreateBinding, RUN_OUTPUT_CONTENT_SCHEMA,
+    BackendCost, BackendFact, BackendReport, BackendTokenUsage, ErrorClass, RunError, RunStatus,
+    RuntimeCreateBinding, BACKEND_REPORT_SCHEMA, RUN_OUTPUT_CONTENT_SCHEMA,
     RUN_OUTPUT_OBJECT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
 };
 use crate::journal::{deterministic_run_id, now_ms};
@@ -158,6 +162,7 @@ pub enum ReconcileResult {
         status: RunStatus,
         output: Option<Value>,
         error: Option<RunError>,
+        backend_report: Option<Box<BackendReport>>,
     },
 }
 
@@ -239,6 +244,73 @@ struct LocalTextStreamState {
     output_text: String,
     delta_buffer: String,
     consumed_response_bytes: u64,
+}
+
+#[derive(Default)]
+enum CapturedBackendFact<T> {
+    #[default]
+    Unknown,
+    Reported(T),
+    Invalid,
+}
+
+impl<T: PartialEq> CapturedBackendFact<T> {
+    fn observe(&mut self, value: std::result::Result<Option<T>, ()>) {
+        match value {
+            Ok(Some(value)) => match self {
+                Self::Unknown => *self = Self::Reported(value),
+                Self::Reported(current) if current == &value => {}
+                Self::Reported(_) => *self = Self::Invalid,
+                Self::Invalid => {}
+            },
+            Ok(None) => {}
+            Err(()) => *self = Self::Invalid,
+        }
+    }
+
+    fn into_report(self) -> BackendFact<T> {
+        match self {
+            Self::Reported(value) => BackendFact::Reported { value },
+            Self::Unknown | Self::Invalid => BackendFact::Unknown,
+        }
+    }
+}
+
+#[derive(Default)]
+struct HostedBackendReport {
+    resolved_model: CapturedBackendFact<String>,
+    usage: CapturedBackendFact<BackendTokenUsage>,
+    cost: CapturedBackendFact<BackendCost>,
+}
+
+impl HostedBackendReport {
+    fn observe(&mut self, value: &Value) {
+        if let Some(model) = value.get("model") {
+            self.resolved_model
+                .observe(parse_bounded_backend_string(model, MAX_MODEL_BYTES));
+        }
+        let Some(usage) = value.get("usage") else {
+            return;
+        };
+        let Some(usage) = usage.as_object() else {
+            self.usage.observe(Err(()));
+            self.cost.observe(Err(()));
+            return;
+        };
+        self.usage.observe(parse_backend_usage(usage));
+        if usage.contains_key("cost") || usage.contains_key("cost_unit") {
+            self.cost.observe(parse_backend_cost(usage));
+        }
+    }
+
+    fn finish(self) -> BackendReport {
+        BackendReport {
+            schema: BACKEND_REPORT_SCHEMA.to_string(),
+            resolved_model: self.resolved_model.into_report(),
+            usage: self.usage.into_report(),
+            cost: self.cost.into_report(),
+        }
+    }
 }
 
 struct LocalTextWorkerTask {
@@ -865,6 +937,7 @@ impl AdapterExecutor for LiveAdapterExecutor {
                 api_url,
                 api_key,
                 model,
+                ..
             } => dispatch_openai_text(
                 self,
                 api_url,
@@ -1138,6 +1211,7 @@ fn reconcile_local_text(
             code: "settlement_unknown".to_string(),
             message: "model backend settlement is unknown".to_string(),
         }),
+        backend_report: None,
     })
 }
 
@@ -1185,6 +1259,7 @@ async fn run_local_text_worker(mut task: LocalTextWorkerTask) -> bool {
             },
             output: None,
             error: Some(fault.error),
+            backend_report: None,
         },
     };
     matches!(
@@ -1390,6 +1465,8 @@ async fn run_http_artifact_status_worker_inner(
 async fn run_local_text_worker_inner(
     task: &mut LocalTextWorkerTask,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
+    let mut backend_report = matches!(&task.backend, LocalTextBackend::OpenAiCompatible { .. })
+        .then(HostedBackendReport::default);
     let (api_url, api_key, model, enable_thinking, private_endpoint) = match &task.backend {
         LocalTextBackend::OpenAiCompatible {
             api_url,
@@ -1504,7 +1581,11 @@ async fn run_local_text_worker_inner(
                     done = true;
                     break;
                 }
-                let delta = extract_stream_text_delta(&payload)?;
+                let value = parse_stream_json(&payload)?;
+                if let Some(report) = backend_report.as_mut() {
+                    report.observe(&value);
+                }
+                let delta = extract_stream_text_delta(&value);
                 if !delta.is_empty() {
                     append_local_text_delta(&mut stream_state, &task.offer, &delta)?;
                     if stream_state.delta_buffer.len() >= LOCAL_TEXT_DELTA_FLUSH_BYTES {
@@ -1558,6 +1639,9 @@ async fn run_local_text_worker_inner(
         status: RunStatus::Completed,
         output: Some(output),
         error: None,
+        backend_report: backend_report
+            .map(HostedBackendReport::finish)
+            .map(Box::new),
     })
 }
 
@@ -1715,26 +1799,88 @@ fn consume_local_text_stream_bytes(
     Ok(())
 }
 
-fn extract_stream_text_delta(payload: &str) -> std::result::Result<String, AdapterFault> {
-    let value = serde_json::from_str::<Value>(payload).map_err(|_| {
+fn parse_stream_json(payload: &str) -> std::result::Result<Value, AdapterFault> {
+    serde_json::from_str::<Value>(payload).map_err(|_| {
         AdapterFault::malformed(
             "model backend returned invalid data",
             "text stream event must be valid json",
         )
-    })?;
+    })
+}
+
+fn extract_stream_text_delta(value: &Value) -> String {
     if let Some(text) = value
         .pointer("/choices/0/delta/content")
         .and_then(Value::as_str)
     {
-        return Ok(text.to_string());
+        return text.to_string();
     }
     if let Some(text) = value
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
     {
-        return Ok(text.to_string());
+        return text.to_string();
     }
-    Ok(String::new())
+    String::new()
+}
+
+fn parse_bounded_backend_string(
+    value: &Value,
+    max_bytes: usize,
+) -> std::result::Result<Option<String>, ()> {
+    let value = value.as_str().ok_or(())?;
+    if value.trim().is_empty()
+        || value.trim() != value
+        || value.len() > max_bytes
+        || value.chars().any(char::is_control)
+    {
+        return Err(());
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn parse_backend_usage(
+    usage: &serde_json::Map<String, Value>,
+) -> std::result::Result<Option<BackendTokenUsage>, ()> {
+    fn token(
+        usage: &serde_json::Map<String, Value>,
+        name: &str,
+    ) -> std::result::Result<Option<u64>, ()> {
+        match usage.get(name) {
+            Some(value) => value.as_u64().map(Some).ok_or(()),
+            None => Ok(None),
+        }
+    }
+
+    let input_tokens = token(usage, "prompt_tokens")?;
+    let output_tokens = token(usage, "completion_tokens")?;
+    let total_tokens = token(usage, "total_tokens")?;
+    if input_tokens.is_none() && output_tokens.is_none() && total_tokens.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(BackendTokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+    }))
+}
+
+fn parse_backend_cost(
+    usage: &serde_json::Map<String, Value>,
+) -> std::result::Result<Option<BackendCost>, ()> {
+    let cost = usage.get("cost").ok_or(())?;
+    let Value::Number(cost) = cost else {
+        return Err(());
+    };
+    let value = cost.to_string();
+    if value.starts_with('-') || value.len() > MAX_BACKEND_COST_BYTES {
+        return Err(());
+    }
+    let unit = match usage.get("cost_unit") {
+        Some(value) => parse_bounded_backend_string(value, MAX_BACKEND_COST_UNIT_BYTES)?,
+        None => None,
+    };
+    Ok(Some(BackendCost { value, unit }))
 }
 
 fn local_text_cancelled_result() -> ReconcileResult {
@@ -1747,6 +1893,7 @@ fn local_text_cancelled_result() -> ReconcileResult {
             code: "cancelled".to_string(),
             message: "model run was cancelled".to_string(),
         }),
+        backend_report: None,
     }
 }
 
@@ -1760,6 +1907,7 @@ fn worker_settlement_unknown_result() -> ReconcileResult {
             code: "settlement_unknown".to_string(),
             message: "model backend settlement is unknown".to_string(),
         }),
+        backend_report: None,
     }
 }
 
@@ -1813,6 +1961,7 @@ fn worker_control_lost_fault(detail: &'static str) -> AdapterFault {
 }
 
 fn map_reqwest_failure(err: reqwest::Error) -> AdapterFault {
+    let err = err.without_url();
     if err.is_timeout() {
         return AdapterFault::timeout(
             "model backend timed out",
@@ -1874,6 +2023,7 @@ fn reconcile_http_job(
                 code: "settlement_unknown".to_string(),
                 message: "model backend settlement is unknown".to_string(),
             }),
+            backend_report: None,
         });
     }
     let state = parse_http_job_backend_state(backend_state)?;
@@ -1893,6 +2043,7 @@ fn reconcile_http_job(
                 code: "settlement_unknown".to_string(),
                 message: "model backend settlement is unknown".to_string(),
             }),
+            backend_report: None,
         });
     }
     let run_id = deterministic_run_id(binding);
@@ -2068,6 +2219,7 @@ fn absorb_cancel_poll_fault(
                 code: "settlement_unknown".to_string(),
                 message: "model backend settlement is unknown".to_string(),
             }),
+            backend_report: None,
         });
     }
     state.next_poll_at_ms = next_poll_at_ms(now, poll_interval_ms).min(deadline);
@@ -2371,6 +2523,7 @@ fn parse_http_job_status_result(
                     code: "cancelled".to_string(),
                     message: "model run was cancelled".to_string(),
                 }),
+                backend_report: None,
             })
         }
         "failed" => {
@@ -2389,6 +2542,7 @@ fn parse_http_job_status_result(
                     code: "backend_failed".to_string(),
                     message: "model backend failed".to_string(),
                 }),
+                backend_report: None,
             })
         }
         "completed" => {
@@ -2405,6 +2559,7 @@ fn parse_http_job_status_result(
                 status: RunStatus::Completed,
                 output: Some(output),
                 error: None,
+                backend_report: None,
             })
         }
         "settlement_unknown" => {
@@ -2754,6 +2909,7 @@ mod tests {
                 api_url: api_url.to_string(),
                 api_key: Some("secret".to_string()),
                 model: "gpt-test".to_string(),
+                hosted: crate::config::test_hosted_disclosure(),
             },
             enabled: true,
         }
@@ -2841,6 +2997,28 @@ mod tests {
     }
 
     #[test]
+    fn reqwest_failure_detail_omits_configured_url_query() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let sentinel = "private-query-sentinel";
+        let url = format!("http://{address}/unavailable?token={sentinel}");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(reqwest::Client::new().get(&url).send())
+            .unwrap_err();
+
+        let fault = map_reqwest_failure(error);
+        assert_eq!(fault.error.class, ErrorClass::TransportInterrupted);
+        let loggable = format!("{fault:?}");
+        assert!(!fault.detail.as_deref().unwrap().contains(&url));
+        assert!(!loggable.contains(sentinel));
+    }
+
+    #[test]
     fn local_text_first_bytes_can_use_the_offer_runtime_limit() {
         let server = start_server_with_first_byte_delay(
             vec![HttpResponseSpec {
@@ -2876,13 +3054,23 @@ mod tests {
         let result = runtime
             .block_on(run_local_text_worker_inner(&mut task))
             .unwrap();
-        let ReconcileResult::Terminal { status, output, .. } = result else {
+        let ReconcileResult::Terminal {
+            status,
+            output,
+            backend_report,
+            ..
+        } = result
+        else {
             panic!("expected completed result");
         };
         assert_eq!(status, RunStatus::Completed);
         assert_eq!(
             output,
             Some(json!({ "schema": RUN_OUTPUT_TEXT_SCHEMA, "text": "" }))
+        );
+        assert_eq!(
+            backend_report.map(|report| *report),
+            Some(BackendReport::unknown())
         );
         assert!(update_rx.try_recv().is_err());
     }
@@ -3458,6 +3646,7 @@ mod tests {
             error,
             events,
             output,
+            ..
         } = result
         else {
             panic!("expected cancelled terminal reconcile result");
