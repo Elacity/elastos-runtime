@@ -366,6 +366,7 @@ mod tests {
     struct TestServer {
         base_url: String,
         requests: Arc<Mutex<Vec<String>>>,
+        request_active: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
         join: Option<thread::JoinHandle<()>>,
     }
@@ -450,6 +451,8 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_active = Arc::new(AtomicBool::new(false));
+        let request_active_clone = Arc::clone(&request_active);
         let shutdown = Arc::new(AtomicBool::new(false));
         let requests_clone = Arc::clone(&requests);
         let shutdown_clone = Arc::clone(&shutdown);
@@ -482,6 +485,7 @@ mod tests {
                 };
                 let request = read_request(&mut stream);
                 requests_clone.lock().unwrap().push(request);
+                request_active_clone.store(true, Ordering::SeqCst);
                 write_response(&mut stream, &action);
                 if let Some(release) = action.hold_open {
                     while !release.load(Ordering::Relaxed)
@@ -496,11 +500,13 @@ mod tests {
                         }
                     }
                 }
+                request_active_clone.store(false, Ordering::SeqCst);
             }
         });
         TestServer {
             base_url,
             requests,
+            request_active,
             shutdown,
             join: Some(join),
         }
@@ -625,6 +631,20 @@ mod tests {
                 hosted: crate::config::test_hosted_disclosure(),
             },
             enabled: true,
+        }
+    }
+
+    fn responses_text_offer(base_url: &str) -> ConfiguredOffer {
+        ConfiguredOffer {
+            id: "responses-text".to_string(),
+            title: "Responses Text".to_string(),
+            adapter: AdapterConfig::OpenAiResponsesText {
+                api_url: format!("{base_url}/responses"),
+                api_key: Some("sentinel-responses-key".to_string()),
+                model: "sentinel-responses-model".to_string(),
+                hosted: crate::config::test_hosted_disclosure(),
+            },
+            ..local_text_offer(base_url)
         }
     }
 
@@ -3134,6 +3154,219 @@ mod tests {
     }
 
     #[test]
+    fn responses_stream_reports_and_durably_replays_backend_evidence() {
+        let server = start_server(vec![sse_action(
+            &[
+                json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": "do-not-emit",
+                })
+                .to_string(),
+                json!({
+                    "type": "response.output_text.delta",
+                    "delta": "hello",
+                })
+                .to_string(),
+                json!({
+                    "type": "response.output_item.added",
+                    "item": {"type": "function_call", "name": "private-tool"},
+                })
+                .to_string(),
+                json!({
+                    "type": "response.output_text.delta",
+                    "delta": " world",
+                })
+                .to_string(),
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "status": "completed",
+                        "model": "resolved-responses-model",
+                        "usage": {
+                            "input_tokens": 7,
+                            "output_tokens": 2,
+                            "total_tokens": 9,
+                            "cost": 0.25,
+                            "cost_unit": "USD",
+                        },
+                    },
+                })
+                .to_string(),
+            ],
+            false,
+        )]);
+        let offer = responses_text_offer(&server.base_url);
+        let root = temp_root("responses-report-replay");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let offers = send_request(
+            &provider,
+            ProviderOperation::OffersList,
+            json!({"op": "offers_list"}),
+        );
+        assert_eq!(
+            offers["data"]["offers"][0]["hosted"]["requested_selector"],
+            "sentinel-responses-model"
+        );
+        assert_eq!(
+            offers["data"]["offers"][0]["hosted"]["provider_request_policy"],
+            "single_dispatch_no_retry"
+        );
+
+        let input = text_input("hello world");
+        let binding = create_binding("request:responses-report", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap().to_string();
+        let terminal = wait_for_terminal(&provider, &run_id, &access_binding(&binding));
+        let expected_report = json!({
+            "schema": BACKEND_REPORT_SCHEMA,
+            "resolved_model": {"status": "reported", "value": "resolved-responses-model"},
+            "usage": {
+                "status": "reported",
+                "value": {"input_tokens": 7, "output_tokens": 2, "total_tokens": 9},
+            },
+            "cost": {"status": "unknown"},
+        });
+        assert_eq!(
+            terminal["data"]["terminal"]["output"],
+            json!({"schema": RUN_OUTPUT_TEXT_SCHEMA, "text": "hello world"})
+        );
+        assert_eq!(
+            terminal["data"]["terminal"]["backend_report"],
+            expected_report
+        );
+        let page = events_page(&provider, &run_id, &access_binding(&binding), 0);
+        let events = page["data"]["events"].as_array().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["prepared", "dispatched", "text_delta", "output"]
+        );
+        assert_eq!(events[2]["data"], json!({"text": "hello world"}));
+        assert_eq!(events.last().unwrap()["backend_report"], expected_report);
+        assert_no_private_leakage(
+            &[offers.to_string(), terminal.to_string(), page.to_string()],
+            &[
+                server.base_url.as_str(),
+                "sentinel-responses-key",
+                "do-not-emit",
+                "private-tool",
+            ],
+        );
+        let request = server.requests.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(request.starts_with("post /responses http/1.1\r\n"));
+        assert!(request.contains("content-type: application/json\r\n"));
+        assert!(request.contains("authorization: bearer sentinel-responses-key\r\n"));
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+
+        provider.shutdown_on_eof();
+        let mut restarted = ProviderCoordinatorHandle::start();
+        init_provider(&restarted, &root, vec![offer]);
+        let replayed = get_run(&restarted, &run_id, &access_binding(&binding));
+        assert_eq!(replayed["data"]["terminal"], terminal["data"]["terminal"]);
+        let replayed_page = events_page(&restarted, &run_id, &access_binding(&binding), 0);
+        assert_eq!(replayed_page["data"]["events"], page["data"]["events"]);
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        restarted.shutdown_on_eof();
+    }
+
+    #[test]
+    fn responses_terminal_failures_are_generic_and_not_retried() {
+        let terminal_types = ["response.failed", "response.incomplete", "error"];
+        let actions = terminal_types
+            .iter()
+            .map(|event_type| {
+                sse_action(
+                    &[json!({
+                        "type": event_type,
+                        "error": {"message": "private failure detail"},
+                    })
+                    .to_string()],
+                    false,
+                )
+            })
+            .collect();
+        let server = start_server(actions);
+        let offer = responses_text_offer(&server.base_url);
+        let root = temp_root("responses-terminal-failures");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        for (index, event_type) in terminal_types.iter().enumerate() {
+            let input = text_input(event_type);
+            let binding = create_binding(
+                &format!("request:responses-terminal-{index}"),
+                &offer,
+                &input,
+            );
+            let created = create_run(&provider, &offer, &binding, &input);
+            let run_id = created["data"]["run_id"].as_str().unwrap();
+            let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+            assert_eq!(terminal["data"]["status"], "failed");
+            assert_eq!(
+                terminal["data"]["terminal"]["error"],
+                json!({
+                    "class": "backend_failed",
+                    "code": "backend_failed",
+                    "message": "model backend failed",
+                })
+            );
+            assert!(terminal["data"]["terminal"]["output"].is_null());
+            assert_eq!(
+                terminal["data"]["terminal"]["backend_report"],
+                serde_json::to_value(crate::contract::BackendReport::unknown()).unwrap()
+            );
+            assert_no_private_leakage(&[terminal.to_string()], &["private failure detail"]);
+            assert_eq!(server.requests.lock().unwrap().len(), index + 1);
+        }
+
+        provider.shutdown_on_eof();
+    }
+
+    #[test]
+    fn responses_stream_requires_completed_instead_of_done_or_eof() {
+        let server = start_server(vec![
+            sse_action(
+                &[json!({
+                    "type": "response.output_text.delta",
+                    "delta": "partial",
+                })
+                .to_string()],
+                false,
+            ),
+            sse_action(&[], true),
+        ]);
+        let offer = responses_text_offer(&server.base_url);
+        let root = temp_root("responses-missing-completed");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        for (index, prompt) in ["eof", "done"].iter().enumerate() {
+            let input = text_input(prompt);
+            let binding = create_binding(
+                &format!("request:responses-missing-completed-{index}"),
+                &offer,
+                &input,
+            );
+            let created = create_run(&provider, &offer, &binding, &input);
+            let run_id = created["data"]["run_id"].as_str().unwrap();
+            let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+            assert_eq!(terminal["data"]["status"], "failed");
+            assert_eq!(
+                terminal["data"]["terminal"]["error"]["class"],
+                "response_malformed"
+            );
+            assert!(terminal["data"]["terminal"]["output"].is_null());
+            assert_eq!(server.requests.lock().unwrap().len(), index + 1);
+        }
+
+        provider.shutdown_on_eof();
+    }
+
+    #[test]
     fn conflicting_hosted_stream_facts_become_unknown_without_changing_text() {
         let server = start_server(vec![sse_action(
             &[
@@ -3247,40 +3480,79 @@ mod tests {
     }
 
     #[test]
-    fn local_cancel_returns_promptly_and_settles_cancelled() {
-        let (stalled, release, stalled_started) = stalled_sse_action();
-        let server = start_server(vec![stalled]);
-        let offer = local_text_offer(&server.base_url);
-        let root = temp_root("cancel");
-        let mut provider = ProviderCoordinatorHandle::start();
-        init_provider(&provider, &root, vec![offer.clone()]);
+    fn responses_and_chat_cancel_with_active_backend_settle_unknown() {
+        for (label, responses) in [("chat", false), ("responses", true)] {
+            let (stalled, release, stalled_started) = stalled_sse_action();
+            let server = start_server(vec![stalled]);
+            let offer = if responses {
+                responses_text_offer(&server.base_url)
+            } else {
+                local_text_offer(&server.base_url)
+            };
+            let root = temp_root(&format!("cancel-{label}"));
+            let mut provider = ProviderCoordinatorHandle::start();
+            init_provider(&provider, &root, vec![offer.clone()]);
 
-        let input = text_input("cancel me");
-        let binding = create_binding("request:cancel", &offer, &input);
-        let create_response = create_run(&provider, &offer, &binding, &input);
-        let run_id = create_response["data"]["run_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        wait_for_flag(&stalled_started);
+            let input = text_input("cancel me");
+            let binding = create_binding(&format!("request:cancel-{label}"), &offer, &input);
+            let created = create_run(&provider, &offer, &binding, &input);
+            let run_id = created["data"]["run_id"].as_str().unwrap().to_string();
+            wait_for_flag(&stalled_started);
 
-        let started = Instant::now();
-        let cancel_response = cancel_run(&provider, &run_id, &access_binding(&binding));
-        assert!(
-            started.elapsed() < PROMPT_RETURN_BOUND,
-            "local cancel must return promptly, took {:?}",
-            started.elapsed()
-        );
-        assert_eq!(cancel_response["data"]["status"], "reconciling");
+            let started = Instant::now();
+            let cancel_response = cancel_run(&provider, &run_id, &access_binding(&binding));
+            assert!(
+                started.elapsed() < PROMPT_RETURN_BOUND,
+                "hosted cancel must return promptly, took {:?}",
+                started.elapsed()
+            );
+            assert_eq!(cancel_response["data"]["status"], "reconciling");
 
-        let terminal = wait_for_terminal(&provider, &run_id, &access_binding(&binding));
-        assert_eq!(terminal["data"]["status"], "cancelled");
-        let run = load_run(&root, &run_id);
-        assert_eq!(run.status, crate::contract::RunStatus::Cancelled);
-        assert_eq!(run.events.last().unwrap().kind, "cancelled");
+            let terminal = wait_for_terminal(&provider, &run_id, &access_binding(&binding));
+            assert!(!release.load(Ordering::Relaxed));
+            assert!(server.request_active.load(Ordering::SeqCst));
+            assert_eq!(server.requests.lock().unwrap().len(), 1);
+            assert_eq!(terminal["data"]["status"], "settlement_unknown");
+            let run = load_run(&root, &run_id);
+            assert_eq!(run.status, crate::contract::RunStatus::SettlementUnknown);
+            assert_eq!(run.events.last().unwrap().kind, "settlement_unknown");
+            assert_eq!(
+                run.events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.kind.as_str(),
+                        "completed" | "failed" | "cancelled" | "settlement_unknown"
+                    ))
+                    .count(),
+                1
+            );
+            let page = events_page(&provider, &run_id, &access_binding(&binding), 0);
+            assert_eq!(
+                cancel_run(&provider, &run_id, &access_binding(&binding))["data"]["status"],
+                "settlement_unknown"
+            );
+            provider.shutdown_on_eof();
 
-        release.store(true, Ordering::Relaxed);
-        provider.shutdown_on_eof();
+            let mut restarted = ProviderCoordinatorHandle::start();
+            init_provider(&restarted, &root, vec![offer.clone()]);
+            assert_eq!(
+                get_run(&restarted, &run_id, &access_binding(&binding))["data"]["terminal"],
+                terminal["data"]["terminal"]
+            );
+            assert_eq!(
+                events_page(&restarted, &run_id, &access_binding(&binding), 0)["data"]["events"],
+                page["data"]["events"]
+            );
+            assert_eq!(
+                create_run(&restarted, &offer, &binding, &input)["data"]["run_id"],
+                run_id
+            );
+            assert!(server.request_active.load(Ordering::SeqCst));
+            assert!(!release.load(Ordering::Relaxed));
+            assert_eq!(server.requests.lock().unwrap().len(), 1);
+            release.store(true, Ordering::Relaxed);
+            restarted.shutdown_on_eof();
+        }
     }
 
     #[test]

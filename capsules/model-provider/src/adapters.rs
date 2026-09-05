@@ -246,6 +246,13 @@ struct LocalTextStreamState {
     consumed_response_bytes: u64,
 }
 
+#[derive(Debug)]
+enum ParsedTextStreamEvent {
+    Delta(String),
+    Completed,
+    Ignored,
+}
+
 #[derive(Default)]
 enum CapturedBackendFact<T> {
     #[default]
@@ -284,7 +291,7 @@ struct HostedBackendReport {
 }
 
 impl HostedBackendReport {
-    fn observe(&mut self, value: &Value) {
+    fn observe_chat_completions(&mut self, value: &Value) {
         if let Some(model) = value.get("model") {
             self.resolved_model
                 .observe(parse_bounded_backend_string(model, MAX_MODEL_BYTES));
@@ -297,10 +304,30 @@ impl HostedBackendReport {
             self.cost.observe(Err(()));
             return;
         };
-        self.usage.observe(parse_backend_usage(usage));
+        self.usage.observe(parse_backend_usage(
+            usage,
+            "prompt_tokens",
+            "completion_tokens",
+        ));
         if usage.contains_key("cost") || usage.contains_key("cost_unit") {
             self.cost.observe(parse_backend_cost(usage));
         }
+    }
+
+    fn observe_responses_completed(&mut self, response: &serde_json::Map<String, Value>) {
+        if let Some(model) = response.get("model") {
+            self.resolved_model
+                .observe(parse_bounded_backend_string(model, MAX_MODEL_BYTES));
+        }
+        let Some(usage) = response.get("usage") else {
+            return;
+        };
+        let Some(usage) = usage.as_object() else {
+            self.usage.observe(Err(()));
+            return;
+        };
+        self.usage
+            .observe(parse_backend_usage(usage, "input_tokens", "output_tokens"));
     }
 
     fn finish(self) -> BackendReport {
@@ -326,6 +353,11 @@ struct LocalTextWorkerTask {
 
 enum LocalTextBackend {
     OpenAiCompatible {
+        api_url: String,
+        api_key: Option<String>,
+        model: String,
+    },
+    OpenAiResponses {
         api_url: String,
         api_key: Option<String>,
         model: String,
@@ -567,9 +599,7 @@ impl LiveAdapterExecutor {
 
     fn spawn_local_text_worker(
         &self,
-        api_url: &str,
-        api_key: Option<&str>,
-        model: &str,
+        backend: LocalTextBackend,
         offer: &ConfiguredOffer,
         binding: &RuntimeCreateBinding,
         prompt: &str,
@@ -598,62 +628,7 @@ impl LiveAdapterExecutor {
             },
         );
         self.spawn_text_worker(
-            LocalTextBackend::OpenAiCompatible {
-                api_url: api_url.to_string(),
-                api_key: api_key.map(str::to_string),
-                model: model.to_string(),
-            },
-            offer,
-            prompt,
-            deadline_ms,
-            PreparedLocalTextWorker {
-                run_id,
-                generation,
-                cancel_rx,
-                backend_state,
-            },
-            workers,
-        )
-    }
-
-    fn spawn_local_llama_worker(
-        &self,
-        engine: &LocalArtifactConfig,
-        model: &LocalArtifactConfig,
-        settings: &LocalLlamaSettings,
-        offer: &ConfiguredOffer,
-        binding: &RuntimeCreateBinding,
-        prompt: &str,
-        deadline_ms: u64,
-    ) -> std::result::Result<Value, AdapterFault> {
-        let run_id = deterministic_run_id(binding);
-        let backend_state = serialize_local_text_backend_state(false)?;
-        let mut workers = self.workers.lock().unwrap();
-        if workers.contains_key(&run_id) {
-            return Err(AdapterFault::context(
-                "model run could not start",
-                "local text worker already exists for run_id",
-            ));
-        }
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        workers.insert(
-            run_id.clone(),
-            WorkerRecord {
-                generation,
-                control: WorkerControl::LocalText { cancel_tx },
-                join_handle: None,
-                retired_handles: Vec::new(),
-            },
-        );
-        self.spawn_text_worker(
-            LocalTextBackend::LocalLlama {
-                engines: self.local_llama.clone(),
-                offer_id: offer.id.clone(),
-                engine: engine.clone(),
-                model: model.clone(),
-                settings: settings.clone(),
-            },
+            backend,
             offer,
             prompt,
             deadline_ms,
@@ -938,11 +913,30 @@ impl AdapterExecutor for LiveAdapterExecutor {
                 api_key,
                 model,
                 ..
-            } => dispatch_openai_text(
+            } => dispatch_text(
                 self,
+                LocalTextBackend::OpenAiCompatible {
+                    api_url: api_url.clone(),
+                    api_key: api_key.clone(),
+                    model: model.clone(),
+                },
+                offer,
+                binding,
+                input,
+                deadline_ms,
+            ),
+            AdapterConfig::OpenAiResponsesText {
                 api_url,
-                api_key.as_deref(),
+                api_key,
                 model,
+                ..
+            } => dispatch_text(
+                self,
+                LocalTextBackend::OpenAiResponses {
+                    api_url: api_url.clone(),
+                    api_key: api_key.clone(),
+                    model: model.clone(),
+                },
                 offer,
                 binding,
                 input,
@@ -952,11 +946,15 @@ impl AdapterExecutor for LiveAdapterExecutor {
                 engine,
                 model,
                 settings,
-            } => dispatch_local_llama_text(
+            } => dispatch_text(
                 self,
-                engine,
-                model,
-                settings,
+                LocalTextBackend::LocalLlama {
+                    engines: self.local_llama.clone(),
+                    offer_id: offer.id.clone(),
+                    engine: engine.clone(),
+                    model: model.clone(),
+                    settings: settings.clone(),
+                },
                 offer,
                 binding,
                 input,
@@ -998,6 +996,7 @@ impl AdapterExecutor for LiveAdapterExecutor {
     ) -> std::result::Result<ReconcileResult, AdapterFault> {
         match adapter {
             AdapterConfig::OpenAiCompatibleText { .. }
+            | AdapterConfig::OpenAiResponsesText { .. }
             | AdapterConfig::LocalLlamaCppText { .. } => {
                 reconcile_local_text(self, binding, backend_state)
             }
@@ -1029,6 +1028,7 @@ impl AdapterExecutor for LiveAdapterExecutor {
     ) -> std::result::Result<CancelResult, AdapterFault> {
         match adapter {
             AdapterConfig::OpenAiCompatibleText { .. }
+            | AdapterConfig::OpenAiResponsesText { .. }
             | AdapterConfig::LocalLlamaCppText { .. } => {
                 cancel_local_text(self, binding, backend_state)
             }
@@ -1059,6 +1059,7 @@ impl AdapterExecutor for LiveAdapterExecutor {
     ) -> std::result::Result<CancelReservation, AdapterFault> {
         match adapter {
             AdapterConfig::OpenAiCompatibleText { .. }
+            | AdapterConfig::OpenAiResponsesText { .. }
             | AdapterConfig::LocalLlamaCppText { .. } => reserve_local_text_cancel(backend_state),
             AdapterConfig::HttpJobArtifact { cancel_url, .. } => {
                 reserve_http_job_cancel(backend_state, cancel_url.is_some(), offer)
@@ -1067,57 +1068,17 @@ impl AdapterExecutor for LiveAdapterExecutor {
     }
 }
 
-fn dispatch_openai_text(
+fn dispatch_text(
     executor: &LiveAdapterExecutor,
-    api_url: &str,
-    api_key: Option<&str>,
-    model: &str,
+    backend: LocalTextBackend,
     offer: &ConfiguredOffer,
     binding: &RuntimeCreateBinding,
     input: &Value,
     deadline_ms: u64,
 ) -> std::result::Result<DispatchResult, AdapterFault> {
     let prompt = validate_text_prompt(input)?;
-    let backend_state = executor.spawn_local_text_worker(
-        api_url,
-        api_key,
-        model,
-        offer,
-        binding,
-        prompt,
-        deadline_ms,
-    )?;
-    Ok(DispatchResult::Running {
-        events: vec![EventSeed {
-            kind: "dispatched",
-            data: json!({
-                "offer_id": offer.id
-            }),
-        }],
-        backend_state,
-    })
-}
-
-fn dispatch_local_llama_text(
-    executor: &LiveAdapterExecutor,
-    engine: &LocalArtifactConfig,
-    model: &LocalArtifactConfig,
-    settings: &LocalLlamaSettings,
-    offer: &ConfiguredOffer,
-    binding: &RuntimeCreateBinding,
-    input: &Value,
-    deadline_ms: u64,
-) -> std::result::Result<DispatchResult, AdapterFault> {
-    let prompt = validate_text_prompt(input)?;
-    let backend_state = executor.spawn_local_llama_worker(
-        engine,
-        model,
-        settings,
-        offer,
-        binding,
-        prompt,
-        deadline_ms,
-    )?;
+    let backend_state =
+        executor.spawn_local_text_worker(backend, offer, binding, prompt, deadline_ms)?;
     Ok(DispatchResult::Running {
         events: vec![EventSeed {
             kind: "dispatched",
@@ -1465,14 +1426,32 @@ async fn run_http_artifact_status_worker_inner(
 async fn run_local_text_worker_inner(
     task: &mut LocalTextWorkerTask,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
-    let mut backend_report = matches!(&task.backend, LocalTextBackend::OpenAiCompatible { .. })
-        .then(HostedBackendReport::default);
-    let (api_url, api_key, model, enable_thinking, private_endpoint) = match &task.backend {
+    let mut backend_report = matches!(
+        &task.backend,
+        LocalTextBackend::OpenAiCompatible { .. } | LocalTextBackend::OpenAiResponses { .. }
+    )
+    .then(HostedBackendReport::default);
+    let (api_url, api_key, body, private_endpoint) = match &task.backend {
         LocalTextBackend::OpenAiCompatible {
             api_url,
             api_key,
             model,
-        } => (api_url.clone(), api_key.clone(), model.clone(), None, false),
+        } => (
+            api_url.clone(),
+            api_key.clone(),
+            text_generation_request_body(&task.offer, model, &task.prompt, None),
+            false,
+        ),
+        LocalTextBackend::OpenAiResponses {
+            api_url,
+            api_key,
+            model,
+        } => (
+            api_url.clone(),
+            api_key.clone(),
+            responses_text_request_body(&task.offer, model, &task.prompt),
+            false,
+        ),
         LocalTextBackend::LocalLlama {
             engines,
             offer_id,
@@ -1490,13 +1469,13 @@ async fn run_local_text_worker_inner(
                 )
                 .await
                 .map_err(map_local_llama_fault)?;
-            (
-                endpoint.api_url,
-                None,
-                endpoint.model,
+            let body = text_generation_request_body(
+                &task.offer,
+                &endpoint.model,
+                &task.prompt,
                 Some(endpoint.enable_thinking),
-                true,
-            )
+            );
+            (endpoint.api_url, None, body, true)
         }
     };
     let client = backend_client(
@@ -1506,7 +1485,6 @@ async fn run_local_text_worker_inner(
             .unwrap_or(u64::MAX),
     )?;
     let request = {
-        let body = text_generation_request_body(&task.offer, &model, &task.prompt, enable_thinking);
         let mut builder = client
             .post(&api_url)
             .header("content-type", "application/json")
@@ -1518,7 +1496,7 @@ async fn run_local_text_worker_inner(
     };
     let response = tokio::select! {
         changed = task.cancel_rx.changed() => {
-            return handle_local_text_cancel_signal(&task.cancel_rx, changed);
+            return handle_local_text_cancel_signal(&task.backend, &task.cancel_rx, changed);
         }
         response = request.send() => response.map_err(|err| map_text_reqwest_failure(err, private_endpoint))?
     };
@@ -1538,7 +1516,7 @@ async fn run_local_text_worker_inner(
     while !done {
         let next = tokio::select! {
             changed = task.cancel_rx.changed() => {
-                return handle_local_text_cancel_signal(&task.cancel_rx, changed);
+                return handle_local_text_cancel_signal(&task.backend, &task.cancel_rx, changed);
             }
             chunk = response.chunk() => chunk.map_err(|err| map_text_reqwest_failure(err, private_endpoint))?
         };
@@ -1577,27 +1555,34 @@ async fn run_local_text_worker_inner(
                         "text stream event must be valid utf-8",
                     )
                 })?;
-                if payload.trim() == "[DONE]" {
-                    done = true;
-                    break;
-                }
-                let value = parse_stream_json(&payload)?;
-                if let Some(report) = backend_report.as_mut() {
-                    report.observe(&value);
-                }
-                let delta = extract_stream_text_delta(&value);
-                if !delta.is_empty() {
-                    append_local_text_delta(&mut stream_state, &task.offer, &delta)?;
-                    if stream_state.delta_buffer.len() >= LOCAL_TEXT_DELTA_FLUSH_BYTES {
-                        flush_local_text_delta(
-                            &task.offer,
-                            &task.run_id,
-                            task.generation,
-                            &task.updates,
-                            &mut stream_state.delta_buffer,
-                        )
-                        .await?;
+                let parsed = match &task.backend {
+                    LocalTextBackend::OpenAiResponses { .. } => parse_responses_stream_event(
+                        &payload,
+                        backend_report
+                            .as_mut()
+                            .expect("responses worker must collect backend evidence"),
+                    )?,
+                    _ => parse_chat_completions_stream_event(&payload, backend_report.as_mut())?,
+                };
+                match parsed {
+                    ParsedTextStreamEvent::Delta(delta) if !delta.is_empty() => {
+                        append_local_text_delta(&mut stream_state, &task.offer, &delta)?;
+                        if stream_state.delta_buffer.len() >= LOCAL_TEXT_DELTA_FLUSH_BYTES {
+                            flush_local_text_delta(
+                                &task.offer,
+                                &task.run_id,
+                                task.generation,
+                                &task.updates,
+                                &mut stream_state.delta_buffer,
+                            )
+                            .await?;
+                        }
                     }
+                    ParsedTextStreamEvent::Completed => {
+                        done = true;
+                        break;
+                    }
+                    ParsedTextStreamEvent::Delta(_) | ParsedTextStreamEvent::Ignored => {}
                 }
                 continue;
             }
@@ -1680,6 +1665,16 @@ fn text_generation_request_body(
     body
 }
 
+fn responses_text_request_body(offer: &ConfiguredOffer, model: &str, prompt: &str) -> Value {
+    json!({
+        "model": model,
+        "input": prompt,
+        "stream": true,
+        "store": false,
+        "max_output_tokens": text_generation_max_tokens(offer),
+    })
+}
+
 fn text_generation_max_tokens(offer: &ConfiguredOffer) -> u64 {
     // Four output bytes per token is an operational estimate. The exact serialized output byte
     // check remains authoritative.
@@ -1705,9 +1700,17 @@ fn map_text_reqwest_failure(err: reqwest::Error, private_endpoint: bool) -> Adap
 }
 
 fn handle_local_text_cancel_signal(
+    backend: &LocalTextBackend,
     cancel_rx: &watch::Receiver<bool>,
     changed: std::result::Result<(), tokio::sync::watch::error::RecvError>,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
+    if matches!(
+        backend,
+        LocalTextBackend::OpenAiCompatible { .. } | LocalTextBackend::OpenAiResponses { .. }
+    ) {
+        // Closing a hosted HTTP stream does not confirm that backend work stopped.
+        return Ok(worker_settlement_unknown_result());
+    }
     match changed {
         Ok(()) => {
             if *cancel_rx.borrow() {
@@ -1808,6 +1811,77 @@ fn parse_stream_json(payload: &str) -> std::result::Result<Value, AdapterFault> 
     })
 }
 
+fn parse_chat_completions_stream_event(
+    payload: &str,
+    backend_report: Option<&mut HostedBackendReport>,
+) -> std::result::Result<ParsedTextStreamEvent, AdapterFault> {
+    if payload.trim() == "[DONE]" {
+        return Ok(ParsedTextStreamEvent::Completed);
+    }
+    let value = parse_stream_json(payload)?;
+    if let Some(report) = backend_report {
+        report.observe_chat_completions(&value);
+    }
+    let delta = extract_stream_text_delta(&value);
+    if delta.is_empty() {
+        return Ok(ParsedTextStreamEvent::Ignored);
+    }
+    Ok(ParsedTextStreamEvent::Delta(delta))
+}
+
+fn parse_responses_stream_event(
+    payload: &str,
+    backend_report: &mut HostedBackendReport,
+) -> std::result::Result<ParsedTextStreamEvent, AdapterFault> {
+    let value = parse_stream_json(payload)?;
+    let event_type = value.get("type").and_then(Value::as_str).ok_or_else(|| {
+        AdapterFault::malformed(
+            "model backend returned invalid data",
+            "responses stream event must contain a string type",
+        )
+    })?;
+    match event_type {
+        "response.output_text.delta" => value
+            .get("delta")
+            .and_then(Value::as_str)
+            .map(|delta| ParsedTextStreamEvent::Delta(delta.to_string()))
+            .ok_or_else(|| {
+                AdapterFault::malformed(
+                    "model backend returned invalid data",
+                    "responses output text delta must be a string",
+                )
+            }),
+        "response.completed" => {
+            let response = value
+                .get("response")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    AdapterFault::malformed(
+                        "model backend returned invalid data",
+                        "responses completed event must contain a response object",
+                    )
+                })?;
+            if response.get("status").and_then(Value::as_str) != Some("completed") {
+                return Err(AdapterFault::malformed(
+                    "model backend returned invalid data",
+                    "responses completed event response status must be completed",
+                ));
+            }
+            backend_report.observe_responses_completed(response);
+            Ok(ParsedTextStreamEvent::Completed)
+        }
+        "response.failed" | "response.incomplete" | "error" => {
+            let fault = AdapterFault::backend_failed(
+                "model backend failed",
+                format!("responses stream ended with {event_type}"),
+            );
+            fault.log();
+            Err(fault)
+        }
+        _ => Ok(ParsedTextStreamEvent::Ignored),
+    }
+}
+
 fn extract_stream_text_delta(value: &Value) -> String {
     if let Some(text) = value
         .pointer("/choices/0/delta/content")
@@ -1841,6 +1915,8 @@ fn parse_bounded_backend_string(
 
 fn parse_backend_usage(
     usage: &serde_json::Map<String, Value>,
+    input_name: &str,
+    output_name: &str,
 ) -> std::result::Result<Option<BackendTokenUsage>, ()> {
     fn token(
         usage: &serde_json::Map<String, Value>,
@@ -1852,8 +1928,8 @@ fn parse_backend_usage(
         }
     }
 
-    let input_tokens = token(usage, "prompt_tokens")?;
-    let output_tokens = token(usage, "completion_tokens")?;
+    let input_tokens = token(usage, input_name)?;
+    let output_tokens = token(usage, output_name)?;
     let total_tokens = token(usage, "total_tokens")?;
     if input_tokens.is_none() && output_tokens.is_none() && total_tokens.is_none() {
         return Ok(None);
@@ -2963,11 +3039,12 @@ mod tests {
     }
 
     #[test]
-    fn text_generation_request_json_uses_policy_token_ceiling_for_both_backends() {
+    fn responses_and_chat_request_json_use_policy_token_ceiling() {
         let mut offer = openai_offer("http://example.invalid/chat");
         offer.policy.inline_output_bytes_limit = 64;
         let hosted = text_generation_request_body(&offer, "hosted", "hello", None);
         let local = text_generation_request_body(&offer, "local", "hello", Some(false));
+        let responses = responses_text_request_body(&offer, "responses", "hello");
         assert_eq!(
             hosted,
             json!({
@@ -2985,6 +3062,16 @@ mod tests {
                 "max_tokens": 16,
                 "messages": [{ "role": "user", "content": "hello" }],
                 "chat_template_kwargs": { "enable_thinking": false },
+            })
+        );
+        assert_eq!(
+            responses,
+            json!({
+                "model": "responses",
+                "input": "hello",
+                "stream": true,
+                "store": false,
+                "max_output_tokens": 16,
             })
         );
 
@@ -3016,6 +3103,38 @@ mod tests {
         let loggable = format!("{fault:?}");
         assert!(!fault.detail.as_deref().unwrap().contains(&url));
         assert!(!loggable.contains(sentinel));
+    }
+
+    #[test]
+    fn responses_parser_requires_authoritative_completion_envelope() {
+        for payload in [
+            json!({"type": "response.completed"}),
+            json!({"type": "response.completed", "response": []}),
+            json!({"type": "response.completed", "response": {}}),
+            json!({"type": "response.completed", "response": {"status": "failed"}}),
+            json!({"type": "response.output_text.delta", "delta": {}}),
+        ] {
+            let mut report = HostedBackendReport::default();
+            let Err(fault) = parse_responses_stream_event(&payload.to_string(), &mut report) else {
+                panic!("invalid responses event was accepted");
+            };
+            assert_eq!(fault.error.class, ErrorClass::ResponseMalformed);
+        }
+
+        let mut report = HostedBackendReport::default();
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "model": "m".repeat(MAX_MODEL_BYTES + 1),
+                "usage": {"input_tokens": "invalid"},
+            },
+        });
+        assert!(matches!(
+            parse_responses_stream_event(&completed.to_string(), &mut report).unwrap(),
+            ParsedTextStreamEvent::Completed
+        ));
+        assert_eq!(report.finish(), BackendReport::unknown());
     }
 
     #[test]
@@ -3109,11 +3228,13 @@ mod tests {
             let url = format!("{}/chat", server.base_url);
             thread::spawn(move || {
                 started_tx.send(()).unwrap();
-                let result = dispatch_openai_text(
+                let result = dispatch_text(
                     &executor,
-                    &url,
-                    Some("secret"),
-                    "gpt-test",
+                    LocalTextBackend::OpenAiCompatible {
+                        api_url: url,
+                        api_key: Some("secret".to_string()),
+                        model: "gpt-test".to_string(),
+                    },
                     &offer,
                     &run_binding,
                     &input,
@@ -3789,11 +3910,13 @@ mod tests {
         let executor = LiveAdapterExecutor::new(runtime.handle.clone(), mpsc::channel(4).0);
         let openai_offer = openai_offer(&format!("{}/chat", redirect.base_url));
 
-        let fault = dispatch_openai_text(
+        let fault = dispatch_text(
             &executor,
-            &format!("{}/chat", redirect.base_url),
-            Some("secret"),
-            "gpt-test",
+            LocalTextBackend::OpenAiCompatible {
+                api_url: format!("{}/chat", redirect.base_url),
+                api_key: Some("secret".to_string()),
+                model: "gpt-test".to_string(),
+            },
             &openai_offer,
             &openai_binding(),
             &text_input("hello"),

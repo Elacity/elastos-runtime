@@ -225,6 +225,13 @@ pub enum AdapterConfig {
         model: String,
         hosted: HostedDisclosureConfig,
     },
+    OpenAiResponsesText {
+        api_url: String,
+        #[serde(default)]
+        api_key: Option<String>,
+        model: String,
+        hosted: HostedDisclosureConfig,
+    },
     LocalLlamaCppText {
         engine: LocalArtifactConfig,
         model: LocalArtifactConfig,
@@ -245,6 +252,12 @@ impl AdapterConfig {
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::OpenAiCompatibleText {
+                api_url,
+                api_key,
+                model,
+                hosted,
+            }
+            | Self::OpenAiResponsesText {
                 api_url,
                 api_key,
                 model,
@@ -298,7 +311,9 @@ impl AdapterConfig {
     pub fn stream_output(&self) -> bool {
         matches!(
             self,
-            Self::OpenAiCompatibleText { .. } | Self::LocalLlamaCppText { .. }
+            Self::OpenAiCompatibleText { .. }
+                | Self::OpenAiResponsesText { .. }
+                | Self::LocalLlamaCppText { .. }
         )
     }
 }
@@ -437,7 +452,8 @@ impl ConfiguredOffer {
 
     pub fn summary(&self) -> OfferSummary {
         let hosted = match &self.adapter {
-            AdapterConfig::OpenAiCompatibleText { model, hosted, .. } => {
+            AdapterConfig::OpenAiCompatibleText { model, hosted, .. }
+            | AdapterConfig::OpenAiResponsesText { model, hosted, .. } => {
                 Some(hosted.summary(model))
             }
             _ => None,
@@ -458,6 +474,11 @@ impl ConfiguredOffer {
         let adapter = match &self.adapter {
             AdapterConfig::OpenAiCompatibleText { api_url, model, .. } => json!({
                 "kind": "open_ai_compatible_text",
+                "api_url": api_url,
+                "model": model,
+            }),
+            AdapterConfig::OpenAiResponsesText { api_url, model, .. } => json!({
+                "kind": "open_ai_responses_text",
                 "api_url": api_url,
                 "model": model,
             }),
@@ -494,19 +515,20 @@ impl ConfiguredOffer {
     fn validate_canonical_modalities(&self) -> Result<()> {
         match &self.adapter {
             AdapterConfig::OpenAiCompatibleText { .. }
+            | AdapterConfig::OpenAiResponsesText { .. }
             | AdapterConfig::LocalLlamaCppText { .. } => {
                 if self.operation != "text.generate" {
-                    anyhow::bail!("openai compatible text offers require operation text.generate");
+                    anyhow::bail!("text generation offers require operation text.generate");
                 }
                 validate_exact_modalities(
                     &self.input_modalities,
                     &["text/plain"],
-                    "openai compatible text input_modalities",
+                    "text generation input_modalities",
                 )?;
                 validate_exact_modalities(
                     &self.output_modalities,
                     &["text/plain"],
-                    "openai compatible text output_modalities",
+                    "text generation output_modalities",
                 )?;
             }
             AdapterConfig::HttpJobArtifact { .. } => {
@@ -1135,6 +1157,42 @@ mod tests {
         let artifact_json = serde_json::to_string(&artifact_summary).unwrap();
         assert!(!artifact_json.contains("jobs.example.test"));
         assert!(!artifact_json.contains("token-a"));
+    }
+
+    #[test]
+    fn responses_adapter_has_distinct_binding_and_shared_hosted_disclosure() {
+        let endpoint = "https://example.test/v1/text";
+        let model = "model-test";
+        let mut chat = base_offer();
+        if let AdapterConfig::OpenAiCompatibleText {
+            api_url,
+            model: configured_model,
+            ..
+        } = &mut chat.adapter
+        {
+            *api_url = endpoint.to_string();
+            *configured_model = model.to_string();
+        }
+        let mut responses = chat.clone();
+        responses.adapter = AdapterConfig::OpenAiResponsesText {
+            api_url: endpoint.to_string(),
+            api_key: Some("sentinel-responses-key".to_string()),
+            model: model.to_string(),
+            hosted: test_hosted_disclosure(),
+        };
+
+        responses.validate().unwrap();
+        let responses_hash = responses.execution_binding_hash().unwrap();
+        assert_ne!(responses_hash, chat.execution_binding_hash().unwrap());
+        let mut rotated = responses.clone();
+        if let AdapterConfig::OpenAiResponsesText { api_key, .. } = &mut rotated.adapter {
+            *api_key = Some("rotated-responses-key".to_string());
+        }
+        assert_eq!(responses_hash, rotated.execution_binding_hash().unwrap());
+        assert_eq!(responses.summary(), chat.summary());
+        let public = serde_json::to_string(&responses.summary()).unwrap();
+        assert!(!public.contains("example.test"));
+        assert!(!public.contains("sentinel-responses-key"));
     }
 
     #[test]
