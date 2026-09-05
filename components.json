@@ -1411,16 +1411,24 @@
       }
     },
     "llama-server": {
+      "version": "b10516",
       "platforms": {
         "linux-amd64": {
-          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b8192/llama-b8192-bin-ubuntu-x64.tar.gz",
-          "checksum": "sha256:7f98074d1d5596bd8153b5a23aaa5ed77a3759ded9527f39e24d1695c45c35f3",
-          "extract_path": "llama-b8192/llama-server",
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10516/llama-b10516-bin-ubuntu-x64.tar.gz",
+          "checksum": "sha256:f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35",
+          "extract_path": "llama-b10516/llama-server",
           "install_path": "bin/llama-server"
         },
         "linux-arm64": {
           "strategy": "source-build",
           "note": "No official aarch64 binary. Run: scripts/build-llama-server.sh"
+        },
+        "darwin-arm64": {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10516/llama-b10516-bin-macos-arm64.tar.gz",
+          "checksum": "sha256:ee3324327d621026ae80c24031670e65fa62a0b23a3a027dbe2f65f240affd30",
+          "extract_path": "llama-b10516",
+          "install_path": "libexec/llama.cpp/b10516/darwin-arm64",
+          "binary_path": "llama-server"
         }
       }
     },
@@ -1447,13 +1455,24 @@
       }
     },
     "model-qwen3.5-9b": {
-      "size_mb": 5680,
-      "description": "Qwen3.5 9B Q4_K_M — higher quality, needs more memory",
+      "size_mb": 6170,
+      "description": "Qwen3.5 9B Q4_K_M — stable Mac evaluation candidate",
       "platforms": {
         "*": {
-          "url": "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
-          "checksum": "sha256:03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8",
-          "install_path": "models/Qwen3.5-9B-Q4_K_M.gguf"
+          "url": "https://huggingface.co/bartowski/Qwen_Qwen3.5-9B-GGUF/resolve/bc658f7a1ae222ee901a565aafd2f5b8c839e176/Qwen_Qwen3.5-9B-Q4_K_M.gguf",
+          "checksum": "sha256:d784ce9eda1a5a7b51e8f705a9e6310844bf4f173654d115823c775fdea56d43",
+          "install_path": "models/Qwen_Qwen3.5-9B-Q4_K_M.gguf"
+        }
+      }
+    },
+    "model-bonsai-8b-q1": {
+      "size_mb": 1160,
+      "description": "PrismML Bonsai 8B Q1_0 — experimental low-memory Mac candidate",
+      "platforms": {
+        "*": {
+          "url": "https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/48516770dd04643643e9f9019a2a349cf26c5dbd/Bonsai-8B-Q1_0.gguf",
+          "checksum": "sha256:284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54",
+          "install_path": "models/Bonsai-8B-Q1_0.gguf"
         }
       }
     }

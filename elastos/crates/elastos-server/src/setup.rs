@@ -12,6 +12,9 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(unix)]
+mod local_model_engine_receipt;
+
 const DEFAULT_SETUP_PROFILE: &str = "home";
 const CACHED_CID_FILE: &str = ".elastos-cid";
 const CACHED_ARTIFACT_SHA_FILE: &str = ".elastos-artifact-sha256";
@@ -123,6 +126,9 @@ pub struct PlatformInfo {
     pub extract_path: Option<String>,
     #[serde(default)]
     pub install_path: Option<String>,
+    /// Executable path inside a directory-valued extracted bundle.
+    #[serde(default)]
+    pub binary_path: Option<String>,
     pub strategy: Option<String>,
     /// Local filesystem path to copy from (for "local-copy" strategy).
     pub source: Option<String>,
@@ -315,6 +321,9 @@ async fn run_with_data_dir(
             &platform,
         ) {
             InstallState::Installed => {
+                if let Some(platform_info) = platform_info {
+                    ensure_bundle_executable_link(&data_dir, name, platform_info)?;
+                }
                 println!("[skip] {} — already installed", name);
                 skipped_count += 1;
                 continue;
@@ -394,7 +403,7 @@ async fn run_with_data_dir(
             println!("[install] {} — copying from {}", name, source.display());
             atomic_copy_file(&source, &dest)?;
             set_local_copy_permissions(&source, &dest);
-            maybe_write_component_cache_metadata(&manifest, Some(platform_info), name, &dest)?;
+            write_cache_metadata(&manifest, Some(platform_info), &platform, name, &dest)?;
             println!("  Installed: {}", dest.display());
             changed = true;
         } else if !matches!(binary_install_state, InstallState::Installed) {
@@ -426,7 +435,7 @@ async fn run_with_data_dir(
                 &ipfs_gateways,
             )
             .await?;
-            maybe_write_component_cache_metadata(&manifest, Some(platform_info), name, &dest)?;
+            write_cache_metadata(&manifest, Some(platform_info), &platform, name, &dest)?;
             changed = true;
         }
 
@@ -816,7 +825,7 @@ pub(crate) async fn ensure_capsule_component_for_home_launch(
         &gateways,
     )
     .await?;
-    maybe_write_component_cache_metadata(&manifest, Some(platform_info), name, &dest)?;
+    write_cache_metadata(&manifest, Some(platform_info), &platform, name, &dest)?;
 
     let installed_manifest = dest.join("capsule.json");
     let manifest_bytes = fs::read(&installed_manifest).map_err(|err| {
@@ -1046,6 +1055,38 @@ fn component_install_state_for_name(
     component: &Component,
     platform_info: Option<&PlatformInfo>,
 ) -> InstallState {
+    #[cfg(unix)]
+    if name == "llama-server"
+        && platform_info
+            .and_then(|info| info.binary_path.as_ref())
+            .is_some()
+    {
+        let Some(path) = resolve_install_path(component, platform_info) else {
+            return InstallState::Missing;
+        };
+        let bundle = data_dir.join(path);
+        if !bundle.exists() {
+            return InstallState::Missing;
+        }
+        let result = local_model_engine_receipt_args(component, platform_info.unwrap()).and_then(
+            |(version, checksum, binary)| {
+                local_model_engine_receipt::verify(
+                    &bundle,
+                    version,
+                    &detect_platform(),
+                    checksum,
+                    binary,
+                )
+            },
+        );
+        return match result {
+            Ok(()) => InstallState::Installed,
+            Err(err) => {
+                InstallState::Stale(format!("llama-server bundle verification failed: {err}"))
+            }
+        };
+    }
+
     let base = component_install_state(data_dir, component, platform_info);
     if !matches!(base, InstallState::Installed) {
         return base;
@@ -1220,13 +1261,29 @@ fn installed_provider_capsule_metadata_stale_reason(
     None
 }
 
-fn maybe_write_component_cache_metadata(
+fn write_cache_metadata(
     manifest: &ComponentsManifest,
     platform_info: Option<&PlatformInfo>,
+    platform: &str,
     name: &str,
     dest: &Path,
 ) -> anyhow::Result<()> {
     if !dest.is_dir() {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    if name == "llama-server"
+        && platform_info
+            .and_then(|info| info.binary_path.as_ref())
+            .is_some()
+    {
+        let component = manifest.external.get(name).ok_or_else(|| {
+            anyhow::anyhow!("llama-server is missing from the component manifest")
+        })?;
+        let (version, checksum, binary) =
+            local_model_engine_receipt_args(component, platform_info.unwrap())?;
+        local_model_engine_receipt::write(dest, version, platform, checksum, binary)?;
         return Ok(());
     }
 
@@ -1252,6 +1309,27 @@ fn maybe_write_component_cache_metadata(
         return Ok(());
     };
     write_platform_cache_metadata(platform_info, dest)
+}
+
+fn local_model_engine_receipt_args<'a>(
+    component: &'a Component,
+    platform_info: &'a PlatformInfo,
+) -> anyhow::Result<(&'a str, &'a str, &'a str)> {
+    Ok((
+        component
+            .version
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("llama-server bundle version is missing"))?,
+        platform_info
+            .checksum
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("llama-server bundle checksum is missing"))?,
+        platform_info
+            .binary_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("llama-server bundle binary path is missing"))?,
+    ))
 }
 
 fn extracted_bundle_cache_stale_reason(
@@ -1988,7 +2066,13 @@ pub async fn refresh_installed_components_for_update(
             &gateways,
         )
         .await?;
-        maybe_write_component_cache_metadata(&new_manifest, Some(new_platform_info), name, &dest)?;
+        write_cache_metadata(
+            &new_manifest,
+            Some(new_platform_info),
+            platform,
+            name,
+            &dest,
+        )?;
         refreshed.push(name.clone());
     }
 
@@ -2030,7 +2114,7 @@ fn component_signature(component: Option<&Component>, platform: &str) -> Option<
     let component = component?;
     let platform_info = resolve_platform_info(component, platform)?;
     Some(format!(
-        "version={:?}|component_install={:?}|platform_install={:?}|url={:?}|cid={:?}|release_path={:?}|checksum={:?}|extract={:?}|strategy={:?}|source={:?}",
+        "version={:?}|component_install={:?}|platform_install={:?}|url={:?}|cid={:?}|release_path={:?}|checksum={:?}|extract={:?}|binary={:?}|strategy={:?}|source={:?}",
         component.version,
         component.install_path,
         platform_info.install_path,
@@ -2039,6 +2123,7 @@ fn component_signature(component: Option<&Component>, platform: &str) -> Option<
         platform_info.release_path,
         platform_info.checksum,
         platform_info.extract_path,
+        platform_info.binary_path,
         platform_info.strategy,
         platform_info.source
     ))
@@ -2060,7 +2145,7 @@ fn component_capsule_metadata_signature(
     let metadata = component?.capsule_metadata.as_ref()?;
     let platform_info = resolve_component_capsule_metadata_platform_info(metadata, platform)?;
     Some(format!(
-        "component_install={:?}|platform_install={:?}|url={:?}|cid={:?}|release_path={:?}|checksum={:?}|extract={:?}|strategy={:?}|source={:?}|size={:?}",
+        "component_install={:?}|platform_install={:?}|url={:?}|cid={:?}|release_path={:?}|checksum={:?}|extract={:?}|binary={:?}|strategy={:?}|source={:?}|size={:?}",
         metadata.install_path,
         platform_info.install_path,
         platform_info.url,
@@ -2068,6 +2153,7 @@ fn component_capsule_metadata_signature(
         platform_info.release_path,
         platform_info.checksum,
         platform_info.extract_path,
+        platform_info.binary_path,
         platform_info.strategy,
         platform_info.source,
         platform_info.size
@@ -2170,6 +2256,7 @@ async fn download_component(
         );
         match install_first_party_component_via_carrier(data_dir, name, platform_info, dest).await {
             Ok(()) => {
+                ensure_bundle_executable_link(data_dir, name, platform_info)?;
                 println!("  Installed: {}", dest.display());
                 return Ok(());
             }
@@ -2253,6 +2340,8 @@ async fn download_component(
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(dest, fs::Permissions::from_mode(0o755));
     }
+
+    ensure_bundle_executable_link(data_dir, name, platform_info)?;
 
     println!("  Installed: {}", dest.display());
     Ok(())
@@ -2442,6 +2531,74 @@ fn extract_from_tarball(
         extract_path,
         extracted.display()
     )
+}
+
+fn ensure_bundle_executable_link(
+    data_dir: &Path,
+    name: &str,
+    platform_info: &PlatformInfo,
+) -> anyhow::Result<()> {
+    let Some(binary_path) = platform_info.binary_path.as_deref() else {
+        return Ok(());
+    };
+    let install_path = platform_info.install_path.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("component '{name}' bundle executable requires install_path")
+    })?;
+    let install_path = Path::new(install_path);
+    let binary_path = Path::new(binary_path);
+    for (label, path) in [("install_path", install_path), ("binary_path", binary_path)] {
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            anyhow::bail!("component '{name}' bundle {label} must be a relative safe path");
+        }
+    }
+
+    let target = data_dir.join(install_path).join(binary_path);
+    let metadata = fs::symlink_metadata(&target).map_err(|err| {
+        anyhow::anyhow!(
+            "component '{name}' bundle executable is unavailable at {}: {err}",
+            target.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("component '{name}' bundle executable must be a regular file");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let bin_dir = data_dir.join("bin");
+        fs::create_dir_all(&bin_dir)?;
+        let link = bin_dir.join(name);
+        if let Ok(existing) = fs::symlink_metadata(&link) {
+            if !existing.file_type().is_symlink() {
+                anyhow::bail!(
+                    "component '{name}' cannot replace the existing non-link executable at {}",
+                    link.display()
+                );
+            }
+        }
+        let temporary = bin_dir.join(format!(".{name}.link-{}", std::process::id()));
+        let _ = fs::remove_file(&temporary);
+        symlink(&target, &temporary)?;
+        if let Err(err) = fs::rename(&temporary, &link) {
+            let _ = fs::remove_file(&temporary);
+            return Err(err.into());
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    anyhow::bail!("component '{name}' bundle executable links are unsupported on this platform")
 }
 
 fn atomic_write_file(dest: &Path, data: &[u8]) -> anyhow::Result<()> {
@@ -3238,6 +3395,7 @@ mod tests {
                 ),
                 extract_path: None,
                 install_path: Some("bin/site-provider".to_string()),
+                binary_path: None,
                 strategy: None,
                 source: None,
                 note: None,
@@ -3265,6 +3423,220 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn directory_bundle_exposes_declared_binary_at_stable_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("libexec/llama.cpp/b10516/darwin-arm64");
+        fs::create_dir_all(&bundle).unwrap();
+        let binary = bundle.join("llama-server");
+        fs::write(&binary, b"llama-server").unwrap();
+        let platform_info = PlatformInfo {
+            url: None,
+            cid: None,
+            release_path: None,
+            checksum: None,
+            extract_path: Some("llama-b10516".to_string()),
+            install_path: Some("libexec/llama.cpp/b10516/darwin-arm64".to_string()),
+            binary_path: Some("llama-server".to_string()),
+            strategy: None,
+            source: None,
+            note: None,
+            size: None,
+        };
+
+        ensure_bundle_executable_link(tmp.path(), "llama-server", &platform_info).unwrap();
+        let link = tmp.path().join("bin/llama-server");
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::canonicalize(&link).unwrap(),
+            fs::canonicalize(&binary).unwrap()
+        );
+
+        ensure_bundle_executable_link(tmp.path(), "llama-server", &platform_info).unwrap();
+        assert_eq!(
+            fs::canonicalize(&link).unwrap(),
+            fs::canonicalize(&binary).unwrap()
+        );
+
+        let unsafe_info = PlatformInfo {
+            binary_path: Some("../llama-server".to_string()),
+            ..platform_info
+        };
+        assert!(
+            ensure_bundle_executable_link(tmp.path(), "llama-server", &unsafe_info)
+                .unwrap_err()
+                .to_string()
+                .contains("relative safe path")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn llama_bundle_fixture(root: &Path) -> (ComponentsManifest, PathBuf, PathBuf) {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let data = root.join("data");
+        let bundle = data.join("libexec/llama.cpp/fixture-v1/darwin-arm64");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(bundle.join("libfixture.dylib"), b"fixture dylib\n").unwrap();
+        fs::write(bundle.join("llama-server"), b"fixture llama-server\n").unwrap();
+        fs::set_permissions(
+            bundle.join("llama-server"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        symlink("libfixture.dylib", bundle.join("libllama.dylib")).unwrap();
+        let model = data.join("models/stable.gguf");
+        fs::create_dir_all(model.parent().unwrap()).unwrap();
+        fs::write(&model, b"stable model\n").unwrap();
+        let manifest = serde_json::from_value(serde_json::json!({
+            "external": {
+                "llama-server": {
+                    "version": "fixture-v1",
+                    "platforms": {"darwin-arm64": {
+                        "url": "https://fixture.invalid/llama.tar.gz",
+                        "checksum": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "extract_path": "llama-fixture-v1",
+                        "install_path": "libexec/llama.cpp/fixture-v1/darwin-arm64",
+                        "binary_path": "llama-server",
+                        "strategy": "prebuilt"
+                    }}
+                },
+                "model-qwen3.5-9b": {
+                    "description": "stable fixture",
+                    "platforms": {"*": {
+                        "url": "https://fixture.invalid/stable.gguf",
+                        "checksum": compute_sha256_checksum(&model).unwrap(),
+                        "install_path": "models/stable.gguf"
+                    }}
+                }
+            },
+            "profiles": {}
+        }))
+        .unwrap();
+        (manifest, data, bundle)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_fetch_fixture_receipt(bundle: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(
+            bundle.join(".elastos-engine.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "archive_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "entries": [
+                    {"path": "libfixture.dylib", "sha256": compute_sha256_checksum(&bundle.join("libfixture.dylib")).unwrap(), "type": "file"},
+                    {"path": "libllama.dylib", "target": "libfixture.dylib", "type": "symlink"},
+                    {"path": "llama-server", "sha256": compute_sha256_checksum(&bundle.join("llama-server")).unwrap(), "type": "file"}
+                ],
+                "platform": "darwin-arm64",
+                "schema": "elastos.local-model-engine/v2",
+                "version": "fixture-v1"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        for (path, mode) in [
+            (bundle.join("libfixture.dylib"), 0o400),
+            (bundle.join("llama-server"), 0o500),
+            (bundle.join(".elastos-engine.json"), 0o400),
+            (bundle.to_path_buf(), 0o500),
+        ] {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fetch_llama_bundle_has_exact_inventory_for_runtime_setup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest, data, bundle) = llama_bundle_fixture(tmp.path());
+        write_fetch_fixture_receipt(&bundle);
+        let component = &manifest.external["llama-server"];
+        let state = component_install_state_for_name(
+            &manifest,
+            &data,
+            "llama-server",
+            component,
+            resolve_platform_info(component, "darwin-arm64"),
+        );
+        assert_eq!(state, InstallState::Installed);
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(bundle.join("unexpected.dylib"), b"unexpected\n").unwrap();
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(matches!(
+            component_install_state_for_name(
+                &manifest,
+                &data,
+                "llama-server",
+                component,
+                resolve_platform_info(component, "darwin-arm64"),
+            ),
+            InstallState::Stale(_)
+        ));
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runtime_setup_llama_bundle_is_reused_by_fetch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest, data, bundle) = llama_bundle_fixture(tmp.path());
+        let component = &manifest.external["llama-server"];
+        write_cache_metadata(
+            &manifest,
+            resolve_platform_info(component, "darwin-arm64"),
+            "darwin-arm64",
+            "llama-server",
+            &bundle,
+        )
+        .unwrap();
+        let manifest_path = tmp.path().join("components.json");
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let tools = tmp.path().join("tools");
+        fs::create_dir(&tools).unwrap();
+        let uname = tools.join("uname");
+        fs::write(
+            &uname,
+            b"#!/bin/sh\n[ \"$1\" = \"-s\" ] && echo Darwin || echo arm64\n",
+        )
+        .unwrap();
+        fs::set_permissions(&uname, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = Command::new("bash")
+            .arg(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../../scripts/fetch/fetch-model.sh"),
+            )
+            .arg("stable")
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    tools.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("ELASTOS_COMPONENTS_MANIFEST", manifest_path)
+            .env("ELASTOS_DATA_DIR", &data)
+            .output()
+            .unwrap();
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!bundle.join(CACHED_ARTIFACT_SHA_FILE).exists());
+    }
+
     #[test]
     fn test_component_install_state_detects_stale_extracted_bundle_metadata() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3286,6 +3658,7 @@ mod tests {
                 checksum: Some("sha256:new-home-cli-archive".to_string()),
                 extract_path: Some("home-cli".to_string()),
                 install_path: Some("capsules/home-cli".to_string()),
+                binary_path: None,
                 strategy: None,
                 source: None,
                 note: None,
@@ -3346,6 +3719,7 @@ mod tests {
                 checksum: None,
                 extract_path: None,
                 install_path: Some("bin/object-provider".to_string()),
+                binary_path: None,
                 strategy: None,
                 source: None,
                 note: None,
@@ -3367,6 +3741,7 @@ mod tests {
                 ),
                 extract_path: Some("object-provider".to_string()),
                 install_path: Some("capsules/object-provider".to_string()),
+                binary_path: None,
                 strategy: None,
                 source: None,
                 note: None,
@@ -3740,6 +4115,7 @@ mod tests {
                 checksum: None,
                 extract_path: Some("marketplace".to_string()),
                 install_path: Some("capsules/marketplace".to_string()),
+                binary_path: None,
                 strategy: None,
                 source: None,
                 note: None,
@@ -3821,6 +4197,7 @@ mod tests {
             ),
             extract_path: Some("marketplace".to_string()),
             install_path: Some("capsules/marketplace".to_string()),
+            binary_path: None,
             strategy: None,
             source: None,
             note: None,
@@ -4086,6 +4463,7 @@ mod tests {
                 )),
                 extract_path: None,
                 install_path: Some("bin/vmlinux".to_string()),
+                binary_path: None,
                 strategy: Some("local-copy".to_string()),
                 source: Some(source_path.to_string_lossy().to_string()),
                 note: None,
@@ -4118,6 +4496,7 @@ mod tests {
             checksum: None,
             extract_path: None,
             install_path: None,
+            binary_path: None,
             strategy: None,
             source: None,
             note: None,
@@ -4139,6 +4518,7 @@ mod tests {
             checksum: None,
             extract_path: None,
             install_path: Some("bin/shell".to_string()),
+            binary_path: None,
             strategy: None,
             source: None,
             note: None,
@@ -4162,6 +4542,7 @@ mod tests {
             )),
             extract_path: None,
             install_path: Some("bin/shell".to_string()),
+            binary_path: None,
             strategy: None,
             source: None,
             note: None,
@@ -4181,6 +4562,7 @@ mod tests {
                 checksum: None,
                 extract_path: None,
                 install_path: Some("bin/shell".to_string()),
+                binary_path: None,
                 strategy: Some(strategy.to_string()),
                 source: None,
                 note: None,
@@ -4202,6 +4584,7 @@ mod tests {
             checksum: None,
             extract_path: None,
             install_path: Some("bin/shell".to_string()),
+            binary_path: None,
             strategy: None,
             source: None,
             note: None,
