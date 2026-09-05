@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-09-03 UTC
+Last updated: 2026-09-04 UTC
 
 This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
@@ -230,6 +230,87 @@ boundaries. Each custody node owns one independent share and its node-local
 rights check. Runtime and capsules do not receive private provider, storage,
 Chain, RPC, or Carrier topology.
 
+Verified on branch `feat/protected-content-installed-e2e-proof` between
+2026-09-02 and 2026-09-04, against the simulation-only
+`deploy/custody-host/` three-node harness (see its own README for the
+simulation boundary):
+
+- The three-node compose harness is live with DID-keyed public descriptor
+  handoff, and node resurrection after stop/start is proven on three separate
+  occasions: each node returns with the same DID, a fresh readiness receipt,
+  and zero required environment variables.
+- Real `CarrierPeerDid` transport dial proofs exist for each node: a signed
+  operator-control denial plus the container-side audit log recording the
+  dialing client's DID.
+- The offline 2-of-3 custody composition ceremony
+  (`elastos protected-content-config`) runs over three real node descriptors
+  exported by the harness, and its own verify path passes.
+- `protected-content-installed-e2e-proof.sh --phase preflight` reports
+  `preflight_ok: true` for all three nodes' descriptors, dials, and receipts.
+- `scripts/custody-harness-ci-smoke.sh` (the CI-safe `provision` + `preflight`
+  rehearsal against a fresh throwaway harness instance) passes fully, locally.
+
+Verified on the same branch between 2026-09-05 and 2026-09-07, live, against
+the same simulation-only three-node harness, with the installed client
+Runtime (`scripts/setup-source-home.sh` receipt, started by
+`scripts/mac-source-home-restart.sh`) and three custody-host containers built
+from the reviewed server/capsules tree, an Anvil fork of Base as the private
+chain (two distinct-origin evidence RPC sources, finality advanced by a block
+ticker) and headless, recovery-ready, profiled principals (creator, buyer,
+denial) with managed wallet accounts funded through `anvil_setBalance`:
+
+- The full installed journey ran end to end and the finalize receipt reads
+  `overall_ok: true` with every required phase present and `ok: true`: mint
+  (real ffmpeg DASH preparation, CENC protection, three-node custody
+  provisioning, a signed availability receipt with three replicas and a live
+  multi-peer proof, the on-chain mint and the ERC-1155 operator approval on
+  the operative), availability, buy (fresh availability, `buyAccess`
+  finalized on both evidence sources), open (managed-wallet viewer release
+  approval, a 2-of-3 release settled by the nodes' own chain rights evidence,
+  init and segment reads, close), the custody and replica drills, the
+  negative cases (below quorum fails closed, non-purchaser and cross-principal
+  reads denied, stale replay rejected, tampered custody share excluded), the
+  mid-session restart (SIGKILL between approval and confirmation, no
+  duplicate transaction), cleanup (explicit close settles; the boot sweeper
+  settles a lease abandoned by a mid-open kill) and finalize.
+- Product contracts observed live and now asserted by the driver: one
+  stopped or tampered committee member does not deny the viewer (2-of-3
+  serves; below quorum with two nodes down fails closed on availability);
+  `content status` reports the last stored availability receipt; media parts
+  are released strictly in order; a non-purchasing principal is refused by
+  the purchase gate before any session gate.
+- A custody committee member settles every release through its own chain
+  rights evidence, so the standalone provider host and the custody-host
+  image carry the chain plane (trusting the provisioned client issuer), and
+  each node needs the client's network configuration with evidence RPC URLs
+  reachable from the node.
+- The receipt's phase blocks cite the branch commits current when each phase
+  ran (the branch was re-folded to three commits during the run); the
+  binding evidence is the recorded host and per-container binary sha256.
+  After the proof, the server/capsules commit took two lint-only edits to
+  pass `cargo clippy --all-targets -D warnings` (an explicit
+  `too_many_arguments` allow on `RuntimePreparedRecipient::from_persisted_parts`
+  and boxing the signed arm of `RuntimeReleaseWalletOutcome`) plus test-only
+  changes (the mock wallet binds outcomes on the real six authority fields,
+  a regression test for the restart-completion projection); no behaviour
+  changed, and the proof binaries predate those edits.
+
+Not yet verified: the same journey on distinct seed/third-node hardware
+across genuinely distinct operators and failure domains (gates 3 and 4), a
+real Base deployment instead of the Anvil fork, and the in-browser Brave
+UIUX path of the journey (gate 8). The local `custody-harness-ci-smoke.sh`
+runs are arm64 on Docker Desktop; the CI job `custody-harness-smoke` ran for
+the first time on a Linux amd64 runner on 2026-09-07 (PR #57) and failed
+before any node exported its descriptor: a bind mount keeps the host
+directory's owner and mode on Linux, so the containers' unprivileged user
+could not write `shared/` (Docker Desktop maps that ownership away, which
+is why no macOS run could see it). `up.sh` and the entrypoint now handle
+that host explicitly and the smoke preserves the nodes' logs on failure;
+the third run on that runner (2026-09-07, after the same steps had passed on
+a plain Linux Docker Engine in a VM) is green: three distinct DID-keyed
+descriptors, composition generated and verified, three Carrier dial proofs,
+provision and preflight `ok: true`, clean teardown.
+
 ## PR15 Extraction Ledger
 
 PR #15 / `feat/dkms-esp-port` is source evidence, not a merge target. The
@@ -326,6 +407,12 @@ complete. Installed proof and the atomic authority cutover remain open.
 
 ## Proof Path Ledger
 
+- Installed protected-content e2e proof path:
+  `scripts/protected-content-installed-e2e-proof.sh --phase <name>`, run
+  against a real installed client Runtime and the `deploy/custody-host/`
+  simulation-only three-node harness. `scripts/custody-harness-ci-smoke.sh`
+  is the CI-safe rehearsal of its `provision` and `preflight` phases against
+  a fresh throwaway instance of that harness.
 - Installed operator/update proof path: `public-install-operator-smoke.sh`.
 - DID/profile proof path: `public-install-identity-smoke.sh` or
   `local-identity-profile-smoke.sh`, depending on target role.
