@@ -208,7 +208,7 @@ pub async fn register_begin(
     let mut manager = state.manager.lock().await;
     require_existing_registration_authority(&manager, &session)?;
     require_guest_registration_policy(&state.data_dir, manager.status().registered)?;
-    match manager.begin_registration(&session.token, &rp.id) {
+    match manager.begin_registration(&session.token, &rp.id, &rp.origin) {
         Ok(options) => Ok(Json(options)),
         Err(e) => Err(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
     }
