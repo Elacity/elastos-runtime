@@ -280,6 +280,22 @@ complete. Installed proof and the atomic authority cutover remain open.
 
 ## Authority And Wallet Truth
 
+- Registration source tests verify one-use ceremony binding to the exact RP
+  and origin, and expected enrollment denials return HTTP 403. Credential saves
+  use a stable file lock, encrypted-snapshot conflict checks and atomic
+  replacement. Unix paths use directory descriptors and no-follow checks;
+  fresh files are owner-only. Key creation shares the identity lock. Failed
+  writes reload durable facts; post-replacement failure has indeterminate
+  durability. Auth-state locking uses the standard cross-process file API.
+  The non-Unix identity adapter preserves existing path/ACL behavior without
+  claiming Unix path protection or directory durability. Windows acceptance
+  remains open. Credential and principal writes still have separate commit
+  boundaries. Fresh registration rejects existing credentials; durable,
+  authorized recovery must own any future exact credential adoption.
+  One-use public HTTPS enrollment and same-principal passkey linking remain
+  unimplemented. The enrollment design preserves normal loopback onboarding
+  through the same first-owner operation. These are source findings, not
+  installed enrollment or recovery proof.
 - Home authority uses signed `elastos.home.launch-token/v4` envelopes. Runtime
   validation binds resource, actors, principal, proof, grant, session,
   lifetime, and non-delegatability; callers cannot supply Wallet authority.

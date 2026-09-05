@@ -1052,6 +1052,35 @@ mod tests {
     }
 
     #[test]
+    fn new_registration_ceremony_cannot_adopt_an_existing_credential() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
+        let rp = "home.example";
+        let origin = "https://home.example";
+        let first = manager
+            .begin_principal_registration("first", rp, origin)
+            .unwrap();
+        let response = registration_response(&first.public_key.challenge, rp, origin);
+        manager
+            .complete_registration("first", &response, rp, origin)
+            .unwrap();
+        let before = std::fs::read(temp.path().join("identity/credentials.json")).unwrap();
+        let credentials = manager.credentials();
+        let fresh = manager
+            .begin_principal_registration("fresh", rp, origin)
+            .unwrap();
+        let response = registration_response(&fresh.public_key.challenge, rp, origin);
+        assert!(manager
+            .complete_registration("fresh", &response, rp, origin)
+            .is_err());
+        assert_eq!(manager.credentials(), credentials);
+        assert_eq!(
+            std::fs::read(temp.path().join("identity/credentials.json")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
     fn registration_validates_client_data_and_attestation_against_bound_authority() {
         for (rp_id, origin, expected) in [
             ("localhost", "https://other.example", "Origin mismatch"),

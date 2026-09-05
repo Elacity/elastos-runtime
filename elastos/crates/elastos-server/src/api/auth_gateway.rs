@@ -4260,19 +4260,22 @@ mod tests {
         attestation.extend_from_slice(b"authData");
         attestation.extend_from_slice(&[0x58, u8::try_from(auth_data.len()).unwrap()]);
         attestation.extend_from_slice(&auth_data);
-        let response: RegistrationResponse = serde_json::from_value(json!({
-            "id": URL_SAFE_NO_PAD.encode(credential_id),
-            "rawId": URL_SAFE_NO_PAD.encode(credential_id),
-            "type": "public-key",
-            "response": {
-                "clientDataJson": URL_SAFE_NO_PAD.encode(json!({
-                    "type": "webauthn.create", "challenge": begin.options.public_key.challenge,
-                    "origin": "https://home.example"
-                }).to_string()),
-                "attestationObject": URL_SAFE_NO_PAD.encode(attestation)
-            }
-        }))
-        .unwrap();
+        let response_for = |challenge: &str| {
+            serde_json::from_value::<RegistrationResponse>(json!({
+                "id": URL_SAFE_NO_PAD.encode(credential_id),
+                "rawId": URL_SAFE_NO_PAD.encode(credential_id),
+                "type": "public-key",
+                "response": {
+                    "clientDataJson": URL_SAFE_NO_PAD.encode(json!({
+                        "type": "webauthn.create", "challenge": challenge,
+                        "origin": "https://home.example"
+                    }).to_string()),
+                    "attestationObject": URL_SAFE_NO_PAD.encode(&attestation)
+                }
+            }))
+            .unwrap()
+        };
+        let response = response_for(&begin.options.public_key.challenge);
         let result = passkey_register_complete_inner(
             &state,
             &headers,
@@ -4300,6 +4303,29 @@ mod tests {
             .credentials()
             .iter()
             .any(|credential| credential.rp_id == "home.example"));
+        drop(manager);
+        let credential_path = temp.path().join("identity/credentials.json");
+        let auth_path = crate::auth::auth_state_path(temp.path()).unwrap();
+        let credential_bytes = std::fs::read(&credential_path).unwrap();
+        let auth_bytes = std::fs::read(&auth_path).unwrap();
+        let fresh = passkey_register_begin_inner(&state, &headers, false)
+            .await
+            .unwrap();
+        assert!(passkey_register_complete_inner(
+            &state,
+            &headers,
+            PasskeyRegisterCompleteRequest {
+                ceremony_id: fresh.ceremony_id,
+                response: response_for(&fresh.options.public_key.challenge),
+                display_name: None,
+            },
+            false,
+        )
+        .await
+        .is_err());
+        // A fresh fmt:none ceremony cannot adopt another person's existing key.
+        assert_eq!(std::fs::read(&credential_path).unwrap(), credential_bytes);
+        assert_eq!(std::fs::read(&auth_path).unwrap(), auth_bytes);
     }
 
     #[test]
