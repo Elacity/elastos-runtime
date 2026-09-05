@@ -29,10 +29,11 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         config.validate().map_err(|err| {
             ProviderFault::internal(format!("invalid model provider init config: {err}"))
         })?;
-        let extra = serde_json::from_value::<ProviderInitExtra>(config.extra).map_err(|err| {
-            ProviderFault::internal(format!("invalid model provider init config: {err}"))
-        })?;
-        extra.validate(&config.base_path).map_err(|err| {
+        let extra =
+            serde_json::from_value::<ProviderInitExtra>(config.extra.clone()).map_err(|err| {
+                ProviderFault::internal(format!("invalid model provider init config: {err}"))
+            })?;
+        extra.validate(&config).map_err(|err| {
             ProviderFault::internal(format!("invalid model provider init config: {err}"))
         })?;
         if let Some(provider_id) = extra.provider_id.as_deref() {
@@ -198,6 +199,7 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             &offer,
             &request.runtime_binding,
             &request.input,
+            run.deadline_ms,
         ) {
             Ok(result) => {
                 let stored_offer = run.offer.clone();
@@ -351,6 +353,28 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         apply_reconcile_result(&stored_offer, &mut run, result)?;
         self.journal.store_run(&run)?;
         Ok(())
+    }
+
+    pub(crate) fn run_deadline_expired(&self, run_id: &str) -> Result<bool, ProviderFault> {
+        Ok(self
+            .journal
+            .load_run_if_present(run_id)?
+            .map(|run| !run.status.is_terminal() && deadline_expired(now_ms(), run.deadline_ms))
+            .unwrap_or(false))
+    }
+
+    pub(crate) fn settle_local_text_run_timeout(
+        &mut self,
+        run_id: &str,
+    ) -> Result<(), ProviderFault> {
+        let Some(mut run) = self.journal.load_run_if_present(run_id)? else {
+            return Ok(());
+        };
+        if run.status.is_terminal() {
+            return Ok(());
+        }
+        transition_timeout(&mut run)?;
+        self.journal.store_run(&run)
     }
 
     pub(crate) fn settle_local_text_run_unknown(
@@ -516,19 +540,11 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             self.journal.store_run(run)?;
             return Ok(());
         };
-        if now_ms() > run.deadline_ms {
-            let stored_offer = run.offer.clone();
-            transition_terminal(
-                &stored_offer,
-                run,
-                RunStatus::Failed,
-                None,
-                Some(RunError {
-                    class: ErrorClass::BackendTimeout,
-                    code: "backend_timeout".to_string(),
-                    message: "model backend timed out".to_string(),
-                }),
-            )?;
+        if deadline_expired(now_ms(), run.deadline_ms) {
+            if self.adapters.has_active_local_text_worker(&run.run_id) {
+                return Ok(());
+            }
+            transition_timeout(run)?;
             self.journal.store_run(run)?;
             return Ok(());
         }
@@ -828,6 +844,25 @@ fn transition_error(
         _ => RunStatus::Failed,
     };
     transition_terminal(offer, run, status, None, Some(error))
+}
+
+fn transition_timeout(run: &mut StoredRun) -> Result<(), ProviderFault> {
+    let offer = run.offer.clone();
+    transition_terminal(
+        &offer,
+        run,
+        RunStatus::Failed,
+        None,
+        Some(RunError {
+            class: ErrorClass::BackendTimeout,
+            code: "backend_timeout".to_string(),
+            message: "model backend timed out".to_string(),
+        }),
+    )
+}
+
+fn deadline_expired(now_ms: u64, deadline_ms: u64) -> bool {
+    now_ms >= deadline_ms
 }
 
 fn apply_run_atomically(
@@ -1194,6 +1229,7 @@ mod tests {
             _offer: &ConfiguredOffer,
             _binding: &RuntimeCreateBinding,
             _input: &Value,
+            _deadline_ms: u64,
         ) -> std::result::Result<DispatchResult, AdapterFault> {
             *self.dispatch_calls.lock().unwrap() += 1;
             self.dispatch_results.lock().unwrap().remove(0)
@@ -1442,6 +1478,12 @@ mod tests {
         run.backend_state = Some(running_backend_state());
         run.status = RunStatus::Running;
         run
+    }
+
+    #[test]
+    fn run_deadline_expires_at_equality() {
+        assert!(!deadline_expired(41, 42));
+        assert!(deadline_expired(42, 42));
     }
 
     #[test]

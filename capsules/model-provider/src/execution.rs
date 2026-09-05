@@ -133,6 +133,11 @@ impl ProviderCoordinator {
     async fn route_request(&mut self, request: ProviderEnvelope) -> Result<Value, ProviderFault> {
         match request.operation {
             ProviderOperation::Init => {
+                if self.provider.is_some() {
+                    return Err(ProviderFault::invalid_request(
+                        "model provider is already initialized",
+                    ));
+                }
                 let init = serde_json::from_value::<InitRequest>(request.value)
                     .map_err(|_| ProviderFault::invalid_request("invalid init request body"))?;
                 if init.op != "init" {
@@ -243,6 +248,18 @@ impl ProviderCoordinator {
                     let _ = acknowledge.send(WorkerApplyAck::Rejected);
                     return;
                 }
+                match provider.run_deadline_expired(run_id.as_str()) {
+                    Ok(true) => {
+                        let _ = acknowledge.send(WorkerApplyAck::TimedOut);
+                        return;
+                    }
+                    Err(err) => {
+                        err.log();
+                        let _ = acknowledge.send(WorkerApplyAck::Rejected);
+                        return;
+                    }
+                    Ok(false) => {}
+                }
                 let ack =
                     match provider.apply_worker_reconcile_result(run_id.as_str(), guard, result) {
                         Ok(()) => WorkerApplyAck::Applied,
@@ -253,7 +270,11 @@ impl ProviderCoordinator {
                     };
                 let _ = acknowledge.send(ack);
             }
-            WorkerUpdate::Exited { run_id, generation } => {
+            WorkerUpdate::Exited {
+                run_id,
+                generation,
+                timed_out,
+            } => {
                 let Some(record) = provider
                     .adapters()
                     .remove_worker_if_current(run_id.as_str(), generation)
@@ -261,6 +282,12 @@ impl ProviderCoordinator {
                     return;
                 };
                 provider.adapters().await_worker_record(record).await;
+                if timed_out {
+                    if let Err(err) = provider.settle_local_text_run_timeout(run_id.as_str()) {
+                        err.log();
+                    }
+                    return;
+                }
                 if let Err(err) = provider.settle_local_text_run_unknown(run_id.as_str()) {
                     err.log();
                 }
@@ -288,6 +315,7 @@ impl ProviderCoordinator {
             }
         }
         provider.adapters().shutdown_workers().await;
+        provider.adapters().shutdown_local_llama().await;
         while let Ok(update) = self.updates.try_recv() {
             self.handle_update(update).await;
         }
@@ -298,7 +326,9 @@ impl ProviderCoordinator {
 mod tests {
     use super::*;
     use crate::adapters::serialize_local_text_backend_state;
-    use crate::config::{AdapterConfig, ConfiguredOffer, OfferPolicy};
+    use crate::config::{
+        AdapterConfig, ConfiguredOffer, LocalArtifactConfig, LocalLlamaSettings, OfferPolicy,
+    };
     use crate::contract::{
         model_input_hash, RunEvent, RuntimeAccessBinding, RuntimeCreateBinding, RUN_EVENT_SCHEMA,
         RUN_OUTPUT_TEXT_SCHEMA,
@@ -308,6 +338,7 @@ mod tests {
     use serde_json::{json, Value};
     use std::io::{self, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::path::{Path, PathBuf};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         mpsc as std_mpsc, Arc, Mutex,
@@ -596,6 +627,65 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn local_llama_offer(root: &str, mode: &str) -> (ConfiguredOffer, PathBuf, String) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = Path::new(root);
+        std::fs::create_dir_all(root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (engine, model, events) = crate::test_support::write_fake_llama_server(&root, mode);
+        (
+            ConfiguredOffer {
+                adapter: AdapterConfig::LocalLlamaCppText {
+                    engine: LocalArtifactConfig {
+                        sha256: crate::test_support::sha256_file(&engine),
+                        path: engine.to_string_lossy().into_owned(),
+                    },
+                    model: LocalArtifactConfig {
+                        sha256: crate::test_support::sha256_file(&model),
+                        path: model.to_string_lossy().into_owned(),
+                    },
+                    settings: LocalLlamaSettings {
+                        context_size: 256,
+                        parallel: 1,
+                        threads: 1,
+                        batch_threads: 1,
+                        gpu_layers: 0,
+                        health_timeout_ms: 2_000,
+                        shutdown_timeout_ms: 250,
+                        enable_thinking: false,
+                    },
+                },
+                ..local_text_offer("http://unused.invalid")
+            },
+            events,
+            root.to_string_lossy().into_owned(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn fake_llama_events(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn wait_for_fake_llama_event(path: &Path, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !fake_llama_events(path).iter().any(|line| line == expected) {
+            assert!(
+                Instant::now() < deadline,
+                "missing fake llama event {expected}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn artifact_offer(base_url: &str) -> ConfiguredOffer {
         ConfiguredOffer {
             id: "artifact-job".to_string(),
@@ -811,7 +901,16 @@ mod tests {
         run_id: &str,
         binding: &RuntimeAccessBinding,
     ) -> Value {
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        wait_for_terminal_with_timeout(provider, run_id, binding, WAIT_TIMEOUT)
+    }
+
+    fn wait_for_terminal_with_timeout(
+        provider: &ProviderCoordinatorHandle,
+        run_id: &str,
+        binding: &RuntimeAccessBinding,
+        timeout: Duration,
+    ) -> Value {
+        let deadline = Instant::now() + timeout;
         loop {
             let response = get_run(provider, run_id, binding);
             let status = response["data"]["status"].as_str().unwrap();
@@ -2524,6 +2623,352 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_llama_streams_concurrent_runs_reuses_child_and_rejects_reinit() {
+        let root = temp_root("local-llama-stream");
+        let (offer, events, root) = local_llama_offer(&root, "healthy");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let first_input = text_input("one");
+        let first_binding = create_binding("request:local-one", &offer, &first_input);
+        let first = create_run(&provider, &offer, &first_binding, &first_input);
+        let second_input = text_input("two");
+        let second_binding = create_binding("request:local-two", &offer, &second_input);
+        let second = create_run(&provider, &offer, &second_binding, &second_input);
+        let first_run_id = first["data"]["run_id"].as_str().unwrap();
+        let second_run_id = second["data"]["run_id"].as_str().unwrap();
+        let first_terminal =
+            wait_for_terminal(&provider, first_run_id, &access_binding(&first_binding));
+        let second_terminal =
+            wait_for_terminal(&provider, second_run_id, &access_binding(&second_binding));
+        assert_eq!(
+            first_terminal["data"]["terminal"]["output"]["text"],
+            "reply:one"
+        );
+        assert_eq!(
+            second_terminal["data"]["terminal"]["output"]["text"],
+            "reply:two"
+        );
+        let lines = fake_llama_events(&events);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("start:"))
+                .count(),
+            1
+        );
+        assert!(lines.iter().any(|line| line == "request:one"));
+        assert!(lines.iter().any(|line| line == "request:two"));
+
+        let repeated_init = provider
+            .request(init_request(&root, vec![offer.clone()]))
+            .unwrap();
+        assert_eq!(repeated_init["status"], "error");
+        assert_eq!(repeated_init["code"], "invalid_request");
+
+        let public = serde_json::to_string(&json!({
+            "first": first_terminal,
+            "second": second_terminal,
+            "offers": send_request(
+                &provider,
+                ProviderOperation::OffersList,
+                json!({"op":"offers_list"}),
+            ),
+        }))
+        .unwrap();
+        for private in [
+            "127.0.0.1",
+            "/bin/fake-llama-server",
+            "/models/fake.gguf",
+            "fake.events",
+        ] {
+            assert!(
+                !public.contains(private),
+                "public model data leaked {private}"
+            );
+        }
+        let runs = Path::new(&root).join("providers/model-provider/runs");
+        for entry in std::fs::read_dir(runs).unwrap() {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            let durable = String::from_utf8(bytes).unwrap();
+            assert!(!durable.contains("127.0.0.1"));
+            assert!(!durable.contains("fake-llama-server"));
+            assert!(!durable.contains("fake.gguf"));
+        }
+
+        provider.shutdown_on_eof();
+        wait_for_fake_llama_event(&events, "term");
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| *line == "term")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_llama_cancel_keeps_engine_for_later_run() {
+        let root = temp_root("local-llama-cancel");
+        let (offer, events, root) = local_llama_offer(&root, "healthy");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let input = text_input("stall");
+        let binding = create_binding("request:local-cancel", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        wait_for_fake_llama_event(&events, "request:stall");
+        let cancelled = cancel_run(&provider, run_id, &access_binding(&binding));
+        assert_eq!(cancelled["data"]["status"], "reconciling");
+        assert_eq!(
+            wait_for_terminal(&provider, run_id, &access_binding(&binding))["data"]["status"],
+            "cancelled"
+        );
+
+        let later_input = text_input("later");
+        let later_binding = create_binding("request:local-later", &offer, &later_input);
+        let later = create_run(&provider, &offer, &later_binding, &later_input);
+        let later_run_id = later["data"]["run_id"].as_str().unwrap();
+        assert_eq!(
+            wait_for_terminal(&provider, later_run_id, &access_binding(&later_binding))["data"]
+                ["terminal"]["output"]["text"],
+            "reply:later"
+        );
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| line.starts_with("start:"))
+                .count(),
+            1
+        );
+        provider.shutdown_on_eof();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_llama_deadline_expires_without_polling_before_late_output() {
+        let root = temp_root("local-llama-no-poll-deadline");
+        let (mut offer, _events, root) = local_llama_offer(&root, "slow_health");
+        offer.policy.runtime_ms_limit = 150;
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let input = text_input("late");
+        let binding = create_binding("request:local-no-poll-deadline", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let run = loop {
+            let run = load_run(&root, run_id);
+            if run.status.is_terminal() {
+                break run;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker did not settle without polling"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(run.status, crate::contract::RunStatus::Failed);
+        assert_eq!(run.error.as_ref().unwrap().code, "backend_timeout");
+        assert!(run.output.is_none());
+
+        provider.shutdown_on_eof();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_llama_deadline_holds_capacity_until_worker_stops() {
+        let root = temp_root("local-llama-timeout-capacity");
+        let (mut offer, events, root) = local_llama_offer(&root, "timeout_ignore_term");
+        offer.policy.concurrency_limit = 1;
+        offer.policy.runtime_ms_limit = 2_000;
+        let AdapterConfig::LocalLlamaCppText { settings, .. } = &mut offer.adapter else {
+            unreachable!();
+        };
+        settings.health_timeout_ms = 5_000;
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let first_input = text_input("first");
+        let first_binding = create_binding("request:local-timeout-first", &offer, &first_input);
+        let first = create_run(&provider, &offer, &first_binding, &first_input);
+        let first_run_id = first["data"]["run_id"].as_str().unwrap();
+        wait_for_fake_llama_event(&events, "term_ignored");
+        assert_eq!(
+            get_run(&provider, first_run_id, &access_binding(&first_binding))["data"]["status"],
+            "running"
+        );
+
+        let blocked_input = text_input("blocked");
+        let blocked_binding =
+            create_binding("request:local-timeout-blocked", &offer, &blocked_input);
+        let blocked = create_run(&provider, &offer, &blocked_binding, &blocked_input);
+        assert_eq!(
+            blocked["data"]["terminal"]["error"]["code"],
+            "selection_unavailable"
+        );
+
+        assert_eq!(
+            wait_for_terminal(&provider, first_run_id, &access_binding(&first_binding))["data"]
+                ["terminal"]["error"]["code"],
+            "backend_timeout"
+        );
+        let next_input = text_input("next");
+        let next_binding = create_binding("request:local-timeout-next", &offer, &next_input);
+        let next = create_run(&provider, &offer, &next_binding, &next_input);
+        assert_eq!(next["data"]["status"], "running");
+
+        provider.shutdown_on_eof();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_llama_crash_fails_once_and_restarts_on_later_run() {
+        let root = temp_root("local-llama-crash");
+        let (offer, events, root) = local_llama_offer(&root, "crash_once");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let crash_input = text_input("crash");
+        let crash_binding = create_binding("request:local-crash", &offer, &crash_input);
+        let crashed = create_run(&provider, &offer, &crash_binding, &crash_input);
+        let crash_run_id = crashed["data"]["run_id"].as_str().unwrap();
+        let failed = wait_for_terminal(&provider, crash_run_id, &access_binding(&crash_binding));
+        assert_eq!(failed["data"]["status"], "failed");
+        assert_eq!(
+            failed["data"]["terminal"]["error"]["message"],
+            "model backend transport was interrupted"
+        );
+        let serialized = serde_json::to_string(&failed).unwrap();
+        assert!(!serialized.contains("127.0.0.1"));
+        assert!(!serialized.contains("fake.gguf"));
+
+        let retry_input = text_input("after-crash");
+        let retry_binding = create_binding("request:local-restart", &offer, &retry_input);
+        let retry = create_run(&provider, &offer, &retry_binding, &retry_input);
+        let retry_run_id = retry["data"]["run_id"].as_str().unwrap();
+        assert_eq!(
+            wait_for_terminal(&provider, retry_run_id, &access_binding(&retry_binding))["data"]
+                ["terminal"]["output"]["text"],
+            "reply:after-crash"
+        );
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| line.starts_with("start:"))
+                .count(),
+            2
+        );
+        provider.shutdown_on_eof();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires ELASTOS_MODEL_EVAL_ROOT and real local model artifacts"]
+    fn opt_in_local_llama_evaluation_root_smoke() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let evaluation_root = std::fs::canonicalize(
+            std::env::var("ELASTOS_MODEL_EVAL_ROOT")
+                .expect("set ELASTOS_MODEL_EVAL_ROOT for the opt-in local llama smoke"),
+        )
+        .unwrap();
+        let engine = std::fs::canonicalize(evaluation_root.join("bin/llama-server")).unwrap();
+        let model = std::fs::canonicalize(
+            std::env::var_os("ELASTOS_MODEL_EVAL_MODEL")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| evaluation_root.join("models/Bonsai-8B-Q1_0.gguf")),
+        )
+        .unwrap();
+        assert!(engine.is_file() && engine.starts_with(&evaluation_root));
+        assert!(model.is_file() && model.starts_with(&evaluation_root));
+        let journal = crate::test_support::temp_root_path(
+            "model-provider-execution",
+            "installed-llama-journal",
+        );
+        std::fs::create_dir_all(&journal).unwrap();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut offer = local_text_offer("http://unused.invalid");
+        offer.policy.inline_output_bytes_limit = 64;
+        offer.policy.runtime_ms_limit = 60_000;
+        offer.adapter = AdapterConfig::LocalLlamaCppText {
+            engine: LocalArtifactConfig {
+                sha256: crate::test_support::sha256_file(&engine),
+                path: engine.to_string_lossy().into_owned(),
+            },
+            model: LocalArtifactConfig {
+                sha256: crate::test_support::sha256_file(&model),
+                path: model.to_string_lossy().into_owned(),
+            },
+            settings: LocalLlamaSettings {
+                context_size: 4_096,
+                parallel: 1,
+                threads: 8,
+                batch_threads: 8,
+                gpu_layers: 99,
+                health_timeout_ms: 120_000,
+                shutdown_timeout_ms: 5_000,
+                enable_thinking: false,
+            },
+        };
+        let mut provider = ProviderCoordinatorHandle::start();
+        let init = provider
+            .request(ProviderEnvelope {
+                operation: ProviderOperation::Init,
+                value: json!({
+                    "op": "init",
+                    "config": {
+                        "base_path": evaluation_root,
+                        "extra": {
+                            "provider_id": "model-provider",
+                            "journal_dir": journal,
+                            "offers": [offer.clone()],
+                        }
+                    }
+                }),
+            })
+            .unwrap();
+        assert_eq!(init["status"], "ok");
+        let input = text_input("Reply with exactly one word: ready.");
+        let binding = create_binding("request:installed-local-llama", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let started = get_run(&provider, run_id, &access_binding(&binding));
+        assert_eq!(started["data"]["status"], "running");
+        let terminal = wait_for_terminal_with_timeout(
+            &provider,
+            run_id,
+            &access_binding(&binding),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            terminal["data"]["status"], "completed",
+            "terminal response: {terminal:#}"
+        );
+        let output = &terminal["data"]["terminal"]["output"];
+        let text = output["text"].as_str().unwrap_or_default().trim();
+        let answer = text
+            .strip_suffix('.')
+            .or_else(|| text.strip_suffix('!'))
+            .or_else(|| text.strip_suffix('?'))
+            .unwrap_or(text);
+        assert!(
+            answer.eq_ignore_ascii_case("ready"),
+            "terminal response: {terminal:#}"
+        );
+        assert!(
+            serde_json::to_vec(output).unwrap().len() as u64
+                <= offer.policy.inline_output_bytes_limit,
+            "terminal response: {terminal:#}"
+        );
+        provider.shutdown_on_eof();
+    }
+
     #[test]
     fn text_stream_deltas_are_ordered_and_terminal_output_is_exact() {
         let server = start_server(vec![sse_action(
@@ -2907,6 +3352,7 @@ mod tests {
                 WorkerUpdate::Exited {
                     run_id: update_run_id,
                     generation,
+                    ..
                 } => {
                     assert_eq!(update_run_id, &run_id);
                     assert_eq!(*generation, 1);

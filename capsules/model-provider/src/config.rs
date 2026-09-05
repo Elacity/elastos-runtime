@@ -4,6 +4,8 @@ use elastos_model_contract::model_input_hash;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use url::Url;
 
@@ -32,6 +34,12 @@ pub const MAX_RUN_EVENTS_PAGE_BYTES_LIMIT: u64 = 224 * 1024;
 pub const MAX_RUNTIME_MS_LIMIT: u64 = 3_600_000;
 pub const MAX_RETENTION_SECS: u64 = 604_800;
 pub const MAX_CANCEL_SETTLEMENT_TIMEOUT_MS: u64 = 300_000;
+pub const MAX_LOCAL_LLAMA_CONTEXT_SIZE: u32 = 32_768;
+pub const MAX_LOCAL_LLAMA_PARALLEL: u32 = 64;
+pub const MAX_LOCAL_LLAMA_THREADS: u32 = 512;
+pub const MAX_LOCAL_LLAMA_GPU_LAYERS: u32 = 4_096;
+pub const MAX_LOCAL_LLAMA_HEALTH_TIMEOUT_MS: u64 = 120_000;
+pub const MAX_LOCAL_LLAMA_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,7 +94,7 @@ pub struct ProviderInitExtra {
 }
 
 impl ProviderInitExtra {
-    pub fn validate(&self, base_path: &str) -> Result<()> {
+    pub fn validate(&self, bridge: &BridgeProviderConfig) -> Result<()> {
         if let Some(provider_id) = self.provider_id.as_deref() {
             validate_bounded_trimmed(provider_id, "provider_id", MAX_PROVIDER_ID_BYTES)?;
         }
@@ -96,7 +104,7 @@ impl ProviderInitExtra {
                 anyhow::bail!("journal_dir must be an absolute path");
             }
         }
-        if base_path.is_empty() && self.journal_dir.is_none() {
+        if bridge.base_path.is_empty() && self.journal_dir.is_none() {
             anyhow::bail!("model provider init requires base_path or journal_dir");
         }
         if self.offers.len() > MAX_OFFER_COUNT {
@@ -105,12 +113,33 @@ impl ProviderInitExtra {
         let mut offer_ids = BTreeSet::new();
         for offer in &self.offers {
             offer.validate()?;
+            offer.validate_local_artifacts(bridge)?;
             if !offer_ids.insert(offer.id.as_str()) {
                 anyhow::bail!("duplicate model offer id in provider config");
             }
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalArtifactConfig {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalLlamaSettings {
+    pub context_size: u32,
+    pub parallel: u32,
+    pub threads: u32,
+    pub batch_threads: u32,
+    pub gpu_layers: u32,
+    pub health_timeout_ms: u64,
+    pub shutdown_timeout_ms: u64,
+    pub enable_thinking: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -121,6 +150,11 @@ pub enum AdapterConfig {
         #[serde(default)]
         api_key: Option<String>,
         model: String,
+    },
+    LocalLlamaCppText {
+        engine: LocalArtifactConfig,
+        model: LocalArtifactConfig,
+        settings: LocalLlamaSettings,
     },
     HttpJobArtifact {
         create_url: String,
@@ -146,6 +180,15 @@ impl AdapterConfig {
                     validate_bounded_trimmed(api_key, "openai adapter api_key", MAX_SECRET_BYTES)?;
                 }
                 validate_bounded_trimmed(model, "openai adapter model", MAX_MODEL_BYTES)?;
+            }
+            Self::LocalLlamaCppText {
+                engine,
+                model,
+                settings,
+            } => {
+                validate_local_artifact_config(engine, "local llama engine")?;
+                validate_local_artifact_config(model, "local llama model")?;
+                settings.validate()?;
             }
             Self::HttpJobArtifact {
                 create_url,
@@ -177,7 +220,45 @@ impl AdapterConfig {
     }
 
     pub fn stream_output(&self) -> bool {
-        matches!(self, Self::OpenAiCompatibleText { .. })
+        matches!(
+            self,
+            Self::OpenAiCompatibleText { .. } | Self::LocalLlamaCppText { .. }
+        )
+    }
+}
+
+impl LocalLlamaSettings {
+    fn validate(&self) -> Result<()> {
+        validate_nonzero_bounded(
+            self.context_size,
+            MAX_LOCAL_LLAMA_CONTEXT_SIZE,
+            "local llama context_size",
+        )?;
+        validate_nonzero_bounded(
+            self.parallel,
+            MAX_LOCAL_LLAMA_PARALLEL,
+            "local llama parallel",
+        )?;
+        validate_nonzero_bounded(self.threads, MAX_LOCAL_LLAMA_THREADS, "local llama threads")?;
+        validate_nonzero_bounded(
+            self.batch_threads,
+            MAX_LOCAL_LLAMA_THREADS,
+            "local llama batch_threads",
+        )?;
+        if self.gpu_layers > MAX_LOCAL_LLAMA_GPU_LAYERS {
+            anyhow::bail!("local llama gpu_layers must be in 0..={MAX_LOCAL_LLAMA_GPU_LAYERS}");
+        }
+        validate_nonzero_bounded(
+            self.health_timeout_ms,
+            MAX_LOCAL_LLAMA_HEALTH_TIMEOUT_MS,
+            "local llama health_timeout_ms",
+        )?;
+        validate_nonzero_bounded(
+            self.shutdown_timeout_ms,
+            MAX_LOCAL_LLAMA_SHUTDOWN_TIMEOUT_MS,
+            "local llama shutdown_timeout_ms",
+        )?;
+        Ok(())
     }
 }
 
@@ -297,6 +378,16 @@ impl ConfiguredOffer {
                 "api_url": api_url,
                 "model": model,
             }),
+            AdapterConfig::LocalLlamaCppText {
+                engine,
+                model,
+                settings,
+            } => json!({
+                "kind": "local_llama_cpp_text",
+                "engine_sha256": engine.sha256,
+                "model_sha256": model.sha256,
+                "settings": settings,
+            }),
             AdapterConfig::HttpJobArtifact {
                 create_url,
                 status_url,
@@ -319,7 +410,8 @@ impl ConfiguredOffer {
 
     fn validate_canonical_modalities(&self) -> Result<()> {
         match &self.adapter {
-            AdapterConfig::OpenAiCompatibleText { .. } => {
+            AdapterConfig::OpenAiCompatibleText { .. }
+            | AdapterConfig::LocalLlamaCppText { .. } => {
                 if self.operation != "text.generate" {
                     anyhow::bail!("openai compatible text offers require operation text.generate");
                 }
@@ -353,6 +445,14 @@ impl ConfiguredOffer {
             }
         }
         Ok(())
+    }
+
+    fn validate_local_artifacts(&self, bridge: &BridgeProviderConfig) -> Result<()> {
+        let AdapterConfig::LocalLlamaCppText { engine, model, .. } = &self.adapter else {
+            return Ok(());
+        };
+        validate_local_artifact(bridge, engine, true, "local llama engine")?;
+        validate_local_artifact(bridge, model, false, "local llama model")
     }
 }
 
@@ -419,10 +519,157 @@ fn validate_bounded_trimmed(value: &str, label: &str, max_bytes: usize) -> Resul
     Ok(())
 }
 
+fn validate_nonzero_bounded<T>(value: T, max: T, label: &str) -> Result<()>
+where
+    T: Copy + Ord + From<u8> + std::fmt::Display,
+{
+    if value < T::from(1) || value > max {
+        anyhow::bail!("{label} must be in 1..={max}");
+    }
+    Ok(())
+}
+
+fn validate_local_artifact_config(config: &LocalArtifactConfig, label: &str) -> Result<()> {
+    validate_bounded_trimmed(&config.path, label, MAX_BASE_PATH_BYTES)?;
+    if !Path::new(&config.path).is_absolute() {
+        anyhow::bail!("{label} path must be absolute");
+    }
+    let digest = config.sha256.strip_prefix("sha256:").unwrap_or_default();
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        anyhow::bail!("{label} sha256 must be canonical lowercase sha256 hex");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_local_artifact(
+    bridge: &BridgeProviderConfig,
+    artifact: &LocalArtifactConfig,
+    executable: bool,
+    label: &str,
+) -> Result<()> {
+    validate_local_artifact_config(artifact, label)?;
+    validate_bounded_trimmed(&bridge.base_path, "base_path", MAX_BASE_PATH_BYTES)?;
+    let base = Path::new(&bridge.base_path);
+    if !base.is_absolute() {
+        anyhow::bail!("base_path must be an absolute path");
+    }
+    let canonical_base =
+        fs::canonicalize(base).map_err(|_| anyhow::anyhow!("base_path is unavailable"))?;
+    if canonical_base != base {
+        anyhow::bail!("base_path must not contain symlinks");
+    }
+    let path = Path::new(&artifact.path);
+    let canonical =
+        fs::canonicalize(path).map_err(|_| anyhow::anyhow!("{label} is unavailable"))?;
+    if canonical != path {
+        anyhow::bail!("{label} path must not contain symlinks");
+    }
+    let allowed = if bridge.allowed_paths.is_empty() {
+        canonical.starts_with(&canonical_base)
+    } else {
+        bridge.allowed_paths.iter().any(|relative| {
+            let relative = Path::new(relative);
+            relative.is_relative()
+                && relative
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+                && fs::canonicalize(canonical_base.join(relative))
+                    .map(|root| root.starts_with(&canonical_base) && canonical.starts_with(root))
+                    .unwrap_or(false)
+        })
+    };
+    if !allowed {
+        anyhow::bail!("{label} is outside Runtime-admitted paths");
+    }
+    validate_local_artifact_metadata(artifact, executable)
+}
+
+pub(crate) fn revalidate_local_artifact(
+    artifact: &LocalArtifactConfig,
+    executable: bool,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    let label = if executable {
+        "local llama engine"
+    } else {
+        "local llama model"
+    };
+    if std::time::Instant::now() >= deadline {
+        anyhow::bail!("{label} verification deadline expired");
+    }
+    let path = Path::new(&artifact.path);
+    let canonical =
+        fs::canonicalize(path).map_err(|_| anyhow::anyhow!("{label} is unavailable"))?;
+    if canonical != path {
+        anyhow::bail!("{label} path must not contain symlinks");
+    }
+    validate_local_artifact_metadata(artifact, executable)?;
+    let expected = artifact.sha256.strip_prefix("sha256:").unwrap_or_default();
+    let mut file = fs::File::open(path).map_err(|_| anyhow::anyhow!("{label} is unavailable"))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("{label} verification deadline expired");
+        }
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| anyhow::anyhow!("{label} could not be verified"))?;
+        if read == 0 {
+            break;
+        }
+        use sha2::Digest as _;
+        hasher.update(&buffer[..read]);
+    }
+    use sha2::Digest as _;
+    if format!("{:x}", hasher.finalize()) != expected {
+        anyhow::bail!("{label} checksum does not match operator config");
+    }
+    Ok(())
+}
+
+fn validate_local_artifact_metadata(
+    artifact: &LocalArtifactConfig,
+    executable: bool,
+) -> Result<()> {
+    let label = if executable {
+        "local llama engine"
+    } else {
+        "local llama model"
+    };
+    let path = Path::new(&artifact.path);
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| anyhow::anyhow!("{label} is unavailable"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+        anyhow::bail!("{label} must be a non-empty regular non-symlink file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let mode = metadata.permissions().mode() & 0o777;
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || mode & 0o022 != 0
+        {
+            anyhow::bail!("{label} must be an owner-controlled single-link file");
+        }
+        if executable && mode & 0o111 == 0 {
+            anyhow::bail!("{label} must be executable");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
 
     fn base_offer() -> ConfiguredOffer {
         ConfiguredOffer {
@@ -465,6 +712,99 @@ mod tests {
         }
     }
 
+    fn local_llama_offer(engine: &Path, model: &Path) -> ConfiguredOffer {
+        ConfiguredOffer {
+            adapter: AdapterConfig::LocalLlamaCppText {
+                engine: LocalArtifactConfig {
+                    path: engine.to_string_lossy().into_owned(),
+                    sha256:
+                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_string(),
+                },
+                model: LocalArtifactConfig {
+                    path: model.to_string_lossy().into_owned(),
+                    sha256:
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .to_string(),
+                },
+                settings: LocalLlamaSettings {
+                    context_size: 4_096,
+                    parallel: 1,
+                    threads: 2,
+                    batch_threads: 2,
+                    gpu_layers: 0,
+                    health_timeout_ms: 1_000,
+                    shutdown_timeout_ms: 100,
+                    enable_thinking: false,
+                },
+            },
+            ..base_offer()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_llama_init_admits_metadata_without_hashing_large_artifacts() {
+        let root = crate::test_support::temp_root_path("model-provider-config", "local-llama");
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let bin = root.join("bin");
+        let models = root.join("models");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&models).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let engine = bin.join("llama-server");
+        let model = models.join("model.gguf");
+        fs::write(&engine, b"engine bytes").unwrap();
+        fs::write(&model, b"model bytes do not match configured digest").unwrap();
+        fs::set_permissions(&engine, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&model, fs::Permissions::from_mode(0o600)).unwrap();
+        let extra = ProviderInitExtra {
+            provider_id: Some("model-provider".to_string()),
+            journal_dir: Some(root.join("journal").to_string_lossy().into_owned()),
+            offers: vec![local_llama_offer(&engine, &model)],
+        };
+        let bridge = BridgeProviderConfig {
+            base_path: root.to_string_lossy().into_owned(),
+            allowed_paths: Vec::new(),
+            ..Default::default()
+        };
+
+        extra.validate(&bridge).unwrap();
+
+        let outside = crate::test_support::temp_root_path("model-provider-config", "outside");
+        fs::create_dir_all(&outside).unwrap();
+        let outside = fs::canonicalize(outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+        let outside_model = outside.join("model.gguf");
+        fs::write(&outside_model, b"outside").unwrap();
+        fs::set_permissions(&outside_model, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut outside_extra = extra.clone();
+        if let AdapterConfig::LocalLlamaCppText { model, .. } = &mut outside_extra.offers[0].adapter
+        {
+            model.path = outside_model.to_string_lossy().into_owned();
+        }
+        assert!(outside_extra.validate(&bridge).is_err());
+
+        let linked_allowed = root.join("linked-models");
+        symlink(&outside, &linked_allowed).unwrap();
+        let linked_allowed_bridge = BridgeProviderConfig {
+            base_path: root.to_string_lossy().into_owned(),
+            allowed_paths: vec!["linked-models".to_string()],
+            ..Default::default()
+        };
+        assert!(outside_extra.validate(&linked_allowed_bridge).is_err());
+
+        let linked_engine = bin.join("linked-server");
+        symlink(&engine, &linked_engine).unwrap();
+        let mut linked_extra = extra;
+        if let AdapterConfig::LocalLlamaCppText { engine, .. } = &mut linked_extra.offers[0].adapter
+        {
+            engine.path = linked_engine.to_string_lossy().into_owned();
+        }
+        assert!(linked_extra.validate(&bridge).is_err());
+    }
+
     #[test]
     fn journal_root_requires_absolute_operator_path() {
         assert!(journal_root("", None).is_err());
@@ -498,7 +838,11 @@ mod tests {
                 ..base_offer()
             }],
         };
-        assert!(config.validate("/tmp/base").is_err());
+        let bridge = BridgeProviderConfig {
+            base_path: "/tmp/base".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate(&bridge).is_err());
 
         let bridge = BridgeProviderConfig {
             base_path: "/tmp/base".to_string(),
@@ -530,8 +874,8 @@ mod tests {
                 }]
             }),
         };
-        let extra = serde_json::from_value::<ProviderInitExtra>(bridge.extra).unwrap();
-        assert!(extra.validate(&bridge.base_path).is_err());
+        let extra = serde_json::from_value::<ProviderInitExtra>(bridge.extra.clone()).unwrap();
+        assert!(extra.validate(&bridge).is_err());
     }
 
     #[test]
@@ -550,8 +894,8 @@ mod tests {
         .unwrap();
 
         bridge.validate().unwrap();
-        let extra = serde_json::from_value::<ProviderInitExtra>(bridge.extra).unwrap();
-        extra.validate(&bridge.base_path).unwrap();
+        let extra = serde_json::from_value::<ProviderInitExtra>(bridge.extra.clone()).unwrap();
+        extra.validate(&bridge).unwrap();
     }
 
     #[test]

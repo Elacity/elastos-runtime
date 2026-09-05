@@ -1,9 +1,10 @@
-use crate::config::{AdapterConfig, ConfiguredOffer};
+use crate::config::{AdapterConfig, ConfiguredOffer, LocalArtifactConfig, LocalLlamaSettings};
 use crate::contract::{
     ErrorClass, RunError, RunStatus, RuntimeCreateBinding, RUN_OUTPUT_CONTENT_SCHEMA,
     RUN_OUTPUT_OBJECT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
 };
 use crate::journal::{deterministic_run_id, now_ms};
+use crate::local_llama::{LocalLlamaEngines, LocalLlamaFault};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -26,7 +27,6 @@ const HTTP_JOB_BACKEND_STATE_ACTIVE: &str = "active";
 pub(crate) const LOCAL_TEXT_BACKEND_STATE_SCHEMA: &str =
     "elastos.model.provider-local-text-state/v1";
 const BACKEND_CONNECT_TIMEOUT_MS: u64 = 500;
-const BACKEND_READ_IDLE_TIMEOUT_MS: u64 = 500;
 const LOCAL_TEXT_DELTA_FLUSH_BYTES: usize = 8 * 1024;
 const MAX_LOCAL_TEXT_SSE_LINE_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_TEXT_SSE_EVENT_BYTES: usize = 128 * 1024;
@@ -35,7 +35,6 @@ fn backend_client(timeout_ms: u64) -> std::result::Result<reqwest::Client, Adapt
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_millis(BACKEND_CONNECT_TIMEOUT_MS))
-        .read_timeout(Duration::from_millis(BACKEND_READ_IDLE_TIMEOUT_MS))
         .timeout(Duration::from_millis(timeout_ms))
         .build()
         .map_err(|err| {
@@ -44,6 +43,17 @@ fn backend_client(timeout_ms: u64) -> std::result::Result<reqwest::Client, Adapt
                 format!("failed to build backend client: {err}"),
             )
         })
+}
+
+fn remaining_run_timeout(deadline_ms: u64) -> std::result::Result<Duration, AdapterFault> {
+    let remaining_ms = deadline_ms.saturating_sub(now_ms());
+    if remaining_ms == 0 {
+        return Err(AdapterFault::timeout(
+            "model backend timed out",
+            "model run deadline expired",
+        ));
+    }
+    Ok(Duration::from_millis(remaining_ms))
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +197,7 @@ pub(crate) enum WorkerUpdate {
     Exited {
         run_id: String,
         generation: u64,
+        timed_out: bool,
     },
 }
 
@@ -194,6 +205,7 @@ pub(crate) enum WorkerUpdate {
 pub(crate) enum WorkerApplyAck {
     Applied,
     Rejected,
+    TimedOut,
 }
 
 #[derive(Debug, Clone)]
@@ -232,13 +244,34 @@ struct LocalTextStreamState {
 struct LocalTextWorkerTask {
     run_id: String,
     generation: u64,
-    api_url: String,
-    api_key: Option<String>,
-    model: String,
+    backend: LocalTextBackend,
     offer: ConfiguredOffer,
+    deadline_ms: u64,
     prompt: String,
     cancel_rx: watch::Receiver<bool>,
     updates: mpsc::Sender<WorkerUpdate>,
+}
+
+enum LocalTextBackend {
+    OpenAiCompatible {
+        api_url: String,
+        api_key: Option<String>,
+        model: String,
+    },
+    LocalLlama {
+        engines: LocalLlamaEngines,
+        offer_id: String,
+        engine: LocalArtifactConfig,
+        model: LocalArtifactConfig,
+        settings: LocalLlamaSettings,
+    },
+}
+
+struct PreparedLocalTextWorker {
+    run_id: String,
+    generation: u64,
+    cancel_rx: watch::Receiver<bool>,
+    backend_state: Value,
 }
 
 struct HttpArtifactCreateWorkerTask {
@@ -293,7 +326,12 @@ pub trait AdapterExecutor {
         offer: &ConfiguredOffer,
         binding: &RuntimeCreateBinding,
         input: &Value,
+        deadline_ms: u64,
     ) -> std::result::Result<DispatchResult, AdapterFault>;
+
+    fn has_active_local_text_worker(&self, _run_id: &str) -> bool {
+        false
+    }
 
     fn reconcile(
         &self,
@@ -327,6 +365,7 @@ pub struct LiveAdapterExecutor {
     updates: mpsc::Sender<WorkerUpdate>,
     workers: Arc<Mutex<BTreeMap<String, WorkerRecord>>>,
     next_generation: Arc<AtomicU64>,
+    local_llama: LocalLlamaEngines,
 }
 
 impl LiveAdapterExecutor {
@@ -336,6 +375,7 @@ impl LiveAdapterExecutor {
             updates,
             workers: Arc::new(Mutex::new(BTreeMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
+            local_llama: LocalLlamaEngines::default(),
         }
     }
 
@@ -449,6 +489,10 @@ impl LiveAdapterExecutor {
         }
     }
 
+    pub(crate) async fn shutdown_local_llama(&self) {
+        self.local_llama.shutdown().await;
+    }
+
     fn spawn_local_text_worker(
         &self,
         api_url: &str,
@@ -457,6 +501,7 @@ impl LiveAdapterExecutor {
         offer: &ConfiguredOffer,
         binding: &RuntimeCreateBinding,
         prompt: &str,
+        deadline_ms: u64,
     ) -> std::result::Result<Value, AdapterFault> {
         let run_id = deterministic_run_id(binding);
         let backend_state = serialize_local_text_backend_state(false)?;
@@ -480,21 +525,102 @@ impl LiveAdapterExecutor {
                 retired_handles: Vec::new(),
             },
         );
+        self.spawn_text_worker(
+            LocalTextBackend::OpenAiCompatible {
+                api_url: api_url.to_string(),
+                api_key: api_key.map(str::to_string),
+                model: model.to_string(),
+            },
+            offer,
+            prompt,
+            deadline_ms,
+            PreparedLocalTextWorker {
+                run_id,
+                generation,
+                cancel_rx,
+                backend_state,
+            },
+            workers,
+        )
+    }
+
+    fn spawn_local_llama_worker(
+        &self,
+        engine: &LocalArtifactConfig,
+        model: &LocalArtifactConfig,
+        settings: &LocalLlamaSettings,
+        offer: &ConfiguredOffer,
+        binding: &RuntimeCreateBinding,
+        prompt: &str,
+        deadline_ms: u64,
+    ) -> std::result::Result<Value, AdapterFault> {
+        let run_id = deterministic_run_id(binding);
+        let backend_state = serialize_local_text_backend_state(false)?;
+        let mut workers = self.workers.lock().unwrap();
+        if workers.contains_key(&run_id) {
+            return Err(AdapterFault::context(
+                "model run could not start",
+                "local text worker already exists for run_id",
+            ));
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        workers.insert(
+            run_id.clone(),
+            WorkerRecord {
+                generation,
+                control: WorkerControl::LocalText { cancel_tx },
+                join_handle: None,
+                retired_handles: Vec::new(),
+            },
+        );
+        self.spawn_text_worker(
+            LocalTextBackend::LocalLlama {
+                engines: self.local_llama.clone(),
+                offer_id: offer.id.clone(),
+                engine: engine.clone(),
+                model: model.clone(),
+                settings: settings.clone(),
+            },
+            offer,
+            prompt,
+            deadline_ms,
+            PreparedLocalTextWorker {
+                run_id,
+                generation,
+                cancel_rx,
+                backend_state,
+            },
+            workers,
+        )
+    }
+
+    fn spawn_text_worker(
+        &self,
+        backend: LocalTextBackend,
+        offer: &ConfiguredOffer,
+        prompt: &str,
+        deadline_ms: u64,
+        prepared: PreparedLocalTextWorker,
+        mut workers: std::sync::MutexGuard<'_, BTreeMap<String, WorkerRecord>>,
+    ) -> std::result::Result<Value, AdapterFault> {
+        let PreparedLocalTextWorker {
+            run_id,
+            generation,
+            cancel_rx,
+            backend_state,
+        } = prepared;
         let updates = self.updates.clone();
         let offer = offer.clone();
-        let api_url = api_url.to_string();
-        let api_key = api_key.map(str::to_string);
-        let model = model.to_string();
         let prompt = prompt.to_string();
         let run_id_for_task = run_id.clone();
         let join_handle = self.runtime.spawn(async move {
-            run_local_text_worker(LocalTextWorkerTask {
+            let timed_out = run_local_text_worker(LocalTextWorkerTask {
                 run_id: run_id_for_task.clone(),
                 generation,
-                api_url,
-                api_key,
-                model,
+                backend,
                 offer,
+                deadline_ms,
                 prompt,
                 cancel_rx,
                 updates: updates.clone(),
@@ -504,6 +630,7 @@ impl LiveAdapterExecutor {
                 .send(WorkerUpdate::Exited {
                     run_id: run_id_for_task,
                     generation,
+                    timed_out,
                 })
                 .await;
         });
@@ -566,6 +693,7 @@ impl LiveAdapterExecutor {
                 .send(WorkerUpdate::Exited {
                     run_id: run_id_for_task,
                     generation,
+                    timed_out: false,
                 })
                 .await;
         });
@@ -629,6 +757,7 @@ impl LiveAdapterExecutor {
                 .send(WorkerUpdate::Exited {
                     run_id: run_id_for_task,
                     generation,
+                    timed_out: false,
                 })
                 .await;
         });
@@ -710,6 +839,7 @@ impl LiveAdapterExecutor {
                 .send(WorkerUpdate::Exited {
                     run_id: run_id_for_task,
                     generation,
+                    timed_out: false,
                 })
                 .await;
         });
@@ -728,6 +858,7 @@ impl AdapterExecutor for LiveAdapterExecutor {
         offer: &ConfiguredOffer,
         binding: &RuntimeCreateBinding,
         input: &Value,
+        deadline_ms: u64,
     ) -> std::result::Result<DispatchResult, AdapterFault> {
         match adapter {
             AdapterConfig::OpenAiCompatibleText {
@@ -742,6 +873,21 @@ impl AdapterExecutor for LiveAdapterExecutor {
                 offer,
                 binding,
                 input,
+                deadline_ms,
+            ),
+            AdapterConfig::LocalLlamaCppText {
+                engine,
+                model,
+                settings,
+            } => dispatch_local_llama_text(
+                self,
+                engine,
+                model,
+                settings,
+                offer,
+                binding,
+                input,
+                deadline_ms,
             ),
             AdapterConfig::HttpJobArtifact {
                 create_url,
@@ -766,6 +912,10 @@ impl AdapterExecutor for LiveAdapterExecutor {
         }
     }
 
+    fn has_active_local_text_worker(&self, run_id: &str) -> bool {
+        self.has_local_text_worker(run_id)
+    }
+
     fn reconcile(
         &self,
         adapter: &AdapterConfig,
@@ -774,7 +924,8 @@ impl AdapterExecutor for LiveAdapterExecutor {
         backend_state: &Value,
     ) -> std::result::Result<ReconcileResult, AdapterFault> {
         match adapter {
-            AdapterConfig::OpenAiCompatibleText { .. } => {
+            AdapterConfig::OpenAiCompatibleText { .. }
+            | AdapterConfig::LocalLlamaCppText { .. } => {
                 reconcile_local_text(self, binding, backend_state)
             }
             AdapterConfig::HttpJobArtifact {
@@ -804,7 +955,8 @@ impl AdapterExecutor for LiveAdapterExecutor {
         allow_send: bool,
     ) -> std::result::Result<CancelResult, AdapterFault> {
         match adapter {
-            AdapterConfig::OpenAiCompatibleText { .. } => {
+            AdapterConfig::OpenAiCompatibleText { .. }
+            | AdapterConfig::LocalLlamaCppText { .. } => {
                 cancel_local_text(self, binding, backend_state)
             }
             AdapterConfig::HttpJobArtifact {
@@ -833,7 +985,8 @@ impl AdapterExecutor for LiveAdapterExecutor {
         backend_state: &Value,
     ) -> std::result::Result<CancelReservation, AdapterFault> {
         match adapter {
-            AdapterConfig::OpenAiCompatibleText { .. } => reserve_local_text_cancel(backend_state),
+            AdapterConfig::OpenAiCompatibleText { .. }
+            | AdapterConfig::LocalLlamaCppText { .. } => reserve_local_text_cancel(backend_state),
             AdapterConfig::HttpJobArtifact { cancel_url, .. } => {
                 reserve_http_job_cancel(backend_state, cancel_url.is_some(), offer)
             }
@@ -849,10 +1002,49 @@ fn dispatch_openai_text(
     offer: &ConfiguredOffer,
     binding: &RuntimeCreateBinding,
     input: &Value,
+    deadline_ms: u64,
 ) -> std::result::Result<DispatchResult, AdapterFault> {
     let prompt = validate_text_prompt(input)?;
-    let backend_state =
-        executor.spawn_local_text_worker(api_url, api_key, model, offer, binding, prompt)?;
+    let backend_state = executor.spawn_local_text_worker(
+        api_url,
+        api_key,
+        model,
+        offer,
+        binding,
+        prompt,
+        deadline_ms,
+    )?;
+    Ok(DispatchResult::Running {
+        events: vec![EventSeed {
+            kind: "dispatched",
+            data: json!({
+                "offer_id": offer.id
+            }),
+        }],
+        backend_state,
+    })
+}
+
+fn dispatch_local_llama_text(
+    executor: &LiveAdapterExecutor,
+    engine: &LocalArtifactConfig,
+    model: &LocalArtifactConfig,
+    settings: &LocalLlamaSettings,
+    offer: &ConfiguredOffer,
+    binding: &RuntimeCreateBinding,
+    input: &Value,
+    deadline_ms: u64,
+) -> std::result::Result<DispatchResult, AdapterFault> {
+    let prompt = validate_text_prompt(input)?;
+    let backend_state = executor.spawn_local_llama_worker(
+        engine,
+        model,
+        settings,
+        offer,
+        binding,
+        prompt,
+        deadline_ms,
+    )?;
     Ok(DispatchResult::Running {
         events: vec![EventSeed {
             kind: "dispatched",
@@ -980,9 +1172,10 @@ fn cancel_local_text(
     })
 }
 
-async fn run_local_text_worker(mut task: LocalTextWorkerTask) {
+async fn run_local_text_worker(mut task: LocalTextWorkerTask) -> bool {
     let result = match run_local_text_worker_inner(&mut task).await {
         Ok(result) => result,
+        Err(fault) if fault.error.class == ErrorClass::BackendTimeout => return true,
         Err(fault) => ReconcileResult::Terminal {
             events: Vec::new(),
             status: match fault.error.class {
@@ -994,14 +1187,23 @@ async fn run_local_text_worker(mut task: LocalTextWorkerTask) {
             error: Some(fault.error),
         },
     };
-    let _ = send_worker_apply_update(
-        &task.run_id,
-        task.generation,
-        WorkerApplyGuard::None,
-        result,
-        &task.updates,
+    matches!(
+        send_worker_apply_update(
+            &task.run_id,
+            task.generation,
+            WorkerApplyGuard::None,
+            result,
+            &task.updates,
+        )
+        .await,
+        Err(AdapterFault {
+            error: RunError {
+                class: ErrorClass::BackendTimeout,
+                ..
+            },
+            ..
+        })
     )
-    .await;
 }
 
 async fn run_http_artifact_create_worker(task: HttpArtifactCreateWorkerTask) {
@@ -1188,19 +1390,51 @@ async fn run_http_artifact_status_worker_inner(
 async fn run_local_text_worker_inner(
     task: &mut LocalTextWorkerTask,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
-    let client = backend_client(task.offer.policy.runtime_ms_limit)?;
+    let (api_url, api_key, model, enable_thinking, private_endpoint) = match &task.backend {
+        LocalTextBackend::OpenAiCompatible {
+            api_url,
+            api_key,
+            model,
+        } => (api_url.clone(), api_key.clone(), model.clone(), None, false),
+        LocalTextBackend::LocalLlama {
+            engines,
+            offer_id,
+            engine,
+            model,
+            settings,
+        } => {
+            let endpoint = engines
+                .endpoint_with_timeout(
+                    offer_id,
+                    engine,
+                    model,
+                    settings,
+                    remaining_run_timeout(task.deadline_ms)?,
+                )
+                .await
+                .map_err(map_local_llama_fault)?;
+            (
+                endpoint.api_url,
+                None,
+                endpoint.model,
+                Some(endpoint.enable_thinking),
+                true,
+            )
+        }
+    };
+    let client = backend_client(
+        remaining_run_timeout(task.deadline_ms)?
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    )?;
     let request = {
+        let body = text_generation_request_body(&task.offer, &model, &task.prompt, enable_thinking);
         let mut builder = client
-            .post(&task.api_url)
+            .post(&api_url)
             .header("content-type", "application/json")
-            .json(&json!({
-                "model": task.model,
-                "stream": true,
-                "messages": [
-                    { "role": "user", "content": task.prompt }
-                ]
-            }));
-        if let Some(api_key) = task.api_key.as_deref() {
+            .json(&body);
+        if let Some(api_key) = api_key.as_deref() {
             builder = builder.header("authorization", format!("Bearer {api_key}"));
         }
         builder
@@ -1209,7 +1443,7 @@ async fn run_local_text_worker_inner(
         changed = task.cancel_rx.changed() => {
             return handle_local_text_cancel_signal(&task.cancel_rx, changed);
         }
-        response = request.send() => response.map_err(map_reqwest_failure)?
+        response = request.send() => response.map_err(|err| map_text_reqwest_failure(err, private_endpoint))?
     };
     if !response.status().is_success() {
         return Err(AdapterFault::backend_failed(
@@ -1229,7 +1463,7 @@ async fn run_local_text_worker_inner(
             changed = task.cancel_rx.changed() => {
                 return handle_local_text_cancel_signal(&task.cancel_rx, changed);
             }
-            chunk = response.chunk() => chunk.map_err(map_reqwest_failure)?
+            chunk = response.chunk() => chunk.map_err(|err| map_text_reqwest_failure(err, private_endpoint))?
         };
         let Some(chunk) = next else {
             return Err(AdapterFault::malformed(
@@ -1325,6 +1559,65 @@ async fn run_local_text_worker_inner(
         output: Some(output),
         error: None,
     })
+}
+
+fn map_local_llama_fault(fault: LocalLlamaFault) -> AdapterFault {
+    match fault {
+        LocalLlamaFault::Timeout => AdapterFault::timeout(
+            "model backend timed out",
+            "local llama engine health deadline expired",
+        ),
+        LocalLlamaFault::Failed => AdapterFault::backend_failed(
+            "model backend failed",
+            "local llama engine was unavailable",
+        ),
+    }
+}
+
+fn text_generation_request_body(
+    offer: &ConfiguredOffer,
+    model: &str,
+    prompt: &str,
+    enable_thinking: Option<bool>,
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "stream": true,
+        "max_tokens": text_generation_max_tokens(offer),
+        "messages": [
+            { "role": "user", "content": prompt }
+        ]
+    });
+    if let Some(enable_thinking) = enable_thinking {
+        body["chat_template_kwargs"] = json!({
+            "enable_thinking": enable_thinking,
+        });
+    }
+    body
+}
+
+fn text_generation_max_tokens(offer: &ConfiguredOffer) -> u64 {
+    // Four output bytes per token is an operational estimate. The exact serialized output byte
+    // check remains authoritative.
+    const ESTIMATED_OUTPUT_BYTES_PER_TOKEN: u64 = 4;
+
+    (offer.policy.inline_output_bytes_limit / ESTIMATED_OUTPUT_BYTES_PER_TOKEN).max(1)
+}
+
+fn map_text_reqwest_failure(err: reqwest::Error, private_endpoint: bool) -> AdapterFault {
+    if private_endpoint {
+        if err.is_timeout() {
+            return AdapterFault::timeout(
+                "model backend timed out",
+                "local llama request deadline expired",
+            );
+        }
+        return AdapterFault::transport(
+            "model backend transport was interrupted",
+            "local llama request was interrupted",
+        );
+    }
+    map_reqwest_failure(err)
 }
 
 fn handle_local_text_cancel_signal(
@@ -1491,6 +1784,10 @@ async fn send_worker_apply_update(
     match ack_rx.await {
         Ok(WorkerApplyAck::Applied) => Ok(()),
         Ok(WorkerApplyAck::Rejected) => Err(worker_update_rejected_fault()),
+        Ok(WorkerApplyAck::TimedOut) => Err(AdapterFault::timeout(
+            "model backend timed out",
+            "model run deadline expired before worker update",
+        )),
         Err(_) => Err(worker_control_lost_fault(
             "worker acknowledgement channel was dropped",
         )),
@@ -2309,6 +2606,13 @@ mod tests {
     }
 
     fn start_server(responses: Vec<HttpResponseSpec>) -> TestServer {
+        start_server_with_first_byte_delay(responses, Duration::ZERO)
+    }
+
+    fn start_server_with_first_byte_delay(
+        responses: Vec<HttpResponseSpec>,
+        first_byte_delay: Duration,
+    ) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -2345,6 +2649,7 @@ mod tests {
                     response.push_str("\r\n");
                 }
                 response.push_str("\r\n");
+                thread::sleep(first_byte_delay);
                 stream.write_all(response.as_bytes()).unwrap();
                 stream.write_all(&spec.body).unwrap();
                 stream.flush().unwrap();
@@ -2502,6 +2807,87 @@ mod tests {
     }
 
     #[test]
+    fn text_generation_request_json_uses_policy_token_ceiling_for_both_backends() {
+        let mut offer = openai_offer("http://example.invalid/chat");
+        offer.policy.inline_output_bytes_limit = 64;
+        let hosted = text_generation_request_body(&offer, "hosted", "hello", None);
+        let local = text_generation_request_body(&offer, "local", "hello", Some(false));
+        assert_eq!(
+            hosted,
+            json!({
+                "model": "hosted",
+                "stream": true,
+                "max_tokens": 16,
+                "messages": [{ "role": "user", "content": "hello" }],
+            })
+        );
+        assert_eq!(
+            local,
+            json!({
+                "model": "local",
+                "stream": true,
+                "max_tokens": 16,
+                "messages": [{ "role": "user", "content": "hello" }],
+                "chat_template_kwargs": { "enable_thinking": false },
+            })
+        );
+
+        let first = hosted["max_tokens"].as_u64().unwrap();
+        assert!(first > 0 && first <= offer.policy.inline_output_bytes_limit);
+        assert_eq!(text_generation_max_tokens(&offer), first);
+        offer.policy.inline_output_bytes_limit = 4_096;
+        assert_eq!(text_generation_max_tokens(&offer), 1_024);
+        assert_ne!(text_generation_max_tokens(&offer), first);
+    }
+
+    #[test]
+    fn local_text_first_bytes_can_use_the_offer_runtime_limit() {
+        let server = start_server_with_first_byte_delay(
+            vec![HttpResponseSpec {
+                status_line: "200 OK",
+                body: sse_body(&[], true),
+                headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            }],
+            Duration::from_millis(700),
+        );
+        let mut offer = openai_offer(&format!("{}/chat", server.base_url));
+        offer.policy.runtime_ms_limit = 2_000;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (update_tx, mut update_rx) = mpsc::channel(1);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut task = LocalTextWorkerTask {
+            run_id: "run-delayed-first-byte".to_string(),
+            generation: 1,
+            backend: LocalTextBackend::OpenAiCompatible {
+                api_url: format!("{}/chat", server.base_url),
+                api_key: Some("secret".to_string()),
+                model: "gpt-test".to_string(),
+            },
+            offer,
+            deadline_ms: now_ms().saturating_add(30_000),
+            prompt: "hello".to_string(),
+            cancel_rx,
+            updates: update_tx,
+        };
+
+        let result = runtime
+            .block_on(run_local_text_worker_inner(&mut task))
+            .unwrap();
+        let ReconcileResult::Terminal { status, output, .. } = result else {
+            panic!("expected completed result");
+        };
+        assert_eq!(status, RunStatus::Completed);
+        assert_eq!(
+            output,
+            Some(json!({ "schema": RUN_OUTPUT_TEXT_SCHEMA, "text": "" }))
+        );
+        assert!(update_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn duplicate_local_text_dispatch_creates_no_unowned_or_duplicate_worker() {
         let server = start_server(vec![
             HttpResponseSpec {
@@ -2543,6 +2929,7 @@ mod tests {
                     &offer,
                     &run_binding,
                     &input,
+                    now_ms().saturating_add(30_000),
                 )
                 .map(|_| ());
                 result_tx.send(result).unwrap();
@@ -2619,6 +3006,7 @@ mod tests {
                 WorkerUpdate::Exited {
                     run_id: update_run_id,
                     generation: update_generation,
+                    ..
                 } => {
                     assert_eq!(update_run_id, run_id);
                     assert_eq!(update_generation, generation);
@@ -2672,10 +3060,13 @@ mod tests {
                 let mut task = LocalTextWorkerTask {
                     run_id: "run-coalesced".to_string(),
                     generation: 1,
-                    api_url: url,
-                    api_key: Some("secret".to_string()),
-                    model: "gpt-test".to_string(),
+                    backend: LocalTextBackend::OpenAiCompatible {
+                        api_url: url,
+                        api_key: Some("secret".to_string()),
+                        model: "gpt-test".to_string(),
+                    },
                     offer,
+                    deadline_ms: now_ms().saturating_add(30_000),
                     prompt: "hello".to_string(),
                     cancel_rx,
                     updates: update_tx,
@@ -2886,10 +3277,13 @@ mod tests {
         let mut task = LocalTextWorkerTask {
             run_id: "run-truncated".to_string(),
             generation: 1,
-            api_url: format!("{}/chat", server.base_url),
-            api_key: Some("secret".to_string()),
-            model: "gpt-test".to_string(),
+            backend: LocalTextBackend::OpenAiCompatible {
+                api_url: format!("{}/chat", server.base_url),
+                api_key: Some("secret".to_string()),
+                model: "gpt-test".to_string(),
+            },
             offer: openai_offer(&format!("{}/chat", server.base_url)),
+            deadline_ms: now_ms().saturating_add(30_000),
             prompt: "hello".to_string(),
             cancel_rx,
             updates: update_tx,
@@ -2921,10 +3315,13 @@ mod tests {
         let mut task = LocalTextWorkerTask {
             run_id: "run-control-loss".to_string(),
             generation: 1,
-            api_url: format!("{}/chat", server.base_url),
-            api_key: Some("secret".to_string()),
-            model: "gpt-test".to_string(),
+            backend: LocalTextBackend::OpenAiCompatible {
+                api_url: format!("{}/chat", server.base_url),
+                api_key: Some("secret".to_string()),
+                model: "gpt-test".to_string(),
+            },
             offer: openai_offer(&format!("{}/chat", server.base_url)),
+            deadline_ms: now_ms().saturating_add(30_000),
             prompt: "hello".to_string(),
             cancel_rx,
             updates: update_tx,
@@ -3211,6 +3608,7 @@ mod tests {
             &openai_offer,
             &openai_binding(),
             &text_input("hello"),
+            now_ms().saturating_add(30_000),
         )
         .unwrap();
 
