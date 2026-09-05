@@ -94,6 +94,12 @@ audited reassignment that verifies the root and its protectors before mutation.
 Hosted, loopback, native, and mobile hosts need explicit origin or host-auth
 policy; none may gain authority from a trusted header.
 
+Public first-owner enrollment must start from one-use local operator authority
+and bind one exact HTTPS origin and RP before the ceremony begins. Adding a
+credential to an existing owner requires explicit self-link consent and keeps
+the same principal and protected root. Both flows reuse Runtime auth state and
+produce typed denial, replay, expiry, concurrency, and audit results.
+
 Principal-root protection should use random per-principal data keys. Protectors
 may include a Recovery Kit, client-side WebAuthn PRF wrapping, DID-backed
 recovery, and future quantum-resistant envelopes. Runtime stores wrapped
@@ -133,19 +139,26 @@ in the UI. Recipients verify it before retaining, mounting, or forking it.
 The contract and its limits live in
 [Content availability](docs/CONTENT_AVAILABILITY.md).
 
+The first package-delivery milestone is the verified local Qwen model as a
+signed, CID-identified content capsule installed through typed Runtime Get. Its
+ordered flow and acceptance gate live in
+[Content capsule distribution](docs/CONTENT_CAPSULE_DISTRIBUTION.md).
+
 ### 3. Build Runtime-mediated protected content
 
 The target protected-content design uses the same effect path as ordinary
 content:
 
-`viewer -> Runtime -> rights provider -> custody providers -> decrypt provider`
+`viewer -> Runtime -> custody nodes (node-local rights) -> decrypt provider`
 
-Runtime will resolve the content object, check availability, verify rights,
-request recipient-encrypted custody contributions, create a scoped decrypt or
-render session, and record the result. Each dependency will have a typed
-contract and fail closed. Viewers will receive scoped output or a scoped
-session, not content keys, custody shares, chain RPC, Wallet authority, storage
-APIs, provider routes, network locations, or credentials.
+Runtime will resolve the content object, check availability, load the exact
+Chain policy, and ask each selected custody node to evaluate rights locally
+before it returns a recipient-encrypted contribution. Runtime then creates a
+scoped decrypt or render session and records the result. Each dependency has a
+typed contract. Every invalid or unavailable dependency fails closed. Viewers
+will receive scoped output or a scoped session, not content keys, custody shares,
+chain RPC, Wallet authority, storage APIs, provider routes, network locations,
+or credentials.
 
 The dependency order is contracts and cryptographic review, private provider
 protocols, Wallet/Chain authority, durable Runtime coordination, then installed
@@ -490,6 +503,11 @@ It must not create a separate trust root or expose key material to apps.
 AI providers and agents need explicit identity, capabilities, budget policy,
 data access, and audit. Hosted credentials stay inside configured providers.
 Local and hosted models should expose the same typed Runtime contract.
+Installed provider acceptance precedes service publication. Runtime publishes
+the operator-selected signed offer and owns principal-scoped grants. The
+destination Runtime authorizes each remote request, and Carrier transports only
+the route that Runtime selected. Local-engine sharing and hosted-API sharing
+have separate acceptance tracks in [Model provider](docs/MODEL_PROVIDER.md).
 
 Operator tools should derive decisions from source, signed artifacts, and
 machine-readable evidence. Durable docs should record contracts and current

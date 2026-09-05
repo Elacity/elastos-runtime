@@ -17,17 +17,18 @@ section if a higher section is incoherent, unverified, or too large to review.
 
 Active priority index:
 
-- current priority: publish the tested local candidate for team review after
-  explicit push authorization, then review the combined candidate on its exact
-  revision. The candidate is not ready to merge
+- current priority: review the unpublished candidate tail as four or five
+  coherent groups with an exact final-tree check, then publish that source for
+  team review after explicit authorization. Source review does not make the
+  candidate ready to release
 - released line: `origin/main@8ac18bec` is `v0.7.0`. Keep follow-up work on
   `origin/upstream/0.7.1-dev` until the reviewed 0.7.1 line is ready. The
   checked publish flow still owns release stamping
-- local candidate `900d7e5c` contains the reviewed PR52 source at
-  `origin/feat/protected-content-installed-provisioning@4d688cc5`, PR54 at
-  `origin/feat/home-first-run-seed-0.7.1@2a49ea57`, and the PR55 Home Agent
-  source from `origin/feat/home-shelf-assistant-face-0.7.1@923193bb`. PR54 and
-  PR55 remain the original feature review slices
+- audited source snapshot `1b30cca5` has tree `5af0e57f`. That source tip
+  is 47 commits ahead of `origin/upstream/0.7.1-dev` and 14 commits ahead of
+  `origin/feat/0.7.1-integration`. Earlier candidate `900d7e5c` remains the
+  broad installed UIUX and protected-content proof. The reviewed PR52, PR54,
+  and PR55 source slices remain part of the current candidate
 - integrated UIUX source evidence: published
   `origin/feat/0.7-uiux-candidate` at `8b547590`; this ref is donor evidence,
   not installed, live, or release truth
@@ -39,6 +40,10 @@ Active priority index:
   seed and the third custody node with matching stable receipts
 - all other work remains queued below
 
+Builder implements bounded source steps. The Analyser reviews proof and advances
+gates. Anders approves publication, installation, and human acceptance. Sash and
+Irzhy review the areas that they own or changed.
+
 ### Integrated UIUX and protected-content proof
 
 Verified integrated source and installed localhost truth is in
@@ -49,41 +54,74 @@ protected-content prerequisites. It did not change the pending Wallet approval.
 
 Open gates, in order:
 
-1. [ ] After explicit authorization, publish the tested candidate for team
-   review. Review the combined candidate on its exact revision before any
-   merge decision.
-2. [ ] After PR54 and PR55 review results or merge commits reach upstream,
-   rebuild or rebase the candidate on that updated upstream. Drop
-   patch-equivalent duplicates and retain the unique integration fixes.
-3. [ ] Rerun the source gates and isolated installed acceptance on that exact
-   rebuilt candidate.
-4. [ ] After separate authorization, install the same reviewed tree on the
-   seed and the third custody node with matching stable Runtime, component,
-   capsule metadata, provider, static audit, installation, and platform
-   restart receipts.
-5. [ ] Provision one real signed owner-only 2-of-3 custody composition across
-   three distinct operators and failure domains.
-6. [ ] Install the private multi-RPC Chain configuration and verify the exact
-   deployed Base network, contract, token, emitter, and finality authority.
-7. [ ] Prove exactly three protected-content replicas and repair after one
-    replica is lost.
-8. [ ] Fund the creator and buyer Base accounts, then run the Brave
-    two-Runtime journey: mint, list, and share on localhost; import, deny,
-    buy, open, play, and close on the seed. Prove one bound KID with allowed,
-    denied, and unbound reads, the CentralStorage binding, the exact
-    `AuthorityGateway.buyAccess` receipt and event, restart, replay, tamper
-    rejection, settlement, cleanup, and zero unresolved state.
-9. [ ] Complete the remaining installed UIUX cases for first-run recovery and
-    Profile creation, configured model execution, collaboration, Browser
-    startup diagnostics, and protected-content prerequisites. Keep the broad
-    localhost journey as completed evidence rather than repeating it.
-10. [ ] Make one atomic cutover that selects the Runtime-owned
-    protected-content path and removes the provisional `drm`, `rights`, `key`,
-    and `decrypt` authority surfaces from startup, registration, resources,
-    packaging, tests, and docs.
+1. [ ] The release integrator reviews the five grouped unpublished commits on
+   `feat/0.7.1-integration`: artifact verification, local-engine lifecycle,
+   hosted evidence, Responses with honest hosted cancellation, and delivery
+   documentation. The private mapping preserves the original snapshot and
+   identifies the approved cancellation and documentation corrections.
+   Run the repository Verification Gate plus
+   `(cd elastos && cargo test -p elastos-server --lib model_provider -- --nocapture)`,
+   `(cd elastos && cargo test -p elastos-server --lib llama_bundle -- --nocapture)`,
+   `cargo test --manifest-path capsules/model-provider/Cargo.toml --locked`, and
+   `python3 scripts/fetch/fetch-model-smoke.py`, followed by
+   `node scripts/home-agent-shell-smoke.mjs`. Finish when the grouped diff and
+   narrow source gates are ready for review; do not use a blind squash.
+2. [ ] The Runtime auth owner starts `fix/home-owner-bootstrap` from a fresh
+   `origin/upstream/0.7.1-dev`, then integrates it into the existing candidate.
+   Reuse the current auth challenge state. First add one-use public first-owner
+   enrollment bound at begin time to one operator-approved HTTPS origin and RP;
+   then add explicit self-link consent for another credential to the same
+   principal and root. Prove typed 403 responses, expiry, replay and concurrent
+   use, unchanged role counts, exact principal/root continuity, and one owner of
+   each identity route. Finish when installed public-origin enrollment and
+   same-principal linking pass without a second auth store or takeover path.
+3. [ ] The Mac proof owner tests the exact reviewed candidate in the isolated
+   source Home. Run a fresh signed Qwen completion, explicitly cancel the
+   selected run, verify backend stop or honest unknown settlement with one
+   terminal result and no duplicate dispatch, and prove restart and cleanup.
+   Managed-engine stream closure alone is not backend-stop proof.
+   Also run focused Recovery, Profile,
+   navigation and Terminal tests. Add Browser media only when the target
+   supplies accepted evidence. Finish with hash-bound receipts for the exact
+   tree; the earlier completed Qwen run and current artifact parity are separate
+   evidence.
+4. [ ] After the first three gates, the release integrator may publish the
+   source-ready candidate for review. If PR52, PR54, or PR55 changes upstream,
+   compare patches and trees before rebuilding the tail, keep unique fixes, and
+   omit patch-equivalent copies. Finish with a reviewed source revision and
+   green source gates. Release and installed readiness remain separate.
+5. [ ] The protected-content owner completes installed prerequisites on the
+   reviewed candidate: stable receipts on localhost, seed, and the third custody
+   node; one signed owner-only 2-of-3 composition across three distinct operators
+   and failure domains; and exact private Chain configuration. Each custody node
+   uses its own two to five explicit unique RPC sources and requires two exact
+   agreeing finalized results. Prove three replicas with repair, funded creator
+   and buyer accounts, exact KID, object and CentralStorage binding, the
+   `AuthorityGateway.buyAccess` receipt, allowed, denied and unbound reads, and
+   restart, replay, tamper rejection and cleanup in the full two-Runtime
+   mint-to-play journey. Before peer acceptance, the Carrier owner must land the
+   bounded request-frame gate below. Under explicit install approval, enable the
+   inactive path only on the test scope for human acceptance. After review, make
+   one atomic rollout that selects the Runtime-owned path and removes the
+   provisional `drm`, `rights`, `key`, and `decrypt` surfaces without fallback.
+   Finish with the reviewed rollout and an explicit release decision. The full
+   contract and acceptance details are in
+   [docs/PROTECTED_CONTENT.md](docs/PROTECTED_CONTENT.md).
 
-The operator-owned model-provider configuration remains a separate installed
-Assistant proof item. Missing configuration is an honest zero-offer state.
+The next delivery milestone after this closeout is the CID-installed Qwen slice
+under [Content distribution and Windows](#content-distribution-and-windows).
+Remote hosted service publication, Jetson proof, and standing mandates are
+separate later tracks. They are not prerequisites for current source review or
+the protected-content release decision.
+
+### Required transport gate before peer acceptance
+
+- [ ] The Carrier owner starts `fix/carrier-request-bounds` from the then-current
+  development line. Bound bytes, deadline, and concurrent stream resources at
+  the incoming request frame before JSON decode, while preserving current
+  provider-invocation semantics. Cover oversized, slow, truncated, and valid
+  calls. Finish before externally exposed CID, remote-model, or protected peer
+  acceptance. Review the broader signed-protocol work separately.
 
 ### Home audit follow-up
 
@@ -125,10 +163,6 @@ Assistant proof item. Missing configuration is an honest zero-offer state.
 The August 31 source-merge scope leaves these items open. Their donor work is
 preserved; an older implementation is not evidence that it fits current contracts.
 
-- [ ] Adapt Carrier's incoming request size and deadline limits from the
-  retained Carrier work without changing current provider-invocation semantics.
-  Cover oversized, slow and incomplete frames plus valid protected-content
-  calls. Review the broader signed-protocol and peer-budget work separately.
 - [ ] Review the retained native-component interoperability design as a
   separate proposal. COMO adoption needs its own feasibility and isolation proof.
 - [ ] Adapt advanced Assistant workflows under
@@ -139,10 +173,31 @@ preserved; an older implementation is not evidence that it fits current contract
 
 ### Content distribution and Windows
 
-- [ ] Implement the signed content-capsule catalog and typed Get contract in
-  [docs/CONTENT_CAPSULE_DISTRIBUTION.md](docs/CONTENT_CAPSULE_DISTRIBUTION.md).
-  Use the complete bundle CID, publisher verification, availability evidence,
-  atomic admission, install/removal receipts and partial-download cleanup.
+- [ ] Deliver the first CID-installed Qwen content capsule through the contract
+  and acceptance gate in
+  [docs/CONTENT_CAPSULE_DISTRIBUTION.md](docs/CONTENT_CAPSULE_DISTRIBUTION.md):
+  1. [ ] Build the complete GGUF content-capsule closure and calculate its CID.
+  2. [ ] Sign one catalog entry and root with the publisher DID, exact CID,
+         license, provenance, resources, and model-provider interface facts.
+  3. [ ] Seed setup with the trusted signed catalog-root CID or equivalent
+         pinned signed head, then verify it under configured publisher trust so
+         a fresh Runtime can project the Qwen entry.
+  4. [ ] Publish honest availability evidence; publisher-only bootstrap is
+         acceptable only when the catalog states it.
+  5. [ ] Add typed Home Get admission and Runtime orchestration that reuse the
+         existing content fetch, status and ensure operations, installed
+         inventory, and provider registration. Add bounded staging, resource
+         and license checks, interface verification, atomic admission, and
+         install receipts without a second transfer path.
+  6. [ ] Let Runtime durably bind each running model offer to the exact admitted
+         record and content CID, then give `model-provider` only the private
+         canonical artifact descriptor that it revalidates. Keep package
+         identity separate from service-offer identity, and keep host paths and
+         backend routes private while Home projects approved package facts.
+  7. [ ] Project Available, Downloading, and Ready in Home from Runtime records.
+  8. [ ] Prove restart, one fresh inference from the preserved admission,
+         removal, unpin policy, provider cleanup, receipts, and
+         interrupted or invalid install cleanup on the installed path.
   Keep large model bytes outside Git and external repositories behind providers.
 - [ ] Prove the WSL-first strategy in [docs/WINDOWS.md](docs/WINDOWS.md) on a
   fresh Windows machine, including stable localhost/passkey origin, Recovery
@@ -471,28 +526,30 @@ installed behavior and public-live behavior require separate evidence.
 - [ ] Keep unfinished surfaces out of the main live path unless they launch from Home and return cleanly.
 - [ ] Rehearse and simplify the Home/People/Spaces/System story so the front door feels useful without internal-runtime narration.
 - [ ] Extend `elastos.runtime.services/v1` beyond local configured-provider cards and conversation offers: remote Exit, storage, relay, model, and hosting offers must arrive as provider-backed `elastos.service.offer/v1` records through People/Carrier, and enabling one must create/select a principal-scoped provider grant instead of giving capsules direct People-state authority.
-  - [ ] Model Provider subtask: keep one typed `model-provider` contract and
-    complete it in this order:
+  - [ ] Model Provider subtask: follow the independent backend and consumption
+    tracks in [Model provider](docs/MODEL_PROVIDER.md#deployment-and-placement).
+    Source and installed evidence stays in [state.md](state.md).
 
-    1. evaluate Qwen3.5-9B Q4_K_M as the Mac baseline and PrismML Bonsai 8B Q1
-       as the low-memory comparison; keep Qwen3.8-27B and Bonsai 27B as later
-       benchmark candidates
-    2. install and prove the `model-provider` llama.cpp engine lifecycle on
-       macOS Metal, including verified artifacts, health, limits, stream,
-       cancel, restart, shutdown, and orphan cleanup
-    3. prove hosted adapters locally through the current Chat Completions seam,
-       then add the provider-internal OpenAI Responses API adapter and prove
-       explicit provider, cost, privacy, limits, requested selector, resolved
-       model, and fallback facts
-    4. add optional `elastos.service.offer/v1` publication with an
-       operator-selected offer, Runtime policy, and a principal-scoped grant
-    5. run a full Runtime on Jetson and prove the signed model service over
-       Carrier before considering a smaller provider host
-
-    Runtime keeps publication, grants, quotas, selection, routing, and audit.
-    The provider keeps backend URLs, credentials, process details, and topology
-    private. Model artifacts remain immutable content installed through the
-    content-provider path.
+    1. Rerun local Qwen completion, cancellation with confirmed backend stop or
+       explicit unknown settlement, restart, and cleanup on the exact candidate.
+    2. Prove real operator-configured Chat Completions and Responses routes with
+       fallback disabled, truthful provider/model and usage/cost facts, one
+       dispatch, redaction, cancellation, restart, and cleanup.
+    3. After local-engine installed acceptance and Carrier ingress bounds, prove
+       sharing the Mac model with another Runtime. The destination must verify
+       the signed offer/grant and map the authenticated source Runtime plus
+       consumer principal/capsule/run into destination-owned authority before
+       provider dispatch. Current local bindings and an added Carrier allowlist
+       entry alone are insufficient. Test forged `runtime_binding` and identical
+       principal strings from different Runtime issuers, with host Home,
+       workspace, and other runs isolated. Apply the contract's remote lifecycle,
+       limits, consent, and revoke/expiry acceptance without another sharing API.
+    4. Treat hosted sharing as a separate track requiring installed hosted proof,
+       upstream terms/resale/privacy review, and operator cost/rate limits.
+       Local-model sharing can proceed independently of hosted credentials.
+    5. Prove a full Jetson destination Runtime before considering a smaller
+       provider host. Keep content-package CID delivery separate from model
+       service publication and Codex agent execution.
 - [ ] Promote principal-owned Appearance state into a DID-anchored profile/settings object that syncs through Carrier/provider policy and projects back into `localhost://Users/<principal-root>/.AppData/ElastOS/Home/Appearance/...` per trusted device.
 - [ ] Keep `Apps` as the public catalog term and `capsules` as the internal/runtime term; do not expose both as competing public nouns.
 - [ ] Keep settings in `System`; keep files, documents, and provider-backed storage in their owning apps instead of recreating a generic System Storage section.

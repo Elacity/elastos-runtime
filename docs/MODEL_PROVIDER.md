@@ -31,17 +31,32 @@ agent principal and session.
 
 ElastOS has one typed model-provider contract: `offers_list`, `runs_create`,
 `runs_get`, `runs_events`, and `runs_cancel`. A Runtime can use a configured
-offer backed by a local engine or a hosted API. Local and remote service use are
-placements of the same capability, not separate public model APIs, providers,
-or journals.
+offer backed by a local engine or a hosted API. Backend placement and consumer
+placement are independent:
+
+| Backend | Same-Runtime use | Granted cross-Runtime use |
+| --- | --- | --- |
+| Local engine | Operator-configured local inference | Share the selected local capability after remote acceptance |
+| Hosted API | Operator-configured hosted inference | Share after remote acceptance and upstream terms, privacy, and cost review |
+
+Both consumption paths use the existing model operations and service-offer
+contract. Cross-Runtime model use remains planned work. Carrier currently
+excludes `model` from its provider target allowlist. `RuntimeCreateBinding` and
+`RuntimeAccessBinding` describe local-channel authority and carry no
+authenticated remote issuer.
 
 An operator explicitly selects a configured capability for publication under
 Runtime policy. The owning Runtime publishes it as an
 `elastos.service.offer/v1` service and owns grants, quotas, selection, audit,
-and routing. The destination Runtime authorizes each remote request
-independently. Carrier authenticates and transports the route that Runtime
-selects; it does not grant model authority. Hosted credentials and local model
-artifacts stay inside their owning boundaries.
+and routing. Before reusing provider invocation for remote model work, the
+destination Runtime must verify the signed offer and grant, then map the
+authenticated source Runtime and consumer principal, capsule, and run into
+destination-owned authority. Adding an allowlist entry alone cannot establish
+this binding. Carrier authenticates and transports the route that Runtime
+selects; the destination grants model authority. Publication advertises the
+selected capability. Destination-owned grants authorize its use. The host Home,
+workspace, and other runs retain their separate access rules. Hosted credentials
+and local model artifacts stay inside their owning boundaries.
 
 The owning Runtime DID signs the service offer, which names the admitted
 provider capability and contains only bounded capability and policy facts. The
@@ -147,6 +162,13 @@ Cancellation is a request to stop backend work and settle the request as
 If the backend cannot confirm cancellation, the request enters reconciliation
 rather than being reported as safely cancelled.
 
+The hosted Chat Completions and Responses adapters settle cancellation as
+`settlement_unknown` once dispatch may have happened. Closing an HTTP stream
+does not confirm that the hosted backend stopped. Their terminal result and
+events remain durable across replay and restart without redispatch. The managed
+local-engine path retains its current cancellation behavior; installed proof
+that cancellation stops backend work remains open.
+
 Interrupting the presentation layer does not cancel provider work by itself.
 The Agent Host can reconnect to the same request ID and recover durable events.
 After an Agent Host or Runtime restart, the session journal must distinguish:
@@ -200,7 +222,8 @@ not require a new secret store.
 
 ## Staged delivery path
 
-Implement and prove the path in this order:
+Local-engine and hosted-API acceptance are separate tracks. Each backend must
+pass installed lifecycle tests before it can be shared:
 
 1. Evaluate Qwen3.5-9B Q4_K_M as the stable Mac baseline and PrismML Bonsai 8B
    Q1 as an experimental low-memory comparison on an M5 Mac with 24 GB of
@@ -214,18 +237,35 @@ Implement and prove the path in this order:
 3. Prove hosted inference locally. Use the current OpenAI-compatible Chat
    Completions seam where it conforms for OpenRouter, Venice, and xAI/Grok. Add
    one provider-internal OpenAI Responses API adapter.
-4. Add optional service publication after local lifecycle and hosted paths pass.
-   Publish only an operator-selected configured capability with a signed offer
-   and principal-scoped grant.
-5. Prove remote inference with a full Runtime on Jetson, then publish a signed
-   service offer and route the granted operation through Carrier. Design a
-   smaller provider host only after the full Runtime path establishes its need.
+4. Prove optional sharing of the accepted Mac local model with another Runtime.
+   This requires signed offer and grant admission plus bounded Carrier ingress;
+   hosted credentials and a Jetson deployment are separate acceptance tracks.
+5. Prove hosted sharing only after upstream terms and resale policy permit it,
+   with owner-enforced cost and rate limits. Later, prove a full destination
+   Runtime on Jetson before considering a smaller provider host.
 
 Installed acceptance covers Brave inference, ordered streaming, reconnect,
 cancellation, one terminal result, restart, engine crash and orphan cleanup,
 secret and endpoint redaction, and explicit paid provider choice. Remote proof
-also covers disconnect and reconnect. Model output and tool proposals remain
-untrusted and cannot authorize effects.
+uses two Runtime identities and two principals. It covers:
+
+- signed offer admission and explicit host-owned grant, revoke, expiry, and
+  denial before backend dispatch;
+- rejection of forged `runtime_binding` fields and isolation of identical
+  principal strings issued by different Runtimes;
+- scoped create, get, events, and cancel, including access denial for other
+  runs and the host Home and workspace;
+- prompt and event privacy, bounded capacity, queues, tokens, time, and usage;
+- disconnect and reconnect without redispatch, restart with unknown settlement,
+  and service withdrawal; and
+- consumer consent to prompt transfer, separately from operator consent to
+  compute use or credential charges, with honest provenance and backend facts.
+
+These checks extend the existing service offer and model operations rather
+than introducing a separate sharing API, store, or journal. A content CID
+identifies an immutable package; a signed service offer identifies an available
+capability. Model output and tool proposals remain untrusted and cannot
+authorize effects.
 
 ## Conformance requirements
 

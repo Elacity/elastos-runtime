@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-09-03 UTC
+Last updated: 2026-09-05 UTC
 
 This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
@@ -15,13 +15,16 @@ volatile proof logs remain outside the repository.
   changelog, manifest bumps, and lock refresh. Installed artifacts report
   `0.7.0` only after the checked publish flow stamps
   `ELASTOS_RELEASE_VERSION`; unstamped source builds report `0.7.0-dev`.
-- Local candidate `900d7e5c` has tree `c9a9effe` and is 30 commits ahead of
-  `origin/upstream/0.7.1-dev@c511b133`. It contains the reviewed PR52 source at
-  `origin/feat/protected-content-installed-provisioning@4d688cc5`, PR54 at
-  `origin/feat/home-first-run-seed-0.7.1@2a49ea57`, and the PR55 Home Agent
-  source from `origin/feat/home-shelf-assistant-face-0.7.1@923193bb`. PR54 and
-  PR55 remain the original feature review slices. The tested candidate still
-  needs publication and combined team review before a merge decision.
+- The local candidate groups its unpublished model and delivery work into five
+  commits above `origin/feat/0.7.1-integration@12d38266`, with the published
+  prefix unchanged. The original audited snapshot `1b30cca5`, tree `5af0e57f`,
+  remains recorded separately from the approved hosted cancellation correction
+  and documentation update. Earlier candidate `900d7e5c` remains the broad
+  installed UIUX and protected-content proof. The current candidate
+  still needs grouped-tail review, publication, and combined team
+  review before a merge decision. PR52, PR54, and PR55 remain open; their
+  reviewed or adapted work is already present in this local candidate and must
+  be compared by patch if upstream changes.
 - The published protected-content stack is contracts `0c56c56a`, custody
   `2f844cef`, key reconstruction `467a6c03`, custody provider `1b7fa732`,
   Wallet rights `c9e82e75`, Runtime `a8ac6dc8`, and rights `3627da01`.
@@ -91,8 +94,9 @@ volatile proof logs remain outside the repository.
   authentication failures occurred before allocation succeeded, so startup
   latency and those diagnostics need follow-up.
 - Home Agent opens from the desktop and from Ask Assistant into the Home-owned
-  Agent Space. The installation has no configured model offer and reports that
-  state directly. This does not prove model inference.
+  Agent Space. This broad candidate installation had no configured model offer
+  and reported that state directly. A later isolated macOS model proof is
+  recorded under Model And Assistant Truth.
 - People reports discovery as unavailable because the isolated Home has no
   collaboration configuration. The pending Wallet approval remained unchanged
   during the journey.
@@ -100,9 +104,11 @@ volatile proof logs remain outside the repository.
   composition, private Chain and RPC configuration, three replicas, funded
   creator and buyer accounts, and installed two-Runtime proof. No mint, buy,
   playback, seed, third-node, or cutover claim follows from this localhost run.
-- First-run work remains open. Recovery Kit navigation and readiness are slow
-  and indirect. Profile creation should carry the display name into the form
-  and guide the exact create action.
+- Recovery Kit protection and Profile creation worked in the isolated macOS
+  model Home. The passkey, Recovery Kit protection, Profile, and Home Agent
+  session survived a gateway restart from the same stable data root. Recovery
+  Kit and Profile navigation remain slow and indirect and need a focused UX
+  repair.
 - Standalone Assistant and Home Agent are both installed pending an explicit
   product decision. The final default product should present one clear Agent
   surface. Multiple local Brave app copies can create duplicate Dock and
@@ -129,9 +135,8 @@ unchained audit history. Current signed-checkpoint policy owns compatibility;
 retaining those donors does not mean their behavior is in the candidate.
 
 The reviewed content-distribution, Recovery/Profile and WSL-first documents
-are included. The catalog currently projects installed capsules; signed network
-discovery, Home Get and model-content packaging remain planned work. WSL
-packaging and native Windows support also remain unproved product targets.
+are included. Current content-distribution facts and gaps are recorded below.
+WSL packaging and native Windows support remain unproved product targets.
 
 Runtime owns authenticated principal and session authority, capability
 admission, provider selection, lifecycle, durable operation identity, Wallet
@@ -177,10 +182,12 @@ The integrated source includes these durable facts:
   `receipts/source-home-installation.json` receipt after components, native
   providers, capsule trees, and source-home capsule metadata are final. The
   receipt binds source commit/tree/clean state and exact artifact hashes.
-  Setup requires at least 10% free space on both source and data volumes before
-  builds. Its private install stage is removed on success, copy failure and
-  installer failure, as verified by the isolated installation smoke. Source
-  setup and Browser target refresh each retain one default VM backup set.
+  Setup requires 16 GiB free on each source and data volume before builds. The
+  operator process separately requires at least 10% free space on development
+  and staging volumes. Setup removes its private install stage on success, copy
+  failure, and installer failure, as verified by the isolated installation
+  smoke. Source setup and Browser target refresh each retain one default VM
+  backup set.
 - `scripts/mac-source-home-restart.sh` and
   `scripts/linux-source-home-restart.sh` select only that stable Runtime.
   Each owns one exact PID file, stops only the identity-bound prior Runtime,
@@ -193,6 +200,27 @@ The integrated source includes these durable facts:
   including a live prior Runtime after atomic binary replacement. Linux dry-run
   and fixture proof is source evidence; active `/proc`, listener, and binary
   replacement behavior still requires Linux target evidence.
+
+## Content Distribution Truth
+
+- The content plane implements `elastos://content` publish, fetch, status,
+  ensure, repair, and unpublish operations. The content provider owns that
+  capsule-facing contract and uses the IPFS provider as a private low-level
+  backend. Raw `elastos://ipfs` authority stays system-only.
+- Local publication records signed availability receipts. Those receipts prove
+  accepted local retention only; independent network replication needs its own
+  evidence. Gateway CID reads serve verified content through the Runtime-owned
+  route.
+- The Runtime catalog currently projects installed capsules. It has no signed
+  network catalog entry or root, typed Home Get admission, or GGUF
+  content-capsule closure. Model and Assistant Truth below records the current
+  Qwen operator bootstrap.
+- The next vertical slice is the signed, complete-closure CID path in
+  [Content capsule distribution](docs/CONTENT_CAPSULE_DISTRIBUTION.md). CID owns
+  byte identity, publisher signature owns the source claim, availability
+  receipts own retention evidence, Runtime owns policy and atomic admission,
+  and content and availability providers own backend selection and routes.
+  Package identity remains separate from model service offers.
 
 ## Protected-content Contract Truth
 
@@ -293,6 +321,10 @@ complete. Installed proof and the atomic authority cutover remain open.
 - Home authority uses signed `elastos.home.launch-token/v4` envelopes. Runtime
   validation binds resource, actors, principal, proof, grant, session,
   lifetime, and non-delegatability; callers cannot supply Wallet authority.
+- First-owner passkey registration currently requires local Runtime access. A
+  public HTTPS attempt reaches the untyped local-access rejection and returns
+  HTTP 500. The planned origin- and RP-bound bootstrap must return typed 403
+  denials and keep same-principal credential linking as a separate consent flow.
 - Wallet Bus v2.3 is the typed Runtime/Wallet Provider boundary. Wallet Provider
   owns keys, accounts, proofs, approval execution, and validated outcomes;
   Runtime owns launch authorization, orchestration, durable effects, and the
@@ -434,19 +466,105 @@ complete. Installed proof and the atomic authority cutover remain open.
   boundary.
 - A missing installed components manifest or model-provider entry leaves the
   provider unconfigured and unavailable. Runtime does not select a fallback.
-- The current localhost installation has no
-  `providers/model-provider/config.json`, so the provider reports an honest
-  zero-offer state. The current provider can call an OpenAI-compatible Chat
-  Completions backend. It does not yet own a local engine lifecycle, implement
-  a provider-internal OpenAI Responses API adapter, or publish a remote model
-  service.
+- An installation without `providers/model-provider/config.json` reports an
+  honest zero-offer state. The latest isolated macOS source Home configures one
+  local Qwen3.5-9B Q4_K_M offer. The provider can also call OpenAI-compatible
+  Chat Completions and Responses backends. Remote model service publication
+  remains open.
+- The grouped hosted Chat Completions evidence slice is at commit `fcb8fc5e`,
+  tree `1e95de06`. Each OpenAI-compatible offer requires bounded public
+  disclosure for the provider label, pinned requested selector, privacy and
+  terms references, provider-enforced single dispatch without retry, and the
+  operator assertion that upstream routing fallback is disabled. The API key,
+  endpoint, headers, and topology stay private. Local Qwen offer and output
+  JSON stay unchanged.
+- The provider-internal `open_ai_responses_text` source adapter and hosted
+  cancellation correction are at commit `0d768415`, tree `96d45941`.
+  The adapter posts only `model`,
+  `input`, `stream: true`, `store: false`, and policy-derived
+  `max_output_tokens`. It accepts text only from
+  `response.output_text.delta`. Only an authoritative `response.completed`
+  event with response status `completed` succeeds. The `response.failed`,
+  `response.incomplete`, and `error` events produce bounded generic failures.
+  Local Qwen adapter behavior stays unchanged. Hosted cancellation semantics
+  are recorded below.
+- The provider stores hosted backend evidence once on the terminal event and
+  replays it through `runs_get`. It reports the resolved model, token usage,
+  and non-negative backend cost when the Chat Completions backend supplies
+  valid facts. The Responses adapter reports valid model and token usage and
+  keeps cost unknown. Other cases report explicit unknown facts. This is
+  backend-reported evidence, not verified billing. Both hosted adapters reuse
+  the existing worker, journal, cancellation, restart and replay, byte, time,
+  and event limits, with one provider dispatch and zero provider retries.
+  Hosted cancellation after possible dispatch records `settlement_unknown`:
+  an HTTP stream close does not confirm backend stop. A deterministic fixture
+  keeps backend work active while both adapters cancel, then proves one terminal
+  result, replay and restart persistence, and zero redispatch. Managed-engine
+  cancellation behavior is unchanged; backend-stop proof remains open.
+  Deterministic focused fixtures prove the source adapters. The current
+  candidate has passing formatting, Home entropy, public-copy entropy, and diff
+  checks; full-suite and target proof remain separate evidence.
+- A real hosted route still needs acceptance proof. Route-specific evidence
+  must prove the fallback assertion, exact provider and model resolution,
+  usage and cost behavior, one provider dispatch, zero provider retries,
+  redaction, cancel and restart behavior, and cleanup for both the Chat
+  Completions and Responses paths.
 - The current source does not integrate the Codex SDK. Codex remains a later
   agent-execution adapter behind typed agent operations and explicit
   filesystem, network, tool, and approval grants. It is not a model offer.
+- The current `components.json` bootstrap pins the Mac evaluation artifacts to
+  immutable upstream publisher revisions and SHA-256 values: Qwen3.5-9B Q4_K_M
+  is the stable candidate, PrismML Bonsai 8B Q1_0 is experimental, and llama.cpp
+  `b10516` supplies the macOS arm64 engine bundle. The private operator offer
+  selects the canonical installed path and digest. The CID slice will replace
+  this bootstrap as the product artifact-delivery path.
+- The pinned Mac evaluation ran both candidates through llama.cpp. Bonsai
+  passed and was lighter and faster in the three-prompt comparison. Qwen passed
+  with thinking disabled and remains the stable-quality candidate. The local
+  HTTP source fixture also proves macOS arm64 selection, checksum rejection,
+  interrupted-download cleanup, and idempotent verified reuse. The Jetson CUDA
+  source-build behavior is unchanged and reads the llama.cpp source revision
+  from `components.json`; Jetson execution remains unproved.
 - `model-provider` now accepts the Runtime Init envelope fields
   `base_path`, `allowed_paths`, `read_only`, `encryption_key`, and `extra`
   without weakening strict unknown-field handling. The zero-offer stdio Init
   test passes with the Runtime envelope in source tests.
+- The local llama.cpp adapter keeps one engine manager behind the existing
+  provider run journal. Init validates canonical operator-admitted paths and
+  secure file metadata without hashing the model. Each actual child start or
+  restart streams the configured engine and model hashes, starts at most one
+  private loopback child per configured offer, and accepts readiness only when
+  `/v1/models` returns its unpredictable alias. Source tests cover concurrent
+  reuse, fresh bounded alias verification before reuse, one restart for a live
+  but unhealthy child, failed-replacement cleanup, streaming, cancellation,
+  crash restart, bounded health failure, graceful shutdown with bounded forced
+  reap, manager Drop cleanup, idempotent shutdown, repeated-Init rejection, and
+  public and journal redaction. Source process tests prove provider-loss guard
+  cleanup after a provider hard kill. The installed direct and Runtime proofs
+  also observed zero owned engine or guard residue after their shutdown and
+  restart cases.
+- Installed artifact parity is proved for one macOS Qwen offer. The corrected
+  candidate `4a9d50d0`, tree `82fbd7e8`, was rebuilt and installed
+  in the isolated macOS model Home. Built and installed artifacts match at
+  Runtime SHA-256
+  `91052d67728f425c4b8ec0abbe118f1ccb98a44bcde19c9d63b1549bd26a2952` and
+  model-provider SHA-256
+  `886c6c9eb318549e91fb1144eedf7920e6989d69592c350ae125533008cfad36`.
+  Installed-provider verification passed, Home returned HTTP 200, and the
+  identity, Profile, Recovery, and model-config fingerprints were preserved.
+- An earlier installed candidate completed one signed Qwen functional run.
+  Home Agent used offer `local-qwen` through the typed Runtime model path. Its
+  `text.generate` run completed with four events, an
+  `elastos.model.output.text/v1` value containing 1066 output characters, no
+  error, and a duration of about 20.6 seconds. The journal file was owner-only.
+  Runtime kept Qwen engine and provider details private. A fresh completed run,
+  explicit cancellation of the selected run with backend-stop evidence or
+  honest unknown settlement and no duplicate dispatch, restart, and cleanup on
+  the current corrected tree remain open. Current installed hash parity does
+  not supply that execution proof.
+- The reviewed receipt convergence, end-to-end deadline, and hosted URL
+  redaction corrections are complete in source and have fresh installed
+  artifact parity proof.
 - Assistant is a standalone first-party capsule with its own protected
   workspace. Its tested Chat, Build, and Studio behavior uses typed model
   offers and runs. Transcript copy goes only through the trusted Home
@@ -468,15 +586,15 @@ complete. Installed proof and the atomic authority cutover remain open.
   escaped HTML, inert links, headings/lists/blockquotes/tables, fenced and
   inline code, and inline/display math through vendored KaTeX 0.18.3. Focused
   source proof lives in `scripts/assistant-shell-smoke.mjs`. The Home audit
-  records observed UI behavior separately; configured model-run and advanced
-  workflow acceptance remain open.
+  records observed UI behavior separately. Advanced standalone Assistant
+  workflow acceptance remains open.
 - Home Agent is the canonical Home-integrated Agent surface. Standalone
   Assistant remains installed while the product inventories and tests its
   distinct working behavior. It can remain as an explicitly scoped optional
   app, or its useful behavior can move before removal. Future Home Agent tools,
   Library reads, web search, Studio, Usage, and sampling controls require their
-  typed Runtime operations first. The zero-offer Home Agent state is installed
-  proof of honest absence, not configured inference.
+  typed Runtime operations first. Real hosted route acceptance, service
+  publication and grants, and Jetson/Carrier proof remain open.
 
 ## System Truth
 

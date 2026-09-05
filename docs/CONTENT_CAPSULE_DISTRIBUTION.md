@@ -11,6 +11,12 @@ Runtime currently projects installed capsules. The signed network catalog,
 Home Get operation, and model-content packaging described here remain planned
 work; this contract does not claim that those features are implemented.
 
+The implemented content plane already provides `elastos://content` publish,
+fetch, status, ensure, repair, and unpublish operations. It records signed local
+availability receipts, keeps raw IPFS access system-only, and serves verified
+gateway CID reads. These form the package-delivery foundation. The signed
+network catalog and install contract remain open.
+
 ## Decision
 
 A downloadable game or model is a content capsule, not a service offer or a raw
@@ -52,17 +58,83 @@ Home, Library, Apps, a future native model hub, and command projections must
 derive from these records. They must not maintain independent package databases
 or turn display rows into authority.
 
+## First vertical slice: CID-delivered local Qwen
+
+The first delivery slice packages the currently verified Qwen GGUF as one
+content capsule and makes it available to the existing local model provider.
+It uses this sequence:
+
+1. The publisher creates a complete immutable closure with the content-capsule
+   manifest, GGUF payload, format and quantization facts, resource requirements,
+   license, provenance, and compatible model-provider interface.
+2. The CID of that complete closure becomes the package identity. A publisher
+   DID and signature authenticate the source claim for the exact CID.
+3. Setup carries one trusted signed catalog-root CID or equivalent pinned
+   signed head. Runtime verifies its CID and signature under configured
+   publisher trust, then Home projects its signed entries. The initial
+   availability basis may be the publisher alone when the entry states that
+   limitation.
+4. Home sends one typed Get request for the exact catalog entry. Runtime checks
+   principal authority and composes the existing content `fetch`, `status`, and
+   `ensure` operations with installed-inventory and provider-registration state.
+   Get is an admission workflow, not a second content-transfer protocol.
+5. Runtime stages the fetched closure under a bounded private path, verifies the
+   CID, publisher signature, availability evidence, size, resources, license,
+   format, paths, and declared provider interface, then admits it atomically and
+   writes the install receipt.
+6. Runtime durably binds each running model offer to the exact admitted record
+   and content CID. From that record, Runtime gives `model-provider` only the
+   private canonical artifact descriptor that it revalidates before inference.
+   Package identity remains separate from service-offer identity and install
+   authority.
+7. Home derives Available, Downloading, and Ready from catalog, transfer, and
+   installed records. Home may project an approved package name, CID, and
+   status. Runtime keeps host paths and backend routes private. File names and
+   service offers supply no install state.
+
+Later catalog updates may arrive through content or Carrier providers. Runtime
+applies the same publisher-signature and CID checks before Home projects them.
+
+The CID proves the closure bytes. The publisher signature proves who made the
+source claim. Availability receipts prove accepted retention. Runtime owns
+policy and atomic admission. Content and availability providers own backend
+selection and private routes.
+
+Acceptance requires:
+
+- one signed catalog root and entry that resolve to the exact complete-closure
+  CID and verified publisher DID;
+- honest availability evidence for publisher-only, local, or independently
+  retained bytes, with the complete CID as the only package identity and
+  publisher transport and topology kept private;
+- bounded staging and checks for closure CID, signature, size, disk and memory,
+  license, paths, GGUF format, and model-provider interface before admission;
+- one atomic installed record and receipt, plus a durable Runtime-owned link
+  from each running offer to that exact record and content CID, that yields only
+  the private canonical artifact descriptor that `model-provider` revalidates;
+- Home transitions from Available to Downloading to Ready from Runtime facts
+  and projects only the approved package name, CID, and status while Runtime
+  keeps host paths and backend routes private;
+- restart proof that preserves the single admitted record without another
+  transfer, followed by one fresh model request that produces one inference
+  through the admitted artifact, plus explicit removal, unpin policy, provider
+  cleanup, removal receipt, and partial-file cleanup; and
+- installed negative tests for an incorrect CID, signature, publisher, digest,
+  size, license, resource requirement, interface, availability claim, truncated
+  transfer, and interrupted admission.
+
 ## Get flow
 
-`Get` is a typed Runtime operation, not a browser download:
+`Get` is a typed Runtime admission operation, not a browser download or another
+content-provider transfer operation:
 
 ```text
 signed catalog projection
 -> person selects Get
 -> Home sends exact content-capsule identity to Runtime
 -> Runtime verifies principal, session, capability, publisher, and manifest
--> content provider resolves and fetches the CID
--> availability provider verifies or establishes the required pin
+-> Runtime reuses content fetch and status for the CID
+-> Runtime reuses availability ensure for the required pin
 -> Runtime atomically admits the capsule and writes an install receipt
 -> installed inventory and Home facts refresh
 ```
