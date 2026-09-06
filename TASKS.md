@@ -17,8 +17,8 @@ section if a higher section is incoherent, unverified, or too large to review.
 
 Active priority index:
 
-- current priority: isolated installed Qwen acceptance on the reviewed combined
-  model/auth code at `e496fe06`. Remote
+- current priority: isolated installed Qwen acceptance using the
+  [installed provenance in state.md](state.md). Remote
   publication, live deployment, data migration and paid calls require explicit
   authorization. Installed acceptance and release remain separate gates
 - released line: `origin/main@8ac18bec` is `v0.7.0`. Keep follow-up work on
@@ -57,7 +57,8 @@ protected-content prerequisites. It did not change the pending Wallet approval.
 Open gates, in order:
 
 1. [ ] The Mac proof owner completes behavior acceptance on the installed
-   model Home. Run a fresh signed Qwen completion, explicitly cancel the selected
+   model Home; exact installed artifact provenance is in [state.md](state.md).
+   Run a fresh signed Qwen completion, explicitly cancel the selected
    run, verify backend stop or honest unknown settlement with one terminal result
    and no duplicate dispatch, and prove reload, restart and cleanup.
    Managed-engine stream closure alone is not backend-stop proof.

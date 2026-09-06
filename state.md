@@ -24,7 +24,7 @@ volatile proof logs remain outside the repository.
   enrollment `43b8f830`. Two syntax-only setup lint corrections are in the merge.
   Combined identity, auth, model, Home and bootstrap fixtures, strict targeted
   Clippy and formatting pass locally. Independent review of the combined source
-  through integration code tip `e496fe06` is complete. Publication and remaining
+  through integration code tip `3854db3c` is complete. Publication and remaining
   installed behavior acceptance stay open.
   Earlier `900d7e5c` remains the broad installed UIUX/protected-content proof.
   PR52, PR54 and PR55 work
@@ -581,24 +581,26 @@ complete. Installed proof and the atomic authority cutover remain open.
   cleanup after a provider hard kill. The installed direct and Runtime proofs
   also observed zero owned engine or guard residue after their shutdown and
   restart cases.
-- Installed artifact parity is proved for candidate `e496fe06`, tree `426a87d0`,
-  in the existing isolated macOS model Home. Nine native builds cover Runtime
-  and the eight providers affected by the changed dependency closure. All eight
-  installed-provider verifications pass. Built and installed artifacts match at
+- Installed artifact parity is proved for candidate `3854db3c`, tree `6dcafe23`,
+  in the existing isolated macOS model Home. Only model-provider was rebuilt
+  for the local cancellation correction. Runtime and the other providers retain
+  their verified `e496fe06`, tree `426a87d0`, build provenance; capsule assets
+  are unchanged. All eight installed-provider verifications pass. Built and
+  installed artifacts match at
   Runtime SHA-256
   `087c3d5d884fdeb519b71cbdc6d8952332222e8788e118cf9c6ede3bdd6f28cd` and
   model-provider SHA-256
-  `657f3dd6d60955ebbfb0a9c470373ea29d23279286e797ea83cc2d032b75566b`.
+  `035d27214e6baa344cd913da514b8e7ea9ef5c3043df7b262a8cb7ef8ce98f89`.
   Eighty Home/Home Agent assets match source, installation and manifest;
-  nine served assets match. Strict restart passed, and the parent rechecked
-  the receipt and HTTP 200 on 2026-09-06. Brave showed the existing Admin
-  account and Profile after reload.
-- Existing identity/TLS, private configuration, model and recovery bytes match
-  their preservation hashes. Runtime added one empty owner-only Identity lock.
-  Live auth/audit and browser journals changed after restart; their timing
-  correlates with a Brave reload but does not prove its cause. Their aggregate
-  is not a byte-parity pass. Profile's individual pre-install hash was not
-  captured; the observed Profile is separate evidence.
+  nine served assets match. Strict restart and independent receipt/HTTP 200
+  checks passed on 2026-09-06. The principal-root upgrade returned
+  `already_ready` with zero migrated roots or objects.
+- During the Model-only update, device identity/TLS, private configuration, model
+  weights, migration-backup files and all three protected user objects retained
+  their captured hashes, sizes, modes and ownership. AuthState, passkey material,
+  the downloaded Recovery Kit, and live journals are outside this byte-parity
+  claim. An independent read-only account check matches the previously observed
+  Admin record; fresh sign-in and model behavior acceptance remain open.
 - An earlier installed candidate completed one signed Qwen functional run.
   Home Agent used offer `local-qwen` through the typed Runtime model path. Its
   `text.generate` run completed with four events, an
