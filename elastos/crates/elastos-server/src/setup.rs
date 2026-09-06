@@ -1336,9 +1336,7 @@ fn extracted_bundle_cache_stale_reason(
     install_root: &Path,
     platform_info: &PlatformInfo,
 ) -> Option<String> {
-    if platform_info.extract_path.is_none() {
-        return None;
-    }
+    platform_info.extract_path.as_ref()?;
 
     if let Some(expected_cid) = platform_info
         .cid
@@ -2594,7 +2592,7 @@ fn ensure_bundle_executable_link(
             let _ = fs::remove_file(&temporary);
             return Err(err.into());
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]

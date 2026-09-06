@@ -1631,6 +1631,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "hex",
  "hkdf",
+ "libc",
  "p256",
  "rand 0.8.7",
  "serde",
@@ -1871,6 +1872,7 @@ dependencies = [
  "wasmparser 0.236.1",
  "x-wing",
  "zip",
+ "zeroize",
 ]
 
 [[package]]

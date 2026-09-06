@@ -125,6 +125,17 @@ the protected-content release decision.
 
 ### Home audit follow-up
 
+- [ ] Add one durable first-owner enrollment operation after the credential
+  persistence prerequisite: verified loopback requests
+  retain normal onboarding; public HTTPS enrollment requires a one-use
+  operator token bound to the exact origin and RP. Both auth route owners
+  must share the first-owner rule. Exact credential adoption requires the
+  same previously authorized durable recovery operation; a fresh registration
+  must reject an existing credential. Public enrollment requires proven secure
+  persistence on its host; non-Unix path protection and directory durability
+  remain open. Verify interruption and competing-enrollment recovery.
+  Implement same-principal passkey linking afterward, preserving existing
+  proof mappings and distinguishing credential count from person count.
 - [ ] Diagnose and prove direct Desktop/Terminal switching on the installed
   Home. Host-authority and startup-replay repairs have source coverage, but
   an installed transition can still leave a blank shell. Verify the exact

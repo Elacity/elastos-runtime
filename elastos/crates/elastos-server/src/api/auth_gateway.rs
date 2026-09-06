@@ -39,7 +39,7 @@ use super::gateway::{
     GatewayState, RuntimeWalletAdapter, RuntimeWalletAuthority, HOME_CAPSULE_ID,
 };
 
-const AUTH_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
+use crate::auth::AUTH_SESSION_TTL_SECS;
 const RECOVERY_DESCRIPTOR_SCHEMA: &str = "elastos.principal.root-descriptor/v1";
 const FULL_RECOVERY_BUNDLE_SCHEMA: &str = "elastos.full-recovery-bundle/v1";
 const FULL_RECOVERY_PEOPLE_IDENTITY_SCHEMA: &str = "elastos.people.recovery-identity/v1";
@@ -155,6 +155,7 @@ pub struct AuthRevokeResponse {
 #[derive(Debug, Serialize)]
 pub struct PasskeyStatusResponse {
     pub registered: bool,
+    pub owner_setup_pending: bool,
     pub guest_registration_enabled: bool,
 }
 
@@ -324,7 +325,7 @@ pub struct PasskeyBeginResponse<T> {
 #[serde(deny_unknown_fields)]
 pub struct PasskeyRegisterCompleteRequest {
     pub ceremony_id: String,
-    pub response: RegistrationResponse,
+    pub response: Option<RegistrationResponse>,
     #[serde(default)]
     pub display_name: Option<String>,
 }
@@ -411,6 +412,10 @@ pub async fn passkey_status(State(state): State<GatewayState>) -> Response {
     let manager = manager.lock().await;
     Json(PasskeyStatusResponse {
         registered: manager.status().registered,
+        owner_setup_pending: match crate::auth::owner_setup_pending(&state.data_dir) {
+            Ok(pending) => pending,
+            Err(err) => return auth_error_response(err),
+        },
         guest_registration_enabled: crate::auth::guest_registration_enabled(&state.data_dir)
             .unwrap_or(false),
     })
@@ -533,11 +538,14 @@ pub async fn refresh_session(State(state): State<GatewayState>, headers: HeaderM
 pub async fn passkey_register_begin(
     State(state): State<GatewayState>,
     peer: Option<ConnectInfo<SocketAddr>>,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
 ) -> Response {
     let local_first_owner = local_first_owner_registration(&headers, peer.map(|peer| peer.0));
+    if let Err(err) = prepare_owner_claim(&mut headers, local_first_owner) {
+        return auth_error_response(err);
+    }
     match passkey_register_begin_inner(&state, &headers, local_first_owner).await {
-        Ok(response) => Json(response).into_response(),
+        Ok(response) => with_owner_claim_cookie(&headers, Json(response).into_response()),
         Err(err) => auth_error_response(err),
     }
 }
@@ -2900,17 +2908,39 @@ async fn passkey_register_begin_inner(
     state: &GatewayState,
     headers: &HeaderMap,
     local_first_owner: bool,
-) -> anyhow::Result<PasskeyBeginResponse<CreationOptions>> {
-    require_passkey_registration_allowed(state, local_first_owner).await?;
+) -> anyhow::Result<PasskeyBeginResponse<Option<CreationOptions>>> {
     let ceremony_id = format!("passkey:register:{}", random_hex(16));
     let rp = super::handlers::identity::derive_rp(headers)?;
     let manager = state.identity_manager()?;
     let mut manager = manager.lock().await;
-    let options = manager.begin_principal_registration(&ceremony_id, &rp.id)?;
+    let claimant = owner_claim(headers)?.unwrap_or_default();
+    if let Some((ceremony_id, options)) = crate::auth::begin_owner_enrollment(
+        &state.data_dir,
+        &mut manager,
+        &crate::auth::OwnerAdmission {
+            origin: &rp.origin,
+            rp_id: &rp.id,
+            claimant: &claimant,
+            loopback: local_first_owner,
+        },
+        &ceremony_id,
+        crate::auth::now_ts(),
+    )? {
+        return Ok(PasskeyBeginResponse {
+            schema: "elastos.auth.passkey.register.begin/v1".into(),
+            ceremony_id,
+            options,
+        });
+    }
+    drop(manager);
+    require_passkey_registration_allowed(state)?;
+    let manager = state.identity_manager()?;
+    let mut manager = manager.lock().await;
+    let options = manager.begin_principal_registration(&ceremony_id, &rp.id, &rp.origin)?;
     Ok(PasskeyBeginResponse {
         schema: "elastos.auth.passkey.register.begin/v1".to_string(),
         ceremony_id,
-        options,
+        options: Some(options),
     })
 }
 
@@ -2920,25 +2950,56 @@ async fn passkey_register_complete_inner(
     input: PasskeyRegisterCompleteRequest,
     local_first_owner: bool,
 ) -> anyhow::Result<PasskeyVerifyResponse> {
-    require_passkey_registration_allowed(state, local_first_owner).await?;
     let rp = super::handlers::identity::derive_rp(headers)?;
     let manager = state.identity_manager()?;
     let mut manager = manager.lock().await;
-    let outcome =
-        manager.complete_registration(&input.ceremony_id, &input.response, &rp.id, &rp.origin)?;
+    let claimant = owner_claim(headers)?.unwrap_or_default();
+    if let Some(grant) = crate::auth::complete_owner_enrollment(
+        &state.data_dir,
+        &mut manager,
+        &crate::auth::OwnerAdmission {
+            origin: &rp.origin,
+            rp_id: &rp.id,
+            claimant: &claimant,
+            loopback: local_first_owner,
+        },
+        &input.ceremony_id,
+        input.response.as_ref(),
+        input.display_name.as_deref(),
+        crate::auth::now_ts(),
+    )? {
+        drop(manager);
+        return passkey_response_for_grant(state, grant);
+    }
+    drop(manager);
+    require_passkey_registration_allowed(state)?;
+    let manager = state.identity_manager()?;
+    let mut manager = manager.lock().await;
+    let outcome = manager.complete_registration(
+        &input.ceremony_id,
+        input
+            .response
+            .as_ref()
+            .ok_or(crate::auth::OwnerEnrollmentDenied)?,
+        &rp.id,
+        &rp.origin,
+    )?;
     let credential = outcome.credential.clone();
     let origin = outcome.origin.clone();
     let user_verified = outcome.user_verified;
     drop(manager);
-    issue_named_passkey_session_grant(
-        state,
-        &outcome.user_id,
-        &credential,
-        &origin,
-        user_verified,
-        "passkey registration verified and session granted",
-        input.display_name.as_deref(),
-    )
+    let grant = crate::auth::grant_passkey_session(
+        &state.data_dir,
+        crate::auth::PasskeySessionRequest {
+            credential: &credential,
+            origin: &origin,
+            user_verified,
+            display_name: input.display_name.as_deref(),
+            reason: "passkey registration verified and session granted",
+            purpose: crate::auth::PasskeySessionPurpose::GuestRegistration,
+        },
+    )?;
+    passkey_response_for_grant(state, grant)
 }
 
 async fn passkey_authenticate_begin_inner(
@@ -2982,27 +3043,34 @@ async fn passkey_authenticate_complete_inner(
     )
 }
 
-async fn require_passkey_registration_allowed(
-    state: &GatewayState,
-    local_first_owner: bool,
-) -> anyhow::Result<()> {
-    let manager = state.identity_manager()?;
-    let manager = manager.lock().await;
-    let registered = manager.status().registered;
-    drop(manager);
-    if !registered && crate::auth::active_passkey_principal_count(&state.data_dir)? == 0 {
-        if local_first_owner {
-            return Ok(());
-        }
-        anyhow::bail!("first owner passkey registration requires local Runtime access");
-    }
-    if crate::auth::guest_registration_enabled(&state.data_dir)? {
-        return Ok(());
-    }
-    anyhow::bail!("guest passkey registration is disabled")
+#[derive(Debug)]
+enum PasskeyRegistrationDenied {
+    GuestRegistrationDisabled,
 }
 
-fn local_first_owner_registration(headers: &HeaderMap, peer: Option<SocketAddr>) -> bool {
+impl std::fmt::Display for PasskeyRegistrationDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::GuestRegistrationDisabled => "guest passkey registration is disabled",
+        })
+    }
+}
+
+impl std::error::Error for PasskeyRegistrationDenied {}
+
+fn require_passkey_registration_allowed(state: &GatewayState) -> anyhow::Result<()> {
+    if crate::auth::guest_registration_enabled(&state.data_dir)?
+        && crate::auth::active_admin_passkey_principal_count(&state.data_dir)? > 0
+    {
+        return Ok(());
+    }
+    Err(PasskeyRegistrationDenied::GuestRegistrationDisabled.into())
+}
+
+pub(in crate::api) fn local_first_owner_registration(
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> bool {
     let Some(peer) = peer else {
         return false;
     };
@@ -3012,6 +3080,85 @@ fn local_first_owner_registration(headers: &HeaderMap, peer: Option<SocketAddr>)
     super::handlers::identity::derive_rp(headers)
         .map(|rp| loopback_host(&rp.id))
         .unwrap_or(false)
+}
+
+const OWNER_CLAIM_HEADER: &str = "x-elastos-owner-enrollment";
+
+pub(in crate::api) fn owner_claim(
+    headers: &HeaderMap,
+) -> anyhow::Result<Option<zeroize::Zeroizing<String>>> {
+    let public = super::handlers::identity::derive_rp(headers)?
+        .origin
+        .starts_with("https://");
+    let cookie_name = if public {
+        "__Host-elastos-owner-claim="
+    } else {
+        "elastos-owner-claim="
+    };
+    let value = if let Some(header) = headers.get(OWNER_CLAIM_HEADER) {
+        Some(
+            header
+                .to_str()
+                .map_err(|_| crate::auth::OwnerEnrollmentDenied)?,
+        )
+    } else {
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|header| header.to_str().ok())
+            .and_then(|cookies| {
+                cookies
+                    .split(';')
+                    .find_map(|cookie| cookie.trim().strip_prefix(cookie_name))
+            })
+    };
+    value
+        .map(|value| {
+            if value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return Err(crate::auth::OwnerEnrollmentDenied.into());
+            }
+            Ok(zeroize::Zeroizing::new(value.to_string()))
+        })
+        .transpose()
+}
+
+pub(in crate::api) fn prepare_owner_claim(
+    headers: &mut HeaderMap,
+    loopback: bool,
+) -> anyhow::Result<()> {
+    let claim = owner_claim(headers)?
+        .or_else(|| loopback.then(|| zeroize::Zeroizing::new(crate::auth::random_secret_hex())));
+    if let Some(claim) = claim {
+        headers.insert(OWNER_CLAIM_HEADER, HeaderValue::from_str(&claim)?);
+    }
+    Ok(())
+}
+
+pub(in crate::api) fn with_owner_claim_cookie(
+    headers: &HeaderMap,
+    mut response: Response,
+) -> Response {
+    if let Ok(Some(claim)) = owner_claim(headers) {
+        let public = super::handlers::identity::derive_rp(headers)
+            .is_ok_and(|rp| rp.origin.starts_with("https://"));
+        let name = if public {
+            "__Host-elastos-owner-claim"
+        } else {
+            "elastos-owner-claim"
+        };
+        let cookie = format!(
+            "{name}={}; Path=/; HttpOnly; SameSite=Strict{}",
+            claim.as_str(),
+            if public { "; Secure" } else { "" }
+        );
+        if let Ok(cookie) = HeaderValue::from_str(&cookie) {
+            response.headers_mut().append(SET_COOKIE, cookie);
+        }
+    }
+    response
 }
 
 fn forwarded_client_is_remote(headers: &HeaderMap) -> bool {
@@ -3653,62 +3800,26 @@ fn issue_named_passkey_session_grant(
     reason: &str,
     display_name: Option<&str>,
 ) -> anyhow::Result<PasskeyVerifyResponse> {
-    let now = crate::auth::now_ts();
-    let binding = ProofBinding::passkey_webauthn(PasskeyWebAuthnBinding {
-        credential_id: credential.credential_id.clone(),
-        public_key: credential.public_key.clone(),
-        sign_count: credential.sign_count,
-        user_verified,
-        origin: origin.to_string(),
-        rp_id: credential.rp_id.clone(),
-        created_at: now,
-        last_used_at: now,
-        revoked_at: None,
-    });
-    let role = if crate::auth::active_passkey_principal_count(&state.data_dir)? == 0 {
-        crate::auth::RuntimePrincipalRole::Admin
-    } else {
-        crate::auth::RuntimePrincipalRole::Guest
-    };
-    let principal_id =
-        crate::auth::passkey_credential_principal_id(&credential.rp_id, &credential.credential_id)?;
-    let principal = crate::auth::upsert_principal_for_binding_as_role_named(
+    let grant = crate::auth::grant_passkey_session(
         &state.data_dir,
-        binding,
-        principal_id,
-        role,
-        display_name,
-        now,
-    )?;
-    crate::auth::ensure_proof_binding_not_revoked(&principal)?;
-    let grant = AuthSessionGrantV1 {
-        schema: AuthSessionGrantV1::SCHEMA.to_string(),
-        grant_id: format!("grant:{}", random_hex(16)),
-        session_id: format!("auth:{}", random_hex(16)),
-        principal_id: principal.principal_id.clone(),
-        proof_binding_id: principal.proof_binding_id.clone(),
-        issued_at: now,
-        expires_at: now.saturating_add(AUTH_SESSION_TTL_SECS),
-        apps: vec![
-            HOME_CAPSULE_ID.to_string(),
-            super::gateway::SYSTEM_CAPSULE_ID.to_string(),
-        ],
-    };
-    crate::auth::store_session_grant(&state.data_dir, grant.clone())?;
-    crate::auth::append_audit_event(
-        &state.data_dir,
-        audit_event(AuditEventInput {
-            event_type: "auth.session.granted",
-            principal_id: Some(grant.principal_id.clone()),
-            proof_binding_id: Some(grant.proof_binding_id.clone()),
-            session_id: Some(grant.session_id.clone()),
-            result: "ok",
+        crate::auth::PasskeySessionRequest {
+            credential,
+            origin,
+            user_verified,
             reason,
-            occurred_at: now,
-            ..AuditEventInput::default()
-        }),
+            display_name,
+            purpose: crate::auth::PasskeySessionPurpose::SignIn,
+        },
     )?;
+    passkey_response_for_grant(state, grant)
+}
 
+fn passkey_response_for_grant(
+    state: &GatewayState,
+    grant: AuthSessionGrantV1,
+) -> anyhow::Result<PasskeyVerifyResponse> {
+    let principal =
+        crate::auth::load_principal_for_proof_binding(&state.data_dir, &grant.proof_binding_id)?;
     let home_token =
         issue_home_launch_token_for_auth_grant(&state.data_dir, HOME_CAPSULE_ID, &grant)?;
     let system_token = issue_home_launch_token_for_auth_grant(
@@ -3761,7 +3872,9 @@ fn passkey_verified_response(headers: &HeaderMap, response: PasskeyVerifyRespons
 
 pub(in crate::api) fn auth_error_response(err: anyhow::Error) -> Response {
     let text = err.to_string();
-    let status = if text.contains("missing")
+    let status = if err.is::<PasskeyRegistrationDenied>()
+        || err.is::<crate::auth::OwnerEnrollmentDenied>()
+        || text.contains("missing")
         || text.contains("invalid")
         || text.contains("expired")
         || text.contains("mismatch")
@@ -4031,6 +4144,417 @@ mod tests {
         store.save().unwrap();
     }
 
+    fn seed_test_passkey_principal(
+        state: &GatewayState,
+        credential: &StoredCredential,
+        origin: &str,
+        role: crate::auth::RuntimePrincipalRole,
+    ) {
+        let now = crate::auth::now_ts();
+        let binding = ProofBinding::passkey_webauthn(PasskeyWebAuthnBinding {
+            credential_id: credential.credential_id.clone(),
+            public_key: credential.public_key.clone(),
+            sign_count: credential.sign_count,
+            user_verified: true,
+            origin: origin.to_string(),
+            rp_id: credential.rp_id.clone(),
+            created_at: now,
+            last_used_at: now,
+            revoked_at: None,
+        });
+        let auth = crate::auth::load_auth_state(&state.data_dir).unwrap();
+        assert!(auth
+            .principals
+            .iter()
+            .all(|principal| principal.proof_binding_id != binding.id()));
+        let principal_id = crate::auth::passkey_credential_principal_id(
+            &credential.rp_id,
+            &credential.credential_id,
+        )
+        .unwrap();
+        crate::auth::upsert_principal_for_binding_as_role(
+            &state.data_dir,
+            binding,
+            principal_id,
+            role,
+            now,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn owner_enrollment_routes_resume_persisted_candidate_after_reload() {
+        use super::super::handlers::identity::{self, IdentityState};
+        use axum::{
+            body::{to_bytes, Body},
+            http::Request,
+            routing::post,
+            Extension, Router,
+        };
+        use elastos_runtime::{
+            primitives::audit::AuditLog,
+            session::{SessionRegistry, SessionType},
+        };
+        use tower::ServiceExt;
+
+        for direct in [false, true] {
+            for public in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let _auth_dir =
+                    super::super::gateway::set_test_home_launch_auth_data_dir(root.path());
+                let origin = if public {
+                    "https://home.example"
+                } else {
+                    "http://localhost:61180"
+                };
+                let rp = if public { "home.example" } else { "localhost" };
+                let secret = public.then(|| {
+                    crate::auth::arm_owner_enrollment(root.path(), origin, rp, 300).unwrap()
+                });
+                let registry = Arc::new(SessionRegistry::new(Arc::new(AuditLog::new())));
+                let session = registry.create_session(SessionType::Shell, None).await;
+                let bearer = session.token.clone();
+                let make_router = || {
+                    let router = if direct {
+                        Router::new()
+                            .route("/begin", post(identity::register_begin))
+                            .route("/complete", post(identity::register_complete))
+                            .with_state(IdentityState {
+                                manager: Arc::new(tokio::sync::Mutex::new(
+                                    elastos_identity::IdentityManager::new(root.path().into())
+                                        .unwrap(),
+                                )),
+                                session_registry: registry.clone(),
+                                audit_log: None,
+                                data_dir: root.path().into(),
+                            })
+                            .layer(Extension(session.clone()))
+                    } else {
+                        Router::new()
+                            .route("/begin", post(passkey_register_begin))
+                            .route("/complete", post(passkey_register_complete))
+                            .with_state(test_gateway_state(root.path()))
+                    };
+                    let peer: SocketAddr = if public {
+                        "192.0.2.1:1234"
+                    } else {
+                        "127.0.0.1:1234"
+                    }
+                    .parse()
+                    .unwrap();
+                    router.layer(Extension(ConnectInfo(peer)))
+                };
+                let request =
+                    |path: &str, cookie: &str, ceremony: &str, body: serde_json::Value| {
+                        Request::builder()
+                            .method("POST")
+                            .uri(path)
+                            .header("origin", origin)
+                            .header("host", rp)
+                            .header("content-type", "application/json")
+                            .header("cookie", cookie)
+                            .header("x-elastos-owner-ceremony", ceremony)
+                            .body(Body::from(body.to_string()))
+                            .unwrap()
+                    };
+                let app = make_router();
+                let mut begin_request = request("/begin", "", "", json!({}));
+                if let Some(secret) = &secret {
+                    begin_request
+                        .headers_mut()
+                        .insert(OWNER_CLAIM_HEADER, secret.as_str().parse().unwrap());
+                }
+                let begin = app.clone().oneshot(begin_request).await.unwrap();
+                assert_eq!(begin.status(), StatusCode::OK);
+                let cookie = begin.headers()[SET_COOKIE]
+                    .to_str()
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                let selector_header = begin
+                    .headers()
+                    .get("x-elastos-owner-ceremony")
+                    .map(|v| v.to_str().unwrap().to_string());
+                let begin: serde_json::Value =
+                    serde_json::from_slice(&to_bytes(begin.into_body(), 65536).await.unwrap())
+                        .unwrap();
+                let ceremony = selector_header
+                    .unwrap_or_else(|| begin["ceremony_id"].as_str().unwrap().to_string());
+                assert_ne!(ceremony, bearer);
+                assert!(ceremony.len() <= 128);
+                let options = if direct { &begin } else { &begin["options"] };
+                let attestation = crate::auth::owner_attestation_for_test(
+                    options["publicKey"]["challenge"].as_str().unwrap(),
+                    rp,
+                    origin,
+                );
+                let body = if direct {
+                    serde_json::to_value(attestation).unwrap()
+                } else {
+                    json!({"ceremony_id": ceremony, "response": attestation, "display_name": "Owner"})
+                };
+                if direct {
+                    let denied = app
+                        .clone()
+                        .oneshot(request("/complete", &cookie, &bearer, body.clone()))
+                        .await
+                        .unwrap();
+                    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+                    assert!(!elastos_identity::IdentityManager::new(root.path().into())
+                        .unwrap()
+                        .has_credential_history());
+                    assert!(crate::auth::load_auth_state(root.path())
+                        .unwrap()
+                        .sessions
+                        .is_empty());
+                }
+                crate::auth::fail_owner_enrollment_once_for_test(
+                    root.path(),
+                    crate::auth::OwnerEnrollmentTestFault::AfterCredential,
+                );
+                let failed = app
+                    .oneshot(request("/complete", &cookie, &ceremony, body))
+                    .await
+                    .unwrap();
+                assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(crate::auth::owner_setup_pending(root.path()).unwrap());
+                assert_eq!(
+                    elastos_identity::IdentityManager::new(root.path().into())
+                        .unwrap()
+                        .credentials()
+                        .len(),
+                    1
+                );
+                assert!(crate::auth::load_auth_state(root.path())
+                    .unwrap()
+                    .principals
+                    .is_empty());
+                let persisted =
+                    std::fs::read(crate::auth::auth_state_path(root.path()).unwrap()).unwrap();
+                assert!(!String::from_utf8_lossy(&persisted).contains(&bearer));
+
+                // New handler/IdentityManager state; no original attestation in the retry.
+                let app = make_router();
+                let wrong_cookie = format!(
+                    "{}={}",
+                    cookie.split('=').next().unwrap(),
+                    crate::auth::random_secret_hex()
+                );
+                let denied = app
+                    .clone()
+                    .oneshot(request("/begin", &wrong_cookie, "", json!({})))
+                    .await
+                    .unwrap();
+                assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+                assert_eq!(
+                    std::fs::read(crate::auth::auth_state_path(root.path()).unwrap()).unwrap(),
+                    persisted
+                );
+                let resumed = app
+                    .clone()
+                    .oneshot(request("/begin", &cookie, "", json!({})))
+                    .await
+                    .unwrap();
+                assert_eq!(resumed.status(), StatusCode::OK);
+                if direct {
+                    assert_eq!(
+                        resumed.headers()["x-elastos-owner-ceremony"]
+                            .to_str()
+                            .unwrap(),
+                        ceremony
+                    );
+                }
+                let resumed: serde_json::Value =
+                    serde_json::from_slice(&to_bytes(resumed.into_body(), 65536).await.unwrap())
+                        .unwrap();
+                if direct {
+                    assert!(resumed.is_null());
+                } else {
+                    assert_eq!(resumed["ceremony_id"], ceremony);
+                    assert!(resumed["options"].is_null());
+                }
+                let completion = if direct {
+                    serde_json::Value::Null
+                } else {
+                    json!({"ceremony_id": ceremony})
+                };
+                let first = app
+                    .clone()
+                    .oneshot(request("/complete", &cookie, &ceremony, completion.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(first.status(), StatusCode::OK);
+                let first: serde_json::Value =
+                    serde_json::from_slice(&to_bytes(first.into_body(), 65536).await.unwrap())
+                        .unwrap();
+                assert!(first["session_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty()));
+                let replay = app
+                    .oneshot(request("/complete", &cookie, &ceremony, completion))
+                    .await
+                    .unwrap();
+                assert_eq!(replay.status(), StatusCode::OK);
+                let replay: serde_json::Value =
+                    serde_json::from_slice(&to_bytes(replay.into_body(), 65536).await.unwrap())
+                        .unwrap();
+                assert!(replay["session_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty()));
+                assert_eq!(first["session_id"], replay["session_id"]);
+                let auth = crate::auth::load_auth_state(root.path()).unwrap();
+                assert_eq!(
+                    (auth.principals.len(), auth.sessions.len(), auth.audit.len()),
+                    (1, 1, 1)
+                );
+                assert_eq!(
+                    auth.principals[0].role,
+                    crate::auth::RuntimePrincipalRole::Admin
+                );
+                assert_eq!(
+                    auth.principals[0].display_name,
+                    if direct { "" } else { "Owner" }
+                );
+            }
+        }
+    }
+
+    async fn assert_guest_registration_rejects_missing_admin(direct: bool, after_begin: bool) {
+        use super::super::handlers::identity::{self, IdentityState};
+        use axum::{
+            body::{to_bytes, Body},
+            http::Request,
+            routing::post,
+            Extension, Router,
+        };
+        use elastos_runtime::{
+            primitives::audit::AuditLog,
+            session::{SessionRegistry, SessionType},
+        };
+        use tower::ServiceExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(root.path());
+        store_test_credential(root.path(), test_credential());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        crate::auth::set_guest_registration_enabled(root.path(), true, crate::auth::now_ts())
+            .unwrap();
+        let manager = elastos_identity::IdentityManager::new(root.path().into()).unwrap();
+        let registry = Arc::new(SessionRegistry::new(Arc::new(AuditLog::new())));
+        registry
+            .set_default_owner(manager.status().user_id.unwrap())
+            .await;
+        let session = registry.create_session(SessionType::Shell, None).await;
+        let app = if direct {
+            Router::new()
+                .route("/begin", post(identity::register_begin))
+                .route("/complete", post(identity::register_complete))
+                .with_state(IdentityState {
+                    manager: Arc::new(tokio::sync::Mutex::new(manager)),
+                    session_registry: registry,
+                    audit_log: None,
+                    data_dir: root.path().into(),
+                })
+                .layer(Extension(session))
+        } else {
+            Router::new()
+                .route("/begin", post(passkey_register_begin))
+                .route("/complete", post(passkey_register_complete))
+                .with_state(state)
+        };
+        let request = |path: &str, body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("origin", "https://elastos.elacitylabs.com")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let completion = if after_begin {
+            let response = app
+                .clone()
+                .oneshot(request("/begin", json!({})))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let begin: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap())
+                    .unwrap();
+            let options = if direct { &begin } else { &begin["options"] };
+            let attestation = crate::auth::owner_attestation_for_test(
+                options["publicKey"]["challenge"].as_str().unwrap(),
+                "elastos.elacitylabs.com",
+                "https://elastos.elacitylabs.com",
+            );
+            if direct {
+                serde_json::to_value(attestation).unwrap()
+            } else {
+                json!({"ceremony_id": begin["ceremony_id"], "response": attestation})
+            }
+        } else {
+            json!({})
+        };
+        // Revocation occurs after the valid begin in the completion cases.
+        let mut auth = crate::auth::load_auth_state(root.path()).unwrap();
+        auth.principals[0]
+            .proof_binding
+            .passkey
+            .as_mut()
+            .unwrap()
+            .revoked_at = Some(crate::auth::now_ts());
+        crate::auth::save_auth_state(root.path(), &auth).unwrap();
+        let auth_path = crate::auth::auth_state_path(root.path()).unwrap();
+        let identity_path = root.path().join("identity/credentials.json");
+        let auth_before = std::fs::read(&auth_path).unwrap();
+        let identity_before = std::fs::read(&identity_path).unwrap();
+        let result = app
+            .oneshot(request(
+                if after_begin { "/complete" } else { "/begin" },
+                completion,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            std::fs::read(auth_path).unwrap(),
+            auth_before,
+            "guest denial changed auth state"
+        );
+        assert_eq!(
+            std::fs::read(identity_path).unwrap(),
+            identity_before,
+            "guest denial persisted an unusable credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn guest_registration_gateway_rejects_no_live_admin_begin() {
+        assert_guest_registration_rejects_missing_admin(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn guest_registration_gateway_rejects_no_live_admin_completion() {
+        assert_guest_registration_rejects_missing_admin(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn guest_registration_direct_rejects_no_live_admin_begin() {
+        assert_guest_registration_rejects_missing_admin(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn guest_registration_direct_rejects_no_live_admin_completion() {
+        assert_guest_registration_rejects_missing_admin(true, true).await;
+    }
+
     fn copy_test_auth_root(source: &std::path::Path, destination: &std::path::Path) {
         let state = crate::auth::load_auth_state(source).unwrap();
         std::fs::create_dir_all(destination.join("identity")).unwrap();
@@ -4085,6 +4609,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_owner_registration_public_begin_returns_forbidden() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", HeaderValue::from_static("https://home.example"));
+        let response = passkey_register_begin(State(state.clone()), None, headers).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !state
+                .identity_manager()
+                .unwrap()
+                .lock()
+                .await
+                .status()
+                .registered
+        );
+        assert_eq!(
+            crate::auth::active_passkey_principal_count(temp.path()).unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn first_owner_registration_public_complete_returns_forbidden() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", HeaderValue::from_static("https://home.example"));
+        let input = serde_json::from_value(json!({
+            "ceremony_id": "passkey:register:absent",
+            "response": {
+                "id": "fixture", "rawId": "fixture", "type": "public-key",
+                "response": { "clientDataJson": "AA", "attestationObject": "AA" }
+            }
+        }))
+        .unwrap();
+        let response =
+            passkey_register_complete(State(state.clone()), None, headers, Json(input)).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !state
+                .identity_manager()
+                .unwrap()
+                .lock()
+                .await
+                .status()
+                .registered
+        );
+        assert_eq!(
+            crate::auth::active_passkey_principal_count(temp.path()).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn registration_denial_is_typed_even_with_context() {
+        for error in [
+            anyhow::Error::new(crate::auth::OwnerEnrollmentDenied),
+            anyhow::Error::new(PasskeyRegistrationDenied::GuestRegistrationDisabled),
+        ] {
+            let error = error.context("enrollment refused");
+            assert_eq!(auth_error_response(error).status(), StatusCode::FORBIDDEN);
+        }
+        assert_eq!(
+            auth_error_response(anyhow::anyhow!("storage failure")).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn owner_enrollment_orphan_login_cannot_create_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+        store_test_credential(temp.path(), credential.clone());
+        let credentials_path = temp.path().join("identity/credentials.json");
+        let before = std::fs::read(&credentials_path).unwrap();
+        assert!(issue_named_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://home.example",
+            true,
+            "passkey authentication verified and session granted",
+            None
+        )
+        .is_err());
+        assert_eq!(std::fs::read(credentials_path).unwrap(), before);
+        let auth = crate::auth::load_auth_state(temp.path()).unwrap();
+        assert!(auth.principals.is_empty());
+        assert!(auth.sessions.is_empty());
+    }
+
+    #[tokio::test]
     async fn first_owner_registration_rejects_public_origin() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
@@ -4100,8 +4718,8 @@ mod tests {
             .unwrap_err();
 
         assert!(response
-            .to_string()
-            .contains("first owner passkey registration requires local Runtime access"));
+            .downcast_ref::<crate::auth::OwnerEnrollmentDenied>()
+            .is_some());
     }
 
     #[tokio::test]
@@ -4111,13 +4729,146 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("localhost:61180"));
         headers.insert("origin", HeaderValue::from_static("http://localhost:61180"));
+        prepare_owner_claim(&mut headers, true).unwrap();
 
         let response = passkey_register_begin_inner(&state, &headers, true)
             .await
             .unwrap();
 
         assert_eq!(response.schema, "elastos.auth.passkey.register.begin/v1");
-        assert_eq!(response.options.public_key.rp.id, "localhost");
+        assert_eq!(
+            response.options.as_ref().unwrap().public_key.rp.id,
+            "localhost"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_https_guest_registration_binds_begin_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+        store_test_credential(temp.path(), credential.clone());
+        seed_test_passkey_principal(
+            &state,
+            &credential,
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        let admin = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "test existing admin",
+        )
+        .unwrap();
+        crate::auth::set_guest_registration_enabled(temp.path(), true, crate::auth::now_ts())
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", HeaderValue::from_static("https://home.example"));
+        let begin = passkey_register_begin_inner(&state, &headers, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            begin.options.as_ref().unwrap().public_key.rp.id,
+            "home.example"
+        );
+
+        // A fmt:none ES256 attestation using the P-256 generator point.
+        let credential_id = b"https-guest";
+        let mut auth_data = Sha256::digest(b"home.example").to_vec();
+        auth_data.push(0x45); // user present, user verified, attested credential
+        auth_data.extend_from_slice(&[0; 20]); // sign count and AAGUID
+        auth_data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
+        auth_data.extend_from_slice(credential_id);
+        auth_data.extend_from_slice(
+            &hex::decode(concat!(
+                "a5010203262001215820",
+                "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
+                "225820",
+                "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+            ))
+            .unwrap(),
+        );
+        let mut attestation = vec![0xa3, 0x63];
+        attestation.extend_from_slice(b"fmt");
+        attestation.push(0x64);
+        attestation.extend_from_slice(b"none");
+        attestation.push(0x67);
+        attestation.extend_from_slice(b"attStmt");
+        attestation.extend_from_slice(&[0xa0, 0x68]);
+        attestation.extend_from_slice(b"authData");
+        attestation.extend_from_slice(&[0x58, u8::try_from(auth_data.len()).unwrap()]);
+        attestation.extend_from_slice(&auth_data);
+        let response_for = |challenge: &str| {
+            serde_json::from_value::<RegistrationResponse>(json!({
+                "id": URL_SAFE_NO_PAD.encode(credential_id),
+                "rawId": URL_SAFE_NO_PAD.encode(credential_id),
+                "type": "public-key",
+                "response": {
+                    "clientDataJson": URL_SAFE_NO_PAD.encode(json!({
+                        "type": "webauthn.create", "challenge": challenge,
+                        "origin": "https://home.example"
+                    }).to_string()),
+                    "attestationObject": URL_SAFE_NO_PAD.encode(&attestation)
+                }
+            }))
+            .unwrap()
+        };
+        let response = response_for(&begin.options.as_ref().unwrap().public_key.challenge);
+        let result = passkey_register_complete_inner(
+            &state,
+            &headers,
+            PasskeyRegisterCompleteRequest {
+                ceremony_id: begin.ceremony_id,
+                response: Some(response),
+                display_name: None,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!result.home_token.is_empty());
+        assert_ne!(result.principal_id, admin.principal_id);
+        assert_eq!(
+            crate::auth::load_principal_for_proof_binding(temp.path(), &result.proof_binding_id)
+                .unwrap()
+                .role,
+            crate::auth::RuntimePrincipalRole::Guest
+        );
+        let manager = state.identity_manager().unwrap();
+        let manager = manager.lock().await;
+        assert_eq!(manager.credentials().len(), 2);
+        assert!(manager
+            .credentials()
+            .iter()
+            .any(|credential| credential.rp_id == "home.example"));
+        drop(manager);
+        let credential_path = temp.path().join("identity/credentials.json");
+        let auth_path = crate::auth::auth_state_path(temp.path()).unwrap();
+        let credential_bytes = std::fs::read(&credential_path).unwrap();
+        let auth_bytes = std::fs::read(&auth_path).unwrap();
+        let fresh = passkey_register_begin_inner(&state, &headers, false)
+            .await
+            .unwrap();
+        assert!(passkey_register_complete_inner(
+            &state,
+            &headers,
+            PasskeyRegisterCompleteRequest {
+                ceremony_id: fresh.ceremony_id,
+                response: Some(response_for(
+                    &fresh.options.as_ref().unwrap().public_key.challenge
+                )),
+                display_name: None,
+            },
+            false,
+        )
+        .await
+        .is_err());
+        // A fresh fmt:none ceremony cannot adopt another person's existing key.
+        assert_eq!(std::fs::read(&credential_path).unwrap(), credential_bytes);
+        assert_eq!(std::fs::read(&auth_path).unwrap(), auth_bytes);
     }
 
     #[test]
@@ -4138,6 +4889,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
         let credential = test_credential();
+        seed_test_passkey_principal(
+            &state,
+            &credential,
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
 
         let response = issue_passkey_session_grant(
             &state,
@@ -4179,6 +4936,18 @@ mod tests {
     fn each_passkey_gets_its_own_principal_root_and_role() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
 
         let first = issue_passkey_session_grant(
             &state,
@@ -4226,6 +4995,22 @@ mod tests {
         let state = test_gateway_state(temp.path());
         let credential = test_credential();
         store_test_credential(temp.path(), credential.clone());
+        seed_test_passkey_principal(
+            &state,
+            &credential,
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        crate::auth::set_principal_display_name(
+            temp.path(),
+            &crate::auth::load_auth_state(temp.path())
+                .unwrap()
+                .principals[0]
+                .proof_binding_id,
+            "Work laptop",
+            crate::auth::now_ts(),
+        )
+        .unwrap();
         let grant = issue_named_passkey_session_grant(
             &state,
             "identity-test",
@@ -4255,6 +5040,18 @@ mod tests {
     async fn guest_passkey_list_is_scoped_to_current_principal() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let admin_credential = test_credential();
         let guest_credential = test_credential_2();
         store_test_credential(temp.path(), admin_credential.clone());
@@ -4298,6 +5095,18 @@ mod tests {
     async fn recovery_status_is_bound_to_current_principal() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let admin_credential = test_credential();
         let guest_credential = test_credential_2();
         store_test_credential(temp.path(), admin_credential.clone());
@@ -4346,6 +5155,12 @@ mod tests {
     async fn recovery_status_reports_matching_root_protection() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         store_test_credential(temp.path(), credential.clone());
         let grant = issue_passkey_session_grant(
@@ -4382,6 +5197,12 @@ mod tests {
     async fn recovery_status_distinguishes_configured_protection_from_plaintext_objects() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         store_test_credential(temp.path(), credential.clone());
         let grant = issue_passkey_session_grant(
@@ -4424,6 +5245,12 @@ mod tests {
     async fn recovery_status_requires_verified_protector() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         store_test_credential(temp.path(), credential.clone());
         let grant = issue_passkey_session_grant(
@@ -4463,6 +5290,18 @@ mod tests {
     async fn recovery_status_ignores_cross_principal_root_protection() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let admin_credential = test_credential();
         let guest_credential = test_credential_2();
         store_test_credential(temp.path(), admin_credential.clone());
@@ -4511,6 +5350,12 @@ mod tests {
     async fn recovery_status_fails_closed_for_invalid_matching_root_protection() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         store_test_credential(temp.path(), credential.clone());
         let grant = issue_passkey_session_grant(
@@ -4664,6 +5509,12 @@ mod tests {
     async fn recovery_kit_import_rejects_invalid_material() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         store_test_credential(temp.path(), credential.clone());
         let grant = issue_passkey_session_grant(
@@ -4712,6 +5563,12 @@ mod tests {
     async fn recovery_kit_import_accepts_exact_kit_envelope_binding_without_prior_protection() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         store_test_credential(temp.path(), credential.clone());
         let grant = issue_passkey_session_grant(
@@ -4801,6 +5658,12 @@ mod tests {
     async fn recovery_kit_import_rejects_wrong_key_binding_without_mutation() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         store_test_credential(temp.path(), credential.clone());
         let grant = issue_passkey_session_grant(
@@ -4894,6 +5757,12 @@ mod tests {
     async fn recovery_kit_import_requires_plaintext_migration_before_any_commit() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         store_test_credential(temp.path(), credential.clone());
         let grant = issue_passkey_session_grant(
@@ -5007,6 +5876,12 @@ mod tests {
     async fn recovery_kit_import_consumes_matching_did_recovery_proof() {
         let temp = tempfile::tempdir().unwrap();
         let state = did_recovery_test_gateway_state(temp.path(), true).await;
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         store_test_credential(temp.path(), credential.clone());
         let grant = issue_passkey_session_grant(
@@ -5072,6 +5947,12 @@ mod tests {
     async fn recovery_kit_import_rejects_unverified_did_recovery_proof() {
         let temp = tempfile::tempdir().unwrap();
         let state = did_recovery_test_gateway_state(temp.path(), false).await;
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         store_test_credential(temp.path(), credential.clone());
         let grant = issue_passkey_session_grant(
@@ -5129,6 +6010,18 @@ mod tests {
     async fn recovery_kit_import_reassigns_orphaned_root_to_current_passkey() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let old = issue_passkey_session_grant(
             &state,
             "identity-test",
@@ -5277,6 +6170,18 @@ mod tests {
         ] {
             let temp = tempfile::tempdir().unwrap();
             let state = test_gateway_state(temp.path());
+            seed_test_passkey_principal(
+                &state,
+                &test_credential(),
+                "https://elastos.elacitylabs.com",
+                crate::auth::RuntimePrincipalRole::Admin,
+            );
+            seed_test_passkey_principal(
+                &state,
+                &test_credential_2(),
+                "https://elastos.elacitylabs.com",
+                crate::auth::RuntimePrincipalRole::Guest,
+            );
             let recovered = issue_passkey_session_grant(
                 &state,
                 "identity-test",
@@ -5375,6 +6280,18 @@ mod tests {
     async fn recovery_kit_import_reassignment_response_sets_reissued_home_cookie() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let old = issue_passkey_session_grant(
             &state,
             "identity-test",
@@ -5463,6 +6380,18 @@ mod tests {
     async fn recovery_kit_import_reassignment_replaces_active_root_binding() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let active = issue_passkey_session_grant(
             &state,
             "identity-test",
@@ -5540,6 +6469,18 @@ mod tests {
     async fn recovery_kit_import_rejects_cross_principal_material() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let admin_credential = test_credential();
         let guest_credential = test_credential_2();
         store_test_credential(temp.path(), admin_credential.clone());
@@ -5618,6 +6559,18 @@ mod tests {
     async fn guest_passkey_registration_is_policy_gated() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let credential = test_credential();
         store_test_credential(temp.path(), credential.clone());
         let grant = issue_passkey_session_grant(
@@ -5669,6 +6622,8 @@ mod tests {
         );
         assert!(public_allowed
             .options
+            .as_ref()
+            .unwrap()
             .public_key
             .exclude_credentials
             .is_empty());
@@ -5679,18 +6634,41 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
         let state = test_gateway_state(temp.path());
-        let credential = test_credential();
-
-        let registered = issue_named_passkey_session_grant(
-            &state,
-            "identity-test",
-            &credential,
-            "https://elastos.elacitylabs.com",
-            true,
-            "test passkey registration",
-            Some("Anders"),
+        let secret = crate::auth::random_secret_hex();
+        let admission = crate::auth::OwnerAdmission {
+            origin: "http://localhost:61180",
+            rp_id: "localhost",
+            claimant: &secret,
+            loopback: true,
+        };
+        let mut identity = elastos_identity::IdentityManager::new(temp.path().into()).unwrap();
+        let (ceremony, options) = crate::auth::begin_owner_enrollment(
+            temp.path(),
+            &mut identity,
+            &admission,
+            "named-owner",
+            crate::auth::now_ts(),
         )
+        .unwrap()
         .unwrap();
+        let response = crate::auth::owner_attestation_for_test(
+            &options.unwrap().public_key.challenge,
+            admission.rp_id,
+            admission.origin,
+        );
+        let grant = crate::auth::complete_owner_enrollment(
+            temp.path(),
+            &mut identity,
+            &admission,
+            &ceremony,
+            Some(&response),
+            Some("Anders"),
+            crate::auth::now_ts(),
+        )
+        .unwrap()
+        .unwrap();
+        let credential = identity.credentials()[0].clone();
+        let registered = passkey_response_for_grant(&state, grant).unwrap();
         let principal = crate::auth::load_principal_for_proof_binding(
             temp.path(),
             &registered.proof_binding_id,
@@ -5744,7 +6722,7 @@ mod tests {
             &state,
             "identity-test",
             &credential,
-            "https://elastos.elacitylabs.com",
+            "http://localhost:61180",
             true,
             "test passkey authentication",
         )
@@ -5766,6 +6744,12 @@ mod tests {
         }
         let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         let first = issue_passkey_session_grant(
             &state,
@@ -5834,6 +6818,12 @@ mod tests {
         }
         let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         let first = issue_passkey_session_grant(
             &state,
@@ -5890,6 +6880,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         let grant = issue_passkey_session_grant(
             &state,
@@ -5929,6 +6925,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         let grant = issue_passkey_session_grant(
             &state,
@@ -5954,6 +6956,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let trusted = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         let grant = issue_passkey_session_grant(
             &state,
@@ -5997,6 +7005,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         store_test_credential(temp.path(), credential.clone());
         let active = issue_passkey_session_grant(
@@ -6062,6 +7076,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let trusted = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         let grant = issue_passkey_session_grant(
             &state,
@@ -6097,6 +7117,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         let grant = issue_passkey_session_grant(
             &state,
@@ -6141,6 +7167,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         let grant = issue_passkey_session_grant(
             &state,
@@ -6178,6 +7210,12 @@ mod tests {
     async fn passkey_revoke_removes_credential_and_revokes_current_session() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         store_test_credential(temp.path(), credential.clone());
         let grant = issue_passkey_session_grant(
@@ -6214,6 +7252,18 @@ mod tests {
     async fn guest_passkey_cannot_revoke_admin_passkey() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let admin_credential = test_credential();
         let guest_credential = test_credential_2();
         store_test_credential(temp.path(), admin_credential.clone());
@@ -6259,6 +7309,18 @@ mod tests {
     async fn admin_can_revoke_guest_passkey_without_revoking_admin_session() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let admin_credential = test_credential();
         let guest_credential = test_credential_2();
         store_test_credential(temp.path(), admin_credential.clone());
@@ -6316,6 +7378,18 @@ mod tests {
     async fn admin_can_promote_guest_passkey_to_admin() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let admin_credential = test_credential();
         let guest_credential = test_credential_2();
         store_test_credential(temp.path(), admin_credential.clone());
@@ -6368,6 +7442,18 @@ mod tests {
     async fn admin_can_demote_another_admin_passkey_to_guest() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let admin_credential = test_credential();
         let other_credential = test_credential_2();
         store_test_credential(temp.path(), admin_credential.clone());
@@ -6427,6 +7513,18 @@ mod tests {
     async fn admin_cannot_demote_self() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let admin_credential = test_credential();
         let other_credential = test_credential_2();
         store_test_credential(temp.path(), admin_credential.clone());
@@ -6477,6 +7575,18 @@ mod tests {
     async fn guest_cannot_promote_passkeys_to_admin() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let admin_credential = test_credential();
         let guest_credential = test_credential_2();
         store_test_credential(temp.path(), admin_credential.clone());
@@ -6524,6 +7634,18 @@ mod tests {
     async fn guest_cannot_demote_admin_passkeys() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let admin_credential = test_credential();
         let guest_credential = test_credential_2();
         store_test_credential(temp.path(), admin_credential.clone());
@@ -6567,6 +7689,18 @@ mod tests {
     async fn last_admin_passkey_cannot_be_removed_while_guests_remain() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
         let admin_credential = test_credential();
         let guest_credential = test_credential_2();
         store_test_credential(temp.path(), admin_credential.clone());
@@ -6612,6 +7746,12 @@ mod tests {
     fn revoked_passkey_cannot_mint_new_session_grant() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
         let credential = test_credential();
         let grant = issue_passkey_session_grant(
             &state,

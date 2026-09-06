@@ -18,6 +18,8 @@ const unlockPrimary = document.querySelector("#home-unlock-primary");
 const unlockSecondary = document.querySelector("#home-unlock-secondary");
 const unlockStatus = document.querySelector("#home-unlock-status");
 const unlockName = document.querySelector("#home-unlock-name");
+const ownerToken = document.querySelector("#home-owner-token");
+const ownerTokenLabel = document.querySelector("#home-owner-token-label");
 
 let unlockMode = "signin";
 let unlockPresentation = "modal";
@@ -62,7 +64,7 @@ export async function showHomeUnlock(onUnlocked, options = {}) {
     const status = await fetchJson("/api/auth/passkey/status");
     const registered = status.registered === true;
     const guestRegistrationEnabled = status.guest_registration_enabled === true;
-    unlockMode = registered
+    unlockMode = status.owner_setup_pending === true ? "resume_owner" : registered
       ? (guestRegistrationEnabled ? "signin_guest_enabled" : "signin")
       : "create";
     renderUnlockMode({ registered, guestRegistrationEnabled });
@@ -104,7 +106,7 @@ export function hideHomeUnlock() {
 
 export function bindHomeUnlock() {
   const startUnlock = () => {
-    if (unlockMode === "create" || unlockMode === "create_guest") {
+    if (unlockMode === "create" || unlockMode === "create_guest" || unlockMode === "resume_owner") {
       runPasskeyCreate().catch(reportUnlockError);
       return;
     }
@@ -249,15 +251,18 @@ function renderUnlockChecking() {
 }
 
 function renderUnlockMode({ registered, guestRegistrationEnabled }) {
+  const resumingOwner = unlockMode === "resume_owner";
   const creatingGuest = unlockMode === "create_guest";
-  const creatingAdmin = unlockMode === "create";
-  const canCreate = creatingAdmin || creatingGuest;
-  const showFace = registered && !creatingGuest && unlockMode !== "unsupported";
+  const creatingAdmin = unlockMode === "create" || resumingOwner;
+  const canCreate = (creatingAdmin || creatingGuest) && !resumingOwner;
+  const showFace = registered && !creatingGuest && !resumingOwner && unlockMode !== "unsupported";
   if (unlockTitle) {
-    unlockTitle.textContent = creatingGuest ? "Create guest account" : (registered ? "Sign in" : "Set up Home");
+    unlockTitle.textContent = resumingOwner ? "Resume Home setup" : creatingGuest ? "Create guest account" : (registered ? "Sign in" : "Set up Home");
   }
   if (unlockCopy) {
-    if (creatingGuest) {
+    if (resumingOwner) {
+      unlockCopy.textContent = "Finish the passkey setup already verified by this Home.";
+    } else if (creatingGuest) {
       unlockCopy.textContent = "Use a passkey to create your own guest account.";
     } else {
       unlockCopy.textContent = registered
@@ -266,7 +271,7 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
     }
   }
   if (unlockPrimary) {
-    unlockPrimary.textContent = creatingGuest
+    unlockPrimary.textContent = resumingOwner ? "Resume Home setup" : creatingGuest
       ? "Create guest passkey"
       : (registered ? "Use passkey" : "Create admin passkey");
     unlockPrimary.disabled = unlockMode === "unsupported";
@@ -312,6 +317,12 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
     stopUnlockClock();
   }
   setUnlockNameVisible(canCreate);
+  const publicOwnerSetup = creatingAdmin && window.location.protocol === "https:";
+  if (ownerToken) {
+    ownerToken.hidden = !publicOwnerSetup;
+    if (!publicOwnerSetup) ownerToken.value = "";
+  }
+  if (ownerTokenLabel) ownerTokenLabel.hidden = !publicOwnerSetup;
 }
 
 function unlockStatusCopy(registered, guestRegistrationEnabled) {
@@ -333,23 +344,34 @@ async function runPasskeyCreate() {
   setUnlockStatus("Creating passkey", "muted");
   try {
     const displayName = readUnlockName();
-    if (!displayName) {
+    if (!displayName && unlockMode !== "resume_owner") {
       throw new Error("Enter a name for this passkey.");
     }
-    const begin = await fetchJson("/api/auth/passkey/register/begin", { method: "POST" });
-    begin.options.publicKey.user.name = displayName;
-    begin.options.publicKey.user.displayName = displayName;
-    const credential = await navigator.credentials.create(toCreationOptions(begin.options));
-    if (!credential) {
-      throw new Error("Passkey creation was cancelled.");
+    const enrollmentHeaders = {};
+    if ((unlockMode === "create" || unlockMode === "resume_owner") && ownerToken?.value) {
+      enrollmentHeaders["x-elastos-owner-enrollment"] = ownerToken.value.trim();
+    }
+    const beginPromise = fetchJson("/api/auth/passkey/register/begin", { method: "POST", headers: enrollmentHeaders });
+    if (ownerToken) ownerToken.value = "";
+    const begin = await beginPromise;
+    if (begin?.schema !== "elastos.auth.passkey.register.begin/v1" || typeof begin.ceremony_id !== "string" || !begin.ceremony_id || begin.ceremony_id.length > 128) {
+      throw new Error("Home setup returned an invalid response.");
+    }
+    const completion = { ceremony_id: begin.ceremony_id };
+    if (begin.options !== null) {
+      if (!begin.options?.publicKey?.user || !displayName) throw new Error("Home setup returned an invalid response.");
+      begin.options.publicKey.user.name = displayName;
+      begin.options.publicKey.user.displayName = displayName;
+      const credential = await navigator.credentials.create(toCreationOptions(begin.options));
+      if (!credential) throw new Error("Passkey creation was cancelled.");
+      Object.assign(completion, {
+        response: serializeCreatedCredential(credential),
+        display_name: displayName,
+      });
     }
     const response = await fetchJson("/api/auth/passkey/register/complete", {
       method: "POST",
-      body: JSON.stringify({
-        ceremony_id: begin.ceremony_id,
-        response: serializeCreatedCredential(credential),
-        display_name: displayName,
-      }),
+      body: JSON.stringify(completion),
     });
     setHomeAuthorityToken(response?.home_token);
     await unlockComplete(response);
