@@ -172,6 +172,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if body.get('model') != alias or body.get('chat_template_kwargs') != {'enable_thinking': False}:
             self.send_error(400)
             return
+        active = model_path.with_suffix('.active')
+        if mode == 'active_after_disconnect' and prompt == 'stall':
+            active.touch()
         record('request:' + prompt)
         if mode == 'crash_once' and prompt == 'crash':
             marker = model_path.with_suffix('.crashed')
@@ -187,6 +190,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(b': keepalive\n\n')
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
+                    if mode == 'active_after_disconnect':
+                        record('disconnected:stall')
+                        release = model_path.with_suffix('.release')
+                        while not release.exists():
+                            time.sleep(0.025)
+                        active.unlink()
+                        record('work_stopped:stall')
                     record('cancelled')
                     return
                 time.sleep(0.025)

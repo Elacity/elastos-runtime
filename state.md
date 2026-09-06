@@ -523,8 +523,8 @@ complete. Installed proof and the atomic authority cutover remain open.
   `response.output_text.delta`. Only an authoritative `response.completed`
   event with response status `completed` succeeds. The `response.failed`,
   `response.incomplete`, and `error` events produce bounded generic failures.
-  Local Qwen adapter behavior stays unchanged. Hosted cancellation semantics
-  are recorded below.
+  Local Qwen request format stays unchanged. Cancellation semantics are recorded
+  below.
 - The provider stores hosted backend evidence once on the terminal event and
   replays it through `runs_get`. It reports the resolved model, token usage,
   and non-negative backend cost when the Chat Completions backend supplies
@@ -533,11 +533,12 @@ complete. Installed proof and the atomic authority cutover remain open.
   backend-reported evidence, not verified billing. Both hosted adapters reuse
   the existing worker, journal, cancellation, restart and replay, byte, time,
   and event limits, with one provider dispatch and zero provider retries.
-  Hosted cancellation after possible dispatch records `settlement_unknown`:
-  an HTTP stream close does not confirm backend stop. A deterministic fixture
-  keeps backend work active while both adapters cancel, then proves one terminal
-  result, replay and restart persistence, and zero redispatch. Managed-engine
-  cancellation behavior is unchanged; backend-stop proof remains open.
+  Hosted and managed-engine cancellation after possible dispatch records
+  `settlement_unknown`: an HTTP stream close does not confirm backend stop.
+  Deterministic fixtures keep backend work active after cancellation, then prove
+  one terminal result, replay and restart persistence, and zero redispatch.
+  Local completion and confirmed backend cancellation retain their terminal
+  outcomes. Installed cancellation and backend-stop proof remain open.
   Deterministic focused fixtures prove the source adapters. The current
   candidate has passing formatting, Home entropy, public-copy entropy, and diff
   checks; full-suite and target proof remain separate evidence.

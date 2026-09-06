@@ -2739,9 +2739,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn local_llama_cancel_keeps_engine_for_later_run() {
+    fn local_llama_cancel_with_active_backend_settles_unknown_without_redispatch() {
         let root = temp_root("local-llama-cancel");
-        let (offer, events, root) = local_llama_offer(&root, "healthy");
+        let (offer, events, root) = local_llama_offer(&root, "active_after_disconnect");
+        let active = events.with_extension("active");
+        let release = events.with_extension("release");
         let mut provider = ProviderCoordinatorHandle::start();
         init_provider(&provider, &root, vec![offer.clone()]);
 
@@ -2752,19 +2754,69 @@ mod tests {
         wait_for_fake_llama_event(&events, "request:stall");
         let cancelled = cancel_run(&provider, run_id, &access_binding(&binding));
         assert_eq!(cancelled["data"]["status"], "reconciling");
+        let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+        wait_for_fake_llama_event(&events, "disconnected:stall");
+        assert!(active.exists(), "backend work outlives the HTTP consumer");
+        assert!(!release.exists());
+        assert_eq!(terminal["data"]["status"], "settlement_unknown");
+        let run = load_run(&root, run_id);
+        assert_eq!(run.status, crate::contract::RunStatus::SettlementUnknown);
+        assert_eq!(run.events.last().unwrap().kind, "settlement_unknown");
         assert_eq!(
-            wait_for_terminal(&provider, run_id, &access_binding(&binding))["data"]["status"],
-            "cancelled"
+            run.events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind.as_str(),
+                    "completed" | "failed" | "cancelled" | "settlement_unknown"
+                ))
+                .count(),
+            1
         );
+        let page = events_page(&provider, run_id, &access_binding(&binding), 0);
+        for _ in 0..2 {
+            assert_eq!(
+                cancel_run(&provider, run_id, &access_binding(&binding))["data"]["terminal"],
+                terminal["data"]["terminal"]
+            );
+            assert_eq!(
+                get_run(&provider, run_id, &access_binding(&binding))["data"]["terminal"],
+                terminal["data"]["terminal"]
+            );
+            assert_eq!(
+                create_run(&provider, &offer, &binding, &input)["data"]["run_id"],
+                run_id
+            );
+            assert_eq!(
+                events_page(&provider, run_id, &access_binding(&binding), 0)["data"]["events"],
+                page["data"]["events"]
+            );
+        }
+        assert!(active.exists());
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| *line == "request:stall")
+                .count(),
+            1
+        );
+        std::fs::write(&release, b"release").unwrap();
+        wait_for_fake_llama_event(&events, "work_stopped:stall");
+        assert!(!active.exists());
 
         let later_input = text_input("later");
         let later_binding = create_binding("request:local-later", &offer, &later_input);
         let later = create_run(&provider, &offer, &later_binding, &later_input);
         let later_run_id = later["data"]["run_id"].as_str().unwrap();
+        let completed = wait_for_terminal(&provider, later_run_id, &access_binding(&later_binding));
+        assert_eq!(completed["data"]["status"], "completed");
         assert_eq!(
-            wait_for_terminal(&provider, later_run_id, &access_binding(&later_binding))["data"]
-                ["terminal"]["output"]["text"],
+            completed["data"]["terminal"]["output"]["text"],
             "reply:later"
+        );
+        assert_eq!(
+            cancel_run(&provider, later_run_id, &access_binding(&later_binding))["data"]
+                ["terminal"],
+            completed["data"]["terminal"]
         );
         assert_eq!(
             fake_llama_events(&events)
@@ -2774,6 +2826,27 @@ mod tests {
             1
         );
         provider.shutdown_on_eof();
+        let settled_events = fake_llama_events(&events);
+        let mut restarted = ProviderCoordinatorHandle::start();
+        init_provider(&restarted, &root, vec![offer.clone()]);
+        assert_eq!(
+            create_run(&restarted, &offer, &binding, &input)["data"]["run_id"],
+            run_id
+        );
+        assert_eq!(
+            get_run(&restarted, run_id, &access_binding(&binding))["data"]["terminal"],
+            terminal["data"]["terminal"]
+        );
+        assert_eq!(
+            cancel_run(&restarted, run_id, &access_binding(&binding))["data"]["status"],
+            "settlement_unknown"
+        );
+        assert_eq!(
+            events_page(&restarted, run_id, &access_binding(&binding), 0)["data"]["events"],
+            page["data"]["events"]
+        );
+        assert_eq!(fake_llama_events(&events), settled_events);
+        restarted.shutdown_on_eof();
     }
 
     #[cfg(unix)]

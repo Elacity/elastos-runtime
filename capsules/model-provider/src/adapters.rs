@@ -1495,8 +1495,9 @@ async fn run_local_text_worker_inner(
         builder
     };
     let response = tokio::select! {
-        changed = task.cancel_rx.changed() => {
-            return handle_local_text_cancel_signal(&task.backend, &task.cancel_rx, changed);
+        _ = task.cancel_rx.changed() => {
+            // Closing a local or hosted HTTP stream does not confirm backend stop.
+            return Ok(worker_settlement_unknown_result());
         }
         response = request.send() => response.map_err(|err| map_text_reqwest_failure(err, private_endpoint))?
     };
@@ -1515,8 +1516,8 @@ async fn run_local_text_worker_inner(
 
     while !done {
         let next = tokio::select! {
-            changed = task.cancel_rx.changed() => {
-                return handle_local_text_cancel_signal(&task.backend, &task.cancel_rx, changed);
+            _ = task.cancel_rx.changed() => {
+                return Ok(worker_settlement_unknown_result());
             }
             chunk = response.chunk() => chunk.map_err(|err| map_text_reqwest_failure(err, private_endpoint))?
         };
@@ -1697,36 +1698,6 @@ fn map_text_reqwest_failure(err: reqwest::Error, private_endpoint: bool) -> Adap
         );
     }
     map_reqwest_failure(err)
-}
-
-fn handle_local_text_cancel_signal(
-    backend: &LocalTextBackend,
-    cancel_rx: &watch::Receiver<bool>,
-    changed: std::result::Result<(), tokio::sync::watch::error::RecvError>,
-) -> std::result::Result<ReconcileResult, AdapterFault> {
-    if matches!(
-        backend,
-        LocalTextBackend::OpenAiCompatible { .. } | LocalTextBackend::OpenAiResponses { .. }
-    ) {
-        // Closing a hosted HTTP stream does not confirm that backend work stopped.
-        return Ok(worker_settlement_unknown_result());
-    }
-    match changed {
-        Ok(()) => {
-            if *cancel_rx.borrow() {
-                Ok(local_text_cancelled_result())
-            } else {
-                Ok(worker_settlement_unknown_result())
-            }
-        }
-        Err(_) => {
-            if *cancel_rx.borrow() {
-                Ok(local_text_cancelled_result())
-            } else {
-                Ok(worker_settlement_unknown_result())
-            }
-        }
-    }
 }
 
 async fn flush_local_text_delta(
@@ -1957,20 +1928,6 @@ fn parse_backend_cost(
         None => None,
     };
     Ok(Some(BackendCost { value, unit }))
-}
-
-fn local_text_cancelled_result() -> ReconcileResult {
-    ReconcileResult::Terminal {
-        events: Vec::new(),
-        status: RunStatus::Cancelled,
-        output: None,
-        error: Some(RunError {
-            class: ErrorClass::Cancelled,
-            code: "cancelled".to_string(),
-            message: "model run was cancelled".to_string(),
-        }),
-        backend_report: None,
-    }
 }
 
 fn worker_settlement_unknown_result() -> ReconcileResult {
