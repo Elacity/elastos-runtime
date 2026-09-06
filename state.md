@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-09-05 UTC
+Last updated: 2026-09-06 UTC
 
 This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
@@ -23,9 +23,11 @@ volatile proof logs remain outside the repository.
   `145fec2b`, secure credential persistence `eb25f747`, and durable first-owner
   enrollment `43b8f830`. Two syntax-only setup lint corrections are in the merge.
   Combined identity, auth, model, Home and bootstrap fixtures, strict targeted
-  Clippy and formatting pass locally. Independent integration review,
-  publication and installed acceptance remain open. Earlier `900d7e5c` remains
-  the broad installed UIUX/protected-content proof. PR52, PR54 and PR55 work
+  Clippy and formatting pass locally. Independent review of the combined source
+  through integration code tip `e496fe06` is complete. Publication and remaining
+  installed behavior acceptance stay open.
+  Earlier `900d7e5c` remains the broad installed UIUX/protected-content proof.
+  PR52, PR54 and PR55 work
   already present in the candidate must be compared by patch if upstream changes.
 - The published protected-content stack is contracts `0c56c56a`, custody
   `2f844cef`, key reconstruction `467a6c03`, custody provider `1b7fa732`,
@@ -507,11 +509,12 @@ complete. Installed proof and the atomic authority cutover remain open.
   Transport uncertainty retains `providerRunId` and offers Check status through
   `runs_get/events`; navigation detaches without cancellation or a new dispatch.
   Runtime-confirmed unknown settlement retains its completion time and permits a
-  new turn. Controller fixtures cover denial, unknown settlement, completion
-  races, stale polls, late acceptance and saved-workspace recovery. The Home Agent
-  shell and cancellation tests are included in the CI source step; local checks
-  pass. The workbook's MODEL-02 source-note refresh is pending. Installed
-  cancellation acceptance and remote CI proof remain open.
+  new turn. All ten actual-controller cancellation tests pass, covering denial,
+  unknown settlement, completion races, stale polls, late acceptance and
+  saved-workspace recovery. The Home Agent shell and cancellation tests are
+  included in the CI source step; local checks pass. The workbook's MODEL-02
+  source-note refresh remains pending. Installed cancellation acceptance and
+  remote CI proof remain open.
 - The provider-internal `open_ai_responses_text` source adapter and hosted
   cancellation correction are at commit `0d768415`, tree `96d45941`.
   The adapter posts only `model`,
@@ -577,15 +580,24 @@ complete. Installed proof and the atomic authority cutover remain open.
   cleanup after a provider hard kill. The installed direct and Runtime proofs
   also observed zero owned engine or guard residue after their shutdown and
   restart cases.
-- Installed artifact parity is proved for one macOS Qwen offer. The corrected
-  candidate `4a9d50d0`, tree `82fbd7e8`, was rebuilt and installed
-  in the isolated macOS model Home. Built and installed artifacts match at
+- Installed artifact parity is proved for candidate `e496fe06`, tree `426a87d0`,
+  in the existing isolated macOS model Home. Nine native builds cover Runtime
+  and the eight providers affected by the changed dependency closure. All eight
+  installed-provider verifications pass. Built and installed artifacts match at
   Runtime SHA-256
-  `91052d67728f425c4b8ec0abbe118f1ccb98a44bcde19c9d63b1549bd26a2952` and
+  `087c3d5d884fdeb519b71cbdc6d8952332222e8788e118cf9c6ede3bdd6f28cd` and
   model-provider SHA-256
-  `886c6c9eb318549e91fb1144eedf7920e6989d69592c350ae125533008cfad36`.
-  Installed-provider verification passed, Home returned HTTP 200, and the
-  identity, Profile, Recovery, and model-config fingerprints were preserved.
+  `657f3dd6d60955ebbfb0a9c470373ea29d23279286e797ea83cc2d032b75566b`.
+  Eighty Home/Home Agent assets match source, installation and manifest;
+  nine served assets match. Strict restart passed, and the parent rechecked
+  the receipt and HTTP 200 on 2026-09-06. Brave showed the existing Admin
+  account and Profile after reload.
+- Existing identity/TLS, private configuration, model and recovery bytes match
+  their preservation hashes. Runtime added one empty owner-only Identity lock.
+  Live auth/audit and browser journals changed after restart; their timing
+  correlates with a Brave reload but does not prove its cause. Their aggregate
+  is not a byte-parity pass. Profile's individual pre-install hash was not
+  captured; the observed Profile is separate evidence.
 - An earlier installed candidate completed one signed Qwen functional run.
   Home Agent used offer `local-qwen` through the typed Runtime model path. Its
   `text.generate` run completed with four events, an
@@ -594,8 +606,8 @@ complete. Installed proof and the atomic authority cutover remain open.
   Runtime kept Qwen engine and provider details private. A fresh completed run,
   explicit cancellation of the selected run with backend-stop evidence or
   honest unknown settlement and no duplicate dispatch, restart, and cleanup on
-  the current corrected tree remain open. Current installed hash parity does
-  not supply that execution proof.
+  the current corrected tree remain open, including reload behavior.
+  Current installed hash parity does not supply that execution proof.
 - The reviewed receipt convergence, end-to-end deadline, and hosted URL
   redaction corrections are complete in source and have fresh installed
   artifact parity proof.

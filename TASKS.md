@@ -17,8 +17,8 @@ section if a higher section is incoherent, unverified, or too large to review.
 
 Active priority index:
 
-- current priority: parent verification of the combined model/auth integration
-  and its source evidence, then isolated installed acceptance. Remote
+- current priority: isolated installed Qwen acceptance on the reviewed combined
+  model/auth code at `e496fe06`. Remote
   publication, live deployment, data migration and paid calls require explicit
   authorization. Installed acceptance and release remain separate gates
 - released line: `origin/main@8ac18bec` is `v0.7.0`. Keep follow-up work on
@@ -56,36 +56,28 @@ protected-content prerequisites. It did not change the pending Wallet approval.
 
 Open gates, in order:
 
-1. [ ] Independently review the combined merge and journey-register source
-   evidence on the exact candidate revision. The model and auth slices retain
-   their reviewed history; combined focused tests and strict Clippy have local
-   proof. Publication and remote CI need their own authorization and result.
-
-   - [ ] Refresh the journey register's MODEL-02 source note for the verified
-     Home Agent cancellation fix; preserve its installed verdict.
-
-2. [ ] Prove first-owner enrollment on a fresh isolated supported host: normal
-   verified-loopback onboarding, one-use operator-admitted HTTPS origin/RP,
-   typed denials, competing attempts and reload/restart recovery with one owner
-   and one terminal grant. Preserve existing accounts and recovery material.
-   Windows secure enrollment acceptance remains open. Same-principal linking
-   is a separate follow-up, not a dependency of this source closeout.
-3. [ ] The Mac proof owner tests the exact reviewed candidate in the isolated
-   source Home. Run a fresh signed Qwen completion, explicitly cancel the
-   selected run, verify backend stop or honest unknown settlement with one
-   terminal result and no duplicate dispatch, and prove restart and cleanup.
+1. [ ] The Mac proof owner completes behavior acceptance on the installed
+   model Home. Run a fresh signed Qwen completion, explicitly cancel the selected
+   run, verify backend stop or honest unknown settlement with one terminal result
+   and no duplicate dispatch, and prove reload, restart and cleanup.
    Managed-engine stream closure alone is not backend-stop proof.
    Also run focused Recovery, Profile,
    navigation and Terminal tests. Add Browser media only when the target
    supplies accepted evidence. Finish with hash-bound receipts for the exact
    tree; the earlier completed Qwen run and current artifact parity are separate
    evidence.
-4. [ ] After the first three gates, the release integrator may publish the
+2. [ ] Prove first-owner enrollment on a fresh isolated supported host: normal
+   verified-loopback onboarding, one-use operator-admitted HTTPS origin/RP,
+   typed denials, competing attempts and reload/restart recovery with one owner
+   and one terminal grant. Preserve existing accounts and recovery material.
+   Windows secure enrollment acceptance remains open. Same-principal linking
+   is a separate follow-up, not a dependency of this source closeout.
+3. [ ] After the first two gates, the release integrator may publish the
    source-ready candidate for review. If PR52, PR54, or PR55 changes upstream,
    compare patches and trees before rebuilding the tail, keep unique fixes, and
    omit patch-equivalent copies. Finish with a reviewed source revision and
    green source gates. Release and installed readiness remain separate.
-5. [ ] The protected-content owner completes installed prerequisites on the
+4. [ ] The protected-content owner completes installed prerequisites on the
    reviewed candidate: stable receipts on localhost, seed, and the third custody
    node; one signed owner-only 2-of-3 composition across three distinct operators
    and failure domains; and exact private Chain configuration. Each custody node
@@ -102,6 +94,9 @@ Open gates, in order:
    Finish with the reviewed rollout and an explicit release decision. The full
    contract and acceptance details are in
    [docs/PROTECTED_CONTENT.md](docs/PROTECTED_CONTENT.md).
+
+- [ ] Refresh the journey register's MODEL-02 cancellation source note;
+  preserve the installed verdict.
 
 The next delivery milestone after this closeout is the CID-installed Qwen slice
 under [Content distribution and Windows](#content-distribution-and-windows).
