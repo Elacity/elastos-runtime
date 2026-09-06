@@ -15,16 +15,18 @@ volatile proof logs remain outside the repository.
   changelog, manifest bumps, and lock refresh. Installed artifacts report
   `0.7.0` only after the checked publish flow stamps
   `ELASTOS_RELEASE_VERSION`; unstamped source builds report `0.7.0-dev`.
-- The local candidate groups its unpublished model and delivery work into five
-  commits above `origin/feat/0.7.1-integration@12d38266`, with the published
-  prefix unchanged. The original audited snapshot `1b30cca5`, tree `5af0e57f`,
-  remains recorded separately from the approved hosted cancellation correction
-  and documentation update. Earlier candidate `900d7e5c` remains the broad
-  installed UIUX and protected-content proof. The current candidate
-  still needs grouped-tail review, publication, and combined team
-  review before a merge decision. PR52, PR54, and PR55 remain open; their
-  reviewed or adapted work is already present in this local candidate and must
-  be compared by patch if upstream changes.
+- Published integration remains `origin/feat/0.7.1-integration@12d38266`.
+  Local merge `91209988`, tree `16f8f020`, preserves the five reviewed groups:
+  artifact verification `c95cf4c9`, local-engine lifecycle `7c4fc929`, hosted
+  evidence `fcb8fc5e`, Responses and honest cancellation `0d768415`, and delivery
+  documentation `ed275ba0`. Its other parent preserves auth ceremony binding
+  `145fec2b`, secure credential persistence `eb25f747`, and durable first-owner
+  enrollment `43b8f830`. Two syntax-only setup lint corrections are in the merge.
+  Combined identity, auth, model, Home and bootstrap fixtures, strict targeted
+  Clippy and formatting pass locally. Independent integration review,
+  publication and installed acceptance remain open. Earlier `900d7e5c` remains
+  the broad installed UIUX/protected-content proof. PR52, PR54 and PR55 work
+  already present in the candidate must be compared by patch if upstream changes.
 - The published protected-content stack is contracts `0c56c56a`, custody
   `2f844cef`, key reconstruction `467a6c03`, custody provider `1b7fa732`,
   Wallet rights `c9e82e75`, Runtime `a8ac6dc8`, and rights `3627da01`.
@@ -36,10 +38,10 @@ volatile proof logs remain outside the repository.
   fixtures, the privacy-reviewed audit workbook, the completed-mint adoption
   repair from `58ebfb23`, and the equivalent CPU watcher optimization at
   `8e53174f`. The reviewed donor `e4d897f6` is the source comparison, not an
-  ancestor. The candidate source passes formatting, alignment, Home and Browser
-  entropy, Home shell, People discovery, the 26-case Browser close handshake,
-  and Home Agent shell checks. Remote CI remains separate from these local
-  checks.
+  ancestor. The earlier candidate source passed formatting, alignment, Home
+  and Browser entropy, Home shell, People discovery, the 26-case Browser close
+  handshake, and Home Agent shell checks. Combined-merge proof is listed above;
+  remote CI remains separate from local checks.
 - `origin/upstream/0.7.1-dev` also carries Irzhy's verified Base 8453 probe
   evidence, shared build-artifact staging, upstream collaboration work, and
   Browser local-exit orphan cleanup. The protected-content source path remains
@@ -327,20 +329,27 @@ complete. Installed proof and the atomic authority cutover remain open.
   durability. Auth-state locking uses the standard cross-process file API.
   The non-Unix identity adapter preserves existing path/ACL behavior without
   claiming Unix path protection or directory durability. Windows acceptance
-  remains open. Credential and principal writes still have separate commit
-  boundaries. Fresh registration rejects existing credentials; durable,
-  authorized recovery must own any future exact credential adoption.
-  One-use public HTTPS enrollment and same-principal passkey linking remain
-  unimplemented. The enrollment design preserves normal loopback onboarding
-  through the same first-owner operation. These are source findings, not
-  installed enrollment or recovery proof.
+  remains open. Credential and principal writes have separate commit boundaries.
+  The existing auth state now stores the owner operation before credential
+  effects and reconciles its exact verified candidate after interruption.
+  Fresh registration continues to reject existing credentials.
+- Both registration routes share the durable first-owner operation. Verified
+  loopback requests retain onboarding; public HTTPS requires a one-use local
+  operator token bound to the exact origin, RP, Runtime and expiry. Runtime
+  stores only its digest. The same claimant can resume verified enrollment
+  after response loss or reload, preserving the saved name and one terminal
+  grant. Source tests cover both routes, competing claimants, persistence
+  boundaries, expired grants, counters and revoked credentials. Home's reload
+  fixture passes. Installed operator/passkey and recovery proof remain open.
+- Same-principal multi-passkey linking is separate follow-up work. Current
+  auth records store role, root and name per proof binding, and counts count
+  binding records. Canonical account ownership with separately revocable
+  proofs and unique-principal counting requires an explicit existing-state
+  migration/recovery review before linking. This is a source prerequisite,
+  not a demonstrated live defect for current one-passkey accounts.
 - Home authority uses signed `elastos.home.launch-token/v4` envelopes. Runtime
   validation binds resource, actors, principal, proof, grant, session,
   lifetime, and non-delegatability; callers cannot supply Wallet authority.
-- First-owner passkey registration currently requires local Runtime access. A
-  public HTTPS attempt reaches the untyped local-access rejection and returns
-  HTTP 500. The planned origin- and RP-bound bootstrap must return typed 403
-  denials and keep same-principal credential linking as a separate consent flow.
 - Wallet Bus v2.3 is the typed Runtime/Wallet Provider boundary. Wallet Provider
   owns keys, accounts, proofs, approval execution, and validated outcomes;
   Runtime owns launch authorization, orchestration, durable effects, and the
@@ -494,6 +503,13 @@ complete. Installed proof and the atomic authority cutover remain open.
   operator assertion that upstream routing fallback is disabled. The API key,
   endpoint, headers, and topology stay private. Local Qwen offer and output
   JSON stay unchanged.
+- Home Agent cancellation has a verified source presentation gap: Stop clears
+  the live run identity and stream epoch, ignores cancellation-call errors, and
+  can persist Stopped before Runtime settles the run. Provider unknown-settlement
+  fixtures do not prove end-to-end cancellation. The existing persisted
+  providerRunId and runs_get/events/cancel path support the bounded follow-up;
+  cancellation rejection, unknown settlement and completion races need UI proof.
+  Installed cancellation acceptance remains open.
 - The provider-internal `open_ai_responses_text` source adapter and hosted
   cancellation correction are at commit `0d768415`, tree `96d45941`.
   The adapter posts only `model`,

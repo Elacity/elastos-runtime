@@ -17,18 +17,19 @@ section if a higher section is incoherent, unverified, or too large to review.
 
 Active priority index:
 
-- current priority: review the unpublished candidate tail as four or five
-  coherent groups with an exact final-tree check, then publish that source for
-  team review after explicit authorization. Source review does not make the
-  candidate ready to release
+- current priority: parent verification of the combined model/auth integration
+  and its source evidence, then isolated installed acceptance. Remote
+  publication, live deployment, data migration and paid calls require explicit
+  authorization. Installed acceptance and release remain separate gates
 - released line: `origin/main@8ac18bec` is `v0.7.0`. Keep follow-up work on
   `origin/upstream/0.7.1-dev` until the reviewed 0.7.1 line is ready. The
   checked publish flow still owns release stamping
-- audited source snapshot `1b30cca5` has tree `5af0e57f`. That source tip
-  is 47 commits ahead of `origin/upstream/0.7.1-dev` and 14 commits ahead of
-  `origin/feat/0.7.1-integration`. Earlier candidate `900d7e5c` remains the
-  broad installed UIUX and protected-content proof. The reviewed PR52, PR54,
-  and PR55 source slices remain part of the current candidate
+- published integration remains `origin/feat/0.7.1-integration@12d38266`.
+  Local merge `91209988` preserves the five reviewed model/delivery groups
+  through `ed275ba0` and the three reviewed auth commits through `43b8f830`.
+  Earlier candidate `900d7e5c` remains the broad installed UIUX and
+  protected-content proof. The reviewed PR52, PR54, and PR55 source slices
+  remain part of the current candidate
 - integrated UIUX source evidence: published
   `origin/feat/0.7-uiux-candidate` at `8b547590`; this ref is donor evidence,
   not installed, live, or release truth
@@ -41,8 +42,9 @@ Active priority index:
 - all other work remains queued below
 
 Builder implements bounded source steps. The Analyser reviews proof and advances
-gates. Anders approves publication, installation, and human acceptance. Sash and
-Irzhy review the areas that they own or changed.
+gates. Routine local testing stays within the authorized isolated scope. Anders
+approves remote publication, live deployment, data migration, paid calls and
+human acceptance. Sash and Irzhy review the areas that they own or changed.
 
 ### Integrated UIUX and protected-content proof
 
@@ -54,29 +56,24 @@ protected-content prerequisites. It did not change the pending Wallet approval.
 
 Open gates, in order:
 
-1. [ ] The release integrator reviews the five grouped unpublished commits on
-   `feat/0.7.1-integration`: artifact verification, local-engine lifecycle,
-   hosted evidence, Responses with honest hosted cancellation, and delivery
-   documentation. The private mapping preserves the original snapshot and
-   identifies the approved cancellation and documentation corrections.
-   Run the repository Verification Gate plus
-   `(cd elastos && cargo test -p elastos-server --lib model_provider -- --nocapture)`,
-   `(cd elastos && cargo test -p elastos-server --lib llama_bundle -- --nocapture)`,
-   `cargo test --manifest-path capsules/model-provider/Cargo.toml --locked`, and
-   `python3 scripts/fetch/fetch-model-smoke.py`, followed by
-   `node scripts/home-agent-shell-smoke.mjs`. Finish when the grouped diff and
-   narrow source gates are ready for review; do not use a blind squash.
-2. [ ] The Runtime auth owner starts `fix/home-owner-bootstrap` from a fresh
-   `origin/upstream/0.7.1-dev`, then integrates it into the existing candidate.
-   Reuse the current auth challenge state. First add one-use public first-owner
-   enrollment bound at begin time to one operator-approved HTTPS origin and RP;
-   then add explicit self-link consent for another credential to the same
-   principal and root. Prove typed 403 responses, expiry, replay and concurrent
-   use, unchanged role counts, exact principal/root continuity, and one owner of
-   each identity route. Finish when installed public-origin enrollment and
-   same-principal linking pass without a second auth store or takeover path.
+1. [ ] Independently review the combined merge and journey-register source
+   evidence on the exact candidate revision. The model and auth slices retain
+   their reviewed history; combined focused tests and strict Clippy have local
+   proof. Publication and remote CI need their own authorization and result.
+2. [ ] Prove first-owner enrollment on a fresh isolated supported host: normal
+   verified-loopback onboarding, one-use operator-admitted HTTPS origin/RP,
+   typed denials, competing attempts and reload/restart recovery with one owner
+   and one terminal grant. Preserve existing accounts and recovery material.
+   Windows secure enrollment acceptance remains open. Same-principal linking
+   is a separate follow-up, not a dependency of this source closeout.
 3. [ ] The Mac proof owner tests the exact reviewed candidate in the isolated
-   source Home. Run a fresh signed Qwen completion, explicitly cancel the
+   source Home. First correct Home Agent cancellation presentation: retain the
+   existing providerRunId, show pending or unknown settlement, and accept
+   terminal state only from Runtime. Current Stop clears stream ownership and
+   can persist Stopped even when runs_cancel fails. Add controller fixtures for
+   rejection, unknown settlement, late completion and reload without duplicate
+   dispatch; reuse runs_get/events/cancel and existing workspace fields.
+   Then run a fresh signed Qwen completion, explicitly cancel the
    selected run, verify backend stop or honest unknown settlement with one
    terminal result and no duplicate dispatch, and prove restart and cleanup.
    Managed-engine stream closure alone is not backend-stop proof.
@@ -125,17 +122,12 @@ the protected-content release decision.
 
 ### Home audit follow-up
 
-- [ ] Add one durable first-owner enrollment operation after the credential
-  persistence prerequisite: verified loopback requests
-  retain normal onboarding; public HTTPS enrollment requires a one-use
-  operator token bound to the exact origin and RP. Both auth route owners
-  must share the first-owner rule. Exact credential adoption requires the
-  same previously authorized durable recovery operation; a fresh registration
-  must reject an existing credential. Public enrollment requires proven secure
-  persistence on its host; non-Unix path protection and directory durability
-  remain open. Verify interruption and competing-enrollment recovery.
-  Implement same-principal passkey linking afterward, preserving existing
-  proof mappings and distinguishing credential count from person count.
+- [ ] Review the canonical-account prerequisite before same-principal passkey
+  linking: one account owns role, root and name; proof bindings are separately
+  revocable; counts measure unique principals. Review existing-state migration
+  and recovery explicitly before implementation. Then prove explicit consent
+  and new-key possession, cross-principal denial, expiry, replay, restart and
+  revoked links, with unchanged protected roots, roles and principal counts.
 - [ ] Diagnose and prove direct Desktop/Terminal switching on the installed
   Home. Host-authority and startup-replay repairs have source coverage, but
   an installed transition can still leave a blank shell. Verify the exact
