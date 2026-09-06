@@ -542,7 +542,7 @@ export function selectSession(sessionId) {
   if (!sessionId || !ctx.sessions.some((s) => s.id === sessionId)) {
     return;
   }
-  stopAgentStream({ keepPartial: true });
+  stopAgentStream({ keepPartial: true, cancelRun: false });
   closeHarnessPage();
   ctx.activeSessionId = sessionId;
   renderSessions();
@@ -551,7 +551,7 @@ export function selectSession(sessionId) {
 }
 
 export function newChat() {
-  stopAgentStream({ keepPartial: false });
+  stopAgentStream({ keepPartial: false, cancelRun: false });
   closeHarnessPage();
   ctx.followUpQueue = [];
   try {
@@ -606,7 +606,7 @@ export function forkSession(sessionId) {
   if (!source) {
     return;
   }
-  stopAgentStream({ keepPartial: true });
+  stopAgentStream({ keepPartial: true, cancelRun: false });
   const baseTitle = String(source.title || "Chat").replace(/\s*\(fork\)\s*$/i, "");
   const forkBytes = new Uint8Array(3);
   globalThis.crypto.getRandomValues(forkBytes);

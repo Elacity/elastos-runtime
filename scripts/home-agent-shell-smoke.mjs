@@ -104,7 +104,7 @@ assert.ok(gatewayHomeAgent.includes("#[serde(deny_unknown_fields)]"));
 
 assert.equal(manifest.name, "home-agent");
 const methods = manifest.interfaces.flatMap((i) => i.methods.map((m) => m.operation)).sort();
-assert.deepEqual(methods, ["offers_list", "runs_cancel", "runs_create", "runs_events"]);
+assert.deepEqual(methods, ["offers_list", "runs_cancel", "runs_create", "runs_events", "runs_get"]);
 assert.ok(components.external?.["home-agent"], "components.json installs home-agent");
 assert.ok(
   localCarrierSetup.includes('HOME_AGENT_CAPSULE_DIR="${REPO_ROOT}/capsules/home-agent"') &&

@@ -258,17 +258,24 @@ export function compileLiveContext({
   return compiled;
 }
 
-let liveContractRunId = null;
 let liveStreamEpoch = 0;
+let activeRun = null;
 
 export function abortLiveChatStream() {
-  liveStreamEpoch += 1;
-  if (liveContractRunId) {
-    const runId = liveContractRunId;
-    liveContractRunId = null;
-    /* fire-and-forget: best-effort cancel of the contract run */
-    modelRunCall("runs_cancel", { run_id: runId, request_id: newRequestId() }).catch(() => {});
-  }
+  const run = activeRun;
+  if (!run) return Promise.resolve();
+  run.cancelRequested = true;
+  if (run.cancelPromise) return run.cancelPromise;
+  run.patch({ state: TurnState.CANCEL_PENDING, completedAt: null });
+  if (!run.id) return Promise.resolve();
+  const runId = run.id;
+  run.cancelPromise = modelRunCall("runs_cancel", { run_id: runId, request_id: newRequestId() })
+    .catch(() => {
+      if (activeRun === run) {
+        run.patch({ state: TurnState.SETTLEMENT_UNKNOWN, completedAt: null });
+      }
+    });
+  return run.cancelPromise;
 }
 
 /* Detach the UI from the in-flight run WITHOUT cancelling it. The model contract
@@ -277,8 +284,13 @@ export function abortLiveChatStream() {
    uses this so a long generation isn't killed; explicit Stop still uses
    abortLiveChatStream (runs_cancel). */
 export function detachLiveChatStream() {
+  activeRun?.patch({ state: TurnState.SETTLEMENT_UNKNOWN, completedAt: null });
   liveStreamEpoch += 1;
-  liveContractRunId = null;
+  activeRun = null;
+}
+
+export function unresolvedModelTurn(turn) {
+  return Boolean(turn?.providerRunId) && !turn.completedAt && ![TurnState.COMPLETED, TurnState.FAILED, TurnState.STOPPED].includes(turn.state);
 }
 
 export async function modelRunCall(op, body = {}) {
@@ -321,7 +333,7 @@ function newRequestId() {
  * Stream a chat turn through the typed model contract: runs_create on the
  * selected text offer, then runs_events cursor-poll by after_sequence.
  * onDelta({ reasoningDelta, contentDelta, done, seq }) is called as text_delta
- * events arrive; Stop = abortLiveChatStream() (fires runs_cancel).
+ * events arrive; Stop requests cancellation and keeps reading Runtime settlement.
  * Full strings are joined once after unlock — not on every poll.
  */
 export async function streamChatViaContract(
@@ -329,6 +341,7 @@ export async function streamChatViaContract(
   {
     onDelta,
     onAccepted,
+    onState,
     maxTokens = DEFAULT_LIVE_MAX_TOKENS,
     requestedEffort = "medium",
     contextManifest = null,
@@ -336,7 +349,8 @@ export async function streamChatViaContract(
     inputParts = [],
   } = {},
 ) {
-  abortLiveChatStream();
+  detachLiveChatStream();
+  const epoch = liveStreamEpoch;
   if (contextManifest) {
     assertProviderPayloadUnchanged(messages, contextManifest.providerPayloadHash);
   }
@@ -363,43 +377,60 @@ export async function streamChatViaContract(
       }),
     );
   turnStorePut(turn);
+  const patch = (fields) => {
+    const next = turnStorePatch(turn.turnId, fields) || turn;
+    onState?.(next);
+    return next;
+  };
+  const run = { id: null, patch, cancelRequested: false, cancelPromise: null };
+  activeRun = run;
   /* The typed text input has no sampling knobs; the offer's policy owns them.
      maxTokens shaped the context budget upstream and stays on the manifest. */
   void clampLiveMaxTokens(maxTokens);
   const offer = selectedLiveOffer();
-  if (!offer) {
+  if (!offer && !turn.providerRunId) {
+    activeRun = null;
     throw contractError("no_model_offers", "no text model offer on this Home");
   }
-  const created = await modelRunCall(
-    "runs_create",
-    textRunCreateBody({ offer, messages, requestId: newRequestId() }),
-  );
+  const resuming = Boolean(turn.providerRunId);
+  let created;
+  try {
+    created = resuming
+      ? await modelRunCall("runs_get", { run_id: turn.providerRunId, request_id: newRequestId() })
+      : await modelRunCall("runs_create", textRunCreateBody({ offer, messages, requestId: newRequestId() }));
+  } catch (error) {
+    if (activeRun === run) activeRun = null;
+    throw error;
+  }
   const runId = String(created?.run_id || "");
-  if (!runId) {
+  if (!runId || (resuming && runId !== turn.providerRunId)) {
+    if (activeRun === run) activeRun = null;
     throw contractError("no_run_id", "contract returned no run id");
   }
-  let afterSequence = Number.isInteger(Number(created?.sequence_cursor))
+  if (resuming && activeRun !== run) {
+    return { detached: true, turnManifest: turn };
+  }
+  let afterSequence = !resuming && Number.isInteger(Number(created?.sequence_cursor))
     ? Number(created.sequence_cursor)
     : 0;
-  liveContractRunId = runId;
-  turnStorePatch(turn.turnId, {
+  run.id = runId;
+  patch({
     providerRunId: runId,
     state: TurnState.SUBMITTED,
   });
-  turnStorePatch(turn.turnId, { state: TurnState.STREAMING });
-  onAccepted?.({ run_id: runId, turnId: turn.turnId });
+  patch({ state: activeRun === run ? TurnState.STREAMING : TurnState.SETTLEMENT_UNKNOWN, completedAt: null });
+  if (activeRun === run) onAccepted?.({ run_id: runId, turnId: turn.turnId });
+  if (run.cancelRequested && activeRun === run) void abortLiveChatStream();
 
-  const epoch = liveStreamEpoch;
   let seq = 0;
   let streamedChars = 0;
   const emit = (reasoningDelta, contentDelta, done = false) =>
     onDelta?.({ reasoningDelta, contentDelta, done, seq });
   const finish = (extra = {}) => {
-    const next =
-      turnStorePatch(turn.turnId, {
-        state: extra.aborted ? TurnState.STOPPED : TurnState.COMPLETED,
-        completedAt: Date.now(),
-      }) || turn;
+    const next = extra.detached ? turn : patch({
+      state: extra.settlementUnknown ? TurnState.SETTLEMENT_UNKNOWN : extra.aborted ? TurnState.STOPPED : TurnState.COMPLETED,
+      completedAt: Date.now(),
+    });
     return {
       usage: null,
       latencyMs: Date.now() - startedAt,
@@ -415,24 +446,24 @@ export async function streamChatViaContract(
 
   try {
     for (;;) {
-      if (epoch !== liveStreamEpoch || liveContractRunId !== runId) {
-        return finish({ aborted: true });
+      if (epoch !== liveStreamEpoch || activeRun !== run) {
+        return finish({ detached: true });
       }
       const page = await modelRunCall("runs_events", {
         run_id: runId,
         request_id: newRequestId(),
         after_sequence: afterSequence,
       });
-      if (epoch !== liveStreamEpoch || liveContractRunId !== runId) {
-        return finish({ aborted: true });
+      if (epoch !== liveStreamEpoch || activeRun !== run) {
+        return finish({ detached: true });
       }
       const applied = applyRunEventsPage(page, afterSequence);
       afterSequence = applied.nextCursor;
       let eventsInSlice = 0;
       let sliceStart = Date.now();
       for (const delta of applied.textDeltas) {
-        if (epoch !== liveStreamEpoch || liveContractRunId !== runId) {
-          return finish({ aborted: true });
+        if (epoch !== liveStreamEpoch || activeRun !== run) {
+          return finish({ detached: true });
         }
         seq += 1;
         streamedChars += delta.length;
@@ -444,7 +475,10 @@ export async function streamChatViaContract(
           sliceStart = Date.now();
         }
       }
-      const terminal = applied.terminal;
+      if (epoch !== liveStreamEpoch || activeRun !== run) {
+        return finish({ detached: true });
+      }
+      const terminal = applied.terminal || (!applied.hasMore && resuming ? created.terminal : null);
       if (terminal) {
         if (terminal.status === "completed") {
           /* A provider that did not stream settles with the whole text once. */
@@ -458,6 +492,10 @@ export async function streamChatViaContract(
         if (terminal.status === "cancelled") {
           return finish({ aborted: true });
         }
+        if (terminal.status === "settlement_unknown") {
+          return finish({ settlementUnknown: true });
+        }
+        patch({ state: TurnState.FAILED, completedAt: Date.now() });
         const detail = terminal.error && typeof terminal.error === "object" ? terminal.error : {};
         throw contractError(
           String(detail.code || terminal.status || "run_failed"),
@@ -470,8 +508,8 @@ export async function streamChatViaContract(
       await new Promise((resolve) => setTimeout(resolve, CONTRACT_POLL_MS));
     }
   } finally {
-    if (liveContractRunId === runId) {
-      liveContractRunId = null;
+    if (activeRun === run) {
+      activeRun = null;
     }
   }
 }

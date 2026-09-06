@@ -60,6 +60,10 @@ Open gates, in order:
    evidence on the exact candidate revision. The model and auth slices retain
    their reviewed history; combined focused tests and strict Clippy have local
    proof. Publication and remote CI need their own authorization and result.
+
+   - [ ] Refresh the journey register's MODEL-02 source note for the verified
+     Home Agent cancellation fix; preserve its installed verdict.
+
 2. [ ] Prove first-owner enrollment on a fresh isolated supported host: normal
    verified-loopback onboarding, one-use operator-admitted HTTPS origin/RP,
    typed denials, competing attempts and reload/restart recovery with one owner
@@ -67,13 +71,7 @@ Open gates, in order:
    Windows secure enrollment acceptance remains open. Same-principal linking
    is a separate follow-up, not a dependency of this source closeout.
 3. [ ] The Mac proof owner tests the exact reviewed candidate in the isolated
-   source Home. First correct Home Agent cancellation presentation: retain the
-   existing providerRunId, show pending or unknown settlement, and accept
-   terminal state only from Runtime. Current Stop clears stream ownership and
-   can persist Stopped even when runs_cancel fails. Add controller fixtures for
-   rejection, unknown settlement, late completion and reload without duplicate
-   dispatch; reuse runs_get/events/cancel and existing workspace fields.
-   Then run a fresh signed Qwen completion, explicitly cancel the
+   source Home. Run a fresh signed Qwen completion, explicitly cancel the
    selected run, verify backend stop or honest unknown settlement with one
    terminal result and no duplicate dispatch, and prove restart and cleanup.
    Managed-engine stream closure alone is not backend-stop proof.

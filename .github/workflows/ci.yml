@@ -49,6 +49,8 @@ jobs:
       - name: product UI source proofs
         run: |
           node scripts/home-shell-regression-smoke.mjs
+          node scripts/home-agent-shell-smoke.mjs
+          node --test scripts/home-agent-cancellation.test.mjs
           node scripts/people-discovery-smoke.mjs
       - name: Browser close handshake
         run: node --test scripts/browser-window-close-handshake.test.mjs

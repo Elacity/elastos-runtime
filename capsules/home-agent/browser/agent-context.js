@@ -153,6 +153,8 @@ export const TurnState = {
   READY: "ready",
   SUBMITTED: "submitted",
   STREAMING: "streaming",
+  CANCEL_PENDING: "cancel_pending",
+  SETTLEMENT_UNKNOWN: "settlement_unknown",
   STOPPED: "stopped",
   COMPLETED: "completed",
   FAILED: "failed",

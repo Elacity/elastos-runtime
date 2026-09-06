@@ -1059,8 +1059,7 @@ export function hideAgentHarness({ syncStage = true } = {}) {
   scheduleHarnessTeardown(motionGen);
 }
 export function stopAgentHarnessStream() {
-  stopAgentStream({ keepPartial: true, drainQueue: true });
-  setStreamStatus("");
+  return stopAgentStream({ keepPartial: true, drainQueue: true });
 }
 
 function compactUserParts(parts) {
@@ -1110,7 +1109,6 @@ export function sendToAgentHarness(prompt, opts = {}) {
   if (!modelText) {
     if (active) {
       stopAgentStream({ keepPartial: true });
-      turnBusy = false;
     }
     return;
   }
@@ -1587,7 +1585,7 @@ export function bindAgentHarness() {
     const sessionBtn = event.target.closest?.(".agent-harness-session-btn");
     if (sessionBtn) {
       event.preventDefault();
-      stopAgentStream({ keepPartial: true });
+      stopAgentStream({ keepPartial: true, cancelRun: false });
       activeSessionId = sessionBtn.closest(".agent-harness-session")?.dataset.sessionId || null;
       renderSessions();
       renderActiveSession();

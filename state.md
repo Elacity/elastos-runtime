@@ -503,13 +503,15 @@ complete. Installed proof and the atomic authority cutover remain open.
   operator assertion that upstream routing fallback is disabled. The API key,
   endpoint, headers, and topology stay private. Local Qwen offer and output
   JSON stay unchanged.
-- Home Agent cancellation has a verified source presentation gap: Stop clears
-  the live run identity and stream epoch, ignores cancellation-call errors, and
-  can persist Stopped before Runtime settles the run. Provider unknown-settlement
-  fixtures do not prove end-to-end cancellation. The existing persisted
-  providerRunId and runs_get/events/cancel path support the bounded follow-up;
-  cancellation rejection, unknown settlement and completion races need UI proof.
-  Installed cancellation acceptance remains open.
+- Home Agent source keeps cancellation pending until Runtime supplies an outcome.
+  Transport uncertainty retains `providerRunId` and offers Check status through
+  `runs_get/events`; navigation detaches without cancellation or a new dispatch.
+  Runtime-confirmed unknown settlement retains its completion time and permits a
+  new turn. Controller fixtures cover denial, unknown settlement, completion
+  races, stale polls, late acceptance and saved-workspace recovery. The Home Agent
+  shell and cancellation tests are included in the CI source step; local checks
+  pass. The workbook's MODEL-02 source-note refresh is pending. Installed
+  cancellation acceptance and remote CI proof remain open.
 - The provider-internal `open_ai_responses_text` source adapter and hosted
   cancellation correction are at commit `0d768415`, tree `96d45941`.
   The adapter posts only `model`,

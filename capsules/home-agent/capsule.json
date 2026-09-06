@@ -42,6 +42,15 @@
           "operation": "runs_create"
         },
         {
+          "id": "run.get",
+          "description": "Read a typed model run through Runtime authorization.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://model/*",
+          "operation": "runs_get"
+        },
+        {
           "id": "run.events",
           "description": "Read typed model run events through Runtime authorization.",
           "risk": "read",
