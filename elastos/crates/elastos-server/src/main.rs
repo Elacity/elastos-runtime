@@ -1096,6 +1096,15 @@ enum ConfigCommand {
 pub(crate) enum IdentityCommand {
     /// Show the current DID-backed local profile
     Show,
+    /// Admit one first-owner passkey at an exact public HTTPS Home origin
+    ArmOwner {
+        #[arg(long)]
+        origin: String,
+        #[arg(long)]
+        rp_id: String,
+        #[arg(long, default_value_t = 300)]
+        expires_in: u64,
+    },
     /// Manage the profile nickname
     #[command(subcommand)]
     Nickname(IdentityNicknameCommand),

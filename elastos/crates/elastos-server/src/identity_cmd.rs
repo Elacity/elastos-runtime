@@ -13,6 +13,23 @@ pub(crate) struct IdentityProfile {
 
 pub async fn run_identity(cmd: crate::IdentityCommand) -> anyhow::Result<()> {
     match cmd {
+        crate::IdentityCommand::ArmOwner {
+            origin,
+            rp_id,
+            expires_in,
+        } => {
+            if !io::stdout().is_terminal() {
+                anyhow::bail!("owner enrollment requires a local operator terminal");
+            }
+            let secret = elastos_server::auth::arm_owner_enrollment(
+                &default_data_dir(),
+                &origin,
+                &rp_id,
+                expires_in,
+            )?;
+            println!("Enter this one-use token in Home's owner setup field. It expires in {expires_in} seconds:");
+            println!("{}", secret.as_str());
+        }
         crate::IdentityCommand::Show => {
             let profile = load_identity_profile(&default_data_dir()).await?;
             print_identity_profile(&profile)?;

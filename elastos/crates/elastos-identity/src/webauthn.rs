@@ -49,6 +49,16 @@ pub struct RegistrationOutcome {
     pub user_verified: bool,
 }
 
+/// Verified public credential facts. Runtime must durably bind these to its
+/// admitted enrollment operation before asking identity persistence to recover.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationCandidate {
+    pub credential: StoredCredential,
+    pub origin: String,
+    pub user_verified: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthenticationOutcome {
     pub user_id: String,
@@ -137,7 +147,7 @@ pub struct PublicKeyCredentialRequestOptions {
 }
 
 /// Browser → Server: registration response
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RegistrationResponse {
     #[serde(rename = "id")]
@@ -149,7 +159,7 @@ pub struct RegistrationResponse {
     pub _type: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthenticatorAttestationResponse {
     pub client_data_json: String,   // base64url
@@ -186,6 +196,9 @@ struct CollectedClientData {
     type_: String,
     challenge: String,
     origin: String,
+    #[serde(default)]
+    cross_origin: bool,
+    top_origin: Option<String>,
 }
 
 /// Manages WebAuthn registration and authentication
@@ -226,6 +239,23 @@ impl IdentityManager {
     /// List stored passkey credentials without exposing private key material.
     pub fn credentials(&self) -> Vec<StoredCredential> {
         self.store.get_credentials()
+    }
+
+    pub fn reload_credentials(&mut self) -> anyhow::Result<()> {
+        self.store.load()
+    }
+
+    pub fn has_credential_history(&self) -> bool {
+        self.store.data().is_some()
+    }
+
+    /// Only Runtime's durable first-owner operation may call this after verifying
+    /// its own claimant, candidate and ownership history under the auth lock.
+    pub fn persist_enrollment_candidate(
+        &mut self,
+        candidate: &RegistrationCandidate,
+    ) -> anyhow::Result<String> {
+        self.store.persist_first_owner(&candidate.credential)
     }
 
     /// Revoke one passkey credential from the local identity store.
@@ -378,9 +408,45 @@ impl IdentityManager {
             anyhow::bail!("Registration ceremony RP or origin mismatch");
         }
 
+        let candidate = Self::verify_registration_candidate(
+            response,
+            &saved_rp_id,
+            &saved_origin,
+            &URL_SAFE_NO_PAD.encode(pending.challenge),
+        )?;
+        let user_id = self.store.add_credential(candidate.credential.clone());
+        self.store.save()?;
+        Ok(RegistrationOutcome {
+            user_id,
+            credential: candidate.credential,
+            origin: candidate.origin,
+            user_verified: candidate.user_verified,
+        })
+    }
+
+    /// Verify a Runtime-bound challenge without mutating credential persistence.
+    pub fn verify_registration_candidate(
+        response: &RegistrationResponse,
+        rp_id: &str,
+        rp_origin: &str,
+        challenge: &str,
+    ) -> anyhow::Result<RegistrationCandidate> {
+        if response.response.client_data_json.len() > 4096
+            || response.response.attestation_object.len() > 32768
+        {
+            anyhow::bail!("Registration response exceeds limit");
+        }
+        let saved_rp_id = rp_id.to_string();
+        let saved_origin = rp_origin.to_string();
+
         // Decode and verify client data
         let client_data_bytes = URL_SAFE_NO_PAD.decode(&response.response.client_data_json)?;
         let client_data: CollectedClientData = serde_json::from_slice(&client_data_bytes)?;
+
+        // Top-level Home owns registration. Embedded ceremonies are not admitted.
+        if client_data.cross_origin || client_data.top_origin.is_some() {
+            anyhow::bail!("Registration requires top-level Home");
+        }
 
         if client_data.type_ != "webauthn.create" {
             anyhow::bail!("Invalid client data type: {}", client_data.type_);
@@ -388,7 +454,7 @@ impl IdentityManager {
 
         // Verify challenge matches
         let received_challenge = URL_SAFE_NO_PAD.decode(&client_data.challenge)?;
-        if received_challenge != pending.challenge {
+        if received_challenge != URL_SAFE_NO_PAD.decode(challenge)? {
             anyhow::bail!("Challenge mismatch");
         }
 
@@ -411,7 +477,7 @@ impl IdentityManager {
         let auth_data_bytes = extract_cbor_bytes(&att_obj, "authData")?;
 
         // Parse authenticator data
-        if auth_data_bytes.len() < 37 {
+        if auth_data_bytes.len() < 55 {
             anyhow::bail!("AuthData too short");
         }
 
@@ -439,8 +505,14 @@ impl IdentityManager {
         // AAGUID (16 bytes) + credential ID length (2 bytes) + credential ID + COSE key
         let _aaguid = &auth_data_bytes[37..53];
         let cred_id_len = u16::from_be_bytes([auth_data_bytes[53], auth_data_bytes[54]]) as usize;
+        if cred_id_len == 0 || cred_id_len > 1024 || auth_data_bytes.len() <= 55 + cred_id_len {
+            anyhow::bail!("Invalid attested credential length");
+        }
         let cred_id = &auth_data_bytes[55..55 + cred_id_len];
         let cose_key_bytes = &auth_data_bytes[55 + cred_id_len..];
+        if cose_key_bytes.len() > 4096 {
+            anyhow::bail!("Credential key exceeds limit");
+        }
 
         let credential_id = URL_SAFE_NO_PAD.encode(cred_id);
         let public_key = URL_SAFE_NO_PAD.encode(cose_key_bytes);
@@ -455,11 +527,7 @@ impl IdentityManager {
             rp_id: saved_rp_id,
         };
 
-        let user_id = self.store.add_credential(stored.clone());
-        self.store.save()?;
-
-        Ok(RegistrationOutcome {
-            user_id,
+        Ok(RegistrationCandidate {
             credential: stored,
             origin: client_data.origin,
             user_verified: true,
@@ -948,6 +1016,40 @@ mod tests {
                 ),
                 attestation_object: URL_SAFE_NO_PAD.encode(attestation),
             },
+        }
+    }
+
+    #[test]
+    fn owner_registration_rejects_cross_origin_and_top_origin() {
+        for fields in [
+            serde_json::json!({"crossOrigin": true}),
+            serde_json::json!({"crossOrigin": false, "topOrigin": "https://home.example"}),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
+            let options = manager
+                .begin_principal_registration("owner", "home.example", "https://home.example")
+                .unwrap();
+            let mut response = registration_response(
+                &options.public_key.challenge,
+                "home.example",
+                "https://home.example",
+            );
+            let mut client: serde_json::Value = serde_json::from_slice(
+                &URL_SAFE_NO_PAD
+                    .decode(&response.response.client_data_json)
+                    .unwrap(),
+            )
+            .unwrap();
+            for (key, value) in fields.as_object().unwrap() {
+                client[key] = value.clone();
+            }
+            response.response.client_data_json =
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&client).unwrap());
+            assert!(manager
+                .complete_registration("owner", &response, "home.example", "https://home.example")
+                .is_err());
+            assert!(!manager.status().registered);
         }
     }
 

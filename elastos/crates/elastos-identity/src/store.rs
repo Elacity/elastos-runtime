@@ -429,6 +429,38 @@ impl IdentityStore {
         Ok(())
     }
 
+    /// Reconcile only a first-owner candidate bound by Runtime's durable owner.
+    pub(crate) fn persist_first_owner(
+        &mut self,
+        candidate: &StoredCredential,
+    ) -> anyhow::Result<String> {
+        let files = self.files()?;
+        let result = (|| {
+            self.reload_locked(&files)?;
+            if let Some(data) = &self.data {
+                let [existing] = data.credentials.as_slice() else {
+                    anyhow::bail!("Enrollment credential history conflicts");
+                };
+                if existing.credential_id != candidate.credential_id
+                    || existing.public_key != candidate.public_key
+                    || existing.rp_id != candidate.rp_id
+                    || existing.sign_count < candidate.sign_count
+                {
+                    anyhow::bail!("Enrollment credential conflicts");
+                }
+                files.sync()?;
+                return Ok(data.user_id.clone());
+            }
+            let user_id = self.add_credential(candidate.clone());
+            self.save_locked(&files)?;
+            Ok(user_id)
+        })();
+        if result.is_err() {
+            let _ = self.reload_locked(&files);
+        }
+        result
+    }
+
     /// Return the device key as a hex string (for passing to providers).
     pub fn device_key_hex(&self) -> String {
         hex::encode(self.device_key.as_ref())
