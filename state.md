@@ -342,7 +342,26 @@ complete. Installed proof and the atomic authority cutover remain open.
   after response loss or reload, preserving the saved name and one terminal
   grant. Source tests cover both routes, competing claimants, persistence
   boundaries, expired grants, counters and revoked credentials. Home's reload
-  fixture passes. Installed operator/passkey and recovery proof remain open.
+  fixture passes. Installed operator-admitted HTTPS and recovery proof remain open.
+- A fresh isolated macOS owner Home has a strict-start receipt for `8e6d298d`,
+  tree `c7a24314`, and serves Home with HTTP 200. Its verified artifact set
+  contains 132,141,405 bytes; existing identity, configuration and user data
+  were excluded. Before enrollment, an unarmed public origin returned HTTP 403
+  and malformed completion returned HTTP 422. Those checks preserved AuthState
+  bytes, with registration, pending owner setup and guest registration all false.
+  The user then completed Touch ID enrollment. Read-only installed records show
+  one Admin principal, one existing user root, one owner-enrolled event, one
+  consumed owner operation and one matching active terminal grant. The user
+  deferred Recovery Kit setup; root protection and completed bundle-export
+  records remain absent. An existing-install restart preserved owner, grant,
+  credential, user-file and artifact hashes and returned HTTP 200. The upgrade
+  reported zero roots and objects; it created no device-only protection. The
+  old gateway and its direct providers exited. A healthy Home-managed service
+  remains intentionally available with matching binary, policy and dependency
+  fingerprints under the existing reuse contract. This is gateway cleanup,
+  not an all-descendants-reaped claim. Recovery Kit, human reload and
+  operator-admitted HTTPS acceptance remain open; session lifetime stays
+  subject to Runtime policy.
 - Same-principal multi-passkey linking is separate follow-up work. Current
   auth records store role, root and name per proof binding, and counts count
   binding records. Canonical account ownership with separately revocable
@@ -518,11 +537,13 @@ complete. Installed proof and the atomic authority cutover remain open.
   so post-send errors do not prove refusal. Without a run ID, Home Agent blocks
   implicit resend and offers New chat rather than replay or Check status.
   The existing scheduled workspace save preserves this state once written;
-  survival before that save completes is unproved. Only an accepted submission clears its unchanged draft
-  content. The Home Agent shell and cancellation tests are included in the CI
-  source step; local checks pass. The workbook's MODEL-02
-  source-note refresh remains pending. Installed cancellation acceptance and
-  remote CI proof remain open.
+  survival before that save completes is unproved. The composer clears copied text
+  after Agent accepts it into the conversation or queue. An already-unresolved
+  turn preserves unsent drafts; Runtime create acceptance is a separate tracked
+  outcome. The Home Agent shell and cancellation tests are included in the CI
+  source step; local checks pass. The workbook's MODEL-02 source note records
+  this coverage while preserving its installed verdict. Installed interaction
+  acceptance and remote CI proof remain open.
 - The isolated installed Home reported a missing saved run as journal corruption;
   its exact deletion cause is unproved. Provider source returns `run_not_found`
   for a missing requested record in an intact private journal directory, including
@@ -596,10 +617,11 @@ complete. Installed proof and the atomic authority cutover remain open.
   cleanup after a provider hard kill. The installed direct and Runtime proofs
   also observed zero owned engine or guard residue after their shutdown and
   restart cases.
-- Installed artifact parity is proved for candidate `6c6c2fab`, tree `d53da807`,
-  in the existing isolated macOS model Home. Only model-provider was rebuilt
-  for missing-run lookup; three Home Agent scripts carry the draft-handling
-  correction. Runtime and the other providers retain their verified `e496fe06`,
+- Installed artifact parity is proved for candidate `8e6d298d`, tree `c7a24314`,
+  in the existing isolated macOS model Home. Five Home Agent scripts carry the
+  lost-create-acceptance correction. All thirty installed binaries retain their
+  prior hashes; model-provider includes the earlier missing-run correction.
+  Runtime and the other providers retain their verified `e496fe06`,
   tree `426a87d0`, build provenance. Model installed-provider verification passes;
   fourteen other provider binaries retain their captured hashes. Built and
   installed artifacts match at
@@ -607,18 +629,15 @@ complete. Installed proof and the atomic authority cutover remain open.
   `087c3d5d884fdeb519b71cbdc6d8952332222e8788e118cf9c6ede3bdd6f28cd` and
   model-provider SHA-256
   `af51cf994edf69618b17338650fe10882f2cb09fc6dadf7b18f9456c7d8be70c`.
-  Eighty Home/Home Agent assets match source, installation and manifest;
-  all three changed scripts also match served bytes. Strict restart and
-  receipt/HTTP 200 checks passed on 2026-09-07. The principal-root upgrade returned
-  `already_ready` with zero migrated roots or objects.
-- During the Model/Agent update, device identity/TLS, private configuration, model
-  weights, migration-backup files, AuthState and all three protected user objects
+  The five changed scripts match source, installation, manifest and served bytes.
+  Strict restart and receipt/HTTP 200 checks passed on 2026-09-07.
+- During the Agent update, device identity/TLS, private configuration, model
+  weights, migration-backup files and all three protected user objects
   retained their captured hashes, sizes, modes and ownership. Separate passkey
   material, the downloaded Recovery Kit and live journals remain outside this
-  byte-parity claim. An earlier independent read-only account check matches the
-  previously observed Admin record; fresh sign-in and model behavior acceptance
-  remain open.
-- On the corrected installation, the user and an independent accessibility
+  byte-parity claim. Principal, proof, role and protected-root records match the
+  pre-update semantic snapshot; sessions and audit records are volatile.
+- On installed `6c6c2fab`, the user and an independent accessibility
   read observed a complete Qwen reply; the UI reported 14.1 seconds and 55
   tokens. Its journal record was no longer present at metadata inspection.
   Stop on a separate explicit run produced one dispatched journal event and
@@ -626,8 +645,10 @@ complete. Installed proof and the atomic authority cutover remain open.
   in 111.2 seconds, within the 120-second limit, with 4,809 output characters,
   one terminal output event and no error. The journals support those two
   distinct run outcomes. Honest unknown settlement is an allowed cancellation
-  outcome; actual backend stop was unobserved. Installed draft preservation,
-  visual reload recovery, restart and cleanup acceptance remain open.
+  outcome; actual backend stop was unobserved. A subsequent restart reaped the
+  owned provider, engine and guard processes and pruned an already-expired
+  terminal record. Unexpired result retention, installed draft preservation,
+  lost-create-acceptance interaction and visual reload recovery remain open.
 - The reviewed receipt convergence, end-to-end deadline, and hosted URL
   redaction corrections are complete in source and have fresh installed
   artifact parity proof.

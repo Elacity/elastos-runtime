@@ -70,10 +70,12 @@ Open gates, in order:
    navigation and Terminal tests. Add Browser media only when the target
    supplies accepted evidence. Finish with hash-bound receipts for the exact
    tree; functional run evidence and artifact parity remain separate.
-2. [ ] Prove first-owner enrollment on a fresh isolated supported host: normal
-   verified-loopback onboarding, one-use operator-admitted HTTPS origin/RP,
-   typed denials, competing attempts and reload/restart recovery with one owner
-   and one terminal grant. Preserve existing accounts and recovery material.
+2. [ ] Complete first-owner acceptance on the isolated host: verify Recovery Kit
+   export (deferred by the user), one-use operator-admitted HTTPS origin/RP,
+   typed denials, competing attempts and human reload/recovery behavior.
+   Verified loopback Touch ID enrollment and existing-install restart parity
+   with one owner and one terminal grant are recorded in [state.md](state.md).
+   Preserve existing accounts and recovery material.
    Windows secure enrollment acceptance remains open. Same-principal linking
    is a separate follow-up, not a dependency of this source closeout.
 3. [ ] After the first two gates, the release integrator may publish the
@@ -98,9 +100,6 @@ Open gates, in order:
    Finish with the reviewed rollout and an explicit release decision. The full
    contract and acceptance details are in
    [docs/PROTECTED_CONTENT.md](docs/PROTECTED_CONTENT.md).
-
-- [ ] Refresh the journey register's MODEL-02 cancellation source note;
-  preserve the installed verdict.
 
 The next delivery milestone after this closeout is the CID-installed Qwen slice
 under [Content distribution and Windows](#content-distribution-and-windows).
