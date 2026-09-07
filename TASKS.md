@@ -33,11 +33,12 @@ The role matrix and current protocol are in
 installed artifact admission, viewer capability checks, approved remote-service
 selection, and hash-bound device-role proof. The inspected Mac's existing VM
 image failed its manifest hash check; repair or rebuild and verify the image
-before using it for qualification. Linux KVM/Jetson and remote Runtime fixtures
+or reconcile its artifact provenance before qualification. Direct file and
+script inspection passed. Linux KVM/Jetson and remote Runtime fixtures
 are still needed. Preserve the existing journey verdicts until those runs pass.
-The Browser settings refresh also clears a selected Engine or Exit when its
-offer is absent. Retain that explicit selection as unavailable until the
-operator changes it, so a transient discovery failure preserves service intent.
+Browser settings now retain an explicit Engine or Exit selection when its
+offer is absent. Installed verification must cover a service disappearing and
+returning, followed by an explicit operator switch to another service.
 
 - [ ] [B01: One Browser contract and an explicit support matrix](docs/BROWSER_ACCEPTANCE.md#b01).
 - [ ] [B02: A fresh installation opens a usable Browser](docs/BROWSER_ACCEPTANCE.md#b02).

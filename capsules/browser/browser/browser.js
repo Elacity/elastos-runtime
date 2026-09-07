@@ -26,8 +26,9 @@ import {
   isAuthoritySessionError,
   isMissingRuntimePageError,
   requestedDisplayMode,
-} from "./browser-status.js?v=browser-20260730b";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260731a";
+} from "./browser-status.js?v=browser-20260907a";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260907a";
+import { renderServiceSelection } from "./browser-service-selection.js?v=browser-20260907a";
 
 const STATUS_TTL_MS = 4200;
 const PAGE_STATUS_INTERVAL_MS = 2_500;
@@ -46,7 +47,7 @@ const GUARANTEE_POLICY_WEBVIEW = "policy_webview";
 const LOCAL_EXIT_LABEL = "This device";
 const LOCAL_EXIT_SUMMARY = "Use this device's Exit Node for Browser traffic.";
 const DEFAULT_ENGINE_LABEL = "Automatic";
-const DEFAULT_ENGINE_SUMMARY = "Use the best Browser Engine available.";
+const DEFAULT_ENGINE_SUMMARY = "Runtime chooses a compatible Browser Engine.";
 const BROWSER_WINDOW_CLOSE_REQUEST_TYPE =
   "elastos.browser.window-close.request/v1";
 const BROWSER_WINDOW_CLOSE_RESULT_TYPE =
@@ -1527,11 +1528,6 @@ function selectedBrowserEngine(summary = browserSummary) {
   return visibleBrowserEngines(summary).find((engine) => engine.id === selectedBrowserEngineId) || null;
 }
 
-function defaultBrowserEngine(summary = browserSummary) {
-  const engines = visibleBrowserEngines(summary);
-  return engines.find((engine) => engine.default === true) || engines[0] || null;
-}
-
 function browserEngineKindLabel(engine) {
   const substrate = String(engine?.backing_substrate || "").toLowerCase();
   if (substrate === "remote_operator_vm") {
@@ -1567,10 +1563,7 @@ function browserEngineKindLabel(engine) {
 
 function browserEngineLabel(adapterId = selectedBrowserEngineId) {
   if (!adapterId) {
-    const engine = defaultBrowserEngine();
-    return engine
-      ? `${DEFAULT_ENGINE_LABEL} (${browserEngineKindLabel(engine)})`
-      : DEFAULT_ENGINE_LABEL;
+    return DEFAULT_ENGINE_LABEL;
   }
   const engine = visibleBrowserEngines(browserSummary).find(
     (candidate) => candidate.id === adapterId,
@@ -1580,10 +1573,7 @@ function browserEngineLabel(adapterId = selectedBrowserEngineId) {
 
 function browserEngineSummary(engine) {
   if (!engine) {
-    const defaultEngine = defaultBrowserEngine();
-    return defaultEngine
-      ? `${browserEngineLabel("")}. Browser will use this engine unless you choose another one.`
-      : DEFAULT_ENGINE_SUMMARY;
+    return DEFAULT_ENGINE_SUMMARY;
   }
   return `${browserEngineLabel(engine.id)}. Runs the page in an isolated Browser Engine; network access uses the selected Exit Node.`;
 }
@@ -1632,18 +1622,17 @@ function syncExitSelect(summary) {
     return;
   }
   const exits = visibleRemoteCarrierExits(summary);
-  const previous = selectedRemoteExitId;
-  exitSelect.replaceChildren(new Option(LOCAL_EXIT_LABEL, ""));
-  for (const exit of exits) {
-    exitSelect.add(new Option(remoteCarrierExitLabel(exit), exit.id));
-  }
-  selectedRemoteExitId = exits.some((exit) => exit.id === previous)
-    ? previous
-    : "";
-  exitSelect.value = selectedRemoteExitId;
-  const selectedExit = exits.find((exit) => exit.id === selectedRemoteExitId);
+  const selectedExit = renderServiceSelection(exitSelect, {
+    services: exits,
+    selectedId: selectedRemoteExitId,
+    defaultLabel: LOCAL_EXIT_LABEL,
+    labelForService: remoteCarrierExitLabel,
+    unavailableLabel: "Selected Exit Node (unavailable)",
+  });
   const summaryText = selectedExit
     ? remoteCarrierExitSummary(selectedExit)
+    : selectedRemoteExitId
+    ? "Your selected Exit Node is unavailable. Choose another Exit Node to change where Browser traffic exits."
     : LOCAL_EXIT_SUMMARY;
   if (exitSummaryNode) {
     exitSummaryNode.textContent = summaryText;
@@ -1656,23 +1645,17 @@ function syncEngineSelect(summary) {
     return;
   }
   const engines = visibleBrowserEngines(summary);
-  const previous = selectedBrowserEngineId;
-  const defaultEngine = defaultBrowserEngine(summary);
-  engineSelect.replaceChildren(new Option(
-    defaultEngine
-      ? `${DEFAULT_ENGINE_LABEL} (${browserEngineKindLabel(defaultEngine)})`
-      : DEFAULT_ENGINE_LABEL,
-    "",
-  ));
-  for (const engine of engines) {
-    engineSelect.add(new Option(`${browserEngineKindLabel(engine)}: ${engine.id}`, engine.id));
-  }
-  selectedBrowserEngineId = engines.some((engine) => engine.id === previous)
-    ? previous
-    : "";
-  engineSelect.value = selectedBrowserEngineId;
+  const selectedEngine = renderServiceSelection(engineSelect, {
+    services: engines,
+    selectedId: selectedBrowserEngineId,
+    defaultLabel: DEFAULT_ENGINE_LABEL,
+    labelForService: (engine) => `${browserEngineKindLabel(engine)}: ${engine.id}`,
+    unavailableLabel: "Selected Browser Engine (unavailable)",
+  });
   if (engineSummaryNode) {
-    engineSummaryNode.textContent = browserEngineSummary(selectedBrowserEngine(summary));
+    engineSummaryNode.textContent = selectedBrowserEngineId && !selectedEngine
+      ? "Your selected Browser Engine is unavailable. Choose another Engine to change where the page runs."
+      : browserEngineSummary(selectedEngine);
   }
   updateSettingsTitle();
 }

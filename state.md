@@ -76,6 +76,8 @@ qualification matrix is in [docs/BROWSER_SUPPORT.md](docs/BROWSER_SUPPORT.md).
 The initial compatibility slice shares Engine protocol and request types,
 validates declared Engine capabilities before launch, and preserves explicit
 operator selection. Installed acceptance of this slice remains open.
+Browser settings retain a missing selected Engine or Exit as unavailable until
+the operator changes it. Automatic Engine selection remains with Runtime.
 Mac and Linux host adapters now query their virtualization APIs for eligibility.
 The Mac unit check ran locally; the Linux-specific KVM query still needs a
 Linux test run.
@@ -95,7 +97,9 @@ Browser maturity changes. Existing installed observations retain their original
 source bindings and verdicts.
 
 The existing Mac VM artifact preflight rejected the image because its SHA-256
-differs from the sidecar manifest. The active test Home also lacks the required
+differs from the sidecar manifest. Direct read-only inspection with `debugfs`
+passed the VM file and script contract; that result leaves the stale artifact
+receipt unresolved. The active test Home also lacks the required
 VM helper and image set. Neither installation supplies a current B01 product
 acceptance receipt. This identifies local repair work; it does not establish
 the cause of another operator's startup failure.
