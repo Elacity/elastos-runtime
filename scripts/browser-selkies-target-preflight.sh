@@ -6,6 +6,7 @@ out_dir=""
 control_socket=""
 selkies_ws_url=""
 browser_cdp_endpoint=""
+runtime_fetch_proxy_url=""
 supervisor_program="$repo_root/scripts/browser-hosted-product-supervisor.mjs"
 timeout_ms="30000"
 selkies_basic_auth_user=""
@@ -22,7 +23,8 @@ Usage:
     --out-dir /tmp/elastos-browser-product \\
     --control-socket /tmp/elastos-browser-product/selkies-control.sock \\
     --selkies-ws-url ws://127.0.0.1:8081/ws \\
-    --browser-cdp-endpoint http://127.0.0.1:9222
+    --browser-cdp-endpoint http://127.0.0.1:9222 \\
+    --runtime-fetch-proxy-url http://127.0.0.1:19090
 
 Optional:
   --selkies-basic-auth-user ubuntu \\
@@ -62,6 +64,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --browser-cdp-endpoint)
       browser_cdp_endpoint="${2:-}"
+      shift 2
+      ;;
+    --runtime-fetch-proxy-url)
+      runtime_fetch_proxy_url="${2:-}"
       shift 2
       ;;
     --selkies-basic-auth-user)
@@ -104,7 +110,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$out_dir" || -z "$control_socket" || -z "$selkies_ws_url" || -z "$browser_cdp_endpoint" ]]; then
+if [[ -z "$out_dir" || -z "$control_socket" || -z "$selkies_ws_url" || -z "$browser_cdp_endpoint" || -z "$runtime_fetch_proxy_url" ]]; then
+  echo "online target preflight requires --runtime-fetch-proxy-url and the target endpoints" >&2
   usage >&2
   exit 2
 fi
@@ -138,7 +145,7 @@ rm -f "$control_socket"
 
 ice_servers_json="$(node -e 'console.log(JSON.stringify(process.argv.slice(1)))' "${ice_servers[@]}")"
 control_config="$(node -e '
-const [controlSocket, selkiesWsUrl, browserCdpEndpoint, timeoutRaw, basicAuthUser, basicAuthPassword, iceServersRaw, iceUsername, iceCredential] = process.argv.slice(1);
+const [controlSocket, selkiesWsUrl, browserCdpEndpoint, timeoutRaw, basicAuthUser, basicAuthPassword, iceServersRaw, iceUsername, iceCredential, runtimeFetchProxyUrl] = process.argv.slice(1);
 const ws = new URL(selkiesWsUrl);
 if (!["ws:", "wss:"].includes(ws.protocol)) throw new Error("--selkies-ws-url must use ws or wss");
 const cdp = new URL(browserCdpEndpoint);
@@ -164,6 +171,8 @@ const config = {
   control_socket_path: controlSocket,
   replace_existing_socket: true,
   selkies_ws_url: selkiesWsUrl,
+  // The control service owns validation of this existing proxy field.
+  runtime_fetch_proxy_url: runtimeFetchProxyUrl,
   browser_control: {
     kind: "cdp_http",
     endpoint: browserCdpEndpoint,
@@ -190,7 +199,7 @@ if (iceUrls.length > 0) {
   config.ice_servers = [iceServer];
 }
 console.log(JSON.stringify(config));
-' "$control_socket" "$selkies_ws_url" "$browser_cdp_endpoint" "$timeout_ms" "$selkies_basic_auth_user" "$selkies_basic_auth_password" "$ice_servers_json" "$ice_username" "$ice_credential")"
+' "$control_socket" "$selkies_ws_url" "$browser_cdp_endpoint" "$timeout_ms" "$selkies_basic_auth_user" "$selkies_basic_auth_password" "$ice_servers_json" "$ice_username" "$ice_credential" "$runtime_fetch_proxy_url")"
 
 ELASTOS_BROWSER_SELKIES_CONTROL_CONFIG="$control_config" \
   "$repo_root/scripts/browser-selkies-control-service.mjs" >"$out_dir/selkies-control.log" 2>&1 &
