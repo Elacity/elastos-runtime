@@ -23,8 +23,10 @@ const HEADLESS = process.env.HOME_VIRTUAL_AUTH_HEADED !== "1";
 const PRESERVE_PROFILE = process.env.HOME_VIRTUAL_AUTH_PRESERVE_PROFILE === "1";
 const CLEANUP_PASSKEY = process.env.HOME_VIRTUAL_AUTH_CLEANUP !== "0";
 const INCLUDE_BROWSER = process.env.HOME_VIRTUAL_AUTH_BROWSER === "1";
+const CHECK_BROWSER_VIEWER_PREFLIGHT = process.env.HOME_VIRTUAL_AUTH_BROWSER_VIEWER_PREFLIGHT === "1";
 const CHECK_APP_MATRIX = process.env.HOME_VIRTUAL_AUTH_APP_MATRIX === "1";
 const CHECK_SHELL_SWITCH = process.env.HOME_VIRTUAL_AUTH_SHELL_SWITCH !== "0";
+const CHECK_SYSTEM = process.env.HOME_VIRTUAL_AUTH_SYSTEM !== "0";
 const CHECK_BROWSER_SUMMARY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_SUMMARY === "1" ||
   process.env.HOME_VIRTUAL_AUTH_BROWSER_OPEN === "1";
@@ -2443,9 +2445,9 @@ async function createPasskeyFromCurrentUnlock(page, mode) {
   await name.waitFor({ state: "visible", timeout: 10_000 });
   await name.fill(TEST_NAME);
   const tokenPromise = captureNextPasskeyToken(page);
-  await page.locator("#home-unlock-primary").click();
-  await waitForSignedHome(page);
-  return { mode, homeToken: await tokenPromise };
+  const signingIn = page.locator("#home-unlock-primary").click().then(() => waitForSignedHome(page));
+  const [homeToken] = await Promise.all([tokenPromise, signingIn]);
+  return { mode, homeToken };
 }
 
 async function ensureSignedWithVirtualPasskey(page) {
@@ -2660,10 +2662,23 @@ async function openDesktopAppWindow(page, target) {
   await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
   await waitForSignedHome(page);
   const homeGuiFrame = await waitForCapsuleFrame(page, "home-gui");
-  await homeGuiFrame.locator("#launcher-toggle").click();
-  const card = homeGuiFrame.locator(`#launcher-grid [data-target="${target}"]`).first();
-  await card.waitFor({ state: "visible", timeout: 10_000 });
-  await card.click();
+  const setupLater = homeGuiFrame.getByRole("button", { name: "Later", exact: true });
+  const setupVisible = await setupLater.waitFor({ state: "visible", timeout: 5_000 }).then(
+    () => true,
+    (error) => { if (error.name === "TimeoutError") return false; throw error; },
+  );
+  if (setupVisible) {
+    await setupLater.click();
+  }
+  const shelfItem = homeGuiFrame.locator(`#taskbar-targets [data-target="${target}"]`).first();
+  if (await shelfItem.isVisible()) {
+    await shelfItem.click();
+  } else {
+    await homeGuiFrame.locator("#launcher-toggle").click();
+    const card = homeGuiFrame.locator(`#launcher-grid [data-target="${target}"]`).first();
+    await card.waitFor({ state: "visible", timeout: 10_000 });
+    await card.click();
+  }
   // The desktop restores persisted windows at boot and restore can steal
   // focus from the window the launcher just opened, so bind to the newest
   // window for the target rather than whichever one holds the active class.
@@ -3097,8 +3112,52 @@ async function typeHomeCliText(frame, text) {
   await textarea.pressSequentially(text);
 }
 
+async function checkBrowserViewerPreflight(page) {
+  let openRequests = 0;
+  const observeOpen = (request) => {
+    if (request.method() === "POST" && new URL(request.url()).pathname === "/api/apps/browser/open") {
+      openRequests += 1;
+    }
+  };
+  page.on("request", observeOpen);
+  try {
+    await page.addInitScript(() => {
+      Object.defineProperty(window, "RTCPeerConnection", { value: undefined, configurable: true });
+    });
+    const appFrame = await openDesktopAppWindow(page, "browser");
+    const browserToken = assertIsolatedLaunchRoute(appFrame.url(), "browser");
+    const message = "This browser cannot show the Browser session. Use a supported browser or enable WebRTC.";
+    await appFrame.getByText(message, { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
+    assert(openRequests === 0, "Unsupported viewer dispatched an Engine open", { openRequests });
+    const summary = await browserApi(appFrame, browserToken, "/api/apps/browser/summary");
+    assert(summary.ok, "Viewer preflight summary failed", summary);
+    assert(
+      summary.body?.sessions?.schema === "elastos.browser.session-capacity/v1" &&
+        summary.body.sessions.principal_sessions === 0,
+      "Fresh viewer preflight fixture retained Runtime sessions",
+      summary.body?.sessions,
+    );
+    const gui = await homeGuiFrameForPage(page);
+    const window = gui.locator('section.window[data-target="browser"]').last();
+    await window.getByRole("button", { name: "Close", exact: true }).click();
+    await window.waitFor({ state: "hidden", timeout: 30_000 });
+    return {
+      target: "browser",
+      viewer_preflight: { unsupported_viewer_reported: true, open_requests: openRequests, principal_sessions: 0, window_closed: true },
+      browser_summary: { sessions: summary.body.sessions, engine_adapter: summary.body.engine_adapter },
+    };
+  } finally {
+    page.off("request", observeOpen);
+  }
+}
+
 async function checkBrowserLaunchGrant(page, homeToken) {
   assert(homeToken, "checkBrowserLaunchGrant requires a passkey-issued Home token");
+  if (CHECK_BROWSER_VIEWER_PREFLIGHT) {
+    assert(!OPEN_BROWSER && !CHECK_BROWSER_UI_SETUP && !CHECK_BROWSER_UI_INPUT && !CHECK_BROWSER_EMBEDDED_UI_INPUT,
+      "Viewer rejection proof runs separately from Engine/media tests");
+    return checkBrowserViewerPreflight(page);
+  }
   const launched = await page.evaluate(async (token) => {
     const response = await fetch("/api/apps/home/launch", {
       method: "POST",
@@ -3632,7 +3691,7 @@ async function main() {
       : { skipped: true, reason: "created credential will be cleaned up" };
 
     const homePublicCopy = await checkHomePublicCopy(page);
-    const system = await launchSystem(page, homeToken);
+    const system = CHECK_SYSTEM ? await launchSystem(page, homeToken) : null;
     const shellSwitch = CHECK_SHELL_SWITCH
       ? await checkShellSwitchJourney(page, homeToken)
       : null;
@@ -3659,10 +3718,13 @@ async function main() {
       principal_id: passkey.principal_id,
       role: passkey.role,
       virtual_authenticator_credentials: credentialStore,
-      system_fields: system.fields,
+      system_checked: Boolean(system),
+      system_fields: system?.fields || null,
       home_public_copy: homePublicCopy,
       shell_switch: shellSwitch,
       browser_launch_checked: Boolean(browserLaunch),
+      browser_viewer_preflight: browserLaunch?.viewer_preflight || null,
+      browser_summary: browserLaunch?.browser_summary || null,
       browser_ui_setup: browserLaunch?.browser_ui_setup || null,
       browser_ui_input: browserLaunch?.browser_ui_input || null,
       browser_embedded_ui_input: browserLaunch?.browser_embedded_ui_input || null,
