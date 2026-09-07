@@ -8,6 +8,11 @@ use crate::api::browser_engine_protocol::{
     BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA, BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
     BROWSER_ENGINE_PROTOCOL_VERSION, BROWSER_ENGINE_PROVIDER_ID,
 };
+pub(super) use elastos_common::browser_protocol::{
+    BrowserCompatibilityError, BrowserDisplayMode, BrowserEngineInventory, BrowserGuaranteeLevel,
+    BrowserInputRequest, BrowserOpenRequest, BrowserPageCloseRequest, BrowserProfileDescriptor,
+    BrowserViewport as BrowserViewportRequest, BrowserWebrtcSignalRequest,
+};
 use std::sync::{Mutex as StdMutex, Weak};
 use tokio::sync::{watch, Notify};
 #[path = "gateway_browser_engine.rs"]
@@ -55,101 +60,10 @@ pub(super) struct BrowserSummaryQuery {
     pub(super) browser_instance: Option<String>,
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct BrowserOpenRequest {
-    pub(super) url: String,
-    #[serde(default)]
-    pub(super) reason: Option<String>,
-    #[serde(default)]
-    pub(super) remote_exit_id: Option<String>,
-    #[serde(default)]
-    pub(super) adapter_id: Option<String>,
-    #[serde(default)]
-    pub(super) browser_instance: Option<String>,
-    #[serde(default)]
-    pub(super) viewport: Option<BrowserViewportRequest>,
-    pub(super) display_mode: BrowserDisplayMode,
-    pub(super) guarantee_level: BrowserGuaranteeLevel,
-    #[serde(default)]
-    pub(super) async_open: bool,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct BrowserViewportRequest {
-    pub(super) width: u32,
-    pub(super) height: u32,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum BrowserDisplayMode {
-    WebrtcRemoteDisplay,
-    NativeSurface,
-}
-
-impl BrowserDisplayMode {
-    pub(super) fn as_str(self) -> &'static str {
-        match self {
-            Self::WebrtcRemoteDisplay => "webrtc_remote_display",
-            Self::NativeSurface => "native_surface",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum BrowserGuaranteeLevel {
-    MechanismMicrovm,
-    OperatorRbi,
-    PolicyWebview,
-    Diagnostic,
-}
-
-impl BrowserGuaranteeLevel {
-    pub(super) fn as_str(self) -> &'static str {
-        match self {
-            Self::MechanismMicrovm => "mechanism_microvm",
-            Self::OperatorRbi => "operator_rbi",
-            Self::PolicyWebview => "policy_webview",
-            Self::Diagnostic => "diagnostic",
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct BrowserInputRequest {
-    pub(super) event: serde_json::Value,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct BrowserWebrtcSignalRequest {
-    #[serde(rename = "type")]
-    pub(super) signal_type: String,
-    #[serde(default)]
-    pub(super) channel: Option<String>,
-    #[serde(default)]
-    pub(super) sdp: Option<String>,
-    #[serde(default)]
-    pub(super) candidate: Option<serde_json::Value>,
-}
-
 pub(super) struct BrowserProviderResourceCall {
     pub(super) scheme: &'static str,
     pub(super) resource: String,
     pub(super) request: serde_json::Value,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct BrowserPageCloseRequest {
-    pub(super) schema: String,
-    pub(super) cleanup_id: String,
-    #[serde(default)]
-    pub(super) browser_instance: Option<String>,
 }
 
 #[derive(Debug)]
@@ -405,21 +319,21 @@ fn browser_profile_launch_descriptor(
         .to_string();
     Ok((
         disk_path,
-        serde_json::json!({
-            "schema": "elastos.browser.profile/v1",
-            "scope": "active_principal",
-            "storage": BROWSER_PROFILE_STORAGE,
-            "storage_posture": BROWSER_PROFILE_STORAGE_POSTURE,
-            "protected_storage": false,
-            "encrypted": false,
-            "recoverable": false,
-            "recovery": BROWSER_PROFILE_RECOVERY,
-            "uri": profile_uri,
-            "public_uri": "localhost://Users/self/BrowserProfiles/default/profile.ext4",
-            "profile_key": profile_key,
-            "disk_path": disk_path_text,
-            "reset": "whole_profile",
-        }),
+        serde_json::to_value(BrowserProfileDescriptor {
+            schema: "elastos.browser.profile/v1".to_string(),
+            scope: "active_principal".to_string(),
+            storage: BROWSER_PROFILE_STORAGE.to_string(),
+            storage_posture: BROWSER_PROFILE_STORAGE_POSTURE.to_string(),
+            protected_storage: false,
+            encrypted: false,
+            recoverable: false,
+            recovery: BROWSER_PROFILE_RECOVERY.to_string(),
+            uri: profile_uri,
+            public_uri: "localhost://Users/self/BrowserProfiles/default/profile.ext4".to_string(),
+            profile_key,
+            disk_path: disk_path_text,
+            reset: "whole_profile".to_string(),
+        })?,
     ))
 }
 
@@ -645,11 +559,6 @@ async fn execute_browser_open(
         },
         None => None,
     };
-    let (_, profile) =
-        match browser_profile_launch_descriptor(&state.data_dir, &context.principal_id) {
-            Ok(profile) => profile,
-            Err(err) => return Err(BrowserOpenFailure::provider("browser", err)),
-        };
     let engine_registration = match registry
         .registration_for_uri("elastos://browser-engine/launch")
         .await
@@ -666,17 +575,25 @@ async fn execute_browser_open(
         registry.as_ref(),
         &context.principal_id,
         requested_adapter_id.as_deref(),
+        display_mode,
+        guarantee_level,
     )
     .await
     {
         Ok(adapter_id) => adapter_id,
-        Err(message) => {
-            return Err(BrowserOpenFailure::provider(
-                "browser-engine",
-                anyhow::anyhow!(message),
-            ))
+        Err(error) => {
+            let mut body =
+                serde_json::to_value(&error).expect("Browser compatibility error serializes");
+            body["message"] = serde_json::json!(error.to_string());
+            body["stage"] = serde_json::json!("engine_compatibility");
+            return Err(BrowserOpenFailure::json(StatusCode::BAD_REQUEST, body));
         }
     };
+    let (_, profile) =
+        match browser_profile_launch_descriptor(&state.data_dir, &context.principal_id) {
+            Ok(profile) => profile,
+            Err(err) => return Err(BrowserOpenFailure::provider("browser", err)),
+        };
     let profile_key = profile
         .get("profile_key")
         .and_then(|value| value.as_str())

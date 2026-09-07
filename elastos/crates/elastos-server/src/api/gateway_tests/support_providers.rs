@@ -3792,6 +3792,22 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
         match request.get("op").and_then(|value| value.as_str()) {
+            Some("status")
+                if request.get("lifecycle_generation").is_none()
+                    && matches!(
+                        self.failure,
+                        MockDispatchedBrowserLaunchFailure::ExactVzDidNotAct
+                            | MockDispatchedBrowserLaunchFailure::MismatchedVzDidNotAct
+                            | MockDispatchedBrowserLaunchFailure::TerminalVzSettlement
+                            | MockDispatchedBrowserLaunchFailure::MismatchedTerminalVzSettlement
+                    ) =>
+            {
+                let mut response = MockBrowserEngineProvider.send_raw(request).await?;
+                response["data"]["adapters"][0]["supported_guarantee_levels"] =
+                    json!(["mechanism_microvm"]);
+                response["data"]["adapters"][0]["backing_substrate"] = json!("macos_vz");
+                Ok(response)
+            }
             Some("launch") => {
                 let launch_call = self
                     .launch_calls
@@ -4348,6 +4364,10 @@ impl Provider for MockRejectingBrowserEngineProvider {
                         "id": "mock-browser-engine",
                         "engine": "selkies_gstreamer",
                         "default": true,
+                        "backing_substrate": "operator_rbi",
+                        "supported_display_modes": ["webrtc_remote_display"],
+                        "supported_guarantee_levels": ["operator_rbi"],
+                        "network_mode": "runtime_net_only",
                         "direct_network": false,
                         "wallet_injection": false
                     }],
@@ -4398,6 +4418,7 @@ impl Provider for MockMalformedBrowserEngineProvider {
             "status": "ok",
             "data": {
                 "provider": "browser-engine-adapter",
+                "protocol_version": "2.0",
                 "status": "configured",
                 "adapter_count": 1,
                 "required_byte_transport": "adapter_ipc",

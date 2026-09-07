@@ -459,6 +459,283 @@ async fn test_browser_open_rejects_invalid_adapter_inventory_before_reservation(
     assert!(!dir.path().join("browser-streams").exists());
 }
 
+struct BrowserCompatibilityFixture {
+    inventory: serde_json::Value,
+    calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for BrowserCompatibilityFixture {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "fixture requires the provider request contract".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["browser-engine"]
+    }
+    fn name(&self) -> &'static str {
+        "mock-browser-engine"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        self.calls.lock().await.push(request.clone());
+        if request["op"] == "status" && request.get("lifecycle_generation").is_none() {
+            return Ok(json!({"status": "ok", "data": self.inventory}));
+        }
+        MockBrowserEngineProvider.send_raw(request).await
+    }
+}
+
+#[tokio::test]
+async fn test_browser_compatibility_denial_precedes_every_launch_effect() {
+    let valid = MockBrowserEngineProvider
+        .send_raw(&json!({"op": "status", "principal_id": "person:compatibility-fixture"}))
+        .await
+        .unwrap()["data"]
+        .clone();
+    for (pointer, value, requested_adapter, expected_code) in [
+        (
+            "/protocol_version",
+            json!("9.0"),
+            None,
+            "incompatible_engine_protocol",
+        ),
+        (
+            "/protocol_version",
+            serde_json::Value::Null,
+            None,
+            "incompatible_engine_protocol",
+        ),
+        (
+            "/adapters/0/supported_guarantee_levels",
+            json!(["policy_webview"]),
+            Some("mock-browser-engine"),
+            "incompatible_engine_capabilities",
+        ),
+        (
+            "/adapters/0/supported_display_modes",
+            json!([]),
+            None,
+            "invalid_engine_status",
+        ),
+        (
+            "/protocol_version",
+            json!("2.0"),
+            Some("missing-engine"),
+            "engine_not_found",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let authority = passkey_authority(dir.path());
+        let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+        let state = net_exit_test_state(dir.path()).await;
+        let mut inventory = valid.clone();
+        *inventory.pointer_mut(pointer).unwrap() = value;
+        let calls = Arc::new(TokioMutex::new(Vec::new()));
+        state
+            .provider_registry
+            .as_ref()
+            .unwrap()
+            .register_sub_provider(
+                "browser-engine",
+                Arc::new(BrowserCompatibilityFixture {
+                    inventory,
+                    calls: calls.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        let mut body = json!({
+            "url": "https://compatibility.invalid/", "display_mode": "webrtc_remote_display",
+            "guarantee_level": "operator_rbi"
+        });
+        if let Some(adapter) = requested_adapter {
+            body["adapter_id"] = json!(adapter);
+        }
+        let response = gateway_router(state)
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/browser/open")
+                    .header("x-elastos-home-token", token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{expected_code}"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["code"], expected_code);
+        assert_eq!(result["stage"], "engine_compatibility");
+        assert_eq!(result["outcome"]["state"], "terminal_pre_effect_failure");
+        assert_eq!(
+            result["outcome"]["effects"],
+            json!({"page_acquired": false, "vm_acquired": false, "stream_acquired": false})
+        );
+        let calls = calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["op"], "status");
+        assert!(calls[0].get("profile").is_none());
+        assert_eq!(browser_page_session_count(dir.path()).await, 0);
+        assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
+        assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 0);
+        assert_eq!(
+            browser_launch_reconciliation_obligation_count(dir.path()).await,
+            0
+        );
+        assert!(!dir.path().join("browser-lifecycle").exists());
+        assert!(!dir.path().join("browser-streams").exists());
+    }
+}
+
+#[tokio::test]
+async fn test_browser_compatibility_auto_selects_a_compatible_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let state = browser_engine_attached_test_state(dir.path()).await;
+    state
+        .provider_registry
+        .as_ref()
+        .unwrap()
+        .unregister_sub_provider("browser-engine")
+        .await
+        .unwrap();
+    let mut inventory = MockBrowserEngineProvider
+        .send_raw(&json!({"op": "status", "principal_id": "person:compatibility-fixture"}))
+        .await
+        .unwrap()["data"]
+        .clone();
+    inventory["adapters"][0]["supported_display_modes"] = json!(["native_surface"]);
+    inventory["adapters"][0]["supported_guarantee_levels"] = json!(["policy_webview"]);
+    let calls = Arc::new(TokioMutex::new(Vec::new()));
+    state
+        .provider_registry
+        .as_ref()
+        .unwrap()
+        .register_sub_provider(
+            "browser-engine",
+            Arc::new(BrowserCompatibilityFixture {
+                inventory,
+                calls: calls.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    let app = gateway_router(state);
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/browser/open")
+                .header("x-elastos-home-token", token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"url":"https://ela.city/",
+                "display_mode":"webrtc_remote_display", "guarantee_level":"operator_rbi",
+                "viewport":{"width":900,"height":520}})
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let opened: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status, StatusCode::OK, "{opened}");
+    assert_eq!(opened["engine_page"]["adapter"], "mock-jetson-engine");
+    let launches: Vec<_> = calls
+        .lock()
+        .await
+        .iter()
+        .filter(|call| call["op"] == "launch")
+        .cloned()
+        .collect();
+    assert_eq!(launches.len(), 1);
+    assert_eq!(launches[0]["adapter_id"], "mock-jetson-engine");
+    assert_eq!(launches[0]["guarantee_level"], "operator_rbi");
+    let page_id = opened["engine_page"]["page_id"].as_str().unwrap();
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(format!("/api/apps/browser/pages/{page_id}/close"))
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(browser_close_body(browser_cleanup_id(&opened)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(browser_page_session_count(dir.path()).await, 0);
+    assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
+    assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 0);
+}
+
+#[tokio::test]
+async fn test_browser_compatibility_summary_rejects_future_protocol_inventory() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let state = net_exit_test_state(dir.path()).await;
+    state
+        .provider_registry
+        .as_ref()
+        .unwrap()
+        .register_sub_provider(
+            "browser-engine",
+            Arc::new(BrowserCompatibilityFixture {
+                inventory: json!({"provider": "browser-engine-adapter", "protocol_version": "3.0",
+                "direct_network": false, "wallet_injection": false, "adapters": "future format"}),
+                calls: Arc::new(TokioMutex::new(Vec::new())),
+            }),
+        )
+        .await
+        .unwrap();
+    let response = gateway_router(state)
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/apps/browser/summary")
+                .header("x-elastos-home-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        result["engine_adapter"]["status"],
+        "invalid_provider_status"
+    );
+    assert_eq!(
+        result["engine_adapter"]["code"],
+        "incompatible_engine_protocol"
+    );
+    assert!(result["engine_adapter"].get("adapters").is_none());
+}
+
 #[tokio::test]
 async fn test_browser_open_fails_closed_without_attached_engine_transport() {
     let dir = tempfile::tempdir().unwrap();
@@ -2156,12 +2433,22 @@ async fn test_browser_open_fails_closed_when_display_session_unavailable() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let message = String::from_utf8(body.to_vec()).unwrap();
-    assert!(message.contains("native_surface"));
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["code"], "no_compatible_engine");
+    assert_eq!(payload["stage"], "engine_compatibility");
+    assert_eq!(payload["outcome"]["state"], "terminal_pre_effect_failure");
+    assert_eq!(
+        payload["outcome"]["effects"],
+        json!({
+            "page_acquired": false, "vm_acquired": false, "stream_acquired": false
+        })
+    );
+    assert!(!dir.path().join("browser-lifecycle").exists());
+    assert!(!dir.path().join("browser-streams").exists());
 }
 
 #[tokio::test]

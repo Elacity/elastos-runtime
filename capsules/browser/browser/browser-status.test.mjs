@@ -37,6 +37,27 @@ test("pre-effect open failure never claims a missing terminal close", () => {
   assert.doesNotMatch(friendlyOpenError(error), /terminal close/i);
 });
 
+test("compatibility denial explains the required repair before launch", () => {
+  for (const [code, message] of [
+    ["incompatible_engine_protocol", "Browser Engine and Runtime versions are incompatible. Update them to a compatible release."],
+    ["incompatible_engine_capabilities", "The selected Browser Engine does not support this display and isolation requirement."],
+    ["no_compatible_engine", "An approved Browser Engine with the required display and isolation capabilities is needed."],
+    ["engine_not_found", "Browser Engine is unavailable. Choose an available approved Engine."],
+  ]) {
+    const error = openError("terminal_pre_effect_failure");
+    error.payload.code = code;
+    error.payload.stage = "engine_compatibility";
+    assert.equal(friendlyOpenError(error), message);
+  }
+});
+
+test("compatibility wording cannot hide acquired effects or pending cleanup", () => {
+  const error = openError("cleanup_pending", { page_acquired: true, vm_acquired: true });
+  error.payload.code = "incompatible_engine_protocol";
+  error.payload.stage = "engine_compatibility";
+  assert.match(friendlyOpenError(error), /cleanup is pending/);
+});
+
 test("cleanup-pending open failure is driven by structured acquired effects", () => {
   const error = openError("cleanup_pending", {
     page_acquired: true,

@@ -3,6 +3,10 @@
 > Architecture target, not current shipped behavior. For current proof level see
 > [../state.md](../state.md).
 
+The shared wire definitions and version rules are in
+[Browser contract](BROWSER_PROTOCOL.md). Device roles, resource requirements and
+qualification gates are in [Browser support](BROWSER_SUPPORT.md).
+
 ## Decision
 
 ElastOS needs a real browser capsule, but the first production target should not

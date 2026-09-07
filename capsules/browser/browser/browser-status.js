@@ -63,6 +63,19 @@ export function friendlyOpenError(error) {
     return "Browser session expired. Reopening from Home...";
   }
   const outcome = runtimeOpenOutcome(error);
+  if (outcome?.state === "terminal_pre_effect_failure" && error?.payload?.stage === "engine_compatibility") {
+    switch (error?.payload?.code) {
+      case "incompatible_engine_protocol":
+        return "Browser Engine and Runtime versions are incompatible. Update them to a compatible release.";
+      case "incompatible_engine_capabilities":
+        return "The selected Browser Engine does not support this display and isolation requirement.";
+      case "no_compatible_engine":
+        return "An approved Browser Engine with the required display and isolation capabilities is needed.";
+      case "engine_not_found":
+      case "engine_unavailable":
+        return "Browser Engine is unavailable. Choose an available approved Engine.";
+    }
+  }
   if (outcome?.state === "terminal_pre_effect_failure") {
     return "Browser Engine failed to start cleanly. No Browser page or VM was acquired.";
   }

@@ -446,6 +446,44 @@ fn status_is_unavailable_without_configured_adapter() {
     assert_eq!(response["data"]["status"], "unavailable");
     assert_eq!(response["data"]["direct_network"], false);
     assert_eq!(response["data"]["wallet_injection"], false);
+    elastos_common::browser_protocol::BrowserEngineInventory::from_status(&response["data"])
+        .expect("provider status must satisfy the Runtime's shared inventory contract");
+}
+
+#[test]
+fn configured_inventory_uses_the_same_contract_as_runtime_selection() {
+    let mut provider = BrowserEngineAdapter::new();
+    let result = serde_json::to_value(provider.init(json!({
+        "adapters": [{
+            "id": "proof-engine", "kind": "contract_proof",
+            "display_modes": ["webrtc_remote_display"]
+        }]
+    })))
+    .unwrap();
+    assert_eq!(result["status"], "ok");
+    let status = serde_json::to_value(provider.status(None)).unwrap();
+    let inventory =
+        elastos_common::browser_protocol::BrowserEngineInventory::from_status(&status["data"])
+            .unwrap();
+    assert_eq!(
+        inventory
+            .select(
+                None,
+                BrowserDisplayMode::WebrtcRemoteDisplay,
+                BrowserGuaranteeLevel::OperatorRbi
+            )
+            .unwrap()
+            .id,
+        "proof-engine"
+    );
+    assert!(inventory
+        .select(
+            None,
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::MechanismMicrovm
+        )
+        .is_err());
+    assert!(provider.page_control_sessions.is_empty());
 }
 
 #[test]

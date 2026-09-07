@@ -68,6 +68,38 @@ volatile proof logs remain outside the repository.
   transport before the Runtime-selected custody target handles the request.
   Public provider projection excludes these targets.
 
+## Browser contract and device qualification
+
+Browser B01 is in progress. The contract is in
+[docs/BROWSER_PROTOCOL.md](docs/BROWSER_PROTOCOL.md), and the role-specific
+qualification matrix is in [docs/BROWSER_SUPPORT.md](docs/BROWSER_SUPPORT.md).
+The initial compatibility slice shares Engine protocol and request types,
+validates declared Engine capabilities before launch, and preserves explicit
+operator selection. Installed acceptance of this slice remains open.
+Mac and Linux host adapters now query their virtualization APIs for eligibility.
+The Mac unit check ran locally; the Linux-specific KVM query still needs a
+Linux test run.
+
+Read-only target observations on 2026-09-07 identify a macOS 26.5.2 ARM64
+machine with 24 GiB RAM, 10 logical CPUs and hardware virtualization reported
+available; its Brave version is 152.1.94.119. A Linux AMD64 server reports
+kernel 6.8.0-136-generic, 8 logical CPUs, approximately 15.2 GiB RAM and no KVM
+device. Those observations identify test roles, not certified product support.
+The Linux server can be considered for Exit/remote-consumer qualification;
+local Engine qualification requires a separate KVM target.
+
+The existing journey register retains intermittent Browser startup/navigation
+and recovery failures, incomplete media proof, and unverified remote Engine/Exit
+selection. Every matrix row remains pending installed qualification for the
+Browser maturity changes. Existing installed observations retain their original
+source bindings and verdicts.
+
+The existing Mac VM artifact preflight rejected the image because its SHA-256
+differs from the sidecar manifest. The active test Home also lacks the required
+VM helper and image set. Neither installation supplies a current B01 product
+acceptance receipt. This identifies local repair work; it does not establish
+the cause of another operator's startup failure.
+
 ## Branch Hygiene
 
 - Local UIUX subgroup branches are extraction scaffolding already contained in

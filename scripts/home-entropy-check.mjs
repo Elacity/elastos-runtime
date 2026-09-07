@@ -1557,6 +1557,7 @@ const chainProvider = readAll([
 const netProvider = read("capsules/net-provider/src/main.rs");
 const exitProvider = read("capsules/exit-provider/src/main.rs");
 const browserEngineAdapter = readAll([
+  "elastos/crates/elastos-common/src/browser_protocol.rs",
   "capsules/browser-engine-adapter/src/main.rs",
   "capsules/browser-engine-adapter/src/display.rs",
   "capsules/browser-engine-adapter/src/ids.rs",

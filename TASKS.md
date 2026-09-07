@@ -24,6 +24,21 @@ Initial analysis source:
 [`8ac18bec65ca650615be879f7ab3f66799d9fc53`](https://github.com/Elacity/elastos-runtime/tree/8ac18bec65ca650615be879f7ab3f66799d9fc53).
 Revalidate those findings against the implementation base before each repair.
 
+B01 source work shares the Runtime/Engine request and capability definitions,
+rejects incompatible Engines before profile preparation and launch effects, and
+selects an Engine that meets the requested display and isolation requirement.
+The role matrix and current protocol are in
+[BROWSER_SUPPORT.md](docs/BROWSER_SUPPORT.md) and
+[BROWSER_PROTOCOL.md](docs/BROWSER_PROTOCOL.md). Remaining B01 acceptance needs
+installed artifact admission, viewer capability checks, approved remote-service
+selection, and hash-bound device-role proof. The inspected Mac's existing VM
+image failed its manifest hash check; repair or rebuild and verify the image
+before using it for qualification. Linux KVM/Jetson and remote Runtime fixtures
+are still needed. Preserve the existing journey verdicts until those runs pass.
+The Browser settings refresh also clears a selected Engine or Exit when its
+offer is absent. Retain that explicit selection as unavailable until the
+operator changes it, so a transient discovery failure preserves service intent.
+
 - [ ] [B01: One Browser contract and an explicit support matrix](docs/BROWSER_ACCEPTANCE.md#b01).
 - [ ] [B02: A fresh installation opens a usable Browser](docs/BROWSER_ACCEPTANCE.md#b02).
 - [ ] [B03: Every failure has an actionable diagnosis](docs/BROWSER_ACCEPTANCE.md#b03).

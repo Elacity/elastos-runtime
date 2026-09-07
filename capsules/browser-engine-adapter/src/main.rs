@@ -5,6 +5,12 @@
 //! wallet, or browser-engine authority; configured host adapters attach only
 //! through Runtime-owned stream and display sessions.
 
+use elastos_common::browser_protocol::{
+    BrowserDisplayMode, BrowserEngineAdapterCapabilities, BrowserGuaranteeLevel,
+    BrowserProfileDescriptor, BrowserViewport as ViewportRequest,
+    BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA, BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
+    BROWSER_ENGINE_PROTOCOL_VERSION, BROWSER_ENGINE_PROVIDER_ID,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,10 +32,6 @@ const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
 };
-const BROWSER_ENGINE_PROVIDER_ID: &str = "browser-engine-adapter";
-const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.0";
-const BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA: &str = "elastos.browser.engine-cleanup-binding/v2";
-const BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA: &str = "elastos.browser.engine-cleanup-result/v2";
 const BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA: &str =
     "elastos.browser.engine.launch-reconciliation/v1";
 const BROWSER_ENGINE_RECONCILIATION_TIMEOUT: std::time::Duration =
@@ -2103,25 +2105,24 @@ impl BrowserEngineAdapter {
             .cloned()
     }
 
-    fn adapter_summaries(&self) -> Vec<Value> {
+    fn adapter_summaries(&self) -> Vec<BrowserEngineAdapterCapabilities> {
         self.adapters
             .iter()
             .enumerate()
-            .map(|(index, adapter)| {
-                json!({
-                    "id": adapter.id,
-                    "engine": adapter.kind,
-                    "default": index == 0,
-                    "supported_display_modes": adapter.display_modes
-                        .iter()
-                        .map(|mode| mode.as_str())
-                        .collect::<Vec<_>>(),
-                    "supported_guarantee_levels": adapter_guarantee_levels(adapter.kind),
-                    "backing_substrate": adapter_backing_substrate(adapter),
-                    "network_mode": "runtime_net_only",
-                    "direct_network": false,
-                    "wallet_injection": false,
-                })
+            .map(|(index, adapter)| BrowserEngineAdapterCapabilities {
+                id: adapter.id.clone(),
+                engine: serde_json::to_value(adapter.kind)
+                    .expect("AdapterKind serializes as a string")
+                    .as_str()
+                    .expect("AdapterKind has a string representation")
+                    .to_string(),
+                default: index == 0,
+                supported_display_modes: adapter.display_modes.clone(),
+                supported_guarantee_levels: adapter_guarantee_levels(adapter.kind),
+                backing_substrate: adapter_backing_substrate(adapter).to_string(),
+                network_mode: "runtime_net_only".to_string(),
+                direct_network: false,
+                wallet_injection: false,
             })
             .collect()
     }
@@ -2130,24 +2131,24 @@ impl BrowserEngineAdapter {
         let mut levels = BTreeSet::new();
         for adapter in &self.adapters {
             for level in adapter_guarantee_levels(adapter.kind) {
-                levels.insert(level);
+                levels.insert(level.as_str());
             }
         }
         levels.into_iter().collect()
     }
 }
 
-fn adapter_guarantee_levels(kind: AdapterKind) -> Vec<&'static str> {
+fn adapter_guarantee_levels(kind: AdapterKind) -> Vec<BrowserGuaranteeLevel> {
     match kind {
-        AdapterKind::ChromiumMicrovm => vec!["mechanism_microvm"],
+        AdapterKind::ChromiumMicrovm => vec![BrowserGuaranteeLevel::MechanismMicrovm],
         AdapterKind::SelkiesGstreamer
         | AdapterKind::HostedRemoteBrowser
         | AdapterKind::ChromiumHeadless
-        | AdapterKind::ContractProof => vec!["operator_rbi"],
+        | AdapterKind::ContractProof => vec![BrowserGuaranteeLevel::OperatorRbi],
         AdapterKind::Cef
         | AdapterKind::Webview2
         | AdapterKind::Geckoview
-        | AdapterKind::Wkwebview => vec!["policy_webview"],
+        | AdapterKind::Wkwebview => vec![BrowserGuaranteeLevel::PolicyWebview],
     }
 }
 
@@ -2275,24 +2276,6 @@ struct StreamSessionReceipt {
     relay_ipc: Option<RelayIpcEndpoint>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct BrowserProfileDescriptor {
-    schema: String,
-    scope: String,
-    storage: String,
-    storage_posture: String,
-    protected_storage: bool,
-    encrypted: bool,
-    recoverable: bool,
-    recovery: String,
-    uri: String,
-    public_uri: String,
-    profile_key: String,
-    disk_path: String,
-    reset: String,
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AdapterIpcEndpoint {
@@ -2312,47 +2295,6 @@ struct RelayIpcEndpoint {
     path: String,
     #[serde(default)]
     stream_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ViewportRequest {
-    width: u32,
-    height: u32,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum BrowserDisplayMode {
-    WebrtcRemoteDisplay,
-    NativeSurface,
-}
-
-impl BrowserDisplayMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::WebrtcRemoteDisplay => "webrtc_remote_display",
-            Self::NativeSurface => "native_surface",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum BrowserGuaranteeLevel {
-    MechanismMicrovm,
-    OperatorRbi,
-    PolicyWebview,
-}
-
-impl BrowserGuaranteeLevel {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::MechanismMicrovm => "mechanism_microvm",
-            Self::OperatorRbi => "operator_rbi",
-            Self::PolicyWebview => "policy_webview",
-        }
-    }
 }
 
 fn adapter_supports_guarantee(kind: AdapterKind, guarantee_level: BrowserGuaranteeLevel) -> bool {
