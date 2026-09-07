@@ -144,7 +144,7 @@ export function recoverStalePersistedTurn(session) {
     return session;
   }
   const state = String(turn.state || "");
-  if (turn.providerRunId && !turn.completedAt && ["submitted", "streaming", "cancel_pending", "settlement_unknown"].includes(state)) {
+  if ((turn.providerRunId || turn.createRequestId) && !turn.completedAt && ["submitted", "streaming", "cancel_pending", "settlement_unknown"].includes(state)) {
     return { ...session, lastTurn: { ...turn, state: "settlement_unknown", completedAt: null } };
   }
   if (state !== "submitted" && state !== "streaming") {

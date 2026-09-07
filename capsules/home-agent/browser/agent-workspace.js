@@ -107,6 +107,9 @@ export function serializeSessionForPersist(session) {
                     providerRunId: m.turn.providerRunId
                       ? String(m.turn.providerRunId).slice(0, 80)
                       : undefined,
+                    createRequestId: m.turn.createRequestId
+                      ? String(m.turn.createRequestId).slice(0, 80)
+                      : undefined,
                     state: String(m.turn.state || "").slice(0, 24),
                     contextManifestId: String(m.turn.contextManifestId || "").slice(0, 16),
                     semanticContextHash: String(m.turn.semanticContextHash || "").slice(0, 16),

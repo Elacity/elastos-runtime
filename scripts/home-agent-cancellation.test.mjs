@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { execFileSync } from "node:child_process";
 
 globalThis.window = { location: { href: "http://home.invalid/apps/home-agent/", hash: "#home_token=fixture" } };
 const live = await import("../capsules/home-agent/browser/agent-live.js");
@@ -148,6 +149,67 @@ test("late creation acknowledgement after detach retains its run ID", async () =
   assert.deepEqual(calls, ["runs_create"]);
 });
 
+for (const mode of ["lost_response", "invalid_json", "missing_run_id", "invalid_run_id", "server_error", "invalid_typed_response_400", "unauthorized", "forbidden", "remote_local_error_code"]) test(`uncertain create acceptance stays unresolved: ${mode}`, async () => {
+  const { ctx, status } = controllerFixture();
+  ctx.turnBusy = false;
+  const settled = defer();
+  controller.bindAgentStream(ctx, { streamEl: () => null, titleEl: () => null,
+    persistAgentWorkspaceSoon: () => {
+      if (ctx.sessions[0].lastTurn?.error) settled.resolve();
+    } });
+  const dispatched = [];
+  globalThis.fetch = async (url, init) => {
+    const op = new URL(url).pathname.split("/").pop();
+    if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
+      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+    ] }) };
+    assert.equal(op, "runs_create");
+    const body = JSON.parse(init.body);
+    assert.equal(ctx.sessions[0].lastTurn.createRequestId, body.request_id, "identity is retained before sending");
+    dispatched.push(body);
+    if (mode === "lost_response") throw new TypeError("acceptance response lost after dispatch");
+    const responseStatus = { server_error: 502, invalid_typed_response_400: 400, unauthorized: 401, forbidden: 403, remote_local_error_code: 400 }[mode] || 200;
+    return { ok: responseStatus === 200, status: responseStatus,
+      json: async () => {
+        if (mode === "invalid_json") throw new SyntaxError("incomplete JSON response");
+        if (mode === "invalid_typed_response_400") return { code: "provider_error", message: "model provider returned an invalid typed response" };
+        if (mode === "remote_local_error_code") return { code: "missing-home-launch-token" };
+        return mode === "invalid_run_id" ? { run_id: {} } : {};
+      } };
+  };
+  await live.probeLiveInference({ force: true });
+  controller.startTurnForPrompt("one explicit request");
+  await settled.promise;
+  await new Promise(setImmediate);
+  assert.equal(dispatched.length, 1);
+  assert.equal(ctx.sessions[0].lastTurn.state, "settlement_unknown");
+  assert.ok(!ctx.sessions[0].lastTurn.completedAt);
+  assert.equal(live.unresolvedModelTurn(ctx.sessions[0].lastTurn), true);
+  const saved = JSON.parse(JSON.stringify(workspace.serializeSessionForPersist(ctx.sessions[0])));
+  assert.equal(saved.lastTurn.createRequestId, dispatched[0].request_id);
+  assert.ok(saved.lastTurn.createRequestId.length <= 80);
+  ctx.sessions[0] = recoverStalePersistedTurn(saved);
+  controller.startTurnForPrompt("must not implicitly retry");
+  await new Promise(setImmediate);
+  assert.equal(dispatched.length, 1, "reload must not create again without a known run ID");
+  assert.equal(controller.canSubmitNewTurn(), false);
+  assert.match(status.textContent, /Run acceptance is unknown.*new chat/);
+  assert.equal(status.children.length, 0, "no Check status that secretly recreates");
+});
+
+test("missing local launch token is proved refused before fetch", () => {
+  execFileSync(process.execPath, ["--input-type=module", "-e", `
+    import assert from "node:assert/strict";
+    globalThis.window = { location: { hash: "", href: "http://home.invalid/apps/home-agent/" } };
+    let calls = 0;
+    globalThis.fetch = async () => { calls += 1; throw new Error("unexpected fetch"); };
+    const { modelRunCall } = await import(${JSON.stringify(new URL("../capsules/home-agent/browser/agent-live.js", import.meta.url).href)});
+    await assert.rejects(modelRunCall("runs_create", {}),
+      (error) => error.code === "missing-home-launch-token" && error.preDispatchRefusal === true);
+    assert.equal(calls, 0);
+  `], { timeout: 5000 });
+});
+
 function controllerFixture() {
   const status = { dataset: {}, textContent: "", hidden: true, children: [], append(...nodes) { this.children.push(...nodes); } };
   globalThis.document = { querySelector: (selector) => selector === "[data-agent-stream-status]" ? status : null,
@@ -234,7 +296,7 @@ test("terminal unknown survives reload and permits an explicit new turn", async 
   assert.equal(status.textContent, "Outcome unknown");
 });
 
-test("actual composer preserves an unsent draft until the old run is checked or a new chat is selected", async () => {
+test("actual composer preserves draft for missing runs and unknown acceptance until explicit new chat", async () => {
   const { status } = controllerFixture();
   const node = () => ({ dataset: {}, style: {}, value: "", scrollHeight: 28,
     classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
@@ -260,33 +322,47 @@ test("actual composer preserves an unsent draft until the old run is checked or 
       ? { offers: [{ id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] }] }
       : op === "runs_create" ? { run_id: "new-draft-run", sequence_cursor: 0 } : terminal("settlement_unknown") };
   };
-  const oldTurn = { turnId: "missing-turn", providerRunId: "missing-run", state: "settlement_unknown", error: "run_not_found" };
   const draft = { text: "new unsent prompt", parts: [{ id: "attachment", kind: "file", name: "notes.txt", text: "reference" }] };
-  workspace.applyAgentWorkspaceSnapshot({ v: 1, activeSessionId: "old", sessions: [{ id: "old", title: "Previous chat",
-    messages: [{ role: "user", text: "old prompt" }], lastTurn: oldTurn }], composerDraft: draft });
-  shelf.applyComposerDraft(draft);
-  harness.showAgentHarness({ restore: true });
-  await new Promise(setImmediate);
-  calls.length = 0;
-  const before = workspace.getAgentWorkspaceSnapshot().sessions[0];
-  const accepted = await shelf.sendAgentComposerMessage();
-  assert.deepEqual(shelf.getComposerDraft(), draft);
-  assert.deepEqual(workspace.getAgentWorkspaceSnapshot().sessions[0], before);
-  assert.equal(accepted, false);
-  assert.deepEqual(calls, [], "Send must not silently resume or redispatch the old run");
-  assert.match(status.textContent, /Run record is unavailable.*new chat/i);
-  status.children.at(-1).click();
-  await new Promise(setImmediate);
-  assert.deepEqual(calls.map((c) => c.op), ["runs_get"]);
-  assert.equal(calls[0].body.run_id, "missing-run");
-  assert.deepEqual(shelf.getComposerDraft(), draft);
-  assert.equal(workspace.getAgentWorkspaceSnapshot().sessions[0].lastTurn.providerRunId, "missing-run");
-  sessions.newChat();
-  assert.equal(await shelf.sendAgentComposerMessage(), true);
-  await new Promise(setImmediate);
-  assert.deepEqual(calls.map((c) => c.op), ["runs_get", "runs_create", "runs_events"]);
-  assert.equal(workspace.getAgentWorkspaceSnapshot().sessions[0].messages.filter((m) => m.role === "user").length, 1);
-  assert.deepEqual(shelf.getComposerDraft(), { text: "", parts: [] });
+  for (const acceptanceUnknown of [false, true]) {
+    calls.length = 0;
+    status.children.length = 0;
+    const oldTurn = acceptanceUnknown
+      ? { turnId: "unknown-turn", createRequestId: "old-create-request", state: "submitted" }
+      : { turnId: "missing-turn", providerRunId: "missing-run", state: "settlement_unknown", error: "run_not_found" };
+    workspace.applyAgentWorkspaceSnapshot({ v: 1, activeSessionId: "old", sessions: [{ id: "old", title: "Previous chat",
+      messages: [{ role: "user", text: "old prompt" }], lastTurn: recoverStalePersistedTurn({ lastTurn: oldTurn }).lastTurn }], composerDraft: draft });
+    shelf.applyComposerDraft(draft);
+    harness.showAgentHarness({ restore: true });
+    await new Promise(setImmediate);
+    if (acceptanceUnknown) assert.equal(calls.filter((c) => c.op !== "offers_list").length, 0);
+    calls.length = 0;
+    const before = workspace.getAgentWorkspaceSnapshot().sessions[0];
+    const accepted = await shelf.sendAgentComposerMessage();
+    assert.deepEqual(shelf.getComposerDraft(), draft);
+    assert.deepEqual(workspace.getAgentWorkspaceSnapshot().sessions[0], before);
+    assert.equal(accepted, false);
+    assert.deepEqual(calls, [], "Send must not silently resume or redispatch the old run");
+    if (acceptanceUnknown) {
+      assert.match(status.textContent, /Run acceptance is unknown.*new chat/i);
+      assert.equal(status.children.length, 0);
+      assert.equal(workspace.getAgentWorkspaceSnapshot().sessions[0].lastTurn.createRequestId, "old-create-request");
+    } else {
+      assert.match(status.textContent, /Run record is unavailable.*new chat/i);
+      status.children.at(-1).click();
+      await new Promise(setImmediate);
+      assert.deepEqual(calls.map((c) => c.op), ["runs_get"]);
+      assert.equal(calls[0].body.run_id, "missing-run");
+      assert.equal(workspace.getAgentWorkspaceSnapshot().sessions[0].lastTurn.providerRunId, "missing-run");
+    }
+    assert.deepEqual(shelf.getComposerDraft(), draft);
+    sessions.newChat();
+    assert.equal(await shelf.sendAgentComposerMessage(), true);
+    await new Promise(setImmediate);
+    assert.deepEqual(calls.map((c) => c.op), acceptanceUnknown ? ["runs_create", "runs_events"] : ["runs_get", "runs_create", "runs_events"]);
+    assert.notEqual(calls.find((c) => c.op === "runs_create").body.request_id, oldTurn.createRequestId);
+    assert.equal(workspace.getAgentWorkspaceSnapshot().sessions[0].messages.filter((m) => m.role === "user").length, 1);
+    assert.deepEqual(shelf.getComposerDraft(), { text: "", parts: [] });
+  }
 
   // The same real composer keeps changes made while its existing send bridge awaits acceptance.
   for (const accepted of [false, true]) {

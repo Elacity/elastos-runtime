@@ -516,6 +516,9 @@ export function formatStreamError(err) {
   if (code === "run_not_found") {
     return "Run record is unavailable. Start a new chat.";
   }
+  if (code === "run_acceptance_unknown") {
+    return "Run acceptance is unknown. Start a new chat.";
+  }
   if (code === "missing-home-launch-token") {
     return "Live unavailable — Home launch token missing (unlock Home and reopen Agent)";
   }
@@ -553,6 +556,10 @@ function showRunSettlement(turn, detail = turn?.error === "run_not_found"
   : "Run status unavailable. Check status or start a new chat.") {
   if (!unresolvedModelTurn(turn)) {
     setStreamStatus("Outcome unknown");
+    return;
+  }
+  if (!turn.providerRunId) {
+    setStreamStatus(formatStreamError({ code: "run_acceptance_unknown" }), { tone: "error" });
     return;
   }
   setStreamStatus(detail, { tone: "error" });
@@ -1646,6 +1653,10 @@ function scheduleIdleWork(fn) {
 
 /** Live turn: contract runs_events → scheduled DOM. Stop requests cancellation. */
 async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
+  if (resumeTurn && !resumeTurn.providerRunId) {
+    showRunSettlement(resumeTurn);
+    return;
+  }
   detachLiveChatStream();
   clearStreamTimer();
   const generation = (ctx.streamGeneration += 1);
@@ -2627,9 +2638,9 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     const honest = formatStreamError(err);
     if (liveTurn?.turnId && !liveTurn.completedAt && ![TurnState.FAILED, TurnState.COMPLETED, TurnState.STOPPED].includes(liveTurn.state)) {
       const failed = turnStorePatch(liveTurn.turnId, {
-        state: liveTurn.providerRunId ? TurnState.SETTLEMENT_UNKNOWN : TurnState.FAILED,
+        state: unresolvedModelTurn(liveTurn) ? TurnState.SETTLEMENT_UNKNOWN : TurnState.FAILED,
         error: String(err?.code || honest).slice(0, 120),
-        completedAt: liveTurn.providerRunId ? null : Date.now(),
+        completedAt: unresolvedModelTurn(liveTurn) ? null : Date.now(),
       });
       if (session) {
         session.lastTurn = cheapTurnSnapshot(failed || liveTurn);
@@ -2660,7 +2671,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     else setStreamStatus(honest, { tone: "error" });
     progressEl?.remove();
     answerRow?.remove();
-    if (!liveTurn?.providerRunId) void probeLiveInference({ force: true });
+    if (!liveTurn?.providerRunId && !unresolvedModelTurn(liveTurn)) void probeLiveInference({ force: true });
     return;
   } finally {
     longTaskObserver?.disconnect();

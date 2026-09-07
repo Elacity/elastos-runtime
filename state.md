@@ -506,14 +506,19 @@ complete. Installed proof and the atomic authority cutover remain open.
   endpoint, headers, and topology stay private. Local Qwen offer and output
   JSON stay unchanged.
 - Home Agent source keeps cancellation pending until Runtime supplies an outcome.
-  Transport uncertainty retains `providerRunId` and offers Check status through
+  Transport uncertainty with a known `providerRunId` offers Check status through
   `runs_get/events`; navigation detaches without cancellation or a new dispatch.
   Runtime-confirmed unknown settlement retains its completion time and permits a
-  new turn. All eleven actual-controller cancellation tests pass, covering denial,
+  new turn. All twenty-one focused cancellation tests pass, covering denial,
   unknown settlement, completion races, stale polls, late acceptance and
   saved-workspace recovery. Home Agent keeps new text and attachments in the
-  composer while the prior run remains unresolved, with Check status and New chat
-  as explicit actions. Only an accepted submission clears its unchanged draft
+  composer while the prior run remains unresolved. A lost or malformed create
+  response retains a bounded request identity and an unknown outcome in the
+  existing turn. HTTP 400 can arise from response projection after dispatch,
+  so post-send errors do not prove refusal. Without a run ID, Home Agent blocks
+  implicit resend and offers New chat rather than replay or Check status.
+  The existing scheduled workspace save preserves this state once written;
+  survival before that save completes is unproved. Only an accepted submission clears its unchanged draft
   content. The Home Agent shell and cancellation tests are included in the CI
   source step; local checks pass. The workbook's MODEL-02
   source-note refresh remains pending. Installed cancellation acceptance and

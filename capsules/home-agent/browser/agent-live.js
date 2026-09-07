@@ -290,7 +290,7 @@ export function detachLiveChatStream() {
 }
 
 export function unresolvedModelTurn(turn) {
-  return Boolean(turn?.providerRunId) && !turn.completedAt && ![TurnState.COMPLETED, TurnState.FAILED, TurnState.STOPPED].includes(turn.state);
+  return Boolean(turn?.providerRunId || turn?.createRequestId) && !turn.completedAt && ![TurnState.COMPLETED, TurnState.FAILED, TurnState.STOPPED].includes(turn.state);
 }
 
 export async function modelRunCall(op, body = {}) {
@@ -298,6 +298,7 @@ export async function modelRunCall(op, body = {}) {
   if (!token) {
     const error = new Error("missing home launch token in Home GUI shell");
     error.code = "missing-home-launch-token";
+    error.preDispatchRefusal = true;
     throw error;
   }
   const res = await fetch(
@@ -384,6 +385,10 @@ export async function streamChatViaContract(
   };
   const run = { id: null, patch, cancelRequested: false, cancelPromise: null };
   activeRun = run;
+  if (turn.createRequestId && !turn.providerRunId) {
+    activeRun = null;
+    throw contractError("run_acceptance_unknown", "Run acceptance is unknown. Start a new chat.");
+  }
   /* The typed text input has no sampling knobs; the offer's policy owns them.
      maxTokens shaped the context budget upstream and stays on the manifest. */
   void clampLiveMaxTokens(maxTokens);
@@ -394,18 +399,26 @@ export async function streamChatViaContract(
   }
   const resuming = Boolean(turn.providerRunId);
   let created;
+  let runId;
+  const createRequestId = resuming ? null : newRequestId();
+  if (!resuming) patch({ createRequestId, state: TurnState.SUBMITTED, completedAt: null });
   try {
     created = resuming
       ? await modelRunCall("runs_get", { run_id: turn.providerRunId, request_id: newRequestId() })
-      : await modelRunCall("runs_create", textRunCreateBody({ offer, messages, requestId: newRequestId() }));
+      : await modelRunCall("runs_create", textRunCreateBody({ offer, messages, requestId: createRequestId }));
+    runId = typeof created?.run_id === "string" ? created.run_id : "";
+    if (!runId || runId.trim() !== runId || runId.length > 80 || (resuming && runId !== turn.providerRunId)) {
+      throw contractError("no_run_id", "contract returned no run id");
+    }
   } catch (error) {
     if (activeRun === run) activeRun = null;
+    if (!resuming) {
+      const refused = error.preDispatchRefusal === true;
+      patch({ state: refused ? TurnState.FAILED : TurnState.SETTLEMENT_UNKNOWN,
+        error: refused ? error.code : "run_acceptance_unknown", completedAt: refused ? Date.now() : null });
+      if (!refused) throw contractError("run_acceptance_unknown", "Run acceptance is unknown. Start a new chat.");
+    }
     throw error;
-  }
-  const runId = String(created?.run_id || "");
-  if (!runId || (resuming && runId !== turn.providerRunId)) {
-    if (activeRun === run) activeRun = null;
-    throw contractError("no_run_id", "contract returned no run id");
   }
   if (resuming && activeRun !== run) {
     return { detached: true, turnManifest: turn };

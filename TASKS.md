@@ -58,8 +58,9 @@ Open gates, in order:
 
 1. [ ] The Mac proof owner completes behavior acceptance on the installed
    model Home; exact installed artifact provenance is in [state.md](state.md).
-   Complete installed draft preservation, reload and restart recovery, retained
-   terminal results, and cleanup. Fresh completion and an explicit Stop with
+   Complete installed draft preservation, unknown create-acceptance handling,
+   reload and restart recovery, retained terminal results, and cleanup.
+   Fresh completion and an explicit Stop with
    terminal unknown settlement are recorded in [state.md](state.md).
    Backend stop or honest unknown settlement remains the cancellation rule,
    with one terminal result and no duplicate dispatch. Keep each explicit

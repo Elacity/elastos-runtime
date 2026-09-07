@@ -63,7 +63,7 @@ for (const gone of ["mock-agent-provider.js", "agent-grants.js", "agent-studio.j
 
 assert.ok(agentLive.includes('from "./model-contract.js"'), "agent-live speaks the typed contract module");
 assert.ok(agentLive.includes("after_sequence: afterSequence"), "runs_events is polled by after_sequence");
-assert.ok(agentLive.includes("textRunCreateBody({ offer, messages, requestId: newRequestId() })"));
+assert.ok(agentLive.includes("textRunCreateBody({ offer, messages, requestId: createRequestId })"));
 assert.ok(agentLive.includes('modelRunCall("runs_cancel", { run_id: runId, request_id: newRequestId() })'));
 assert.ok(!agentLive.includes("agent-run-cursor"), "the URUX cursor helper is gone");
 
