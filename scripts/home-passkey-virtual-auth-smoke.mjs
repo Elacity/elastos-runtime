@@ -2603,13 +2603,13 @@ async function signBackIn(page) {
     state.shell === "resolving" &&
       state.gui === "dormant" &&
       state.activeShellRootHidden &&
-      !state.activeShellFrameSrc &&
+      ["", "about:blank"].includes(state.activeShellFrameSrc) &&
       !state.hostGuiDomPresent,
     "A Home shell remained mounted behind the passkey prompt",
     state,
   );
   const clickTokenPromise = captureNextPasskeyToken(page).catch(() => null);
-  await page.locator("#home-unlock-primary").click();
+  await page.getByRole("button", { name: /^Use passkey/ }).click();
   await waitForSignedHome(page);
   const token = await settleTokenWithin(clickTokenPromise, 1_000)
     || await settleTokenWithin(tokenPromise, 1_000);
@@ -3586,6 +3586,7 @@ async function main() {
 
   const context = await chromium.launchPersistentContext(PROFILE_DIR, {
     headless: HEADLESS,
+    executablePath: process.env.ELASTOS_BROWSER_EXECUTABLE || undefined,
     ignoreHTTPSErrors: true,
     viewport: { width: 1280, height: 900 },
   });
@@ -3646,6 +3647,11 @@ async function main() {
     const report = {
       schema: "elastos.home.passkey-virtual-auth-smoke/v1",
       ok: true,
+      viewer: {
+        version: context.browser()?.version() || null,
+        executable_override: Boolean(process.env.ELASTOS_BROWSER_EXECUTABLE),
+        headed: !HEADLESS,
+      },
       home_url: HOME_URL,
       profile_dir: PROFILE_DIR,
       created_mode: created.mode,
