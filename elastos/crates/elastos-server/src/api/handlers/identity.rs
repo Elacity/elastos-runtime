@@ -439,6 +439,7 @@ fn issue_passkey_session_grant_for_registration(
             user_verified: outcome.user_verified,
             display_name: None,
             reason: "passkey registration verified and session granted",
+            profile_display_name: None,
             purpose: crate::auth::PasskeySessionPurpose::GuestRegistration,
         },
     )
@@ -474,6 +475,7 @@ fn issue_passkey_session_grant(
             user_verified,
             display_name: None,
             reason,
+            profile_display_name: None,
             purpose: crate::auth::PasskeySessionPurpose::SignIn,
         },
     )

@@ -1087,7 +1087,7 @@ fn decode_profile_signing_seed(value: &str) -> anyhow::Result<[u8; 32]> {
     Ok(seed)
 }
 
-fn clean_profile_display_name(input: &str) -> anyhow::Result<String> {
+pub(crate) fn clean_profile_display_name(input: &str) -> anyhow::Result<String> {
     let display_name = crate::auth::clean_principal_display_name(Some(input))?
         .ok_or_else(|| anyhow!("display name must not be empty"))?;
     let normalized = display_name.to_ascii_lowercase();

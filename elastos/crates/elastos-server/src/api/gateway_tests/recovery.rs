@@ -38,25 +38,12 @@ async fn export_full_recovery_bundle_response(
     authority: &TestPasskeyAuthority,
     principal: &crate::auth::PrincipalRecord,
 ) -> Response {
-    export_full_recovery_bundle_with_profile(app, data_dir, authority, principal, None).await
-}
-
-async fn export_full_recovery_bundle_with_profile(
-    app: &axum::Router,
-    data_dir: &std::path::Path,
-    authority: &TestPasskeyAuthority,
-    principal: &crate::auth::PrincipalRecord,
-    display_name: Option<&str>,
-) -> Response {
-    let mut intent = json!({
+    let intent = json!({
         "principal_id": authority.principal_id,
         "localhost_root": principal.localhost_root,
         "label": "Recovery test",
         "download_password": null,
     });
-    if let Some(name) = display_name {
-        intent["profile_display_name"] = json!(name);
-    }
     let step_up = step_up_token_for_app_context(
         data_dir,
         SYSTEM_CAPSULE_ID,
@@ -207,6 +194,15 @@ async fn full_recovery_setup_preserves_identity_and_requires_successful_profile_
     )
     .unwrap();
     assert_eq!(old["included"]["people_identity"], false);
+    let (status, _) = super::home_system::home_test_post_json(
+        &ready,
+        "/api/apps/people/profile",
+        &authority.people_token,
+        "null",
+        json!({"display_name": "Edited Name"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     let unavailable = gateway_router(
         wallet_test_state_with_shared_provider(
             dir.path(),
@@ -214,14 +210,9 @@ async fn full_recovery_setup_preserves_identity_and_requires_successful_profile_
         )
         .await,
     );
-    let failed = export_full_recovery_bundle_with_profile(
-        &unavailable,
-        dir.path(),
-        &authority,
-        &principal,
-        Some("Edited Name"),
-    )
-    .await;
+    let failed =
+        export_full_recovery_bundle_response(&unavailable, dir.path(), &authority, &principal)
+            .await;
     assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let profile = crate::collaboration_profile_authority::load_profile_authority(
         dir.path(),
@@ -246,20 +237,8 @@ async fn full_recovery_setup_preserves_identity_and_requires_successful_profile_
         .any(|action| action == "download_recovery_kit_with_profile"));
     let restarted = gateway_router(wallet_test_state(dir.path()).await);
     let (first, second) = tokio::join!(
-        export_full_recovery_bundle_with_profile(
-            &restarted,
-            dir.path(),
-            &authority,
-            &principal,
-            Some("Edited Name")
-        ),
-        export_full_recovery_bundle_with_profile(
-            &restarted,
-            dir.path(),
-            &authority,
-            &principal,
-            Some("Another Name")
-        ),
+        export_full_recovery_bundle_response(&restarted, dir.path(), &authority, &principal,),
+        export_full_recovery_bundle_response(&restarted, dir.path(), &authority, &principal,),
     );
     assert_eq!(first.status(), StatusCode::OK);
     assert_eq!(second.status(), StatusCode::OK);
@@ -321,7 +300,7 @@ fn full_recovery_setup_concurrent_initial_profile_keeps_one_key() {
 }
 
 #[tokio::test]
-async fn full_recovery_setup_rejects_changed_name_and_wrong_actor_before_effects() {
+async fn full_recovery_export_rejects_changed_intent_and_wrong_actor_before_effects() {
     for wrong_actor in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let authority = passkey_authority_with_name(dir.path(), Some("alex"));
@@ -331,7 +310,7 @@ async fn full_recovery_setup_rejects_changed_name_and_wrong_actor_before_effects
         let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
         let app = gateway_router(wallet_test_state(dir.path()).await);
         let mut intent = json!({"principal_id": principal.principal_id, "localhost_root": principal.localhost_root,
-            "label": "Recovery test", "download_password": null, "profile_display_name": "Alex"});
+            "label": "Recovery test", "download_password": null});
         let step_up = step_up_token_for_app_context(
             dir.path(),
             SYSTEM_CAPSULE_ID,
@@ -340,7 +319,7 @@ async fn full_recovery_setup_rejects_changed_name_and_wrong_actor_before_effects
             &intent,
         );
         if !wrong_actor {
-            intent["profile_display_name"] = json!("Changed");
+            intent["label"] = json!("Changed");
         }
         intent["schema"] = json!("elastos.full-recovery-bundle.export.request/v1");
         intent["step_up_token"] = json!(step_up);
@@ -1160,6 +1139,80 @@ async fn test_full_recovery_bundle_recovers_existing_account_under_new_passkey()
 /// through the normal signed-revision path, reported honestly in the response.
 #[tokio::test]
 async fn test_full_recovery_bundle_restores_people_identity_on_a_fresh_machine() {
+    assert_fresh_machine_full_recovery(false).await;
+}
+
+#[tokio::test]
+async fn test_full_recovery_after_real_enrollment_preserves_single_profile() {
+    assert_fresh_machine_full_recovery(true).await;
+}
+
+async fn enroll_recovering_device_with_current_flow(app: &axum::Router) -> Value {
+    let request = |path: &str, cookie: &str, body: Value| {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("host", "localhost:61180")
+            .header("origin", "http://localhost:61180")
+            .header("cookie", cookie)
+            .header(CONTENT_TYPE, "application/json")
+            .extension(axum::extract::ConnectInfo(
+                "127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let begin = app
+        .clone()
+        .oneshot(request(
+            "/api/auth/passkey/register/begin",
+            "",
+            json!({"intent": {"purpose": "recover"}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(begin.status(), StatusCode::OK);
+    let cookie = begin.headers()[axum::http::header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let begin: Value = serde_json::from_slice(
+        &axum::body::to_bytes(begin.into_body(), 65536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let attestation = crate::auth::owner_attestation_for_test(
+        begin["options"]["publicKey"]["challenge"].as_str().unwrap(),
+        "localhost",
+        "http://localhost:61180",
+    );
+    let complete = app
+        .clone()
+        .oneshot(request(
+            "/api/auth/passkey/register/complete",
+            &cookie,
+            json!({
+                "ceremony_id": begin["ceremony_id"],
+                "response": attestation,
+                "intent": {"purpose": "recover"}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(complete.status(), StatusCode::OK);
+    serde_json::from_slice(
+        &axum::body::to_bytes(complete.into_body(), 65536)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+async fn assert_fresh_machine_full_recovery(real_enrollment: bool) {
     let original_dir = tempfile::tempdir().unwrap();
     let (original_state, _original_provider) =
         wallet_chain_test_state_with_observer(original_dir.path()).await;
@@ -1171,12 +1224,20 @@ async fn test_full_recovery_bundle_restores_people_identity_on_a_fresh_machine()
     )
     .unwrap();
     let _ = elastos_identity::load_or_create_did(original_dir.path()).unwrap();
+    let (status, _) = super::home_system::home_test_post_json(
+        &original_app,
+        "/api/apps/people/profile",
+        &original.people_token,
+        "null",
+        json!({"display_name": "Original Person"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     let export_intent = json!({
         "principal_id": original.principal_id,
         "localhost_root": original_principal.localhost_root,
         "label": "Everything",
         "download_password": "test password",
-        "profile_display_name": "Original Person",
     });
     let fresh_token = step_up_token_for_app_context(
         original_dir.path(),
@@ -1200,7 +1261,6 @@ async fn test_full_recovery_bundle_restores_people_identity_on_a_fresh_machine()
                         "localhost_root": export_intent["localhost_root"],
                         "label": export_intent["label"],
                         "step_up_token": fresh_token,
-                        "profile_display_name": "Original Person",
                         "download_password": "test password"
                     })
                     .to_string(),
@@ -1228,13 +1288,33 @@ async fn test_full_recovery_bundle_restores_people_identity_on_a_fresh_machine()
     // The fresh machine: a different data root whose device key cannot be the
     // original's.
     let fresh_dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(fresh_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let (fresh_state, _fresh_provider) =
         wallet_chain_test_state_with_observer(fresh_dir.path()).await;
     let fresh_app = gateway_router(fresh_state);
-    let replacement = passkey_authority_with_name(fresh_dir.path(), Some("replacement"));
+    let replacement = if real_enrollment {
+        enroll_recovering_device_with_current_flow(&fresh_app).await
+    } else {
+        let authority = passkey_authority_with_name(fresh_dir.path(), Some("replacement"));
+        json!({
+            "principal_id": authority.principal_id,
+            "proof_binding_id": authority.proof_binding_id,
+            "system_token": authority.system_token
+        })
+    };
     let replacement_principal = crate::auth::load_principal_for_proof_binding(
         fresh_dir.path(),
-        &replacement.proof_binding_id,
+        replacement["proof_binding_id"].as_str().unwrap(),
+    )
+    .unwrap();
+    let replacement_profile = crate::collaboration_profile_authority::load_profile_authority(
+        fresh_dir.path(),
+        &replacement_principal.principal_id,
+        &replacement_principal.localhost_root,
     )
     .unwrap();
 
@@ -1244,12 +1324,15 @@ async fn test_full_recovery_bundle_restores_people_identity_on_a_fresh_machine()
             test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/auth/recovery/full-import")
-                .header("x-elastos-home-token", replacement.system_token.as_str())
+                .header(
+                    "x-elastos-home-token",
+                    replacement["system_token"].as_str().unwrap(),
+                )
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
                         "schema": "elastos.full-recovery-bundle.import.request/v1",
-                        "principal_id": replacement.principal_id,
+                        "principal_id": replacement["principal_id"],
                         "localhost_root": replacement_principal.localhost_root,
                         "package": export_json,
                         "password": "test password",
@@ -1274,7 +1357,11 @@ async fn test_full_recovery_bundle_restores_people_identity_on_a_fresh_machine()
     let import_json: serde_json::Value = serde_json::from_str(&import_text).unwrap();
     assert_eq!(import_json["status"], "reassigned");
     let people = &import_json["people_identity_restore"];
-    assert_eq!(people["status"], "restored");
+    assert_eq!(
+        people["status"], "restored",
+        "People restore status={} reason={}",
+        people["status"], people["reason"]
+    );
     assert_eq!(people["profile_did"], profile_did);
     assert_eq!(people["rebound_device"], true);
     assert_eq!(people["contact_store_restored"], false);
@@ -1296,6 +1383,10 @@ async fn test_full_recovery_bundle_restores_people_identity_on_a_fresh_machine()
     assert_eq!(recovered_head.document().display_name, "Original Person");
     let (_, fresh_device_did) = elastos_identity::load_or_create_did(fresh_dir.path()).unwrap();
     assert!(recovered_head.authorizes_endpoint(&fresh_device_did));
+    assert!(
+        replacement_profile.is_none(),
+        "recovery entry created an extra public Profile before restoring the original identity"
+    );
 }
 
 struct MalformedFullRecoveryWalletProvider;

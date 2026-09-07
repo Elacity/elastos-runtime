@@ -36,6 +36,26 @@ pub struct StoredCredential {
 pub struct IdentityData {
     pub user_id: String,
     pub credentials: Vec<StoredCredential>,
+    #[serde(default)]
+    removal_generation: u64,
+}
+
+/// Immutable key history at accepted verification. Sign counters and additions
+/// can advance while Runtime reconciles another registration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestCredentialHistory {
+    removal_generation: u64,
+    keys: Vec<[u8; 32]>,
+}
+
+fn credential_key_digest(key: &StoredCredential) -> anyhow::Result<[u8; 32]> {
+    Ok(Sha256::digest(serde_json::to_vec(&(
+        &key.credential_id,
+        &key.rp_id,
+        &key.public_key,
+    ))?)
+    .into())
 }
 
 /// On-disk encrypted envelope
@@ -461,6 +481,70 @@ impl IdentityStore {
         result
     }
 
+    pub(crate) fn guest_credential_history(&self) -> anyhow::Result<GuestCredentialHistory> {
+        let data = self
+            .data
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("guest credential history missing"))?;
+        if data.credentials.len() > 1024 || data.removal_generation == u64::MAX {
+            anyhow::bail!("guest credential history limit exceeded");
+        }
+        Ok(GuestCredentialHistory {
+            removal_generation: data.removal_generation,
+            keys: data
+                .credentials
+                .iter()
+                .map(credential_key_digest)
+                .collect::<anyhow::Result<_>>()?,
+        })
+    }
+
+    /// Append only to the exact verified history, or reconcile the same saved key.
+    pub(crate) fn persist_guest_candidate(
+        &mut self,
+        candidate: &StoredCredential,
+        previous_history: &GuestCredentialHistory,
+    ) -> anyhow::Result<StoredCredential> {
+        let files = self.files()?;
+        let result = (|| {
+            self.reload_locked(&files)?;
+            let current_history = self.guest_credential_history()?;
+            if current_history.removal_generation != previous_history.removal_generation
+                || !previous_history
+                    .keys
+                    .iter()
+                    .all(|key| current_history.keys.contains(key))
+            {
+                anyhow::bail!("guest credential history removed or changed keys");
+            }
+            let data = self
+                .data
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("guest credential history missing"))?;
+            if let Some(existing) = data
+                .credentials
+                .iter()
+                .find(|item| item.credential_id == candidate.credential_id)
+            {
+                if existing.public_key != candidate.public_key
+                    || existing.rp_id != candidate.rp_id
+                    || existing.sign_count < candidate.sign_count
+                {
+                    anyhow::bail!("guest credential conflicts");
+                }
+                files.sync()?;
+                return Ok(existing.clone());
+            }
+            self.add_credential(candidate.clone());
+            self.save_locked(&files)?;
+            Ok(candidate.clone())
+        })();
+        if result.is_err() {
+            let _ = self.reload_locked(&files);
+        }
+        result
+    }
+
     /// Return the device key as a hex string (for passing to providers).
     pub fn device_key_hex(&self) -> String {
         hex::encode(self.device_key.as_ref())
@@ -502,6 +586,7 @@ impl IdentityStore {
             self.data = Some(IdentityData {
                 user_id: user_id.clone(),
                 credentials: vec![credential],
+                removal_generation: 0,
             });
         }
 
@@ -532,7 +617,11 @@ impl IdentityStore {
         let before = data.credentials.len();
         data.credentials
             .retain(|cred| cred.credential_id != credential_id);
-        data.credentials.len() != before
+        let removed = data.credentials.len() != before;
+        if removed {
+            data.removal_generation = data.removal_generation.saturating_add(1);
+        }
+        removed
     }
 }
 
@@ -659,6 +748,69 @@ mod tests {
         assert_eq!(winner.len(), 1);
         for (_, credentials) in results {
             assert_eq!(credentials[0].credential_id, winner[0].credential_id);
+        }
+    }
+
+    #[test]
+    fn guest_history_allows_counter_advance_and_unrelated_addition() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut current = IdentityStore::new(dir.path()).unwrap();
+        current.add_credential(persistence_credential("admin", 1));
+        current.save().unwrap();
+        let history = current.guest_credential_history().unwrap();
+        let mut pending = IdentityStore::new(dir.path()).unwrap();
+        pending.load().unwrap();
+        current.update_sign_count("admin", 3);
+        current.add_credential(persistence_credential("other-guest", 0));
+        current.save().unwrap();
+        let guest = persistence_credential("guest", 0);
+        pending.persist_guest_candidate(&guest, &history).unwrap();
+        assert_eq!(pending.get_credentials().len(), 3);
+        assert_eq!(pending.get_credentials()[0].sign_count, 3);
+        let bytes = std::fs::read(&pending.path).unwrap();
+        pending.persist_guest_candidate(&guest, &history).unwrap();
+        assert_eq!(std::fs::read(&pending.path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn guest_history_rejects_removed_or_conflicting_keys_without_writes() {
+        for change in [
+            "remove-admin",
+            "change-admin",
+            "remove-guest",
+            "conflict-guest",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = IdentityStore::new(dir.path()).unwrap();
+            store.add_credential(persistence_credential("admin", 1));
+            store.save().unwrap();
+            let history = store.guest_credential_history().unwrap();
+            let guest = persistence_credential("guest", 0);
+            match change {
+                "remove-admin" => {
+                    assert!(store.remove_credential("admin"));
+                }
+                "change-admin" => {
+                    store.data.as_mut().unwrap().credentials[0].public_key = "changed".into()
+                }
+                "remove-guest" => {
+                    store.persist_guest_candidate(&guest, &history).unwrap();
+                    assert!(store.remove_credential("guest"));
+                }
+                "conflict-guest" => {
+                    let mut conflict = guest.clone();
+                    conflict.public_key = "changed".into();
+                    store.add_credential(conflict);
+                }
+                _ => unreachable!(),
+            }
+            store.save().unwrap();
+            let bytes = std::fs::read(&store.path).unwrap();
+            assert!(
+                store.persist_guest_candidate(&guest, &history).is_err(),
+                "{change}"
+            );
+            assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
         }
     }
 

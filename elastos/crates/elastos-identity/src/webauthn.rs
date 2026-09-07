@@ -29,6 +29,7 @@ enum ChallengeType {
 
 struct PendingChallenge {
     challenge: Vec<u8>,
+    registration_binding: Option<[u8; 32]>,
     challenge_type: ChallengeType,
     created: Instant,
 }
@@ -258,6 +259,69 @@ impl IdentityManager {
         self.store.persist_first_owner(&candidate.credential)
     }
 
+    pub fn guest_credential_history(&self) -> anyhow::Result<crate::store::GuestCredentialHistory> {
+        self.store.guest_credential_history()
+    }
+
+    /// Runtime durably binds the verified guest candidate before this effect.
+    pub fn persist_guest_candidate(
+        &mut self,
+        candidate: &RegistrationCandidate,
+        previous_history: &crate::store::GuestCredentialHistory,
+    ) -> anyhow::Result<StoredCredential> {
+        self.store
+            .persist_guest_candidate(&candidate.credential, previous_history)
+    }
+
+    pub fn begin_bound_principal_registration(
+        &mut self,
+        ceremony: &str,
+        rp_id: &str,
+        origin: &str,
+        binding: [u8; 32],
+    ) -> anyhow::Result<CreationOptions> {
+        self.cleanup_expired();
+        if ceremony.len() > 128
+            || rp_id.len() > 253
+            || origin.len() > 512
+            || self.challenges.len() >= 16
+        {
+            anyhow::bail!("guided registration limit exceeded");
+        }
+        let options = self.begin_principal_registration(ceremony, rp_id, origin)?;
+        self.challenges
+            .get_mut(ceremony)
+            .expect("created challenge")
+            .registration_binding = Some(binding);
+        Ok(options)
+    }
+
+    pub fn verify_bound_registration(
+        &self,
+        ceremony: &str,
+        response: &RegistrationResponse,
+        rp_id: &str,
+        origin: &str,
+        binding: [u8; 32],
+    ) -> anyhow::Result<RegistrationCandidate> {
+        let pending = self
+            .challenges
+            .get(ceremony)
+            .ok_or_else(|| anyhow::anyhow!("registration challenge unavailable"))?;
+        if pending.created.elapsed() > CHALLENGE_EXPIRY
+            || pending.registration_binding != Some(binding)
+            || !matches!(&pending.challenge_type, ChallengeType::Registration { rp_id: saved_rp, rp_origin: saved_origin } if saved_rp == rp_id && saved_origin == origin)
+        {
+            anyhow::bail!("registration binding mismatch");
+        }
+        Self::verify_registration_candidate(
+            response,
+            rp_id,
+            origin,
+            &URL_SAFE_NO_PAD.encode(&pending.challenge),
+        )
+    }
+
     /// Revoke one passkey credential from the local identity store.
     pub fn revoke_credential(&mut self, credential_id: &str) -> anyhow::Result<StoredCredential> {
         let credential = self
@@ -370,6 +434,7 @@ impl IdentityManager {
             session_token.to_string(),
             PendingChallenge {
                 challenge,
+                registration_binding: None,
                 challenge_type: ChallengeType::Registration {
                     rp_id: rp_id.to_string(),
                     rp_origin: rp_origin.to_string(),
@@ -389,6 +454,13 @@ impl IdentityManager {
         rp_id: &str,
         rp_origin: &str,
     ) -> anyhow::Result<RegistrationOutcome> {
+        if self
+            .challenges
+            .get(session_token)
+            .is_some_and(|pending| pending.registration_binding.is_some())
+        {
+            anyhow::bail!("guided registration intent required");
+        }
         let pending = self
             .challenges
             .remove(session_token)
@@ -573,6 +645,7 @@ impl IdentityManager {
             PendingChallenge {
                 challenge,
                 challenge_type: ChallengeType::Authentication,
+                registration_binding: None,
                 created: Instant::now(),
             },
         );
@@ -1151,6 +1224,48 @@ mod tests {
             assert!(manager.credentials().is_empty());
             assert!(!temp.path().join("identity/credentials.json").exists());
         }
+    }
+
+    #[test]
+    fn guided_registration_bounds_challenges_and_requires_exact_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = IdentityManager::new(temp.path().into()).unwrap();
+        let rp = "home.example";
+        let origin = "https://home.example";
+        let options = manager
+            .begin_bound_principal_registration("first", rp, origin, [1; 32])
+            .unwrap();
+        let response = registration_response(&options.public_key.challenge, rp, origin);
+        assert!(manager
+            .complete_registration("first", &response, rp, origin)
+            .is_err());
+        assert!(manager
+            .verify_bound_registration("first", &response, rp, origin, [2; 32])
+            .is_err());
+        assert!(manager
+            .verify_bound_registration("first", &response, rp, origin, [1; 32])
+            .is_ok());
+        for n in 1..16 {
+            manager
+                .begin_bound_principal_registration(&format!("pending-{n}"), rp, origin, [1; 32])
+                .unwrap();
+        }
+        assert!(manager
+            .begin_bound_principal_registration("overflow", rp, origin, [1; 32])
+            .is_err());
+        manager.expire_challenge_for_test("first");
+        assert!(manager
+            .verify_bound_registration("first", &response, rp, origin, [1; 32])
+            .is_err());
+        manager
+            .begin_bound_principal_registration("replacement", rp, origin, [1; 32])
+            .unwrap();
+        assert!(manager.credentials().is_empty());
+        assert!(!temp.path().join("identity/credentials.json").exists());
+        let restarted = IdentityManager::new(temp.path().into()).unwrap();
+        assert!(restarted
+            .verify_bound_registration("first", &response, rp, origin, [1; 32])
+            .is_err());
     }
 
     #[test]

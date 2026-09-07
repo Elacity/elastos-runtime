@@ -240,8 +240,6 @@ pub struct FullRecoveryBundleExportRequest {
     pub step_up_token: String,
     #[serde(default)]
     pub download_password: Option<String>,
-    #[serde(default)]
-    pub profile_display_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -321,6 +319,14 @@ pub struct PasskeyBeginResponse<T> {
     pub schema: String,
     pub ceremony_id: String,
     pub options: T,
+    #[serde(skip)]
+    guest_client_cookie: Option<HeaderValue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyRegisterBeginRequest {
+    pub(crate) intent: Option<crate::auth::PasskeyEnrollmentIntent>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -328,8 +334,20 @@ pub struct PasskeyBeginResponse<T> {
 pub struct PasskeyRegisterCompleteRequest {
     pub ceremony_id: String,
     pub response: Option<RegistrationResponse>,
-    #[serde(default)]
+    pub(crate) intent: Option<crate::auth::PasskeyEnrollmentIntent>,
+    #[serde(default, deserialize_with = "reject_registration_name_field")]
     pub display_name: Option<String>,
+    #[serde(default, deserialize_with = "reject_registration_name_field")]
+    pub profile_display_name: Option<String>,
+}
+
+fn reject_registration_name_field<'de, D>(_: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Err(serde::de::Error::custom(
+        "Use the enrollment intent for account setup",
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -541,13 +559,46 @@ pub async fn passkey_register_begin(
     State(state): State<GatewayState>,
     peer: Option<ConnectInfo<SocketAddr>>,
     mut headers: HeaderMap,
+    Json(input): Json<PasskeyRegisterBeginRequest>,
 ) -> Response {
+    if input.intent.is_none() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Enrollment intent is required",
+        )
+            .into_response();
+    }
+    if let Some(crate::auth::PasskeyEnrollmentIntent::Create { public_name }) =
+        input.intent.as_ref()
+    {
+        let valid_name = crate::auth::validate_owner_enrollment_intent(input.intent.as_ref())
+            .is_ok()
+            && crate::collaboration_profile_authority::clean_profile_display_name(public_name)
+                .is_ok();
+        if !valid_name {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Choose a public display name",
+            )
+                .into_response();
+        }
+    }
     let local_first_owner = local_first_owner_registration(&headers, peer.map(|peer| peer.0));
     if let Err(err) = prepare_owner_claim(&mut headers, local_first_owner) {
         return auth_error_response(err);
     }
-    match passkey_register_begin_inner(&state, &headers, local_first_owner).await {
-        Ok(response) => with_owner_claim_cookie(&headers, Json(response).into_response()),
+    let intent = input.intent;
+    match passkey_register_begin_inner(&state, &headers, local_first_owner, intent.as_ref()).await {
+        Ok(mut response) => {
+            let guest_cookie = response.guest_client_cookie.take();
+            let mut response = Json(response).into_response();
+            if let Some(cookie) = guest_cookie {
+                response.headers_mut().append(SET_COOKIE, cookie);
+                response
+            } else {
+                with_owner_claim_cookie(&headers, response)
+            }
+        }
         Err(err) => auth_error_response(err),
     }
 }
@@ -558,6 +609,16 @@ pub async fn passkey_register_complete(
     headers: HeaderMap,
     Json(input): Json<PasskeyRegisterCompleteRequest>,
 ) -> Response {
+    if input.intent.is_none()
+        || input.display_name.is_some()
+        || input.profile_display_name.is_some()
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Use the enrollment intent for account setup",
+        )
+            .into_response();
+    }
     let local_first_owner = local_first_owner_registration(&headers, peer.map(|peer| peer.0));
     match passkey_register_complete_inner(&state, &headers, input, local_first_owner).await {
         Ok(response) => passkey_verified_response(&headers, response),
@@ -1042,9 +1103,118 @@ pub(crate) fn principal_root_protected_object_inventory(
     inventory
 }
 
-/// Synchronous so the activation guard (a mutex guard) never enters the
-/// export handler's async state machine. Consumes the step-up, creates or
-/// loads the kit, and migrates any first-run plaintext under the same guard.
+pub(in crate::api) fn initialize_local_profile(
+    state: &GatewayState,
+    principal: &crate::auth::PrincipalRecord,
+    session_id: &str,
+    display_name: &str,
+) -> anyhow::Result<()> {
+    crate::collaboration_profile_authority::require_profile_authority_passkey_binding(
+        &state.data_dir,
+        &principal.principal_id,
+        Some(&principal.proof_binding_id),
+    )?;
+    if crate::collaboration_profile_authority::load_profile_authority(
+        &state.data_dir,
+        &principal.principal_id,
+        &principal.localhost_root,
+    )?
+    .is_some()
+    {
+        return Ok(());
+    }
+    crate::collaboration_profile_authority::validate_profile_authority_update(
+        &state.data_dir,
+        display_name,
+        None,
+    )?;
+    {
+        let inventory =
+            principal_root_protected_object_inventory(&state.data_dir, &principal.localhost_root);
+        let activation = crate::auth::begin_declarative_principal_root_protection_activation_migrating_plaintext(
+            &state.data_dir, &principal.principal_id, &principal.localhost_root, &inventory,
+        )?;
+        crate::auth::ensure_online_plaintext_migration_is_possible(&activation.plaintext_objects)?;
+        if crate::auth::load_principal_root_protection(
+            &state.data_dir,
+            &principal.principal_id,
+            &principal.localhost_root,
+        )?
+        .is_none()
+        {
+            recovery_kit_get_or_create_for_principal(
+                state,
+                session_id,
+                principal,
+                None,
+                RecoveryKitDelivery::RetainedUnseen,
+                crate::auth::now_ts(),
+            )?;
+        }
+        if !activation.plaintext_objects.is_empty() {
+            let migrated = crate::auth::migrate_principal_root_plaintext_objects_under_activation(
+                &activation.guard,
+                &state.data_dir,
+                &principal.principal_id,
+                &principal.localhost_root,
+                activation.plaintext_objects.clone(),
+            )?;
+            crate::auth::append_audit_event(
+                &state.data_dir,
+                audit_event(AuditEventInput {
+                    event_type: "auth.principal_root.plaintext_migrated",
+                    principal_id: Some(principal.principal_id.clone()),
+                    proof_binding_id: Some(principal.proof_binding_id.clone()),
+                    session_id: Some(session_id.to_string()),
+                    result: "ok",
+                    reason: "declared plaintext objects migrated during Profile setup",
+                    occurred_at: crate::auth::now_ts(),
+                    ..AuditEventInput::default()
+                }),
+            )?;
+            tracing::info!(
+                object_count = migrated.object_count,
+                "declared objects migrated during Profile setup"
+            );
+        }
+    }
+    #[cfg(test)]
+    local_profile_setup_test_fault(&state.data_dir, "after-root")?;
+    crate::collaboration_profile_authority::ensure_initial_profile_authority(
+        &state.data_dir,
+        &principal.principal_id,
+        &principal.localhost_root,
+        &principal.proof_binding_id,
+        display_name,
+        crate::auth::now_ts(),
+    )?;
+    #[cfg(test)]
+    local_profile_setup_test_fault(&state.data_dir, "after-profile")?;
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOCAL_PROFILE_SETUP_FAULT: std::cell::RefCell<Option<(std::path::PathBuf, &'static str)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn local_profile_setup_test_fault(data_dir: &std::path::Path, point: &str) -> anyhow::Result<()> {
+    LOCAL_PROFILE_SETUP_FAULT.with(|slot| {
+        let mut fault = slot.borrow_mut();
+        if fault
+            .as_ref()
+            .is_some_and(|(path, selected)| path == data_dir && *selected == point)
+        {
+            *fault = None;
+            anyhow::bail!("injected local Profile setup failure");
+        }
+        Ok(())
+    })
+}
+
+/// Synchronous so the activation guard never enters the export handler's
+/// async state machine. Export consumes its own bound step-up.
 fn full_recovery_bundle_establish_kit(
     state: &GatewayState,
     launch: &super::gateway::RequiredHomeLaunchToken,
@@ -1069,15 +1239,12 @@ fn full_recovery_bundle_establish_kit(
     crate::auth::ensure_online_plaintext_migration_is_possible(
         &protection_activation.plaintext_objects,
     )?;
-    let mut intent = serde_json::json!({
+    let intent = serde_json::json!({
         "principal_id": input.principal_id,
         "localhost_root": input.localhost_root,
         "label": input.label,
         "download_password": input.download_password,
     });
-    if let Some(name) = &input.profile_display_name {
-        intent["profile_display_name"] = json!(name);
-    }
     consume_passkey_step_up_token(
         &state.data_dir,
         &input.step_up_token,
@@ -1088,7 +1255,7 @@ fn full_recovery_bundle_establish_kit(
     )?;
     let kit = recovery_kit_get_or_create_for_principal(
         state,
-        context,
+        &context.session_id,
         principal,
         input.label.as_deref(),
         RecoveryKitDelivery::RetainedUnseen,
@@ -1155,26 +1322,9 @@ async fn full_recovery_bundle_export_inner(
         );
     }
 
-    if let Some(name) = &input.profile_display_name {
-        crate::collaboration_profile_authority::validate_profile_authority_update(
-            &state.data_dir,
-            name,
-            None,
-        )?;
-    }
     let now = crate::auth::now_ts();
     let kit =
         full_recovery_bundle_establish_kit(state, &launch, &context, &principal, &input, now)?;
-    if let Some(name) = &input.profile_display_name {
-        crate::collaboration_profile_authority::ensure_initial_profile_authority(
-            &state.data_dir,
-            &principal.principal_id,
-            &principal.localhost_root,
-            &principal.proof_binding_id,
-            name,
-            now,
-        )?;
-    }
     let wallet_recovery_set = export_managed_recovery_set(state, &wallet_authority).await?;
     let wallet_recovery_keys = full_bundle_wallet_recovery_keys(wallet_recovery_set)?;
     let wallet_recovery_key_count = wallet_recovery_keys.len();
@@ -1565,7 +1715,7 @@ enum RecoveryKitDelivery {
 
 fn recovery_kit_get_or_create_for_principal(
     state: &GatewayState,
-    context: &super::gateway::HomeLaunchTokenContext,
+    session_id: &str,
     principal: &crate::auth::PrincipalRecord,
     label: Option<&str>,
     delivery: RecoveryKitDelivery,
@@ -1602,9 +1752,9 @@ fn recovery_kit_get_or_create_for_principal(
             event_type: "auth.recovery_kit.created",
             principal_id: Some(principal.principal_id.clone()),
             proof_binding_id: Some(principal.proof_binding_id.clone()),
-            session_id: Some(context.session_id.clone()),
+            session_id: Some(session_id.to_string()),
             result: "ok",
-            reason: "principal recovery kit created for full recovery bundle",
+            reason: "principal recovery material retained locally",
             occurred_at: now,
             ..AuditEventInput::default()
         }),
@@ -2914,13 +3064,14 @@ async fn passkey_register_begin_inner(
     state: &GatewayState,
     headers: &HeaderMap,
     local_first_owner: bool,
+    intent: Option<&crate::auth::PasskeyEnrollmentIntent>,
 ) -> anyhow::Result<PasskeyBeginResponse<Option<CreationOptions>>> {
     let ceremony_id = format!("passkey:register:{}", random_hex(16));
     let rp = super::handlers::identity::derive_rp(headers)?;
     let manager = state.identity_manager()?;
     let mut manager = manager.lock().await;
     let claimant = owner_claim(headers)?.unwrap_or_default();
-    if let Some((ceremony_id, options)) = crate::auth::begin_owner_enrollment(
+    if let Some((ceremony_id, options)) = crate::auth::begin_owner_enrollment_with_intent(
         &state.data_dir,
         &mut manager,
         &crate::auth::OwnerAdmission {
@@ -2930,23 +3081,62 @@ async fn passkey_register_begin_inner(
             loopback: local_first_owner,
         },
         &ceremony_id,
+        intent,
         crate::auth::now_ts(),
     )? {
         return Ok(PasskeyBeginResponse {
             schema: "elastos.auth.passkey.register.begin/v1".into(),
             ceremony_id,
             options,
+            guest_client_cookie: None,
         });
     }
     drop(manager);
     require_passkey_registration_allowed(state)?;
     let manager = state.identity_manager()?;
     let mut manager = manager.lock().await;
-    let options = manager.begin_principal_registration(&ceremony_id, &rp.id, &rp.origin)?;
+    let (options, guest_client_cookie) = if let Some(intent) = intent {
+        if !local_first_owner && !rp.origin.starts_with("https://") {
+            return Err(crate::auth::OwnerEnrollmentDenied.into());
+        }
+        // Guest admission above is separate from remote first-owner admission.
+        // This client claim has its own cookie namespace and no operator meaning.
+        let claim = guest_registration_client_claim(headers, &rp.origin)?
+            .unwrap_or_else(|| zeroize::Zeroizing::new(crate::auth::random_secret_hex()));
+        let options = crate::auth::begin_guest_registration(
+            &state.data_dir,
+            &mut manager,
+            &crate::auth::GuestRegistrationClient {
+                origin: &rp.origin,
+                rp_id: &rp.id,
+                client_claim: &claim,
+            },
+            &ceremony_id,
+            intent,
+        )?;
+        let mut cookie = HeaderValue::from_str(&format!(
+            "{}={}; Path=/; HttpOnly; SameSite=Strict{}",
+            guest_registration_cookie_name(&rp.origin),
+            claim.as_str(),
+            if rp.origin.starts_with("https://") {
+                "; Secure"
+            } else {
+                ""
+            },
+        ))?;
+        cookie.set_sensitive(true);
+        (options, Some(cookie))
+    } else {
+        (
+            manager.begin_principal_registration(&ceremony_id, &rp.id, &rp.origin)?,
+            None,
+        )
+    };
     Ok(PasskeyBeginResponse {
         schema: "elastos.auth.passkey.register.begin/v1".to_string(),
         ceremony_id,
         options: Some(options),
+        guest_client_cookie,
     })
 }
 
@@ -2960,7 +3150,14 @@ async fn passkey_register_complete_inner(
     let manager = state.identity_manager()?;
     let mut manager = manager.lock().await;
     let claimant = owner_claim(headers)?.unwrap_or_default();
-    if let Some(grant) = crate::auth::complete_owner_enrollment(
+    if let Some(name) = &input.profile_display_name {
+        crate::collaboration_profile_authority::validate_profile_authority_update(
+            &state.data_dir,
+            name,
+            None,
+        )?;
+    }
+    if let Some(grant) = crate::auth::complete_owner_enrollment_with_intent(
         &state.data_dir,
         &mut manager,
         &crate::auth::OwnerAdmission {
@@ -2971,7 +3168,13 @@ async fn passkey_register_complete_inner(
         },
         &input.ceremony_id,
         input.response.as_ref(),
-        input.display_name.as_deref(),
+        crate::auth::OwnerEnrollmentCompletion {
+            intent: input.intent.as_ref(),
+            names: crate::auth::OwnerEnrollmentNames {
+                display_name: input.display_name.as_deref(),
+                profile_display_name: input.profile_display_name.as_deref(),
+            },
+        },
         crate::auth::now_ts(),
     )? {
         drop(manager);
@@ -2981,6 +3184,27 @@ async fn passkey_register_complete_inner(
     require_passkey_registration_allowed(state)?;
     let manager = state.identity_manager()?;
     let mut manager = manager.lock().await;
+    if let Some(intent) = &input.intent {
+        let claim = guest_registration_client_claim(headers, &rp.origin)?
+            .ok_or(crate::auth::OwnerEnrollmentDenied)?;
+        let grant = crate::auth::complete_guest_registration(
+            &state.data_dir,
+            &mut manager,
+            &crate::auth::GuestRegistrationClient {
+                origin: &rp.origin,
+                rp_id: &rp.id,
+                client_claim: &claim,
+            },
+            &input.ceremony_id,
+            input
+                .response
+                .as_ref()
+                .ok_or(crate::auth::OwnerEnrollmentDenied)?,
+            intent,
+        )?;
+        drop(manager);
+        return passkey_response_for_grant(state, grant);
+    }
     let outcome = manager.complete_registration(
         &input.ceremony_id,
         input
@@ -3002,6 +3226,7 @@ async fn passkey_register_complete_inner(
             user_verified,
             display_name: input.display_name.as_deref(),
             reason: "passkey registration verified and session granted",
+            profile_display_name: input.profile_display_name.as_deref(),
             purpose: crate::auth::PasskeySessionPurpose::GuestRegistration,
         },
     )?;
@@ -3021,6 +3246,7 @@ async fn passkey_authenticate_begin_inner(
         schema: "elastos.auth.passkey.authenticate.begin/v1".to_string(),
         ceremony_id,
         options,
+        guest_client_cookie: None,
     })
 }
 
@@ -3089,6 +3315,40 @@ pub(in crate::api) fn local_first_owner_registration(
 }
 
 const OWNER_CLAIM_HEADER: &str = "x-elastos-owner-enrollment";
+
+fn guest_registration_cookie_name(origin: &str) -> &'static str {
+    if origin.starts_with("https://") {
+        "__Host-elastos-guest-registration"
+    } else {
+        "elastos-guest-registration"
+    }
+}
+
+fn guest_registration_client_claim(
+    headers: &HeaderMap,
+    origin: &str,
+) -> anyhow::Result<Option<zeroize::Zeroizing<String>>> {
+    let name = guest_registration_cookie_name(origin);
+    let cookies = headers.get_all(axum::http::header::COOKIE);
+    let mut claims = cookies
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|cookie| cookie.trim().split_once('='))
+        .filter(|(key, _)| *key == name);
+    let Some((_, claim)) = claims.next() else {
+        return Ok(None);
+    };
+    if claims.next().is_some()
+        || claim.len() != 64
+        || !claim
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(crate::auth::OwnerEnrollmentDenied.into());
+    }
+    Ok(Some(zeroize::Zeroizing::new(claim.to_string())))
+}
 
 pub(in crate::api) fn owner_claim(
     headers: &HeaderMap,
@@ -3815,6 +4075,7 @@ fn issue_named_passkey_session_grant(
             reason,
             display_name,
             purpose: crate::auth::PasskeySessionPurpose::SignIn,
+            profile_display_name: None,
         },
     )?;
     passkey_response_for_grant(state, grant)
@@ -3826,6 +4087,9 @@ fn passkey_response_for_grant(
 ) -> anyhow::Result<PasskeyVerifyResponse> {
     let principal =
         crate::auth::load_principal_for_proof_binding(&state.data_dir, &grant.proof_binding_id)?;
+    if let Some(name) = crate::auth::confirmed_initial_profile_name(&state.data_dir, &grant)? {
+        initialize_local_profile(state, &principal, &grant.session_id, &name)?;
+    }
     let home_token =
         issue_home_launch_token_for_auth_grant(&state.data_dir, HOME_CAPSULE_ID, &grant)?;
     let system_token = issue_home_launch_token_for_auth_grant(
@@ -4189,7 +4453,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_enrollment_routes_resume_persisted_candidate_after_reload() {
+    async fn owner_enrollment_initial_profile_resumes_without_export() {
         use super::super::handlers::identity::{self, IdentityState};
         use axum::{
             body::{to_bytes, Body},
@@ -4205,7 +4469,7 @@ mod tests {
 
         for direct in [false, true] {
             for public in [false, true] {
-                let root = tempfile::tempdir().unwrap();
+                let root = local_profile_fixture_root();
                 let _auth_dir =
                     super::super::gateway::set_test_home_launch_auth_data_dir(root.path());
                 let origin = if public {
@@ -4264,7 +4528,13 @@ mod tests {
                             .unwrap()
                     };
                 let app = make_router();
-                let mut begin_request = request("/begin", "", "", json!({}));
+                let intent = json!({"purpose": "create", "public_name": "Shared Name"});
+                let begin_body = if direct {
+                    json!({})
+                } else {
+                    json!({"intent": intent})
+                };
+                let mut begin_request = request("/begin", "", "", begin_body.clone());
                 if let Some(secret) = &secret {
                     begin_request
                         .headers_mut()
@@ -4299,8 +4569,30 @@ mod tests {
                 let body = if direct {
                     serde_json::to_value(attestation).unwrap()
                 } else {
-                    json!({"ceremony_id": ceremony, "response": attestation, "display_name": "Owner"})
+                    json!({"ceremony_id": ceremony, "response": attestation, "intent": intent})
                 };
+                if !direct {
+                    let auth_before =
+                        std::fs::read(crate::auth::auth_state_path(root.path()).unwrap()).unwrap();
+                    for invalid in [String::new(), "bad/name".into(), "x".repeat(65)] {
+                        let mut invalid_body = body.clone();
+                        invalid_body["intent"]["public_name"] = json!(invalid);
+                        let denied = app
+                            .clone()
+                            .oneshot(request("/complete", &cookie, &ceremony, invalid_body))
+                            .await
+                            .unwrap();
+                        assert_ne!(denied.status(), StatusCode::OK);
+                        assert_eq!(
+                            std::fs::read(crate::auth::auth_state_path(root.path()).unwrap())
+                                .unwrap(),
+                            auth_before
+                        );
+                        assert!(!elastos_identity::IdentityManager::new(root.path().into())
+                            .unwrap()
+                            .has_credential_history());
+                    }
+                }
                 if direct {
                     let denied = app
                         .clone()
@@ -4350,7 +4642,7 @@ mod tests {
                 );
                 let denied = app
                     .clone()
-                    .oneshot(request("/begin", &wrong_cookie, "", json!({})))
+                    .oneshot(request("/begin", &wrong_cookie, "", begin_body.clone()))
                     .await
                     .unwrap();
                 assert_eq!(denied.status(), StatusCode::FORBIDDEN);
@@ -4360,7 +4652,7 @@ mod tests {
                 );
                 let resumed = app
                     .clone()
-                    .oneshot(request("/begin", &cookie, "", json!({})))
+                    .oneshot(request("/begin", &cookie, "", begin_body))
                     .await
                     .unwrap();
                 assert_eq!(resumed.status(), StatusCode::OK);
@@ -4384,7 +4676,7 @@ mod tests {
                 let completion = if direct {
                     serde_json::Value::Null
                 } else {
-                    json!({"ceremony_id": ceremony})
+                    json!({"ceremony_id": ceremony, "intent": intent})
                 };
                 let first = app
                     .clone()
@@ -4411,9 +4703,42 @@ mod tests {
                     .is_some_and(|id| !id.is_empty()));
                 assert_eq!(first["session_id"], replay["session_id"]);
                 let auth = crate::auth::load_auth_state(root.path()).unwrap();
+                let principal = &auth.principals[0];
+                let profile = crate::collaboration_profile_authority::load_profile_authority(
+                    root.path(),
+                    &principal.principal_id,
+                    &principal.localhost_root,
+                )
+                .unwrap();
+                if direct {
+                    assert!(
+                        profile.is_none(),
+                        "private account labels do not create Profiles"
+                    );
+                } else {
+                    let profile =
+                        profile.expect("verified enrollment establishes the confirmed Profile");
+                    assert_eq!(profile.document().display_name, "Shared Name");
+                    assert_eq!(
+                        profile.document().revision,
+                        1,
+                        "replay preserves the initial identity"
+                    );
+                    let protection = crate::auth::load_principal_root_protection(
+                        root.path(),
+                        &principal.principal_id,
+                        &principal.localhost_root,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert!(protection
+                        .protectors
+                        .iter()
+                        .all(|p| p.verified_at.is_none() && p.profile_coverage.is_none()));
+                }
                 assert_eq!(
                     (auth.principals.len(), auth.sessions.len(), auth.audit.len()),
-                    (1, 1, 1)
+                    (1, 1, if direct { 1 } else { 2 })
                 );
                 assert_eq!(
                     auth.principals[0].role,
@@ -4421,7 +4746,7 @@ mod tests {
                 );
                 assert_eq!(
                     auth.principals[0].display_name,
-                    if direct { "" } else { "Owner" }
+                    if direct { "" } else { "Shared Name" }
                 );
             }
         }
@@ -4475,22 +4800,40 @@ mod tests {
                 .route("/complete", post(passkey_register_complete))
                 .with_state(state)
         };
-        let request = |path: &str, body: serde_json::Value| {
+        let request = |path: &str, body: serde_json::Value, cookie: &str| {
             Request::builder()
                 .method("POST")
                 .uri(path)
                 .header("origin", "https://elastos.elacitylabs.com")
                 .header("content-type", "application/json")
+                .header("cookie", cookie)
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
+        let intent = json!({"purpose": "recover"});
+        let begin_body = if direct {
+            json!({})
+        } else {
+            json!({"intent": intent})
+        };
+        let mut cookie = String::new();
         let completion = if after_begin {
             let response = app
                 .clone()
-                .oneshot(request("/begin", json!({})))
+                .oneshot(request("/begin", begin_body.clone(), ""))
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            if !direct {
+                cookie = response.headers()[SET_COOKIE]
+                    .to_str()
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                assert!(cookie.starts_with("__Host-elastos-guest-registration="));
+            }
             let begin: serde_json::Value =
                 serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap())
                     .unwrap();
@@ -4503,10 +4846,10 @@ mod tests {
             if direct {
                 serde_json::to_value(attestation).unwrap()
             } else {
-                json!({"ceremony_id": begin["ceremony_id"], "response": attestation})
+                json!({"ceremony_id": begin["ceremony_id"], "response": attestation, "intent": intent})
             }
         } else {
-            json!({})
+            begin_body
         };
         // Revocation occurs after the valid begin in the completion cases.
         let mut auth = crate::auth::load_auth_state(root.path()).unwrap();
@@ -4525,6 +4868,7 @@ mod tests {
             .oneshot(request(
                 if after_begin { "/complete" } else { "/begin" },
                 completion,
+                &cookie,
             ))
             .await
             .unwrap();
@@ -4620,7 +4964,15 @@ mod tests {
         let state = test_gateway_state(temp.path());
         let mut headers = HeaderMap::new();
         headers.insert("origin", HeaderValue::from_static("https://home.example"));
-        let response = passkey_register_begin(State(state.clone()), None, headers).await;
+        let response = passkey_register_begin(
+            State(state.clone()),
+            None,
+            headers,
+            Json(PasskeyRegisterBeginRequest {
+                intent: Some(crate::auth::PasskeyEnrollmentIntent::Recover {}),
+            }),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(
             !state
@@ -4637,6 +4989,735 @@ mod tests {
         );
     }
 
+    fn guided_owner_test_router(state: GatewayState) -> axum::Router {
+        axum::Router::new()
+            .route("/begin", axum::routing::post(passkey_register_begin))
+            .route("/complete", axum::routing::post(passkey_register_complete))
+            .with_state(state)
+    }
+
+    async fn guided_owner_http(
+        app: &axum::Router,
+        path: &str,
+        cookie: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, String, serde_json::Value) {
+        use tower::ServiceExt;
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("host", "localhost:61180")
+                    .header("origin", "http://localhost:61180")
+                    .header("cookie", cookie)
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()))
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        assert!(response.headers().get_all(SET_COOKIE).iter().count() <= 1);
+        let cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .map(|value| {
+                value
+                    .to_str()
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!(String::from_utf8_lossy(&bytes)));
+        (status, cookie, body)
+    }
+
+    #[tokio::test]
+    async fn guided_owner_http_rejects_malformed_intent_before_credentials() {
+        for body in [
+            json!({}),
+            json!({"intent": null}),
+            json!({"unexpected": true}),
+            json!({"intent": {"purpose": "recover", "public_name": "Alice"}}),
+            json!({"intent": {"purpose": "create"}}),
+            json!({"intent": {"purpose": "unknown"}}),
+            json!({"intent": {"purpose": "recover"}, "display_name": "Alice"}),
+            json!({"intent": {"purpose": "recover"}, "display_name": null}),
+            json!({"intent": {"purpose": "recover"}, "profile_display_name": "Alice"}),
+            json!({"intent": {"purpose": "recover"}, "profile_display_name": null}),
+        ] {
+            let root = local_profile_fixture_root();
+            let state = test_gateway_state(root.path());
+            let app = guided_owner_test_router(state.clone());
+            let (status, cookie, output) =
+                guided_owner_http(&app, "/begin", "", body.clone()).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}: {output}");
+            assert!(
+                cookie.is_empty(),
+                "rejected begin issued an enrollment cookie"
+            );
+            assert!(state
+                .identity_manager()
+                .unwrap()
+                .lock()
+                .await
+                .credentials()
+                .is_empty());
+            assert!(crate::auth::load_auth_state(root.path())
+                .unwrap()
+                .principals
+                .is_empty());
+        }
+        for name in ["", " Alice ", "Alice\nSmith", "Person", "ElastOS Home"] {
+            let root = local_profile_fixture_root();
+            let state = test_gateway_state(root.path());
+            let app = guided_owner_test_router(state.clone());
+            let (status, _, output) = guided_owner_http(
+                &app,
+                "/begin",
+                "",
+                json!({
+                    "intent": {"purpose": "create", "public_name": name}
+                }),
+            )
+            .await;
+            assert!(!status.is_success(), "accepted {name:?}: {output}");
+            assert!(state
+                .identity_manager()
+                .unwrap()
+                .lock()
+                .await
+                .credentials()
+                .is_empty());
+            assert!(crate::auth::load_auth_state(root.path())
+                .unwrap()
+                .principals
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn guided_enrollment_http_rejects_name_before_effects_then_accepts_correction() {
+        for guest in [false, true] {
+            let root = local_profile_fixture_root();
+            let state = test_gateway_state(root.path());
+            if guest {
+                let credential = test_credential();
+                store_test_credential(root.path(), credential.clone());
+                seed_test_passkey_principal(
+                    &state,
+                    &credential,
+                    "http://localhost:61180",
+                    crate::auth::RuntimePrincipalRole::Admin,
+                );
+                crate::auth::set_guest_registration_enabled(
+                    root.path(),
+                    true,
+                    crate::auth::now_ts(),
+                )
+                .unwrap();
+            }
+            let app = guided_owner_test_router(state.clone());
+            let credentials_before = state.identity_manager().unwrap().lock().await.credentials();
+            let auth_before = crate::auth::load_auth_state(root.path()).unwrap();
+            let auth_path = crate::auth::auth_state_path(root.path()).unwrap();
+            let auth_bytes_before = std::fs::read(&auth_path).ok();
+            let credential_path = root.path().join("identity/credentials.json");
+            let credential_bytes_before = std::fs::read(&credential_path).ok();
+            for name in [
+                "Person",
+                "ElastOS Home",
+                "ElastOS user",
+                "Device deadbeef",
+                "",
+                " Alice ",
+                "Alice/Smith",
+                "Alice\nSmith",
+                "Alice\u{0085}Smith",
+                "Alice\u{009f}Smith",
+            ] {
+                let (status, cookie, output) = guided_owner_http(
+                    &app,
+                    "/begin",
+                    "",
+                    json!({"intent": {"purpose": "create", "public_name": name}}),
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "guest={guest}, name={name:?}: {output}"
+                );
+                assert!(
+                    cookie.is_empty(),
+                    "rejected name issued an enrollment cookie"
+                );
+                assert_eq!(std::fs::read(&auth_path).ok(), auth_bytes_before);
+                assert_eq!(
+                    std::fs::read(&credential_path).ok(),
+                    credential_bytes_before
+                );
+                assert_eq!(
+                    serde_json::to_value(crate::auth::load_auth_state(root.path()).unwrap())
+                        .unwrap(),
+                    serde_json::to_value(&auth_before).unwrap(),
+                    "rejected name changed auth or enrollment claim state"
+                );
+                assert_eq!(
+                    serde_json::to_value(
+                        state.identity_manager().unwrap().lock().await.credentials()
+                    )
+                    .unwrap(),
+                    serde_json::to_value(&credentials_before).unwrap()
+                );
+            }
+            let intent = json!({"purpose": "create", "public_name": "Alice"});
+            let (status, cookie, begin) =
+                guided_owner_http(&app, "/begin", "", json!({"intent": intent})).await;
+            assert_eq!(status, StatusCode::OK, "corrected name: {begin}");
+            assert!(cookie.starts_with(if guest {
+                "elastos-guest-registration="
+            } else {
+                "elastos-owner-claim="
+            }));
+            let response = crate::auth::owner_attestation_for_test(
+                begin["options"]["publicKey"]["challenge"].as_str().unwrap(),
+                "localhost",
+                "http://localhost:61180",
+            );
+            let (status, _, completed) = guided_owner_http(
+                &app,
+                "/complete",
+                &cookie,
+                json!({"ceremony_id": begin["ceremony_id"], "response": response, "intent": intent}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "corrected completion: {completed}");
+            let after = crate::auth::load_auth_state(root.path()).unwrap();
+            assert_eq!(after.principals.len(), auth_before.principals.len() + 1);
+            assert_eq!(after.sessions.len(), 1);
+            assert_eq!(
+                state
+                    .identity_manager()
+                    .unwrap()
+                    .lock()
+                    .await
+                    .credentials()
+                    .len(),
+                credentials_before.len() + 1
+            );
+            let principal = crate::auth::load_principal_for_proof_binding(
+                root.path(),
+                completed["proof_binding_id"].as_str().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                principal.role,
+                if guest {
+                    crate::auth::RuntimePrincipalRole::Guest
+                } else {
+                    crate::auth::RuntimePrincipalRole::Admin
+                }
+            );
+            let profile = crate::collaboration_profile_authority::load_profile_authority(
+                root.path(),
+                &principal.principal_id,
+                &principal.localhost_root,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(profile.document().display_name, "Alice");
+            assert_eq!(
+                principal.initial_profile_display_name.as_deref(),
+                Some("Alice")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guided_owner_http_rejects_missing_intent_and_legacy_names_at_completion() {
+        let root = local_profile_fixture_root();
+        let state = test_gateway_state(root.path());
+        let app = guided_owner_test_router(state.clone());
+        let intent = json!({"purpose": "create", "public_name": "Alice"});
+        let (status, cookie, begin) =
+            guided_owner_http(&app, "/begin", "", json!({"intent": intent})).await;
+        assert_eq!(status, StatusCode::OK);
+        let response = crate::auth::owner_attestation_for_test(
+            begin["options"]["publicKey"]["challenge"].as_str().unwrap(),
+            "localhost",
+            "http://localhost:61180",
+        );
+        let completion =
+            json!({"ceremony_id": begin["ceremony_id"], "response": response, "intent": intent});
+        let auth_path = crate::auth::auth_state_path(root.path()).unwrap();
+        let before = std::fs::read(&auth_path).unwrap();
+        for (field, value) in [
+            ("intent", None),
+            ("intent", Some(serde_json::Value::Null)),
+            ("display_name", Some(json!("Alice"))),
+            ("display_name", Some(serde_json::Value::Null)),
+            ("profile_display_name", Some(json!("Alice"))),
+            ("profile_display_name", Some(serde_json::Value::Null)),
+        ] {
+            let mut invalid = completion.clone();
+            if let Some(value) = value {
+                invalid[field] = value;
+            } else {
+                invalid.as_object_mut().unwrap().remove(field);
+            }
+            let (status, new_cookie, output) =
+                guided_owner_http(&app, "/complete", &cookie, invalid.clone()).await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{invalid}: {output}"
+            );
+            assert!(
+                new_cookie.is_empty(),
+                "rejected completion changed a cookie"
+            );
+            assert_eq!(std::fs::read(&auth_path).unwrap(), before);
+            assert!(state
+                .identity_manager()
+                .unwrap()
+                .lock()
+                .await
+                .credentials()
+                .is_empty());
+            assert!(crate::auth::load_auth_state(root.path())
+                .unwrap()
+                .principals
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn guided_owner_http_preserves_intent_and_exact_retry_after_restart() {
+        for intent in [
+            json!({"purpose": "create", "public_name": "Alice"}),
+            json!({"purpose": "recover"}),
+        ] {
+            let root = local_profile_fixture_root();
+            let state = test_gateway_state(root.path());
+            let app = guided_owner_test_router(state.clone());
+            let (status, cookie, begin) =
+                guided_owner_http(&app, "/begin", "", json!({"intent": intent})).await;
+            assert_eq!(status, StatusCode::OK, "{begin}");
+            let response = crate::auth::owner_attestation_for_test(
+                begin["options"]["publicKey"]["challenge"].as_str().unwrap(),
+                "localhost",
+                "http://localhost:61180",
+            );
+            let completion = json!({"ceremony_id": begin["ceremony_id"], "response": response, "intent": intent});
+            let auth_path = crate::auth::auth_state_path(root.path()).unwrap();
+            let before = std::fs::read(&auth_path).unwrap();
+            let (status, _, _) = guided_owner_http(
+                &app,
+                "/begin",
+                &cookie,
+                json!({"intent": {"purpose": "create", "public_name": "Other"}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            for replacement in [
+                None,
+                Some(json!({"purpose": "create", "public_name": "Other"})),
+                Some(if intent["purpose"] == "create" {
+                    json!({"purpose": "recover"})
+                } else {
+                    json!({"purpose": "create", "public_name": "Alice"})
+                }),
+            ] {
+                let mut invalid = completion.clone();
+                let expected = if replacement.is_none() {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                } else {
+                    StatusCode::FORBIDDEN
+                };
+                if let Some(replacement) = replacement {
+                    invalid["intent"] = replacement;
+                } else {
+                    invalid.as_object_mut().unwrap().remove("intent");
+                }
+                let (status, _, output) =
+                    guided_owner_http(&app, "/complete", &cookie, invalid).await;
+                assert_eq!(status, expected, "{output}");
+            }
+            let mut invalid = completion.clone();
+            invalid["unexpected"] = json!(true);
+            assert_eq!(
+                guided_owner_http(&app, "/complete", &cookie, invalid)
+                    .await
+                    .0,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+            let mut invalid = completion.clone();
+            invalid["profile_display_name"] = json!("Injected");
+            assert_eq!(
+                guided_owner_http(&app, "/complete", &cookie, invalid)
+                    .await
+                    .0,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+            assert_eq!(std::fs::read(&auth_path).unwrap(), before);
+            assert!(state
+                .identity_manager()
+                .unwrap()
+                .lock()
+                .await
+                .credentials()
+                .is_empty());
+
+            crate::auth::fail_owner_enrollment_once_for_test(
+                root.path(),
+                crate::auth::OwnerEnrollmentTestFault::AfterTerminal,
+            );
+            assert_eq!(
+                guided_owner_http(&app, "/complete", &cookie, completion.clone())
+                    .await
+                    .0,
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+            drop(app);
+            drop(state);
+            let state = test_gateway_state(root.path());
+            let app = guided_owner_test_router(state.clone());
+            let (status, _, completed) =
+                guided_owner_http(&app, "/complete", &cookie, completion.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{completed}");
+            let principal = crate::auth::load_principal_for_proof_binding(
+                root.path(),
+                completed["proof_binding_id"].as_str().unwrap(),
+            )
+            .unwrap();
+            let profile = crate::collaboration_profile_authority::load_profile_authority(
+                root.path(),
+                &principal.principal_id,
+                &principal.localhost_root,
+            )
+            .unwrap();
+            if intent["purpose"] == "create" {
+                assert_eq!(profile.as_ref().unwrap().document().display_name, "Alice");
+                assert_eq!(
+                    principal.initial_profile_display_name.as_deref(),
+                    Some("Alice")
+                );
+            } else {
+                assert!(profile.is_none());
+                assert!(principal.initial_profile_display_name.is_none());
+            }
+            let profile_before =
+                profile.map(|value| serde_json::to_value(value.document()).unwrap());
+            let mut retry = completion;
+            retry.as_object_mut().unwrap().remove("response");
+            let (status, _, replay) = guided_owner_http(&app, "/complete", &cookie, retry).await;
+            assert_eq!(status, StatusCode::OK, "{replay}");
+            assert_eq!(replay["session_id"], completed["session_id"]);
+            assert_eq!(
+                crate::collaboration_profile_authority::load_profile_authority(
+                    root.path(),
+                    &principal.principal_id,
+                    &principal.localhost_root
+                )
+                .unwrap()
+                .map(|value| serde_json::to_value(value.document()).unwrap()),
+                profile_before
+            );
+            let auth = crate::auth::load_auth_state(root.path()).unwrap();
+            assert_eq!(
+                (
+                    auth.principals.len(),
+                    auth.sessions.len(),
+                    state
+                        .identity_manager()
+                        .unwrap()
+                        .lock()
+                        .await
+                        .credentials()
+                        .len()
+                ),
+                (1, 1, 1)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guided_guest_https_cookie_is_separate_from_remote_owner_authority() {
+        use tower::ServiceExt;
+        let root = local_profile_fixture_root();
+        let state = test_gateway_state(root.path());
+        let app = guided_owner_test_router(state.clone());
+        let request = |cookie: &str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/begin")
+                .header("host", "home.example")
+                .header("origin", "https://home.example")
+                .header("x-forwarded-proto", "https")
+                .header("content-type", "application/json")
+                .header("cookie", cookie)
+                .extension(ConnectInfo("192.0.2.5:1234".parse::<SocketAddr>().unwrap()))
+                .body(axum::body::Body::from(
+                    json!({"intent": {"purpose": "recover"}}).to_string(),
+                ))
+                .unwrap()
+        };
+        let guest_cookie = format!("__Host-elastos-guest-registration={}", "a".repeat(64));
+        let denied = app.clone().oneshot(request(&guest_cookie)).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert!(denied.headers().get(SET_COOKIE).is_none());
+        assert!(state
+            .identity_manager()
+            .unwrap()
+            .lock()
+            .await
+            .credentials()
+            .is_empty());
+        let credential = test_credential();
+        store_test_credential(root.path(), credential.clone());
+        seed_test_passkey_principal(
+            &state,
+            &credential,
+            "https://home.example",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        crate::auth::set_guest_registration_enabled(root.path(), true, crate::auth::now_ts())
+            .unwrap();
+        let allowed = app.oneshot(request("")).await.unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let cookies = allowed
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(cookies.len(), 1);
+        let cookie = cookies[0].to_str().unwrap();
+        assert!(cookie.starts_with("__Host-elastos-guest-registration="));
+        assert!(cookie.ends_with("; Path=/; HttpOnly; SameSite=Strict; Secure"));
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("home.example"));
+        headers.insert("origin", HeaderValue::from_static("https://home.example"));
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(cookie.split(';').next().unwrap()).unwrap(),
+        );
+        assert!(owner_claim(&headers).unwrap().is_none());
+        assert!(
+            guest_registration_client_claim(&headers, "https://home.example")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn guided_guest_http_disabled_policy_rejects_intent_before_effects() {
+        let root = local_profile_fixture_root();
+        let state = test_gateway_state(root.path());
+        let credential = test_credential();
+        store_test_credential(root.path(), credential.clone());
+        seed_test_passkey_principal(
+            &state,
+            &credential,
+            "http://localhost:61180",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        let app = guided_owner_test_router(state.clone());
+        let auth_path = crate::auth::auth_state_path(root.path()).unwrap();
+        let before = std::fs::read(&auth_path).unwrap();
+        let credential_path = root.path().join("identity/credentials.json");
+        let credentials_before = std::fs::read(&credential_path).unwrap();
+        for intent in [
+            json!({"purpose": "create", "public_name": "Alice"}),
+            json!({"purpose": "recover"}),
+        ] {
+            assert_eq!(
+                guided_owner_http(&app, "/begin", "", json!({"intent": intent}))
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(std::fs::read(&auth_path).unwrap(), before);
+            assert_eq!(std::fs::read(&credential_path).unwrap(), credentials_before);
+        }
+    }
+
+    #[tokio::test]
+    async fn guided_guest_http_create_recover_keeps_role_and_replays_completion() {
+        for intent in [
+            json!({"purpose": "create", "public_name": "Alice"}),
+            json!({"purpose": "recover"}),
+        ] {
+            let root = local_profile_fixture_root();
+            let state = test_gateway_state(root.path());
+            let credential = test_credential();
+            store_test_credential(root.path(), credential.clone());
+            seed_test_passkey_principal(
+                &state,
+                &credential,
+                "http://localhost:61180",
+                crate::auth::RuntimePrincipalRole::Admin,
+            );
+            crate::auth::set_guest_registration_enabled(root.path(), true, crate::auth::now_ts())
+                .unwrap();
+            let admin = crate::auth::load_auth_state(root.path())
+                .unwrap()
+                .principals[0]
+                .clone();
+            let app = guided_owner_test_router(state.clone());
+            let (status, cookie, begin) =
+                guided_owner_http(&app, "/begin", "", json!({"intent": intent})).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "enabled guest {intent} rejected: {begin}"
+            );
+            assert!(cookie.starts_with("elastos-guest-registration="));
+            assert!(!cookie.contains("owner-claim"));
+            let response = crate::auth::owner_attestation_for_test(
+                begin["options"]["publicKey"]["challenge"].as_str().unwrap(),
+                "localhost",
+                "http://localhost:61180",
+            );
+            let completion = json!({
+                "ceremony_id": begin["ceremony_id"],
+                "response": response,
+                "intent": intent,
+            });
+            let credentials_before =
+                std::fs::read(root.path().join("identity/credentials.json")).unwrap();
+            for wrong_cookie in [
+                String::new(),
+                format!("elastos-owner-claim={}", "a".repeat(64)),
+                format!("elastos-guest-registration={}", "b".repeat(64)),
+                format!("{cookie}; {cookie}"),
+            ] {
+                assert_eq!(
+                    guided_owner_http(&app, "/complete", &wrong_cookie, completion.clone())
+                        .await
+                        .0,
+                    StatusCode::FORBIDDEN
+                );
+            }
+            let mut missing_intent = completion.clone();
+            missing_intent.as_object_mut().unwrap().remove("intent");
+            assert_eq!(
+                guided_owner_http(&app, "/complete", &cookie, missing_intent)
+                    .await
+                    .0,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+            let mut changed_intent = completion.clone();
+            changed_intent["intent"] = json!({"purpose": "create", "public_name": "Other"});
+            assert_eq!(
+                guided_owner_http(&app, "/complete", &cookie, changed_intent)
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                std::fs::read(root.path().join("identity/credentials.json")).unwrap(),
+                credentials_before
+            );
+            // The server accepts completion, but the client loses the response.
+            let (status, _, _) =
+                guided_owner_http(&app, "/complete", &cookie, completion.clone()).await;
+            assert_eq!(status, StatusCode::OK);
+            let settled = crate::auth::load_auth_state(root.path()).unwrap();
+            assert_eq!((settled.principals.len(), settled.sessions.len()), (2, 1));
+            let guest = settled
+                .principals
+                .iter()
+                .find(|principal| principal.principal_id != admin.principal_id)
+                .unwrap();
+            assert_eq!(guest.role, crate::auth::RuntimePrincipalRole::Guest);
+            let profile_before = crate::collaboration_profile_authority::load_profile_authority(
+                root.path(),
+                &guest.principal_id,
+                &guest.localhost_root,
+            )
+            .unwrap()
+            .map(|profile| serde_json::to_value(profile.document()).unwrap());
+            if intent["purpose"] == "create" {
+                assert_eq!(guest.initial_profile_display_name.as_deref(), Some("Alice"));
+                assert_eq!(profile_before.as_ref().unwrap()["display_name"], "Alice");
+            } else {
+                assert!(guest.initial_profile_display_name.is_none());
+                assert!(profile_before.is_none());
+            }
+            drop(app);
+            drop(state);
+            let state = test_gateway_state(root.path());
+            let app = guided_owner_test_router(state.clone());
+            for _ in 0..2 {
+                let (status, _, replay) =
+                    guided_owner_http(&app, "/complete", &cookie, completion.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{intent} retry failed: {replay}");
+                assert_eq!(replay["principal_id"], guest.principal_id);
+                assert_eq!(replay["session_id"], settled.sessions[0].grant.session_id);
+                assert_eq!(replay["proof_binding_id"], guest.proof_binding_id);
+            }
+            let after = crate::auth::load_auth_state(root.path()).unwrap();
+            assert_eq!((after.principals.len(), after.sessions.len()), (2, 1));
+            let same_admin = after
+                .principals
+                .iter()
+                .find(|principal| principal.principal_id == admin.principal_id)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(same_admin).unwrap(),
+                serde_json::to_value(&admin).unwrap()
+            );
+            assert_eq!(
+                after
+                    .principals
+                    .iter()
+                    .filter(|principal| principal.role == crate::auth::RuntimePrincipalRole::Guest)
+                    .count(),
+                1
+            );
+            let credentials = state.identity_manager().unwrap().lock().await.credentials();
+            assert_eq!(credentials.len(), 2);
+            assert_eq!(
+                credentials
+                    .iter()
+                    .filter(|item| item.credential_id == credential.credential_id)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    credentials
+                        .iter()
+                        .find(|item| item.credential_id == credential.credential_id)
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(&credential).unwrap()
+            );
+            assert_eq!(
+                crate::collaboration_profile_authority::load_profile_authority(
+                    root.path(),
+                    &guest.principal_id,
+                    &guest.localhost_root,
+                )
+                .unwrap()
+                .map(|profile| serde_json::to_value(profile.document()).unwrap()),
+                profile_before
+            );
+        }
+    }
+
     #[tokio::test]
     async fn first_owner_registration_public_complete_returns_forbidden() {
         let temp = tempfile::tempdir().unwrap();
@@ -4645,6 +5726,7 @@ mod tests {
         headers.insert("origin", HeaderValue::from_static("https://home.example"));
         let input = serde_json::from_value(json!({
             "ceremony_id": "passkey:register:absent",
+            "intent": {"purpose": "recover"},
             "response": {
                 "id": "fixture", "rawId": "fixture", "type": "public-key",
                 "response": { "clientDataJson": "AA", "attestationObject": "AA" }
@@ -4719,7 +5801,7 @@ mod tests {
             HeaderValue::from_static("https://elastos.elacitylabs.com"),
         );
 
-        let response = passkey_register_begin_inner(&state, &headers, false)
+        let response = passkey_register_begin_inner(&state, &headers, false, None)
             .await
             .unwrap_err();
 
@@ -4737,7 +5819,7 @@ mod tests {
         headers.insert("origin", HeaderValue::from_static("http://localhost:61180"));
         prepare_owner_claim(&mut headers, true).unwrap();
 
-        let response = passkey_register_begin_inner(&state, &headers, true)
+        let response = passkey_register_begin_inner(&state, &headers, true, None)
             .await
             .unwrap();
 
@@ -4750,7 +5832,7 @@ mod tests {
 
     #[tokio::test]
     async fn allowed_https_guest_registration_binds_begin_origin() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = local_profile_fixture_root();
         let state = test_gateway_state(temp.path());
         let credential = test_credential();
         store_test_credential(temp.path(), credential.clone());
@@ -4773,7 +5855,7 @@ mod tests {
             .unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("origin", HeaderValue::from_static("https://home.example"));
-        let begin = passkey_register_begin_inner(&state, &headers, false)
+        let begin = passkey_register_begin_inner(&state, &headers, false, None)
             .await
             .unwrap();
         assert_eq!(
@@ -4828,8 +5910,10 @@ mod tests {
             &headers,
             PasskeyRegisterCompleteRequest {
                 ceremony_id: begin.ceremony_id,
+                intent: None,
                 response: Some(response),
-                display_name: None,
+                display_name: Some("Private guest label".into()),
+                profile_display_name: Some("Public guest name".into()),
             },
             false,
         )
@@ -4837,6 +5921,26 @@ mod tests {
         .unwrap();
         assert!(!result.home_token.is_empty());
         assert_ne!(result.principal_id, admin.principal_id);
+        let guest_principal =
+            crate::auth::load_principal_for_proof_binding(temp.path(), &result.proof_binding_id)
+                .unwrap();
+        assert_eq!(guest_principal.display_name, "Private guest label");
+        assert_eq!(
+            guest_principal.initial_profile_display_name.as_deref(),
+            Some("Public guest name")
+        );
+        assert_eq!(
+            crate::collaboration_profile_authority::load_profile_authority(
+                temp.path(),
+                &guest_principal.principal_id,
+                &guest_principal.localhost_root
+            )
+            .unwrap()
+            .unwrap()
+            .document()
+            .display_name,
+            "Public guest name"
+        );
         assert_eq!(
             crate::auth::load_principal_for_proof_binding(temp.path(), &result.proof_binding_id)
                 .unwrap()
@@ -4855,7 +5959,7 @@ mod tests {
         let auth_path = crate::auth::auth_state_path(temp.path()).unwrap();
         let credential_bytes = std::fs::read(&credential_path).unwrap();
         let auth_bytes = std::fs::read(&auth_path).unwrap();
-        let fresh = passkey_register_begin_inner(&state, &headers, false)
+        let fresh = passkey_register_begin_inner(&state, &headers, false, None)
             .await
             .unwrap();
         assert!(passkey_register_complete_inner(
@@ -4863,10 +5967,12 @@ mod tests {
             &headers,
             PasskeyRegisterCompleteRequest {
                 ceremony_id: fresh.ceremony_id,
+                intent: None,
                 response: Some(response_for(
                     &fresh.options.as_ref().unwrap().public_key.challenge
                 )),
                 display_name: None,
+                profile_display_name: None,
             },
             false,
         )
@@ -6592,15 +7698,19 @@ mod tests {
         .unwrap();
         let empty_headers = HeaderMap::new();
 
-        let denied = passkey_register_begin_inner(&state, &empty_headers, false)
+        let denied = passkey_register_begin_inner(&state, &empty_headers, false, None)
             .await
             .unwrap_err()
             .to_string();
-        let admin_denied =
-            passkey_register_begin_inner(&state, &home_token_headers(&grant.home_token), false)
-                .await
-                .unwrap_err()
-                .to_string();
+        let admin_denied = passkey_register_begin_inner(
+            &state,
+            &home_token_headers(&grant.home_token),
+            false,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         let guest = issue_passkey_session_grant(
             &state,
             "identity-test",
@@ -6610,14 +7720,18 @@ mod tests {
             "test guest passkey grant",
         )
         .unwrap();
-        let guest_denied =
-            passkey_register_begin_inner(&state, &home_token_headers(&guest.home_token), false)
-                .await
-                .unwrap_err()
-                .to_string();
+        let guest_denied = passkey_register_begin_inner(
+            &state,
+            &home_token_headers(&guest.home_token),
+            false,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         crate::auth::set_guest_registration_enabled(temp.path(), true, crate::auth::now_ts())
             .unwrap();
-        let public_allowed = passkey_register_begin_inner(&state, &empty_headers, false)
+        let public_allowed = passkey_register_begin_inner(&state, &empty_headers, false, None)
             .await
             .unwrap();
 
@@ -6635,6 +7749,382 @@ mod tests {
             .public_key
             .exclude_credentials
             .is_empty());
+    }
+
+    fn local_profile_fixture_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        root
+    }
+
+    fn local_profile_owner_grant(
+        data_dir: &std::path::Path,
+    ) -> (StoredCredential, AuthSessionGrantV1) {
+        let secret = crate::auth::random_secret_hex();
+        let admission = crate::auth::OwnerAdmission {
+            origin: "http://localhost:61180",
+            rp_id: "localhost",
+            claimant: &secret,
+            loopback: true,
+        };
+        let mut identity = elastos_identity::IdentityManager::new(data_dir.into()).unwrap();
+        let (ceremony, options) = crate::auth::begin_owner_enrollment(
+            data_dir,
+            &mut identity,
+            &admission,
+            "confirmed-owner",
+            crate::auth::now_ts(),
+        )
+        .unwrap()
+        .unwrap();
+        let response = crate::auth::owner_attestation_for_test(
+            &options.unwrap().public_key.challenge,
+            admission.rp_id,
+            admission.origin,
+        );
+        let grant = crate::auth::complete_owner_enrollment_with_names(
+            data_dir,
+            &mut identity,
+            &admission,
+            &ceremony,
+            Some(&response),
+            crate::auth::OwnerEnrollmentNames {
+                display_name: Some("Private label"),
+                profile_display_name: Some("Public name"),
+            },
+            crate::auth::now_ts(),
+        )
+        .unwrap()
+        .unwrap();
+        let before = std::fs::read(crate::auth::auth_state_path(data_dir).unwrap()).unwrap();
+        assert!(crate::auth::complete_owner_enrollment_with_names(
+            data_dir,
+            &mut identity,
+            &admission,
+            &ceremony,
+            None,
+            crate::auth::OwnerEnrollmentNames {
+                display_name: None,
+                profile_display_name: Some("Changed consent")
+            },
+            crate::auth::now_ts(),
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(crate::auth::auth_state_path(data_dir).unwrap()).unwrap(),
+            before
+        );
+        (identity.credentials()[0].clone(), grant)
+    }
+
+    fn local_profile_sign_in(
+        data_dir: &std::path::Path,
+        credential: &StoredCredential,
+    ) -> AuthSessionGrantV1 {
+        crate::auth::grant_passkey_session(
+            data_dir,
+            crate::auth::PasskeySessionRequest {
+                credential,
+                origin: "http://localhost:61180",
+                user_verified: true,
+                display_name: None,
+                profile_display_name: None,
+                reason: "onboarding retry fixture",
+                purpose: crate::auth::PasskeySessionPurpose::SignIn,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn local_profile_setup_resumes_with_current_grant_after_interruption() {
+        for fault in ["after-terminal", "after-root", "after-profile"] {
+            for prune in [false, true] {
+                let root = local_profile_fixture_root();
+                let _auth = super::super::gateway::set_test_home_launch_auth_data_dir(root.path());
+                let state = test_gateway_state(root.path());
+                let (credential, original) = local_profile_owner_grant(root.path());
+                let credentials =
+                    std::fs::read(root.path().join("identity/credentials.json")).unwrap();
+                if fault != "after-terminal" {
+                    LOCAL_PROFILE_SETUP_FAULT
+                        .with(|slot| *slot.borrow_mut() = Some((root.path().into(), fault)));
+                    assert!(passkey_response_for_grant(&state, original.clone()).is_err());
+                }
+                let before = crate::auth::load_auth_state(root.path()).unwrap();
+                let protections = serde_json::to_value(&before.principal_root_protections).unwrap();
+                let mut auth = before;
+                if prune {
+                    auth.sessions.clear();
+                } else {
+                    auth.sessions[0].revoked_at = Some(crate::auth::now_ts());
+                }
+                crate::auth::save_auth_state(root.path(), &auth).unwrap();
+                assert!(
+                    crate::auth::confirmed_initial_profile_name(root.path(), &original).is_err()
+                );
+                let current = local_profile_sign_in(root.path(), &credential);
+                assert_eq!(
+                    crate::auth::confirmed_initial_profile_name(root.path(), &current)
+                        .unwrap()
+                        .as_deref(),
+                    Some("Public name")
+                );
+                let restarted = test_gateway_state(root.path());
+                let response = passkey_response_for_grant(&restarted, current.clone()).unwrap();
+                assert_eq!(response.principal_id, original.principal_id);
+                assert_eq!(response.proof_binding_id, original.proof_binding_id);
+                let principal = crate::auth::load_principal_for_proof_binding(
+                    root.path(),
+                    &current.proof_binding_id,
+                )
+                .unwrap();
+                assert_eq!(principal.display_name, "Private label");
+                let profile = crate::collaboration_profile_authority::load_profile_authority(
+                    root.path(),
+                    &principal.principal_id,
+                    &principal.localhost_root,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(profile.document().display_name, "Public name");
+                assert_eq!(profile.document().revision, 1);
+                let auth = crate::auth::load_auth_state(root.path()).unwrap();
+                if fault != "after-terminal" {
+                    assert_eq!(
+                        serde_json::to_value(&auth.principal_root_protections).unwrap(),
+                        protections
+                    );
+                }
+                assert!(auth
+                    .principal_root_protections
+                    .iter()
+                    .flat_map(|p| &p.protectors)
+                    .all(|p| p.verified_at.is_none() && p.profile_coverage.is_none()));
+                assert_eq!(
+                    std::fs::read(root.path().join("identity/credentials.json")).unwrap(),
+                    credentials
+                );
+                let stable_auth =
+                    std::fs::read(crate::auth::auth_state_path(root.path()).unwrap()).unwrap();
+                let profile_path = crate::collaboration_profile_authority::profile_authority_path(
+                    root.path(),
+                    &principal.localhost_root,
+                )
+                .unwrap();
+                let profile_bytes = std::fs::read(&profile_path).unwrap();
+                passkey_response_for_grant(&restarted, current).unwrap();
+                assert_eq!(std::fs::read(&profile_path).unwrap(), profile_bytes);
+                assert_eq!(
+                    std::fs::read(crate::auth::auth_state_path(root.path()).unwrap()).unwrap(),
+                    stable_auth
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_profile_setup_concurrent_retry_preserves_edited_profile() {
+        let root = local_profile_fixture_root();
+        let _auth = super::super::gateway::set_test_home_launch_auth_data_dir(root.path());
+        let (credential, grant) = local_profile_owner_grant(root.path());
+        let principal =
+            crate::auth::load_principal_for_proof_binding(root.path(), &grant.proof_binding_id)
+                .unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let state = test_gateway_state(root.path());
+                        barrier.wait();
+                        initialize_local_profile(
+                            &state,
+                            &principal,
+                            &grant.session_id,
+                            "Public name",
+                        )
+                        .unwrap();
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        let initial = crate::collaboration_profile_authority::load_profile_authority(
+            root.path(),
+            &principal.principal_id,
+            &principal.localhost_root,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(initial.document().revision, 1);
+        crate::collaboration_profile_authority::update_profile_authority(
+            root.path(),
+            &principal.principal_id,
+            &principal.localhost_root,
+            &principal.proof_binding_id,
+            "Edited public name",
+            None,
+            crate::auth::now_ts(),
+        )
+        .unwrap();
+        let path = crate::collaboration_profile_authority::profile_authority_path(
+            root.path(),
+            &principal.localhost_root,
+        )
+        .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let current = local_profile_sign_in(root.path(), &credential);
+        let auth = std::fs::read(crate::auth::auth_state_path(root.path()).unwrap()).unwrap();
+        let state = test_gateway_state(root.path());
+        passkey_response_for_grant(&state, current).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(crate::auth::auth_state_path(root.path()).unwrap()).unwrap(),
+            auth
+        );
+        let edited = crate::collaboration_profile_authority::load_profile_authority(
+            root.path(),
+            &principal.principal_id,
+            &principal.localhost_root,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            edited.document().profile_did,
+            initial.document().profile_did
+        );
+        assert_eq!(edited.document().display_name, "Edited public name");
+    }
+
+    #[test]
+    fn local_profile_guest_retry_and_unrelated_sign_in_keep_separate_consent() {
+        let root = local_profile_fixture_root();
+        let _auth = super::super::gateway::set_test_home_launch_auth_data_dir(root.path());
+        let (_, owner) = local_profile_owner_grant(root.path());
+        crate::auth::set_guest_registration_enabled(root.path(), true, crate::auth::now_ts())
+            .unwrap();
+        let guest_credential = test_credential_2();
+        store_test_credential(root.path(), guest_credential.clone());
+        let guest = crate::auth::grant_passkey_session(
+            root.path(),
+            crate::auth::PasskeySessionRequest {
+                credential: &guest_credential,
+                origin: "http://localhost:61180",
+                user_verified: true,
+                display_name: Some("Guest private label"),
+                profile_display_name: Some("Guest public name"),
+                reason: "guest registration fixture",
+                purpose: crate::auth::PasskeySessionPurpose::GuestRegistration,
+            },
+        )
+        .unwrap();
+        let state = test_gateway_state(root.path());
+        LOCAL_PROFILE_SETUP_FAULT
+            .with(|slot| *slot.borrow_mut() = Some((root.path().into(), "after-root")));
+        assert!(passkey_response_for_grant(&state, guest.clone()).is_err());
+        let mut auth = crate::auth::load_auth_state(root.path()).unwrap();
+        auth.sessions.clear();
+        crate::auth::save_auth_state(root.path(), &auth).unwrap();
+        let current = local_profile_sign_in(root.path(), &guest_credential);
+        let response = passkey_response_for_grant(&state, current.clone()).unwrap();
+        assert_eq!(response.principal_id, guest.principal_id);
+        assert_ne!(response.principal_id, owner.principal_id);
+        let principal =
+            crate::auth::load_principal_for_proof_binding(root.path(), &guest.proof_binding_id)
+                .unwrap();
+        let profile = crate::collaboration_profile_authority::load_profile_authority(
+            root.path(),
+            &principal.principal_id,
+            &principal.localhost_root,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(profile.document().display_name, "Guest public name");
+        let mut forged = current.clone();
+        forged.principal_id = owner.principal_id.clone();
+        assert!(crate::auth::confirmed_initial_profile_name(root.path(), &forged).is_err());
+        let before = std::fs::read(crate::auth::auth_state_path(root.path()).unwrap()).unwrap();
+        assert!(crate::auth::grant_passkey_session(
+            root.path(),
+            crate::auth::PasskeySessionRequest {
+                credential: &guest_credential,
+                origin: "http://localhost:61180",
+                user_verified: true,
+                display_name: None,
+                profile_display_name: Some("Changed consent"),
+                reason: "invalid consent change",
+                purpose: crate::auth::PasskeySessionPurpose::SignIn,
+            }
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(crate::auth::auth_state_path(root.path()).unwrap()).unwrap(),
+            before
+        );
+        let owner_principal =
+            crate::auth::load_principal_for_proof_binding(root.path(), &owner.proof_binding_id)
+                .unwrap();
+        assert!(
+            crate::collaboration_profile_authority::load_profile_authority(
+                root.path(),
+                &owner.principal_id,
+                &owner_principal.localhost_root
+            )
+            .unwrap()
+            .is_none()
+        );
+        let unrelated_credential = test_credential();
+        store_test_credential(root.path(), unrelated_credential.clone());
+        let unrelated = crate::auth::grant_passkey_session(
+            root.path(),
+            crate::auth::PasskeySessionRequest {
+                credential: &unrelated_credential,
+                origin: "http://localhost:61180",
+                user_verified: true,
+                display_name: Some("Unconfirmed private label"),
+                profile_display_name: None,
+                reason: "existing guest without public consent",
+                purpose: crate::auth::PasskeySessionPurpose::GuestRegistration,
+            },
+        )
+        .unwrap();
+        let unrelated_response = passkey_response_for_grant(&state, unrelated.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(unrelated_response.profile_readiness).unwrap()["status"],
+            "setup_required"
+        );
+        assert!(
+            crate::auth::confirmed_initial_profile_name(root.path(), &unrelated)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::collaboration_profile_authority::load_profile_authority(
+                root.path(),
+                &owner.principal_id,
+                &owner_principal.localhost_root
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            crate::collaboration_profile_authority::load_profile_authority(
+                root.path(),
+                &principal.principal_id,
+                &principal.localhost_root
+            )
+            .unwrap()
+            .unwrap()
+            .document(),
+            profile.document()
+        );
     }
 
     #[test]
@@ -6683,6 +8173,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(principal.display_name, "Anders");
+        let legacy_record = serde_json::to_value(&principal).unwrap();
+        assert!(legacy_record.get("initial_profile_display_name").is_none());
+        assert!(
+            serde_json::from_value::<crate::auth::PrincipalRecord>(legacy_record)
+                .unwrap()
+                .initial_profile_display_name
+                .is_none()
+        );
         assert_eq!(
             serde_json::to_value(&registered.profile_readiness).unwrap(),
             serde_json::json!({

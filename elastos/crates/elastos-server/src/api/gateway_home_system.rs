@@ -25,10 +25,6 @@ const HOME_SERVICES_PEER_CONTACTS_SCHEMA: &str = "elastos.services.peer-contacts
 /// that renames the object and its schema together.
 const LEGACY_HOME_SERVICES_PEER_CONTACTS_SCHEMA: &str = "elastos.people.contacts-state/v1";
 const HOME_PEOPLE_DISCOVERY_SCHEMA: &str = "elastos.people.discovery/v1";
-const PEOPLE_PROFILE_PROTECTION_REQUIRED_SCHEMA: &str =
-    "elastos.people.profile-protection-required/v1";
-const PEOPLE_PROFILE_PROTECTION_REQUIRED_MESSAGE: &str =
-    "Open System, choose Security, and download Recovery. Then retry creating your Profile.";
 const HOME_SERVICES_STATE_SCHEMA: &str = "elastos.services.state/v1";
 const HOME_SERVICES_STATE_MAX_BYTES: usize = 32 * 1024;
 const HOME_SERVICES_REQUESTS_SCHEMA: &str = "elastos.services.requests/v1";
@@ -115,14 +111,6 @@ struct HomeEventsResponse {
     keepalive: bool,
     retry_after_ms: u64,
     events: Vec<HomeRealtimeEvent>,
-}
-
-#[derive(Debug, Serialize)]
-struct PeopleProfileProtectionRequiredResponse {
-    schema: &'static str,
-    status: &'static str,
-    action_target: &'static str,
-    message: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -1899,24 +1887,43 @@ pub(super) async fn people_profile_update(
         Err(err) => return home_error_response(err),
     };
     if existing_profile.is_none() {
-        let recovery = match crate::api::auth_gateway::principal_root_recovery_status_for_context(
-            &state, &context,
-        ) {
-            Ok(recovery) => recovery,
-            Err(err) => return home_error_response(err),
-        };
-        if !crate::api::auth_gateway::principal_root_recovery_is_ready(&recovery) {
-            return (
-                StatusCode::CONFLICT,
-                Json(PeopleProfileProtectionRequiredResponse {
-                    schema: PEOPLE_PROFILE_PROTECTION_REQUIRED_SCHEMA,
-                    status: "recovery_required",
-                    action_target: "system",
-                    message: PEOPLE_PROFILE_PROTECTION_REQUIRED_MESSAGE,
-                }),
+        let initialized = (|| {
+            let principal = crate::auth::load_principal_for_proof_binding(
+                &state.data_dir,
+                context
+                    .proof_binding_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("Profile requires passkey authority"))?,
+            )?;
+            crate::api::auth_gateway::initialize_local_profile(
+                &state,
+                &principal,
+                &context.session_id,
+                &req.display_name,
             )
-                .into_response();
+        })();
+        if let Err(err) = initialized {
+            return home_error_response(err);
         }
+        // Return the identity just established; a retried first-create must not
+        // manufacture another Profile revision.
+        refresh_runtime_owned_contexts_after_profile_change(
+            &state.data_dir,
+            state.collaboration_discovery_service.as_ref(),
+        );
+        return match load_gateway_identity_summary_for_context(&state.data_dir, &context) {
+            Ok(identity) => Json(identity.without_device_identity()).into_response(),
+            Err(err) => home_error_response(err),
+        };
+    }
+    if existing_profile
+        .as_ref()
+        .is_some_and(|profile| profile.document().display_name == req.display_name.trim())
+    {
+        return match load_gateway_identity_summary_for_context(&state.data_dir, &context) {
+            Ok(identity) => Json(identity.without_device_identity()).into_response(),
+            Err(err) => home_error_response(err),
+        };
     }
     match update_profile_for_context(&state.data_dir, &context, &req.display_name) {
         Ok(identity) => {
