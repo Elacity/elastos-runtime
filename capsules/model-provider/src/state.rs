@@ -3049,7 +3049,7 @@ mod tests {
     fn owner_access_prunes_newly_expired_terminal_run() {
         let root = temp_root("owner-prune");
         let adapters = FakeAdapters::default();
-        let mut state = init_state(&root, vec![offer("local-text")], adapters);
+        let mut state = init_state(&root, vec![offer("local-text")], adapters.clone());
         let input = serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"hello"});
         let binding = create_binding("request:owner-prune", "local-text", &input);
         let mut run = StoredRun::new_prepared(
@@ -3083,6 +3083,38 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), "run_not_found");
         assert!(!path.exists());
+
+        for restart in [false, true] {
+            if restart {
+                state = init_state(&root, vec![offer("local-text")], adapters.clone());
+            }
+            for _ in 0..2 {
+                for result in [
+                    state.handle_runs_get(RunsGetRequest {
+                        op: "runs_get".to_string(),
+                        run_id: run.run_id.clone(),
+                        runtime_binding: access_binding(&binding),
+                    }),
+                    state.handle_runs_events(RunsEventsRequest {
+                        op: "runs_events".to_string(),
+                        run_id: run.run_id.clone(),
+                        runtime_binding: access_binding(&binding),
+                        after_sequence: Some(0),
+                    }),
+                    state.handle_runs_cancel(RunsCancelRequest {
+                        op: "runs_cancel".to_string(),
+                        run_id: run.run_id.clone(),
+                        runtime_binding: access_binding(&binding),
+                    }),
+                ] {
+                    assert_eq!(result.unwrap_err().code(), "run_not_found");
+                }
+            }
+            assert!(!path.exists());
+            assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 0);
+            assert_eq!(*adapters.reconcile_calls.lock().unwrap(), 0);
+            assert!(adapters.cancel_allow_send.lock().unwrap().is_empty());
+        }
     }
 
     #[test]

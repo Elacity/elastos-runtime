@@ -320,6 +320,13 @@ fn load_verified_run_file(
         )));
     }
     let metadata = fs::symlink_metadata(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound
+            && expected_run_id.is_some()
+            && fs::symlink_metadata(runs_dir)
+                .is_ok_and(|metadata| validate_existing_directory(runs_dir, &metadata).is_ok())
+        {
+            return ProviderFault::unauthorized_run_access();
+        }
         ProviderFault::corrupt_journal(format!(
             "failed to inspect model run journal {}: {err}",
             path.display()
@@ -1492,6 +1499,50 @@ mod tests {
         symlink_path(&missing_target, &link_path);
         let error = journal.load_run_if_present(&linked_run.run_id).unwrap_err();
         assert_eq!(error.code(), "journal_corrupt");
+        assert_eq!(
+            journal.load_run(&linked_run.run_id).unwrap_err().code(),
+            "journal_corrupt"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_requested_run_requires_an_intact_private_directory() {
+        let root = temp_root("missing-requested-run");
+        let journal = RunJournal::open(root.clone()).unwrap();
+        let run_id = prepared_run("request:missing").run_id;
+        assert_eq!(
+            journal.load_run(&run_id).unwrap_err().code(),
+            "run_not_found"
+        );
+        let path = hashed_path(&journal.runs_dir, &run_id);
+        assert_eq!(
+            load_verified_run_file(&path, &journal.runs_dir, None)
+                .unwrap_err()
+                .code(),
+            "journal_corrupt"
+        );
+        for mode in [0o755, 0o000] {
+            set_mode(&journal.runs_dir, mode);
+            assert_eq!(
+                journal.load_run(&run_id).unwrap_err().code(),
+                "journal_corrupt"
+            );
+        }
+        set_mode(&journal.runs_dir, 0o700);
+        fs::remove_dir(&journal.runs_dir).unwrap();
+        assert_eq!(
+            journal.load_run(&run_id).unwrap_err().code(),
+            "journal_corrupt"
+        );
+        let target = root.join("replacement");
+        fs::create_dir(&target).unwrap();
+        set_mode(&target, 0o700);
+        symlink_path(&target, &journal.runs_dir);
+        assert_eq!(
+            journal.load_run(&run_id).unwrap_err().code(),
+            "journal_corrupt"
+        );
     }
 
     #[test]
