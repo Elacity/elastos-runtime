@@ -509,12 +509,22 @@ complete. Installed proof and the atomic authority cutover remain open.
   Transport uncertainty retains `providerRunId` and offers Check status through
   `runs_get/events`; navigation detaches without cancellation or a new dispatch.
   Runtime-confirmed unknown settlement retains its completion time and permits a
-  new turn. All ten actual-controller cancellation tests pass, covering denial,
+  new turn. All eleven actual-controller cancellation tests pass, covering denial,
   unknown settlement, completion races, stale polls, late acceptance and
-  saved-workspace recovery. The Home Agent shell and cancellation tests are
-  included in the CI source step; local checks pass. The workbook's MODEL-02
+  saved-workspace recovery. Home Agent keeps new text and attachments in the
+  composer while the prior run remains unresolved, with Check status and New chat
+  as explicit actions. Only an accepted submission clears its unchanged draft
+  content. The Home Agent shell and cancellation tests are included in the CI
+  source step; local checks pass. The workbook's MODEL-02
   source-note refresh remains pending. Installed cancellation acceptance and
   remote CI proof remain open.
+- The isolated installed Home reported a missing saved run as journal corruption;
+  its exact deletion cause is unproved. Provider source returns `run_not_found`
+  for a missing requested record in an intact private journal directory, including
+  reads after retention cleanup and restart. Unsafe directories and corrupt records
+  remain integrity failures. Home Agent source gives a New chat instruction while
+  retaining the old run identity and unknown outcome. Installed recovery proof
+  remains open.
 - The provider-internal `open_ai_responses_text` source adapter and hosted
   cancellation correction are at commit `0d768415`, tree `96d45941`.
   The adapter posts only `model`,

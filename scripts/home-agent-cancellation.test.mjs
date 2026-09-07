@@ -233,3 +233,72 @@ test("terminal unknown survives reload and permits an explicit new turn", async 
   assert.ok(ctx.sessions[0].lastTurn.completedAt > 0);
   assert.equal(status.textContent, "Outcome unknown");
 });
+
+test("actual composer preserves an unsent draft until the old run is checked or a new chat is selected", async () => {
+  const { status } = controllerFixture();
+  const node = () => ({ dataset: {}, style: {}, value: "", scrollHeight: 28,
+    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    setAttribute() {}, focus() {}, querySelector: () => null });
+  const input = node();
+  const nodes = new Map([["#agent-composer-input", input], [".taskbar", node()], ["#agent-harness", node()],
+    ["[data-agent-stream-status]", status]]);
+  Object.assign(document, { body: node(), documentElement: node(), querySelectorAll: () => [],
+    querySelector: (selector) => nodes.get(selector) || null });
+  Object.assign(window, { innerHeight: 800, matchMedia: () => ({ matches: true }) });
+  globalThis.requestAnimationFrame = window.requestAnimationFrame;
+  globalThis.cancelAnimationFrame = window.cancelAnimationFrame;
+  const harness = await import("../capsules/home-agent/browser/agent-harness.js");
+  const shelf = await import("../capsules/home-agent/browser/agent-shelf.js");
+  const bridge = await import("../capsules/home-agent/browser/agent-send.js");
+  bridge.registerAgentHarnessApi({ sendToAgentHarness: harness.sendToAgentHarness });
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    const op = new URL(url).pathname.split("/").pop();
+    calls.push({ op, body: JSON.parse(init.body) });
+    if (op === "runs_get") return { ok: false, status: 404, json: async () => ({ code: "run_not_found", message: "model run not found" }) };
+    return { ok: true, json: async () => op === "offers_list"
+      ? { offers: [{ id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] }] }
+      : op === "runs_create" ? { run_id: "new-draft-run", sequence_cursor: 0 } : terminal("settlement_unknown") };
+  };
+  const oldTurn = { turnId: "missing-turn", providerRunId: "missing-run", state: "settlement_unknown", error: "run_not_found" };
+  const draft = { text: "new unsent prompt", parts: [{ id: "attachment", kind: "file", name: "notes.txt", text: "reference" }] };
+  workspace.applyAgentWorkspaceSnapshot({ v: 1, activeSessionId: "old", sessions: [{ id: "old", title: "Previous chat",
+    messages: [{ role: "user", text: "old prompt" }], lastTurn: oldTurn }], composerDraft: draft });
+  shelf.applyComposerDraft(draft);
+  harness.showAgentHarness({ restore: true });
+  await new Promise(setImmediate);
+  calls.length = 0;
+  const before = workspace.getAgentWorkspaceSnapshot().sessions[0];
+  const accepted = await shelf.sendAgentComposerMessage();
+  assert.deepEqual(shelf.getComposerDraft(), draft);
+  assert.deepEqual(workspace.getAgentWorkspaceSnapshot().sessions[0], before);
+  assert.equal(accepted, false);
+  assert.deepEqual(calls, [], "Send must not silently resume or redispatch the old run");
+  assert.match(status.textContent, /Run record is unavailable.*new chat/i);
+  status.children.at(-1).click();
+  await new Promise(setImmediate);
+  assert.deepEqual(calls.map((c) => c.op), ["runs_get"]);
+  assert.equal(calls[0].body.run_id, "missing-run");
+  assert.deepEqual(shelf.getComposerDraft(), draft);
+  assert.equal(workspace.getAgentWorkspaceSnapshot().sessions[0].lastTurn.providerRunId, "missing-run");
+  sessions.newChat();
+  assert.equal(await shelf.sendAgentComposerMessage(), true);
+  await new Promise(setImmediate);
+  assert.deepEqual(calls.map((c) => c.op), ["runs_get", "runs_create", "runs_events"]);
+  assert.equal(workspace.getAgentWorkspaceSnapshot().sessions[0].messages.filter((m) => m.role === "user").length, 1);
+  assert.deepEqual(shelf.getComposerDraft(), { text: "", parts: [] });
+
+  // The same real composer keeps changes made while its existing send bridge awaits acceptance.
+  for (const accepted of [false, true]) {
+    const pending = defer();
+    bridge.registerAgentHarnessApi({ sendToAgentHarness: () => pending.promise });
+    shelf.applyComposerDraft(draft);
+    const sending = shelf.sendAgentComposerMessage();
+    input.value = "next draft";
+    shelf.addComposerAttachment({ name: "later.txt", text: "later reference" });
+    pending.resolve(accepted);
+    assert.equal(await sending, accepted);
+    assert.equal(input.value, "next draft");
+    assert.deepEqual(shelf.getComposerDraft().parts.map((p) => p.name), accepted ? ["later.txt"] : ["notes.txt", "later.txt"]);
+  }
+});

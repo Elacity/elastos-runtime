@@ -513,6 +513,9 @@ export function formatStreamError(err) {
   if (code === "aborted") {
     return "Run status unavailable.";
   }
+  if (code === "run_not_found") {
+    return "Run record is unavailable. Start a new chat.";
+  }
   if (code === "missing-home-launch-token") {
     return "Live unavailable — Home launch token missing (unlock Home and reopen Agent)";
   }
@@ -545,7 +548,9 @@ export function setStreamStatus(label, { tone = "idle" } = {}) {
   el.textContent = text;
 }
 
-function showRunSettlement(turn, detail = "Run status unavailable.") {
+function showRunSettlement(turn, detail = turn?.error === "run_not_found"
+  ? formatStreamError({ code: "run_not_found" })
+  : "Run status unavailable. Check status or start a new chat.") {
   if (!unresolvedModelTurn(turn)) {
     setStreamStatus("Outcome unknown");
     return;
@@ -1423,6 +1428,13 @@ export function stopAgentStream({ keepPartial = true, drainQueue = false, cancel
 
 export const NO_MODEL_OFFER_STATUS =
   "No model offer on this Home — install a model provider (Store · Services) to chat";
+
+export function canSubmitNewTurn() {
+  const turn = ctx.sessions.find((s) => s.id === ctx.activeSessionId)?.lastTurn;
+  if (!unresolvedModelTurn(turn)) return true;
+  showRunSettlement(turn);
+  return false;
+}
 
 /** One decision point (one canonical path): a turn runs on the typed model
  *  contract or it does not run. Nothing here invents a reply. */

@@ -61,6 +61,7 @@ import {
   stopAgentStream,
   abortAgentStreamNow,
   startTurnForPrompt,
+  canSubmitNewTurn,
   deleteMessageAt,
   beginEditUserMessage,
   cancelEditUserMessage,
@@ -877,7 +878,7 @@ export function showAgentHarness({
 } = {}) {
   const harness = harnessEl();
   if (!harness) {
-    return;
+    return false;
   }
 
   /* Already open (e.g. Agent button while harness visible) — keep room, optional send. */
@@ -896,6 +897,7 @@ export function showAgentHarness({
   }
 
   if (prompt) {
+    if (!canSubmitNewTurn()) return false;
     const session = ensureSessionForPrompt(prompt);
     session.messages.push(
       makeUserSessionMessage(prompt, { displayText: displayText || prompt, parts, session }),
@@ -987,6 +989,7 @@ export function showAgentHarness({
   if (!fromShelf) {
     shelfComposerInput()?.focus({ preventScroll: true });
   }
+  return true;
 }
 
 /** Generation-safe settle after Home breathe — menubar edge-reveal only then. */
@@ -1110,14 +1113,15 @@ export function sendToAgentHarness(prompt, opts = {}) {
     if (active) {
       stopAgentStream({ keepPartial: true });
     }
-    return;
+    return false;
   }
   if (active) {
     /* While a turn streams, queue follow-ups instead of cutting the answer. */
     if (turnBusy) {
       enqueueFollowUp(modelText, { displayText, parts });
-      return;
+      return true;
     }
+    if (!canSubmitNewTurn()) return false;
     closeHarnessPage();
     const session = ensureSessionForPrompt(modelText);
     if (session.title === "New chat" || session.messages.length === 0) {
@@ -1130,9 +1134,9 @@ export function sendToAgentHarness(prompt, opts = {}) {
     clearEmptyState();
     appendMessage("user", displayText, { parts, modelText });
     startTurnForPrompt(modelText);
-    return;
+    return true;
   }
-  showAgentHarness({ prompt: modelText, displayText, parts });
+  return showAgentHarness({ prompt: modelText, displayText, parts });
 }
 
 function renderDesktopAttachOptions(menu) {
