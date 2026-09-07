@@ -129,8 +129,11 @@ the protected-content release decision.
   an installed transition can still leave a blank shell. Verify the exact
   Inbox handoff through that transition and native Terminal Chat separately.
 - [ ] Verify installed combined Profile and Recovery Kit setup and updated-kit
-  coverage for an existing Profile. Source restore and retry tests pass; the
-  user's earlier downloaded kit omitted the Profile created afterward.
+  coverage for an existing Profile. Installed guidance, focus and Profile
+  preservation pass. The user must save the complete kit with Touch ID, then
+  verify coverage and Home readiness after reload. Source restore and retry
+  tests pass; the earlier downloaded kit omitted the later Profile. Installed
+  Chat opening remains unverified.
   Keep clean first-run window placement acceptance open.
 - [ ] Complete Browser input ordering, lifecycle and accepted media proof on
   the target installation. Source checks cover only their stated contracts.

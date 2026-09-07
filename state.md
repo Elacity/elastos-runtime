@@ -361,8 +361,20 @@ complete. Installed proof and the atomic authority cutover remain open.
   not an all-descendants-reaped claim. After that restart, the user saved a
   Recovery Kit and created a Profile. The exported bundle explicitly omitted
   People identity and preceded the Profile by 15 seconds. Root recovery is
-  configured; that downloaded kit does not cover the later Profile. Installed
-  combined setup, human reload and operator-admitted HTTPS acceptance remain
+  configured; that downloaded kit does not cover the later Profile.
+  The owner installation now binds `abefc7ae`, tree `81d89d5a`. Runtime and
+  object-provider built and installed hashes match. The five changed
+  Home/System/People assets match source, installed, served and manifest hashes.
+  Strict restart returned HTTP 200. Home reload replaced the previous managed
+  service through
+  the existing binary-fingerprint check; its old process tree exited.
+  Owner/protection state, encrypted Profile, downloaded kit and private config
+  match preflight. The Home browser-state file changed after the audit reload;
+  semantic equality of that file is unverified. The model installation remains
+  unchanged. Installed Home shows one Save Recovery Kit action, System shows
+  Profile needs backup and focuses Save complete Recovery Kit, and People
+  retains the existing Profile. Updated-kit export and Touch ID remain with
+  the user. Installed Chat opening and operator-admitted HTTPS acceptance stay
   open; session lifetime stays subject to Runtime policy.
 - Same-principal multi-passkey linking is separate follow-up work. Current
   auth records store role, root and name per proof binding, and counts count
@@ -840,7 +852,8 @@ complete. Installed proof and the atomic authority cutover remain open.
   concurrent first creation, retry, actor/name rejection, failed export after
   an older kit, and readiness refresh. Auth/server strict Clippy, format gates,
   System and People browser fixtures, setup and Home shell smokes, and Home
-  entropy pass. Installed combined-setup acceptance remains open.
+  entropy pass. Installed existing-Profile guidance and focus are verified;
+  updated-kit export, coverage refresh and fresh combined setup remain open.
 
 ## Collaboration Truth
 
