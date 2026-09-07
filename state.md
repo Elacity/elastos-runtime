@@ -216,15 +216,27 @@ The integrated source includes these durable facts:
   evidence. Gateway CID reads serve verified content through the Runtime-owned
   route.
 - The Runtime catalog currently projects installed capsules. It has no signed
-  network catalog entry or root, typed Home Get admission, or GGUF
-  content-capsule closure. Model and Assistant Truth below records the current
-  Qwen operator bootstrap.
-- The next vertical slice is the signed, complete-closure CID path in
+  network catalog entry or root, model selection-to-preparation admission, or
+  GGUF content-capsule closure. Marketplace and System show installed inventory;
+  model-provider consumes static private artifact/offer configuration. Model
+  and Assistant Truth below records the current Qwen operator bootstrap.
+- The signed, complete-closure CID model path is required in the current
+  closeout, alongside onboarding and window policy. People select or use a
+  model; Runtime prepares the exact content behind that action. Settings local
+  retention is separate from trust, admission and provider readiness. The plan is in
   [Content capsule distribution](docs/CONTENT_CAPSULE_DISTRIBUTION.md). CID owns
   byte identity, publisher signature owns the source claim, availability
   receipts own retention evidence, Runtime owns policy and atomic admission,
   and content and availability providers own backend selection and routes.
   Package identity remains separate from model service offers.
+- Current large-file paths buffer complete payloads: `content.rs` drains the
+  provider stream into a vector, `ProviderStreamSession` holds that vector, and
+  the selected native IPFS provider reads complete cat responses before base64
+  encoding or writing. Stream/range labels do not prove bounded backend reads
+  or network cancellation. The 64 MiB content import bound and 100 MiB gateway
+  file bound are not a multi-gigabyte model delivery path. Bounded native
+  transfer, strict package metadata, signed catalog admission and inventory-to-
+  offer binding remain implementation prerequisites, not installed support.
 
 ## Protected-content Contract Truth
 
@@ -488,6 +500,28 @@ complete. Installed proof and the atomic authority cutover remain open.
 - `scripts/mac-source-home-restart.sh` remains the source-home restart/proof
   helper for macOS target evidence.
 
+## Documents Working-Copy Truth
+
+- Runtime requires a read revision for working-copy saves and compares the
+  principal, document, path, title and body under the existing principal-root
+  mutation lock. Publication completion retains current local edits. The
+  metadata and body remain separate files; an incomplete write reports an
+  uncertain outcome and requires a fresh read before recovery.
+- The editor draft preserves an observed created ID and revision before saving
+  its body. An unknown create result keeps the draft and pauses automatic
+  retries. The existing dialog offers checking Documents or explicitly creating
+  a copy with a duplicate warning. Known-document conflicts pause autosave and
+  use an exact read before explicit retry. Late results retain newer selections
+  and edits.
+- Parent Rust proof passes 21 Documents tests with one external-IPFS test
+  ignored, nine gateway Documents tests and the shared conditional-write/GBA
+  regressions. The 13 conflict and nine close-handshake Node tests pass, as do
+  behavior and Home/public-copy entropy checks. Parent Brave proof passes at
+  1280px and 390px, including visible Save in two pages, retained stored winner,
+  losing draft and paused autosave. Workspace/Chain formatting and diff checks
+  pass; fixture processes are cleaned. Installed Homes remain unchanged and
+  installed conflict/recovery acceptance remains open.
+
 ## GBA Capsule Truth
 
 - `gba-emulator` is a conditional viewer capsule, not an always-on native
@@ -497,6 +531,16 @@ complete. Installed proof and the atomic authority cutover remain open.
 - ROM and save bytes cross authenticated Runtime viewer routes. Save state is
   scoped to the launch principal; the engine has no Runtime WASI adapter,
   preopens, environment, socket, FIFO, or direct-network authority.
+- The current save-conflict source requires an exact read revision or confirmed
+  absence on viewer-storage writes. Runtime compares under the existing
+  principal-root mutation lock and retains protected storage. GBA serializes
+  saves per game and keeps live progress when a write conflicts or its result
+  is uncertain. Check saved data reconciles the exact failed save; loading a
+  different stored version requires explicit discard confirmation. Node18 and
+  parent conditional-write3/storage-route1/GBA8 tests pass. Parent opaque-frame
+  Brave proof covers ETag/CAS, changing pixels, trusted input, nonzero audio,
+  save/state reload and fixture cleanup. Installed conflict/reconciliation and
+  manual acceptance remain open.
 - `scripts/normalize-gba-engine-imports.mjs` deterministically converts the
   exact pinned upstream Emscripten import label into the capsule-local
   `capsule.local.memfs.v1` boundary. The product artifact imports only that
@@ -604,8 +648,12 @@ complete. Installed proof and the atomic authority cutover remain open.
   immutable upstream publisher revisions and SHA-256 values: Qwen3.5-9B Q4_K_M
   is the stable candidate, PrismML Bonsai 8B Q1_0 is experimental, and llama.cpp
   `b10516` supplies the macOS arm64 engine bundle. The private operator offer
-  selects the canonical installed path and digest. The CID slice will replace
-  this bootstrap as the product artifact-delivery path.
+  selects the canonical installed path and digest. The current closeout must
+  replace this setup-only product dependency with CID-addressed selection and
+  Runtime preparation for that one Qwen package. Existing engine verification
+  remains required on a fresh installation. Real catalog publisher trust,
+  signed closure identity and availability deployment still need evidence;
+  fixture keys and CIDs do not establish production readiness.
 - The pinned Mac evaluation ran both candidates through llama.cpp. Bonsai
   passed and was lighter and faster in the three-prompt comparison. Qwen passed
   with thinking disabled and remains the stable-quality candidate. The local
@@ -830,30 +878,132 @@ complete. Installed proof and the atomic authority cutover remain open.
 - Home first-run onboarding now honors the existing `settings=security`
   deep-link, focuses the recovery action when verified readiness becomes
   available, and refreshes Home summary state after Recovery Kit export. People
-  setup prefills the suggested first Profile name as editable text, preserves
-  unfocused edits across refresh, and still requires explicit create or
-  confirm.
+  name editing preserves unfocused drafts across refresh. Create enrollment
+  initializes the Profile with the confirmed initial name.
 - Declared content icons stay capsule-owned and serve only manifest-declared
   icon variants. Nested content entrypoints resolve icons from their matching
   serving root, and declared icon requests reject ROM bytes, traversal, and
   symlinked targets.
 - Fresh desktop placement seeds only visible targets on first run. Saved hidden
   target positions remain intact after later reloads.
-- System source offers one action to confirm an editable Profile name and save
-  a complete Recovery Kit. Passkey step-up binds the name. Runtime protects the
-  root, creates the initial Profile under its existing mutation lock, and
-  exports that verified identity. Existing Profiles remain unchanged. The
-  Recovery Kit protector records Profile coverage only after successful full
-  export; an older kit still recovers its root while Home requests an updated
-  kit for an uncovered Profile. People saves refresh Home, and Profile readiness
-  participates in the existing Home event cursor. The kit reminder leaves Chat
-  available to an existing ready Profile.
-- Focused source tests cover empty-machine restore of the same Profile,
-  concurrent first creation, retry, actor/name rejection, failed export after
-  an older kit, and readiness refresh. Auth/server strict Clippy, format gates,
-  System and People browser fixtures, setup and Home shell smokes, and Home
-  entropy pass. Installed existing-Profile guidance and focus are verified;
-  updated-kit export, coverage refresh and fresh combined setup remain open.
+- The current onboarding backend binds Create or Recover
+  intent to the passkey ceremony. Create records the explicit initial public
+  name; Recover skips initial Profile creation. Source tests verify exact owner
+  and guest retries, including restart after verified enrollment. Runtime
+  retains authority over grants, guest policy and durable consent.
+- An actual HTTP Recover enrollment followed by full import preserves the
+  original Profile through the existing verified root and Profile/Wallet
+  restoration paths. Successful recovered-root reassignment retires the
+  previous initial Create-name consent; rejected reassignment preserves it.
+  The full-recovery tests retain the existing partial Wallet recovery outcomes.
+- Home source offers Create account and Recover account through native radio
+  controls. Create passes the initial Profile name with the enrollment intent;
+  Recover opens System's existing kit import control. Source fixtures verify
+  exact retry after a lost completion response and preserve the current account
+  on signed-in reload. System export waits for a ready Profile. Save and Later
+  remain separate from enrollment, and files need a separate backup.
+  Missing-Profile Recover and later sign-in open System Security/import from
+  typed readiness. Home summary sync keeps the import form focused; explicit
+  reminders and Chat guide the same recovery step. Unknown readiness checks
+  System. Composed source tests cover cancellation, invalid import, repeated
+  refresh, sign-in without a stored Recover flag, and ready-Profile Save/Later.
+  Installed onboarding acceptance remains open.
+- The current onboarding source passes all 70 auth gateway tests and all 15
+  full-recovery tests on the same binary, plus strict server/identity Clippy
+  for lib/tests under Rust 1.91.0 and `RUSTFLAGS=-D warnings`. Recovery passes
+  under default umask; its fresh-machine fixture explicitly creates the same
+  owner-only `0700` data root required by installation.
+  Workspace/Chain formatting, Home/public-copy entropy and UI Node smokes pass.
+  An isolated Brave fixture passes six HTTPS
+  Create/Recover views at 1280x900, 390x844 and 320x568 using the actual enrollment
+  markup, styles and auth modules. It checks the named dialog, native radio
+  keys, 44px label targets, Tab and scroll access to inputs and the primary
+  button, viewport bounds and zero page errors. The final UI change adds only
+  friendly rejected-name copy and passes the Node smoke. Installed passkey/gateway
+  acceptance remains open. Existing identities and installed recovery material
+  are unchanged.
+- The public registration decoder rejects missing/null intent and explicit
+  legacy name fields, including null, before registration effects. Runtime
+  checks Create names with the existing pure validators before owner-claim
+  preparation and returns 422 for invalid input. Operational errors retain
+  their existing handling. Original owner-first and optional internal
+  dispatch remain in place, with native identity contracts unchanged.
+- Source tests verify correction after definitive pre-begin name rejection,
+  C1 control rejection and explicit Resume after a lost credential prompt.
+  Uncertain replies retain the original intent and deadline; cached responses
+  retry exact completion. Signed-in Home preserves its current account.
+  Installed passkey, recovery and Save/Later proof remains open.
+- Installed owner and Qwen Homes remain on `abefc7ae` and `8e6d298d`,
+  respectively. Their guidance, focus and artifact evidence applies to those
+  trees. The current onboarding and window source changes await combined
+  installed acceptance.
+- Optional single/multiple/hybrid window metadata passes through the existing
+  manifest, Runtime catalog and launch path. The 41-manifest source inventory
+  has ten single, six hybrid, one multiple, two content, two shells, two owned
+  Home/Agent surfaces and eighteen providers. System, People, Inbox, Wallet,
+  Assistant, Marketplace, Services, MetaMask, UniSat and WalletConnect declare
+  single policy. Reuse preserves each current frame, token and draft, while
+  explicit deep links and Recovery Kit Save bind to its current document.
+  Browser, Library, Chat, Documents, Archive and GBA declare hybrid policy.
+  Ordinary no-query Open reuses the window; explicit New Window and selected
+  launches keep independent frames. Library pickers remain separate. Capsule
+  File menus keep their commands and one Home New Window command where policy
+  permits it. Absent policy preserves prior behavior. Elacity Player declares
+  multiple policy for independent selected mint sessions and suppresses generic
+  blank New Window. The owned Home Agent remains separate from Assistant.
+- Documents, Library, Archive, GBA and Chat use one Home presentation-hint client
+  through the existing host and GUI to the exact window/session record.
+  Documents reports verified saved or Library-file selection, Library its
+  verified folder, Archive its current stat/list selection, GBA its accepted
+  engine switch, and Chat its guarded verified direct or explicit shared/default
+  selection. Per-frame challenges, current-document nonces and sequences reject
+  stale reports after reload, replacement or retirement; Home retains exact
+  source/origin/token checks. Explicit new/clear removes the old selector;
+  loading and unchanged public share mode retain startup state. Literal Library
+  names keep spaces, percent, question and hash characters. Persisted hints
+  contain settled selectors; Runtime reauthorizes fresh restored launches.
+  Drafts, effects, one-shot actions and picker state stay outside hints.
+  Browser retains its Runtime-owned instance and Player its selected mint.
+- Home binds each Library picker to its exact opener, document and request.
+  Library closes after receiver acceptance. Browser carries the chooser ID
+  through the existing Runtime upload path; the guest control service checks it
+  across asynchronous CDP operations and preserves a replacement chooser.
+  Archive separates exact Home picker delivery from parent-owned menus. Chat
+  adds current-document/request and conversation-selection checks to its
+  attachment path. The matching control service is bundled into the guest
+  initrd by `build-browser-vm-rootfs.sh`; installed chooser proof must include
+  that artifact.
+- Final-composite source and component checks are recorded below. These
+  receipts apply to the combined source, rather than isolated intermediate
+  commit builds. Installed navigation, picker, public share-reader and manual
+  acceptance remain open in [TASKS.md](TASKS.md).
+
+| Surface | Current source/component evidence |
+| --- | --- |
+| Window metadata | Common 92, window projection 1, Home launch 5, browser discovery 20 and catalog 23 tests pass; inventory covers all 41 manifests. |
+| Reuse and selection | Selection 40 and Recovery Save 32 pass, including deep links, draft preservation, launch races, stale-document rejection and independent restores. System's real-Brave fixture passes 4/4. |
+| Current navigation | Home regression proves verified A-to-B selection restores B alongside independent C with fresh tokens. The grouped consumer regression covers real Library/Archive/GBA/Chat selectors, relay and restore, failed/stale loads, picker exclusion and GBA save conflicts. |
+| Documents and GBA saves | Documents save 13/close 9 and GBA save 18 pass. Real-Brave Documents layout/conflict and GBA opaque-frame proof pass with the shared module; storage and two-file failure limits remain in their sections above. |
+| Picker delivery | Home/Library/Archive 18 and Browser/CDP 16 pass. The real-Brave Library menu fixture passes exact Archive request/document/acknowledgement delivery, visible standalone status and existing file/extract assertions. Its Browser chooser receiver is a fixture. |
+| Generated Chat | Native tests pass 30/30. Regenerated JS/WASM pass all nine configured real-Brave scenarios: bootstrap/reload/reopen, failures, stale switches and 375/640/1280 layouts. Installed artifact parity remains open. |
+| Host fixture lifecycle | Restored-Browser Brave proof records one Home refresh, two open requests, one provider effect, one cleanup effect and zero remaining pages/VMs. Fixture contracts pass 10/10, including error preservation, Shutdown and unique generations. Home bridge, Home/public-copy/Browser entropy, syntax, diff and applicable formatting checks pass. |
+
+- Hosted target fixtures require the existing Runtime proxy, use one adapter
+  process and generation, pass returned cleanup through that process, and
+  request Shutdown even after close failure. A binary override requires an
+  explicit SHA-256. The full control-service smoke passes Wallet consent,
+  signatures and transactions, chooser/upload, navigation, paste and nested
+  hosted-display launch, then fails at `engine_close_indeterminate`: its v1
+  close response lacks the required generation-bound v2 terminal receipt with
+  observed-absence proof. Independent reproduction confirms the same result
+  and exited fixture processes. Fake signaling proves fixture behavior;
+  hosted product completion and installed Browser media remain open.
+- Home fixtures use the current auth DOM and Runtime summary/presence shapes.
+  Restored-lifecycle testing stops on captured bootstrap errors and accepts an
+  optional browser executable; System keeps its boot/error assertions without
+  temporary trace injection. Home entropy skips configured `target-build`
+  output alongside `target`. Source-document link and read failures still fail
+  the gate.
 
 ## Collaboration Truth
 

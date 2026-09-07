@@ -65,7 +65,7 @@ credentials, process details, and topology stay inside the model provider. A
 model artifact is separate immutable content. Its canonical package identity
 is the CID of the complete manifest-and-payload closure. Engine, component, and
 payload hashes are verification facts rather than package identities. Runtime
-installs the package through the content provider path described in
+prepares and admits the package through the planned content provider path in
 [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
 
 A hosted web API is a provider-internal HTTPS interoperability edge on the
@@ -218,6 +218,56 @@ selector, resolved model when the backend reports it, and explicit fallback
 policy. Credentials start in the current owner-only provider config. Secret
 indirection can use an existing secure service when one is available; it does
 not require a new secret store.
+
+## Local content selection and retention
+
+The current closeout includes the complete path from trusted model discovery
+to a real local reply for one verified Qwen package. It is pending implementation.
+Marketplace adds Models browse/details/Use within the existing app; System
+manages the same model records and local retention. Assistant and Home Agent
+keep their existing pickers and typed run lifecycle. These are projections of
+one Runtime catalog, admission inventory and offer binding, not separate model
+stores. A model remains identifiable by complete-closure CID even when its
+bytes are not local.
+
+Selecting a model may ask Runtime to prepare it under current authority. The
+person sees availability, Preparing/progress, Ready or actionable failure,
+offline and incompatibility states. Preparation can be cancelled or retried.
+Ordinary on-demand use may cache bytes. Keep on this device requests explicit
+retention; releasing Keep makes them evictable once active references and run
+settlement permit removal. The same inventory distinguishes cache, Keep,
+admission and readiness, while catalog identity stays visible. A local pin alone
+proves neither trust nor engine readiness. There is no user GGUF download,
+file-picker or private
+path configuration step in this product flow.
+
+Runtime validates signed publisher/catalog and package facts, resource policy,
+engine compatibility and content integrity before deriving a private verified
+artifact descriptor for the model provider. Startup currently loads static
+operator offers; the new admitted-content binding must reuse the existing
+ProviderRegistry and run journal and preserve other configured capabilities.
+An idle-safe provider refresh may expose the newly admitted local offer; a busy
+or unknown-settlement run prevents destructive reconfiguration and removal.
+Content preparation status is distinct from a dispatched model run.
+
+Existing `offers_list`, `runs_create`, `runs_get`, `runs_events` and `runs_cancel`
+remain the inference contract. Runtime binds the selected package and offer to
+the exact admitted descriptor; the provider revalidates it before inference.
+Preparation failure never changes the selected model to an available substitute.
+Drafts and existing runs survive selection, progress, cancel, retry and restart.
+The ordinary explicit Send/run action dispatches once only when that selected
+model and provider are ready.
+
+The bounded transfer, manifest/inventory limits, proposed preparation/retention
+intents, commit order and tests are in
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md#source-prerequisites-and-bounded-implementation-plan).
+Fresh-install acceptance must prove the compatible engine and its verified
+libraries are available, then select the real signed catalog entry with no
+pre-existing GGUF or private offer setup and obtain a real Qwen reply. Exact
+package size, publisher trust, license/provenance and availability deployment
+are prerequisites. Small signed fixtures prove rejection and lifecycle behavior,
+not a production catalog or real inference. Code, tests, manifests and docs go
+to Git review; model bytes and private publisher keys stay outside Git.
 
 ## Staged delivery path
 

@@ -1,6 +1,6 @@
 # Content capsule distribution
 
-This document defines the intended distribution contract for downloadable
+This document defines the intended distribution contract for CID-addressed
 content. It covers free games, local model files, and other portable data.
 Protected-content rights and
 key release remain in [PROTECTED_CONTENT.md](PROTECTED_CONTENT.md), while
@@ -8,8 +8,8 @@ replication policy and availability receipts remain in
 [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md).
 
 Runtime currently projects installed capsules. The signed network catalog,
-Home Get operation, and model-content packaging described here remain planned
-work; this contract does not claim that those features are implemented.
+selection-to-preparation admission, and model-content packaging described here
+remain planned work; this contract does not claim that those features are implemented.
 
 The implemented content plane already provides `elastos://content` publish,
 fetch, status, ensure, repair, and unpublish operations. It records signed local
@@ -19,7 +19,7 @@ network catalog and install contract remain open.
 
 ## Decision
 
-A downloadable game or model is a content capsule, not a service offer or a raw
+A game or model is a content capsule, not a service offer or a raw
 URL entry in Home.
 
 - A GBA game is a `role=content`, `type=data` capsule bound to a compatible
@@ -50,34 +50,39 @@ projections with narrower jobs:
 | --- | --- |
 | Signed catalog entry | Points to an exact capsule CID and presents publisher, version, compatibility, size, and license metadata. |
 | Availability receipt | States where and under which policy the CID is retained or replicated. |
-| Installed inventory | Records which verified capsules this Runtime has admitted and pinned. |
+| Installed inventory | Records admission, cached bytes, explicit Keep retention and provider readiness as distinct facts. |
 | Install or removal receipt | Records the principal, exact CID, operation, result, and time. |
 | Service offer | Advertises a running provider capability after installation; it is not package identity or install authority. |
 
-Home, Library, Apps, a future native model hub, and command projections must
+Home, Library, Marketplace, System and Agent model pickers must
 derive from these records. They must not maintain independent package databases
 or turn display rows into authority.
 
-## First vertical slice: CID-delivered local Qwen
+## First vertical slice: use and retain local Qwen
 
 The first delivery slice packages the currently verified Qwen GGUF as one
 content capsule and makes it available to the existing local model provider.
-It uses this sequence:
+This is required for the current closeout, not a later catalog-only milestone.
+The person selects or uses the model; Runtime resolves and prepares its exact
+content. Settings may offer Keep on this device or release local retention.
+Transfer and installation are backend mechanisms, not a traditional download
+workflow, file picker or editable model path. It uses this sequence:
 
 1. The publisher creates a complete immutable closure with the content-capsule
    manifest, GGUF payload, format and quantization facts, resource requirements,
    license, provenance, and compatible model-provider interface.
 2. The CID of that complete closure becomes the package identity. A publisher
-   DID and signature authenticate the source claim for the exact CID.
+   DID and signature authenticate the detached source claim for the exact CID;
+   the hashed closure does not contain its own resulting CID.
 3. Setup carries one trusted signed catalog-root CID or equivalent pinned
    signed head. Runtime verifies its CID and signature under configured
    publisher trust, then Home projects its signed entries. The initial
    availability basis may be the publisher alone when the entry states that
    limitation.
-4. Home sends one typed Get request for the exact catalog entry. Runtime checks
-   principal authority and composes the existing content `fetch`, `status`, and
+4. Home sends a typed selection/preparation intent for the exact catalog entry.
+   Runtime checks principal authority and composes existing content `fetch`, `status`, and
    `ensure` operations with installed-inventory and provider-registration state.
-   Get is an admission workflow, not a second content-transfer protocol.
+   Preparation composes admission with existing transfer authority.
 5. Runtime stages the fetched closure under a bounded private path, verifies the
    CID, publisher signature, availability evidence, size, resources, license,
    format, paths, and declared provider interface, then admits it atomically and
@@ -87,10 +92,14 @@ It uses this sequence:
    private canonical artifact descriptor that it revalidates before inference.
    Package identity remains separate from service-offer identity and install
    authority.
-7. Home derives Available, Downloading, and Ready from catalog, transfer, and
-   installed records. Home may project an approved package name, CID, and
-   status. Runtime keeps host paths and backend routes private. File names and
-   service offers supply no install state.
+7. Marketplace Models browse/details/Use, System model management and existing
+   Assistant/Home Agent pickers project the same catalog, inventory and offer
+   records. They show availability, Preparing with progress, Ready, or an
+   actionable failed, offline or incompatible state. Selection can prepare the
+   exact model; inference waits for admission and provider readiness. A pin is
+   retention, not evidence of trust, license acceptance or inference readiness.
+   Runtime keeps paths and backend routes private. Selection preserves drafts
+   and existing runs and never silently substitutes another model.
 
 Later catalog updates may arrive through content or Carrier providers. Runtime
 applies the same publisher-signature and CID checks before Home projects them.
@@ -112,25 +121,25 @@ Acceptance requires:
 - one atomic installed record and receipt, plus a durable Runtime-owned link
   from each running offer to that exact record and content CID, that yields only
   the private canonical artifact descriptor that `model-provider` revalidates;
-- Home transitions from Available to Downloading to Ready from Runtime facts
+- Home transitions from available content through Preparing to Ready from Runtime facts
   and projects only the approved package name, CID, and status while Runtime
   keeps host paths and backend routes private;
 - restart proof that preserves the single admitted record without another
   transfer, followed by one fresh model request that produces one inference
-  through the admitted artifact, plus explicit removal, unpin policy, provider
-  cleanup, removal receipt, and partial-file cleanup; and
+  through the admitted artifact, plus explicit release of local retention,
+  busy/run protection, unpin policy, provider cleanup, removal receipt and
+  partial-file cleanup; and
 - installed negative tests for an incorrect CID, signature, publisher, digest,
   size, license, resource requirement, interface, availability claim, truncated
   transfer, and interrupted admission.
 
-## Get flow
+## Selection and retention flow
 
-`Get` is a typed Runtime admission operation, not a browser download or another
-content-provider transfer operation:
+Selection requests Runtime preparation; the content provider owns transfer:
 
 ```text
 signed catalog projection
--> person selects Get
+-> person selects or uses the model
 -> Home sends exact content-capsule identity to Runtime
 -> Runtime verifies principal, session, capability, publisher, and manifest
 -> Runtime reuses content fetch and status for the CID
@@ -145,14 +154,111 @@ endpoint, or an external model host directly. A failed fetch, signature,
 manifest, size, compatibility, license-policy, or availability check leaves no
 partially admitted capsule.
 
-The reverse operation must be explicit. Removing a local capsule updates the
-installed inventory and writes a removal receipt. Unpinning local bytes does
-not claim that the CID disappeared from the wider network.
+Runtime may cache bytes for ordinary on-demand use. Keep on this device requests
+explicit local retention beyond that cache policy. Releasing Keep makes bytes
+eligible for eviction; it does not immediately delete them. Actual free-space
+removal waits for active references and run settlement, then updates inventory
+and the removal receipt. Cached, kept, admitted and ready remain distinct facts
+in the same inventory records. The signed catalog identity remains visible with
+its actual availability after local eviction. Unpinning local bytes says nothing
+about whether another provider retains the CID.
+
+## Source prerequisites and bounded implementation plan
+
+The following are source limitations, not completed large-model support:
+
+| Existing surface | Verified limitation and required extension |
+| --- | --- |
+| `elastos/crates/elastos-common/src/manifest.rs` | Strict `CapsuleManifest` has generic resources, requirements and an optional signature, but no typed model format/quantization/license/provenance block or signed catalog-root admission. Add bounded model-content metadata and canonical signed closure/catalog validation; retain strict unknown-field and path checks. |
+| `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | Active inventory comes from installed `components.json` external entries and valid capsule directories. Extend this inventory's admission/receipt ownership and its catalog projection; a source-directory scan or a separate model store is insufficient. |
+| `elastos/crates/elastos-server/src/content.rs` | `fetch_bytes_via_provider` calls `drain_to_vec`; `materialize_data_capsule` repeats this per file. `import_exact` and aggregate `import_object` bytes are capped at 64 MiB; import permits at most 512 files. These whole-buffer import/materialization paths are not the multi-gigabyte model path. |
+| `elastos/crates/elastos-runtime/src/provider/registry.rs` | `open_provider_stream` decodes the full response into `ProviderStreamSession.bytes`; 64 KiB `read_next` chunks slice that buffer. Consumer chunking alone does not bound producer memory or cancel network transfer. |
+| `capsules/ipfs-provider/src/main.rs` | Runtime's registered native IPFS backend handles `Cat` with CID/path only. `cat` and `cat_to_path` fetch the entire file with `read_to_end` before encoding or writing. Implement bounded backend reads and actual cancellation before using this path for Qwen. |
+| `elastos/crates/elastos-server/src/api/gateway_site.rs` | Gateway CID reads buffer content before enforcing the 100 MiB file limit. Ordinary browser file responses are not a model-transfer route. |
+| `server_infra.rs` and `capsules/model-provider/src/config.rs` | Offers come from private startup config; local descriptors contain path and SHA-256. Bind admitted content to those verified descriptors and the existing ProviderRegistry lifecycle, rather than giving Settings write access to config. |
+
+First confirm the selected backend and its capabilities through Runtime. Extend
+the existing content fetch/range contract down to that backend with exact CID,
+manifest-approved relative path, offset and length. Bound each backend read and
+response before allocation, with one in-flight chunk, deadlines, incremental
+integrity verification, observed progress and cancellation of the actual read.
+Reject ignored ranges, wrong offsets, oversized/truncated data and closure or
+digest mismatch. Do not implement this by draining a complete stream and then
+slicing it, or by merely increasing the existing whole-file limits.
+
+Runtime owns one private staging operation for the exact package identity and
+admission record. Bound catalog/manifest bytes, file count, each file, total
+bytes and time from validated policy and exact package facts. Account for
+backend pin storage, staging and final placement, preserving at least 10% free
+space on every affected volume before and during preparation. Verify ownership,
+mode, symlink/hard-link refusal and containment. Atomically admit only the full
+verified closure; restart reconciles the same record and removes only its owned
+partial staging. Retry neither duplicates admission nor repeats a completed
+transfer. Cancellation and cleanup leave other packages and user data intact.
+
+Proposed local commit order, after the separate onboarding/recovery and window
+policy slices:
+
+1. **Package and catalog admission contract.** Extend the existing manifest,
+   inventory/catalog and Runtime authority types for one Qwen package. Signed
+   catalog entries can exist before local materialization. Add narrowly typed
+   preparation, status/cancel and retention intents at this Runtime boundary:
+   the current catalog is read-only and content fetch does not authorize an
+   installation. Inputs identify the exact catalog entry/CID or owned operation;
+   Runtime derives principal, trust, provider and paths. Keep one inventory and
+   its admission receipts, not an independent Store registry or second journal.
+   Test canonical closure identity, signature/trust/revocation, size/license/
+   provenance/compatibility rejection, caller isolation and bounded projections.
+2. **Bounded content transfer and atomic preparation.** Extend only the selected
+   native backend and existing content/registry transfer path needed above.
+   Test a deterministic streamed fixture larger than old whole-file limits with
+   bounded peak buffers, slow/oversized/ignored-range failures, mid-read cancel,
+   retry, concurrent duplicate selection, low disk, crash/restart and exact
+   partial cleanup. Include proof that provider work stops, not just UI progress.
+3. **Admission-to-offer binding.** Reuse the installed engine receipt, private
+   artifact verification, ProviderRegistry and model run journal. Derive offers
+   from admitted records; reinitialize the existing provider only when idle and
+   safe, preserving active and unknown-settlement runs. Test absent/incompatible
+   engine, tampered artifacts, duplicate admission, restart without transfer,
+   busy retention release and exact CID-to-offer/run binding. This is not a new
+   inference provider or a capsule-facing config operation.
+4. **Shared model experience.** Add Models within existing Marketplace and model
+   management within System; extend Assistant/Home Agent selectors. Test the
+   same records across
+   all views; Use/Keep/release intent shapes; Preparing, progress, cancel, retry,
+   failed/offline/incompatible/ready states; selection while preparing; draft/run
+   preservation; and inference disabled until the selected model is ready.
+   Keep ordinary app catalog behavior and hosted configuration unchanged.
+5. **Cold proof and publication review.** After source review, use the existing
+   authorized isolated proof scope with a compatible fresh install and no
+   model bytes or operator offer preconfiguration. Select the real signed Qwen
+   entry, prepare, receive a real reply through the existing typed run contract,
+   restart, reuse without transfer, release Keep and verify busy-safe eviction.
+   Verify actual
+   artifact/receipt parity and human behavior, then publish code/tests/docs/
+   manifests only after explicit authorization. Passkey ceremonies require the
+   person's action; GitHub publication, live changes, paid calls and destructive
+   data operations retain explicit approval gates. Routine isolated proof does
+   not require a new approval per step. Fixture proof remains separate.
+
+The first package is the currently verified Qwen3.5-9B Q4_K_M with the existing
+llama.cpp engine; `components.json` estimates 6170 MB, which is not an exact
+signed closure size. Packaging must establish exact bytes, complete-closure CID,
+publisher signature/trust, base and quantization licenses/provenance, resource
+limits and real availability. The existing engine's platform/checksum receipt
+and shared libraries must work on a genuinely fresh supported install; missing
+engine or unsupported hardware yields an actionable incompatible/unavailable
+state rather than using an ambient executable or another model. Engine delivery
+uses the existing verified component mechanism, not a second UI downloader.
+No production publisher, signed catalog CID or availability deployment is
+invented by fixtures. Git contains code, tests, docs and reviewed manifests;
+large model bytes and private publisher keys remain outside it. Remote hosted
+inference publication, Jetson and mandates remain later work.
 
 ## Bootstrap while the network matures
 
 Content should already be available from the declared ElastOS availability
-network before it is presented as normally Gettable. During bootstrap, the
+network before it is presented as available for use. During bootstrap, the
 existing trusted publisher may be the only declared source or replica. This is
 an availability limitation, not a different identity model: the catalog still
 names the content capsule by CID and Runtime still verifies the same package.
@@ -194,7 +300,7 @@ them through Runtime contracts.
 
 ## Admission checks
 
-Before a content capsule is shown as Gettable or admitted, verify at least:
+Before a content capsule is shown as available for preparation or admitted, verify at least:
 
 - canonical manifest encoding and the complete bundle CID;
 - publisher identity, signature, version, and revocation state;
