@@ -529,8 +529,8 @@ installed behavior and public-live behavior require separate evidence.
 
     1. Rerun local Qwen completion, cancellation with confirmed backend stop or
        explicit unknown settlement, restart, and cleanup on the exact candidate.
-       Verify missing saved-run recovery after installing the reviewed source
-       correction: preserve the unsent draft and old run identity, then use
+       Verify missing saved-run recovery in Brave on the corrected installation:
+       preserve the unsent draft and old run identity, then use
        Check status or explicit New chat without an automatic redispatch.
     2. Prove real operator-configured Chat Completions and Responses routes with
        fallback disabled, truthful provider/model and usage/cost facts, one
