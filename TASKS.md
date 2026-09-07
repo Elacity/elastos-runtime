@@ -58,15 +58,17 @@ Open gates, in order:
 
 1. [ ] The Mac proof owner completes behavior acceptance on the installed
    model Home; exact installed artifact provenance is in [state.md](state.md).
-   Run a fresh signed Qwen completion, explicitly cancel the selected
-   run, verify backend stop or honest unknown settlement with one terminal result
-   and no duplicate dispatch, and prove reload, restart and cleanup.
+   Complete installed draft preservation, reload and restart recovery, retained
+   terminal results, and cleanup. Fresh completion and an explicit Stop with
+   terminal unknown settlement are recorded in [state.md](state.md).
+   Backend stop or honest unknown settlement remains the cancellation rule,
+   with one terminal result and no duplicate dispatch. Keep each explicit
+   run's terminal and dispatch evidence distinct.
    Managed-engine stream closure alone is not backend-stop proof.
    Also run focused Recovery, Profile,
    navigation and Terminal tests. Add Browser media only when the target
    supplies accepted evidence. Finish with hash-bound receipts for the exact
-   tree; the earlier completed Qwen run and current artifact parity are separate
-   evidence.
+   tree; functional run evidence and artifact parity remain separate.
 2. [ ] Prove first-owner enrollment on a fresh isolated supported host: normal
    verified-loopback onboarding, one-use operator-admitted HTTPS origin/RP,
    typed denials, competing attempts and reload/restart recovery with one owner

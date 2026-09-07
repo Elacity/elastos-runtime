@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-09-06 UTC
+Last updated: 2026-09-07 UTC
 
 This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
@@ -613,16 +613,16 @@ complete. Installed proof and the atomic authority cutover remain open.
   byte-parity claim. An earlier independent read-only account check matches the
   previously observed Admin record; fresh sign-in and model behavior acceptance
   remain open.
-- An earlier installed candidate completed one signed Qwen functional run.
-  Home Agent used offer `local-qwen` through the typed Runtime model path. Its
-  `text.generate` run completed with four events, an
-  `elastos.model.output.text/v1` value containing 1066 output characters, no
-  error, and a duration of about 20.6 seconds. The journal file was owner-only.
-  Runtime kept Qwen engine and provider details private. A fresh completed run,
-  explicit cancellation of the selected run with backend-stop evidence or
-  honest unknown settlement and no duplicate dispatch, restart, and cleanup on
-  the current corrected tree remain open, including reload behavior.
-  Current installed hash parity does not supply that execution proof.
+- On the corrected installation, the user and an independent accessibility
+  read observed a complete Qwen reply; the UI reported 14.1 seconds and 55
+  tokens. Its journal record was no longer present at metadata inspection.
+  Stop on a separate explicit run produced one dispatched journal event and
+  one terminal `settlement_unknown` event. A later explicit submission completed
+  in 111.2 seconds, within the 120-second limit, with 4,809 output characters,
+  one terminal output event and no error. The journals support those two
+  distinct run outcomes. Honest unknown settlement is an allowed cancellation
+  outcome; actual backend stop was unobserved. Installed draft preservation,
+  visual reload recovery, restart and cleanup acceptance remain open.
 - The reviewed receipt convergence, end-to-end deadline, and hosted URL
   redaction corrections are complete in source and have fresh installed
   artifact parity proof.
