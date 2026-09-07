@@ -63,6 +63,11 @@ export function friendlyOpenError(error) {
     return "Browser session expired. Reopening from Home...";
   }
   const outcome = runtimeOpenOutcome(error);
+  if (outcome?.state === "terminal_pre_effect_failure" && error?.payload?.stage === "viewer_compatibility") {
+    return error.payload.code === "unsupported_viewer_display_mode"
+      ? "This Browser view needs a streamed display. Open Browser from Home with its default display."
+      : "This browser cannot show the Browser session. Use a supported browser or enable WebRTC.";
+  }
   if (outcome?.state === "terminal_pre_effect_failure" && error?.payload?.stage === "engine_compatibility") {
     switch (error?.payload?.code) {
       case "incompatible_engine_protocol":

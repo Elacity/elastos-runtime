@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { requireBrowserViewer } from "../capsules/browser/browser/browser-runtime-api.js";
 
 const browserSource = fs.readFileSync(
   new URL("../capsules/browser/browser/browser.js", import.meta.url),
@@ -1125,6 +1126,49 @@ test("pending Home close blocks creation of a replacement Runtime owner", async 
     context.requestRuntimeOpen("https://example.com/"),
     (error) => error?.cleanupOutcome?.reason === "home_window_close_pending",
   );
+});
+
+test("viewer denial preserves an existing page before close or open dispatch", async () => {
+  const page = { page_id: "page-kept" };
+  const loading = [];
+  const context = vm.createContext({
+    runtimeOpenInFlight: 0,
+    homeWindowCloseInFlight: false,
+    pendingHomeWindowCloseDelivery: null,
+    homeWindowTerminalCloseConfirmed: false,
+    currentPage: page,
+    currentPageGeneration: 7,
+    currentRemoteExitId: "exit-kept",
+    currentBrowserEngineId: "engine-kept",
+    selectedRemoteExitId: "exit-next",
+    selectedBrowserEngineId: "engine-next",
+    runtimeOwnershipTerminallyAbsent: false,
+    normalizeRuntimeOpenUrl: (value) => value,
+    visibleAddressForUrl: (value) => value,
+    browserEngineLabel: (value) => value,
+    browserExitLabel: (value) => value,
+    setLoading: (value) => loading.push(value),
+    showStatus() {},
+    launchContractForOpen: async () => ({ displayMode: "webrtc_remote_display" }),
+    requireViewer: (mode) => requireBrowserViewer(mode, {}),
+    closeRuntimePage: () => assert.fail("Viewer rejection must preserve the old page"),
+    fetchJson: () => assert.fail("Viewer rejection must precede Engine dispatch"),
+    isAuthoritySessionError: () => false,
+    friendlyOpenError: (error) => error.message,
+  });
+  vm.runInContext(
+    `${extractFunction(browserSource, "proveRuntimeOwnershipAbsentBeforeDispatch")}\n${extractFunction(browserSource, "requestRuntimeOpen")}\nthis.requestRuntimeOpen = requestRuntimeOpen;`,
+    context,
+  );
+  await assert.rejects(
+    context.requestRuntimeOpen("https://example.com/"),
+    (error) => error.payload?.code === "viewer_unavailable",
+  );
+  assert.equal(context.currentPage, page);
+  assert.equal(context.currentPageGeneration, 7);
+  assert.equal(context.runtimeOwnershipTerminallyAbsent, false);
+  assert.equal(context.runtimeOpenInFlight, 0);
+  assert.deepEqual(loading, [true, false]);
 });
 
 test("ownership-changing open returns pending without closing or claiming terminal", async () => {

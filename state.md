@@ -78,6 +78,9 @@ validates declared Engine capabilities before launch, and preserves explicit
 operator selection. Installed acceptance of this slice remains open.
 Browser settings retain a missing selected Engine or Exit as unavailable until
 the operator changes it. Automatic Engine selection remains with Runtime.
+The web Runtime adapter checks WebRTC viewer eligibility before page replacement
+and Engine dispatch. Tests prove that viewer denial preserves an existing page
+and acquires no new page or stream. Installed viewer proof remains open.
 Mac and Linux host adapters now query their virtualization APIs for eligibility.
 The Mac unit check ran locally; the Linux-specific KVM query still needs a
 Linux test run.

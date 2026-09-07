@@ -111,6 +111,15 @@ Diagnostic and image-polling display modes are rejected.
 
 ## Errors, events, deadlines and cancellation
 
+The web Runtime adapter reports `elastos.browser.viewer-capabilities/v1` with
+WebRTC transport features, reported receive-codec MIME types and an eligibility
+result. Its `viewer_unavailable` and `unsupported_viewer_display_mode` errors
+carry `stage: viewer_compatibility` and a terminal pre-effect open outcome. This
+check runs before closing the previous page or dispatching a new open. Codec
+queries can be unreported; actual SDP negotiation and media proof determine
+interoperability. Headless and native operators retain their own display
+capability requirements behind the same Runtime page contract.
+
 Compatibility errors are stable typed codes:
 `incompatible_engine_protocol`, `invalid_engine_status`, `engine_unavailable`,
 `engine_not_found`, `incompatible_engine_capabilities`, and

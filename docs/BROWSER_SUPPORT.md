@@ -51,6 +51,14 @@ before admitting a local VM. The kernel defines API version
 requirements. A successful query is an eligibility check, not a completed VM
 launch. [Linux KVM API](https://docs.kernel.org/virt/kvm/api.html).
 
+The web Runtime adapter checks WebRTC peer connections, transceivers,
+datachannels and reported receive codecs before it closes an existing page or
+requests a new Engine page. It reports typed viewer incompatibility without
+allocating a peer connection or requesting camera or microphone access. A
+viewer whose browser lacks a codec query proceeds to actual SDP negotiation;
+its unreported codecs remain unknown. This eligibility check does not establish
+codec interoperability or installed media support.
+
 Viewer adaptation uses WebRTC capability negotiation and actual media results.
 Qualify decoding, audio playback policy, datachannels, focus and input on the
 selected browser. Browser names and user-agent strings alone are insufficient

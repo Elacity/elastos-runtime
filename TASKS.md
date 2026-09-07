@@ -30,7 +30,7 @@ selects an Engine that meets the requested display and isolation requirement.
 The role matrix and current protocol are in
 [BROWSER_SUPPORT.md](docs/BROWSER_SUPPORT.md) and
 [BROWSER_PROTOCOL.md](docs/BROWSER_PROTOCOL.md). Remaining B01 acceptance needs
-installed artifact admission, viewer capability checks, approved remote-service
+installed artifact admission, approved remote-service
 selection, and hash-bound device-role proof. The inspected Mac's existing VM
 image failed its manifest hash check; repair or rebuild and verify the image
 or reconcile its artifact provenance before qualification. Direct file and
@@ -39,6 +39,8 @@ are still needed. Preserve the existing journey verdicts until those runs pass.
 Browser settings now retain an explicit Engine or Exit selection when its
 offer is absent. Installed verification must cover a service disappearing and
 returning, followed by an explicit operator switch to another service.
+The web Runtime adapter now checks viewer eligibility before page replacement
+or Engine dispatch. Installed viewer and negotiated-codec proof remains open.
 
 - [ ] [B01: One Browser contract and an explicit support matrix](docs/BROWSER_ACCEPTANCE.md#b01).
 - [ ] [B02: A fresh installation opens a usable Browser](docs/BROWSER_ACCEPTANCE.md#b02).

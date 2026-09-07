@@ -6,7 +6,7 @@ import {
   normalizeUrl,
   sameBrowserStreamTarget,
   visibleAddressForUrl,
-} from "./browser-runtime-api.js?v=browser-20260627b";
+} from "./browser-runtime-api.js?v=browser-20260907b";
 import {
   createBrowserClipboardBridge,
 } from "./browser-clipboard.js?v=browser-20260725b";
@@ -26,9 +26,9 @@ import {
   isAuthoritySessionError,
   isMissingRuntimePageError,
   requestedDisplayMode,
-} from "./browser-status.js?v=browser-20260907a";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260907a";
-import { renderServiceSelection } from "./browser-service-selection.js?v=browser-20260907a";
+} from "./browser-status.js?v=browser-20260907b";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260907b";
+import { renderServiceSelection } from "./browser-service-selection.js?v=browser-20260907b";
 
 const STATUS_TTL_MS = 4200;
 const PAGE_STATUS_INTERVAL_MS = 2_500;
@@ -70,7 +70,7 @@ const launchToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).
 const homeParentOrigin = params.get("home_origin") || "";
 const debugMetrics =
   params.get("debug") === "1" || params.get("metrics") === "1";
-const { fetchJson } = createRuntimeApi({ launchToken });
+const { fetchJson, requireViewer } = createRuntimeApi({ launchToken });
 const homeClipboard = createHomeClipboardClient({
   targetId: "browser",
   homeOrigin: homeParentOrigin,
@@ -1835,6 +1835,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
   runtimeOpenInFlight += 1;
   try {
     const { displayMode, guaranteeLevel } = await launchContractForOpen();
+    requireViewer(displayMode);
     const previousPage = currentPage;
     const previousGeneration = currentPageGeneration;
     const previousOwner = runtimePageOwner(previousPage, previousGeneration);
