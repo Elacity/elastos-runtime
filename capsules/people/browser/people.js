@@ -516,7 +516,7 @@ async function saveProfile() {
     window.top.postMessage({
       type: "home:open-target",
       target: "system",
-      query: {},
+      query: { settings: "security" },
       homeToken,
     }, homeParentOrigin);
     profileForm.dataset.profileState = "retry";
@@ -534,6 +534,9 @@ async function saveProfile() {
     });
     showStatus(profileForm?.dataset.profileState === "saved" ? "Profile saved." : "Profile created.", "ok");
     await refreshPeople({ quiet: true });
+    if (homeParentOrigin && window.top && window.top !== window) {
+      window.top.postMessage({ type: "home:refresh-summary", homeToken }, homeParentOrigin);
+    }
   } catch (error) {
     if (error.status === 409
       && error.schema === "elastos.people.profile-protection-required/v1"

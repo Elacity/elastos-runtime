@@ -38,12 +38,25 @@ async fn export_full_recovery_bundle_response(
     authority: &TestPasskeyAuthority,
     principal: &crate::auth::PrincipalRecord,
 ) -> Response {
-    let intent = json!({
+    export_full_recovery_bundle_with_profile(app, data_dir, authority, principal, None).await
+}
+
+async fn export_full_recovery_bundle_with_profile(
+    app: &axum::Router,
+    data_dir: &std::path::Path,
+    authority: &TestPasskeyAuthority,
+    principal: &crate::auth::PrincipalRecord,
+    display_name: Option<&str>,
+) -> Response {
+    let mut intent = json!({
         "principal_id": authority.principal_id,
         "localhost_root": principal.localhost_root,
         "label": "Recovery test",
         "download_password": null,
     });
+    if let Some(name) = display_name {
+        intent["profile_display_name"] = json!(name);
+    }
     let step_up = step_up_token_for_app_context(
         data_dir,
         SYSTEM_CAPSULE_ID,
@@ -51,6 +64,9 @@ async fn export_full_recovery_bundle_response(
         "auth.full-recovery-bundle.export",
         &intent,
     );
+    let mut request = intent.clone();
+    request["schema"] = json!("elastos.full-recovery-bundle.export.request/v1");
+    request["step_up_token"] = json!(step_up);
     app.clone()
         .oneshot(
             test_browser_request("localhost:61180", "null")
@@ -58,16 +74,7 @@ async fn export_full_recovery_bundle_response(
                 .uri("/api/auth/recovery/full-export")
                 .header("x-elastos-home-token", authority.system_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({
-                        "schema": "elastos.full-recovery-bundle.export.request/v1",
-                        "principal_id": intent["principal_id"],
-                        "localhost_root": intent["localhost_root"],
-                        "label": intent["label"],
-                        "step_up_token": step_up,
-                    })
-                    .to_string(),
-                ))
+                .body(Body::from(request.to_string()))
                 .unwrap(),
         )
         .await
@@ -178,6 +185,200 @@ async fn full_recovery_export_marks_handoff_only_after_the_complete_bundle_succe
     let payload: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["recovery_configured"], true);
     assert!(payload["required_actions"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn full_recovery_setup_preserves_identity_and_requires_successful_profile_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("alex"));
+    let principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+    let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    let ready = gateway_router(wallet_test_state(dir.path()).await);
+    // An older, verified kit remains useful for the root, but contains no Profile.
+    let old =
+        export_full_recovery_bundle_response(&ready, dir.path(), &authority, &principal).await;
+    assert_eq!(old.status(), StatusCode::OK);
+    let old: Value = serde_json::from_slice(
+        &axum::body::to_bytes(old.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(old["included"]["people_identity"], false);
+    let unavailable = gateway_router(
+        wallet_test_state_with_shared_provider(
+            dir.path(),
+            Arc::new(RejectingFullRecoveryWalletProvider),
+        )
+        .await,
+    );
+    let failed = export_full_recovery_bundle_with_profile(
+        &unavailable,
+        dir.path(),
+        &authority,
+        &principal,
+        Some("Edited Name"),
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let profile = crate::collaboration_profile_authority::load_profile_authority(
+        dir.path(),
+        &principal.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap()
+    .expect("Profile exists before Wallet export");
+    assert_eq!(profile.document().display_name, "Edited Name");
+    let status = crate::api::auth_gateway::principal_root_recovery_status_for_verified_principal(
+        dir.path(),
+        &principal.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap();
+    assert!(crate::api::auth_gateway::principal_root_recovery_is_ready(
+        &status
+    ));
+    assert!(status
+        .required_actions
+        .iter()
+        .any(|action| action == "download_recovery_kit_with_profile"));
+    let restarted = gateway_router(wallet_test_state(dir.path()).await);
+    let (first, second) = tokio::join!(
+        export_full_recovery_bundle_with_profile(
+            &restarted,
+            dir.path(),
+            &authority,
+            &principal,
+            Some("Edited Name")
+        ),
+        export_full_recovery_bundle_with_profile(
+            &restarted,
+            dir.path(),
+            &authority,
+            &principal,
+            Some("Another Name")
+        ),
+    );
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    let after = crate::collaboration_profile_authority::load_profile_authority(
+        dir.path(),
+        &principal.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        profile, after,
+        "retry never renames or revises an existing Profile"
+    );
+    let status = crate::api::auth_gateway::principal_root_recovery_status_for_verified_principal(
+        dir.path(),
+        &principal.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap();
+    assert!(status.required_actions.is_empty());
+}
+
+#[test]
+fn full_recovery_setup_concurrent_initial_profile_keeps_one_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("alex"));
+    let principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+    let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    crate::auth::store_test_principal_root_protection(dir.path(), &principal.principal_id);
+    let before = crate::api::gateway::gateway_home_runtime::home_state(dir.path());
+    let barrier = std::sync::Barrier::new(2);
+    let profiles = std::thread::scope(|scope| {
+        let create = || {
+            barrier.wait();
+            crate::collaboration_profile_authority::ensure_initial_profile_authority(
+                dir.path(),
+                &principal.principal_id,
+                &principal.localhost_root,
+                &authority.proof_binding_id,
+                "Alex",
+                crate::auth::now_ts(),
+            )
+            .unwrap()
+        };
+        let first = scope.spawn(create);
+        let second = scope.spawn(create);
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert_eq!(profiles.0, profiles.1);
+    assert_eq!(profiles.0.document().revision, 1);
+    let after = crate::api::gateway::gateway_home_runtime::home_state(dir.path());
+    assert_eq!(
+        serde_json::to_value(before.people).unwrap(),
+        serde_json::to_value(after.people).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn full_recovery_setup_rejects_changed_name_and_wrong_actor_before_effects() {
+    for wrong_actor in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let authority = passkey_authority_with_name(dir.path(), Some("alex"));
+        let principal =
+            crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+                .unwrap();
+        let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
+        let app = gateway_router(wallet_test_state(dir.path()).await);
+        let mut intent = json!({"principal_id": principal.principal_id, "localhost_root": principal.localhost_root,
+            "label": "Recovery test", "download_password": null, "profile_display_name": "Alex"});
+        let step_up = step_up_token_for_app_context(
+            dir.path(),
+            SYSTEM_CAPSULE_ID,
+            &authority.system_token,
+            "auth.full-recovery-bundle.export",
+            &intent,
+        );
+        if !wrong_actor {
+            intent["profile_display_name"] = json!("Changed");
+        }
+        intent["schema"] = json!("elastos.full-recovery-bundle.export.request/v1");
+        intent["step_up_token"] = json!(step_up);
+        let token = if wrong_actor {
+            app_token_for_authority(dir.path(), PEOPLE_CAPSULE_ID, &authority)
+        } else {
+            authority.system_token.clone()
+        };
+        let response = app
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/auth/recovery/full-export")
+                    .header("x-elastos-home-token", token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(intent.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+        assert!(crate::auth::load_principal_root_protection(
+            dir.path(),
+            &principal.principal_id,
+            &principal.localhost_root
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            crate::collaboration_profile_authority::load_profile_authority(
+                dir.path(),
+                &principal.principal_id,
+                &principal.localhost_root
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
 }
 
 struct RejectingFullRecoveryWalletProvider;
@@ -970,24 +1171,12 @@ async fn test_full_recovery_bundle_restores_people_identity_on_a_fresh_machine()
     )
     .unwrap();
     let _ = elastos_identity::load_or_create_did(original_dir.path()).unwrap();
-    crate::auth::store_test_principal_root_protection(original_dir.path(), &original.principal_id);
-    let saved = crate::collaboration_profile_authority::update_profile_authority(
-        original_dir.path(),
-        &original.principal_id,
-        &original_principal.localhost_root,
-        &original.proof_binding_id,
-        "Original Person",
-        Some("original"),
-        crate::auth::now_ts(),
-    )
-    .unwrap();
-    let profile_did = saved.document().profile_did.clone();
-
     let export_intent = json!({
         "principal_id": original.principal_id,
         "localhost_root": original_principal.localhost_root,
         "label": "Everything",
         "download_password": "test password",
+        "profile_display_name": "Original Person",
     });
     let fresh_token = step_up_token_for_app_context(
         original_dir.path(),
@@ -1011,6 +1200,7 @@ async fn test_full_recovery_bundle_restores_people_identity_on_a_fresh_machine()
                         "localhost_root": export_intent["localhost_root"],
                         "label": export_intent["label"],
                         "step_up_token": fresh_token,
+                        "profile_display_name": "Original Person",
                         "download_password": "test password"
                     })
                     .to_string(),
@@ -1024,6 +1214,16 @@ async fn test_full_recovery_bundle_restores_people_identity_on_a_fresh_machine()
         .await
         .unwrap();
     let export_json: serde_json::Value = serde_json::from_slice(&export_body).unwrap();
+    let saved = crate::collaboration_profile_authority::load_profile_authority(
+        original_dir.path(),
+        &original.principal_id,
+        &original_principal.localhost_root,
+    )
+    .unwrap()
+    .expect("first setup exports its new Profile");
+    let profile_did = saved.document().profile_did.clone();
+    assert_eq!(saved.document().display_name, "Original Person");
+    assert_eq!(saved.document().revision, 1);
 
     // The fresh machine: a different data root whose device key cannot be the
     // original's.

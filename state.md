@@ -351,17 +351,19 @@ complete. Installed proof and the atomic authority cutover remain open.
   bytes, with registration, pending owner setup and guest registration all false.
   The user then completed Touch ID enrollment. Read-only installed records show
   one Admin principal, one existing user root, one owner-enrolled event, one
-  consumed owner operation and one matching active terminal grant. The user
-  deferred Recovery Kit setup; root protection and completed bundle-export
-  records remain absent. An existing-install restart preserved owner, grant,
+  consumed owner operation and one matching active terminal grant. An
+  existing-install restart preserved owner, grant,
   credential, user-file and artifact hashes and returned HTTP 200. The upgrade
   reported zero roots and objects; it created no device-only protection. The
   old gateway and its direct providers exited. A healthy Home-managed service
   remains intentionally available with matching binary, policy and dependency
   fingerprints under the existing reuse contract. This is gateway cleanup,
-  not an all-descendants-reaped claim. Recovery Kit, human reload and
-  operator-admitted HTTPS acceptance remain open; session lifetime stays
-  subject to Runtime policy.
+  not an all-descendants-reaped claim. After that restart, the user saved a
+  Recovery Kit and created a Profile. The exported bundle explicitly omitted
+  People identity and preceded the Profile by 15 seconds. Root recovery is
+  configured; that downloaded kit does not cover the later Profile. Installed
+  combined setup, human reload and operator-admitted HTTPS acceptance remain
+  open; session lifetime stays subject to Runtime policy.
 - Same-principal multi-passkey linking is separate follow-up work. Current
   auth records store role, root and name per proof binding, and counts count
   binding records. Canonical account ownership with separately revocable
@@ -825,17 +827,20 @@ complete. Installed proof and the atomic authority cutover remain open.
   symlinked targets.
 - Fresh desktop placement seeds only visible targets on first run. Saved hidden
   target positions remain intact after later reloads.
-- Current source proof for the onboarding slice is focused and local:
-  `recovery_readiness_change_emits_home_summary_event_only`,
-  `test_recovery_readiness_and_first_profile_gate_share_one_recovery_rule`,
-  `scripts/people-discovery-smoke.mjs`, and
-  `scripts/home-shell-regression-smoke.mjs` pass. The Home audit keeps installed
-  outcomes separate from those source tests. Empty-machine recovery coverage
-  for a first kit that predates the later random Profile key remains open.
-  Manual GUI acceptance still requires the exact installed artifact.
-- A fresh Recovery Kit export is now truthful about included People identity.
-  Source still needs a separate repair for empty-machine recovery when the first
-  kit predates the later random Profile key.
+- System source offers one action to confirm an editable Profile name and save
+  a complete Recovery Kit. Passkey step-up binds the name. Runtime protects the
+  root, creates the initial Profile under its existing mutation lock, and
+  exports that verified identity. Existing Profiles remain unchanged. The
+  Recovery Kit protector records Profile coverage only after successful full
+  export; an older kit still recovers its root while Home requests an updated
+  kit for an uncovered Profile. People saves refresh Home, and Profile readiness
+  participates in the existing Home event cursor. The kit reminder leaves Chat
+  available to an existing ready Profile.
+- Focused source tests cover empty-machine restore of the same Profile,
+  concurrent first creation, retry, actor/name rejection, failed export after
+  an older kit, and readiness refresh. Auth/server strict Clippy, format gates,
+  System and People browser fixtures, setup and Home shell smokes, and Home
+  entropy pass. Installed combined-setup acceptance remains open.
 
 ## Collaboration Truth
 

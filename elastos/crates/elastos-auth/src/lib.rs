@@ -304,6 +304,15 @@ pub struct PrincipalRootProtectorV1 {
     pub envelope: Option<PrincipalRootProtectorEnvelopeV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive: Option<PrincipalRootRecoveryArchiveV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_coverage: Option<RecoveryProfileCoverageV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryProfileCoverageV1 {
+    pub profile_did: String,
+    pub exported_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -478,6 +487,22 @@ pub fn validate_principal_root_protection(
         if let Some(archive) = &protector.archive {
             validate_principal_root_protector_archive_kind(protector)?;
             validate_principal_root_recovery_archive(archive)?;
+        }
+        if let Some(coverage) = &protector.profile_coverage {
+            if protector.kind != PrincipalRootProtectorKind::RecoveryKit
+                || protector.archive.is_none()
+                || protector.verified_at.is_none()
+                || coverage.exported_at < protector.created_at
+                || coverage.exported_at > protection.updated_at
+                || !coverage.profile_did.starts_with("did:key:z")
+                || !(16..=128).contains(&coverage.profile_did.len())
+                || !coverage
+                    .profile_did
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b':')
+            {
+                return Err("invalid recovery Profile coverage".to_string());
+            }
         }
     }
     Ok(())
@@ -1362,6 +1387,7 @@ mod tests {
             data_key_id: "pdek:abc123".to_string(),
             crypto: PrincipalRootCryptoProfileV1::default(),
             protectors: vec![PrincipalRootProtectorV1 {
+                profile_coverage: None,
                 protector_id: "protector:recovery:abc123".to_string(),
                 kind: PrincipalRootProtectorKind::RecoveryKit,
                 label: "Recovery Kit".to_string(),
@@ -1399,6 +1425,44 @@ mod tests {
         let err = validate_principal_root_protection(&missing_ml_kem)
             .expect_err("hybrid KEM metadata must include ML-KEM");
         assert!(err.contains("ml-kem-768"));
+    }
+
+    #[test]
+    fn recovery_profile_coverage_requires_verified_archive_and_bounded_identity() {
+        let mut protection = principal_root_protection();
+        let protector = &mut protection.protectors[0];
+        protector.archive = Some(PrincipalRootRecoveryArchiveV1 {
+            cipher: "aes-256-gcm".to_string(),
+            nonce: "AAAAAAAAAAAAAAAA".to_string(),
+            encrypted_recovery_kit: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            created_at: protection.updated_at,
+        });
+        protector.profile_coverage = Some(RecoveryProfileCoverageV1 {
+            profile_did: "did:key:z6Mkh11111111111111111111111111111111111111111".to_string(),
+            exported_at: protection.updated_at,
+        });
+        validate_principal_root_protection(&protection).unwrap();
+        for case in 0..5 {
+            let mut invalid = protection.clone();
+            let protector = &mut invalid.protectors[0];
+            match case {
+                0 => protector.archive = None,
+                1 => protector.verified_at = None,
+                2 => protector.profile_coverage.as_mut().unwrap().profile_did = "x".repeat(129),
+                3 => protector.profile_coverage.as_mut().unwrap().exported_at = 0,
+                _ => protector.profile_coverage.as_mut().unwrap().exported_at += 1,
+            }
+            assert!(validate_principal_root_protection(&invalid).is_err());
+        }
+        let mut old = serde_json::to_value(&protection).unwrap();
+        old["protectors"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("profile_coverage");
+        let old: PrincipalRootProtectionV1 = serde_json::from_value(old).unwrap();
+        validate_principal_root_protection(&old).unwrap();
+        assert!(old.protectors[0].verified_at.is_some());
+        assert!(old.protectors[0].profile_coverage.is_none());
     }
 
     #[test]

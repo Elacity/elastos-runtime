@@ -2820,6 +2820,54 @@ pub fn load_principal_root_protection(
     Ok(Some(protection))
 }
 
+pub(crate) fn mark_recovery_kit_handed_to_person(
+    data_dir: &Path,
+    kit: &RecoveryKitV1,
+    coverage: Option<elastos_runtime::auth::RecoveryProfileCoverageV1>,
+    now: u64,
+) -> anyhow::Result<()> {
+    verify_recovery_kit_material(kit)?;
+    mutate_auth_state(data_dir, |state| {
+        let protection = state
+            .principal_root_protections
+            .iter_mut()
+            .find(|stored| {
+                stored.principal_id == kit.principal_id
+                    && stored.localhost_root == kit.localhost_root
+            })
+            .ok_or_else(|| anyhow!("principal root protection is missing"))?;
+        validate_principal_root_protection(protection).map_err(anyhow::Error::msg)?;
+        if protection.data_key_id != kit.data_key_id || protection.crypto != kit.crypto {
+            anyhow::bail!("recovery kit protection binding mismatch");
+        }
+        let protector = protection
+            .protectors
+            .iter_mut()
+            .find(|protector| protector.protector_id == kit.protector_id)
+            .ok_or_else(|| anyhow!("recovery kit protector is missing"))?;
+        if protector.kind != PrincipalRootProtectorKind::RecoveryKit {
+            anyhow::bail!("recovery kit protector kind mismatch");
+        }
+        let archived = recovery_kit_from_archive(
+            data_dir,
+            protector
+                .archive
+                .as_ref()
+                .ok_or_else(|| anyhow!("recovery kit archive is missing"))?,
+        )?;
+        verify_recovery_kit_material(&archived)?;
+        if archived != *kit {
+            anyhow::bail!("recovery kit archive binding mismatch");
+        }
+        protector.verified_at.get_or_insert(now);
+        if let Some(coverage) = coverage {
+            protector.profile_coverage = Some(coverage);
+        }
+        protection.updated_at = now.max(protection.updated_at);
+        validate_principal_root_protection(protection).map_err(anyhow::Error::msg)
+    })
+}
+
 #[derive(Debug)]
 pub struct PrincipalRootProtectionActivationGuard {
     _guard: std::sync::MutexGuard<'static, ()>,
@@ -5903,6 +5951,7 @@ pub(crate) fn store_test_principal_root_protection(
         data_key_id,
         crypto,
         protectors: vec![elastos_runtime::auth::PrincipalRootProtectorV1 {
+            profile_coverage: None,
             protector_id: kit.protector_id,
             kind: PrincipalRootProtectorKind::RecoveryKit,
             label: "Test Recovery Kit".to_string(),

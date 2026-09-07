@@ -7861,7 +7861,9 @@ assert(
 assert(
   system.includes('id="recovery-password"') &&
     system.includes("Download Recovery Kit") &&
-    system.includes("Downloads everything recoverable for this account") &&
+    system.includes("Save your Profile, Home data recovery, and built-in Wallet recovery keys in one kit.") &&
+    system.includes('id="recovery-profile-name"') &&
+    systemJs.includes("intent.profile_display_name = name;") &&
     systemJs.includes("download_password") &&
     systemJs.includes("recoveryDownloadPassword") &&
     systemJs.includes("elastos.full-recovery-bundle.export.request/v1") &&

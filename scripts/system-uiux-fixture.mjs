@@ -92,6 +92,7 @@ export function makeSystemSummary(
     appearance,
     identity: {
       device_did: deviceDid,
+      profile_readiness: { schema: "elastos.profile.readiness/v1", status: "ready" },
     },
     runtime: {
       version: "0.7.0-source",

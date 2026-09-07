@@ -136,6 +136,7 @@ struct HomeRealtimeEvent {
 struct HomeRealtimeSnapshot {
     principal_id: String,
     recovery_readiness: RecoveryReadinessSummary,
+    profile_readiness: ProfileReadinessSummary,
     notification_signature: Vec<String>,
     wallet_request_signature: Vec<String>,
     capability_request_count: usize,
@@ -3337,6 +3338,12 @@ async fn home_realtime_snapshot(
     HomeRealtimeSnapshot {
         principal_id: context.principal_id.clone(),
         recovery_readiness,
+        profile_readiness: profile_readiness_for_principal(
+            &state.data_dir,
+            &home_browser_principal_id(context),
+            &home_browser_localhost_root(context),
+        )
+        .readiness,
         notification_signature,
         wallet_request_signature,
         capability_request_count,
@@ -3376,7 +3383,11 @@ struct HomeRealtimeCursorParts {
 
 fn home_realtime_cursor_parts(snapshot: &HomeRealtimeSnapshot) -> HomeRealtimeCursorParts {
     HomeRealtimeCursorParts {
-        home: stable_cursor_hash(&(&snapshot.principal_id, &snapshot.recovery_readiness)),
+        home: stable_cursor_hash(&(
+            &snapshot.principal_id,
+            &snapshot.recovery_readiness,
+            &snapshot.profile_readiness,
+        )),
         inbox: stable_cursor_hash(&(
             &snapshot.notification_signature,
             &snapshot.wallet_request_signature,
@@ -3753,7 +3764,12 @@ pub(super) fn recovery_readiness_for_context(
         &home_browser_localhost_root(context),
     ) {
         Ok(recovery) => {
-            if crate::api::auth_gateway::principal_root_recovery_is_ready(&recovery) {
+            if crate::api::auth_gateway::principal_root_recovery_is_ready(&recovery)
+                && !recovery
+                    .required_actions
+                    .iter()
+                    .any(|action| action == "download_recovery_kit_with_profile")
+            {
                 RecoveryReadinessSummary::ready()
             } else {
                 RecoveryReadinessSummary::setup_required()
@@ -5940,6 +5956,7 @@ mod home_realtime_tests {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
             recovery_readiness: RecoveryReadinessSummary::unavailable(),
+            profile_readiness: ProfileReadinessSummary::setup_required(),
             notification_signature: Vec::new(),
             wallet_request_signature: Vec::new(),
             capability_request_count: 0,
@@ -5979,6 +5996,7 @@ mod home_realtime_tests {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
             recovery_readiness: RecoveryReadinessSummary::unavailable(),
+            profile_readiness: ProfileReadinessSummary::setup_required(),
             notification_signature: Vec::new(),
             wallet_request_signature: Vec::new(),
             capability_request_count: 0,
@@ -6021,6 +6039,7 @@ mod home_realtime_tests {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
             recovery_readiness: RecoveryReadinessSummary::setup_required(),
+            profile_readiness: ProfileReadinessSummary::setup_required(),
             notification_signature: Vec::new(),
             wallet_request_signature: Vec::new(),
             capability_request_count: 0,
@@ -6034,9 +6053,16 @@ mod home_realtime_tests {
             }),
         };
         let cursor = home_realtime_cursor(&snapshot);
+        let profile_changed = HomeRealtimeSnapshot {
+            profile_readiness: ProfileReadinessSummary::ready(),
+            ..snapshot
+        };
+        assert!(home_realtime_events(&cursor, &profile_changed)
+            .iter()
+            .any(|event| event.kind == "home.summary.changed"));
         let changed = HomeRealtimeSnapshot {
             recovery_readiness: RecoveryReadinessSummary::ready(),
-            ..snapshot
+            ..profile_changed
         };
 
         let events = home_realtime_events(&cursor, &changed);

@@ -1011,20 +1011,18 @@ assert(
 );
 assert(
   homeGuiTemplate.includes('id="setup-sheet"') &&
-    homeGuiTemplate.includes("Save a Recovery Kit, then create your Profile.") &&
+    homeGuiTemplate.includes("Create your Profile and save a complete Recovery Kit in System.") &&
     homeGuiTemplate.includes('id="setup-sheet-recovery"') &&
-    homeGuiTemplate.includes('id="setup-sheet-profile"') &&
-    homeGuiTemplate.indexOf('id="setup-sheet-step-recovery"') <
-      homeGuiTemplate.indexOf('id="setup-sheet-step-profile"'),
-  "Home setup sheet must keep the Recovery-first order and the bounded setup actions",
+    !homeGuiTemplate.includes('id="setup-sheet-profile"'),
+  "Home setup must use one System action for Profile and complete recovery",
 );
 assert(
   homeSetupSheetScript.includes('const PROFILE_READINESS_SCHEMA = "elastos.profile.readiness/v1";') &&
     homeSetupSheetScript.includes('const RECOVERY_READINESS_SCHEMA = "elastos.recovery.readiness/v1";') &&
     homeSetupSheetScript.includes('openTarget("system", { query: { settings: "security" } });') &&
-    homeSetupSheetScript.includes('openTarget("people");') &&
+    !homeSetupSheetScript.includes('openTarget("people");') &&
     homeSetupSheetScript.includes('const SETUP_HOLD_TARGETS = new Set(["chat-room"]);') &&
-    homeSetupSheetScript.includes('return status !== "ready" && status !== "signed_out";') &&
+    homeSetupSheetScript.includes('return status !== "signed_out" && !setupFinished(summary);') &&
     !homeSetupSheetScript.includes("principal_id") &&
     !homeSetupSheetScript.includes("credential_id") &&
     !homeSetupSheetScript.includes("localStorage") &&
@@ -1036,13 +1034,10 @@ assert(
   "Home setup must use typed Runtime readiness only, hold Chat only, and open System or People without local fallback state",
 );
 assert(
-  homeSetupSheetScript.includes('recoveryButton.textContent = unavailable') &&
-    homeSetupSheetScript.includes('? "Open System"') &&
-    homeSetupSheetScript.includes('profileButton.disabled = unavailable || profileReady || !recoveryReady || !targetById(summary, "people");') &&
-    homeSetupSheetScript.includes('const next = unavailable || homeRecoveryStatus(shellState.currentSummary) !== "ready"') &&
-    homeSetupSheetScript.includes('? recoveryButton') &&
-    homeSetupSheetScript.includes(': profileButton;'),
-  "Unavailable setup state must route only to System and must not enable Profile",
+  homeSetupSheetScript.includes(': profileReady ? "Save Recovery Kit" : "Finish setup";') &&
+    homeSetupSheetScript.includes('recoveryButton.disabled = complete || !targetById(summary, "system");') &&
+    homeSetupSheetScript.includes('recoveryButton : closeButton)?.focus();'),
+  "Setup must focus its one admitted System action",
 );
 assert(
   homeSetupSheetScript.includes('rememberChromeNotification({') &&

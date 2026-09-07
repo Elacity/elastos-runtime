@@ -240,6 +240,8 @@ pub struct FullRecoveryBundleExportRequest {
     pub step_up_token: String,
     #[serde(default)]
     pub download_password: Option<String>,
+    #[serde(default)]
+    pub profile_display_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -949,6 +951,20 @@ pub(in crate::api) fn principal_root_recovery_status_for_verified_principal(
     if !recovery_configured {
         required_actions.push("verify_recovery_before_public_guest_hosting".to_string());
     }
+    if let Some(profile) = crate::collaboration_profile_authority::load_profile_authority(
+        data_dir,
+        principal_id,
+        localhost_root,
+    )? {
+        if !protection.protectors.iter().any(|protector| {
+            protector
+                .profile_coverage
+                .as_ref()
+                .is_some_and(|coverage| coverage.profile_did == profile.document().profile_did)
+        }) {
+            required_actions.push("download_recovery_kit_with_profile".to_string());
+        }
+    }
     Ok(PrincipalRootRecoveryStatusV1 {
         schema: elastos_runtime::auth::PRINCIPAL_ROOT_RECOVERY_STATUS_SCHEMA.to_string(),
         principal_id: principal_id.to_string(),
@@ -1053,18 +1069,22 @@ fn full_recovery_bundle_establish_kit(
     crate::auth::ensure_online_plaintext_migration_is_possible(
         &protection_activation.plaintext_objects,
     )?;
+    let mut intent = serde_json::json!({
+        "principal_id": input.principal_id,
+        "localhost_root": input.localhost_root,
+        "label": input.label,
+        "download_password": input.download_password,
+    });
+    if let Some(name) = &input.profile_display_name {
+        intent["profile_display_name"] = json!(name);
+    }
     consume_passkey_step_up_token(
         &state.data_dir,
         &input.step_up_token,
         launch,
         180,
         "auth.full-recovery-bundle.export",
-        &serde_json::json!({
-            "principal_id": input.principal_id,
-            "localhost_root": input.localhost_root,
-            "label": input.label,
-            "download_password": input.download_password,
-        }),
+        &intent,
     )?;
     let kit = recovery_kit_get_or_create_for_principal(
         state,
@@ -1135,9 +1155,26 @@ async fn full_recovery_bundle_export_inner(
         );
     }
 
+    if let Some(name) = &input.profile_display_name {
+        crate::collaboration_profile_authority::validate_profile_authority_update(
+            &state.data_dir,
+            name,
+            None,
+        )?;
+    }
     let now = crate::auth::now_ts();
     let kit =
         full_recovery_bundle_establish_kit(state, &launch, &context, &principal, &input, now)?;
+    if let Some(name) = &input.profile_display_name {
+        crate::collaboration_profile_authority::ensure_initial_profile_authority(
+            &state.data_dir,
+            &principal.principal_id,
+            &principal.localhost_root,
+            &principal.proof_binding_id,
+            name,
+            now,
+        )?;
+    }
     let wallet_recovery_set = export_managed_recovery_set(state, &wallet_authority).await?;
     let wallet_recovery_keys = full_bundle_wallet_recovery_keys(wallet_recovery_set)?;
     let wallet_recovery_key_count = wallet_recovery_keys.len();
@@ -1147,6 +1184,21 @@ async fn full_recovery_bundle_export_inner(
         &principal.localhost_root,
     )?;
     let people_identity_included = people_identity.is_some();
+    // This identity comes from the verified bundle being returned, not a later
+    // Profile read or the caller's proposed name.
+    let profile_coverage = people_identity
+        .as_ref()
+        .map(|identity| {
+            let profile_did = identity
+                .pointer("/profile_authority_bundle/signed_profile/payload/profile_did")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("verified recovery Profile identity is missing"))?;
+            Ok::<_, anyhow::Error>(elastos_runtime::auth::RecoveryProfileCoverageV1 {
+                profile_did: profile_did.to_string(),
+                exported_at: now,
+            })
+        })
+        .transpose()?;
     let mut bundle = json!({
         "schema": FULL_RECOVERY_BUNDLE_SCHEMA,
         "bundle_id": format!("bundle:{}", random_hex(16)),
@@ -1193,7 +1245,7 @@ async fn full_recovery_bundle_export_inner(
             ..AuditEventInput::default()
         }),
     )?;
-    mark_recovery_kit_handed_to_person(state, &principal, &kit, now)?;
+    crate::auth::mark_recovery_kit_handed_to_person(&state.data_dir, &kit, profile_coverage, now)?;
     Ok(value)
 }
 
@@ -1558,53 +1610,6 @@ fn recovery_kit_get_or_create_for_principal(
         }),
     )?;
     Ok(kit)
-}
-
-fn mark_recovery_kit_handed_to_person(
-    state: &GatewayState,
-    principal: &crate::auth::PrincipalRecord,
-    kit: &RecoveryKitV1,
-    now: u64,
-) -> anyhow::Result<()> {
-    crate::auth::verify_recovery_kit_material(kit)?;
-    if kit.principal_id != principal.principal_id || kit.localhost_root != principal.localhost_root
-    {
-        anyhow::bail!("recovery kit principal binding mismatch");
-    }
-    let mut protection = crate::auth::load_principal_root_protection(
-        &state.data_dir,
-        &principal.principal_id,
-        &principal.localhost_root,
-    )?
-    .ok_or_else(|| anyhow::anyhow!("principal root protection is missing"))?;
-    if protection.data_key_id != kit.data_key_id || protection.crypto != kit.crypto {
-        anyhow::bail!("recovery kit protection binding mismatch");
-    }
-    let protector = protection
-        .protectors
-        .iter_mut()
-        .find(|protector| protector.protector_id == kit.protector_id)
-        .ok_or_else(|| anyhow::anyhow!("recovery kit protector is missing"))?;
-    if protector.kind != PrincipalRootProtectorKind::RecoveryKit {
-        anyhow::bail!("recovery kit protector kind mismatch");
-    }
-    let archived_kit = crate::auth::recovery_kit_from_archive(
-        &state.data_dir,
-        protector
-            .archive
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("recovery kit archive is missing"))?,
-    )?;
-    crate::auth::verify_recovery_kit_material(&archived_kit)?;
-    if archived_kit != *kit {
-        anyhow::bail!("recovery kit archive binding mismatch");
-    }
-    if protector.verified_at.is_some() {
-        return Ok(());
-    }
-    protector.verified_at = Some(now);
-    protection.updated_at = now.max(protection.updated_at);
-    crate::auth::store_principal_root_protection(&state.data_dir, protection)
 }
 
 /// The People identity a Full Recovery Bundle carries: the decrypted profile
@@ -2550,6 +2555,7 @@ fn protection_from_recovery_kit(
         data_key_id: kit.data_key_id.clone(),
         crypto: kit.crypto.clone(),
         protectors: vec![PrincipalRootProtectorV1 {
+            profile_coverage: None,
             protector_id: kit.protector_id.clone(),
             kind: PrincipalRootProtectorKind::RecoveryKit,
             label,
@@ -5409,6 +5415,7 @@ mod tests {
             data_key_id: "pdek:abc123".to_string(),
             crypto: elastos_runtime::auth::PrincipalRootCryptoProfileV1::default(),
             protectors: vec![elastos_runtime::auth::PrincipalRootProtectorV1 {
+                profile_coverage: None,
                 protector_id: "protector:recovery:abc123".to_string(),
                 kind: elastos_runtime::auth::PrincipalRootProtectorKind::RecoveryKit,
                 label: "Recovery Kit".to_string(),
@@ -5485,6 +5492,7 @@ mod tests {
             data_key_id: kit.data_key_id.clone(),
             crypto: kit.crypto.clone(),
             protectors: vec![elastos_runtime::auth::PrincipalRootProtectorV1 {
+                profile_coverage: None,
                 protector_id: "protector:did:abc123".to_string(),
                 kind: elastos_runtime::auth::PrincipalRootProtectorKind::DidRecovery,
                 label: "Recovery DID".to_string(),

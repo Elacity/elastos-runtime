@@ -28,6 +28,12 @@ const uiSoundsInput = document.querySelector("#ui-sounds");
 const passkeyStatusNode = document.querySelector('[data-field="passkey-status"]');
 const accountListNode = document.querySelector("#account-list");
 const recoveryDownloadButton = document.querySelector("#recovery-download");
+const recoveryProfileSetup = document.querySelector("#recovery-profile-setup");
+const recoveryProfileName = document.querySelector("#recovery-profile-name");
+let recoveryProfileRequired = false;
+let recoveryProfileStatus = "unavailable";
+let recoveryProfileDraftInitialized = false;
+let recoveryExportBusy = false;
 const recoveryImportInput = document.querySelector("#recovery-import");
 const recoveryPasswordInput = document.querySelector("#recovery-password");
 const recoveryStatusNode = document.querySelector('[data-field="recovery-status"]');
@@ -244,7 +250,7 @@ function focusRequestedSettingsAction() {
     return;
   }
   requestedSettingsActionFocused = true;
-  recoveryDownloadButton.focus();
+  (recoveryProfileRequired ? recoveryProfileName : recoveryDownloadButton)?.focus();
 }
 
 function hasShellAccess() {
@@ -268,8 +274,21 @@ async function fetchJson(url, init) {
   return response.json();
 }
 
+function renderRecoveryProfileSetup(identity) {
+  const readiness = identity.profile_readiness;
+  recoveryProfileStatus = readiness?.schema === "elastos.profile.readiness/v1"
+    && ["ready", "setup_required"].includes(readiness.status) ? readiness.status : "unavailable";
+  recoveryProfileRequired = recoveryProfileStatus === "setup_required";
+  if (recoveryProfileSetup) recoveryProfileSetup.hidden = !recoveryProfileRequired;
+  if (recoveryProfileRequired && recoveryProfileName && !recoveryProfileDraftInitialized) {
+    recoveryProfileName.value = readText(identity.profile_setup_display_name);
+    recoveryProfileDraftInitialized = true;
+  }
+}
+
 function renderSystemSummary(systemSummary) {
   const identity = systemSummary.identity || {};
+  renderRecoveryProfileSetup(identity);
   const appearance = parseAppearance(systemSummary.appearance);
   const authority = systemSummary.authority || {};
   const access = systemSummary.access || {};
@@ -2211,6 +2230,24 @@ async function refreshRecoveryStatus() {
 }
 
 function setRecoveryStatus(status) {
+  if (recoveryProfileStatus === "unavailable") {
+    showRecoveryStatus("Unavailable", "error");
+    showRecoveryNote("Profile setup could not be checked. Refresh System and try again.", "error");
+    setRecoveryButton("Download Recovery Kit", true);
+    return;
+  }
+  if (recoveryProfileRequired) {
+    showRecoveryStatus("Finish setup", "muted");
+    showRecoveryNote("Confirm your Profile name, then save the complete kit offline.", "muted");
+    setRecoveryButton("Create Profile and save kit", false);
+    return;
+  }
+  if (status?.required_actions?.includes("download_recovery_kit_with_profile")) {
+    showRecoveryStatus("Profile needs backup", "muted");
+    showRecoveryNote("Save a new kit that includes your Profile.", "muted");
+    setRecoveryButton("Save complete Recovery Kit", false);
+    return;
+  }
   const configured = status && status.recovery_configured === true;
   const downloadAvailable = status && status.recovery_download_available === true;
   const protectedRoot = status && status.protection_configured === true;
@@ -2237,11 +2274,13 @@ function setRecoveryStatus(status) {
 }
 
 async function onRecoveryDownload() {
-  if (!hasShellAccess() || !recoveryDownloadButton) {
+  if (!hasShellAccess() || !recoveryDownloadButton || recoveryDownloadButton.disabled || recoveryExportBusy) {
     return;
   }
   clearRecoveryPending();
+  recoveryExportBusy = true;
   setRecoveryButton(recoveryDownloadButton.textContent, true);
+  if (recoveryProfileName) recoveryProfileName.readOnly = true;
   showRecoveryStatus("Preparing", "muted");
   showRecoveryNote("", "muted");
   try {
@@ -2263,10 +2302,17 @@ async function onRecoveryDownload() {
     );
     setRecoveryButton("Download Recovery Kit", false);
     notifyHomeSummaryChanged();
+    await refreshSystemSummary().catch(() => {
+      showRecoveryNote("Recovery Kit downloaded. Store it offline. Refresh System to update setup status.", "success");
+    });
   } catch (error) {
     showRecoveryStatus("Not set", "error");
     showRecoveryNote(String(error.message || error), "error");
     setRecoveryButton("Download Recovery Kit", false);
+  } finally {
+    recoveryExportBusy = false;
+    if (recoveryProfileName) recoveryProfileName.readOnly = false;
+    setRecoveryButton(recoveryDownloadButton.textContent, recoveryProfileStatus === "unavailable");
   }
 }
 
@@ -2406,6 +2452,9 @@ function recoveryImportPlan(status, imported, options = {}) {
 }
 
 async function exportFullRecoveryBundle(status) {
+  if (recoveryProfileStatus === "unavailable") {
+    throw new Error("Profile setup could not be checked. Refresh System and try again.");
+  }
   const downloadPassword = recoveryDownloadPassword();
   const intent = {
     principal_id: readText(status.principal_id),
@@ -2413,6 +2462,14 @@ async function exportFullRecoveryBundle(status) {
     label: "Recovery Kit",
     download_password: downloadPassword || null,
   };
+  if (recoveryProfileRequired) {
+    const name = recoveryProfileName?.value.trim() || "";
+    if (!name) {
+      recoveryProfileName?.focus();
+      throw new Error("Enter a Profile name.");
+    }
+    intent.profile_display_name = name;
+  }
   const stepUpToken = await requestPasskeyStepUp(
     "auth.full-recovery-bundle.export",
     intent,
@@ -2426,6 +2483,7 @@ async function exportFullRecoveryBundle(status) {
       localhost_root: intent.localhost_root,
       label: intent.label,
       step_up_token: stepUpToken,
+      ...(intent.profile_display_name ? { profile_display_name: intent.profile_display_name } : {}),
       ...(downloadPassword ? { download_password: downloadPassword } : {}),
     }),
   });
@@ -2529,7 +2587,7 @@ function downloadRecoveryKit(kit) {
 function setRecoveryButton(label, disabled) {
   if (recoveryDownloadButton) {
     recoveryDownloadButton.textContent = readText(label) || "Download Recovery Kit";
-    recoveryDownloadButton.disabled = disabled || !hasShellAccess();
+    recoveryDownloadButton.disabled = disabled || recoveryExportBusy || !hasShellAccess();
   }
 }
 

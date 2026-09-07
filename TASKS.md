@@ -70,8 +70,8 @@ Open gates, in order:
    navigation and Terminal tests. Add Browser media only when the target
    supplies accepted evidence. Finish with hash-bound receipts for the exact
    tree; functional run evidence and artifact parity remain separate.
-2. [ ] Complete first-owner acceptance on the isolated host: verify Recovery Kit
-   export (deferred by the user), one-use operator-admitted HTTPS origin/RP,
+2. [ ] Complete first-owner acceptance on the isolated host: verify the combined
+   Profile and Recovery Kit action, one-use operator-admitted HTTPS origin/RP,
    typed denials, competing attempts and human reload/recovery behavior.
    Verified loopback Touch ID enrollment and existing-install restart parity
    with one owner and one terminal grant are recorded in [state.md](state.md).
@@ -128,8 +128,10 @@ the protected-content release decision.
   Home. Host-authority and startup-replay repairs have source coverage, but
   an installed transition can still leave a blank shell. Verify the exact
   Inbox handoff through that transition and native Terminal Chat separately.
-- [ ] Prove recovery coverage when a Profile is created after the first
-  recovery-kit download, plus clean first-run Profile and window placement.
+- [ ] Verify installed combined Profile and Recovery Kit setup and updated-kit
+  coverage for an existing Profile. Source restore and retry tests pass; the
+  user's earlier downloaded kit omitted the Profile created afterward.
+  Keep clean first-run window placement acceptance open.
 - [ ] Complete Browser input ordering, lifecycle and accepted media proof on
   the target installation. Source checks cover only their stated contracts.
 - [ ] Finish document-dialog keyboard focus and the remaining app-by-app
