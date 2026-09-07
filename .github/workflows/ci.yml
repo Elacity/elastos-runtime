@@ -166,6 +166,108 @@ jobs:
               (cd "$capsule" && cargo test)
           done
 
+  # Rehearses the ELACITY-2298 dKMS ceremony (offline custody composition +
+  # Carrier dial-proof preflight) against a fresh instance of the
+  # deploy/custody-host 3-node compose harness -- scripts/custody-harness-ci-smoke.sh
+  # owns all the logic (throwaway client identity, throwaway compose
+  # project, receipt assertions, full teardown); this job is thin glue over
+  # it. Gated to workflow_dispatch and PRs that actually touch the harness
+  # image, the proof driver, or the protected-content/carrier crates it
+  # exercises -- NOT every push, since the image build + 3-node bring-up
+  # add real wall time.
+  custody-harness-smoke:
+    name: custody-harness-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: source-gate
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
+    # The top-level `permissions: contents: read` above zeroes every other
+    # scope for every job; dorny/paths-filter resolves a pull_request's
+    # changed files via the GitHub API (this job's checkout is fetch-depth 1,
+    # so there's no local base commit to diff against) and needs
+    # `pull-requests: read` to do that -- without this, the filter step
+    # (unconditional on pull_request) 403s and fails the job on every PR.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+      - name: detect custody/carrier-relevant changes
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            custody:
+              - 'deploy/custody-host/**'
+              - 'scripts/protected-content-installed-e2e-proof.sh'
+              - 'scripts/protected-content-installed-static-audit.py'
+              - 'scripts/custody-harness-ci-smoke.sh'
+              - 'capsules/custody-provider/**'
+              - 'capsules/availability-provider/**'
+              - 'capsules/ipfs-provider/**'
+              - 'elastos/crates/elastos-protected-content-*/**'
+              # Targeted, not the whole elastos-server crate (which would
+              # fire this 60-minute job on most PRs): exactly the modules
+              # this smoke actually exercises -- Carrier transport/dial,
+              # standalone provider hosting, and the custody
+              # composition/chain-config CLI the ceremony drives.
+              - 'elastos/crates/elastos-server/src/carrier.rs'
+              - 'elastos/crates/elastos-server/src/carrier_service.rs'
+              - 'elastos/crates/elastos-server/src/provider_host.rs'
+              - 'elastos/crates/elastos-server/src/run_cmd.rs'
+              - 'elastos/crates/elastos-server/src/server_infra.rs'
+              - 'elastos/crates/elastos-server/src/node_cmd.rs'
+              - 'elastos/crates/elastos-server/src/protected_content_config.rs'
+      - id: should-run
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ steps.filter.outputs.custody }}" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no custody/carrier-relevant paths changed on this PR; skipping the smoke run" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - if: steps.should-run.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@1.91.0
+      # Builds the host `elastos` binary the smoke script itself invokes
+      # (identity show, node peer add, node status) -- same cache shape as
+      # the test-elastos/lint jobs above.
+      - if: steps.should-run.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: elastos
+          prefix-key: ${{ runner.os }}-custody-smoke-bd
+          cache-directories: target-build
+      - if: steps.should-run.outputs.run == 'true'
+        uses: docker/setup-buildx-action@v3
+      # Pre-warms the custody-host image's BuildKit layer cache via the GHA
+      # cache backend, tagged/loaded exactly as deploy/custody-host/up.sh's
+      # own `docker compose up -d --build` expects it -- that later build
+      # then hits this same local layer cache instead of rebuilding cold.
+      - name: pre-build custody-host image (GHA layer cache)
+        if: steps.should-run.outputs.run == 'true'
+        run: |
+          docker buildx build \
+            -f deploy/custody-host/Dockerfile \
+            -t elastos-custody-host:latest \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --load \
+            .
+      - name: custody harness smoke
+        if: steps.should-run.outputs.run == 'true'
+        run: scripts/custody-harness-ci-smoke.sh
+      - name: upload evidence receipt on failure
+        if: failure() && steps.should-run.outputs.run == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: custody-harness-smoke-evidence
+          path: /tmp/custody-harness-ci-smoke-evidence/
+          retention-days: 7
+          if-no-files-found: ignore
+
   # The source-home jobs run only once the test phase is green, in parallel
   # across the three architectures. They are the de-facto release builders:
   # setup-source-home compiles the runtime, shell, home-cli and every provider
