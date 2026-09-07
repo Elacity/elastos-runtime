@@ -407,6 +407,8 @@ fn run_prepare_observed(
         return Err(());
     }
     run_ffmpeg_observed(state, &input_path, &prepared_dir, observe_lifecycle)?;
+    normalize_segment_indexes(&segments_dir)?;
+    normalize_segment_containers(&segments_dir, state.max_output_part_bytes)?;
     let init_len = validate_regular_file_len(
         &prepared_dir.join("init.mp4"),
         false,
@@ -505,13 +507,11 @@ fn run_ffmpeg_observed(
         .arg("-seg_duration")
         .arg(OUTPUT_SEGMENT_DURATION_SECS_V1)
         .arg("-streaming")
-        .arg("1")
+        .arg("0")
         .arg("-use_timeline")
         .arg("0")
         .arg("-use_template")
         .arg("1")
-        .arg("-start_number")
-        .arg("0")
         .arg("-init_seg_name")
         .arg("init.mp4")
         .arg("-media_seg_name")
@@ -781,6 +781,118 @@ fn terminate_and_join(
     Ok(())
 }
 
+/// The ffmpeg DASH muxer has no `start_number` option and always numbers media
+/// segments from 1 (`startNumber="1"`), while the Runtime's prepared-media
+/// contract is 0-based and contiguous. Shift a contiguous 1-based run down by
+/// one so the output matches the contract; a 0-based run is left untouched and
+/// any other numbering is rejected. Renaming ascending never collides because
+/// index `n - 1` is always free once `n - 1` itself has been moved.
+fn normalize_segment_indexes(segments_dir: &Path) -> Result<(), ()> {
+    let mut indexes = Vec::new();
+    for entry in fs::read_dir(segments_dir).map_err(|_| ())? {
+        let entry = entry.map_err(|_| ())?;
+        let name = entry.file_name();
+        indexes.push(parse_segment_index(&name.to_string_lossy())?);
+    }
+    indexes.sort_unstable();
+    let Some(&first) = indexes.first() else {
+        return Err(());
+    };
+    if indexes
+        .iter()
+        .enumerate()
+        .any(|(offset, actual)| *actual != first.checked_add(offset).unwrap_or(usize::MAX))
+    {
+        return Err(());
+    }
+    match first {
+        0 => Ok(()),
+        1 => {
+            for index in indexes {
+                fs::rename(
+                    segments_dir.join(format!("{index:08}.m4s")),
+                    segments_dir.join(format!("{:08}.m4s", index - 1)),
+                )
+                .map_err(|_| ())?;
+            }
+            Ok(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// The Runtime's prepared-media contract wants each media segment to be exactly
+/// one `moof` + `mdat` pair. ffmpeg's DASH muxer prefixes every segment with a
+/// `styp` brand box and a `sidx` index box; both are optional in ISOBMFF/MSE
+/// and the `sidx` byte ranges become stale once the segment is re-packaged
+/// for protection anyway, so they are stripped here. Anything else (a
+/// multi-fragment segment, a trailing box) is rejected rather than repaired.
+fn normalize_segment_containers(segments_dir: &Path, max_output_part_bytes: u64) -> Result<(), ()> {
+    for entry in fs::read_dir(segments_dir).map_err(|_| ())? {
+        let path = entry.map_err(|_| ())?.path();
+        validate_regular_file_len(&path, true, max_output_part_bytes)?;
+        let bytes = fs::read(&path).map_err(|_| ())?;
+        let stripped = strip_dash_segment_prefix(&bytes)?;
+        if stripped.len() != bytes.len() {
+            fs::write(&path, stripped).map_err(|_| ())?;
+        }
+    }
+    Ok(())
+}
+
+/// Drop leading `styp` / `sidx` boxes and require the remainder to be exactly
+/// `moof` followed by `mdat`, spanning the whole segment.
+fn strip_dash_segment_prefix(bytes: &[u8]) -> Result<&[u8], ()> {
+    let mut offset = 0usize;
+    let mut kinds = Vec::new();
+    while offset < bytes.len() {
+        let (kind, size) = read_box_header(bytes, offset)?;
+        kinds.push((offset, kind));
+        offset = offset.checked_add(size).ok_or(())?;
+    }
+    if offset != bytes.len() {
+        return Err(());
+    }
+    let body_start = kinds
+        .iter()
+        .take_while(|(_, kind)| kind == b"styp" || kind == b"sidx")
+        .count();
+    let body: Vec<&[u8; 4]> = kinds[body_start..].iter().map(|(_, kind)| kind).collect();
+    if body != [b"moof", b"mdat"] {
+        return Err(());
+    }
+    Ok(&bytes[kinds[body_start].0..])
+}
+
+/// Minimal ISOBMFF box header reader: returns (type, total size) for the box
+/// at `offset`, accepting 32-bit and 64-bit (`size == 1`) sizes and rejecting
+/// zero-size ("to end of file") and out-of-range boxes.
+fn read_box_header(bytes: &[u8], offset: usize) -> Result<([u8; 4], usize), ()> {
+    let header = bytes
+        .get(offset..offset.checked_add(8).ok_or(())?)
+        .ok_or(())?;
+    let size32 = u32::from_be_bytes(header[..4].try_into().map_err(|_| ())?);
+    let kind: [u8; 4] = header[4..8].try_into().map_err(|_| ())?;
+    let (size, header_len) = match size32 {
+        0 => return Err(()),
+        1 => {
+            let large = bytes
+                .get(offset + 8..offset.checked_add(16).ok_or(())?)
+                .ok_or(())?;
+            (
+                usize::try_from(u64::from_be_bytes(large.try_into().map_err(|_| ())?))
+                    .map_err(|_| ())?,
+                16usize,
+            )
+        }
+        size => (size as usize, 8usize),
+    };
+    if size < header_len || offset.checked_add(size).ok_or(())? > bytes.len() {
+        return Err(());
+    }
+    Ok((kind, size))
+}
+
 fn validate_segments_output(
     segments_dir: &Path,
     max_output_part_bytes: u64,
@@ -1027,6 +1139,22 @@ fn control_request_has_exact_fields(value: &Value, op: &str) -> bool {
     }
 }
 
+/// The transfer ABI the Runtime attaches to every local JSON provider
+/// invocation; the provider only accepts an envelope carrying exactly this.
+fn expected_local_json_runtime_invocation_abi() -> Value {
+    json!({
+        "schema": "elastos.provider.transfer-abi/v1",
+        "transfer": "json",
+        "transport": "runtime-local-provider-plane",
+        "range_supported": false,
+        "progress_supported": false,
+        "progress_mode": "none",
+        "transport_native_stream": false,
+        "backpressure": "not_applicable",
+        "cancel_supported": false
+    })
+}
+
 fn strip_runtime_invocation_envelope(
     value: &mut Value,
     expected_target: &str,
@@ -1038,7 +1166,10 @@ fn strip_runtime_invocation_envelope(
     }
     let envelope = object.remove("_runtime_invocation").ok_or(())?;
     let envelope = envelope.as_object().ok_or(())?;
-    if envelope.len() != 10 {
+    if envelope.len() != 11 {
+        return Err(());
+    }
+    if envelope.get("abi") != Some(&expected_local_json_runtime_invocation_abi()) {
         return Err(());
     }
     if envelope.get("schema").and_then(Value::as_str) != Some("elastos.provider.invocation/v1") {
@@ -1142,6 +1273,61 @@ pub fn run_provider_process() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_box(kind: &[u8; 4], content: &[u8]) -> Vec<u8> {
+        let mut out = (8 + content.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(content);
+        out
+    }
+
+    #[test]
+    fn strip_dash_segment_prefix_drops_styp_and_sidx_and_keeps_single_fragment() {
+        let moof = make_box(b"moof", b"fragment-header");
+        let mdat = make_box(b"mdat", b"payload");
+        let bare = [moof.clone(), mdat.clone()].concat();
+        let prefixed = [
+            make_box(b"styp", b"msdh"),
+            make_box(b"sidx", &[0u8; 44]),
+            moof.clone(),
+            mdat.clone(),
+        ]
+        .concat();
+
+        assert_eq!(strip_dash_segment_prefix(&bare).unwrap(), bare.as_slice());
+        assert_eq!(
+            strip_dash_segment_prefix(&prefixed).unwrap(),
+            bare.as_slice()
+        );
+        assert_eq!(
+            strip_dash_segment_prefix(&[make_box(b"styp", b"msdh"), bare.clone()].concat())
+                .unwrap(),
+            bare.as_slice()
+        );
+    }
+
+    #[test]
+    fn strip_dash_segment_prefix_rejects_multi_fragment_trailing_and_malformed_segments() {
+        let moof = make_box(b"moof", b"fragment-header");
+        let mdat = make_box(b"mdat", b"payload");
+        let bare = [moof.clone(), mdat.clone()].concat();
+
+        let two_fragments = [bare.clone(), bare.clone()].concat();
+        assert!(strip_dash_segment_prefix(&two_fragments).is_err());
+        let trailing = [bare.clone(), make_box(b"free", b"")].concat();
+        assert!(strip_dash_segment_prefix(&trailing).is_err());
+        let sidx_in_the_middle =
+            [moof.clone(), make_box(b"sidx", &[0u8; 4]), mdat.clone()].concat();
+        assert!(strip_dash_segment_prefix(&sidx_in_the_middle).is_err());
+        assert!(strip_dash_segment_prefix(&[mdat.clone(), moof.clone()].concat()).is_err());
+        assert!(strip_dash_segment_prefix(b"").is_err());
+        assert!(strip_dash_segment_prefix(&bare[..bare.len() - 1]).is_err());
+        let mut zero_size = bare.clone();
+        zero_size[..4].copy_from_slice(&0u32.to_be_bytes());
+        assert!(strip_dash_segment_prefix(&zero_size).is_err());
+        let only_prefix = make_box(b"styp", b"msdh");
+        assert!(strip_dash_segment_prefix(&only_prefix).is_err());
+    }
 
     #[cfg(unix)]
     #[test]

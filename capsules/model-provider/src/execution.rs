@@ -1823,7 +1823,17 @@ mod tests {
     #[test]
     fn artifact_status_redirect_preserves_active_state_and_private_location_stays_hidden() {
         let redirect_target = "http://127.0.0.1:9/private-status";
-        let server = start_server(vec![redirect_action(redirect_target.to_string())]);
+        // The 25ms poll interval can fire a second poll before this test
+        // finishes its post-assertion reads under parallel load; queue
+        // benign "running" follow-ups so that extra poll is absorbed the
+        // same way the truncated/timeout sibling tests already do, rather
+        // than exhausting the action queue and tripping the server's
+        // unexpected-request guard.
+        let server = start_server(vec![
+            redirect_action(redirect_target.to_string()),
+            json_action(json!({"state":"running"})),
+            json_action(json!({"state":"running"})),
+        ]);
         let offer = artifact_offer_with_cancel_timeout(&server.base_url, 1_000);
         let root = temp_root("artifact-status-redirect");
         let input = artifact_input("status");

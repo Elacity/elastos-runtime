@@ -15,8 +15,8 @@ mod open;
 mod test_media;
 
 pub use coordinator::{
-    RuntimeCustodyProvider, RuntimeProviderCallError, RuntimeReleaseCoordinator,
-    RuntimeReleaseCoordinatorError, RuntimeReleaseCoordinatorOutcome,
+    wallet_rights_signature_result, RuntimeCustodyProvider, RuntimeProviderCallError,
+    RuntimeReleaseCoordinator, RuntimeReleaseCoordinatorError, RuntimeReleaseCoordinatorOutcome,
     RuntimeReleaseNonterminalReason, RuntimeReleaseReconcileOffer, RuntimeRightsProvider,
     RuntimeSelectedProvider,
 };
