@@ -589,6 +589,32 @@ installed behavior and public-live behavior require separate evidence.
 
 ## Next
 
+### Encrypted storage and replaceable object protection
+
+The [storage and access contract](docs/STORAGE_AND_ACCESS.md) records the target
+product behavior. Follow the
+[implementation guide](docs/OBJECT_PROTECTION_IMPLEMENTATION.md) on the
+user-approved development base. This work extends the architecture; it does not
+declare the current protected-content release or a future backend complete.
+
+- [ ] Extract the smallest internal protection contract around creation and
+  open/use/close. Preserve current dKMS checks, formats, journals, provider
+  selection, and the existing content path. Prove substitution with a fake
+  compatible backend and rejection of unsupported or weaker policies.
+- [ ] Bind object and policy versions, caller and device, consumer, action,
+  grant dependencies, and session lifetime. Prove dependent revocation, active
+  cancellation, stale authority, restart, and replay handling.
+- [ ] Classify the current output path honestly. Prove protected-use outputs,
+  including read-to-write, export, clipboard, caches, and agent service effects,
+  before advertising enforcement of those restrictions.
+- [ ] Persist authenticated protection descriptors and implement an explicit
+  migration path. Prove recovery and interrupted migration while preserving
+  readable old objects and their accepted rights.
+- [ ] Prove an editable encrypted document across two devices, a group, and a
+  scoped agent, including save conflicts, history, metadata, revocation,
+  key-and-data recovery, and retention. Add installed evidence for each claimed
+  platform before recording product support in `state.md`.
+
 ### Capsule ABI stabilization
 - [ ] Use the capsule contract in
   [docs/CAPSULE_MODEL.md](docs/CAPSULE_MODEL.md) as the shared

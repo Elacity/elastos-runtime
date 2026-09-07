@@ -33,6 +33,8 @@ Each top-level ledger has one job:
 - [Consequence-aware effects](CONSEQUENCE_AWARE_EFFECTS.md): shared observation,
   actuation, settlement, and local-safety rules
 - [Content availability](CONTENT_AVAILABILITY.md): CID, IPLD, availability, and replication
+- [Storage, ownership, and access](STORAGE_AND_ACCESS.md): encrypted storage,
+  protected use, sharing, groups, devices, agents, revocation, and recovery
 - [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md): games,
   models, Get, bootstrap sources, and external gateways
 - [People and conversations](PEOPLE_CONVERSATIONS.md): profiles, contacts,
@@ -70,6 +72,8 @@ Each top-level ledger has one job:
 - [Chain provider](CHAIN_PROVIDER.md): typed chain reads, proofs, and transactions
 - [Wallet provider](WALLET_PROVIDER.md): account, proof, approval, and signing authority
 - [Protected content](PROTECTED_CONTENT.md): sealed object access sequence
+- [Object protection implementation](OBJECT_PROTECTION_IMPLEMENTATION.md):
+  replaceable dKMS/dDRM boundary, migration rules, delivery slices, and acceptance
 - [Protected-content v1 contracts](PROTECTED_CONTENT_CONTRACTS_V1.md): canonical
   identity, rights, custody and release schemas
 - [Rights provider](RIGHTS_PROVIDER.md): canonical role and provisional capsule
