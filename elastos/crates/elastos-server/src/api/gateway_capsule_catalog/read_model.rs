@@ -154,6 +154,11 @@ fn catalog_capsule_summary(
     let component = components.get(&manifest.name);
     let name = manifest.name.clone();
     let role = manifest.role.clone();
+    let window_policy = if role == CapsuleRole::Content {
+        target.and_then(|target| target.window_policy)
+    } else {
+        manifest.window_policy
+    };
     let capsule_type = manifest.capsule_type.clone();
     let runtime_abi = manifest.runtime_abi.clone();
     let bus_contract = manifest.bus_contract.clone();
@@ -225,6 +230,7 @@ fn catalog_capsule_summary(
             .or_else(|| manifest.description.clone())
             .unwrap_or_else(|| "Capsule metadata available through Runtime.".to_string()),
         author: manifest.author,
+        window_policy,
         role,
         capsule_type,
         runtime_abi,
@@ -688,6 +694,8 @@ pub(in crate::api::gateway) struct CapsuleCatalogPolicy {
 #[derive(Serialize)]
 pub(in crate::api::gateway) struct CapsuleSummary {
     pub(in crate::api::gateway) name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) window_policy: Option<elastos_common::CapsuleWindowPolicy>,
     pub(in crate::api::gateway) version: String,
     pub(in crate::api::gateway) title: String,
     pub(in crate::api::gateway) description: String,

@@ -413,6 +413,7 @@ mod tests {
             providers: None,
             icon: None,
             viewer: None,
+            window_policy: None,
             signature: None,
         }
     }

@@ -440,6 +440,7 @@ mod tests {
             authority: None,
             icon: None,
             viewer: None,
+            window_policy: None,
             signature: None,
         };
 
@@ -502,6 +503,7 @@ mod tests {
             authority: None,
             icon: None,
             viewer: None,
+            window_policy: None,
             signature: None,
         };
 

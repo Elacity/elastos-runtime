@@ -14,8 +14,8 @@ pub use manifest::{
     elastos_bus_v1_wit_sha256, AffordanceApprovalMode, AffordanceAuditMode, AffordanceRisk,
     CapsuleAffordanceDescriptor, CapsuleExecution, CapsuleInterfaceDescriptor, CapsuleManifest,
     CapsuleProjection, CapsuleRequirement, CapsuleRole, CapsuleRuntimeAbi, CapsuleType,
-    MicroVmConfig, Permissions, ProviderAuthority, ProviderCapabilitySchema, RequirementKind,
-    ResourceLimits, ELASTOS_BUS_V1_CONTRACT, ELASTOS_BUS_V1_WORLD, SCHEMA_V1,
+    CapsuleWindowPolicy, MicroVmConfig, Permissions, ProviderAuthority, ProviderCapabilitySchema,
+    RequirementKind, ResourceLimits, ELASTOS_BUS_V1_CONTRACT, ELASTOS_BUS_V1_WORLD, SCHEMA_V1,
 };
 use sha2::{Digest, Sha256};
 pub use timestamp::{SecureTimestamp, CLOCK_SKEW_TOLERANCE_SECS};

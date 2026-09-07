@@ -4,6 +4,7 @@
   "version": "0.2.0",
   "description": "Play GBA games",
   "role": "viewer",
+  "window_policy": "hybrid",
   "type": "wasm",
   "runtime_abi": "elastos.runtime-projection/v1",
   "bus_contract": "elastos.runtime-projection/v1",

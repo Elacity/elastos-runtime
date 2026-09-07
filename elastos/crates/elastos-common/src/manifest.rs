@@ -61,6 +61,11 @@ pub struct CapsuleManifest {
     #[serde(default)]
     pub projections: Vec<CapsuleProjection>,
 
+    /// Optional web-window presentation policy. Absence leaves existing shell
+    /// behavior unchanged; this metadata grants no execution or session authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_policy: Option<CapsuleWindowPolicy>,
+
     pub entrypoint: String,
 
     /// Typed requirements needed by this capsule.
@@ -291,6 +296,18 @@ impl CapsuleManifest {
 
         if self.version.trim().is_empty() {
             return Err("manifest version must not be empty".to_string());
+        }
+
+        if self.window_policy.is_some()
+            && (!matches!(self.role, CapsuleRole::App | CapsuleRole::Viewer)
+                || self.capsule_type != CapsuleType::Wasm
+                || !matches!(
+                    self.execution,
+                    Some(CapsuleExecution::WebProjection | CapsuleExecution::Component)
+                )
+                || !self.projections.contains(&CapsuleProjection::Web))
+        {
+            return Err("window_policy requires an app or viewer with web/component execution and a web projection".to_string());
         }
 
         // Reject path traversal and absolute paths in entrypoint
@@ -796,6 +813,20 @@ pub enum CapsuleExecution {
     Data,
 }
 
+/// Presentation within one Home GUI session, independent of Runtime authority.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CapsuleWindowPolicy {
+    /// Ordinary Open focuses the existing window; Home omits blank New Window.
+    Single,
+    /// Each Open may create an independent window. The capsule owns any
+    /// selection-aware New Window command; Home supplies no blank command.
+    Multiple,
+    /// Query-free Open reuses a window; Home supplies blank New Window even
+    /// with capsule-owned menus. Explicit and content launches are independent.
+    Hybrid,
+}
+
 /// Product-visible projection surface declared by a capsule manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
@@ -963,6 +994,72 @@ mod tests {
     use super::*;
 
     // ── Core parse/validation tests (strict v1 schema) ──────────────
+
+    #[test]
+    fn window_policy_validates_presentation_contract() {
+        let base = serde_json::json!({
+            "schema": "elastos.capsule/v1", "version": "0.1.0", "name": "window-fixture",
+            "role": "app", "type": "wasm", "entrypoint": "browser/index.html",
+            "runtime_abi": "elastos.runtime-projection/v1",
+            "bus_contract": "elastos.runtime-projection/v1",
+            "execution": "web-projection", "projections": ["web"]
+        });
+        let absent: CapsuleManifest = serde_json::from_value(base.clone()).unwrap();
+        absent.validate().unwrap();
+        assert!(serde_json::to_value(absent)
+            .unwrap()
+            .get("window_policy")
+            .is_none());
+        for role in ["app", "viewer"] {
+            for policy in ["single", "multiple", "hybrid"] {
+                let mut value = base.clone();
+                value["role"] = serde_json::json!(role);
+                value["window_policy"] = serde_json::json!(policy);
+                let manifest: CapsuleManifest = serde_json::from_value(value).unwrap();
+                manifest.validate().unwrap();
+                assert_eq!(
+                    serde_json::to_value(manifest).unwrap()["window_policy"],
+                    policy
+                );
+            }
+        }
+        let mut component = base.clone();
+        component["runtime_abi"] = serde_json::json!("elastos.component/v1");
+        component["bus_contract"] = serde_json::json!(ELASTOS_BUS_V1_CONTRACT);
+        component["wit_world_sha256"] = serde_json::json!(elastos_bus_v1_wit_sha256());
+        component["execution"] = serde_json::json!("component");
+        component["window_policy"] = serde_json::json!("hybrid");
+        serde_json::from_value::<CapsuleManifest>(component)
+            .unwrap()
+            .validate()
+            .unwrap();
+        for invalid in [
+            serde_json::json!("singleton"),
+            serde_json::json!({"mode": "single"}),
+            serde_json::json!(1),
+        ] {
+            let mut value = base.clone();
+            value["window_policy"] = invalid;
+            assert!(serde_json::from_value::<CapsuleManifest>(value).is_err());
+        }
+        for (field, invalid) in [
+            ("role", serde_json::json!("provider")),
+            ("role", serde_json::json!("content")),
+            ("role", serde_json::json!("shell")),
+            ("execution", serde_json::Value::Null),
+            ("execution", serde_json::json!("microvm")),
+            ("projections", serde_json::json!(["facts"])),
+        ] {
+            let mut value = base.clone();
+            value[field] = invalid;
+            value["window_policy"] = serde_json::json!("single");
+            let manifest: CapsuleManifest = serde_json::from_value(value).unwrap();
+            assert!(
+                manifest.validate().unwrap_err().contains("window_policy"),
+                "wrong rejection for {field}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_manifest() {

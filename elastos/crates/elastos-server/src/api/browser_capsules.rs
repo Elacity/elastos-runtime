@@ -46,6 +46,7 @@ struct BrowserCapsule {
 #[derive(Clone, Debug)]
 pub(crate) struct LaunchableBrowserCapsule {
     pub name: String,
+    pub window_policy: Option<elastos_common::CapsuleWindowPolicy>,
     pub description: Option<String>,
     pub role: CapsuleRole,
     /// Capsule-relative entrypoint, the anchor icon routes resolve against.
@@ -57,6 +58,8 @@ pub(crate) struct LaunchableBrowserCapsule {
 #[derive(Clone, Debug)]
 pub(crate) struct ViewerBoundCapsule {
     pub name: String,
+    /// Window behavior belongs to the resolved executable viewer.
+    pub window_policy: Option<elastos_common::CapsuleWindowPolicy>,
     pub description: Option<String>,
     pub viewer: String,
     pub entrypoint: String,
@@ -256,6 +259,7 @@ pub(crate) fn list_launchable_browser_capsules(data_dir: &Path) -> Vec<Launchabl
             capsule.manifest.name.clone(),
             LaunchableBrowserCapsule {
                 name: capsule.manifest.name,
+                window_policy: capsule.manifest.window_policy,
                 description: capsule.manifest.description,
                 role: capsule.manifest.role,
                 entrypoint: capsule.manifest.entrypoint,
@@ -268,6 +272,13 @@ pub(crate) fn list_launchable_browser_capsules(data_dir: &Path) -> Vec<Launchabl
 }
 
 pub(crate) fn list_viewer_bound_capsules(data_dir: &Path, viewer: &str) -> Vec<ViewerBoundCapsule> {
+    let Ok(viewer_capsule) = resolve_browser_capsule(data_dir, viewer) else {
+        return Vec::new();
+    };
+    if viewer_capsule.manifest.role != CapsuleRole::Viewer {
+        return Vec::new();
+    }
+    let window_policy = viewer_capsule.manifest.window_policy;
     let mut capsules = BTreeMap::new();
     let installed_root = installed_capsules_root(data_dir);
     for manifest in list_active_capsule_manifests(data_dir) {
@@ -276,7 +287,6 @@ pub(crate) fn list_viewer_bound_capsules(data_dir: &Path, viewer: &str) -> Vec<V
             || manifest.capsule_type != CapsuleType::Data
             || manifest.viewer.as_deref() != Some(viewer)
             || !dir.join(&manifest.entrypoint).is_file()
-            || !is_launchable_viewer_capsule(data_dir, viewer)
         {
             continue;
         }
@@ -284,6 +294,7 @@ pub(crate) fn list_viewer_bound_capsules(data_dir: &Path, viewer: &str) -> Vec<V
             manifest.name.clone(),
             ViewerBoundCapsule {
                 name: manifest.name,
+                window_policy,
                 description: manifest.description,
                 viewer: viewer.to_string(),
                 entrypoint: manifest.entrypoint,
@@ -320,14 +331,16 @@ pub(crate) fn resolve_viewer_bound_capsule(
 ) -> Option<ViewerBoundCapsule> {
     let candidate = installed_active_capsule_dir(data_dir, name)?;
     let manifest = load_capsule_manifest(&candidate, name)?;
+    let viewer_capsule = resolve_browser_capsule(data_dir, viewer).ok()?;
     if manifest.role == CapsuleRole::Content
         && manifest.capsule_type == CapsuleType::Data
         && manifest.viewer.as_deref() == Some(viewer)
         && candidate.join(&manifest.entrypoint).is_file()
-        && is_launchable_viewer_capsule(data_dir, viewer)
+        && viewer_capsule.manifest.role == CapsuleRole::Viewer
     {
         return Some(ViewerBoundCapsule {
             name: manifest.name,
+            window_policy: viewer_capsule.manifest.window_policy,
             description: manifest.description,
             viewer: viewer.to_string(),
             entrypoint: manifest.entrypoint,

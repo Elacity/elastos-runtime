@@ -5,6 +5,7 @@
   "description": "Connect MetaMask as an optional approval method",
   "author": "elastos",
   "role": "app",
+  "window_policy": "single",
   "type": "wasm",
   "runtime_abi": "elastos.runtime-projection/v1",
   "bus_contract": "elastos.runtime-projection/v1",

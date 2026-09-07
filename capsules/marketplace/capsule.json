@@ -4,6 +4,7 @@
   "version": "0.2.0",
   "description": "Browse apps, viewers, services, and content available in ElastOS",
   "role": "app",
+  "window_policy": "single",
   "type": "wasm",
   "runtime_abi": "elastos.runtime-projection/v1",
   "bus_contract": "elastos.runtime-projection/v1",
