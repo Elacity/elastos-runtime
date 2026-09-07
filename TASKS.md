@@ -40,7 +40,12 @@ Browser settings now retain an explicit Engine or Exit selection when its
 offer is absent. Installed verification must cover a service disappearing and
 returning, followed by an explicit operator switch to another service.
 The web Runtime adapter now checks viewer eligibility before page replacement
-or Engine dispatch. Installed viewer and negotiated-codec proof remains open.
+or Engine dispatch. The focused installed Brave test proves disabled-WebRTC
+rejection through Home's actual Browser sandbox, zero Engine open requests and
+sessions, and clean window close. Qualify actual media and negotiated codecs
+next. The existing VM control helper differs from current source as well as
+having a stale image receipt. Keep the general Home test separate from this
+focused result; its System and shell-switch journeys still need verification.
 
 - [ ] [B01: One Browser contract and an explicit support matrix](docs/BROWSER_ACCEPTANCE.md#b01).
 - [ ] [B02: A fresh installation opens a usable Browser](docs/BROWSER_ACCEPTANCE.md#b02).

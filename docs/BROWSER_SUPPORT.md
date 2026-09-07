@@ -72,6 +72,15 @@ session does not establish full Browser media support.
 
 ## Evidence required to mark an entry supported
 
+The installed source-home harness can use an explicitly selected Chromium
+viewer through `ELASTOS_BROWSER_EXECUTABLE`. Its focused
+`HOME_VIRTUAL_AUTH_BROWSER_VIEWER_PREFLIGHT=1` run disables WebRTC in the test
+viewer, opens Browser through Home's Shelf or launcher, checks the error and
+absence of Engine open requests and sessions, then closes the window. It uses
+the real capsule sandbox and records the viewer version. This is a rejection
+test, separate from Engine and media acceptance. Optional System and shell
+journeys retain their own results when omitted from a focused run.
+
 Each receipt must identify the source commit and tree; Browser capsule identity
 and content hash; Runtime, Engine and host-helper hashes; VM/image manifest where
 used; device model, OS, architecture and resource budget; viewer and operator

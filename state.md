@@ -80,7 +80,16 @@ Browser settings retain a missing selected Engine or Exit as unavailable until
 the operator changes it. Automatic Engine selection remains with Runtime.
 The web Runtime adapter checks WebRTC viewer eligibility before page replacement
 and Engine dispatch. Tests prove that viewer denial preserves an existing page
-and acquires no new page or stream. Installed viewer proof remains open.
+and acquires no new page or stream. An isolated installed Mac run at
+`1588529bf57278f9ba2558751efbd0d3ce0acd34` passed the focused Browser viewer
+preflight in headless Brave 152.0.7977.76. It completed passkey creation and
+sign-in, opened Browser through Home's Shelf and sandbox, showed the disabled
+WebRTC error, sent zero Engine open requests, retained zero Runtime sessions,
+and closed the Browser window. Source, installed and served assets were checked.
+This fixture had no VM image; media, Engine operation and device certification
+remain open. The broader System and shell-switch journeys were outside this run.
+Home's visible passkey control now participates in the accessibility tree;
+the installed sign-in used its role and label.
 Mac and Linux host adapters now query their virtualization APIs for eligibility.
 The Mac unit check ran locally; the Linux-specific KVM query still needs a
 Linux test run.
@@ -101,8 +110,9 @@ source bindings and verdicts.
 
 The existing Mac VM artifact preflight rejected the image because its SHA-256
 differs from the sidecar manifest. Direct read-only inspection with `debugfs`
-passed the VM file and script contract; that result leaves the stale artifact
-receipt unresolved. The active test Home also lacks the required
+passed the VM file and script contract. Its embedded Browser control helper
+differs from current source, so source parity and the stale artifact receipt
+still require repair. The user's active test Home also lacks the required
 VM helper and image set. Neither installation supplies a current B01 product
 acceptance receipt. This identifies local repair work; it does not establish
 the cause of another operator's startup failure.
