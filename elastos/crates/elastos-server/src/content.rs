@@ -2657,6 +2657,125 @@ pub async fn fetch_bytes_via_provider(
         .map_err(|err| anyhow::anyhow!("content provider stream read failed: {err}"))
 }
 
+/// Validate signed catalog metadata using the existing content closure list.
+/// This proves descriptive consistency only; payload verification and admission
+/// require the later bounded content transfer.
+pub(crate) fn validate_model_content_closure_metadata(
+    capsule: &Value,
+    object: &Value,
+) -> anyhow::Result<(elastos_common::CapsuleManifest, u64)> {
+    let capsule_bytes = serde_json::to_vec(capsule)?;
+    if capsule_bytes.len() > 64 * 1024 {
+        anyhow::bail!("model capsule manifest exceeds its byte limit");
+    }
+    let manifest: elastos_common::CapsuleManifest = serde_json::from_value(capsule.clone())?;
+    manifest.validate().map_err(anyhow::Error::msg)?;
+    let model = manifest
+        .model_content
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("model catalog requires model_content metadata"))?;
+    let fields = object
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("invalid content closure"))?;
+    if fields.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "schema"
+                | "kind"
+                | "content_digest"
+                | "files"
+                | "links"
+                | "object_did"
+                | "publisher_did"
+        )
+    }) {
+        anyhow::bail!("unknown model content closure field");
+    }
+    let files = object
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("missing model content closure files"))?;
+    if files.is_empty() || files.len() > 32 {
+        anyhow::bail!("model content closure file count exceeds its limit");
+    }
+    for file in files {
+        if file.as_object().is_none_or(|fields| {
+            fields.len() != 3
+                || fields
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "path" | "sha256" | "size"))
+        }) {
+            anyhow::bail!("invalid model content file fields");
+        }
+    }
+    let closure = parse_content_object_manifest("model-catalog", &serde_json::to_vec(object)?)?;
+    if closure.kind != "capsule" || !closure.links.is_empty() || closure.object_did.is_some() {
+        anyhow::bail!("model catalog requires a self-contained capsule closure");
+    }
+    let mut total = 0_u64;
+    let mut paths = BTreeSet::new();
+    let mut previous = "";
+    let mut digest = sha2::Sha256::new();
+    for file in &closure.files {
+        elastos_common::validate_model_content_path(&file.path).map_err(anyhow::Error::msg)?;
+        if file.path.as_str() <= previous
+            || !paths.insert(file.path.to_ascii_lowercase())
+            || file.path.eq_ignore_ascii_case(CONTENT_OBJECT_MANIFEST_PATH)
+            || file.size == 0
+            || file.size > 16 * 1024 * 1024 * 1024
+            || (file.path != manifest.entrypoint && file.size > 1024 * 1024)
+            || file.sha256.len() != 64
+            || !file
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            anyhow::bail!("invalid, aliased or unbounded model content file");
+        }
+        previous = &file.path;
+        total = total
+            .checked_add(file.size)
+            .ok_or_else(|| anyhow::anyhow!("model size overflow"))?;
+        digest.update(file.path.as_bytes());
+        digest.update(b"\0");
+        digest.update(file.sha256.as_bytes());
+        digest.update(b"\0");
+        digest.update(file.size.to_string().as_bytes());
+        digest.update(b"\0");
+    }
+    if total > 16 * 1024 * 1024 * 1024
+        || closure.content_digest != format!("sha256:{:x}", digest.finalize())
+    {
+        anyhow::bail!("model closure size or digest mismatch");
+    }
+    for path in [
+        &manifest.entrypoint,
+        &model.license.path,
+        &model.provenance.base_license.path,
+        &model.provenance.path,
+    ] {
+        if !closure.files.iter().any(|file| &file.path == path) {
+            anyhow::bail!("model content reference is absent from the closure");
+        }
+    }
+    for path in [
+        &model.license.path,
+        &model.provenance.base_license.path,
+        &model.provenance.path,
+    ] {
+        if path == &manifest.entrypoint || path == "capsule.json" {
+            anyhow::bail!("model notice must be a distinct closure file");
+        }
+    }
+    let capsule_file = closure
+        .files
+        .iter()
+        .find(|file| file.path == "capsule.json")
+        .ok_or_else(|| anyhow::anyhow!("model closure lacks capsule.json"))?;
+    verify_content_object_file("model-catalog", capsule_file, &capsule_bytes)?;
+    Ok((manifest, total))
+}
+
 pub async fn fetch_content_object_manifest(
     registry: &ProviderRegistry,
     cid: &str,

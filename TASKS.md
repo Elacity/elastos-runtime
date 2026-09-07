@@ -70,8 +70,8 @@ installed onboarding and window acceptance do not block CID source work.
    or release local retention. Runtime owns transfer and atomic admission behind
    these actions, rather than a traditional download/install or file-picker UI.
    All projections use the same Runtime catalog, admission and inventory facts.
-   First close native backend bounded-transfer, manifest and engine-availability
-   prerequisites; a stream label or installed catalog row is insufficient.
+   First close native backend bounded-transfer, full closure verification and
+   engine-availability prerequisites; a stream label or catalog row is insufficient.
    Prove progress, cancel, retry, failure/offline state, readiness,
    incompatibility, busy-safe retention release, restart and idempotence, with
    at least 10% free disk and bounded partial cleanup. Catalog selection may

@@ -215,11 +215,25 @@ The integrated source includes these durable facts:
   accepted local retention only; independent network replication needs its own
   evidence. Gateway CID reads serve verified content through the Runtime-owned
   route.
-- The Runtime catalog currently projects installed capsules. It has no signed
-  network catalog entry or root, model selection-to-preparation admission, or
-  GGUF content-capsule closure. Marketplace and System show installed inventory;
-  model-provider consumes static private artifact/offer configuration. Model
-  and Assistant Truth below records the current Qwen operator bootstrap.
+- The current Runtime catalog source projects installed capsules and optionally
+  verifies one operator-pinned signed model catalog snapshot. The existing
+  `components.json` config supplies a raw CIDv1/SHA-256 head and a nonempty
+  trusted publisher set independently from the entry. The authenticated catalog
+  projects the verified publisher DID, declared package CID, exact declared
+  size and bounded model facts as `unprepared`, with installed and launchable
+  both false. Same-name local files do not establish admission or readiness;
+  malformed model trust leaves ordinary installed inventory available.
+- The first-Qwen metadata profile and limits are in
+  [Content capsule distribution](docs/CONTENT_CAPSULE_DISTRIBUTION.md#implemented-catalog-metadata-profile).
+  Source tests pass 3 focused metadata tests, all 95 common tests, 6 model
+  catalog tests and the final 25-test server capsule-catalog regression.
+  Workspace/Chain formatting, Home/public-copy entropy and diff checks pass.
+  These prove metadata consistency and publisher verification,
+  including rejection paths; full package CID and payload verification await
+  preparation. Installed Homes remain unchanged. Model-provider still consumes
+  static private artifact/offer configuration, and Marketplace/System model
+  selection remains future work. Model and Assistant Truth below records the
+  existing Qwen operator bootstrap.
 - The signed, complete-closure CID model path is required in the current
   closeout, alongside onboarding and window policy. People select or use a
   model; Runtime prepares the exact content behind that action. Settings local
@@ -235,7 +249,7 @@ The integrated source includes these durable facts:
   encoding or writing. Stream/range labels do not prove bounded backend reads
   or network cancellation. The 64 MiB content import bound and 100 MiB gateway
   file bound are not a multi-gigabyte model delivery path. Bounded native
-  transfer, strict package metadata, signed catalog admission and inventory-to-
+  transfer, full closure verification, atomic package admission and inventory-to-
   offer binding remain implementation prerequisites, not installed support.
 
 ## Protected-content Contract Truth

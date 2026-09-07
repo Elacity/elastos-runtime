@@ -222,7 +222,11 @@ not require a new secret store.
 ## Local content selection and retention
 
 The current closeout includes the complete path from trusted model discovery
-to a real local reply for one verified Qwen package. It is pending implementation.
+to a real local reply for one verified Qwen package. Runtime source now verifies
+the bounded signed catalog metadata described in
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md#implemented-catalog-metadata-profile).
+Its model rows remain unprepared. Transfer, package admission, offer binding and
+the following UI flow remain pending implementation.
 Marketplace adds Models browse/details/Use within the existing app; System
 manages the same model records and local retention. Assistant and Home Agent
 keep their existing pickers and typed run lifecycle. These are projections of

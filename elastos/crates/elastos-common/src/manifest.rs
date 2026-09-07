@@ -66,6 +66,11 @@ pub struct CapsuleManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_policy: Option<CapsuleWindowPolicy>,
 
+    /// Descriptive model metadata. The content object manifest owns file sizes
+    /// and digests; Runtime separately verifies publisher trust and admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_content: Option<ModelContentMetadata>,
+
     pub entrypoint: String,
 
     /// Typed requirements needed by this capsule.
@@ -125,6 +130,144 @@ pub struct CapsuleManifest {
     /// Optional base64-encoded signature
     #[serde(default)]
     pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelContentMetadata {
+    pub format: String,
+    pub quantization: String,
+    pub engine: String,
+    pub consumer_interface: String,
+    pub consumer_interface_version: String,
+    pub minimum_memory_mb: u32,
+    pub license: ModelContentLicense,
+    pub provenance: ModelContentProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelContentLicense {
+    pub spdx_id: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelContentProvenance {
+    pub base_repository: String,
+    pub base_revision: String,
+    pub base_license: ModelContentLicense,
+    pub quantized_repository: String,
+    pub quantized_revision: String,
+    pub path: String,
+}
+
+impl ModelContentMetadata {
+    fn validate(&self, manifest: &CapsuleManifest) -> Result<(), String> {
+        if manifest.role != CapsuleRole::Content
+            || manifest.capsule_type != CapsuleType::Data
+            || manifest.runtime_abi.is_some()
+            || manifest.execution.is_some()
+            || manifest.bus_contract.is_some()
+            || manifest.wit_world_sha256.is_some()
+            || manifest.viewer.is_some()
+            || manifest.microvm.is_some()
+            || manifest.providers.is_some()
+            || manifest.authority.is_some()
+            || manifest.provides.is_some()
+            || !manifest.requires.is_empty()
+            || !manifest.capabilities.is_empty()
+            || !manifest.interfaces.is_empty()
+            || manifest.permissions.host_process
+            || manifest.permissions.guest_network
+            || !manifest.permissions.storage.is_empty()
+            || !manifest.permissions.messaging.is_empty()
+        {
+            return Err(
+                "model_content requires passive content/data without execution authority".into(),
+            );
+        }
+        if self.format != "gguf"
+            || self.quantization != "Q4_K_M"
+            || self.engine != "llama.cpp"
+            || self.consumer_interface != "elastos.provider.model"
+            || self.consumer_interface_version != "0.1.0"
+            || !(1..=1_048_576).contains(&self.minimum_memory_mb)
+        {
+            return Err(
+                "unsupported model_content format, engine, interface or resource requirement"
+                    .into(),
+            );
+        }
+        validate_model_content_path(&manifest.entrypoint)?;
+        validate_descriptor_id("model_content name", &manifest.name)?;
+        for (value, limit) in [
+            (manifest.version.as_str(), 32),
+            (manifest.description.as_deref().unwrap_or(""), 1024),
+            (manifest.author.as_deref().unwrap_or(""), 128),
+        ] {
+            if value.len() > limit || value.chars().any(char::is_control) {
+                return Err("model_content display facts exceed their bounds".into());
+            }
+        }
+        if !manifest.entrypoint.ends_with(".gguf") {
+            return Err("model_content entrypoint must name its GGUF file".into());
+        }
+        for license in [&self.license, &self.provenance.base_license] {
+            if license.spdx_id != "Apache-2.0" {
+                return Err("model_content first profile requires Apache-2.0 license facts".into());
+            }
+            validate_model_content_path(&license.path)?;
+        }
+        validate_model_content_path(&self.provenance.path)?;
+        for repository in [
+            &self.provenance.base_repository,
+            &self.provenance.quantized_repository,
+        ] {
+            validate_model_content_path(repository)?;
+            if repository.split('/').count() != 2 {
+                return Err(
+                    "model_content provenance requires an owner/repository identifier".into(),
+                );
+            }
+        }
+        for revision in [
+            &self.provenance.base_revision,
+            &self.provenance.quantized_revision,
+        ] {
+            if revision.len() != 40
+                || !revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(
+                    "model_content provenance requires an exact lowercase Git revision".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Portable canonical model-package path; file identity stays in the existing
+/// content object manifest. Reject aliases before materialization on any host.
+pub fn validate_model_content_path(path: &str) -> Result<(), String> {
+    if path.is_empty()
+        || path.len() > 256
+        || path.split('/').any(|part| {
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || part.ends_with('.')
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+    {
+        return Err("model_content path must be a bounded canonical relative path".into());
+    }
+    Ok(())
 }
 
 /// A single typed capsule requirement.
@@ -287,6 +430,9 @@ impl CapsuleManifest {
 
     /// Validate manifest fields after deserialization.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(model) = &self.model_content {
+            model.validate(self)?;
+        }
         if self.schema != SCHEMA_V1 {
             return Err(format!(
                 "unsupported schema \"{}\", expected \"{}\"",
@@ -994,6 +1140,120 @@ mod tests {
     use super::*;
 
     // ── Core parse/validation tests (strict v1 schema) ──────────────
+
+    fn model_content_fixture() -> Value {
+        // Synthetic metadata only; this fixture is not a published model package.
+        serde_json::json!({
+            "schema": "elastos.capsule/v1", "version": "0.1.0",
+            "name": "model-fixture", "role": "content", "type": "data",
+            "entrypoint": "weights.gguf", "projections": ["content"],
+            "model_content": {
+                "format": "gguf", "quantization": "Q4_K_M", "engine": "llama.cpp",
+                "consumer_interface": "elastos.provider.model",
+                "consumer_interface_version": "0.1.0", "minimum_memory_mb": 8192,
+                "license": {"spdx_id": "Apache-2.0", "path": "LICENSE"},
+                "provenance": {
+                    "base_repository": "fixture/base", "base_revision": "a".repeat(40),
+                    "base_license": {"spdx_id": "Apache-2.0", "path": "LICENSE.base"},
+                    "quantized_repository": "fixture/quantized",
+                    "quantized_revision": "b".repeat(40), "path": "PROVENANCE.md"
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn model_content_metadata_accepts_bounded_gguf() {
+        let value = model_content_fixture();
+        let manifest: CapsuleManifest = serde_json::from_value(value.clone()).unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(manifest).unwrap()["model_content"],
+            value["model_content"]
+        );
+    }
+
+    #[test]
+    fn model_content_metadata_rejects_unknown_fields_and_authority() {
+        for field in ["extra", "payload_sha256", "payload_size", "provider_route"] {
+            let mut value = model_content_fixture();
+            value["model_content"][field] = serde_json::json!("untrusted");
+            assert!(serde_json::from_value::<CapsuleManifest>(value).is_err());
+        }
+        for (field, invalid) in [
+            ("role", serde_json::json!("app")),
+            ("type", serde_json::json!("wasm")),
+            ("viewer", serde_json::json!("assistant")),
+            ("capabilities", serde_json::json!(["elastos://model/*"])),
+            (
+                "permissions",
+                serde_json::json!({"storage": ["localhost://*"]}),
+            ),
+        ] {
+            let mut value = model_content_fixture();
+            value[field] = invalid;
+            assert!(serde_json::from_value::<CapsuleManifest>(value)
+                .unwrap()
+                .validate()
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn model_content_metadata_rejects_paths_compatibility_and_unbounded_facts() {
+        for (pointer, invalid) in [
+            ("/entrypoint", serde_json::json!("../weights.gguf")),
+            ("/entrypoint", serde_json::json!("models//weights.gguf")),
+            ("/model_content/license/path", serde_json::json!("/LICENSE")),
+            (
+                "/model_content/provenance/path",
+                serde_json::json!("docs/./notice"),
+            ),
+            (
+                "/model_content/provenance/base_revision",
+                serde_json::json!("main"),
+            ),
+            (
+                "/model_content/provenance/base_repository",
+                serde_json::json!("a".repeat(257)),
+            ),
+            (
+                "/model_content/license/spdx_id",
+                serde_json::json!("unknown"),
+            ),
+            (
+                "/model_content/consumer_interface",
+                serde_json::json!("elastos.provider.other"),
+            ),
+            (
+                "/model_content/consumer_interface_version",
+                serde_json::json!("9.0.0"),
+            ),
+            ("/model_content/engine", serde_json::json!("ambient")),
+            ("/model_content/format", serde_json::json!("executable")),
+            ("/model_content/quantization", serde_json::json!("unknown")),
+            ("/model_content/minimum_memory_mb", serde_json::json!(0)),
+            (
+                "/model_content/minimum_memory_mb",
+                serde_json::json!(1_048_577),
+            ),
+            ("/description", serde_json::json!("x".repeat(1025))),
+        ] {
+            let mut value = model_content_fixture();
+            if pointer == "/description" {
+                value["description"] = invalid;
+            } else {
+                *value.pointer_mut(pointer).unwrap() = invalid;
+            }
+            assert!(
+                serde_json::from_value::<CapsuleManifest>(value)
+                    .unwrap()
+                    .validate()
+                    .is_err(),
+                "{pointer}"
+            );
+        }
+    }
 
     #[test]
     fn window_policy_validates_presentation_contract() {

@@ -651,6 +651,7 @@ mod tests {
             icon: None,
             viewer: None,
             window_policy: None,
+            model_content: None,
             signature: None,
         }
     }

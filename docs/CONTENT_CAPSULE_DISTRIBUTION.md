@@ -7,15 +7,15 @@ key release remain in [PROTECTED_CONTENT.md](PROTECTED_CONTENT.md), while
 replication policy and availability receipts remain in
 [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md).
 
-Runtime currently projects installed capsules. The signed network catalog,
-selection-to-preparation admission, and model-content packaging described here
-remain planned work; this contract does not claim that those features are implemented.
+Runtime source projects installed capsules and can verify one locally supplied,
+operator-pinned signed model catalog snapshot. Selection-to-preparation,
+model-content packaging and network catalog updates remain planned work.
 
 The implemented content plane already provides `elastos://content` publish,
 fetch, status, ensure, repair, and unpublish operations. It records signed local
 availability receipts, keeps raw IPFS access system-only, and serves verified
 gateway CID reads. These form the package-delivery foundation. The signed
-network catalog and install contract remain open.
+network delivery and package admission contract remain open.
 
 ## Decision
 
@@ -163,14 +163,46 @@ in the same inventory records. The signed catalog identity remains visible with
 its actual availability after local eviction. Unpinning local bytes says nothing
 about whether another provider retains the CID.
 
+## Implemented catalog metadata profile
+
+The optional `CapsuleManifest.model_content` block describes passive
+`role=content`, `type=data` content. Its first-Qwen profile supports GGUF,
+Q4_K_M, llama.cpp and `elastos.provider.model` version `0.1.0`. It requires
+Apache-2.0 license references for the base and quantized model, a provenance
+notice, bounded owner/repository identifiers and exact 40-character lowercase
+Git revisions. The declared memory floor is 1 to 1,048,576 MiB. This profile
+grants no execution, viewer, storage or provider capability. Other formats,
+licenses and provenance schemes remain outside this closeout.
+
+The existing `_elastos_object.json` owns file paths, exact sizes and SHA-256
+digests. Catalog validation checks its ordered unique file list and content
+digest, canonical `capsule.json` bytes, entrypoint and notice references. It
+rejects traversal, aliases and missing references. Limits are 32 files, 256-byte
+relative paths, a 64 KiB capsule manifest, 1 MiB per auxiliary file and 16 GiB
+total declared content. Payload bytes and the complete package CID still need
+verification during preparation.
+
+Operator configuration in `components.json.model_catalog` pins the exact raw
+CIDv1/SHA-256 head and one to eight trusted publisher DIDs. Runtime reads the
+fixed local `model-catalog.json` snapshot with a 128 KiB bound, verifies that
+head and signature independently from entry claims, and accepts one current
+signed entry. The entry names a canonical DAG-PB/SHA-256 package closure CID.
+The existing authenticated catalog exposes verified publisher identity,
+declared CID/size and model metadata as `unprepared`, with installed and
+launchable both false. A same-name local directory does not establish admission.
+Absent model configuration preserves ordinary installed inventory; invalid
+model configuration marks only the model catalog unavailable. Snapshot
+verification provides publisher metadata, while transfer, atomic admission,
+provider readiness and deployed availability require their own proof.
+
 ## Source prerequisites and bounded implementation plan
 
 The following are source limitations, not completed large-model support:
 
 | Existing surface | Verified limitation and required extension |
 | --- | --- |
-| `elastos/crates/elastos-common/src/manifest.rs` | Strict `CapsuleManifest` has generic resources, requirements and an optional signature, but no typed model format/quantization/license/provenance block or signed catalog-root admission. Add bounded model-content metadata and canonical signed closure/catalog validation; retain strict unknown-field and path checks. |
-| `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | Active inventory comes from installed `components.json` external entries and valid capsule directories. Extend this inventory's admission/receipt ownership and its catalog projection; a source-directory scan or a separate model store is insufficient. |
+| `elastos/crates/elastos-common/src/manifest.rs` | The bounded passive metadata profile above is implemented. Preparation must verify its declared facts against the complete fetched package before admission. |
+| `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | The catalog projects installed inventory plus verified, unprepared model metadata. Extend existing inventory admission/receipt ownership for preparation; source-directory presence and a signed metadata row alone are insufficient. |
 | `elastos/crates/elastos-server/src/content.rs` | `fetch_bytes_via_provider` calls `drain_to_vec`; `materialize_data_capsule` repeats this per file. `import_exact` and aggregate `import_object` bytes are capped at 64 MiB; import permits at most 512 files. These whole-buffer import/materialization paths are not the multi-gigabyte model path. |
 | `elastos/crates/elastos-runtime/src/provider/registry.rs` | `open_provider_stream` decodes the full response into `ProviderStreamSession.bytes`; 64 KiB `read_next` chunks slice that buffer. Consumer chunking alone does not bound producer memory or cancel network transfer. |
 | `capsules/ipfs-provider/src/main.rs` | Runtime's registered native IPFS backend handles `Cat` with CID/path only. `cat` and `cat_to_path` fetch the entire file with `read_to_end` before encoding or writing. Implement bounded backend reads and actual cancellation before using this path for Qwen. |
@@ -199,9 +231,8 @@ transfer. Cancellation and cleanup leave other packages and user data intact.
 Proposed local commit order, after the separate onboarding/recovery and window
 policy slices:
 
-1. **Package and catalog admission contract.** Extend the existing manifest,
-   inventory/catalog and Runtime authority types for one Qwen package. Signed
-   catalog entries can exist before local materialization. Add narrowly typed
+1. **Package admission contract.** Build on the verified catalog metadata and
+   existing inventory/Runtime ownership for one Qwen package. Add narrowly typed
    preparation, status/cancel and retention intents at this Runtime boundary:
    the current catalog is read-only and content fetch does not authorize an
    installation. Inputs identify the exact catalog entry/CID or owned operation;

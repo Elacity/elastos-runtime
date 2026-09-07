@@ -34,6 +34,18 @@ pub struct ComponentsManifest {
     pub capsules: HashMap<String, CapsuleEntry>,
 
     pub profiles: HashMap<String, Profile>,
+
+    /// Operator-pinned signed model catalog. Absence keeps installed inventory
+    /// unchanged; catalog entries cannot supply their own trust configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog: Option<ModelCatalogConfig>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCatalogConfig {
+    pub head_cid: String,
+    pub publisher_dids: Vec<String>,
 }
 
 /// A setup-materialized component.
@@ -3776,6 +3788,7 @@ mod tests {
         fs::create_dir_all(binary_path.parent().unwrap()).unwrap();
         fs::write(&binary_path, b"object-provider").unwrap();
         let manifest = ComponentsManifest {
+            model_catalog: None,
             external: HashMap::new(),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
@@ -3864,11 +3877,13 @@ mod tests {
         ));
 
         let old_manifest = ComponentsManifest {
+            model_catalog: None,
             external: HashMap::from([("object-provider".to_string(), old_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
         };
         let new_manifest = ComponentsManifest {
+            model_catalog: None,
             external: HashMap::from([("object-provider".to_string(), new_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
@@ -3894,11 +3909,13 @@ mod tests {
         let mut old_component = new_component.clone();
         old_component.capsule_metadata = None;
         let old_manifest = ComponentsManifest {
+            model_catalog: None,
             external: HashMap::from([("object-provider".to_string(), old_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
         };
         let new_manifest = ComponentsManifest {
+            model_catalog: None,
             external: HashMap::from([("object-provider".to_string(), new_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
@@ -4131,6 +4148,7 @@ mod tests {
             platforms,
         };
         let manifest = ComponentsManifest {
+            model_catalog: None,
             external: HashMap::new(),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
