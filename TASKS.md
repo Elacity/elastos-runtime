@@ -10,6 +10,37 @@ Guiding-star constraints live in [PRINCIPLES.md](PRINCIPLES.md).
 
 Do not add new product surface area until the `Now` section is materially tighter.
 
+## Browser maturity workstream
+
+The Browser work requested on 2026-09-07 has one acceptance contract:
+[Browser maturity goals](docs/BROWSER_ACCEPTANCE.md). The order there applies
+within this workstream; existing release work below retains its own scope.
+People and agents use the same Browser authority and lifecycle. Runtime owns
+device compatibility and independent local or remote placement of Engine and
+Exit. These checkboxes are the canonical status; the linked document gives
+instructions, dependencies, and measurable acceptance criteria.
+
+Initial analysis source:
+[`8ac18bec65ca650615be879f7ab3f66799d9fc53`](https://github.com/Elacity/elastos-runtime/tree/8ac18bec65ca650615be879f7ab3f66799d9fc53).
+Revalidate those findings against the implementation base before each repair.
+
+- [ ] [B01: One Browser contract and an explicit support matrix](docs/BROWSER_ACCEPTANCE.md#b01).
+- [ ] [B02: A fresh installation opens a usable Browser](docs/BROWSER_ACCEPTANCE.md#b02).
+- [ ] [B03: Every failure has an actionable diagnosis](docs/BROWSER_ACCEPTANCE.md#b03).
+- [ ] [B04: People and agents have equal Browser capabilities](docs/BROWSER_ACCEPTANCE.md#b04).
+- [ ] [B05: Input and navigation feel like a browser](docs/BROWSER_ACCEPTANCE.md#b05).
+- [ ] [B06: Sessions recover from normal interruptions](docs/BROWSER_ACCEPTANCE.md#b06).
+- [ ] [B07: One slow session cannot block the others](docs/BROWSER_ACCEPTANCE.md#b07).
+- [ ] [B08: Remote Engine is an ordinary Runtime service](docs/BROWSER_ACCEPTANCE.md#b08).
+- [ ] [B09: Exit has identical local and remote network semantics](docs/BROWSER_ACCEPTANCE.md#b09).
+- [ ] [B10: Prove independent placement of UI, Engine, and Exit](docs/BROWSER_ACCEPTANCE.md#b10).
+- [ ] [B11: Meet measured responsiveness and media budgets](docs/BROWSER_ACCEPTANCE.md#b11).
+- [ ] [B12: Profiles and user state survive safely](docs/BROWSER_ACCEPTANCE.md#b12).
+- [ ] [B13: Complete daily browser workflows and accessibility](docs/BROWSER_ACCEPTANCE.md#b13).
+- [ ] [B14: Preserve authority, privacy, and bounded revocation](docs/BROWSER_ACCEPTANCE.md#b14).
+- [ ] [B15: Updates and repair preserve a working installation](docs/BROWSER_ACCEPTANCE.md#b15).
+- [ ] [B16: Release only from repeatable product evidence](docs/BROWSER_ACCEPTANCE.md#b16).
+
 ## Now
 
 Build order: finish the reviewed onboarding and window source closeout, then
