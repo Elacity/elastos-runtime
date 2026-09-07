@@ -208,6 +208,7 @@ struct ContentFetchTransfer {
     transfer: ProviderTransfer,
     range: Option<ProviderByteRange>,
     progress: Option<ProviderProgress>,
+    bounded_read: bool,
 }
 
 impl ContentFetchTransfer {
@@ -281,6 +282,15 @@ impl ContentFetchTransfer {
             transfer,
             range,
             progress,
+            bounded_read: match request.get("bounded_read") {
+                None | Some(Value::Bool(false)) => false,
+                Some(Value::Bool(true)) => true,
+                _ => {
+                    return Err(ProviderError::Provider(
+                        "bounded_read must be a boolean".into(),
+                    ))
+                }
+            },
         })
     }
 }
@@ -2973,7 +2983,9 @@ impl ContentProvider {
         {
             Ok(result) => result,
             Err(local_err)
-                if request.get("local_only").and_then(|value| value.as_bool()) == Some(true) =>
+                if transfer.bounded_read
+                    || request.get("local_only").and_then(|value| value.as_bool())
+                        == Some(true) =>
             {
                 return Err(local_err);
             }
@@ -3041,6 +3053,9 @@ impl ContentProvider {
             "op": "cat",
             "cid": cid,
         });
+        if transfer.bounded_read {
+            ipfs_request["bounded_read"] = Value::Bool(true);
+        }
         if !path.is_empty() {
             ipfs_request["path"] = Value::String(path.to_string());
         }
@@ -11299,6 +11314,160 @@ mod tests {
         assert_eq!(requests[0]["cid"], TEST_CID);
         assert_eq!(requests[0]["uri"], format!("elastos://{TEST_CID}"));
         assert_eq!(requests[0]["path"], "remote.md");
+    }
+
+    #[tokio::test]
+    async fn content_bounded_read_validates_native_receipt_once_without_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let content = Arc::new(ContentProvider::new(
+            root.path().to_path_buf(),
+            Arc::downgrade(&registry),
+        ));
+        registry
+            .register_sub_provider("content", content)
+            .await
+            .unwrap();
+        // Reuse the fixture's fixed-response provider at the existing IPFS slot.
+        let backend = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({
+                "data": base64::engine::general_purpose::STANDARD.encode(b"89ab"),
+                "_runtime_applied_range": { "schema": "elastos.provider.applied-range/v1",
+                    "cid": TEST_CID, "path": "weights.gguf", "start": 8, "end": 11 }
+            }))),
+        });
+        registry
+            .register_sub_provider("ipfs", backend.clone())
+            .await
+            .unwrap();
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({}))),
+        });
+        registry.register(availability.clone()).await;
+        let request = json!({ "op": "fetch", "cid": TEST_CID, "path": "weights.gguf",
+            "bounded_read": true, "range": { "start": 8, "end": 11 },
+            "progress": { "request_id": "bounded-content", "expected_bytes": 4 } });
+        for (transfer, outer_transfer) in [
+            ("bytes", ProviderTransfer::Bytes),
+            ("stream", ProviderTransfer::Stream),
+        ] {
+            let mut request = request.clone();
+            request["transfer"] = json!(transfer);
+            let response = registry
+                .invoke_provider(ProviderInvocation {
+                    source: "fixture-runtime".into(),
+                    target: "content".into(),
+                    op: "fetch".into(),
+                    request,
+                    transfer: outer_transfer,
+                    range: None,
+                    progress: None,
+                    transport: ProviderInvocationTransport::Local,
+                })
+                .await
+                .unwrap();
+            let bytes = if transfer == "bytes" {
+                base64::engine::general_purpose::STANDARD
+                    .decode(response["data"]["data"].as_str().unwrap())
+                    .unwrap()
+            } else {
+                decode_test_stream_payload(&response["data"]["stream"])
+            };
+            assert_eq!(bytes, b"89ab");
+            assert!(!response.to_string().contains("_runtime_applied_range"));
+            assert_eq!(
+                response["data"]["transfer"]["range"],
+                json!({ "start": 8, "end": 11 })
+            );
+        }
+        let sent = backend.requests.lock().await;
+        assert_eq!(sent.len(), 2);
+        for request in sent.iter() {
+            assert_eq!(request["bounded_read"], true);
+            assert_eq!(
+                request["_runtime_invocation"]["range"],
+                json!({ "start": 8, "end": 11 })
+            );
+        }
+        drop(sent);
+        let mut stream_request = request.clone();
+        stream_request["transfer"] = json!("stream");
+        let mut session = registry
+            .open_provider_stream(
+                ProviderInvocation {
+                    source: "runtime-content-consumer".into(),
+                    target: "content".into(),
+                    op: "fetch".into(),
+                    request: stream_request,
+                    transfer: ProviderTransfer::Stream,
+                    range: None,
+                    progress: Some(ProviderProgress {
+                        request_id: "bounded-content".into(),
+                        expected_bytes: Some(4),
+                    }),
+                    transport: ProviderInvocationTransport::Local,
+                },
+                ProviderStreamOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.drain_to_vec().unwrap(), b"89ab");
+        for response in [
+            provider_error("not_found", "missing"),
+            provider_ok(
+                json!({ "data": base64::engine::general_purpose::STANDARD.encode(b"89ab") }),
+            ),
+            provider_ok(json!({ "data": "ODlhYg==", "_runtime_applied_range": {
+                "schema": "elastos.provider.applied-range/v1", "cid": TEST_CID,
+                "path": "other.gguf", "start": 8, "end": 11 } })),
+        ] {
+            *backend.response.lock().await = response;
+            assert!(registry
+                .invoke_provider(ProviderInvocation {
+                    source: "fixture-runtime".into(),
+                    target: "content".into(),
+                    op: "fetch".into(),
+                    request: request.clone(),
+                    transfer: ProviderTransfer::Json,
+                    range: None,
+                    progress: None,
+                    transport: ProviderInvocationTransport::Local,
+                })
+                .await
+                .is_err());
+        }
+        assert_eq!(backend.requests.lock().await.len(), 6);
+        assert!(availability.requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn content_bounded_read_invalid_contract_has_no_provider_effect() {
+        let (_root, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        for invalid in [json!("true"), Value::Null, json!(1)] {
+            assert!(content
+                .send_raw(&json!({ "op": "fetch", "cid": TEST_CID,
+                    "bounded_read": invalid, "range": { "start": 8, "end": 11 }
+                }))
+                .await
+                .is_err());
+        }
+        for range in [
+            Value::Null,
+            json!({ "start": 8 }),
+            json!({ "start": 9, "end": 8 }),
+            json!({ "start": 0, "end": 65536 }),
+        ] {
+            assert!(content
+                .send_raw(&json!({ "op": "fetch", "cid": TEST_CID,
+                    "bounded_read": true, "range": range
+                }))
+                .await
+                .is_err());
+        }
+        assert!(ipfs.requests.lock().await.is_empty());
+        assert!(registry.get("availability").await.is_none());
     }
 
     #[tokio::test]

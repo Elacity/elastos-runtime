@@ -195,28 +195,47 @@ model configuration marks only the model catalog unavailable. Snapshot
 verification provides publisher metadata, while transfer, atomic admission,
 provider readiness and deployed availability require their own proof.
 
+## Implemented bounded local reads
+
+The existing Content fetch request accepts strict `bounded_read: true` with a
+closed byte range. Runtime routes it locally to native IPFS Cat. Each read has
+a 64 KiB cap and a five-second total HTTP/body deadline. Native Cat borrows the
+ready backend and refreshes its existing activity record. It uses encoded query
+parameters with redirects and proxy inheritance disabled, and performs no
+startup, pin, retry or fallback for this mode.
+
+Runtime validates the private applied-range receipt against the exact CID,
+relative path, range and byte count. It consumes the range once and removes
+the receipt from Bytes and Stream output. Missing or conflicting receipts fail;
+bounded Content failures do not enter ordinary availability fallback. Remote
+bounded calls are outside this local contract.
+
+Source tests prove deadline-driven socket closure, a distinct next read and the
+existing bridge's serialized response drain. This bounds one dispatched read;
+preparation status, cancellation and cleanup still need an owned operation.
+The receipt does not verify package identity or payload hashes. The current
+per-read cap is a source proof limit; large-package throughput remains unmeasured.
+
 ## Source prerequisites and bounded implementation plan
 
-The following are source limitations, not completed large-model support:
+The following separates implemented primitives from remaining package work:
 
-| Existing surface | Verified limitation and required extension |
+| Existing surface | Current state and required extension |
 | --- | --- |
 | `elastos/crates/elastos-common/src/manifest.rs` | The bounded passive metadata profile above is implemented. Preparation must verify its declared facts against the complete fetched package before admission. |
 | `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | The catalog projects installed inventory plus verified, unprepared model metadata. Extend existing inventory admission/receipt ownership for preparation; source-directory presence and a signed metadata row alone are insufficient. |
-| `elastos/crates/elastos-server/src/content.rs` | `fetch_bytes_via_provider` calls `drain_to_vec`; `materialize_data_capsule` repeats this per file. `import_exact` and aggregate `import_object` bytes are capped at 64 MiB; import permits at most 512 files. These whole-buffer import/materialization paths are not the multi-gigabyte model path. |
-| `elastos/crates/elastos-runtime/src/provider/registry.rs` | `open_provider_stream` decodes the full response into `ProviderStreamSession.bytes`; 64 KiB `read_next` chunks slice that buffer. Consumer chunking alone does not bound producer memory or cancel network transfer. |
-| `capsules/ipfs-provider/src/main.rs` | Runtime's registered native IPFS backend handles `Cat` with CID/path only. `cat` and `cat_to_path` fetch the entire file with `read_to_end` before encoding or writing. Implement bounded backend reads and actual cancellation before using this path for Qwen. |
+| `elastos/crates/elastos-server/src/content.rs` | Explicit bounded fetch delegates to local IPFS without fallback. Ordinary `fetch_bytes_via_provider` and `materialize_data_capsule` still drain whole files. `import_exact` and aggregate `import_object` remain capped at 64 MiB and 512 files. Preparation must use a bounded transfer loop instead of these whole-buffer paths. |
+| `elastos/crates/elastos-runtime/src/provider/registry.rs` | Bounded reads validate and consume the native range once for Bytes and Stream. Ordinary `open_provider_stream` still decodes the full response into `ProviderStreamSession.bytes`; consumer chunking alone does not bound producer memory or cancel network work. |
+| `capsules/ipfs-provider/src/main.rs` | Explicit bounded Cat enforces finite bytes/time and uses the existing backend lifecycle. Ordinary `cat` and `cat_to_path` still read the entire file before encoding or writing. |
 | `elastos/crates/elastos-server/src/api/gateway_site.rs` | Gateway CID reads buffer content before enforcing the 100 MiB file limit. Ordinary browser file responses are not a model-transfer route. |
 | `server_infra.rs` and `capsules/model-provider/src/config.rs` | Offers come from private startup config; local descriptors contain path and SHA-256. Bind admitted content to those verified descriptors and the existing ProviderRegistry lifecycle, rather than giving Settings write access to config. |
 
-First confirm the selected backend and its capabilities through Runtime. Extend
-the existing content fetch/range contract down to that backend with exact CID,
-manifest-approved relative path, offset and length. Bound each backend read and
-response before allocation, with one in-flight chunk, deadlines, incremental
-integrity verification, observed progress and cancellation of the actual read.
-Reject ignored ranges, wrong offsets, oversized/truncated data and closure or
-digest mismatch. Do not implement this by draining a complete stream and then
-slicing it, or by merely increasing the existing whole-file limits.
+Preparation must confirm the selected backend through Runtime and use bounded
+reads for the exact CID, manifest-approved relative path, offset and length.
+Keep one in-flight read, incremental integrity verification and observed
+progress. Cancel stops further dispatch, then waits for the dispatched read and
+its response drain before terminal cleanup. Verify the complete closure and
+payload digests before admission; a range receipt alone cannot establish them.
 
 Runtime owns one private staging operation for the exact package identity and
 admission record. Bound catalog/manifest bytes, file count, each file, total
@@ -240,8 +259,8 @@ policy slices:
    its admission receipts, not an independent Store registry or second journal.
    Test canonical closure identity, signature/trust/revocation, size/license/
    provenance/compatibility rejection, caller isolation and bounded projections.
-2. **Bounded content transfer and atomic preparation.** Extend only the selected
-   native backend and existing content/registry transfer path needed above.
+2. **Bounded content transfer and atomic preparation.** Build on the verified
+   local-read primitive with one Runtime-owned transfer and admission operation.
    Test a deterministic streamed fixture larger than old whole-file limits with
    bounded peak buffers, slow/oversized/ignored-range failures, mid-read cancel,
    retry, concurrent duplicate selection, low disk, crash/restart and exact

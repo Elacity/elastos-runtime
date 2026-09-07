@@ -243,14 +243,24 @@ The integrated source includes these durable facts:
   receipts own retention evidence, Runtime owns policy and atomic admission,
   and content and availability providers own backend selection and routes.
   Package identity remains separate from model service offers.
-- Current large-file paths buffer complete payloads: `content.rs` drains the
-  provider stream into a vector, `ProviderStreamSession` holds that vector, and
-  the selected native IPFS provider reads complete cat responses before base64
-  encoding or writing. Stream/range labels do not prove bounded backend reads
-  or network cancellation. The 64 MiB content import bound and 100 MiB gateway
-  file bound are not a multi-gigabyte model delivery path. Bounded native
-  transfer, full closure verification, atomic package admission and inventory-to-
-  offer binding remain implementation prerequisites, not installed support.
+- Explicit `bounded_read: true` now carries a closed range through local
+  Content to native IPFS, with a 64 KiB per-read cap and five-second total HTTP
+  and body deadline. Native reads use the ready backend and its existing activity
+  record, with redirects and proxy inheritance disabled. They perform no startup,
+  pin, retry or fallback. Runtime checks the private CID/path/range receipt and
+  exact byte count, consumes the range once, and removes that receipt from Bytes
+  and Stream output. Remote bounded calls fail before dispatch.
+- Source verification passes all 27 native tests, 4 Runtime and 2 server bounded
+  tests, all 55 provider tests and 11 content-fetch regressions under Rust 1.91
+  with warnings denied. The stalled-body fixture observes the connection end
+  after the deadline and a distinct next read succeeding; the existing bridge
+  test preserves response association after caller cancellation. Workspace,
+  Chain and native formatting, Home/public-copy entropy and diff checks pass.
+- Ordinary whole-object paths still buffer complete payloads. The bounded read
+  is a source prerequisite, not full model preparation or package identity proof.
+  Preparation approval, operation status/cancel and cleanup, complete closure
+  verification, atomic admission, offer binding, shared model UI and real cold
+  Qwen acceptance remain open. Installed Homes remain unchanged.
 
 ## Protected-content Contract Truth
 

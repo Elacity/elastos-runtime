@@ -20,6 +20,8 @@ const LOCKFILE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const LOCKFILE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const LARGE_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
+const BOUNDED_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_BOUNDED_READ_BYTES: u64 = 64 * 1024;
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
@@ -60,6 +62,8 @@ enum Request {
         cid: String,
         #[serde(default)]
         path: Option<String>,
+        #[serde(default)]
+        bounded_read: bool,
         #[serde(default, rename = "_runtime_invocation")]
         _runtime_invocation: Option<serde_json::Value>,
     },
@@ -264,7 +268,18 @@ impl IpfsProvider {
             } => self.add_bytes(&data, &filename, pin),
             Request::AddPath { path, pin } => self.add_path(&path, pin),
             Request::AddDirectory { files, pin, .. } => self.add_directory(files, pin),
-            Request::Cat { cid, path, .. } => self.cat(&cid, path.as_deref()),
+            Request::Cat {
+                cid,
+                path,
+                bounded_read,
+                _runtime_invocation,
+            } => {
+                if bounded_read {
+                    self.cat_bounded(&cid, path.as_deref(), _runtime_invocation.as_ref())
+                } else {
+                    self.cat(&cid, path.as_deref())
+                }
+            }
             Request::CatToPath { cid, path, dest } => {
                 self.cat_to_path(&cid, path.as_deref(), &dest)
             }
@@ -612,6 +627,121 @@ impl IpfsProvider {
     }
 
     // ── Read ops ────────────────────────────────────────────────────
+
+    fn cat_bounded(
+        &self,
+        cid: &str,
+        path: Option<&str>,
+        invocation: Option<&serde_json::Value>,
+    ) -> Response {
+        let result = (|| -> Result<serde_json::Value, String> {
+            let invocation = invocation.ok_or("bounded read requires Runtime invocation")?;
+            if invocation["schema"] != "elastos.provider.invocation/v1"
+                || invocation["target"] != "ipfs"
+                || invocation["op"] != "cat"
+                || invocation["transport"] != "runtime-local-provider-plane"
+                || !matches!(invocation["transfer"].as_str(), Some("bytes" | "stream"))
+            {
+                return Err("invalid bounded read invocation".into());
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Range {
+                start: u64,
+                end: u64,
+            }
+            let range: Range = serde_json::from_value(invocation["range"].clone())
+                .map_err(|_| "bounded read requires a closed range")?;
+            let length = range
+                .end
+                .checked_sub(range.start)
+                .and_then(|n| n.checked_add(1))
+                .filter(|n| *n <= MAX_BOUNDED_READ_BYTES)
+                .ok_or("bounded read range exceeds limit")?;
+            if let Some(expected) = invocation
+                .pointer("/progress/expected_bytes")
+                .filter(|v| !v.is_null())
+            {
+                if expected.as_u64() != Some(length) {
+                    return Err("bounded read expected length mismatch".into());
+                }
+            }
+            let path = path.unwrap_or("");
+            if cid.is_empty()
+                || cid.len() > 128
+                || !cid.bytes().all(|b| b.is_ascii_alphanumeric())
+                || path.len() > 1024
+                || (!path.is_empty()
+                    && path.split('/').any(|part| {
+                        part.is_empty()
+                            || part == "."
+                            || part == ".."
+                            || !part
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+                    }))
+            {
+                return Err("invalid bounded content identity".into());
+            }
+            // A bounded read borrows the ready backend; it never starts or pins it.
+            if self.state != KuboState::Ready || self.api_port == 0 {
+                return Err("bounded read backend is not ready".into());
+            }
+            let arg = if path.is_empty() {
+                cid.to_string()
+            } else {
+                format!("{cid}/{path}")
+            };
+            update_coord_last_used(&self.data_dir);
+            let agent = ureq::AgentBuilder::new()
+                .redirects(0)
+                .try_proxy_from_env(false)
+                .build();
+            let response = agent
+                .post(&format!("{}/api/v0/cat", self.api_url()))
+                .query("arg", &arg)
+                .query("offset", &range.start.to_string())
+                .query("length", &length.to_string())
+                .set("Accept-Encoding", "identity")
+                .timeout(BOUNDED_READ_TIMEOUT)
+                .call()
+                .map_err(|e| e.to_string())?;
+            if response.status() != 200
+                || response
+                    .header("Content-Encoding")
+                    .is_some_and(|v| v != "identity")
+                || response
+                    .header("Content-Length")
+                    .is_some_and(|v| v.parse::<u64>().ok() != Some(length))
+            {
+                return Err("invalid bounded read response".into());
+            }
+            let mut bytes = Vec::with_capacity(length as usize + 1);
+            response
+                .into_reader()
+                .take(length + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            if bytes.len() as u64 != length {
+                return Err("bounded read response length mismatch".into());
+            }
+            update_coord_last_used(&self.data_dir);
+            Ok(serde_json::json!({
+                "data": BASE64.encode(&bytes),
+                "_runtime_applied_range": {
+                    "schema": "elastos.provider.applied-range/v1",
+                    "cid": cid, "path": path, "start": range.start, "end": range.end
+                }
+            }))
+        })();
+        match result {
+            Ok(data) => Response::ok(data),
+            Err(error) => {
+                eprintln!("ipfs-provider: bounded read failed: {error}");
+                Response::error("bounded_read_failed", "Bounded content read failed")
+            }
+        }
+    }
 
     fn cat(&mut self, cid: &str, path: Option<&str>) -> Response {
         let arg = match path {
@@ -1506,6 +1636,328 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bounded_cat_fixture_request() -> serde_json::Value {
+        serde_json::json!({
+            "op": "cat", "bounded_read": true,
+            "cid": "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
+            "path": "weights.gguf",
+            "_runtime_invocation": {
+                "schema": "elastos.provider.invocation/v1", "source": "content-provider",
+                "target": "ipfs", "op": "cat", "transport": "runtime-local-provider-plane",
+                "transfer": "bytes", "range": { "start": 8, "end": 11 },
+                "progress": { "request_id": "range-fixture", "expected_bytes": 4 }
+            }
+        })
+    }
+
+    fn bounded_cat_fixture_provider(root: &Path, port: u16) -> IpfsProvider {
+        write_coord_file(
+            root,
+            &CoordFile {
+                kubo_pid: std::process::id(),
+                api_port: port,
+                gateway_port: port,
+                started_at: 1,
+                last_used: 1,
+            },
+        );
+        IpfsProvider {
+            state: KuboState::Ready,
+            api_port: port,
+            gateway_port: port,
+            kubo_binary: None,
+            kubo_child: None,
+            data_dir: root.to_path_buf(),
+            repo_dir: root.join("unused-repo"),
+        }
+    }
+
+    fn accept_bounded_fixture(listener: &std::net::TcpListener) -> std::net::TcpStream {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            match listener.accept() {
+                Ok((socket, _)) => return socket,
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => panic!("fixture accept failed or expired: {err}"),
+            }
+        }
+    }
+
+    fn read_bounded_fixture_headers(socket: &mut std::net::TcpStream) -> String {
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            assert!(bytes.len() < 4096 && Instant::now() < deadline);
+            let mut byte = [0];
+            socket.read_exact(&mut byte).unwrap();
+            bytes.push(byte[0]);
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn bounded_read_body_deadline_closes_socket_and_next_read_succeeds() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let backend = std::thread::spawn(move || {
+            let mut stalled = accept_bounded_fixture(&listener);
+            let first = read_bounded_fixture_headers(&mut stalled);
+            stalled
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n8")
+                .unwrap();
+            // Observe the actual HTTP connection ending, not a dropped caller future.
+            stalled
+                .set_read_timeout(Some(Duration::from_secs(8)))
+                .unwrap();
+            let mut byte = [0];
+            match stalled.read(&mut byte) {
+                Ok(0) => {}
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                    ) => {}
+                other => panic!("stalled native read did not close its socket: {other:?}"),
+            }
+            let mut next = accept_bounded_fixture(&listener);
+            let second = read_bounded_fixture_headers(&mut next);
+            next.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ncdef",
+            )
+            .unwrap();
+            (first, second)
+        });
+        let mut provider = bounded_cat_fixture_provider(root.path(), port);
+        let started = Instant::now();
+        let failed =
+            provider.handle(serde_json::from_value(bounded_cat_fixture_request()).unwrap());
+        let elapsed = started.elapsed();
+        let mut next_request = bounded_cat_fixture_request();
+        next_request["_runtime_invocation"]["range"] =
+            serde_json::json!({ "start": 12, "end": 15 });
+        next_request["_runtime_invocation"]["progress"]["request_id"] =
+            serde_json::json!("next-consumer");
+        let next = provider.handle(serde_json::from_value(next_request).unwrap());
+        let (first, second) = backend.join().unwrap();
+        assert!(matches!(failed, Response::Error { .. }));
+        assert!(
+            elapsed >= BOUNDED_READ_TIMEOUT - Duration::from_millis(100)
+                && elapsed < Duration::from_secs(8)
+        );
+        for (headers, offset) in [(first, "offset=8"), (second, "offset=12")] {
+            assert!(headers.starts_with("POST /api/v0/cat?"));
+            assert!(headers.contains(offset) && headers.contains("length=4"));
+        }
+        let Response::Ok { data: Some(data) } = next else {
+            panic!("next read failed: {next:?}")
+        };
+        assert_eq!(
+            BASE64.decode(data["data"].as_str().unwrap()).unwrap(),
+            b"cdef"
+        );
+        assert_eq!(provider.state, KuboState::Ready);
+        assert!(!root.path().join("unused-repo").exists());
+    }
+
+    #[test]
+    fn bounded_read_rejects_redirect_short_and_chunked_oversized_responses() {
+        for response in [
+            &b"HTTP/1.1 302 Found\r\nLocation: /unexpected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n89a"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\n89abc\r\n0\r\n\r\n"[..],
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let backend = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut requests = Vec::new();
+                while Instant::now() < deadline {
+                    let mut socket = match listener.accept() {
+                        Ok((socket, _)) => socket,
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            if done_rx.try_recv().is_ok() { break; }
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(err) => panic!("fixture accept failed: {err}"),
+                    };
+                    requests.push(read_bounded_fixture_headers(&mut socket));
+                    socket.write_all(response).unwrap();
+                }
+                requests
+            });
+            let mut provider = bounded_cat_fixture_provider(root.path(), port);
+            let result = provider.handle(serde_json::from_value(bounded_cat_fixture_request()).unwrap());
+            done_tx.send(()).unwrap();
+            let requests = backend.join().unwrap();
+            assert_eq!(requests.len(), 1, "bounded failure must not follow, retry or prefetch");
+            assert!(requests[0].starts_with("POST /api/v0/cat?"));
+            assert!(matches!(result, Response::Error { .. }));
+        }
+    }
+
+    #[test]
+    fn bounded_read_rejects_invalid_input_without_backend_or_startup() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut provider =
+            bounded_cat_fixture_provider(root.path(), listener.local_addr().unwrap().port());
+        for (pointer, value) in [
+            ("/cid", serde_json::json!("cid&length=999")),
+            ("/path", serde_json::json!("../weights.gguf")),
+            ("/path", serde_json::json!("weights.gguf?offset=0")),
+            ("/path", serde_json::json!("/weights.gguf")),
+            ("/_runtime_invocation/range/end", serde_json::Value::Null),
+            ("/_runtime_invocation/range/end", serde_json::json!(7)),
+            (
+                "/_runtime_invocation/range/end",
+                serde_json::json!(u64::MAX),
+            ),
+            (
+                "/_runtime_invocation/progress/expected_bytes",
+                serde_json::json!(5),
+            ),
+        ] {
+            let mut request = bounded_cat_fixture_request();
+            *request.pointer_mut(pointer).unwrap() = value;
+            assert!(matches!(
+                provider.handle(serde_json::from_value(request).unwrap()),
+                Response::Error { .. }
+            ));
+        }
+        let mut request = bounded_cat_fixture_request();
+        request["bounded_read"] = serde_json::json!("true");
+        assert!(serde_json::from_value::<Request>(request).is_err());
+        provider.state = KuboState::Cold;
+        assert!(matches!(
+            provider.handle(serde_json::from_value(bounded_cat_fixture_request()).unwrap()),
+            Response::Error { .. }
+        ));
+        assert!(matches!(listener.accept(), Err(err) if err.kind() == io::ErrorKind::WouldBlock));
+        assert_eq!(read_coord_file(root.path()).unwrap().last_used, 1);
+        assert!(!root.path().join("unused-repo").exists());
+    }
+
+    #[test]
+    fn test_cat_native_range_dispatch_is_bounded_without_prefetch() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let mut observations = Vec::new();
+        for ignore_range in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (done_tx, done_rx) = mpsc::channel();
+            let backend = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut requests = Vec::new();
+                while Instant::now() < deadline {
+                    let (mut socket, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            if done_rx.try_recv().is_ok() {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(err) => panic!("fixture accept failed: {err}"),
+                    };
+                    socket.set_nonblocking(false).unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        assert!(headers.len() < 4096 && Instant::now() < deadline);
+                        let mut byte = [0];
+                        socket.read_exact(&mut byte).unwrap();
+                        headers.push(byte[0]);
+                    }
+                    let headers = String::from_utf8(headers).unwrap();
+                    let request = headers.lines().next().unwrap().to_string();
+                    let target = request.split_whitespace().nth(1).unwrap();
+                    let query: Vec<_> = target.split_once('?').unwrap().1.split('&').collect();
+                    let ranged = query.contains(&"offset=8") && query.contains(&"length=4");
+                    let body: &[u8] = if ranged && !ignore_range {
+                        b"89ab"
+                    } else {
+                        b"0123456789abcdef"
+                    };
+                    let mut reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    reply.extend_from_slice(body);
+                    socket.write_all(&reply).unwrap();
+                    requests.push((request, ranged));
+                }
+                requests
+            });
+            let mut provider = bounded_cat_fixture_provider(root.path(), port);
+            let request = serde_json::from_value(bounded_cat_fixture_request()).unwrap();
+            let response = provider.handle(request);
+            done_tx.send(()).unwrap();
+            let requests = backend.join().unwrap();
+            assert!(!root.path().join("unused-repo").exists());
+            let coord = read_coord_file(root.path()).unwrap();
+            assert!(
+                coord.last_used > 1,
+                "bounded read must refresh backend activity"
+            );
+            assert_eq!(coord.kubo_pid, std::process::id());
+            assert_eq!(coord.api_port, port);
+            observations.push((ignore_range, requests, response));
+        }
+
+        for (ignore_range, requests, response) in observations {
+            assert_eq!(
+                requests.len(),
+                1,
+                "bounded Cat must not pin, prefetch or retry"
+            );
+            assert!(requests[0].0.starts_with("POST /api/v0/cat?"));
+            assert!(requests[0].1, "bounded Cat must send offset=8 and length=4");
+            if ignore_range {
+                assert!(
+                    matches!(response, Response::Error { .. }),
+                    "oversized response accepted"
+                );
+            } else {
+                let Response::Ok { data: Some(data) } = response else {
+                    panic!("exact range failed: {response:?}");
+                };
+                assert_eq!(
+                    BASE64.decode(data["data"].as_str().unwrap()).unwrap(),
+                    b"89ab"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_bind_free_port() {

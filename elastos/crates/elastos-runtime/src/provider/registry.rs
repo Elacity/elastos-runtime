@@ -1151,6 +1151,7 @@ impl ProviderRegistry {
             ));
         }
         validate_provider_transfer_contract(&invocation)?;
+        bounded_provider_read_range(&invocation)?;
         let target_op = invocation
             .request
             .get("op")
@@ -1307,6 +1308,25 @@ fn apply_provider_transfer_response(
     response: &mut serde_json::Value,
     invocation: &ProviderInvocation,
 ) -> Result<(), ProviderError> {
+    let bounded_range = bounded_provider_read_range(invocation)?;
+    let applied = response
+        .get_mut("data")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|data| data.remove("_runtime_applied_range"));
+    let mut normalized = invocation.clone();
+    if let Some((range, length)) = bounded_range {
+        if response.get("status").and_then(serde_json::Value::as_str) != Some("error") {
+            validate_applied_provider_range(response, invocation, range, length, applied)?;
+            // The backend already applied this exact range. Normalize the bounded
+            // payload into Bytes/Stream without applying the offset a second time.
+            normalized.range = None;
+        }
+    } else if applied.is_some() {
+        return Err(ProviderError::Provider(
+            "unexpected applied range receipt".into(),
+        ));
+    }
+    let invocation = &normalized;
     let result = match invocation.transfer {
         ProviderTransfer::Json => Ok(()),
         ProviderTransfer::Bytes => apply_provider_byte_range(response, invocation),
@@ -1314,6 +1334,120 @@ fn apply_provider_transfer_response(
     };
     redact_public_provider_runtime_metadata(response);
     result
+}
+
+const MAX_BOUNDED_PROVIDER_READ_BYTES: u64 = 64 * 1024;
+
+fn bounded_provider_read_range(
+    invocation: &ProviderInvocation,
+) -> Result<Option<(ProviderByteRange, u64)>, ProviderError> {
+    match invocation.request.get("bounded_read") {
+        None | Some(serde_json::Value::Bool(false)) => return Ok(None),
+        Some(serde_json::Value::Bool(true)) => {}
+        _ => {
+            return Err(ProviderError::Provider(
+                "bounded_read must be a boolean".into(),
+            ))
+        }
+    }
+    // Content owns its nested fetch range. Its outer call must not
+    // slice the already-normalized backend response again.
+    if invocation.target == "content"
+        && invocation.op == "fetch"
+        && invocation.range.is_none()
+        && matches!(invocation.transport, ProviderInvocationTransport::Local)
+    {
+        return Ok(None);
+    }
+    if invocation.target != "ipfs"
+        || invocation.op != "cat"
+        || !matches!(invocation.transport, ProviderInvocationTransport::Local)
+        || invocation.transfer == ProviderTransfer::Json
+    {
+        return Err(ProviderError::Provider(
+            "bounded read requires local IPFS Cat bytes or stream".into(),
+        ));
+    }
+    let range = invocation
+        .range
+        .ok_or_else(|| ProviderError::Provider("bounded read requires a closed range".into()))?;
+    let length = range
+        .end
+        .and_then(|end| end.checked_sub(range.start))
+        .and_then(|size| size.checked_add(1))
+        .filter(|size| *size <= MAX_BOUNDED_PROVIDER_READ_BYTES)
+        .ok_or_else(|| ProviderError::Provider("bounded read range exceeds limit".into()))?;
+    if invocation
+        .progress
+        .as_ref()
+        .and_then(|p| p.expected_bytes)
+        .is_some_and(|expected| expected != length)
+    {
+        return Err(ProviderError::Provider(
+            "bounded read expected length mismatch".into(),
+        ));
+    }
+    Ok(Some((range, length)))
+}
+
+fn validate_applied_provider_range(
+    response: &serde_json::Value,
+    invocation: &ProviderInvocation,
+    range: ProviderByteRange,
+    length: u64,
+    applied: Option<serde_json::Value>,
+) -> Result<(), ProviderError> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct AppliedRange {
+        schema: String,
+        cid: String,
+        path: String,
+        start: u64,
+        end: u64,
+    }
+    let invalid = || ProviderError::Provider("invalid bounded read receipt or payload".into());
+    if response.get("status").and_then(serde_json::Value::as_str) != Some("ok")
+        || response
+            .get("data")
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(|data| data.len() != 1)
+    {
+        return Err(invalid());
+    }
+    let applied: AppliedRange =
+        serde_json::from_value(applied.ok_or_else(invalid)?).map_err(|_| invalid())?;
+    if applied.schema != "elastos.provider.applied-range/v1"
+        || Some(applied.cid.as_str())
+            != invocation
+                .request
+                .get("cid")
+                .and_then(serde_json::Value::as_str)
+        || applied.path
+            != invocation
+                .request
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+        || applied.start != range.start
+        || Some(applied.end) != range.end
+    {
+        return Err(invalid());
+    }
+    let encoded = response
+        .pointer("/data/data")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    if encoded.len() as u64 > length.div_ceil(3) * 4 {
+        return Err(invalid());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| invalid())?;
+    if bytes.len() as u64 != length {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn redact_public_provider_runtime_metadata(response: &mut serde_json::Value) {
@@ -2249,6 +2383,165 @@ mod tests {
         );
         assert_eq!(response["_runtime_transfer"]["transfer"], "json");
         assert_eq!(response["_runtime_transfer"]["status"], "completed");
+    }
+
+    fn bounded_read_fixture(transfer: ProviderTransfer) -> (ProviderInvocation, serde_json::Value) {
+        (
+            ProviderInvocation {
+                source: "content-provider".into(),
+                target: "ipfs".into(),
+                op: "cat".into(),
+                request: serde_json::json!({ "op": "cat", "bounded_read": true, "cid": "fixture-cid", "path": "weights.gguf" }),
+                transfer,
+                range: Some(ProviderByteRange {
+                    start: 8,
+                    end: Some(11),
+                }),
+                progress: Some(ProviderProgress {
+                    request_id: "range-fixture".into(),
+                    expected_bytes: Some(4),
+                }),
+                transport: ProviderInvocationTransport::Local,
+            },
+            serde_json::json!({ "status": "ok", "data": {
+                "data": base64::engine::general_purpose::STANDARD.encode(b"89ab"),
+                "_runtime_applied_range": { "schema": "elastos.provider.applied-range/v1",
+                    "cid": "fixture-cid", "path": "weights.gguf", "start": 8, "end": 11 }
+            } }),
+        )
+    }
+
+    #[test]
+    fn bounded_read_consumes_exact_range_once_and_removes_private_receipt() {
+        for transfer in [ProviderTransfer::Bytes, ProviderTransfer::Stream] {
+            let (invocation, mut response) = bounded_read_fixture(transfer);
+            apply_provider_transfer_response(&mut response, &invocation).unwrap();
+            assert_eq!(
+                provider_stream_response_bytes(response["data"].as_object().unwrap()).unwrap(),
+                b"89ab"
+            );
+            assert!(response["data"].get("_runtime_applied_range").is_none());
+        }
+    }
+
+    #[test]
+    fn bounded_read_rejects_missing_conflicting_or_malformed_receipts_and_payloads() {
+        for transfer in [ProviderTransfer::Bytes, ProviderTransfer::Stream] {
+            let (invocation, response) = bounded_read_fixture(transfer);
+            for (pointer, value) in [
+                ("/data/_runtime_applied_range", serde_json::Value::Null),
+                (
+                    "/data/_runtime_applied_range/schema",
+                    serde_json::json!("unknown"),
+                ),
+                (
+                    "/data/_runtime_applied_range/cid",
+                    serde_json::json!("other-cid"),
+                ),
+                (
+                    "/data/_runtime_applied_range/path",
+                    serde_json::json!("other.gguf"),
+                ),
+                ("/data/_runtime_applied_range/start", serde_json::json!(0)),
+                ("/data/_runtime_applied_range/end", serde_json::json!(12)),
+                ("/data/_runtime_applied_range/start", serde_json::json!("8")),
+                ("/data/data", serde_json::json!("%%%%")),
+                (
+                    "/data/data",
+                    serde_json::json!(base64::engine::general_purpose::STANDARD.encode(b"89a")),
+                ),
+                (
+                    "/data/data",
+                    serde_json::json!(base64::engine::general_purpose::STANDARD.encode(b"89abc")),
+                ),
+            ] {
+                let mut invalid = response.clone();
+                *invalid.pointer_mut(pointer).unwrap() = value;
+                assert!(
+                    apply_provider_transfer_response(&mut invalid, &invocation).is_err(),
+                    "accepted {pointer}"
+                );
+            }
+            let mut missing = response.clone();
+            missing["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("_runtime_applied_range");
+            assert!(apply_provider_transfer_response(&mut missing, &invocation).is_err());
+            let mut extra = response.clone();
+            extra["data"]["_runtime_applied_range"]["extra"] = serde_json::json!(true);
+            assert!(apply_provider_transfer_response(&mut extra, &invocation).is_err());
+            let mut conflicting = response.clone();
+            conflicting["data"]["stream"] = provider_stream_payload(b"other payload");
+            assert!(apply_provider_transfer_response(&mut conflicting, &invocation).is_err());
+        }
+    }
+
+    #[test]
+    fn bounded_read_requires_strict_mode_and_closed_small_range() {
+        let (invocation, _) = bounded_read_fixture(ProviderTransfer::Bytes);
+        for range in [
+            None,
+            Some(ProviderByteRange {
+                start: 8,
+                end: None,
+            }),
+            Some(ProviderByteRange {
+                start: 9,
+                end: Some(8),
+            }),
+            Some(ProviderByteRange {
+                start: 0,
+                end: Some(MAX_BOUNDED_PROVIDER_READ_BYTES),
+            }),
+            Some(ProviderByteRange {
+                start: 0,
+                end: Some(u64::MAX),
+            }),
+        ] {
+            let mut invalid = invocation.clone();
+            invalid.range = range;
+            assert!(bounded_provider_read_range(&invalid).is_err());
+        }
+        let mut invalid = invocation.clone();
+        invalid.request["bounded_read"] = serde_json::json!("true");
+        assert!(bounded_provider_read_range(&invalid).is_err());
+        let mut invalid = invocation.clone();
+        invalid.target = "availability".into();
+        assert!(bounded_provider_read_range(&invalid).is_err());
+        let mut invalid = invocation.clone();
+        invalid.transfer = ProviderTransfer::Json;
+        assert!(bounded_provider_read_range(&invalid).is_err());
+        let mut invalid = invocation;
+        invalid.progress.as_mut().unwrap().expected_bytes = Some(5);
+        assert!(bounded_provider_read_range(&invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_read_rejects_remote_content_and_outer_range_before_dispatch() {
+        let registry = ProviderRegistry::new();
+        let carrier = Arc::new(MockCarrierInvoker::default());
+        registry.set_carrier_invoker(carrier.clone()).await;
+        let (mut invocation, _) = bounded_read_fixture(ProviderTransfer::Stream);
+        invocation.target = "content".into();
+        invocation.op = "fetch".into();
+        invocation.request["op"] = serde_json::json!("fetch");
+        invocation.range = None;
+        assert!(bounded_provider_read_range(&invocation).is_ok());
+        let mut remote = invocation.clone();
+        remote.transport = ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+            peer_did: "did:key:zFixture".into(),
+            timeout_ms: Some(5000),
+        });
+        assert!(matches!(registry.invoke_provider(remote).await,
+            Err(ProviderError::Provider(message)) if message.contains("bounded read requires local IPFS")));
+        invocation.range = Some(ProviderByteRange {
+            start: 8,
+            end: Some(11),
+        });
+        assert!(matches!(registry.invoke_provider(invocation).await,
+            Err(ProviderError::Provider(message)) if message.contains("bounded read requires local IPFS")));
+        assert!(carrier.requests.lock().await.is_empty());
     }
 
     #[tokio::test]
