@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
 import json
+import hashlib
 import mimetypes
 import os
 import pathlib
+import re
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,8 +16,6 @@ STATE_DIR = pathlib.Path(sys.argv[2]).resolve()
 BROWSER_ROOT = ROOT / "capsules" / "gba-emulator" / "browser"
 FIXTURE_ROOT = pathlib.Path(__file__).parent
 ROM = ROOT / "capsules" / "gba-ucity" / "ucity.gba"
-SAVE = STATE_DIR / "game.sav"
-SAVE_STATE = STATE_DIR / "game.ss1"
 RESULT = STATE_DIR / "result.json"
 STATE = {
     "put_count": 0,
@@ -29,6 +29,22 @@ STATE = {
     "trusted_input": {},
 }
 LOCK = threading.Lock()
+
+
+def storage_target(path):
+    prefix = "/api/viewers/gba-emulator/storage/gba-ucity/"
+    if not path.startswith(prefix):
+        return None
+    parts = path[len(prefix):].split("/")
+    if len(parts) != 2 or parts[0] not in ("save", "state"):
+        return None
+    if not re.fullmatch(r"[a-zA-Z0-9_-][a-zA-Z0-9._-]{0,127}", parts[1]):
+        return None
+    return STATE_DIR / parts[0] / parts[1]
+
+
+def revision(path, body):
+    return '"' + hashlib.sha256(path.encode() + b"\0" + body).hexdigest() + '"'
 
 mimetypes.add_type("application/wasm", ".wasm")
 mimetypes.add_type("text/javascript", ".js")
@@ -88,17 +104,20 @@ class Handler(BaseHTTPRequestHandler):
         # the product headers needed by its module, WASM, and Runtime fetches.
         self.send_header("Access-Control-Allow-Origin", "null")
         self.send_header(
-            "Access-Control-Allow-Headers", "content-type, x-elastos-home-token"
+            "Access-Control-Allow-Headers", "content-type, x-elastos-home-token, if-match, if-none-match"
         )
         self.send_header("Access-Control-Allow-Methods", "GET, PUT, POST, OPTIONS")
         self.send_header("Cross-Origin-Resource-Policy", "cross-origin")
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
-    def send_bytes(self, status, body, content_type):
+    def send_bytes(self, status, body, content_type, etag=None):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if etag is not None:
+            self.send_header("ETag", etag)
+            self.send_header("Access-Control-Expose-Headers", "ETag")
         self.end_headers()
         if body:
             self.wfile.write(body)
@@ -157,22 +176,26 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"items": [{"capsule": "gba-ucity", "title": "uCity"}]})
             return
         if path.startswith("/api/viewers/gba-emulator/storage/gba-ucity/save/"):
-            if not SAVE.exists():
-                self.send_json(404, {"error": "save not found"})
-                return
             with LOCK:
+                target = storage_target(path)
+                if target is None or not target.exists():
+                    self.send_json(404, {"error": "save not found"})
+                    return
+                body = target.read_bytes()
                 if STATE["put_count"]:
                     STATE["get_after_put"] += 1
-            self.send_bytes(200, SAVE.read_bytes(), "application/octet-stream")
+            self.send_bytes(200, body, "application/octet-stream", revision(path, body))
             return
         if path.startswith("/api/viewers/gba-emulator/storage/gba-ucity/state/"):
-            if not SAVE_STATE.exists():
-                self.send_json(404, {"error": "state not found"})
-                return
             with LOCK:
+                target = storage_target(path)
+                if target is None or not target.exists():
+                    self.send_json(404, {"error": "state not found"})
+                    return
+                body = target.read_bytes()
                 if STATE["state_put_count"]:
                     STATE["state_get_after_put"] += 1
-            self.send_bytes(200, SAVE_STATE.read_bytes(), "application/octet-stream")
+            self.send_bytes(200, body, "application/octet-stream", revision(path, body))
             return
         if path == "/proof/save-status":
             with LOCK:
@@ -206,16 +229,36 @@ class Handler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
-        target = SAVE if is_save else SAVE_STATE
-        target.write_bytes(body)
+        target = storage_target(path)
+        if target is None:
+            self.send_json(400, {"error": "invalid storage target"})
+            return
+        matching = self.headers.get_all("If-Match", [])
+        absent = self.headers.get_all("If-None-Match", [])
+        if not matching and not absent:
+            self.send_json(428, {"error": "save precondition required"})
+            return
+        if not ((absent == ["*"] and not matching) or (
+            len(matching) == 1 and not absent and re.fullmatch(r'"[0-9a-f]{64}"', matching[0])
+        )):
+            self.send_json(400, {"error": "invalid save precondition"})
+            return
         with LOCK:
+            current = target.read_bytes() if target.exists() else None
+            if (absent and current is not None) or (matching and (
+                current is None or matching[0] != revision(path, current)
+            )):
+                self.send_json(412, {"error": "saved data changed"})
+                return
+            target.parent.mkdir(exist_ok=True)
+            target.write_bytes(body)
             if is_save:
                 STATE["put_count"] += 1
                 STATE["save_bytes"] = len(body)
             else:
                 STATE["state_put_count"] += 1
                 STATE["state_bytes"] = len(body)
-        self.send_json(200, {"status": "ok"})
+        self.send_bytes(204, b"", "application/octet-stream", revision(path, body))
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)

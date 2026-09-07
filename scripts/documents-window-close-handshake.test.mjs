@@ -97,6 +97,7 @@ const documentsSaveHarnessSource = [
   "suspendAutosaveForHomeWindowClose",
   "resumeAutosaveForHomeWindowClose",
   "applySavedDocumentState",
+  "requireSavedWorkingCopy",
   "saveCurrent",
   "requestHomeWindowCloseDecision",
 ]
@@ -216,6 +217,7 @@ function createDocumentsSaveHarness() {
   const state = {
     current: {
       doc_did: "doc-1",
+      revision: "a".repeat(64),
       title: "Audit",
       body: "Original body",
       file_name: "audit.md",
@@ -257,6 +259,9 @@ function createDocumentsSaveHarness() {
     elements,
     autosaveTimerId: 0,
     autosaveQueued: false,
+    queuedSaveTarget: null,
+    saveRecovery: null,
+    savedWorkingCopy: { ...state.current },
     pendingHomeWindowCloseTarget: null,
     saveInFlight: null,
     window: {
@@ -281,8 +286,9 @@ function createDocumentsSaveHarness() {
     setDirty(value) {
       state.dirty = value === true;
     },
-    documentsProviderApi(action) {
+    documentsProviderApi(action, payload) {
       assert.equal(action, "save");
+      assert.equal(payload.if_revision, state.current.revision);
       providerCalls += 1;
       return providerDeferred.promise;
     },
@@ -317,6 +323,7 @@ function createDocumentsSaveHarness() {
       providerDeferred.resolve({
         document: {
           doc_did: "doc-1",
+          revision: "b".repeat(64),
           title: "Audit",
           body: "Original body",
           file_name: "audit.md",
@@ -406,6 +413,7 @@ function createDocumentsHarness({
     elements,
     autosaveTimerId: 0,
     autosaveQueued: queuedAutosave,
+    saveRecovery: null,
     pendingHomeWindowCloseTarget: null,
     saveInFlight: null,
     reportSaveFailure() {

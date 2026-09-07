@@ -119,6 +119,7 @@ async fn test_documents_provider_round_trip() {
                         "doc_did": doc_did,
                         "title": "Provider Notes",
                         "body": "# Provider Notes\n\nSaved through provider.\n",
+                        "if_revision": created_payload["data"]["document"]["revision"],
                     }))
                     .unwrap(),
                 ))
@@ -608,6 +609,7 @@ async fn test_viewer_gateway_storage_routes_require_home_token_and_round_trip_by
                 .method("PUT")
                 .uri("/api/viewers/gba-emulator/storage/demo-rom/state/demo.ss1")
                 .header("x-elastos-home-token", home_token.clone())
+                .header("if-none-match", "*")
                 .body(Body::from("save-state"))
                 .unwrap(),
         )
@@ -663,6 +665,7 @@ async fn test_viewer_gateway_storage_scopes_users_self_to_launch_principal() {
                 .method("PUT")
                 .uri(storage_uri)
                 .header("x-elastos-home-token", admin_token.clone())
+                .header("if-none-match", "*")
                 .body(Body::from("admin-state"))
                 .unwrap(),
         )
@@ -677,6 +680,7 @@ async fn test_viewer_gateway_storage_scopes_users_self_to_launch_principal() {
                 .method("PUT")
                 .uri(storage_uri)
                 .header("x-elastos-home-token", guest_token.clone())
+                .header("if-none-match", "*")
                 .body(Body::from("guest-state"))
                 .unwrap(),
         )

@@ -4186,6 +4186,17 @@ pub fn read_principal_root_object(
     let _guard = principal_root_object_mutation_lock()
         .lock()
         .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
+    read_principal_root_object_locked(data_dir, principal_id, localhost_root, object_uri, path)
+}
+
+// Caller holds principal_root_object_mutation_lock, including conditional writes.
+fn read_principal_root_object_locked(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &Path,
+) -> anyhow::Result<Vec<u8>> {
     let bytes = read_principal_root_object_bytes(path)?;
     let Some(protection) = load_principal_root_protection(data_dir, principal_id, localhost_root)?
     else {
@@ -4259,6 +4270,7 @@ pub fn write_principal_root_object(
         PrincipalRootObjectWriteOptions {
             require_protection: false,
             create_only: false,
+            precondition: None,
         },
     )
 }
@@ -4281,6 +4293,7 @@ pub(crate) fn create_principal_root_object(
         PrincipalRootObjectWriteOptions {
             require_protection: false,
             create_only: true,
+            precondition: None,
         },
     )
 }
@@ -4303,13 +4316,135 @@ pub(crate) fn write_protected_principal_root_object(
         PrincipalRootObjectWriteOptions {
             require_protection: true,
             create_only: false,
+            precondition: None,
         },
     )
 }
 
-struct PrincipalRootObjectWriteOptions {
+pub(crate) enum PrincipalRootObjectPrecondition<'a> {
+    Absent,
+    Revision(&'a str),
+}
+
+#[derive(Debug)]
+pub(crate) struct PrincipalRootObjectWriteConflict;
+
+impl std::fmt::Display for PrincipalRootObjectWriteConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("principal-root object write precondition failed")
+    }
+}
+
+impl std::error::Error for PrincipalRootObjectWriteConflict {}
+
+pub(crate) fn principal_root_object_revision(
+    principal_id: &str,
+    object_uri: &str,
+    plaintext: &[u8],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(principal_id.as_bytes());
+    digest.update([0]);
+    digest.update(object_uri.as_bytes());
+    digest.update([0]);
+    digest.update(plaintext);
+    format!("\"{}\"", hex::encode(digest.finalize()))
+}
+
+pub(crate) fn write_principal_root_object_if_revision(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &Path,
+    plaintext: &[u8],
+    precondition: PrincipalRootObjectPrecondition<'_>,
+) -> anyhow::Result<()> {
+    write_principal_root_object_inner(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        path,
+        plaintext,
+        PrincipalRootObjectWriteOptions {
+            require_protection: false,
+            create_only: matches!(precondition, PrincipalRootObjectPrecondition::Absent),
+            precondition: Some(precondition),
+        },
+    )
+}
+
+struct PrincipalRootObjectWriteOptions<'a> {
     require_protection: bool,
     create_only: bool,
+    precondition: Option<PrincipalRootObjectPrecondition<'a>>,
+}
+
+/// Internal access to a group of local object operations under the existing mutation lock.
+pub(crate) struct PrincipalRootObjectMutation<'a> {
+    data_dir: &'a Path,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl<'a> PrincipalRootObjectMutation<'a> {
+    pub(crate) fn acquire(data_dir: &'a Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            data_dir,
+            _guard: principal_root_object_mutation_lock()
+                .lock()
+                .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?,
+        })
+    }
+
+    pub(crate) fn data_dir(&self) -> &Path {
+        self.data_dir
+    }
+
+    pub(crate) fn read(
+        &self,
+        principal_id: &str,
+        localhost_root: &str,
+        object_uri: &str,
+        path: &Path,
+    ) -> anyhow::Result<Vec<u8>> {
+        validate_principal_root_object_binding(principal_id, localhost_root, object_uri)?;
+        validate_principal_root_object_path(self.data_dir, object_uri, path)?;
+        read_principal_root_object_locked(
+            self.data_dir,
+            principal_id,
+            localhost_root,
+            object_uri,
+            path,
+        )
+    }
+
+    pub(crate) fn write(
+        &self,
+        principal_id: &str,
+        localhost_root: &str,
+        object_uri: &str,
+        path: &Path,
+        plaintext: &[u8],
+    ) -> anyhow::Result<()> {
+        write_principal_root_object_locked(
+            self.data_dir,
+            principal_id,
+            localhost_root,
+            object_uri,
+            path,
+            plaintext,
+            PrincipalRootObjectWriteOptions {
+                require_protection: false,
+                create_only: false,
+                precondition: None,
+            },
+        )
+    }
+
+    pub(crate) fn atomic_file(&self, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+        atomic_write(path, bytes)
+    }
 }
 
 fn write_principal_root_object_inner(
@@ -4319,13 +4454,62 @@ fn write_principal_root_object_inner(
     object_uri: &str,
     path: &Path,
     plaintext: &[u8],
-    options: PrincipalRootObjectWriteOptions,
+    options: PrincipalRootObjectWriteOptions<'_>,
 ) -> anyhow::Result<()> {
     validate_principal_root_object_binding(principal_id, localhost_root, object_uri)?;
     validate_principal_root_object_path(data_dir, object_uri, path)?;
     let _guard = principal_root_object_mutation_lock()
         .lock()
         .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
+    write_principal_root_object_locked(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        path,
+        plaintext,
+        options,
+    )
+}
+
+fn write_principal_root_object_locked(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &Path,
+    plaintext: &[u8],
+    options: PrincipalRootObjectWriteOptions<'_>,
+) -> anyhow::Result<()> {
+    validate_principal_root_object_binding(principal_id, localhost_root, object_uri)?;
+    validate_principal_root_object_path(data_dir, object_uri, path)?;
+    if let Some(precondition) = options.precondition {
+        let exists = match std::fs::symlink_metadata(path) {
+            Ok(_) => true,
+            Err(err) if err.kind() == ErrorKind::NotFound => false,
+            Err(err) => return Err(err.into()),
+        };
+        let matches = match precondition {
+            PrincipalRootObjectPrecondition::Absent => !exists,
+            PrincipalRootObjectPrecondition::Revision(expected) => {
+                exists
+                    && principal_root_object_revision(
+                        principal_id,
+                        object_uri,
+                        &read_principal_root_object_locked(
+                            data_dir,
+                            principal_id,
+                            localhost_root,
+                            object_uri,
+                            path,
+                        )?,
+                    ) == expected
+            }
+        };
+        if !matches {
+            return Err(PrincipalRootObjectWriteConflict.into());
+        }
+    }
     let protection = load_principal_root_protection(data_dir, principal_id, localhost_root)?;
     if options.require_protection && protection.is_none() {
         anyhow::bail!("protected principal-root object requires active principal-root protection");
@@ -8533,6 +8717,7 @@ mod tests {
             PrincipalRootObjectWriteOptions {
                 require_protection: true,
                 create_only: true,
+                precondition: None,
             },
         )
         .unwrap();
@@ -8575,6 +8760,7 @@ mod tests {
             PrincipalRootObjectWriteOptions {
                 require_protection: true,
                 create_only: true,
+                precondition: None,
             },
         )
         .unwrap_err();
@@ -8598,6 +8784,183 @@ mod tests {
             .unwrap(),
             br#"{"profile":"first"}"#
         );
+    }
+
+    #[test]
+    fn principal_root_conditional_write_preserves_protection_and_rejects_stale_revision() {
+        let data = tempfile::tempdir().unwrap();
+        let principal = "person:local:conditional-save";
+        let protection = store_test_principal_root_protection(data.path(), principal);
+        let root = &protection.localhost_root;
+        let uri = format!("{root}/.AppData/LocalHost/GBA/game.sav");
+        let path = rooted_localhost_fs_path(data.path(), &uri).unwrap();
+        let write = |bytes: &[u8], condition| {
+            write_principal_root_object_if_revision(
+                data.path(),
+                principal,
+                root,
+                &uri,
+                &path,
+                bytes,
+                condition,
+            )
+        };
+        write(b"first", PrincipalRootObjectPrecondition::Absent).unwrap();
+        let revision = principal_root_object_revision(principal, &uri, b"first");
+        write(
+            b"winner",
+            PrincipalRootObjectPrecondition::Revision(&revision),
+        )
+        .unwrap();
+        let encrypted = std::fs::read(&path).unwrap();
+        let envelope: PrincipalRootObjectEnvelopeV1 = serde_json::from_slice(&encrypted).unwrap();
+        assert_eq!(envelope.object_uri, uri);
+        assert_eq!(envelope.principal_id, principal);
+        assert!(!String::from_utf8_lossy(&encrypted).contains("winner"));
+        for condition in [
+            PrincipalRootObjectPrecondition::Absent,
+            PrincipalRootObjectPrecondition::Revision(&revision),
+        ] {
+            assert!(write(b"loser", condition)
+                .unwrap_err()
+                .is::<PrincipalRootObjectWriteConflict>());
+            assert_eq!(std::fs::read(&path).unwrap(), encrypted);
+        }
+        assert_eq!(
+            read_principal_root_object(data.path(), principal, root, &uri, &path).unwrap(),
+            b"winner"
+        );
+        // Content revisions remain stable when read again after a restart, and bind the root/principal.
+        let current = principal_root_object_revision(principal, &uri, b"winner");
+        let other = principal_root_object_revision("person:local:other", &uri, b"winner");
+        assert_ne!(current, other);
+        assert!(write(
+            b"foreign",
+            PrincipalRootObjectPrecondition::Revision(&other)
+        )
+        .unwrap_err()
+        .is::<PrincipalRootObjectWriteConflict>());
+        assert!(write_principal_root_object_if_revision(
+            data.path(),
+            "person:local:other",
+            root,
+            &uri,
+            &path,
+            b"foreign",
+            PrincipalRootObjectPrecondition::Revision(&current)
+        )
+        .is_err());
+        write(b"next", PrincipalRootObjectPrecondition::Revision(&current)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn principal_root_conditional_write_serializes_same_revision_and_first_create() {
+        let data = tempfile::tempdir().unwrap();
+        let principal = "person:local:save-race";
+        let root = principal_localhost_root(principal);
+        let uri = format!("{root}/.AppData/LocalHost/GBA/game.sav");
+        let path = rooted_localhost_fs_path(data.path(), &uri).unwrap();
+        for existing in [false, true] {
+            let revision = if existing {
+                write_principal_root_object(
+                    data.path(),
+                    principal,
+                    &root,
+                    &uri,
+                    &path,
+                    b"round baseline",
+                )
+                .unwrap();
+                Some(principal_root_object_revision(
+                    principal,
+                    &uri,
+                    b"round baseline",
+                ))
+            } else {
+                None
+            };
+            let barrier = std::sync::Barrier::new(2);
+            let results = std::thread::scope(|scope| {
+                let writers: Vec<_> = [b"window-one".as_slice(), b"window-two".as_slice()]
+                    .into_iter()
+                    .map(|bytes| {
+                        let barrier = &barrier;
+                        let revision = revision.as_deref();
+                        let path = &path;
+                        let root = &root;
+                        let uri = &uri;
+                        let data = data.path();
+                        scope.spawn(move || {
+                            barrier.wait();
+                            let condition = revision.map_or(
+                                PrincipalRootObjectPrecondition::Absent,
+                                PrincipalRootObjectPrecondition::Revision,
+                            );
+                            (
+                                bytes,
+                                write_principal_root_object_if_revision(
+                                    data, principal, root, uri, path, bytes, condition,
+                                ),
+                            )
+                        })
+                    })
+                    .collect();
+                writers
+                    .into_iter()
+                    .map(|writer| writer.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                results.iter().filter(|(_, result)| result.is_ok()).count(),
+                1
+            );
+            let (winner, _) = results.iter().find(|(_, result)| result.is_ok()).unwrap();
+            assert!(results
+                .iter()
+                .find(|(_, result)| result.is_err())
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap_err()
+                .is::<PrincipalRootObjectWriteConflict>());
+            assert_eq!(
+                read_principal_root_object(data.path(), principal, &root, &uri, &path).unwrap(),
+                *winner
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn principal_root_conditional_write_rejects_symlink() {
+        let data = tempfile::tempdir().unwrap();
+        let principal = "person:local:save-link";
+        let root = principal_localhost_root(principal);
+        let uri = format!("{root}/game.sav");
+        let path = rooted_localhost_fs_path(data.path(), &uri).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let victim = data.path().join("victim");
+        std::fs::write(&victim, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        assert!(write_principal_root_object_if_revision(
+            data.path(),
+            principal,
+            &root,
+            &uri,
+            &path,
+            b"overwrite",
+            PrincipalRootObjectPrecondition::Absent
+        )
+        .is_err());
+        assert_eq!(std::fs::read(victim).unwrap(), b"preserve");
     }
 
     #[cfg(unix)]

@@ -1299,6 +1299,7 @@ a {
 
   .toolbar-actions {
     justify-content: flex-start;
+    min-width: 0;
     max-width: 100%;
     overflow-x: auto;
     scrollbar-width: none;
@@ -1593,6 +1594,10 @@ let autosaveTimerId = 0;
 let statusClearTimerId = 0;
 let saveInFlight = null;
 let autosaveQueued = false;
+let queuedSaveTarget = null;
+let savedWorkingCopy = null;
+let saveRecovery = null;
+let documentSelectionSequence = 0;
 let pendingHomeWindowCloseTarget = null;
 let homeChromeReady = false;
 let lastHomeMenuManifestSignature = "";
@@ -1947,9 +1952,15 @@ function resetPendingSaveIntent() {
 
 function replaceCurrentDocument(document) {
   resetPendingSaveIntent();
+  queuedSaveTarget = null;
+  saveRecovery = null;
+  savedWorkingCopy = document ? { ...document } : null;
+  documentSelectionSequence += 1;
   state.current = document;
   state.currentSessionId += 1;
 }
+
+
 
 function isCurrentSessionTarget(target) {
   return !!target && state.currentSessionId === target.sessionId;
@@ -1965,6 +1976,7 @@ function scheduleAutosave() {
     !state.current ||
     state.mode !== "shell" ||
     !state.dirty ||
+    saveRecovery?.target.sessionId === state.currentSessionId ||
     pendingHomeWindowCloseTarget?.sessionId === state.currentSessionId
   ) {
     return;
@@ -1977,6 +1989,7 @@ function scheduleAutosave() {
 }
 
 function reportSaveFailure(error, fallback) {
+  if (error?.documentsTarget && !isCurrentDocumentTarget(error.documentsTarget)) return;
   setStatus(readableDocumentsError(error, fallback), "warning");
 }
 
@@ -2755,7 +2768,10 @@ async function loadSummary() {
 }
 
 async function loadLibraryObject(uri) {
+  const sequence = ++documentSelectionSequence;
+  const sessionId = state.currentSessionId;
   const response = await libraryObjectApi("read", { uri });
+  if (sequence !== documentSelectionSequence || sessionId !== state.currentSessionId) return;
   const object = response.object || {};
   const name = object.name || baseName(object.uri || uri);
   replaceCurrentDocument({
@@ -2852,6 +2868,10 @@ function sendChatAttachmentOpenResult({ attachmentId, ok, message }) {
 }
 
 async function selectDocument(docDid, options) {
+  const sequence = ++documentSelectionSequence;
+  const sessionId = state.currentSessionId;
+  const title = elements.titleInput.value;
+  const body = elements.editor.value;
   const force = !!(options && options.force);
   if (state.current && state.current.doc_did !== docDid && state.dirty) {
     const confirmed = await confirmInCapsule({
@@ -2859,7 +2879,7 @@ async function selectDocument(docDid, options) {
       message: "Open another document without saving this draft?",
       confirmLabel: "Discard",
     });
-    if (!confirmed) {
+    if (!confirmed || sequence !== documentSelectionSequence || sessionId !== state.currentSessionId) {
       return;
     }
   }
@@ -2867,7 +2887,13 @@ async function selectDocument(docDid, options) {
     return;
   }
   resetPendingSaveIntent();
-  const response = await documentsProviderApi("get", { doc_did: docDid });
+  const response = await documentsProviderApi("get", { doc_did: docDid }).catch((error) => {
+    if (sequence !== documentSelectionSequence || sessionId !== state.currentSessionId) return null;
+    throw error;
+  });
+  if (sequence !== documentSelectionSequence || sessionId !== state.currentSessionId ||
+      title !== elements.titleInput.value || body !== elements.editor.value) return;
+  requireSavedWorkingCopy(response.document, docDid);
   replaceCurrentDocument(response.document);
   upsertDocumentListItem(response.document);
   renderDocumentsList();
@@ -2895,6 +2921,7 @@ async function createDocument(title) {
 
 function applySavedDocumentState(persistedDocument, saveTarget, requestedTitle, requestedBody, successMessage, options) {
   const quiet = !!(options && options.quiet);
+  if (!isCurrentDocumentTarget(saveTarget)) return;
   const libraryProjection = isLibraryFileProjection(persistedDocument);
   if (!libraryProjection) {
     upsertDocumentListItem(persistedDocument);
@@ -2903,6 +2930,8 @@ function applySavedDocumentState(persistedDocument, saveTarget, requestedTitle, 
   if (!isCurrentDocumentTarget(saveTarget)) {
     return;
   }
+  savedWorkingCopy = { ...persistedDocument };
+  saveRecovery = null;
   const changedDuringSave =
     elements.titleInput.value !== requestedTitle ||
     elements.editor.value !== requestedBody;
@@ -2928,20 +2957,33 @@ function applySavedDocumentState(persistedDocument, saveTarget, requestedTitle, 
   scheduleStatusClear();
 }
 
-async function saveCurrent(options) {
-  if (!state.current) {
-    return;
+function requireSavedWorkingCopy(document, expectedId) {
+  if (!document || typeof document.doc_did !== "string" || !document.doc_did ||
+      (expectedId && document.doc_did !== expectedId) ||
+      !/^[0-9a-f]{64}$/.test(document.revision || "") ||
+      typeof document.title !== "string" || typeof document.body !== "string") {
+    throw new Error("Save result could not be confirmed. Your edits are kept.");
   }
+  return document;
+}
+
+async function saveCurrent(options) {
+  if (!state.current) return;
   const saveTarget = {
     sessionId: state.currentSessionId,
     identity: documentIdentity(state.current),
   };
-  const saveDocument = { ...state.current };
   if (saveInFlight) {
     autosaveQueued = true;
+    queuedSaveTarget = saveTarget;
     return saveInFlight;
   }
-  const quiet = !!(options && options.quiet);
+  if (options?.autosave && saveRecovery?.target.sessionId === saveTarget.sessionId) {
+    throw new Error("Automatic saving is paused. Choose Save to check the stored document.");
+  }
+  let saveDocument = { ...state.current };
+  const baseline = { ...(savedWorkingCopy || saveDocument) };
+  const quiet = !!options?.quiet;
   clearAutosaveTimer();
   const requestedTitle = elements.titleInput.value;
   const requestedBody = elements.editor.value;
@@ -2970,28 +3012,85 @@ async function saveCurrent(options) {
       }, saveTarget, requestedTitle, requestedBody, "Saved to Library.", options);
       return;
     }
-    let persistedDocument = saveDocument;
-    if (isDraftDocument(saveDocument)) {
-      const created = await documentsProviderApi("create", {
-        title: requestedTitle || null,
-      });
-      persistedDocument = created.document;
+    if (saveRecovery && isCurrentDocumentTarget(saveRecovery.target)) {
+      const recovery = saveRecovery;
+      if (recovery.phase === "create") {
+        const choice = await chooseInCapsule({
+          title: "Save result unknown",
+          message: "A document may already exist. Check Documents before saving again. Creating a copy may make a duplicate.",
+          confirmLabel: "Check Documents",
+          secondaryLabel: "Create copy",
+          defaultFocus: "cancel",
+        });
+        if (!isCurrentDocumentTarget(saveTarget)) return;
+        if (choice === "confirm") {
+          const response = await documentsProviderApi("summary", {});
+          if (!isCurrentDocumentTarget(saveTarget)) return;
+          state.documents = response.documents;
+          renderDocumentsList();
+          throw new Error("Your draft is kept. Select the stored document to check it, or choose Save to create a copy.");
+        }
+        if (choice !== "secondary") throw new Error("Your draft is kept. Saving remains paused.");
+        saveRecovery = null;
+      } else {
+        const response = await documentsProviderApi("get", { doc_did: recovery.base.doc_did });
+        if (!isCurrentDocumentTarget(saveTarget)) return;
+        const observed = requireSavedWorkingCopy(response.document, recovery.base.doc_did);
+        if (observed.title === recovery.title && observed.body === recovery.body) {
+          applySavedDocumentState(observed, saveTarget, recovery.inputTitle, recovery.body, "Saved document confirmed.", options);
+          return;
+        }
+        if (observed.revision !== recovery.base.revision ||
+            observed.title !== recovery.base.title || observed.body !== recovery.base.body) {
+          throw new Error("The stored document changed. Your edits are kept. Use Save As for a copy, or open the stored document.");
+        }
+        saveDocument = observed;
+        saveRecovery = null;
+      }
     }
+    if (!isCurrentDocumentTarget(saveTarget)) return;
+    if (isDraftDocument(saveDocument)) {
+      saveRecovery = { target: { ...saveTarget }, phase: "create" };
+      const created = await documentsProviderApi("create", { title: requestedTitle || null });
+      saveDocument = requireSavedWorkingCopy(created.document);
+      if (!isCurrentDocumentTarget(saveTarget)) return;
+      // Retain the observed identity before a follow-up write can lose its reply.
+      state.current = { ...saveDocument, title: elements.titleInput.value, body: elements.editor.value };
+      savedWorkingCopy = { ...saveDocument };
+      saveTarget.identity = documentIdentity(state.current);
+    }
+    requireSavedWorkingCopy(saveDocument);
+    saveRecovery = {
+      target: { ...saveTarget }, phase: "save",
+      base: isDraftDocument(baseline) ? { ...saveDocument } : baseline,
+      title: requestedTitle.trim() || "Untitled", inputTitle: requestedTitle, body: requestedBody,
+    };
     const response = await documentsProviderApi("save", {
-      doc_did: persistedDocument.doc_did,
+      doc_did: saveDocument.doc_did,
       title: requestedTitle,
       body: requestedBody,
+      if_revision: saveDocument.revision,
     });
-    applySavedDocumentState(response.document, saveTarget, requestedTitle, requestedBody, "Saved.", options);
+    const persisted = requireSavedWorkingCopy(response.document, saveDocument.doc_did);
+    if (persisted.title !== (requestedTitle.trim() || "Untitled") || persisted.body !== requestedBody) {
+      throw new Error("Save result could not be confirmed. Your edits are kept.");
+    }
+    applySavedDocumentState(persisted, saveTarget, requestedTitle, requestedBody, "Saved.", options);
   })();
   try {
     await saveInFlight;
+  } catch (error) {
+    error.documentsTarget = { ...saveTarget };
+    throw error;
   } finally {
     saveInFlight = null;
     if (autosaveQueued) {
       autosaveQueued = false;
+      const queued = queuedSaveTarget;
+      queuedSaveTarget = null;
       if (
-        state.dirty &&
+        isCurrentDocumentTarget(queued) && state.dirty &&
+        saveRecovery?.target.sessionId !== state.currentSessionId &&
         pendingHomeWindowCloseTarget?.sessionId !== state.currentSessionId
       ) {
         void saveCurrent({ quiet: true, autosave: true }).catch((error) => {
@@ -3192,13 +3291,24 @@ async function saveAsCurrent(title, fileName) {
   if (!state.current || isDraftDocument(state.current) || isLibraryFileProjection(state.current)) {
     return;
   }
+  const target = { sessionId: state.currentSessionId, identity: documentIdentity(state.current) };
+  const requestedTitle = elements.titleInput.value;
+  const requestedBody = elements.editor.value;
   setStatus("Creating new document…");
   const response = await documentsProviderApi("save_as", {
     doc_did: state.current.doc_did,
     title: title || null,
     file_name: fileName || null,
-    body: elements.editor.value,
+    body: requestedBody,
   });
+  if (!isCurrentDocumentTarget(target)) return;
+  requireSavedWorkingCopy(response.document);
+  if (elements.titleInput.value !== requestedTitle || elements.editor.value !== requestedBody) {
+    upsertDocumentListItem(response.document);
+    renderDocumentsList();
+    setStatus("Copy saved. Newer edits are kept in this document.", "warning");
+    return;
+  }
   replaceCurrentDocument(response.document);
   upsertDocumentListItem(response.document);
   renderDocumentsList();
