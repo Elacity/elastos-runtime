@@ -252,7 +252,7 @@ function renderProfile(identity) {
       ? "Shown to people you connect with."
       : (unavailable
         ? "Profile could not be verified. Use System Recovery before continuing."
-        : "Your Profile is your signed identity for People and Chat.");
+        : "Confirm the name people will see in People and Chat. Discovery stays off until you enable it.");
   }
   if (profileSubmit) {
     profileSubmit.textContent = hasProfile
@@ -512,19 +512,6 @@ function emptyMarkup(title, copy) {
 }
 
 async function saveProfile() {
-  if (profileForm?.dataset.profileState === "recovery_required") {
-    window.top.postMessage({
-      type: "home:open-target",
-      target: "system",
-      query: { settings: "security" },
-      homeToken,
-    }, homeParentOrigin);
-    profileForm.dataset.profileState = "retry";
-    profileSubmit.textContent = "Retry Create Profile";
-    setBusy(false);
-    showStatus("Complete Recovery in System, then retry creating your Profile.", "error");
-    return;
-  }
   const displayName = profileInput.value.trim();
   setBusy(true);
   try {
@@ -537,20 +524,6 @@ async function saveProfile() {
     if (homeParentOrigin && window.top && window.top !== window) {
       window.top.postMessage({ type: "home:refresh-summary", homeToken }, homeParentOrigin);
     }
-  } catch (error) {
-    if (error.status === 409
-      && error.schema === "elastos.people.profile-protection-required/v1"
-      && error.resultStatus === "recovery_required"
-      && error.actionTarget === "system") {
-      profileForm.dataset.profileState = "recovery_required";
-      profileTitle.textContent = "Recovery required";
-      profileDescription.textContent = readText(error.message)
-        || "Open System, choose Security, and download Recovery. Then retry creating your Profile.";
-      profileSubmit.textContent = "Open System";
-      showStatus(profileDescription.textContent, "error");
-      return;
-    }
-    throw error;
   } finally {
     setBusy(false);
   }
@@ -614,8 +587,7 @@ function setBusy(busy) {
   for (const control of [profileInput, profileSubmit]) {
     if (control) {
       control.disabled = busy
-        || profileForm?.dataset.profileState === "unavailable"
-        || (control === profileInput && profileForm?.dataset.profileState === "recovery_required");
+        || profileForm?.dataset.profileState === "unavailable";
     }
   }
 }

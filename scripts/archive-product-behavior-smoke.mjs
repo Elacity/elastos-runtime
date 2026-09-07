@@ -48,8 +48,9 @@ assert(
   source.includes('function isTrustedHomeMessage(event) {') &&
     source.includes('return event.origin === "null" && event.source === window.parent;') &&
     source.includes("window.addEventListener(\"message\", handleTrustedHomeMessage);") &&
-    !source.includes("event.origin !== homeParentOrigin || event.source !== window.top"),
-  "Archive must accept inbound Home messages only from the opaque parent frame boundary.",
+    source.includes("event.origin !== homeParentOrigin || event.source !== window.top") &&
+    source.includes("data.documentNonce !== libraryPickerDocumentNonce"),
+  "Archive must retain opaque-parent menus and bind picker delivery to the exact top Home and current document.",
 );
 assert(
   source.includes('if (data.type === "archive:open-library-object") {') &&

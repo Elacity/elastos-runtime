@@ -4,12 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UI_DIR="${ROOT}/capsules/chat-room-ui"
 OUT_DIR="${ROOT}/capsules/chat-room/browser"
-TARGET_WASM="${UI_DIR}/target/wasm32-unknown-unknown/release/chat_room_ui.wasm"
+TARGET_WASM="${CARGO_TARGET_DIR:-${UI_DIR}/target}/wasm32-unknown-unknown/release/chat_room_ui.wasm"
 STAMP_FILE="${UI_DIR}/.chat_room_ui_source.sha256"
 TARGET_JS="${OUT_DIR}/chat_room_ui.js"
 TARGET_BINDGEN_WASM="${OUT_DIR}/chat_room_ui_bg.wasm"
 
-cargo build --manifest-path "${UI_DIR}/Cargo.toml" --target wasm32-unknown-unknown --release
+cargo build --locked --manifest-path "${UI_DIR}/Cargo.toml" --target wasm32-unknown-unknown --release
 
 SOURCE_HASH="$(sha256sum "${TARGET_WASM}" | awk '{print $1}')"
 if [[ -f "${STAMP_FILE}" ]] \

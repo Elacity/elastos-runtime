@@ -1,10 +1,12 @@
 import { BUTTON_BITS, gamepadMask as readGamepadMask } from "./gba-input.js";
+import { createHomeNavigationClient } from "/apps/home/home-navigation-client.js";
 
 const VIEWER_ID = "gba-emulator";
 const MAX_ROM_BYTES = 64 * 1024 * 1024;
 const query = new URLSearchParams(window.location.search);
 const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
 const homeParentOrigin = query.get("home_origin") || "";
+const homeNavigation = createHomeNavigationClient({ homeToken, homeOrigin: homeParentOrigin });
 if (homeToken && homeParentOrigin && window.top !== window) {
   window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);
 }
@@ -474,6 +476,7 @@ async function openGame(request, title = "GBA Emulator") {
   module.setVolume(0);
   module.setFastForwardMultiplier(1);
   module.resumeGame();
+  homeNavigation.setQuery(request.capsule ? { capsule: request.capsule } : { objectUri: request.objectUri });
   emptyState.hidden = true;
   powerLed.classList.remove("off");
   setGameControlsEnabled(true);
@@ -681,4 +684,6 @@ const launch = requestedGame();
 if (launch) {
   const title = query.get("name") || query.get("capsule") || fileNameFromUri(launch.objectUri);
   openGame(launch, title).catch((error) => showStatus(error.message || String(error), true));
+} else {
+  homeNavigation.setQuery({});
 }

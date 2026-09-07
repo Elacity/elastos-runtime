@@ -279,6 +279,7 @@ function createDocumentsSaveHarness() {
     scheduleStatusClear() {},
     clearStatus() {},
     upsertDocumentListItem() {},
+    updateDocumentsNavigation() {},
     renderDocumentsList() {},
     renderCurrentDocument() {},
     refreshPreviewFromEditor() {},

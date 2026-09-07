@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 import http from "node:http";
-import { createReadStream, existsSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 
-const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
-const { chromium } = require("playwright");
+const playwrightModule = process.env.ELASTOS_PLAYWRIGHT_MODULE
+  ? await import(pathToFileURL(process.env.ELASTOS_PLAYWRIGHT_MODULE).href)
+  : createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url))("playwright");
+const { chromium } = playwrightModule.chromium ? playwrightModule : playwrightModule.default;
 const multiSelectModifier = process.platform === "darwin" ? "Meta" : "Control";
 
 function browserAssetRoot(capsuleName) {
@@ -17,6 +20,7 @@ function browserAssetRoot(capsuleName) {
 
 const capsuleRoot = browserAssetRoot("library");
 const archiveManagerRoot = browserAssetRoot("archive-manager");
+const homeNavigationClientPath = path.resolve("capsules/home/browser/home-navigation-client.js");
 const homeClipboardClientFixture = `
 export function createHomeClipboardClient({ targetId } = {}) {
   let started = false;
@@ -58,6 +62,77 @@ export function createHomeClipboardClient({ targetId } = {}) {
 }
 `;
 const token = "library-menu-smoke-token";
+const openerToken = `${token}-opener`;
+// Reuse Home's picker owner/delivery/ACK state machine, as in its Node smoke.
+const homeHostSource = readFileSync("capsules/home/browser/home-shell-host.js", "utf8");
+const homePickerFunctions = ["currentLibraryPicker", "settleLibraryPicker", "cancelLibraryPicker",
+  "validPickerIdentity", "openLibraryPicker", "acceptLibraryPicker", "deliverMessageToHomeGuiTargetFrame"]
+  .map(name => {
+    const start = homeHostSource.search(new RegExp(`(?:async )?function ${name}\\(`));
+    if (start < 0) throw new Error(`Missing Home picker function: ${name}`);
+    return homeHostSource.slice(start, homeHostSource.indexOf("\n}", start) + 2);
+  }).join("\n");
+const pickerHostFixture = `
+  const launchedAppContexts = new Map();
+  const OPAQUE_FRAME_TARGET = location.origin;
+  const library = document.querySelector('#library-frame');
+  const openerFrame = document.querySelector('#opener-frame');
+  const pickerToken = ${JSON.stringify(token)}, openerToken = ${JSON.stringify(openerToken)};
+  window.__pickerCloses = [];
+  function requireHomeGuiActive() {}
+  ${homePickerFunctions}
+  function openTargetFromHomeGui(target, { query }) {
+    if (target !== 'library') throw new Error('Fixture only opens Library');
+    const owner = launchedAppContexts.get(openerToken).pickerRequest;
+    if (owner.id !== query.pickerRequestId) throw new Error('Unowned picker');
+    cancelLibraryPicker(launchedAppContexts.get(pickerToken));
+    owner.pickerToken = pickerToken;
+    launchedAppContexts.set(pickerToken, { targetId: 'library', source: library.contentWindow,
+      origin: location.origin, pickerOwner: owner });
+    library.hidden = false; openerFrame.hidden = true;
+    library.src = '/apps/library/?' + new URLSearchParams({ ...query, home_origin: location.origin })
+      + '#home_token=' + encodeURIComponent(pickerToken);
+  }
+  window.__openPickerOpener = async target => {
+    cancelLibraryPicker(launchedAppContexts.get(openerToken));
+    launchedAppContexts.clear();
+    const loaded = new Promise(resolve => { openerFrame.onload = resolve; });
+    if (target === 'browser') {
+      // Browser ACK is a chooser fixture, not a Browser/CDP product proof.
+      openerFrame.src = '/picker-browser.html';
+    } else {
+      openerFrame.src = '/apps/archive-manager/?home_origin=' + encodeURIComponent(location.origin)
+        + '#home_token=' + encodeURIComponent(openerToken);
+    }
+    await loaded;
+    library.hidden = true; openerFrame.hidden = target === 'browser';
+    const opener = { targetId: target, source: openerFrame.contentWindow, origin: location.origin };
+    launchedAppContexts.set(openerToken, opener);
+    if (target === 'browser') {
+      openLibraryPicker({ ...opener, homeToken: openerToken }, { requestId: 'browser-chooser',
+        documentNonce: 'browser-document', query: { mode: 'attach', returnTarget: 'browser' } });
+    }
+  };
+  window.__pickerRecord = () => launchedAppContexts.get(openerToken)?.pickerRequest;
+  window.addEventListener('message', async event => {
+    if (event.origin !== location.origin) return;
+    const data = event.data || {};
+    const entry = launchedAppContexts.get(data.homeToken);
+    if (!entry || entry.source !== event.source) return;
+    const context = { ...entry, kind: 'app-frame', homeToken: data.homeToken };
+    if (data.type === 'home:open-target' && data.target === 'library') {
+      openLibraryPicker(context, data);
+    } else if (data.type === 'home:deliver-to-target') {
+      const accepted = await deliverMessageToHomeGuiTargetFrame(data.target, data.payload, context, data.pickerId);
+      event.source.postMessage({ type: 'home:shell-response', requestId: data.requestId, result: { accepted } }, event.origin);
+    } else if (data.type === 'home:picker-accepted') {
+      acceptLibraryPicker(context, data);
+    } else if (data.type === 'home:close-self' && entry.targetId === 'library') {
+      window.__pickerCloses.push(entry.pickerOwner?.phase);
+      if (entry.pickerOwner?.phase === 'accepted') { library.hidden = true; openerFrame.hidden = false; }
+    }
+  });
+`;
 const principalRoot = "localhost://Users/smoke";
 const desktopUri = `${principalRoot}/Desktop`;
 const documentsUri = `${principalRoot}/Documents`;
@@ -711,6 +786,11 @@ async function readRawBody(req) {
 
 async function serveStatic(req, res) {
   const url = new URL(req.url, "http://127.0.0.1");
+  if (url.pathname === "/apps/home/home-navigation-client.js") {
+    res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
+    createReadStream(homeNavigationClientPath).pipe(res);
+    return;
+  }
   if (url.pathname === "/apps/home/home-clipboard-client.js") {
     res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
     res.end(homeClipboardClientFixture);
@@ -1164,6 +1244,20 @@ function handleProvider(op, payload, res) {
 function createServer() {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
+    if (url.pathname === "/picker-browser.html") {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(`<!doctype html><script>
+        addEventListener('message', event => {
+          if (event.source === parent && event.origin === location.origin && event.data.type === 'browser:file-picker-selection') window.selection = event.data;
+        });
+        window.ack = changes => {
+          const { pickerId, requestId, documentNonce, deliveryId } = window.selection;
+          parent.postMessage({ type: 'home:picker-accepted', homeToken: ${JSON.stringify(openerToken)},
+            pickerId, requestId, documentNonce, deliveryId, accepted: true, ...changes }, location.origin);
+        };
+      </script>`);
+      return;
+    }
     if (url.pathname === "/host.html") {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       res.end(`<!doctype html>
@@ -1171,16 +1265,19 @@ function createServer() {
 <head>
   <style>
     html, body { margin: 0; width: 100%; height: 100%; }
-    #library-frame { border: 0; width: 100vw; height: 100vh; display: block; }
+    iframe { border: 0; width: 100vw; height: 100vh; display: block; }
+    iframe[hidden] { display: none; }
   </style>
 </head>
 <body>
   <iframe id="library-frame" src="/apps/library/?home_origin=${encodeURIComponent("http://" + req.headers.host)}#home_token=${encodeURIComponent(token)}"></iframe>
+  <iframe id="opener-frame" hidden></iframe>
   <script>
     window.__shellMessages = [];
     window.addEventListener("message", (event) => {
       if (event.origin === window.location.origin) window.__shellMessages.push(event.data);
     });
+    ${pickerHostFixture}
   </script>
 </body>
 </html>`);
@@ -1371,13 +1468,13 @@ function createServer() {
       return;
     }
     if (url.pathname === "/api/viewers/archive-manager/library-roots") {
-      if (req.method !== "GET" || req.headers["x-elastos-home-token"] !== token) {
+      if (req.method !== "GET" || ![token, openerToken].includes(req.headers["x-elastos-home-token"])) {
         return sendJson(res, 403, JSON.stringify({ status: "error", message: "forbidden" }));
       }
       return handleProvider("roots", {}, res);
     }
     if (url.pathname === "/api/viewers/archive-manager/library-object") {
-      if (!["GET", "POST"].includes(req.method) || req.headers["x-elastos-home-token"] !== token) {
+      if (!["GET", "POST"].includes(req.method) || ![token, openerToken].includes(req.headers["x-elastos-home-token"])) {
         return sendJson(res, 403, JSON.stringify({ status: "error", message: "forbidden" }));
       }
       const uri = url.searchParams.get("uri") || "";
@@ -1720,7 +1817,7 @@ async function run() {
   const server = createServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({ headless: true, executablePath: process.env.BRAVE_BIN || undefined });
   let context;
   try {
     context = await browser.newContext({ acceptDownloads: true });
@@ -2119,7 +2216,13 @@ async function run() {
     assert(ops.some((entry) => entry.op === "status" && entry.payload.uri.endsWith("/Published.md")), "Status must call status");
     await page.locator("[data-dialog-close]").click();
     await openItemMenu(page, "Published.md");
+    const repaired = page.waitForResponse(response => {
+      const request = response.request();
+      return new URL(response.url()).pathname === "/api/provider/object/repair" &&
+        request.method() === "POST" && request.postDataJSON()?.uri === `${documentsUri}/Published.md`;
+    });
     await clickMenu(page, "Repair");
+    assert((await repaired).ok(), "Repair response must succeed");
     assert(ops.some((entry) => entry.op === "repair" && entry.payload.uri.endsWith("/Published.md")), "Repair must call repair");
 
     includesAll(await openItemMenu(page, "Bundle.tar.gz"), ["Open", "Download", "Extract Here", "Cut", "Copy", "Delete", "Rename", "Properties"], "archive file menu");
@@ -2575,6 +2678,12 @@ async function run() {
     await libraryFrame.page().keyboard.press("Escape");
     await libraryFrame.locator(".item").filter({ hasText: "Viewer.md" }).first().click();
     await libraryFrame.locator("#picker-action-button").filter({ hasText: "Select for Browser" }).first().click();
+    await libraryFrame.getByText("Browser did not confirm this item. Check it before trying again.", { exact: true }).waitFor();
+    assert(await page.evaluate(() => !window.__shellMessages.some(message => message.type === "home:deliver-to-target")),
+      "Unowned picker must not dispatch a selection");
+    await page.evaluate(() => window.__openPickerOpener("browser"));
+    await libraryFrame.locator(".item").filter({ hasText: "Viewer.md" }).first().click();
+    await libraryFrame.locator("#picker-action-button").filter({ hasText: "Select for Browser" }).first().click();
     await page.waitForFunction(() =>
       window.__shellMessages?.some((message) =>
         message?.type === "home:deliver-to-target" &&
@@ -2583,14 +2692,49 @@ async function run() {
         message?.payload?.fileName === "Viewer.md" &&
         message?.payload?.sizeBytes > 0),
     );
+    const browserOpener = await (await page.locator("#opener-frame").elementHandle()).contentFrame();
+    await browserOpener.waitForFunction(() => !!window.selection);
+    assert(await page.evaluate(() => window.__pickerCloses.length === 0), "Library closed before Browser fixture ACK");
+    await browserOpener.evaluate(() => window.ack({ documentNonce: "stale-document" }));
+    await page.waitForFunction(() => window.__shellMessages.some(message => message.type === "home:picker-accepted" && message.documentNonce === "stale-document"));
+    assert(await page.evaluate(() => window.__pickerRecord().phase === "delivering" && window.__pickerCloses.length === 0),
+      "Stale Browser fixture ACK must not close Library");
+    await browserOpener.evaluate(() => window.ack({}));
+    await page.waitForFunction(() => window.__pickerCloses.length === 1);
+    assert(await page.evaluate(() => window.__pickerCloses[0] === "accepted"), "Browser picker closed without accepted delivery");
 
     await page.evaluate(() => {
       window.__shellMessages = [];
     });
-    await libraryFrame.goto(
-      `http://127.0.0.1:${port}/apps/library/?mode=archive-open&returnTarget=archive-manager&home_origin=${encodeURIComponent("http://127.0.0.1:" + port)}#home_token=${encodeURIComponent(token)}`,
-    );
+    await page.evaluate(() => window.__openPickerOpener("archive-manager"));
+    const archiveOpener = await (await page.locator("#opener-frame").elementHandle()).contentFrame();
+    await archiveOpener.locator("#open-existing-archive").waitFor();
+    const archiveReadsBeforeRejectedDelivery = ops.filter(entry => entry.op === "archive_entries").length;
+    await archiveOpener.evaluate(uri => window.dispatchEvent(new MessageEvent("message", {
+      origin: "null", source: window.parent,
+      data: { type: "archive:open-library-object", object: { uri } },
+    })), `${documentsUri}/Portable.zip`);
+    await page.evaluate(uri => document.querySelector("#opener-frame").contentWindow.postMessage({
+      type: "archive:open-library-object", requestId: "missing-request", documentNonce: "missing-document",
+      pickerId: "missing-picker", deliveryId: "missing-delivery", object: { uri },
+    }, location.origin), `${documentsUri}/Portable.zip`);
+    await page.waitForFunction(() => window.__shellMessages.some(message => message.type === "home:picker-accepted" && message.requestId === "missing-request" && message.accepted === false));
+    await archiveOpener.locator("#open-existing-archive").click();
     await libraryFrame.locator("#picker-action-button").filter({ hasText: "Open in Archive" }).first().waitFor();
+    assert(new URL(libraryFrame.url()).searchParams.get("mode") === "archive-open" &&
+      new URL(libraryFrame.url()).searchParams.get("returnTarget") === "archive-manager", "Home must launch Archive's exact open chooser");
+    for (const changed of ["requestId", "documentNonce"]) {
+      await page.evaluate(({ uri, changed }) => {
+        const record = window.__pickerRecord();
+        document.querySelector("#opener-frame").contentWindow.postMessage({
+          type: "archive:open-library-object", pickerId: record.id, deliveryId: "stale-delivery",
+          requestId: record.requestId, documentNonce: record.documentNonce, [changed]: "stale-" + changed, object: { uri },
+        }, location.origin);
+      }, { uri: `${documentsUri}/Portable.zip`, changed });
+      await page.waitForFunction(changed => window.__shellMessages.some(message => message.type === "home:picker-accepted" && message[changed] === "stale-" + changed && message.accepted === false), changed);
+    }
+    assert(ops.filter(entry => entry.op === "archive_entries").length === archiveReadsBeforeRejectedDelivery,
+      "Forged, unowned and stale Archive deliveries must not read an archive");
     await libraryFrame.waitForFunction(() => document.querySelector("#status-text")?.classList.contains("hidden"));
     const pickerZipItem = libraryFrame.locator(".item").filter({ hasText: "Loose.zip" }).first();
     await pickerZipItem.click();
@@ -2602,6 +2746,14 @@ async function run() {
         message?.payload?.type === "archive:open-library-object" &&
         message?.payload?.object?.uri?.endsWith("/Loose.zip")),
     );
+    await page.waitForFunction(() => window.__pickerCloses.length === 2);
+    assert(await page.evaluate(() => window.__pickerCloses.every(phase => phase === "accepted")),
+      "Archive must accept its current document before Library closes");
+    await archiveOpener.locator("#title").filter({ hasText: "Loose.zip" }).waitFor();
+    await archiveOpener.locator("#new-archive-button").click();
+    await libraryFrame.locator("#picker-action-button").filter({ hasText: "Create ZIP" }).waitFor();
+    assert(new URL(libraryFrame.url()).searchParams.get("mode") === "archive-create", "Home must launch Archive's exact create chooser");
+    assert(new URL(libraryFrame.url()).searchParams.get("pickerRequestId"), "Archive New ZIP must receive Home's owned picker ID");
 
     const archivePage = await context.newPage();
     await archivePage.goto(
@@ -2629,43 +2781,13 @@ async function run() {
       `http://127.0.0.1:${port}/apps/archive-manager/#home_token=${encodeURIComponent(token)}`,
     );
     await archiveBlankPage.locator("#open-existing-archive").click();
-    await archiveBlankPage.waitForURL((url) =>
-      url.pathname === "/apps/library/" &&
-        url.searchParams.get("mode") === "archive-open" &&
-        url.searchParams.get("returnTarget") === "archive-manager",
-    );
-    await archiveBlankPage.locator("#picker-action-button").filter({ hasText: "Open in Archive" }).first().waitFor();
-    await archiveBlankPage.goto(
-      `http://127.0.0.1:${port}/apps/archive-manager/#home_token=${encodeURIComponent(token)}`,
-    );
+    await archiveBlankPage.locator("#empty-state").getByText("Open Archive from Home to choose a Library item.", { exact: true }).waitFor();
+    assert(new URL(archiveBlankPage.url()).pathname === "/apps/archive-manager/", "Standalone Archive must stay outside Home's picker authority");
+    assert(await archiveBlankPage.locator("#empty-state").isVisible(), "Standalone Archive lost its empty state");
     await archiveBlankPage.locator("#make-new-archive").click();
-    await archiveBlankPage.waitForURL((url) =>
-      url.pathname === "/apps/library/" &&
-        url.searchParams.get("mode") === "archive-create" &&
-        url.searchParams.get("returnTarget") === "archive-manager",
-    );
-    await archiveBlankPage.locator("#picker-action-button").filter({ hasText: "Create ZIP" }).first().waitFor();
+    await archiveBlankPage.locator("#empty-state").getByText("Open Archive from Home to choose a Library item.", { exact: true }).waitFor();
+    assert(new URL(archiveBlankPage.url()).pathname === "/apps/archive-manager/", "Standalone New ZIP must not invent a chooser route");
     await archiveBlankPage.close();
-    const archiveMessagePage = await context.newPage();
-    await archiveMessagePage.goto(
-      `http://127.0.0.1:${port}/apps/archive-manager/#home_token=${encodeURIComponent(token)}`,
-    );
-    await archiveMessagePage.evaluate((uri) => {
-      window.dispatchEvent(new MessageEvent("message", {
-        data: {
-          type: "archive:open-library-object",
-          object: {
-            uri,
-            name: "Portable.zip",
-            mime: "application/zip",
-          },
-        },
-        origin: "null",
-        source: window.parent,
-      }));
-    }, `${documentsUri}/Portable.zip`);
-    await archiveMessagePage.locator("#entry-list").filter({ hasText: "Nested/deep.txt" }).first().waitFor();
-    await archiveMessagePage.close();
     assert(
       ops.some((entry) => entry.op === "roots"),
       "Archive destination picker must load roots through the Runtime viewer route",

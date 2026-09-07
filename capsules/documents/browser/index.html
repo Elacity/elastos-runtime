@@ -1498,6 +1498,7 @@ a {
 <div id="context-menu" class="context-menu hidden" role="menu" aria-hidden="true"></div>
 
 <script type="module">
+import { createHomeNavigationClient } from "/apps/home/home-navigation-client.js";
 import {
   createHomeClipboardClient,
 } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
@@ -1525,6 +1526,7 @@ const state = {
   pendingChatAttachmentId: "",
 };
 const homeOrigin = new URLSearchParams(window.location.search).get("home_origin") || "";
+const homeNavigation = createHomeNavigationClient({ homeToken: state.homeToken, homeOrigin });
 const DOCUMENTS_WINDOW_CLOSE_REQUEST_TYPE =
   "elastos.documents.window-close.request/v1";
 const DOCUMENTS_WINDOW_CLOSE_RESULT_TYPE =
@@ -1958,9 +1960,21 @@ function replaceCurrentDocument(document) {
   documentSelectionSequence += 1;
   state.current = document;
   state.currentSessionId += 1;
+  updateDocumentsNavigation(document);
 }
 
-
+function updateDocumentsNavigation(document) {
+  // A settled editor selection replaces the hint; initial loading stays null.
+  let query = {};
+  if (document?.library_object_uri && typeof document.revision === "string" && document.revision) {
+    query = { objectUri: document.library_object_uri };
+  } else if (document?.doc_did && /^[0-9a-f]{64}$/.test(document.revision || "")) {
+    query = { doc: document.doc_did };
+  } else if (document?.doc_did || document?.library_object_uri) {
+    return; // An unverified result does not replace the last settled hint.
+  }
+  homeNavigation.setQuery(query);
+}
 
 function isCurrentSessionTarget(target) {
   return !!target && state.currentSessionId === target.sessionId;
@@ -2941,6 +2955,7 @@ function applySavedDocumentState(persistedDocument, saveTarget, requestedTitle, 
     body: changedDuringSave ? elements.editor.value : requestedBody,
     file_name: persistedDocument.file_name || state.current?.file_name || "",
   };
+  updateDocumentsNavigation(persistedDocument);
   if (changedDuringSave) {
     refreshPreviewFromEditor();
     renderHistory();
@@ -3058,6 +3073,7 @@ async function saveCurrent(options) {
       state.current = { ...saveDocument, title: elements.titleInput.value, body: elements.editor.value };
       savedWorkingCopy = { ...saveDocument };
       saveTarget.identity = documentIdentity(state.current);
+      updateDocumentsNavigation(saveDocument);
     }
     requireSavedWorkingCopy(saveDocument);
     saveRecovery = {

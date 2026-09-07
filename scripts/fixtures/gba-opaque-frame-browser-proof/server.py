@@ -141,6 +141,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = unquote(urlparse(self.path).path)
         self.record_api_origin(path)
+        if path == "/apps/home/home-navigation-client.js":
+            self.send_bytes(200, (ROOT / "capsules/home/browser/home-navigation-client.js").read_bytes(), "text/javascript")
+            return
         if path == "/":
             self.send_bytes(200, HARNESS.encode(), "text/html; charset=utf-8")
             return

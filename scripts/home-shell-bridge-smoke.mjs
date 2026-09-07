@@ -326,6 +326,7 @@ globalThis.document = {
   addEventListener() {},
   createElement: (tag) => new FakeElement(tag),
   querySelector: elementForSelector,
+  getElementById: (id) => elementForSelector(`#${id}`),
   querySelectorAll: () => [],
 };
 Object.defineProperty(globalThis, "navigator", {

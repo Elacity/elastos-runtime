@@ -47,6 +47,7 @@ function player(store) {
     setTimeout, clearTimeout, confirm: () => false };
   window.self = window.top = window;
   const context = vm.createContext({ window, document: { body: { dataset: {} }, getElementById: element },
+    createHomeNavigationClient: () => ({ setQuery() {} }),
     URLSearchParams, Uint8Array, crypto: webcrypto, console, fetch: (...args) => store.fetch(...args), game });
   vm.runInContext(source + `
     loadEngine = async () => (engine = game);

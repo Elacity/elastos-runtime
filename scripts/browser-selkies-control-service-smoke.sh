@@ -1914,14 +1914,16 @@ if (response.file_chooser?.pending !== true || response.file_chooser?.mode !== "
 ' "$click_response"
 
 file_upload_response="$tmp_dir/file-upload-response.json"
+file_chooser_request_id="$("$node_bin" -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).file_chooser.request_id)' "$click_response")"
 curl --silent --show-error --fail \
   --unix-socket "$control_socket" \
   --header "content-type: application/json" \
   --data @- \
-  "http://browser-engine/pages/$page_id/input" >"$file_upload_response" <<'JSON'
+  "http://browser-engine/pages/$page_id/input" >"$file_upload_response" <<JSON
 {
   "event": {
     "type": "file_upload",
+    "request_id": "$file_chooser_request_id",
     "file_name": "avatar.png",
     "mime_type": "image/png",
     "content_base64": "SGVsbG8gQnJvd3Nlcg==",

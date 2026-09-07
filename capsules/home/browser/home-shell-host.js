@@ -170,6 +170,7 @@ function retireLaunchedAppContext(homeToken) {
     return false;
   }
   cancelBrowserAuthorityRenewalsForToken(homeToken);
+  cancelLibraryPicker(context);
   homeClipboardHost.retireFrame(context.clipboardState);
   launchedAppContexts.delete(homeToken);
   return true;
@@ -178,6 +179,7 @@ function retireLaunchedAppContext(homeToken) {
 function clearLaunchedAppContexts() {
   clearPendingBrowserAuthorityRenewals();
   for (const context of launchedAppContexts.values()) {
+    cancelLibraryPicker(context);
     homeClipboardHost.retireFrame(context.clipboardState);
   }
   launchedAppContexts.clear();
@@ -391,12 +393,22 @@ function handleHomeUiPreferenceMessage(event, context, data) {
 async function showHostAuthGate(options = {}) {
   enterHostAuthGate();
   const personName = options?.preserveSignedProfileLabel ? currentSignedProfileDisplayName() : "";
-  const unlockReady = showHomeUnlock(async (response) => {
+  const unlockReady = showHomeUnlock(async (response, flow) => {
     await boot();
+    if (flow?.enrollmentPurpose === "recover") {
+      await activateDesktopShell();
+      await openTargetFromHomeGui("system", { query: { settings: "security", recovery: "import" } });
+      return;
+    }
     const profileActionTarget = profileReadinessActionTarget(response);
     if (profileActionTarget) {
       await activateDesktopShell();
-      await openTargetFromHomeGui(profileActionTarget);
+      const query = { settings: "security" };
+      if (response?.profile_readiness?.schema === "elastos.profile.readiness/v1" &&
+          response.profile_readiness.status === "setup_required") {
+        query.recovery = "import";
+      }
+      await openTargetFromHomeGui(profileActionTarget, { query });
     }
   }, {
     ...options,
@@ -407,6 +419,13 @@ async function showHostAuthGate(options = {}) {
 }
 
 async function launchHomeTarget(target, query = {}) {
+  const pickerOwner = target === "library" && query.pickerRequestId
+    ? [...launchedAppContexts.values()].map((context) => context.pickerRequest)
+      .find((record) => record?.id === query.pickerRequestId && currentLibraryPicker(record))
+    : null;
+  if (target === "library" && query.mode && query.mode !== "browse" && !pickerOwner) {
+    throw new Error("Open a new Library picker from the receiving app.");
+  }
   const body = {
     target,
     query: {
@@ -420,6 +439,15 @@ async function launchHomeTarget(target, query = {}) {
   });
   if (launched?.attach_kind === "iframe") {
     rememberLaunchedAppContext(launched);
+    if (pickerOwner) {
+      const token = homeLaunchTokenFromRoute(launched.route);
+      if (!currentLibraryPicker(pickerOwner) || pickerOwner.pickerToken) {
+        retireLaunchedAppContext(token);
+        throw new Error("This Library request is no longer available.");
+      }
+      pickerOwner.pickerToken = token;
+      launchedAppContexts.get(token).pickerOwner = pickerOwner;
+    }
   }
   return launched;
 }
@@ -653,8 +681,90 @@ function handleBrowserAuthorityRenewalResult(context, message) {
   });
 }
 
-async function deliverMessageToHomeGuiTargetFrame(target, payload) {
+function currentLibraryPicker(record) {
+  return !!record && launchedAppContexts.get(record.openerToken) === record.opener &&
+    record.opener.source === record.source && record.opener.pickerRequest === record;
+}
+
+function settleLibraryPicker(record, accepted) {
+  if (!record?.resolve) return false;
+  window.clearTimeout(record.timer);
+  const resolve = record.resolve;
+  record.resolve = null;
+  record.phase = accepted ? "accepted" : "rejected";
+  resolve(accepted);
+  return true;
+}
+
+function cancelLibraryPicker(context) {
+  for (const record of [context?.pickerRequest, context?.pickerOwner]) {
+    if (record) {
+      settleLibraryPicker(record, false);
+      record.phase = "retired";
+    }
+  }
+  if (context) context.pickerRequest = null;
+}
+
+function openLibraryPicker(context, data) {
+  const opener = launchedAppContexts.get(context.homeToken);
+  const query = data.query || {};
+  const expectedMode = context.targetId === "archive-manager"
+    ? ["archive-open", "archive-create"] : ["attach"];
+  if (!opener || opener.source !== context.source ||
+      !["browser", "chat-room", "archive-manager"].includes(context.targetId) ||
+      !expectedMode.includes(query.mode) || query.returnTarget !== context.targetId ||
+      !validPickerIdentity(data.requestId) || !validPickerIdentity(data.documentNonce) ||
+      Object.keys(query).some((key) => !["mode", "returnTarget"].includes(key))) {
+    throw new Error("This Library request is unavailable.");
+  }
+  if (opener.pickerRequest?.requestId === data.requestId &&
+      opener.pickerRequest?.documentNonce === data.documentNonce) return;
+  cancelLibraryPicker(opener);
+  const record = {
+    id: crypto.randomUUID(), requestId: data.requestId, documentNonce: data.documentNonce,
+    openerToken: context.homeToken, opener, source: context.source, phase: "ready",
+  };
+  opener.pickerRequest = record;
+  return openTargetFromHomeGui("library", { query: { ...query, pickerRequestId: record.id } });
+}
+
+function validPickerIdentity(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_:-]{1,128}$/.test(value);
+}
+
+function acceptLibraryPicker(context, data) {
+  const record = launchedAppContexts.get(context.homeToken)?.pickerRequest;
+  if (!currentLibraryPicker(record) || record.phase !== "delivering" ||
+      context.source !== record.source || data.pickerId !== record.id ||
+      data.requestId !== record.requestId || data.documentNonce !== record.documentNonce ||
+      data.deliveryId !== record.deliveryId || typeof data.accepted !== "boolean") return false;
+  const picker = launchedAppContexts.get(record.pickerToken);
+  return settleLibraryPicker(record, !!picker && picker.pickerOwner === record && data.accepted);
+}
+
+async function deliverMessageToHomeGuiTargetFrame(target, payload, sender = null, pickerId = "") {
   requireHomeGuiActive("deliver target message");
+  if (sender?.targetId === "library") {
+    const picker = launchedAppContexts.get(sender.homeToken);
+    const record = picker?.pickerOwner;
+    const type = { browser: "browser:file-picker-selection", "chat-room": "chat-room:attach-library-item", "archive-manager": "archive:open-library-object" }[target];
+    if (!currentLibraryPicker(record) || picker.source !== sender.source ||
+        record.id !== pickerId || record.opener.targetId !== target ||
+        record.phase !== "ready" || payload.type !== type) return false;
+    record.phase = "delivering";
+    record.deliveryId = crypto.randomUUID();
+    return new Promise((resolve) => {
+      record.resolve = resolve;
+      record.timer = window.setTimeout(() => settleLibraryPicker(record, false), 30_000);
+      try {
+        record.source.postMessage({
+          ...payload, pickerId: record.id, requestId: record.requestId,
+          documentNonce: record.documentNonce, deliveryId: record.deliveryId,
+        }, OPAQUE_FRAME_TARGET);
+      } catch (_error) { settleLibraryPicker(record, false); }
+    });
+  }
   const contexts = [...launchedAppContexts.values()].reverse();
   const context = contexts.find((candidate) => candidate.targetId === target && candidate.source);
   if (!context) {
@@ -1397,6 +1507,10 @@ window.addEventListener("message", (event) => {
   if (!context) {
     return;
   }
+  if (data.type === "home:navigation-hint") {
+    relayHomeNavigation(context, data);
+    return;
+  }
   if (data.type === "home:shell-ready") {
     if (context.kind === "shell-frame") {
       settleActiveShellReady(context);
@@ -1424,6 +1538,16 @@ window.addEventListener("message", (event) => {
     return;
   }
   if (data.type === "home:app-ready") {
+    if (context.kind === "app-frame" && ["documents", "library", "archive-manager", "gba-emulator", "chat-room"].includes(context.targetId) &&
+        hasExactMessageKeys(data, ["type", "homeToken"])) {
+      postToActiveShell({ type: "home:gui-command", command: "navigation-hint",
+        homeToken: context.homeToken, navigation: null });
+    }
+    if (context.kind === "app-frame") {
+      const app = launchedAppContexts.get(context.homeToken);
+      if (app?.pickerRequest) cancelLibraryPicker(app);
+      if (app?.pickerOwner?.phase === "delivering") settleLibraryPicker(app.pickerOwner, false);
+    }
     if (
       context.kind === "app-frame" &&
       context.clipboardState &&
@@ -1431,6 +1555,12 @@ window.addEventListener("message", (event) => {
     ) {
       homeClipboardHost.resetFrame(context.clipboardState, context);
     }
+    return;
+  }
+  if (data.type === "home:picker-accepted") {
+    if (context.kind === "app-frame" && hasExactMessageKeys(data, [
+      "type", "homeToken", "pickerId", "requestId", "documentNonce", "deliveryId", "accepted",
+    ])) acceptLibraryPicker(context, data);
     return;
   }
   if (homeClipboardHost.handle(event, context, data)) {
@@ -1629,13 +1759,15 @@ window.addEventListener("message", (event) => {
       console.warn("home ignored malformed deliver-to-target payload", context.targetId, target);
       return;
     }
-    deliverMessageToHomeGuiTargetFrame(target, payload)
+    deliverMessageToHomeGuiTargetFrame(target, payload, context, data.pickerId)
       .then((delivered) => {
+        if (context.targetId === "library") replyToShellRequest(event, data.requestId, { accepted: delivered });
         if (!delivered) {
           console.warn("home could not deliver message to target", target);
         }
       })
       .catch((error) => {
+        if (context.targetId === "library") replyToShellRequest(event, data.requestId, { accepted: false });
         console.error("home deliver-to-target failed", error);
       });
     return;
@@ -1704,6 +1836,12 @@ window.addEventListener("message", (event) => {
     return;
   }
   const query = data.query && typeof data.query === "object" ? data.query : {};
+  if (target === "library" && query.mode && query.mode !== "browse") {
+    Promise.resolve().then(() => openLibraryPicker(context, data)).catch((error) => {
+      replyToShellRequest(event, data.requestId, null, error);
+    });
+    return;
+  }
   if (context.kind === "shell-frame") {
     if (context.targetId === HOME_GUI_SHELL_ID) {
       openTargetFromHomeGui(target, { query }).catch((error) => {
@@ -1718,6 +1856,21 @@ window.addEventListener("message", (event) => {
     console.error("home open-target failed", error);
   });
 });
+
+function relayHomeNavigation(context, data) {
+  if (context.kind !== "app-frame" || !["documents", "library", "archive-manager", "gba-emulator", "chat-room"].includes(context.targetId) ||
+      !hasExactMessageKeys(data, ["type", "homeToken", "requestId", "documentNonce", "sequence", "phase", "query"]) ||
+      ![data.requestId, data.documentNonce].every((value) => typeof value === "string" && /^[A-Za-z0-9-]{1,64}$/.test(value)) ||
+      !Number.isSafeInteger(data.sequence) || data.sequence < 0 ||
+      !["state", "unloading"].includes(data.phase)) return false;
+  // Bound the relay; the GUI validates the exact presentation selector shape.
+  if (data.query !== null && (!data.query || typeof data.query !== "object" || Array.isArray(data.query) ||
+      Object.keys(data.query).length > 1 || Object.entries(data.query).some(([key, value]) =>
+        !["doc", "objectUri", "uri", "capsule", "conversation_id"].includes(key) || typeof value !== "string" || value.length > 2048))) return false;
+  postToActiveShell({ type: "home:gui-command", command: "navigation-hint",
+    homeToken: context.homeToken, navigation: data });
+  return true;
+}
 
 function homeMessageContext(event, data) {
   if (!data || typeof data !== "object") {

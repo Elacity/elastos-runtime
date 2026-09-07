@@ -52,6 +52,276 @@ import {
 import { showAssistantFace } from "./shell-assistant-face.js?v=home-20260813a";
 
 let windowHooks = null;
+let pendingSystemRecoverySave = null;
+
+// Presentation state only. A fresh Runtime launch authorizes every restore.
+export function probeHomeNavigation(entry, reset = false) {
+  if (!["documents", "library", "archive-manager", "gba-emulator", "chat-room"].includes(entry?.targetId) ||
+      shellState.windows.get(entry.id) !== entry || restorableLaunchQuery(entry.targetId, { query: entry.launchQuery }) === null) return false;
+  const frame = entry.node.querySelector(".window-frame");
+  const route = frame?.dataset.route;
+  const homeToken = browserLaunchAuthority(route)?.homeToken;
+  if (!homeToken || !frame.contentWindow) return false;
+  let record = entry.homeNavigation;
+  if (reset || !record || record.frame !== frame || record.source !== frame.contentWindow || record.route !== route) {
+    record = { frame, source: frame.contentWindow, route, homeToken, targetId: entry.targetId,
+      requestId: window.crypto.randomUUID(), documentNonce: "", sequence: -1 };
+    entry.homeNavigation = record;
+  }
+  record.source.postMessage({ type: "elastos.home.navigation.request/v1",
+    homeToken, requestId: record.requestId }, "*");
+  return true;
+}
+
+function validHomeNavigationQuery(targetId, query) {
+  if (!query || typeof query !== "object" || Array.isArray(query)) return false;
+  const keys = Object.keys(query);
+  if (keys.length === 0) return true;
+  if (keys.length !== 1) return false;
+  if (targetId === "documents" && keys[0] === "doc") {
+    return typeof query.doc === "string" && query.doc.length <= 512 && /^did:[A-Za-z0-9._:%-]+$/.test(query.doc);
+  }
+  if (targetId === "chat-room") {
+    return keys[0] === "conversation_id" && typeof query.conversation_id === "string" &&
+      /^[A-Za-z0-9:._-]{1,512}$/.test(query.conversation_id);
+  }
+  if (targetId === "gba-emulator" && keys[0] === "capsule") {
+    return typeof query.capsule === "string" && /^[a-z0-9][a-z0-9-]{0,127}$/.test(query.capsule);
+  }
+  const field = targetId === "library" ? "uri" : "objectUri";
+  if (keys[0] !== field || typeof query[field] !== "string" || query[field].length > 2048) return false;
+  const uri = query[field];
+  if (!uri.startsWith("localhost://") || uri !== uri.trim() || /[\u0000-\u001f\u007f\\]/.test(uri)) return false;
+  // Library uses literal rooted paths, not URL decoding/query/fragment semantics.
+  // Runtime checks the actual root and access when the restored launch opens it.
+  const parts = uri.slice("localhost://".length).split("/");
+  if (targetId === "library" && parts.at(-1) === "") parts.pop();
+  return /^[A-Za-z][A-Za-z0-9_-]*$/.test(parts[0]) && (targetId === "library" || parts.length > 1) &&
+    parts.every((part) => part !== "" && part !== "." && part !== "..");
+}
+
+export function acceptHomeNavigation(entry, data) {
+  const record = entry?.homeNavigation;
+  if (!record || entry.targetId !== record.targetId || shellState.windows.get(entry.id) !== entry ||
+      restorableLaunchQuery(entry.targetId, { query: entry.launchQuery }) === null ||
+      entry.node.querySelector(".window-frame") !== record.frame ||
+      record.frame.contentWindow !== record.source || record.frame.dataset.route !== record.route ||
+      !hasExactKeys(data, ["type", "homeToken", "requestId", "documentNonce", "sequence", "phase", "query"]) ||
+      data.type !== "home:navigation-hint" || data.homeToken !== record.homeToken ||
+      data.requestId !== record.requestId || typeof data.documentNonce !== "string" ||
+      !/^[A-Za-z0-9-]{1,64}$/.test(data.documentNonce) ||
+      (record.documentNonce && record.documentNonce !== data.documentNonce) ||
+      !Number.isSafeInteger(data.sequence) || data.sequence < 0 || data.sequence <= record.sequence ||
+      !["state", "unloading"].includes(data.phase) ||
+      (data.query !== null && !validHomeNavigationQuery(entry.targetId, data.query))) return false;
+  if (data.phase === "unloading") {
+    if (data.query !== null || !record.documentNonce) return false;
+    entry.homeNavigation = null;
+    return true;
+  }
+  record.documentNonce = data.documentNonce;
+  record.sequence = data.sequence;
+  // Null means this document is still loading, not a request to clear selection.
+  if (data.query !== null) {
+    entry.launchQuery = { ...data.query };
+    persistBrowserSession();
+  }
+  return true;
+}
+
+export function openSystemRecoverySave() {
+  if (pendingSystemRecoverySave) return pendingSystemRecoverySave;
+  ensureDesktopForNewLaunch();
+  const pending = launchBrowserTargetWindow(SYSTEM_APP_ID)
+    .then((entry) => requestSystemWindow(entry, "save"))
+    .catch(() => false)
+    .finally(() => {
+      if (pendingSystemRecoverySave === pending) pendingSystemRecoverySave = null;
+    });
+  pendingSystemRecoverySave = pending;
+  return pending;
+}
+
+async function requestSystemWindow(entry, action, query = {}) {
+  while (entry.systemRequest) {
+    // Recheck after each wait; another caller may have claimed the document.
+    await entry.systemRequest.promise;
+    if (shellState.windows.get(entry.id) !== entry) return false;
+  }
+  const frame = entry.node.querySelector(".window-frame");
+  const record = { entry, action, query, frame, source: frame?.contentWindow,
+    route: frame?.dataset.route, sent: false, timer: null, listener: null, onLoad: null };
+  record.homeToken = browserLaunchAuthority(record.route)?.homeToken;
+  record.requestId = window.crypto.randomUUID();
+  record.sequence = (entry.systemRequestSequence || 0) + 1;
+  if (!Number.isSafeInteger(record.sequence)) return false;
+  entry.systemRequestSequence = record.sequence;
+  record.promise = new Promise((resolve) => { record.resolve = resolve; });
+  entry.systemRequest = record;
+  if (!currentSystemWindowFrame(record)) {
+    if (shellState.windows.get(entry.id) === entry) removeWindowEntries([entry]);
+    finishSystemWindowRequest(record, false);
+    return record.promise;
+  }
+  record.listener = (event) => handleSystemWindowMessage(record, event);
+  window.addEventListener("message", record.listener);
+  let loaded = false;
+  record.onLoad = () => {
+    if (loaded) finishSystemWindowRequest(record, false);
+    loaded = true;
+  };
+  frame.addEventListener("load", record.onLoad);
+  // Startup is bounded. The person's passkey decision has no Home transport timer.
+  record.timer = window.setTimeout(() => finishSystemWindowRequest(record, false), 15000);
+  probeSystemWindow(record);
+  return record.promise;
+}
+
+function probeSystemWindow(record) {
+  if (!currentSystemWindowFrame(record)) return finishSystemWindowRequest(record, false);
+  record.source.postMessage({ type: "elastos.system.window-ready.request/v1",
+    homeToken: record.homeToken, requestId: record.requestId }, "*");
+}
+
+function currentSystemWindowFrame(record) {
+  return Boolean(record.entry && record.homeToken && record.source
+    && shellState.windows.get(record.entry.id) === record.entry
+    && record.entry.targetId === SYSTEM_APP_ID
+    && record.entry.node.querySelector(".window-frame") === record.frame
+    && record.frame.contentWindow === record.source && record.frame.dataset.route === record.route);
+}
+
+function handleSystemWindowMessage(record, event) {
+  if (record.entry.systemRequest !== record) return;
+  if (!currentSystemWindowFrame(record)) return finishSystemWindowRequest(record, false);
+  const data = event.data;
+  if (event.source !== record.source || event.origin !== "null" || !data
+    || data.homeToken !== record.homeToken) return;
+  if (data.type === "home:app-unloading" && hasExactKeys(data, ["type", "homeToken", "documentNonce"])
+    && (!record.sent || data.documentNonce === record.documentNonce)) {
+    finishSystemWindowRequest(record, false);
+  } else if (data.type === "home:app-ready" && !record.sent
+    && hasExactKeys(data, ["type", "homeToken", "documentNonce"])) {
+    probeSystemWindow(record);
+  } else if (data.type === "elastos.system.window-ready.result/v1"
+    && hasExactKeys(data, ["type", "homeToken", "requestId", "documentNonce"])
+    && data.requestId === record.requestId
+    && typeof data.documentNonce === "string" && /^[a-zA-Z0-9-]{1,64}$/.test(data.documentNonce)) {
+    if (record.sent) {
+      if (data.documentNonce !== record.documentNonce) finishSystemWindowRequest(record, false);
+      return;
+    }
+    record.documentNonce = data.documentNonce;
+    record.sent = true;
+    if (record.action === "save") {
+      window.clearTimeout(record.timer);
+      record.timer = null;
+    }
+    record.source.postMessage({ type: "elastos.system.window.request/v1",
+      homeToken: record.homeToken, requestId: record.requestId, documentNonce: record.documentNonce,
+      sequence: record.sequence, action: record.action, query: record.query }, "*");
+  } else if (record.sent && data.type === "elastos.system.window.result/v1"
+    && hasExactKeys(data, ["type", "homeToken", "requestId", "documentNonce", "ok"])
+    && data.requestId === record.requestId && data.documentNonce === record.documentNonce
+    && typeof data.ok === "boolean") {
+    finishSystemWindowRequest(record, data.ok);
+  }
+}
+
+function finishSystemWindowRequest(record, ok) {
+  if (record.entry.systemRequest !== record) return;
+  window.clearTimeout(record.timer);
+  if (record.listener) window.removeEventListener("message", record.listener);
+  if (record.onLoad) record.frame.removeEventListener("load", record.onLoad);
+  record.entry.systemRequest = null;
+  record.resolve(ok);
+}
+
+async function requestSelectionWindow(entry, query) {
+  const field = entry.targetId === "inbox" ? "notification_id" : "wallet_request";
+  if (!hasExactKeys(query, [field]) || typeof query[field] !== "string"
+    || !/^[a-zA-Z0-9:._-]{1,256}$/.test(query[field])) return false;
+  while (entry.selectionRequest) {
+    await entry.selectionRequest.promise;
+    if (shellState.windows.get(entry.id) !== entry) return false;
+  }
+  const frame = entry.node.querySelector(".window-frame");
+  const record = { entry, query: { [field]: query[field] }, frame, source: frame?.contentWindow,
+    route: frame?.dataset.route, target: entry.targetId, sent: false,
+    requestId: window.crypto.randomUUID(), expiresAt: Date.now() + 15000,
+    sequence: (entry.selectionRequestSequence || 0) + 1 };
+  record.homeToken = browserLaunchAuthority(record.route)?.homeToken;
+  if (!Number.isSafeInteger(record.sequence)) return false;
+  entry.selectionRequestSequence = record.sequence;
+  record.promise = new Promise(resolve => { record.resolve = resolve; });
+  entry.selectionRequest = record;
+  if (!currentSelectionWindowFrame(record)) {
+    finishSelectionWindowRequest(record, false);
+    return record.promise;
+  }
+  record.listener = event => handleSelectionWindowMessage(record, event);
+  window.addEventListener("message", record.listener);
+  record.timer = window.setTimeout(() => finishSelectionWindowRequest(record, false), 15000);
+  probeSelectionWindow(record);
+  return record.promise;
+}
+
+function currentSelectionWindowFrame(record) {
+  return Boolean(record.source && record.homeToken
+    && shellState.windows.get(record.entry.id) === record.entry
+    && record.entry.targetId === record.target
+    && record.entry.node.querySelector(".window-frame") === record.frame
+    && record.frame.contentWindow === record.source && record.frame.dataset.route === record.route);
+}
+
+function probeSelectionWindow(record) {
+  record.source.postMessage({ type: `elastos.${record.target}.window-ready.request/v1`,
+    homeToken: record.homeToken, requestId: record.requestId }, "*");
+}
+
+function handleSelectionWindowMessage(record, event) {
+  if (record.entry.selectionRequest !== record) return;
+  if (!currentSelectionWindowFrame(record)) return finishSelectionWindowRequest(record, false);
+  const data = event.data;
+  if (event.source !== record.source || event.origin !== "null" || !data
+    || data.homeToken !== record.homeToken) return;
+  if (data.type === "home:app-unloading" && hasExactKeys(data, ["type", "homeToken", "documentNonce"])
+    && (!record.sent || data.documentNonce === record.documentNonce)) {
+    finishSelectionWindowRequest(record, false);
+  } else if (data.type === "home:app-ready"
+    && hasExactKeys(data, ["type", "homeToken", "documentNonce"])) {
+    if (record.sent && data.documentNonce !== record.documentNonce) finishSelectionWindowRequest(record, false);
+    else if (!record.sent) probeSelectionWindow(record);
+  } else if (data.type === `elastos.${record.target}.window-ready.result/v1`
+    && hasExactKeys(data, ["type", "homeToken", "requestId", "documentNonce"])
+    && data.requestId === record.requestId && typeof data.documentNonce === "string"
+    && /^[a-zA-Z0-9-]{1,64}$/.test(data.documentNonce)) {
+    if (record.sent) {
+      if (data.documentNonce !== record.documentNonce) finishSelectionWindowRequest(record, false);
+      return;
+    }
+    record.sent = true;
+    record.documentNonce = data.documentNonce;
+    record.source.postMessage({ type: `elastos:${record.target}-chrome-command`,
+      cmd: record.target === "inbox" ? "select-notification" : "review-request",
+      homeToken: record.homeToken, requestId: record.requestId, documentNonce: record.documentNonce,
+      sequence: record.sequence, expiresAt: record.expiresAt, query: record.query }, "*");
+  } else if (record.sent && data.type === `elastos.${record.target}.window.result/v1`
+    && hasExactKeys(data, ["type", "homeToken", "requestId", "documentNonce", "ok"])
+    && data.requestId === record.requestId && data.documentNonce === record.documentNonce
+    && typeof data.ok === "boolean") {
+    finishSelectionWindowRequest(record, data.ok);
+  }
+}
+
+function finishSelectionWindowRequest(record, ok) {
+  if (record.entry.selectionRequest !== record) return;
+  window.clearTimeout(record.timer);
+  if (record.listener) window.removeEventListener("message", record.listener);
+  record.entry.selectionRequest = null;
+  record.resolve(ok);
+}
+
 const REQUIRED_WINDOW_HOOKS = [
   "clearIdentitySurface",
   "hideLauncher",
@@ -81,12 +351,15 @@ const DOCUMENTS_WINDOW_CLOSE_RESULT_TYPE =
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const HOME_AGENT_TARGET_ID = "home-agent";
 const MAX_SESSION_WINDOWS = 24;
-const SINGLE_SESSION_TARGETS = new Set(["people", "inbox", "wallet"]);
+function isSingleWindowTarget(targetId, summary = shellState.currentSummary) {
+  return targetById(summary, targetId)?.window_policy === "single";
+}
 
-/** Single-session apps refocus rather than open a second window, so the menu
- *  bar does not offer them a New Window that would not do that. */
+/** Hybrid supplies a blank window. Multiple capsules own selection-aware
+ * commands; absent policy retains the existing generic menu behavior. */
 export function supportsMenuNewWindow(targetId) {
-  return !SINGLE_SESSION_TARGETS.has(targetId);
+  const policy = targetById(shellState.currentSummary, targetId)?.window_policy;
+  return policy !== "single" && policy !== "multiple";
 }
 const WALLET_CONNECTOR_TARGETS = new Set([
   "wallet-metamask",
@@ -116,7 +389,7 @@ const SYSTEM_IFRAME_SANDBOX_EXTRAS = [
   "allow-top-navigation-to-custom-protocols",
 ];
 const COMMON_IFRAME_ALLOW = ["autoplay", "fullscreen"];
-const pendingWindowLaunches = new Set();
+const pendingWindowLaunches = new Map();
 const pendingBrowserWindowCloses = new Map();
 const pendingDocumentsWindowCloses = new Map();
 
@@ -201,8 +474,10 @@ function persistedBrowserSessionEntries() {
     ),
   )
     .reverse()
+    .map((entry) => ({ entry, query: restorableLaunchQuery(entry.targetId, { query: entry.launchQuery }) }))
+    .filter(({ query }) => query !== null)
     .slice(0, MAX_SESSION_WINDOWS)
-    .map((entry) => {
+    .map(({ entry, query }) => {
       const bounds = currentWindowBounds(entry.node);
       const restoreBounds = currentWindowRestoreBounds(entry.node);
       return {
@@ -223,7 +498,7 @@ function persistedBrowserSessionEntries() {
         restoreY: restoreBounds.y,
         restoreWidth: restoreBounds.width,
         restoreHeight: restoreBounds.height,
-        query: normalizedLaunchQuery(entry.launchQuery),
+        query,
       };
     });
 }
@@ -319,12 +594,14 @@ export function normalizeRestorableSession(summary, storedSession, options = {})
     if (
       !targetId ||
       targetId === HOME_AGENT_TARGET_ID ||
-      (SINGLE_SESSION_TARGETS.has(targetId) && seenTargets.has(targetId)) ||
+      (isSingleWindowTarget(targetId, summary) && seenTargets.has(targetId)) ||
       !targetById(summary, targetId)
     ) {
       continue;
     }
-    if (SINGLE_SESSION_TARGETS.has(targetId)) {
+    const query = restorableLaunchQuery(targetId, item);
+    if (query === null) continue;
+    if (isSingleWindowTarget(targetId, summary)) {
       seenTargets.add(targetId);
     }
     normalized.push({
@@ -338,7 +615,7 @@ export function normalizeRestorableSession(summary, storedSession, options = {})
         typeof item?.desktopSpaceId === "string" && item.desktopSpaceId.startsWith("desk-")
           ? item.desktopSpaceId
           : desktopStageId(),
-      query: restorableLaunchQuery(targetId, item),
+      query,
       x: Number.isFinite(item?.x) ? item.x : 48,
       y: Number.isFinite(item?.y) ? item.y : 60,
       width: Number.isFinite(item?.width) ? item.width : 560,
@@ -356,7 +633,27 @@ export function normalizeRestorableSession(summary, storedSession, options = {})
 }
 
 function restorableLaunchQuery(targetId, item) {
-  const query = normalizedLaunchQuery(item?.query);
+  let query = normalizedLaunchQuery(item?.query);
+  // Restore navigation, not one-shot actions or a previous caller's picker.
+  if (targetId === "library") {
+    if ((query.mode && query.mode !== "browse") || query.returnTarget) return null;
+    query = Object.fromEntries(Object.entries(query).filter(([key]) => ["uri", "objectUri"].includes(key)));
+  } else if (targetId === "browser") {
+    query = Object.fromEntries(Object.entries(query).filter(([key]) => [
+      "browser_instance", "url", "browser_engine_id", "adapter_id", "remote_exit_id",
+      "display_mode", "display", "guarantee_level", "guarantee",
+    ].includes(key)));
+  } else {
+    // Restore approved startup navigation only; current edits stay capsule-owned.
+    const keys = {
+      documents: ["doc", "cid", "objectUri", "object_uri", "view"],
+      "chat-room": ["conversation_id"],
+      "archive-manager": ["objectUri", "uri", "name", "mime", "contentCid", "archiveSupport"],
+      "gba-emulator": ["capsule", "objectUri", "uri", "name"],
+      "elacity-player": ["mint_id"],
+    }[targetId];
+    if (keys) query = Object.fromEntries(Object.entries(query).filter(([key]) => keys.includes(key)));
+  }
   if (targetId === "browser" && !query.browser_instance) {
     query.browser_instance = nextBrowserInstanceId();
   }
@@ -654,6 +951,9 @@ function tearDownWindowEntry(entry) {
   if (!entry) {
     return;
   }
+  if (entry.systemRequest) finishSystemWindowRequest(entry.systemRequest, false);
+  if (entry.selectionRequest) finishSelectionWindowRequest(entry.selectionRequest, false);
+  entry.homeNavigation = null;
   cleanupFrameAutoFit(entry.node);
   shellState.windows.delete(entry.id);
   entry.node.remove();
@@ -1171,6 +1471,8 @@ function renderSystemErrorWindow({
 }
 
 function renderTargetLaunchError(targetId, error) {
+  // A selection refusal stays in the existing app, which owns its review feedback.
+  if (error?.selectionOnly) return;
   const title = shellState.currentSummary ? targetTitle(shellState.currentSummary, targetId) : targetId;
   console.error(`failed to launch ${targetId}`, error);
   renderSystemErrorWindow({
@@ -1283,35 +1585,21 @@ export function openTarget(targetId, options = {}) {
     showAssistantFace();
     return;
   }
-  if (SINGLE_SESSION_TARGETS.has(targetId) && browserWindowCount(targetId) > 0) {
-    activateTargetGroup(targetId);
-    return;
-  }
   // Launching from a fullscreen Space returns to a Desktop first, so the new
   // window opens somewhere it is visible.
   ensureDesktopForNewLaunch();
-  const baseQuery = normalizedLaunchQuery(options.query);
-  let guardedByBrowserActivation = false;
-  if (targetId === "browser" && !baseQuery.browser_instance) {
-    if (ignoreRepeatedAction("open-target:browser", BROWSER_DESKTOP_OPEN_GUARD_MS)) {
-      return;
-    }
-    guardedByBrowserActivation = true;
-  }
-  const launchOptions = targetId === "browser"
-    ? withBrowserInstanceQuery({ ...options, query: baseQuery })
-    : { ...options, query: baseQuery };
-  const pendingLaunchKey = guardedByBrowserActivation
-    ? "open-target:browser:desktop"
-    : launchActionKey(targetId, launchOptions.query);
-  if (pendingWindowLaunches.has(pendingLaunchKey)) {
+  const launchOptions = { ...options, query: normalizedLaunchQuery(options.query) };
+  const pendingLaunchKey = launchActionKey(targetId, launchOptions.query);
+  const trackDefaultOpen = options.newWindow !== true;
+  if (trackDefaultOpen && pendingWindowLaunches.has(pendingLaunchKey)) {
     return;
   }
-  if (!guardedByBrowserActivation && ignoreRepeatedAction(pendingLaunchKey)) {
+  if (trackDefaultOpen && ignoreRepeatedAction(pendingLaunchKey, targetId === "browser" ? BROWSER_DESKTOP_OPEN_GUARD_MS : undefined)) {
     return;
   }
-  pendingWindowLaunches.add(pendingLaunchKey);
-  launchBrowserTargetWindow(targetId, launchOptions)
+  const pending = launchBrowserTargetWindow(targetId, launchOptions);
+  if (trackDefaultOpen) pendingWindowLaunches.set(pendingLaunchKey, pending);
+  pending
     .catch((error) => {
       const status = Number(error && error.status);
       if (status === 401 || status === 403) {
@@ -1322,7 +1610,7 @@ export function openTarget(targetId, options = {}) {
       renderTargetLaunchError(targetId, error);
     })
     .finally(() => {
-      pendingWindowLaunches.delete(pendingLaunchKey);
+      if (trackDefaultOpen && pendingWindowLaunches.get(pendingLaunchKey) === pending) pendingWindowLaunches.delete(pendingLaunchKey);
     });
 }
 
@@ -1395,7 +1683,56 @@ export function handleTaskbarTargetClick(targetId) {
   activateTargetGroup(targetId);
 }
 
+function topDefaultHybridWindow(targetId) {
+  const entries = sortWindowEntriesByZOrder(browserWindowEntriesForTarget(targetId));
+  return entries.find((entry) => {
+    if (targetId !== "library") return true;
+    // Library pickers belong to their caller, not to an ordinary browse Open.
+    const route = entry.node.querySelector(".window-frame")?.dataset.route;
+    if (!route) return false;
+    try {
+      const mode = new URL(route, window.location.href).searchParams.get("mode");
+      return !mode || mode === "browse";
+    } catch {
+      return false;
+    }
+  }) || null;
+}
+
 async function launchBrowserTargetWindow(targetId, options = {}) {
+  const single = isSingleWindowTarget(targetId);
+  const defaultHybrid = !single && targetById(shellState.currentSummary, targetId)?.window_policy === "hybrid"
+    && options.newWindow !== true && !options.authorizedLaunch && !options.restoredPlacement
+    && Object.keys(options.query || {}).length === 0;
+  if (!single && !defaultHybrid) return createBrowserTargetWindow(targetId, options);
+  let entry = single ? topBrowserWindowEntryForTarget(targetId) : topDefaultHybridWindow(targetId);
+  const key = `${single ? "single" : "default"}:${targetId}`;
+  if (!entry) {
+    let pending = pendingWindowLaunches.get(key);
+    if (!pending) {
+      pending = createBrowserTargetWindow(targetId, options);
+      pendingWindowLaunches.set(key, pending);
+    }
+    try {
+      entry = await pending;
+    } finally {
+      if (pendingWindowLaunches.get(key) === pending) pendingWindowLaunches.delete(key);
+    }
+  }
+  if (shellState.windows.get(entry.id) !== entry) throw new Error("App window was closed");
+  if (!options.restoredPlacement) focusWindow(entry.id);
+  if (targetId === SYSTEM_APP_ID && Object.keys(options.query || {}).length > 0) {
+    const ok = await requestSystemWindow(entry, "navigate", options.query);
+    if (!ok) throw new Error("System could not open the requested settings");
+  }
+  if ((targetId === "inbox" || targetId === "wallet") && Object.keys(options.query || {}).length > 0) {
+    const ok = await requestSelectionWindow(entry, options.query);
+    if (!ok) throw Object.assign(new Error("The app could not select this request."), { selectionOnly: true });
+  }
+  return entry;
+}
+
+async function createBrowserTargetWindow(targetId, options = {}) {
   const launchQuery = targetId === "browser"
     ? withBrowserInstanceQuery({ query: options.query }).query
     : normalizedLaunchQuery(options.query);
@@ -1486,9 +1823,17 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
 }
 
 export function attachAuthorizedTarget(launched) {
+  let query = {};
+  const policy = targetById(shellState.currentSummary, launched?.target)?.window_policy;
+  if (policy === "hybrid" || policy === "multiple" || launched?.target === "browser" || launched?.target === "library") {
+    // Keep approved selectors for this launch; snapshot applies its own filter.
+    const params = new URL(launched.route, window.location.href).searchParams;
+    params.delete("home_origin");
+    query = Object.fromEntries(params);
+  }
   return launchBrowserTargetWindow(launched?.target, {
     authorizedLaunch: launched,
-    query: {},
+    query,
   });
 }
 
@@ -1554,6 +1899,7 @@ function syncBrowserWindow(entry, launched) {
   cleanupFrameAutoFit(node);
 
   const syncLoadedFrame = () => {
+    probeHomeNavigation(entry, true);
     if (entry.targetId !== "browser") {
       installFrameAutoFit(node, frame);
     }
@@ -1995,7 +2341,7 @@ export async function restoreShellSession() {
   const restoredEntries = [];
   const restoredSingleSessionTargets = new Set();
   for (const restoredWindow of restoredWindows) {
-    if (SINGLE_SESSION_TARGETS.has(restoredWindow.target)) {
+    if (isSingleWindowTarget(restoredWindow.target)) {
       if (restoredSingleSessionTargets.has(restoredWindow.target)) {
         continue;
       }

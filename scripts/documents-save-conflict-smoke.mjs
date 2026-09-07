@@ -48,11 +48,13 @@ function editor(server, current = server.docs.get("did:one")) {
     clearAutosaveTimer() {}, setStatus() {}, clearStatus() {}, scheduleStatusClear() {},
     renderDocumentsList() {}, renderCurrentDocument() { context.state.dirty = false; context.elements.titleInput.value = context.state.current.title; context.elements.editor.value = context.state.current.body; }, refreshPreviewFromEditor() {}, renderHistory() {},
     upsertDocumentListItem() {}, reportSaveFailure() {}, scheduleAutosave() {},
+    navigationMessages: [],
+    homeNavigation: { setQuery(query) { context.navigationMessages.push({ query }); } },
     setDirty(value) { context.state.dirty = value; },
     confirmInCapsule: async () => false,
     chooseInCapsule: async () => "cancel",
   });
-  vm.runInContext(["isCurrentSessionTarget", "isCurrentDocumentTarget", "resetPendingSaveIntent", "replaceCurrentDocument", "applySavedDocumentState", "requireSavedWorkingCopy", "saveCurrent", "selectDocument", "saveAsCurrent"].map(functionSource).join("\n"), context);
+  vm.runInContext(["updateDocumentsNavigation", "isCurrentSessionTarget", "isCurrentDocumentTarget", "resetPendingSaveIntent", "replaceCurrentDocument", "applySavedDocumentState", "requireSavedWorkingCopy", "saveCurrent", "selectDocument", "saveAsCurrent"].map(functionSource).join("\n"), context);
   return context;
 }
 
@@ -78,6 +80,8 @@ test("lost first save reply retains the exact created document and never repeats
   await assert.rejects(app.saveCurrent({ autosave: true }));
   assert.equal(server.requests.filter((value) => value.op === "create").length, 1);
   assert.equal(app.elements.editor.value, "Keep me");
+  assert.equal(app.navigationMessages.at(-1).query.doc, "did:created-1");
+  assert(!JSON.stringify(app.navigationMessages).includes("Keep me"));
 });
 
 test("a stale GET cannot replace a newer document selection", async () => {
@@ -92,6 +96,8 @@ test("a stale GET cannot replace a newer document selection", async () => {
   held.resolve();
   await first;
   assert.equal(app.state.current.doc_did, "did:three");
+  assert.equal(app.navigationMessages.at(-1).query.doc, "did:three");
+  assert(!app.navigationMessages.some((message) => message.query?.doc === "did:two"));
 });
 
 test("unknown create pauses autosave and explicit copy warns of duplicate risk", async () => {

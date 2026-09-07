@@ -200,6 +200,7 @@ const summary = {
 
 globalThis.HTMLElement = FakeElement;
 globalThis.document = {
+  getElementById: id => elementForSelector(`#${id}`),
   activeElement: null,
   body: elementForSelector("body"),
   documentElement: elementForSelector("html"),
@@ -213,6 +214,7 @@ Object.defineProperty(globalThis, "navigator", {
   value: {},
 });
 globalThis.window = {
+  sessionStorage: { getItem: () => null },
   crypto: { randomUUID: () => "home-shell-recovery-smoke" },
   location: {
     href: "http://localhost:61180/apps/home/",
