@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
+import { browserOpenResponseEvidence } from "./lib/browser-open-failure.mjs";
 import { installBrowserJourneyAudioProbe, controlledTonePresent } from "./lib/browser-journey-audio.mjs";
 import { diagnoseBrowserJourneyRecovery } from "./lib/browser-journey-recovery.mjs";
 import { diagnoseBrowserViewerReload, readBrowserViewerReloadDocument, browserViewerSignalMetadata } from "./lib/browser-journey-viewer-reload.mjs";
@@ -2024,7 +2025,8 @@ async function waitForEmbeddedBrowserPage(appFrame, failures, ignoredOpenIds = n
       !(entry.open_id && ignoredOpenIds.has(entry.open_id)));
     if (failure) {
       throw Object.assign(new Error("Embedded Browser startup returned a failed open settlement"), {
-        details: { stage: smokeStage, status: failure.status, settlement: failure.body },
+        details: { stage: smokeStage, status: failure.status, settlement: failure.body,
+          response_format: failure.response_format, admission_reason: failure.admission_reason },
       });
     }
     const pageId = await appFrame.evaluate(() => window.__elastosBrowserCurrentPageId || "");
@@ -2953,11 +2955,12 @@ async function checkBrowserEmbeddedUiInput(page, baselineToken) {
   const captureOpenFailure = async response => {
     const request = response.request();
     if (!/^\/api\/apps\/browser\/open(?:\/[^/]+)?$/.test(new URL(response.url()).pathname)) return;
-    const body = await response.json().catch(() => null);
+    const evidence = await browserOpenResponseEvidence(response);
+    const { body } = evidence;
     if ((request.method() === "POST" && !response.ok()) ||
       (body?.schema === "elastos.browser.open-status/v1" && body.status === "failed")) {
       openFailures.push({ frame: request.frame(), open_id: body?.open_id || "",
-        at: Date.now(), status: response.status(), body });
+        at: Date.now(), status: response.status(), ...evidence });
       if (openFailures.length > 8) openFailures.shift();
     }
   };
