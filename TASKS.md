@@ -24,6 +24,89 @@ Initial analysis source:
 [`8ac18bec65ca650615be879f7ab3f66799d9fc53`](https://github.com/Elacity/elastos-runtime/tree/8ac18bec65ca650615be879f7ab3f66799d9fc53).
 Revalidate those findings against the implementation base before each repair.
 
+### Current execution milestone
+
+Mission acceptance remains B01–B16 in `BROWSER_ACCEPTANCE.md`. The execution
+checkpoint requested on 2026-09-08 narrows the next proof to the task-owned Mac:
+open Browser through Home, load a controlled page, receive a decoded WebRTC
+frame, navigate, type, scroll, and close through Home with confirmed session
+cleanup. One coordinating operator owns that installed Runtime, VM and viewer.
+Independent source repair and regression work can proceed in separate file scopes.
+
+- Passed prerequisites: protocol 2.1 compatibility/readiness source checks;
+  matching installed Runtime, providers and guest artifacts; served Home parity.
+  Repairs cover Runtime-scoped IPC, the no-NIC online-state projection, Net's
+  handoff to Exit destination policy, and Chromium's loopback proxy rule.
+- Passed installed steps in run 11: Home launch, controlled main and navigation
+  page loads, advancing decoded WebRTC frames, exact text prefixes, scrolling,
+  and fresh UI close. Raw receipt review confirms all 13 VZ cleanup effects,
+  the exact UI close authority and zero Runtime sessions/cleanup obligations.
+- Accepted by independent agent review: runs 11 and 12 pass this narrow
+  installed journey. Run 12 also verifies `b0f648ee`: controlled main and next
+  page status were ready in 334/105 ms, with decoded progress in 563/335 ms.
+  Run 13 repeats the full journey and cleanup with unchanged installed artifacts.
+  Its startup sample excludes it from a formal latency distribution.
+- Runs 14 and 15 pass the journey and cleanup, but startup remains about
+  34–35 seconds in the Engine launcher. The `085d49e7` guest socket cleanup and
+  `8c09a6db` native receipt framing repairs pass focused regressions; neither
+  removed this installed delay. Native `8c127d2f` failure handling is installed
+  with the framing repair and still needs its deterministic failure experiment.
+- Independent review accepts run 16 with the `9923983c` harness, which
+  requires fresh cleanup of the last exercised page and exact response/UI
+  authority. The installed `98ab05a7` image and unchanged native helper match
+  their receipts. Diagnostic capture excludes this run from latency distributions.
+- Run 16 locates most startup delay after website loading: video signaling takes
+  about 18.6 seconds and audio signaling about 4 seconds. The exact installed
+  Selkies source uses blocking two-second sleeps in both async peer retry
+  handlers. Source `56ce99e4` changes those waits to yield to the shared loop;
+  five regressions pass with the retry interval preserved. Independent review
+  accepts installed run 17: launch readiness falls to 13,829 ms, controlled
+  decoded progress is 280/132 ms, and exact close confirms all 13 effects and
+  zero Runtime obligations. This is one measured improvement, not a p95 result.
+  Guest Node also begins about five seconds after its shell launch, with initial
+  entropy 1 and no hardware RNG selected; that separate delay remains open.
+- Run 19 finds an initial UI readiness race: the address field accepts input
+  before the pending default launch settles, which can replace that navigation.
+  Source `f5192b2e` keeps the field pending through startup; four focused tests
+  pass. Served HTML/JavaScript hashes match the installed repair. Run 20 passes
+  both controlled navigations, decoded frames, typing, scrolling and exact
+  cleanup. Its recovery wrapper then rejects a missing fixture URL before any
+  connection cut; this is a harness failure, with product recovery still open.
+- Active local milestone: B06 five-second viewer interruption with the run-17
+  guest/native artifacts and the installed startup UI repair. Review requires
+  the exact controlled URL, frame progress after recovery input, and timely
+  restoration when the last cut observation is unfinished. The repaired probe
+  passes 75 combined regression checks and independent source review. Installed
+  run 21 observes a failed viewer status request followed two milliseconds later
+  by a close request, while Runtime still owns the active page. Video then
+  disappears. Restoration and subsequent exact cleanup pass. The next repair
+  keeps transient status/heartbeat failures separate from page close, then
+  repeats this same journey. Repair `40044c11` is installed with matching served
+  assets. Independent review accepts run 22 for surviving five failed status
+  requests during a 5001 ms HTTP cut, retaining the same owner and media, then
+  exact cleanup. Full recovery remains open: TCP TURN media kept flowing, so
+  the probe correctly rejects the cut. The next test interrupts the task-owned
+  relay as well as HTTP, with an independent resume safeguard.
+  The probe must observe request failure and
+  stopped media, then restore the same page, profile, service selection and
+  input within five seconds.
+  Viewer reload and the other original B06 cases remain separate requirements.
+- Run 09 reached the journey stages, then a test-only summary failed its origin
+  check. Run 10 stalled before Browser launch; that Home setup observation
+  remains unresolved.
+- Full B01, media, repeat/recovery, remote Engine/Exit, device and human
+  qualification remain open. Failed-run cleanup is separate evidence.
+
+B02 installation, B03 stage diagnostics, B05 interaction and B06 recovery can
+use the verified B01 contract slice now. They depend on its delivered contract
+and relevant installed prerequisites, not on complete device certification.
+Keep all parent goal checkboxes open. Every repair returns to the same installed
+journey; reuse unchanged artifacts. Report passed, failed and pending milestones
+at each 30-minute evidence checkpoint and continue authorized local work.
+After this journey passes, review its evidence and run the next ready local
+recovery or repeat-launch slice. Full media, remote placement, device and human
+acceptance remain required by their original goals.
+
 B01 source work shares the Runtime/Engine request and capability definitions,
 rejects incompatible Engines before profile preparation and launch effects, and
 selects an Engine that meets the requested display and isolation requirement.
@@ -31,10 +114,11 @@ The role matrix and current protocol are in
 [BROWSER_SUPPORT.md](docs/BROWSER_SUPPORT.md) and
 [BROWSER_PROTOCOL.md](docs/BROWSER_PROTOCOL.md). Remaining B01 acceptance needs
 installed artifact admission, approved remote-service
-selection, and hash-bound device-role proof. The inspected Mac's existing VM
-image failed its manifest hash check. Rootfs preflight now checks the receipt
-with and without direct guest inspection. Repair or rebuild the image with
-verified provenance and a matching receipt before qualification. Source-home setup now verifies a complete image set and preserves its bytes;
+selection, and hash-bound device-role proof. Initial Mac inspection found an
+image that failed its manifest hash check. The task fixture now uses a fresh,
+verified image and matching helpers, as bound by its installed journey receipts.
+Rootfs preflight checks the receipt with and without direct guest inspection.
+Source-home setup verifies a complete image set and preserves its bytes;
 managed projections carry the matching receipt. Host maintenance reports guest
 drift before any mutation. Build guest changes through the image builder. Add
 automatic artifact acquisition and an atomic, provenance-bound host/guest update
@@ -52,8 +136,9 @@ The web Runtime adapter now checks viewer eligibility before page replacement
 or Engine dispatch. The focused installed Brave test proves disabled-WebRTC
 rejection through Home's actual Browser sandbox, zero Engine open requests and
 sessions, and clean window close. Qualify actual media and negotiated codecs
-next. The existing VM control helper differs from current source as well as
-having a stale image receipt. Keep the general Home test separate from this
+next. The earlier helper drift belongs to the initial inspected installation;
+the current task fixture's matching artifacts are recorded above.
+Keep the general Home test separate from this
 focused result; its System and shell-switch journeys still need verification.
 
 - [ ] [B01: One Browser contract and an explicit support matrix](docs/BROWSER_ACCEPTANCE.md#b01).

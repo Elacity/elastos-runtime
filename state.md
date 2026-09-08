@@ -73,6 +73,113 @@ volatile proof logs remain outside the repository.
 Browser B01 is in progress. The contract is in
 [docs/BROWSER_PROTOCOL.md](docs/BROWSER_PROTOCOL.md), and the role-specific
 qualification matrix is in [docs/BROWSER_SUPPORT.md](docs/BROWSER_SUPPORT.md).
+The fresh Mac fixture at source `21966efe5c43b8f7859734c24c8fc7fa405366a8`
+and tree `d8c8bf4e03907a0f91b7828e66de47fef245d888` now contains the matching
+Runtime, providers, signed VZ launcher and complete guest image. A read-only
+comparison passed for all 13 components in its fixture receipt. Strict startup
+also verified the Runtime, component metadata, served Home and identical Browser
+control helpers in source, installation, initrd and rootfs. Home returned 200;
+the Engine readiness endpoint returned ready. These are installed prerequisites,
+with product interaction and device certification still open.
+The first journey attempt signed in successfully, then its old desktop-shortcut
+selector timed out before Browser launch. The harness now uses Home's existing
+Shelf/launcher path and reuses a visible restored window. Source-home IPC defaults
+now bind to the Runtime data directory; the installed Exit helper started with
+its own socket. The fixture also now uses canonical setup's TURN executable
+selection. Neither observation establishes the cause of Sash's reported failure.
+The next run booted the VM and reached guest page opening, then failed after
+126.6 seconds. Its terminal receipt confirmed VM, TURN, bridges, sockets and
+session-directory cleanup. A subsequent guest-log capture identified repeated
+failure before website navigation: Chromium rejected the Runtime online-state
+projection. Chromium 150 clears an override with zero latency and disabled
+throughputs, restoring the no-NIC guest's offline state. Source repair
+`ee5a84025f235497b553a04c52551f7974ddf704` supplies an active navigator-state hint;
+traffic remains owned by Runtime. Its no-NIC regression reproduced the old failure
+and passes with the repair. The rebuilt guest image passed source and installed
+preflight; source, installed, initrd and rootfs helper hashes match. Installed
+guest logs now report online and show the start of website navigation.
+The controlled localhost page then failed before Engine effects: Net rejected
+the destination before consulting Exit, despite its exact configured grant.
+A focused stream change gives Exit the destination decision while Net validates
+the request and acquires no connection. Seven Net tests and the existing exact
+private-target Exit regressions pass. The rebuilt Net provider is installed with
+matching build/install hashes and updated component metadata for the next journey.
+The fixture is composed: Runtime source remains `21966efe`, guest source is
+`ee5a8402`, and separate patch receipts bind later provider/config changes.
+The installed Net repair permits the controlled target to reach the guest.
+Chromium then reports `ERR_NAME_NOT_RESOLVED`: its implicit loopback bypass
+skips the Runtime proxy. A real Chromium regression reproduces that failure
+and loads the same URL through the proxy when the bypass is disabled. The
+guest launch flag repair is installed from `9f4e123a`, with matching rootfs,
+kernel, initrd and helper checks. Run 09 reached controlled main/navigation
+decoded frames, observed text input and scroll, and confirmed exact UI-close
+cleanup. A later test-only summary failed its opaque-origin contract, so a
+repeat run retained the full passing receipt. Run 11 completed with zero exit
+status. Main decoded frames advanced from 452 to 456, navigation from 910 to
+912, and input reached 1020. Fixture events contain every expected typed prefix
+and scrolling. The fresh close matches the page, cleanup handle and UI request;
+all 13 VZ terminal effects and zero Runtime sessions/obligations were verified.
+Independent agent review accepts runs 11 and 12 for this narrow journey. Run 10 stalled before Browser launch
+and remains an unresolved Home setup observation. Both successful controlled
+navigations took about 15 seconds; source inspection found a second wait for
+an already-consumed DOM readiness event. The `b0f648ee` repair removes that
+second wait. Five focused command regressions and the guest control-only smoke
+pass. The matching guest image passes run 12: main and next-page status are ready
+in 334/105 ms, with decoded progress in 563/335 ms. Strict VZ close proof confirms
+all 13 effects and zero Runtime obligations. Source hashes were captured before
+execution and checked after it. Run 13 repeats the full journey and cleanup.
+Its diagnostic sample shows the native helper waiting for bootstrap receipt
+completion. The guest retains its 30-second descriptor timer and paused socket
+after success. `085d49e7` clears that timer and closes after receipt flush; a real
+socket regression passes. Installed run 14 passes the journey but retains a
+33,983 ms Engine launch. Native `8c09a6db` then reads the bounded bootstrap JSON
+line without waiting for peer closure. Its 37 binary tests pass; installed run
+15 passes the journey but retains the startup delay. These repairs therefore
+establish their socket and framing behavior, not the desired startup speed.
+Independent review accepts installed `98ab05a7` run 16 with the stricter
+`9923983c` journey harness.
+Its reviewed close checks require the last exercised page, exact frame/origin/
+token authority, and matching pending/terminal UI ownership. All 13 cleanup
+properties pass. Private guest observations locate about 18.6 seconds in video
+signaling and 4 seconds in audio signaling after the initial website load.
+The installed Selkies async peer retry handlers each use `time.sleep(2)`, blocking
+the shared signaling loop. Source `56ce99e4` yields during those waits and
+preserves their two-second interval. Five regressions pass, including the
+bounded reproduction of both original blocking handlers. Independent review
+accepts installed run 17: Engine launch readiness is 13,829 ms; controlled
+main/navigation decoded progress is 280/132 ms. Exact UI close confirms all 13
+VZ effects and zero Runtime obligations. This single run establishes improvement;
+the full latency distribution and startup target remain open. Run 19 then
+exposes a startup UI race: an enabled address field accepts navigation before
+the pending default launch settles. Repair `f5192b2e` keeps startup controls
+pending; four focused regressions pass and served assets match the installation.
+Run 20 passes the controlled pages, decoded video, input, scrolling and exact
+cleanup. B06 stops before interruption because its wrapper omits the fixture
+URL. The corrected probe also addresses two review findings: it requires new
+frames after recovery input and restores the connection on time when a final
+cut observation is unfinished. Its 75 combined checks pass with independent
+source review. Run 21 reproduces a product failure: a viewer status request
+fails during the cut, Browser requests close two milliseconds later, and video
+disappears while Runtime still owns the active page. The diagnostic restores
+the connection; explicit close then confirms all 13 effects and zero Runtime
+obligations. Installed repair `40044c11` passes independent run-22 review for
+preserving the same page and media through five failed status requests during
+a 5001 ms HTTP cut. Fresh close again proves all 13 effects and zero obligations.
+Full B06 remains open because media continued during the cut: Chromium's P2P
+packet-loss interceptor applies to UDP, while this VZ path uses TCP TURN.
+The next bounded experiment also interrupts the task-owned relay and retains
+the original observed-stall and five-second recovery requirements.
+Guest and native artifacts remain those accepted in run 17.
+Guest Node also starts about five seconds after its shell launch;
+initial entropy is 1 and no hardware RNG is selected. That secondary cause needs
+its own experiment. Run 16 includes diagnostic overhead and is excluded from
+formal latency distributions. Native diagnostics `8c127d2f` are installed with
+the framing repair: completed guest HTTP failures enter cleanup promptly in
+source tests, while detailed logs stay behind the private control endpoint.
+The deterministic installed failure test remains open.
+The Browser status module at `dd36a332` also preserves authority after a policy
+403; source, installed and served module hashes match. Eleven focused status
+tests pass; real policy-denial close/recovery qualification remains open.
 The initial compatibility slice shares Engine protocol and request types,
 validates declared Engine capabilities before launch, and preserves explicit
 operator selection. Installed acceptance of this slice remains open.
