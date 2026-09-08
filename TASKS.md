@@ -33,30 +33,44 @@ frame, navigate, type, scroll, and close through Home with confirmed session
 cleanup. One coordinating operator owns that installed Runtime, VM and viewer.
 Independent source repair and regression work can proceed in separate file scopes.
 
-Latest checkpoint: installed guest control `6f5d48ae` with the existing Runtime,
-provider, VZ helper and Browser UI. The image and helper match the installed
-receipts; source-only RNG work remains outside this image.
+Latest checkpoint: the image with ICE lifetime source `77983efd` is installed,
+with guest control `6f5d48ae` and the existing Runtime, provider, VZ helper and
+Browser UI. Artifact hashes match the installation receipts. Runs 45–49 fail
+before acquiring a page: the guest signaling connection closes while waiting
+for the legacy SDP offer. Runtime releases each failed launch and reports zero
+remaining sessions. Source-only RNG work remains outside this image.
 
 | Delivered milestone | Current result | Next action |
 | --- | --- | --- |
 | B01 shared compatibility/ownership contract | Accepted prerequisite; full B01 stays open | Use the contract for B02/B03/B05/B06 and operator work. |
-| Requested local Home-to-close journey | Runs 41 and 42 independently accepted on the current image | Keep this bounded milestone accepted while qualifying recovery and devices. |
+| Requested local Home-to-close journey | Runs 41 and 42 independently accepted on the preceding image; current image fails startup | Repair the current image, then repeat this same journey. |
 | B02 Mac TURN admission | Installed valid/absent/nonexistent program cases accepted | Complete automatic artifact admission and fresh-install proof. |
-| B03 passive retained diagnostics | Installed log reads capture the reload failure without audio commands | Matching-library reproduction confirms the defect; install reviewed source `77983efd` and repeat the journey. |
+| B03 passive retained diagnostics | Installed log reads capture the reload failure without audio commands | The bounded failure hold captures video setup stopping after ICE; matching-library tests reproduce a corrupt Gst.Structure constructor. |
 | B05 acknowledged click then text | Installed click and first character each return accepted Runtime results in run 43 | Keep composition, motion, mixed transports and manual interaction open. |
-| B06 viewer reload | Run 42 passes in 1066 ms; run 41 crashes the media producer during video pipeline recreation | The guarded Python reference repair passes both ownership cases; verify its installed image. |
+| B06 viewer reload | Run 42 passes in 1066 ms; run 41 crashes the media producer during video pipeline recreation | Add the missing gst-python dependency, remove fraction workarounds, then repeat normal startup and reload. |
 | B06 five-second interruption | Run 44 passes a 5001 ms cut, recovery in 1911 ms and cleanup in 624 ms | Independent review accepts this bounded result; retain full recovery cases and leases. |
 
-B04 can now implement owner-authorized inspection of the actual Engine page
-against the accepted contract. Its next slice needs capability negotiation,
+B04 has an accepted prerequisite for owner-authorized inspection of the actual
+Engine page. Its implementation follows the current local startup repair. The
+next slice needs capability negotiation,
 bounded snapshots, pagination and document generations. Writer leases, delegated
 operators and Playwright/Camofox/Camoufox adapters retain their full gates.
 
 ICE repair `77983efd` reproduces the dangling wrapper on the first teardown
 with the exact guest library versions. The guarded repair releases all 400
 agents over 100 cycles in each of two ownership cases. Six source guard tests,
-the stage smoke and independent review pass. Its image build preserves the
-previous guest baseline and excludes the unrelated entropy change.
+the stage smoke and independent review pass. The installed image preserves the
+previous guest baseline and excludes the unrelated entropy change. This repro
+only creates and removes bins in NULL state; it does not exercise the real
+Selkies media startup. The installed failures expose that coverage gap.
+
+The exact guest lacks gst-python. Its unchanged data-channel structure
+constructor ignores the name argument and aborts with native heap corruption
+in a bounded matching-library test. Installing only `python3-gst-1.0` makes that
+same call pass. Reviewed source `cbb1e099` supplies the standard bindings and removes
+the old fraction workarounds. Its build gate and ten real video offer/stop cycles
+pass with the matching libraries. The installed startup/reload result remains
+pending while the corrected image builds.
 
 The fractional-timer regression fails before the probe correction; 254 related
 checks pass after it. The recovery threshold remains five seconds. Source tests

@@ -70,18 +70,32 @@ volatile proof logs remain outside the repository.
 
 ## Browser contract and device qualification
 
-The task Mac currently uses guest Engine source `6f5d48ae`, rootfs
-`a811e66ba443dd3b9dc43dbbad8c7f230eb6ddaf36a8150a861a2b11d09a0841`,
-and matching control helper
+The task Mac currently uses the image with ICE lifetime source `77983efd`, rootfs
+`395a8c78fb1b888de69c9f0782990b974a039bd5909e6427ec2f2064f677f153`,
+and guest control source `6f5d48ae`, helper hash
 `eb963971286e8b82d95896c4ba8a849c9938d24dee8dc2a5936784a4564cb489`.
 Runtime, adapter, VZ helper, kernel and Browser UI were reused and verified.
-Runs 41 and 42 pass the requested Home-to-close journey. Run 42 also passes
+Runs 45–49 fail before page acquisition when the guest signaling connection
+closes while waiting for its legacy SDP offer. Each failed launch releases its
+acquired effects; Runtime and control report zero remaining sessions. The
+terminal producer log stops during video setup after the ICE hook, without a
+Python exception. This image is not accepted.
+
+The preceding rootfs
+`a811e66ba443dd3b9dc43dbbad8c7f230eb6ddaf36a8150a861a2b11d09a0841`
+passes the requested Home-to-close journey in runs 41 and 42. Run 42 also passes
 viewer reload in 1066 ms and exact cleanup in 600 ms. Run 41 instead crashes the
 Selkies producer while recreating its video pipeline: GObject assertions precede
-a fatal allocation failure. The matching-library reproduction confirms a dangling ICE wrapper. Reviewed
-source `77983efd` restores only the missing native reference and releases the
-wrapper on stop. Both reference-ownership cases pass 100 cycles each, releasing
-all 400 agents. The image update is building; installed proof is pending.
+a fatal allocation failure. A matching-library reproduction confirms a dangling
+ICE wrapper. Source `77983efd` passes two reference-ownership cases over 100
+cycles each, releasing all 400 agents. Those tests use bins in NULL state and
+leave real Selkies startup uncovered; its installed regression remains open.
+The real module produces an offer in isolation, but its data-channel structure
+constructor reproduces native heap corruption in a smaller matching-library
+test. The guest omits gst-python, whose override supplies that constructor.
+Installing only `python3-gst-1.0` makes the unchanged call pass. Reviewed source `cbb1e099` supplies that dependency and removes the legacy
+fraction workarounds. The new build gate and ten real video offer/stop cycles
+pass. The corrected image still needs installed journey and reload proof.
 Independent agent review accepts both core journeys and the single bounded
 reload in run 42. Repeated recovery qualification remains open.
 Run 43 confirms accepted Runtime click/text responses and normal browsing, then
