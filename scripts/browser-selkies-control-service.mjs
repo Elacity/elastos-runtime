@@ -4706,7 +4706,10 @@ async function applyBrowserCommand(config, browserPage, event, timeoutMs) {
       } else {
         throw new Error("unsupported browser command");
       }
-      await cdp.waitForEvent("Page.domContentEventFired", Math.min(timeoutMs, 15000), "domcontent").catch(() => {});
+      // navigateInitialBrowserPage already observes and consumes this event.
+      if (command !== "navigate") {
+        await cdp.waitForEvent("Page.domContentEventFired", Math.min(timeoutMs, 15000), "domcontent").catch(() => {});
+      }
       await projectAndLogRuntimeProxyOnlineState(
         cdp,
         config.runtimeFetchProxyUrl,
