@@ -1458,6 +1458,7 @@ fn extracted_bundle_cache_stale_reason(
     install_root: &Path,
     platform_info: &PlatformInfo,
 ) -> Option<String> {
+    // Only an extracted bundle can be stale.
     platform_info.extract_path.as_ref()?;
 
     if let Some(expected_cid) = platform_info
