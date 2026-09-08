@@ -239,8 +239,15 @@ broker rejects fixed viewer UID 1 before the old producer finishes retirement.
 Normal browsing and exact cleanup pass. Source `b7ec14fc` passes 28
 attachment regressions, the Selkies smoke and independent agent review. It retries
 only the exact legacy UID rejection before HELLO acknowledgment, inside the
-existing four-second deadline. Installed proof is pending a guest rebuild with
-that single changed input. Runtime, adapter and Browser UI remain reusable.
+existing four-second deadline. Its installed image passes run 34 in 3143 ms
+and run 36 in 3163 ms. Repeat run 35 reaches the four-second attachment deadline;
+normal browsing and exact cleanup pass in all three. Repeated recovery remains
+open. The next diagnosis checks video/audio registration order and producer
+retry timing. Runtime, adapter and Browser UI are unchanged.
+Run 37 then fails at initial typing, before reload; exact cleanup still passes.
+Reviewed source `a80b230a` fixes a proven click/text ordering gap by awaiting
+the existing Runtime click acknowledgment before text insertion. Its 22 ordering
+tests pass; installed proof is pending. Attribution of run 37 remains provisional.
 Guest log reads refresh synchronous audio diagnostics, so observer runs remain
 excluded from formal latency distributions.
 A separate B02 child-process check finds that the installed Mac host-readiness

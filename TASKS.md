@@ -162,8 +162,15 @@ Independent source repair and regression work can proceed in separate file scope
   original four-second attachment deadline, including an explicit monotonic
   check when the event loop is delayed. A socket regression covers delayed
   video and audio retirement, repeated attachment, cancellation and terminal
-  errors. Rebuild the changed guest control from the verified image inputs,
-  reuse the matching Runtime, adapter and UI, then repeat the installed journey.
+  errors. The corrected image is installed with matching helpers and reused
+  Runtime, adapter and UI. Run 34 passes reload in 3143 ms and exact cleanup in
+  567 ms. Repeat run 35 fails attachment at its four-second deadline; normal
+  browsing and all 13 cleanup effects still pass. Run 36 passes in 3163 ms; its
+  late diagnostic read finds the guest already closed. Repeated recovery remains
+  open. The next experiment captures the late attachment failure and checks
+  whether sequential video-offer/audio-registration work misses a producer retry
+  cycle. B02 readiness is source-reviewed and remains outside this installed
+  experiment until the Engine result is understood.
   Guest log requests also refresh synchronous audio diagnostics; runs with that
   observer remain outside formal latency distributions. Full B06 remains open.
   In parallel, B02 has an installed readiness counterexample: valid, absent and
@@ -171,6 +178,12 @@ Independent source repair and regression work can proceed in separate file scope
   These checks change only child environments and acquire no page or VM. The
   readiness source now checks the executable and its cache identity, then will
   repeat the negative checks and the same installed Browser journey.
+  Run 37 fails before reload: main/nav load, then no typed-text event reaches
+  the fixture; close settles all 13 effects in 615 ms. Source review proves a
+  separate ordering gap between data-channel clicks and Runtime text insertion.
+  Reviewed source `a80b230a` sends clicks through the existing acknowledged
+  Runtime input route. Its 22 ordering tests pass; the old source fails the three
+  new click cases. Install that UI-only repair and repeat the same journey.
   Full B05 mixed-transport ordering and motion behavior remain separate gates.
   The probe must observe request failure and
   stopped media, then restore the same page, profile, service selection and
