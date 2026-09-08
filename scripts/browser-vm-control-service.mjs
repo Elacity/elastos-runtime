@@ -25,11 +25,15 @@ function readinessArtifactIdentity(dataDir, launcher) {
   ];
   if (linux) {
     files.push(artifact("ELASTOS_BROWSER_VM_CROSVM_BIN", "bin/crosvm"), "/dev/kvm");
+  } else if (process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("darwin-") ?? process.platform === "darwin") {
+    const turnProgram = process.env.ELASTOS_BROWSER_VM_TURN_PROGRAM;
+    if (!turnProgram || !path.isAbsolute(turnProgram)) return null;
+    files.push(turnProgram);
   }
   try {
     return JSON.stringify(files.map((file) => {
       const info = fs.statSync(file, { bigint: true });
-      return [file, info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].map(String);
+      return [file, info.dev, info.ino, info.mode, info.size, info.mtimeNs, info.ctimeNs].map(String);
     }));
   } catch {
     return null;

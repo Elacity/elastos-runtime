@@ -536,6 +536,12 @@ if mode == "--host-readiness":
         reason = image_reason
     elif not local_substrate_artifacts_ready:
         reason = "preparation_required"
+    elif platform == "darwin-arm64" and not (
+        os.path.isabs(turn_program := os.environ.get("ELASTOS_BROWSER_VM_TURN_PROGRAM", ""))
+        and os.path.isfile(turn_program)
+        and os.access(turn_program, os.X_OK)
+    ):
+        reason = "preparation_required"
     else:
         try:
             if reason is None and platform == "darwin-arm64":

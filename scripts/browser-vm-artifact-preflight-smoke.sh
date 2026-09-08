@@ -278,6 +278,10 @@ if debugfs and mke2fs:
                            "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()}
         host_helper = data / "bin/browser-vz-engine-supervisor"
         host_helper.write_text("#!/bin/sh\nprintf '%s\\n' '{\"schema\":\"elastos.browser.vm-host-capabilities/v1\",\"available\":true}'\n")
+        turn_program = data / "bin/turnserver"
+        turn_program.write_text("#!/bin/sh\nexit 99\n")
+        turn_program.chmod(0o755)
+        env["ELASTOS_BROWSER_VM_TURN_PROGRAM"] = str(turn_program)
         sidecar.write_text(json.dumps(valid))
 
         def host_check(name, expected):
@@ -289,6 +293,12 @@ if debugfs and mke2fs:
             checks.append(name)
 
         host_check("complete fixture host readiness", {"state":"ready"})
+        for name, program in [("absent", None), ("nonexistent", str(data / "absent-turnserver"))]:
+            env.pop("ELASTOS_BROWSER_VM_TURN_PROGRAM", None)
+            if program is not None:
+                env["ELASTOS_BROWSER_VM_TURN_PROGRAM"] = program
+            host_check(f"host rejects {name} TURN program", {"state":"unavailable","reason":"preparation_required"})
+        env["ELASTOS_BROWSER_VM_TURN_PROGRAM"] = str(turn_program)
         original_kernel = (data / "bin/vmlinux").read_bytes()
         (data / "bin/vmlinux").write_bytes(b"changed kernel")
         host_check("host rejects changed kernel", {"state":"unavailable","reason":"artifact_invalid"})
