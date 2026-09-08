@@ -1613,7 +1613,7 @@ assert(
     !browserVmTargetStage.includes('>"$ELASTOS_BROWSER_VM_SERIAL_LOG_DEV"') &&
     browserVmTargetStage.includes('"control_socket_ready_timeout_ms": 60000') &&
     browserVmTargetStage.includes('"control_request_timeout_ms": 120000') &&
-    !browserVmTargetStage.includes("--proxy-bypass-list=<-loopback>") &&
+    browserVmTargetStage.includes("--proxy-bypass-list=<-loopback>") &&
     browserVmRootfsBuild.includes("elastos.browser.vm-rootfs-build/v1") &&
     browserVmRootfsBuild.includes("debootstrap") &&
     browserVmRootfsBuild.includes("elastos-tiny-initrd") &&

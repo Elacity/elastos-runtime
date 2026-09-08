@@ -1221,6 +1221,7 @@ ELASTOS_BROWSER_NATIVE_PROXY_ENGINE_CONFIG="$(cat <<JSON
   "startup_grace_ms": 1000,
   "browser_args": [
     "--proxy-server={proxy_url}",
+    "--proxy-bypass-list=<-loopback>",
     "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
     "--disable-dev-shm-usage",
     "--no-first-run",
