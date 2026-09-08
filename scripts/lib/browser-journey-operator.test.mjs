@@ -193,6 +193,7 @@ const failures = [
   ["foreign fixture", { changeReceipt: r => { r.run = "other-run"; } }, "fixture_invalid"],
   ["nonempty baseline", { changeReceipt: r => { r.events.at(-1).value = "already typed"; } }, "baseline_textbox_not_empty"],
   ["false native value", { changeResponse: r => { if (r.nodes) r.nodes[0].value = "wrong"; } }, "inspection_textbox_mismatch"],
+  ["absent native value field", { changeResponse: r => { if (r.nodes) delete r.nodes[0].value; } }, "inspection_textbox_mismatch"],
   ["foreign native page", { changeResponse: r => { if (r.nodes) r.page_id = "foreign"; } }, "inspection_invalid"],
   ["wrong approved scope", { changeResponse: r => { if (r.requests) r.requests[0].request = { ...r.requests[0].request, max_actions: 16 }; } }, "approval_scope_mismatch"],
   ["owner changes after approval", { changeState: (r, s) => { if (s.approved) r.viewer.browser_instance = "replaced"; } }, "owner_changed"],
@@ -244,4 +245,15 @@ test("stage logging failure cannot prevent revoke or close", async () => {
   const result = await f.run();
   assert.equal(result.ok, true); assert.equal(result.stage_log_failed, true);
   assert.equal(result.revocation.ok, true); assert.equal(f.closed, true);
+});
+
+test("native nullable empty value retains exact fixture effects and cleanup requirements", async () => {
+  const f = fixture({ changeResponse: r => { if (r.nodes) r.nodes[0].value = null; } });
+  const result = await f.run();
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.textbox_observation, { matches: 1, value_kind: "null", value_length: null });
+  assert.equal(result.operator_input.value_length, `Operator-${fixtureRun.slice(0, 8)}`.length);
+  assert.equal(result.human_input.value_length, `Operator-${fixtureRun.slice(0, 8)}-human`.length);
+  assert.equal(result.revoked_input_rejected, true);
+  assert.equal(result.close.effects, 13);
 });

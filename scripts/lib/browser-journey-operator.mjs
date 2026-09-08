@@ -193,7 +193,12 @@ export async function runBrowserOperatorJourney({ runtimeOrigin, runtimeCoords, 
           !seen.has(node.ref), "inspection_ref_invalid");
         seen.add(node.ref);
         if (node.role === "textbox" && node.name === "Test text") {
-          requireEvidence(!textbox && node.value === "", "inspection_textbox_mismatch"); textbox = node;
+          evidence.textbox_observation = { matches: textbox ? 2 : 1,
+            value_kind: node.value === null ? "null" : typeof node.value,
+            value_length: typeof node.value === "string" ? node.value.length : null };
+          // Native AX may omit an empty value. The exact current fixture load
+          // above proves the empty field; inspection binds the native ref.
+          requireEvidence(!textbox && (node.value === "" || node.value === null), "inspection_textbox_mismatch"); textbox = node;
         }
       }
       cursor = body.next_cursor;
