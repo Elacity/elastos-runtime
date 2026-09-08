@@ -2550,6 +2550,8 @@ async fn test_services_carrier_exit_admission_requires_current_issued_contact_gr
     let grant = authorize(&request, &source).unwrap();
     assert_eq!(grant.provider_principal_id, bob.authority.principal_id);
     assert_eq!(grant.requester_principal_id, alice.authority.principal_id);
+    assert_eq!(grant.max_active_streams, 64);
+    assert_eq!(grant.max_active_streams_per_principal, 64);
     assert_eq!(
         grant.expires_at - grant.revision,
         crate::carrier::EXIT_GRANT_TTL_SECS
@@ -3309,6 +3311,8 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
         left_authority.principal_id
     );
     assert_eq!(installed_exit["allowed_ports"], json!([80, 443]));
+    assert_eq!(installed_exit["max_active_streams"], 64);
+    assert_eq!(installed_exit["max_active_streams_per_principal"], 64);
 }
 
 #[tokio::test]

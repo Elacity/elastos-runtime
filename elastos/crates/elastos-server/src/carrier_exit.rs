@@ -7,6 +7,11 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 pub(crate) const EXIT_GRANT_TTL_SECS: u64 = 60 * 60;
+// A page uses parallel website and browser-service connections. Keep admission
+// bounded per approved person and across the host, rather than limiting a page
+// to the two streams used by the original transport fixture.
+pub(crate) const EXIT_GRANT_MAX_STREAMS: usize = 64;
+const EXIT_HOST_MAX_STREAMS: usize = 256;
 const SERVICE_MESSAGE_DOMAIN: &str = "elastos.services.access-message.v1";
 const MAX_SERVICE_MESSAGE_BYTES: usize = 16 * 1024;
 
@@ -108,10 +113,19 @@ pub(crate) struct BrowserExitGrant {
     pub grant_id: String,
     pub revision: u64,
     pub expires_at: u64,
+    pub max_active_streams: usize,
+    pub max_active_streams_per_principal: usize,
 }
 
 impl BrowserExitGrant {
     pub fn validate(&self, source: &iroh::PublicKey, request: &Value, now: u64) -> Result<()> {
+        anyhow::ensure!(
+            self.max_active_streams > 0
+                && self.max_active_streams <= EXIT_GRANT_MAX_STREAMS
+                && self.max_active_streams_per_principal > 0
+                && self.max_active_streams_per_principal <= self.max_active_streams,
+            "Browser Exit stream limits are invalid"
+        );
         anyhow::ensure!(
             self.requester_endpoint == *source
                 && request["principal_id"].as_str() == Some(&self.requester_principal_id)
@@ -181,18 +195,18 @@ impl BrowserExitReservations {
             "Browser Exit stream is already active"
         );
         anyhow::ensure!(
-            active.len() < 64
+            active.len() < EXIT_HOST_MAX_STREAMS
                 && active
                     .values()
                     .filter(|value| value.grant_id == grant.grant_id)
                     .count()
-                    < 4
+                    < grant.max_active_streams
                 && active
                     .values()
-                    .filter(|value| value.grant_id == grant.grant_id
+                    .filter(|value| value.requester_endpoint == grant.requester_endpoint
                         && value.requester_principal_id == grant.requester_principal_id)
                     .count()
-                    < 2,
+                    < grant.max_active_streams_per_principal,
             "Browser Exit stream quota is exhausted"
         );
         active.insert(key.clone(), grant.clone());
@@ -226,6 +240,8 @@ mod tests {
                 grant_id: "issued-grant".into(),
                 revision: 100,
                 expires_at: 200,
+                max_active_streams: 4,
+                max_active_streams_per_principal: 2,
             },
             json!({"grant_id":"issued-grant", "principal_id":"person:requester",
             "target":"tls://example.com:443", "stream_id":"stream:1"}),
@@ -279,6 +295,39 @@ mod tests {
         drop(first);
         let third = state.reserve(&grant, "stream:3").unwrap();
         drop((second, third));
+        assert!(state.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn normal_page_parallel_streams_remain_bounded_and_release_capacity() {
+        let (mut grant, _) = fixture();
+        grant.max_active_streams = EXIT_GRANT_MAX_STREAMS;
+        grant.max_active_streams_per_principal = EXIT_GRANT_MAX_STREAMS;
+        let state = BrowserExitReservations::default();
+        let mut streams = (0..EXIT_GRANT_MAX_STREAMS)
+            .map(|n| state.reserve(&grant, &format!("stream:{n}")).unwrap())
+            .collect::<Vec<_>>();
+        assert!(state.reserve(&grant, "stream:overflow").is_err());
+        let mut another_grant = grant.clone();
+        another_grant.grant_id = "another-grant".into();
+        assert!(state.reserve(&another_grant, "stream:other-grant").is_err());
+        streams.pop();
+        let replacement = state.reserve(&grant, "stream:replacement").unwrap();
+        drop((streams, replacement));
+        assert!(state.0.lock().unwrap().is_empty());
+        let mut all = Vec::new();
+        for person in 0..4 {
+            grant.requester_principal_id = format!("person:{person}");
+            grant.grant_id = format!("grant:{person}");
+            for n in 0..EXIT_GRANT_MAX_STREAMS {
+                all.push(state.reserve(&grant, &format!("stream:{n}")).unwrap());
+            }
+        }
+        grant.requester_principal_id = "person:overflow".into();
+        grant.grant_id = "grant:overflow".into();
+        assert!(state.reserve(&grant, "stream:overflow").is_err());
+        drop(all);
+        assert!(state.reserve(&grant, "stream:after-close").is_ok());
         assert!(state.0.lock().unwrap().is_empty());
     }
 

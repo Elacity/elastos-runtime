@@ -279,6 +279,10 @@ struct HomeServiceAccessRequestRecord {
     authenticated_request: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grant_expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exit_max_active_streams: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exit_max_active_streams_per_principal: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -2600,8 +2604,8 @@ fn home_services_send_access_decision(
             "allowed_schemes": ["tcp", "tls"],
             "allowed_ports": [80, 443],
             "expires_at": request.grant_expires_at,
-            "max_active_streams": 4,
-            "max_active_streams_per_principal": 2,
+            "max_active_streams": request.exit_max_active_streams.unwrap_or(4),
+            "max_active_streams_per_principal": request.exit_max_active_streams_per_principal.unwrap_or(2),
         });
     }
     if decision == "approved"
@@ -3127,6 +3131,10 @@ pub(crate) fn authorize_home_service_exit(
                     .ok()
                     .ok_or_else(|| anyhow::anyhow!("Exit requester identity invalid"))?,
                 grant_id: home_services_remote_exit_grant_id(&record.request_id),
+                max_active_streams: record.exit_max_active_streams.unwrap_or(4),
+                max_active_streams_per_principal: record
+                    .exit_max_active_streams_per_principal
+                    .unwrap_or(2),
                 revision: record.updated_at,
                 expires_at: record
                     .grant_expires_at
@@ -3273,6 +3281,19 @@ fn home_services_remote_exit_grant(
     }
     let id = home_services_remote_exit_id(&record.service_display_name, &record.request_id);
     let grant_id = home_services_remote_exit_grant_id(&record.request_id);
+    let max_active_streams = grant["max_active_streams"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("Exit stream limit required"))?;
+    let max_active_streams_per_principal = grant["max_active_streams_per_principal"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("Exit principal stream limit required"))?;
+    anyhow::ensure!(
+        max_active_streams > 0
+            && max_active_streams <= crate::carrier::EXIT_GRANT_MAX_STREAMS as u64
+            && max_active_streams_per_principal > 0
+            && max_active_streams_per_principal <= max_active_streams,
+        "Exit stream limits are invalid"
+    );
     Ok(serde_json::json!({
         "id": &id,
         "grant_id": &grant_id,
@@ -3284,8 +3305,8 @@ fn home_services_remote_exit_grant(
         "allowed_schemes": ["tcp", "tls"],
         "allowed_ports": [80, 443],
         "expires_at": expires_at,
-        "max_active_streams": 4,
-        "max_active_streams_per_principal": 2,
+        "max_active_streams": max_active_streams,
+        "max_active_streams_per_principal": max_active_streams_per_principal,
     }))
 }
 
@@ -3584,6 +3605,8 @@ fn home_services_merge_access_request(
         status,
         authenticated_request: true,
         grant_expires_at: None,
+        exit_max_active_streams: None,
+        exit_max_active_streams_per_principal: None,
     };
     let changed = state
         .requests
@@ -3726,6 +3749,11 @@ fn home_services_mark_access_request(
     request.updated_at = revision;
     request.grant_expires_at = (status == "approved")
         .then(|| revision.saturating_add(crate::carrier::EXIT_GRANT_TTL_SECS));
+    if request.service_uri == HOME_BROWSER_EXIT_PEER_SERVICE_URI {
+        let limit = (status == "approved").then_some(crate::carrier::EXIT_GRANT_MAX_STREAMS);
+        request.exit_max_active_streams = limit;
+        request.exit_max_active_streams_per_principal = limit;
+    }
     state
         .requests
         .insert(request_id.to_string(), request.clone());

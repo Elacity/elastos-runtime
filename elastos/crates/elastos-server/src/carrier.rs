@@ -71,7 +71,8 @@ pub(crate) use file_transfer::fetch_file_from_trusted_source_to;
 #[path = "carrier_exit.rs"]
 mod browser_exit;
 pub(crate) use browser_exit::{
-    sign_service_message, verify_service_message, BrowserExitGrant, EXIT_GRANT_TTL_SECS,
+    sign_service_message, verify_service_message, BrowserExitGrant, EXIT_GRANT_MAX_STREAMS,
+    EXIT_GRANT_TTL_SECS,
 };
 #[path = "carrier_engine.rs"]
 mod browser_engine;
@@ -9318,6 +9319,8 @@ mod tests {
             grant_id: "operator-grant:server-exit:alice".into(),
             revision: crate::auth::now_ts(),
             expires_at: crate::auth::now_ts() + 60,
+            max_active_streams: 4,
+            max_active_streams_per_principal: 2,
         }
     }
 
