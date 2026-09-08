@@ -101,6 +101,8 @@ const metricsNode = document.querySelector("#browser-metrics");
 let currentPage = null;
 let currentPageGeneration = 0;
 let nextPageGeneration = 1;
+const MAX_PENDING_BROWSER_INPUTS = 128;
+let browserInputQueue = null;
 let currentView = null;
 let currentDisplayMode = "";
 let currentDisplayInput = "runtime_route";
@@ -1358,7 +1360,48 @@ async function sendBrowserInput(
   event,
   { focus = true, history = "push" } = {},
 ) {
-  if (!currentPage?.page_id) {
+  const owner = currentRuntimePageOwner();
+  if (!owner) {
+    return;
+  }
+  if (!browserInputQueue || !sameRuntimePageOwner(browserInputQueue.owner, owner)) {
+    browserInputQueue = { owner, tail: Promise.resolve(), pending: 0, failed: false };
+  }
+  const queue = browserInputQueue;
+  if (queue.pending >= MAX_PENDING_BROWSER_INPUTS) {
+    throw new Error("Browser input is busy. Check the page before typing again.");
+  }
+  queue.pending += 1;
+  // Runtime text insertion must settle before a later key or pointer action.
+  const pending = queue.tail.then(() => {
+    if (!sameRuntimePageOwner(currentRuntimePageOwner(), owner)) {
+      return;
+    }
+    if (queue.failed) {
+      throw new Error("Browser input was canceled after a failed operation.");
+    }
+    return dispatchBrowserInput(event, { focus, history }, owner);
+  });
+  queue.tail = pending.catch(() => {
+    // Delivery can be uncertain. Abandon dependent input without replaying it.
+    queue.failed = true;
+    if (browserInputQueue === queue) {
+      browserInputQueue = null;
+    }
+  });
+  try {
+    return await pending;
+  } finally {
+    queue.pending -= 1;
+  }
+}
+
+async function dispatchBrowserInput(
+  event,
+  { focus = true, history = "push" } = {},
+  inputOwner = currentRuntimePageOwner(),
+) {
+  if (!sameRuntimePageOwner(currentRuntimePageOwner(), inputOwner)) {
     return;
   }
   const requiresRuntimeRoute =
@@ -1387,7 +1430,7 @@ async function sendBrowserInput(
       focusRemoteInput();
     }
   } else {
-    const inputPageId = currentPage.page_id;
+    const inputPageId = inputOwner.page_id;
     let response;
     try {
       response = await fetchJson(
@@ -1398,10 +1441,14 @@ async function sendBrowserInput(
         },
       );
     } catch (error) {
-      if (recoverMissingRuntimePage(error, "Browser session was released.")) {
+      if (!sameRuntimePageOwner(currentRuntimePageOwner(), inputOwner)) {
         return;
       }
+      recoverMissingRuntimePage(error, "Browser session was released.");
       throw error;
+    }
+    if (!sameRuntimePageOwner(currentRuntimePageOwner(), inputOwner)) {
+      return;
     }
     if (event?.type === "file_upload" &&
         (currentPage?.page_id !== inputPageId || libraryPickerRequest?.requestId !== event.request_id)) {
