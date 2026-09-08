@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::Context as _;
 use elastos_common::CapsuleRole;
@@ -216,6 +216,14 @@ struct HomeServicesSelectionState {
     remote_offer_requests: BTreeMap<String, HomeServicesRemoteOfferRequestRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct HomeServicesPendingAccessDecision {
+    decision: String,
+    updated_at: u64,
+    // Constructed from bounded grant fields; stored only in protected principal state.
+    remote_exit: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct HomeServicesRemoteOfferRequestRecord {
     request_id: String,
@@ -229,6 +237,10 @@ struct HomeServicesRemoteOfferRequestRecord {
     status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     installed_remote_exit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_access_decision: Option<HomeServicesPendingAccessDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access_decision_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1943,6 +1955,23 @@ pub(super) async fn people_profile_update(
     }
 }
 
+fn home_services_mutation_lock(data_dir: &std::path::Path) -> anyhow::Result<Arc<Mutex<()>>> {
+    static LOCKS: OnceLock<Mutex<BTreeMap<std::path::PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let key = std::fs::canonicalize(data_dir)?;
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let entry = locks.entry(key).or_default();
+    if let Some(lock) = entry.upgrade() {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    *entry = Arc::downgrade(&lock);
+    Ok(lock)
+}
+
 pub(super) async fn services_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -1954,10 +1983,14 @@ pub(super) async fn services_summary(
         };
     let data_dir = state.data_dir.clone();
     let discovery_service = state.collaboration_discovery_service.clone();
+    let provider_registry = state.provider_registry.clone();
     match tokio::task::spawn_blocking(move || {
-        if let Err(err) =
-            home_services_sync_access_decisions(&data_dir, &context, discovery_service.as_ref())
-        {
+        if let Err(err) = home_services_sync_access_decisions(
+            &data_dir,
+            &context,
+            discovery_service.as_ref(),
+            provider_registry.as_deref(),
+        ) {
             tracing::warn!(
                 error = %err,
                 "could not sync Services access decisions"
@@ -1994,6 +2027,10 @@ pub(super) async fn services_offer_update(
     let data_dir = state.data_dir.clone();
     let discovery_service = state.collaboration_discovery_service.clone();
     match tokio::task::spawn_blocking(move || {
+        let mutation_lock = home_services_mutation_lock(&data_dir)?;
+        let _guard = mutation_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
         let mut home_state = home_state(&data_dir);
         apply_services_peer_authority(
             &data_dir,
@@ -2067,6 +2104,8 @@ pub(super) async fn services_offer_update(
                                 updated_at: sent.created_at,
                                 status: "requested".to_string(),
                                 installed_remote_exit_id: None,
+                                pending_access_decision: None,
+                                access_decision_sha256: None,
                             },
                         );
                     }
@@ -2468,6 +2507,7 @@ fn home_services_send_access_decision(
     >,
     request: &HomeServiceAccessRequestRecord,
     decision: &str,
+    created_at: u64,
 ) -> anyhow::Result<()> {
     if !matches!(decision, "approved" | "denied") {
         anyhow::bail!("service access request decision is invalid");
@@ -2502,7 +2542,6 @@ fn home_services_send_access_decision(
         PROFILE_REQUIRED_SERVICES_MESSAGE,
     )?;
     let provider_display_name = profile.display_name.clone();
-    let created_at = now_ts();
     let mut payload = serde_json::json!({
         "schema": "elastos.service-access-decision/v1",
         "kind": "service_access_decision",
@@ -2555,7 +2594,12 @@ fn home_services_sync_access_decisions(
     discovery_service: Option<
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
+    provider_registry: Option<&elastos_runtime::provider::ProviderRegistry>,
 ) -> anyhow::Result<()> {
+    let mutation_lock = home_services_mutation_lock(data_dir)?;
+    let _guard = mutation_lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
     let mut state = home_services_selection_state(data_dir, context)?;
     if state.remote_offer_requests.is_empty() {
         return Ok(());
@@ -2610,9 +2654,6 @@ fn home_services_sync_access_decisions(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if messages.is_empty() {
-        return Ok(());
-    }
     let mut changed = false;
     for message in messages {
         let Some(content) = message.get("content").and_then(serde_json::Value::as_str) else {
@@ -2628,13 +2669,7 @@ fn home_services_sync_access_decisions(
         {
             continue;
         }
-        match home_services_merge_access_decision(
-            data_dir,
-            context,
-            &mut state,
-            &payload,
-            &runtime.peer_id,
-        ) {
+        match home_services_merge_access_decision(context, &mut state, &payload, &runtime.peer_id) {
             Ok(merged) => changed |= merged,
             Err(err) => tracing::warn!("service access decision ignored: {err}"),
         }
@@ -2643,11 +2678,23 @@ fn home_services_sync_access_decisions(
         state.updated_at = now_ts();
         home_save_services_selection_state(data_dir, context, &state)?;
     }
+    // Persist the bounded approved receipt before activation, so an ACK or
+    // filesystem failure can retry on the next read after the mailbox advances.
+    for request_id in current_requests {
+        if let Err(err) = home_services_activate_pending_decision(
+            data_dir,
+            context,
+            provider_registry,
+            &mut state,
+            &request_id,
+        ) {
+            tracing::warn!(error = %err, "Services Exit activation remains pending");
+        }
+    }
     Ok(())
 }
 
 fn home_services_merge_access_decision(
-    data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
     state: &mut HomeServicesSelectionState,
     payload: &serde_json::Value,
@@ -2687,10 +2734,12 @@ fn home_services_merge_access_decision(
     let Some(service_kind) = home_services_payload_text(payload, "service_kind", 128) else {
         return Ok(false);
     };
-    let updated_at = payload
+    let Some(updated_at) = payload
         .get("created_at")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or_else(now_ts);
+    else {
+        anyhow::bail!("service access decision requires a valid timestamp");
+    };
     let Some(record) = state.remote_offer_requests.values_mut().find(|record| {
         record.request_id == request_id
             && record.target_peer_id == provider_peer_id
@@ -2699,31 +2748,242 @@ fn home_services_merge_access_decision(
     }) else {
         return Ok(false);
     };
-    let mut installed_remote_exit_id = record.installed_remote_exit_id.clone();
-    if decision == "approved" {
-        if service_uri == HOME_BROWSER_EXIT_PEER_SERVICE_URI
-            && service_kind == HOME_REMOTE_EXIT_SERVICE_KIND
-        {
-            installed_remote_exit_id = Some(home_services_install_remote_exit_grant(
-                data_dir, context, record, payload,
-            )?);
-        }
-    } else if decision == "denied" {
-        if let Some(installed_id) = record.installed_remote_exit_id.as_deref() {
-            home_services_remove_remote_exit_grant(data_dir, installed_id)?;
-        }
-        installed_remote_exit_id = None;
+    let skew = elastos_common::collaboration_protocol::MAX_COLLABORATION_CLOCK_SKEW_SECS;
+    if updated_at == 0
+        || updated_at > now_ts().saturating_add(skew)
+        || updated_at < record.created_at.saturating_sub(skew)
+    {
+        anyhow::bail!("service access decision timestamp is outside the request bounds");
     }
-    if record.status == decision
-        && record.updated_at == updated_at
-        && record.installed_remote_exit_id == installed_remote_exit_id
+    let committed = matches!(record.status.as_str(), "approved" | "denied");
+    // Pending revocation is already the newest provider decision even while the
+    // old grant remains installed until its acknowledgement succeeds.
+    if (committed && updated_at < record.updated_at)
+        || record
+            .pending_access_decision
+            .as_ref()
+            .is_some_and(|pending| updated_at < pending.updated_at)
     {
         return Ok(false);
     }
-    record.status = decision;
-    record.updated_at = updated_at;
-    record.installed_remote_exit_id = installed_remote_exit_id;
+    let pending = HomeServicesPendingAccessDecision {
+        remote_exit: if decision == "approved" {
+            Some(home_services_remote_exit_grant(context, record, payload)?)
+        } else {
+            None
+        },
+        decision,
+        updated_at,
+    };
+    if let Some(previous) = record
+        .pending_access_decision
+        .as_ref()
+        .filter(|previous| previous.updated_at == updated_at)
+    {
+        if previous != &pending {
+            anyhow::bail!("service access decision revision conflicts");
+        }
+        return Ok(false);
+    }
+    if committed && record.updated_at == updated_at {
+        if record.status != pending.decision
+            || record
+                .access_decision_sha256
+                .as_ref()
+                .is_some_and(|digest| *digest != home_services_access_decision_sha256(&pending))
+        {
+            anyhow::bail!("service access decision revision conflicts");
+        }
+        // Legacy state has no fingerprint. Keep its committed outcome; only a
+        // strictly newer decision can change it.
+        return Ok(false);
+    }
+    record.pending_access_decision = Some(pending);
     Ok(true)
+}
+
+fn home_services_access_decision_sha256(decision: &HomeServicesPendingAccessDecision) -> String {
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(decision).expect("bounded JSON decision"),
+    ))
+}
+
+fn home_services_activate_pending_decision(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    provider_registry: Option<&elastos_runtime::provider::ProviderRegistry>,
+    state: &mut HomeServicesSelectionState,
+    request_id: &str,
+) -> anyhow::Result<()> {
+    let Some(record) = state
+        .remote_offer_requests
+        .values()
+        .find(|record| record.request_id == request_id)
+    else {
+        return Ok(());
+    };
+    let Some(pending) = record.pending_access_decision.clone() else {
+        return Ok(());
+    };
+    let mut next = state.clone();
+    let next_record = next
+        .remote_offer_requests
+        .get_mut(&record.offer_id)
+        .expect("record came from state");
+    next_record.status = pending.decision.clone();
+    next_record.updated_at = pending.updated_at;
+    next_record.access_decision_sha256 = Some(home_services_access_decision_sha256(&pending));
+    next_record.installed_remote_exit_id = pending
+        .remote_exit
+        .as_ref()
+        .and_then(|exit| exit["id"].as_str())
+        .map(str::to_string);
+    next_record.pending_access_decision = None;
+    next.updated_at = now_ts();
+    if pending.remote_exit.is_none() && record.installed_remote_exit_id.is_none() {
+        home_save_services_selection_state(data_dir, context, &next)?;
+    } else {
+        let (previous_bytes, mut config) = home_services_read_exit_config(data_dir)?;
+        let exits = config
+            .as_object_mut()
+            .expect("validated config object")
+            .entry("remote_carrier_exits")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("Exit config grants must be an array"))?;
+        let id = home_services_remote_exit_id(&record.service_display_name, &record.request_id);
+        let grant_id = home_services_remote_exit_grant_id(&record.request_id);
+        exits.retain(|exit| {
+            exit["id"].as_str() != Some(&id) && exit["grant_id"].as_str() != Some(&grant_id)
+        });
+        if let Some(exit) = pending.remote_exit {
+            exits.push(exit);
+        }
+        home_services_commit_exit_config(
+            data_dir,
+            provider_registry,
+            previous_bytes.as_deref(),
+            &config,
+            || home_save_services_selection_state(data_dir, context, &next),
+        )?;
+    }
+    *state = next;
+    Ok(())
+}
+
+fn home_services_read_exit_config(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<(Option<Vec<u8>>, serde_json::Value)> {
+    let path = home_services_exit_provider_config_path(data_dir);
+    use std::io::Read as _;
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((None, serde_json::json!({})))
+        }
+        Err(_) => anyhow::bail!("existing Exit config is unreadable"),
+    };
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("existing Exit config is unreadable"))?;
+    if bytes.len() > 1024 * 1024 {
+        anyhow::bail!("existing Exit config is too large");
+    }
+    let config: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("existing Exit config is malformed"))?;
+    if !config.is_object() {
+        anyhow::bail!("existing Exit config must be an object");
+    }
+    Ok((Some(bytes), config))
+}
+
+fn home_services_stage_exit_config(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> anyhow::Result<tempfile::NamedTempFile> {
+    use std::io::Write as _;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Exit config requires a parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(bytes)?;
+    file.as_file().sync_all()?;
+    Ok(file)
+}
+
+fn home_services_refresh_exit_config(
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    config: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let request_id = hex::encode(Sha256::digest(serde_json::to_vec(config)?));
+    let request =
+        serde_json::json!({"op":"refresh_config", "request_id":request_id, "config":config});
+    let result = tokio::runtime::Handle::current().block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), registry.send_raw("exit", &request)).await
+    });
+    let response = result
+        .map_err(|_| anyhow::anyhow!("Exit provider acknowledgement timed out"))?
+        .map_err(|_| anyhow::anyhow!("Exit provider acknowledgement unavailable"))?;
+    if response["status"] != "ok"
+        || response["data"]["schema"] != "elastos.exit.config-ack/v1"
+        || response["data"]["request_id"] != request_id
+        || response["data"]["state"] != "applied"
+    {
+        anyhow::bail!("Exit provider did not acknowledge the requested configuration");
+    }
+    Ok(())
+}
+
+fn home_services_commit_exit_config(
+    data_dir: &std::path::Path,
+    registry: Option<&elastos_runtime::provider::ProviderRegistry>,
+    previous_bytes: Option<&[u8]>,
+    config: &serde_json::Value,
+    save_selection: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let registry = registry.ok_or_else(|| anyhow::anyhow!("Exit provider is unavailable"))?;
+    let path = home_services_exit_provider_config_path(data_dir);
+    // Staging catches write failures before asking the provider to change state.
+    let staged = home_services_stage_exit_config(&path, &serde_json::to_vec_pretty(config)?)?;
+    let previous_config = previous_bytes
+        .map(serde_json::from_slice)
+        .transpose()?
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Err(error) = home_services_refresh_exit_config(registry, config) {
+        // A missing/malformed ACK may follow application. Retain the durable
+        // pending decision and explicitly report an unconfirmed compensation.
+        if home_services_refresh_exit_config(registry, &previous_config).is_err() {
+            anyhow::bail!("Exit activation and provider rollback remain unconfirmed");
+        }
+        return Err(error);
+    }
+    let mut replaced = false;
+    let committed = (|| {
+        staged
+            .persist(&path)
+            .map_err(|_| anyhow::anyhow!("Exit config replacement failed"))?;
+        replaced = true;
+        save_selection()
+    })();
+    if let Err(error) = committed {
+        let restored = if replaced {
+            match previous_bytes {
+                Some(bytes) => home_services_stage_exit_config(&path, bytes)
+                    .and_then(|file| file.persist(&path).map(|_| ()).map_err(Into::into)),
+                None => std::fs::remove_file(&path).map_err(Into::into),
+            }
+        } else {
+            Ok(())
+        };
+        let provider_restored = home_services_refresh_exit_config(registry, &previous_config);
+        if restored.is_err() || provider_restored.is_err() {
+            anyhow::bail!("Exit activation rollback remains unconfirmed");
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn home_services_remote_exit_id(display_name: &str, request_id: &str) -> String {
@@ -2756,12 +3016,11 @@ fn home_services_exit_provider_config_path(data_dir: &std::path::Path) -> std::p
     data_dir.join("config/exit-provider.json")
 }
 
-fn home_services_install_remote_exit_grant(
-    data_dir: &std::path::Path,
+fn home_services_remote_exit_grant(
     context: &HomeLaunchTokenContext,
     record: &HomeServicesRemoteOfferRequestRecord,
     payload: &serde_json::Value,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<serde_json::Value> {
     let grant = payload
         .get("remote_exit_grant")
         .filter(|grant| {
@@ -2787,28 +3046,7 @@ fn home_services_install_remote_exit_grant(
     }
     let id = home_services_remote_exit_id(&record.service_display_name, &record.request_id);
     let grant_id = home_services_remote_exit_grant_id(&record.request_id);
-    let path = home_services_exit_provider_config_path(data_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut config = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .filter(|value| value.is_object())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if config.get("schema").is_none() {
-        config["schema"] = serde_json::json!("elastos.browser.local-exit.config/v1");
-    }
-    let mut exits = config
-        .get("remote_carrier_exits")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    exits.retain(|exit| {
-        exit.get("id").and_then(serde_json::Value::as_str) != Some(id.as_str())
-            && exit.get("grant_id").and_then(serde_json::Value::as_str) != Some(grant_id.as_str())
-    });
-    exits.push(serde_json::json!({
+    Ok(serde_json::json!({
         "id": &id,
         "grant_id": &grant_id,
         "peer_did": provider_peer_id,
@@ -2820,35 +3058,7 @@ fn home_services_install_remote_exit_grant(
         "allowed_ports": [80, 443],
         "max_active_streams": 4,
         "max_active_streams_per_principal": 2,
-    }));
-    config["remote_carrier_exits"] = serde_json::Value::Array(exits);
-    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
-    Ok(id)
-}
-
-fn home_services_remove_remote_exit_grant(
-    data_dir: &std::path::Path,
-    installed_id: &str,
-) -> anyhow::Result<()> {
-    let path = home_services_exit_provider_config_path(data_dir);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return Ok(());
-    };
-    let mut config: serde_json::Value = serde_json::from_str(&raw)?;
-    let Some(exits) = config
-        .get("remote_carrier_exits")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return Ok(());
-    };
-    let filtered = exits
-        .iter()
-        .filter(|exit| exit.get("id").and_then(serde_json::Value::as_str) != Some(installed_id))
-        .cloned()
-        .collect::<Vec<_>>();
-    config["remote_carrier_exits"] = serde_json::Value::Array(filtered);
-    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
-    Ok(())
+    }))
 }
 
 pub(super) fn home_services_sync_access_requests(
@@ -2858,6 +3068,10 @@ pub(super) fn home_services_sync_access_requests(
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
 ) -> anyhow::Result<()> {
+    let mutation_lock = home_services_mutation_lock(data_dir)?;
+    let _guard = mutation_lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
     if !home_services_local_exit_shared(data_dir, context)? {
         return Ok(());
     }
@@ -3019,7 +3233,11 @@ fn home_services_merge_access_request(
         requester_display_name,
         requester_handle: handle,
         created_at,
-        updated_at: now,
+        updated_at: state
+            .requests
+            .get(&request_id)
+            .map(|previous| previous.updated_at.max(now))
+            .unwrap_or(now),
         status,
     };
     let changed = state
@@ -3129,23 +3347,43 @@ fn home_services_mark_access_request(
     if !home_services_request_id_is_valid(request_id) {
         anyhow::bail!("service request id is invalid");
     }
+    let mutation_lock = home_services_mutation_lock(data_dir)?;
+    let _guard = mutation_lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
     let mut state = home_services_requests_state(data_dir, context)?;
     let Some(request) = state.requests.get(request_id).cloned() else {
         anyhow::bail!("service request not found");
     };
-    home_services_send_access_decision(data_dir, context, discovery_service, &request, status)
-        .map_err(|err| {
-            if profile_required_message(&err).is_some() {
-                err
-            } else {
-                err.context("service access request delivery failed")
-            }
-        })?;
+    // Decisions in the same clock second still need distinct, ordered revisions.
+    let revision = now_ts().max(request.updated_at.saturating_add(1));
+    if revision
+        > now_ts().saturating_add(
+            elastos_common::collaboration_protocol::MAX_COLLABORATION_CLOCK_SKEW_SECS,
+        )
+    {
+        anyhow::bail!("service access decision clock is ahead; retry later");
+    }
+    home_services_send_access_decision(
+        data_dir,
+        context,
+        discovery_service,
+        &request,
+        status,
+        revision,
+    )
+    .map_err(|err| {
+        if profile_required_message(&err).is_some() {
+            err
+        } else {
+            err.context("service access request delivery failed")
+        }
+    })?;
     let Some(request) = state.requests.get_mut(request_id) else {
         anyhow::bail!("service request not found");
     };
     request.status = status.to_string();
-    request.updated_at = now_ts();
+    request.updated_at = revision;
     let requester = request.requester_display_name.clone();
     state.updated_at = request.updated_at;
     home_save_services_requests_state(data_dir, context, &state)?;

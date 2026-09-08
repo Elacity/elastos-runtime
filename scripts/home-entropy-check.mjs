@@ -2793,8 +2793,12 @@ assert(
     gatewayApi.includes("elastos.service-access-decision/v1") &&
     gatewayApi.includes("home_services_sync_access_decisions") &&
     gatewayApi.includes("home_services_send_access_decision") &&
-    gatewayApi.includes("home_services_install_remote_exit_grant") &&
-    gatewayApi.includes("home_services_remove_remote_exit_grant") &&
+    gatewayApi.includes("home_services_activate_pending_decision") &&
+    gatewayApi.includes("home_services_commit_exit_config") &&
+    gatewayApi.includes("elastos.exit.config-ack/v1") &&
+    gatewayApi.includes("pending_access_decision") &&
+    gatewayHomeSystemTests.includes("test_services_exit_activation_waits_for_provider_ack") &&
+    gatewayHomeSystemTests.includes("test_services_exit_activation_fences_held_ack_and_rolls_back_failed_state_write") &&
     gatewayApi.includes("elastos.service.remote-exit-grant/v1") &&
     gatewayApi.includes("installed_remote_exit_id") &&
     gatewayApi.includes(
