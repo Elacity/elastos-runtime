@@ -77,6 +77,46 @@ Guest control remains source `6f5d48ae`, helper hash
 Runtime, adapter, VZ helper, kernel and Browser UI were reused and verified.
 The installed startup helper and gst-python override match the exported image.
 
+The current initrd is `bfe15d7a854c1d7c8193ce5ddcc37a3b844387653241c0d702f1cf9681ff813d`.
+It enables the existing `virtio_rng` driver through the committed build script;
+all other 4,592 archive entries retain their content and ownership. The rootfs,
+kernel, native helpers and UI stay unchanged. Run 54 confirms random readiness
+before bootstrap and removes the observed five-second delay. Its launcher
+sample is 9251 ms against baseline run 53 at 14392 ms; headed samples 55/56 are
+11271/9651 ms. These are individual samples, and full startup budgets stay open.
+Runs 54/55 pass the core journey, reload and all 13 close effects.
+
+An opt-in controlled audio test generates a quiet 440 Hz tone in the Engine page
+and examines decoded PCM from the product WebRTC receiver. Run 56 passes this
+check plus core browsing, reload and cleanup. Run 57 fails with long silent gaps
+before the planned network cut; its close still clears all 13 effects. The
+cause remains unresolved. Run 58 passes decoded tone before and after a 5001 ms
+HTTP/TURN interruption, with video/input recovery in 1751 ms and exact cleanup
+in 684 ms. That passing run preserves the unexplained failure in run 57.
+Independent agent review accepts the bounded audio evidence in run 58 and the
+failure classification in run 57. Test commit `a1260f19` adds the opt-in probe;
+21 focused checks include resource cleanup on probe failure. Review of the RNG
+repair, sustained A/V, formal distributions and human checks remain open.
+The tested host is an Apple M5 Mac with 24 GiB RAM,
+macOS 26.5.2; this supplies no minimum-hardware or additional-device verdict.
+
+Source commit `cb78ccb9` makes Services use the signed contacts accepted through
+People. It rechecks contact and endpoint ownership before approval or grant
+installation. The old implementation failed the signed-contact regression;
+nine Services tests pass after the repair. The coordinator reviewed this source
+slice; installed remote-service proof remains pending. Exit configuration and
+provider activation, Carrier grant admission, and remote Engine offer/invocation
+remain separate implementation gaps.
+
+The fresh artifact acquisition stage at `a1260f19` reports four missing files
+and installs none when the new data root has no selected artifact store.
+Selecting the verified local store links all four files and passes image-set
+verification without rebuilding. The probe links were then removed and the
+source artifacts retained. This is a bounded source-home installation check;
+automatic package acquisition and a complete fresh Home journey remain open.
+
+Earlier evidence for the same rootfs with the preceding initrd follows.
+
 Runs 50–52 pass Home launch, controlled navigation, advancing decoded WebRTC
 frames, exact text, scrolling and fresh Home close. Each close confirms all 13
 cleanup effects and zero remaining Runtime/control obligations. Runs 50/52 also

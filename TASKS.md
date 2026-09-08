@@ -35,7 +35,10 @@ its support matrix while its accepted contract unblocks dependent work.
 The task Mac passes the requested Home-to-close journey in three independently
 reviewed runs on the corrected guest image. Current evidence and artifact
 identity are in [state.md](state.md#browser-contract-and-device-qualification).
-Cold launcher readiness remains about 14-15 seconds. Fresh ordinary installation,
+The initrd-only RNG activation removes an observed five-second bootstrap delay;
+current launcher samples range from about 9 to 11 seconds. A decoded-audio
+repeat fails with long silence, while a later controlled interruption passes
+audio/video/input recovery. That audio failure remains unexplained. Fresh ordinary installation,
 remote placements, complete operator use and release qualification need proof.
 Sash's reported failure on the published source remains unverified.
 
@@ -55,18 +58,28 @@ alongside the local, operator and remote journeys.
 
 ### Next executable slices
 
-- **B02.startup / active / coordinator; independent source review by Locke.**
+- **B02.acquire / active / coordinator.** The empty-data-root artifact step
+  acquires no image and reports four missing files. Explicit selection of the
+  verified local store installs a matching set without rebuilding. Complete
+  Runtime artifact acquisition through the existing package installer and
+  repeat the fresh Home journey. A developer-supplied store is useful integration
+  evidence but leaves the out-of-box acceptance requirement open.
+- **B02.startup / verifying / coordinator; independent review pending.**
   Prerequisites: accepted compatibility contract, image `d03ec029`, and reviewed
   installed runs 50-52. Reuse Runtime, native helpers, image and UI unless a
   changed input requires rebuilding. First capture the current launch stages
-  with passive observation. Check the earlier entropy/Node delay against this
-  image before applying the separate RNG source change. Read-only review finds
-  that the current initrd already contains the driver and dependencies: the
-  smallest activation experiment repacks only its init script and updates the
-  matching receipt. Rootfs, kernel and native binaries can be reused. Accept the slice only
-  after the diagnosed change improves the measured stage and the same installed
-  journey still passes; formal percentile qualification remains B11 work.
-- **B04.inspect / ready / one source writer assigned at dispatch.**
+  with passive observation. Runs 53/54 confirm that enabling the existing RNG
+  driver removes the five-second delay; the same installed journey passes in
+  runs 54/55. Review the archive and journey receipts before closing this bounded
+  repair. Rootfs, kernel and native binaries were reused. Formal percentile
+  qualification and the remaining startup delay stay in B11.
+- **B11.decoded-audio / active / coordinator.** The controlled tone passes in
+  run 56 and before/after the five-second HTTP/TURN cut in run 58. Run 57 has
+  long silent gaps before its cut. Retain that failure and diagnose it with
+  producer/receiver evidence; concurrent compilation is a hypothesis only.
+  The same audio threshold applies to every repeat. Full sustained-use and
+  human listening acceptance remain open.
+- **B04.inspect / active / delegated source owner; coordinator reviews.**
   Prerequisite: the accepted owner/page contract and existing Engine CDP access.
   Deliver a bounded, capability-negotiated snapshot of the actual Engine page
   with document generation and pagination. Test owner success, foreign-owner
@@ -74,13 +87,18 @@ alongside the local, operator and remote journeys.
   navigation. The first installed proof reads a controlled form from the page
   visible to the human. Actions, writer leases, handoff and adapter conformance
   are its immediate successors; a snapshot alone leaves B04 open.
-- **B08/B09.first-remote / ready / independent source owner at dispatch.**
+- **B08/B09.first-remote / active / independent delegated source owner.**
   Prerequisite: accepted Engine/Exit identity and Runtime service contracts.
   Identify the first missing product operation for A/B/A and A/A/B against
   available peers, then repair that component with a bounded regression.
   First proof must use independent Runtime identities and normal service
   authority. Coordinator schedules actual target execution. Loopback identity
   tests can unblock implementation; physical LAN/WAN proof remains required.
+  Accepted source slice `cb78ccb9` connects Services to signed People contacts
+  and rechecks authority before approval and grant installation. The next
+  bounded slice makes Exit configuration parse and waits for provider
+  acknowledgement before enabling use. Carrier admission and remote Engine
+  offer/invocation follow; the Mac/server journey remains unproved.
 
 ### Time and resource control
 
