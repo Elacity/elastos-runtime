@@ -88,7 +88,8 @@ acceptance. Browser implementation belongs to its separate owner.
    offline/error and incompatible states, busy-safe eviction and shared-view
    idempotence. Preparation belongs to Models; composers require the chosen
    offer's current readiness before a new dispatch. Actual inference needs its
-   own run evidence.
+   own run evidence. Complete Runtime offer retirement and run/Keep/reference
+   checks before model-byte eviction.
 3. [ ] Package the exact existing Qwen model and verified engine for isolated
    setup with a real pinned signed catalog and complete closure, publisher trust
    and honest availability evidence. Distinguish verified upstream references

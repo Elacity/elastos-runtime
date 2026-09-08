@@ -353,7 +353,12 @@ The integrated source includes these durable facts:
   Keep changes leave admission, bytes, quota, offers and readiness unchanged and
   do not interrupt startup verification. Source checks pass 60 server model tests
   (four explicit process prerequisites ignored) and the capsule binding test.
-  Safe eviction and installed retention proof remain open.
+  The model provider retains each engine handle until bounded close confirms
+  reaping and, for production guards, process-group absence. Uncertain closure
+  blocks replacement. The 14 engine unit tests and five process tests pass,
+  including the production guard cases; strict all-target Clippy passes.
+  Runtime offer retirement, run/Keep/reference checks, byte eviction and
+  installed full-Qwen proof remain open.
 - Runtime derives one caller-scoped `model_runtime` projection for catalog GET,
   typed catalog list and preparation status. It reports admission, Keep,
   preparation progress and `dispatch_ready` for the single signed model profile.

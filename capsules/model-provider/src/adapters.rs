@@ -598,8 +598,8 @@ impl LiveAdapterExecutor {
         }
     }
 
-    pub(crate) async fn shutdown_local_llama(&self) {
-        self.local_llama.shutdown().await;
+    pub(crate) async fn shutdown_local_llama(&self) -> Result<(), LocalLlamaFault> {
+        self.local_llama.shutdown().await
     }
 
     fn spawn_local_text_worker(

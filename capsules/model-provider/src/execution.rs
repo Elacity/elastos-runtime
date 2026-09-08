@@ -315,7 +315,9 @@ impl ProviderCoordinator {
             }
         }
         provider.adapters().shutdown_workers().await;
-        provider.adapters().shutdown_local_llama().await;
+        if let Err(fault) = provider.adapters().shutdown_local_llama().await {
+            eprintln!("[model-provider] local engine closure unconfirmed: {fault:?}");
+        }
         while let Ok(update) = self.updates.try_recv() {
             self.handle_update(update).await;
         }

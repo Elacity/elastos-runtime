@@ -316,10 +316,12 @@ policy slices:
    and journal, preserves exact existing offers, and blocks additions while
    workers, cached engines or unresolved runs retain execution ownership.
    Identical Init is idempotent; unresolved bindings survive expiry and restart.
-   Busy activation retains admitted files for retry without transfer. Actual
-   eviction still requires a proved closure receipt for every retained engine
-   and run. Keep/release intents are implemented independently of activation;
-   installed retention and safe eviction proof remain open.
+   Busy activation retains admitted files for retry without transfer. Provider
+   close retains exact engine ownership until bounded reaping and process-group
+   closure succeed; uncertainty blocks replacement. Actual byte eviction still
+   requires Runtime offer retirement and run/Keep/reference checks. Keep/release
+   intents are implemented independently of activation; installed full-Qwen
+   retention and safe eviction proof remain open.
 4. **Shared model experience.** Marketplace Models and System management use one
    vendored presentation/intent helper and the existing typed content methods.
    Catalog rows carry nested readiness; operation replies carry flat readiness.

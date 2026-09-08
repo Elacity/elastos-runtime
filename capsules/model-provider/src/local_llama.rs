@@ -47,6 +47,7 @@ struct RunningEngine {
     endpoint: LocalLlamaEndpoint,
     models_url: String,
     shutdown_timeout: Duration,
+    closing: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -91,6 +92,7 @@ impl LocalLlamaEngines {
             .await
             .map_err(|_| LocalLlamaFault::Timeout)?;
         let stale = match engines.get_mut(offer_id) {
+            Some(running) if running.closing => true,
             Some(running) => match running_engine_is_ready(running, deadline).await? {
                 true => return Ok(running.endpoint.clone()),
                 false => true,
@@ -98,15 +100,7 @@ impl LocalLlamaEngines {
             None => false,
         };
         if stale {
-            if let Some(mut running) = engines.remove(offer_id) {
-                terminate_child(
-                    &mut running.child,
-                    &mut running.liveness,
-                    running.guard_group,
-                    running.shutdown_timeout,
-                )
-                .await;
-            }
+            close_engine(&mut engines, offer_id).await?;
         }
 
         revalidate_local_artifact(engine, true, deadline).map_err(|_| deadline_fault(deadline))?;
@@ -136,51 +130,71 @@ impl LocalLlamaEngines {
                 endpoint: endpoint.clone(),
                 models_url,
                 shutdown_timeout,
+                closing: false,
             },
         );
         let health_result = match engines.get_mut(offer_id) {
             Some(running) => {
-                wait_until_healthy(
-                    &mut running.child,
-                    running.guard_group,
-                    port,
-                    &alias,
-                    health_timeout,
-                )
-                .await
+                #[cfg(not(test))]
+                let initialized =
+                    initialize_guard(running, engine, model, settings, port, &alias, deadline)
+                        .await;
+                #[cfg(test)]
+                let initialized = Ok(());
+                match initialized {
+                    Err(fault) => Err(fault),
+                    Ok(()) => {
+                        wait_until_healthy(
+                            &mut running.child,
+                            running.guard_group,
+                            port,
+                            &alias,
+                            health_timeout.min(deadline.saturating_duration_since(Instant::now())),
+                        )
+                        .await
+                    }
+                }
             }
             None => Err(LocalLlamaFault::Failed),
         };
         if let Err(fault) = health_result {
-            if let Some(mut running) = engines.remove(offer_id) {
-                terminate_child(
-                    &mut running.child,
-                    &mut running.liveness,
-                    running.guard_group,
-                    running.shutdown_timeout,
-                )
-                .await;
-            }
+            close_engine(&mut engines, offer_id).await?;
             return Err(fault);
         }
         Ok(endpoint)
     }
 
-    pub(crate) async fn shutdown(&self) {
-        let engines = {
-            let mut guard = self.engines.lock().await;
-            std::mem::take(&mut *guard)
-        };
-        for (_, mut engine) in engines {
-            terminate_child(
-                &mut engine.child,
-                &mut engine.liveness,
-                engine.guard_group,
-                engine.shutdown_timeout,
-            )
-            .await;
+    pub(crate) async fn shutdown(&self) -> Result<(), LocalLlamaFault> {
+        let mut engines = tokio::time::timeout(GUARD_EXIT_GRACE, self.engines.lock())
+            .await
+            .map_err(|_| LocalLlamaFault::Timeout)?;
+        let ids: Vec<_> = engines.keys().cloned().collect();
+        let mut result = Ok(());
+        for id in ids {
+            if let Err(fault) = close_engine(&mut engines, &id).await {
+                result = Err(fault);
+            }
         }
+        result
     }
+}
+
+async fn close_engine(
+    engines: &mut BTreeMap<String, RunningEngine>,
+    offer_id: &str,
+) -> Result<(), LocalLlamaFault> {
+    if let Some(running) = engines.get_mut(offer_id) {
+        running.closing = true;
+        terminate_child(
+            &mut running.child,
+            &mut running.liveness,
+            running.guard_group,
+            running.shutdown_timeout,
+        )
+        .await?;
+        engines.remove(offer_id);
+    }
+    Ok(())
 }
 
 async fn spawn_managed_engine(
@@ -199,17 +213,22 @@ async fn spawn_managed_engine(
     }
 
     #[cfg(not(test))]
-    spawn_guarded_engine(engine, model, settings, port, alias).await
+    {
+        let _ = (engine, model, settings, port, alias);
+        spawn_guarded_engine()
+    }
 }
 
 #[cfg(not(test))]
-async fn spawn_guarded_engine(
+async fn initialize_guard(
+    running: &mut RunningEngine,
     engine: &LocalArtifactConfig,
     model: &LocalArtifactConfig,
     settings: &LocalLlamaSettings,
     port: u16,
     alias: &str,
-) -> Result<(Child, Option<ChildStdin>, Option<libc::pid_t>), LocalLlamaFault> {
+    deadline: Instant,
+) -> Result<(), LocalLlamaFault> {
     let config = GuardConfig {
         engine_path: engine.path.clone(),
         model_path: model.path.clone(),
@@ -222,6 +241,24 @@ async fn spawn_guarded_engine(
     if frame.len() > MAX_GUARD_CONFIG_BYTES {
         return Err(LocalLlamaFault::Failed);
     }
+    let liveness = running.liveness.as_mut().ok_or(LocalLlamaFault::Failed)?;
+    tokio::time::timeout(
+        GUARD_START_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())),
+        async {
+            liveness
+                .write_all(&frame)
+                .await
+                .map_err(|_| LocalLlamaFault::Failed)?;
+            liveness.flush().await.map_err(|_| LocalLlamaFault::Failed)
+        },
+    )
+    .await
+    .map_err(|_| LocalLlamaFault::Timeout)?
+}
+
+#[cfg(not(test))]
+fn spawn_guarded_engine(
+) -> Result<(Child, Option<ChildStdin>, Option<libc::pid_t>), LocalLlamaFault> {
     let executable = std::env::current_exe().map_err(|_| LocalLlamaFault::Failed)?;
     let mut command = Command::new(executable);
     command
@@ -236,36 +273,9 @@ async fn spawn_guarded_engine(
         command.as_std_mut().process_group(0);
     }
     let mut child = command.spawn().map_err(|_| LocalLlamaFault::Failed)?;
-    let guard_group = child
-        .id()
-        .map(|pid| pid as libc::pid_t)
-        .ok_or(LocalLlamaFault::Failed)?;
-    let Some(mut liveness) = child.stdin.take() else {
-        finish_guard_shutdown(
-            &mut child,
-            Some(guard_group),
-            Duration::from_millis(settings.shutdown_timeout_ms),
-        )
-        .await;
-        return Err(LocalLlamaFault::Failed);
-    };
-    let startup = tokio::time::timeout(GUARD_START_TIMEOUT, async {
-        liveness.write_all(&frame).await.map_err(|_| ())?;
-        liveness.flush().await.map_err(|_| ())?;
-        Ok::<(), ()>(())
-    })
-    .await;
-    if !matches!(startup, Ok(Ok(()))) {
-        drop(liveness);
-        finish_guard_shutdown(
-            &mut child,
-            Some(guard_group),
-            Duration::from_millis(settings.shutdown_timeout_ms),
-        )
-        .await;
-        return Err(LocalLlamaFault::Failed);
-    }
-    Ok((child, Some(liveness), Some(guard_group)))
+    let guard_group = child.id().map(|pid| pid as libc::pid_t);
+    let liveness = child.stdin.take();
+    Ok((child, liveness, guard_group))
 }
 
 #[cfg(test)]
@@ -464,55 +474,100 @@ async fn terminate_child(
     liveness: &mut Option<ChildStdin>,
     guard_group: Option<libc::pid_t>,
     timeout: Duration,
-) {
-    if liveness.take().is_some() {
-        finish_guard_shutdown(child, guard_group, timeout).await;
-        return;
+) -> Result<(), LocalLlamaFault> {
+    if timeout.is_zero() {
+        return Err(LocalLlamaFault::Timeout);
     }
-    if let Ok(Some(_)) = child.try_wait() {
-        return;
+    if let Some(group) = guard_group {
+        if group <= 1 || child.id().is_some_and(|pid| pid != group as u32) {
+            return Err(LocalLlamaFault::Failed);
+        }
+        liveness.take();
+        return finish_guard_shutdown(child, group, timeout).await;
     }
-    let _ = send_graceful_termination(child);
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) if Instant::now() < deadline => {
-                sleep(Duration::from_millis(10)).await;
-            }
-            Ok(None) | Err(_) => break,
+    if child
+        .try_wait()
+        .map_err(|_| LocalLlamaFault::Failed)?
+        .is_some()
+    {
+        return Ok(());
+    }
+    if let Err(error) = send_graceful_termination(child) {
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(LocalLlamaFault::Failed);
         }
     }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
-
-async fn finish_guard_shutdown(
-    child: &mut Child,
-    guard_group: Option<libc::pid_t>,
-    timeout: Duration,
-) {
-    if matches!(
-        tokio::time::timeout(timeout.saturating_add(GUARD_EXIT_GRACE), child.wait()).await,
-        Ok(Ok(_))
-    ) {
-        force_guard_group_cleanup(guard_group);
-        return;
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(result) => result.map(|_| ()).map_err(|_| LocalLlamaFault::Failed),
+        Err(_) => {
+            child.start_kill().map_err(|_| LocalLlamaFault::Failed)?;
+            tokio::time::timeout(GUARD_EXIT_GRACE, child.wait())
+                .await
+                .map_err(|_| LocalLlamaFault::Timeout)?
+                .map(|_| ())
+                .map_err(|_| LocalLlamaFault::Failed)
+        }
     }
-    force_guard_group_cleanup(guard_group);
-    let _ = child.start_kill();
-    let _ = child.wait().await;
 }
 
 #[cfg(unix)]
-fn force_guard_group_cleanup(guard_group: Option<libc::pid_t>) {
-    if let Some(process_group) = guard_group {
-        let _ = signal_process_group(process_group, libc::SIGKILL);
+async fn finish_guard_shutdown(
+    child: &mut Child,
+    guard_group: libc::pid_t,
+    timeout: Duration,
+) -> Result<(), LocalLlamaFault> {
+    if guard_group == unsafe { libc::getpgrp() } {
+        return Err(LocalLlamaFault::Failed);
+    }
+    if child.id().is_some() {
+        let deadline = Instant::now()
+            .checked_add(timeout.saturating_add(GUARD_EXIT_GRACE))
+            .ok_or(LocalLlamaFault::Timeout)?;
+        while !child_exited_without_reaping(guard_group).map_err(|_| LocalLlamaFault::Failed)? {
+            if Instant::now() >= deadline {
+                break;
+            }
+            sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
+        }
+        // Keep the guard PID unreaped while signalling its group. A retry after
+        // reaping only observes absence; it must not signal a recycled group ID.
+        signal_process_group(guard_group, libc::SIGKILL).map_err(|_| LocalLlamaFault::Failed)?;
+    }
+    let deadline = tokio::time::Instant::now() + GUARD_EXIT_GRACE;
+    tokio::time::timeout_at(deadline, child.wait())
+        .await
+        .map_err(|_| LocalLlamaFault::Timeout)?
+        .map_err(|_| LocalLlamaFault::Failed)?;
+    loop {
+        if unsafe { libc::kill(-guard_group, 0) } != 0 {
+            return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                Ok(())
+            } else {
+                Err(LocalLlamaFault::Failed)
+            };
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(LocalLlamaFault::Timeout);
+        }
+        sleep(
+            Duration::from_millis(10)
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+        )
+        .await;
     }
 }
 
 #[cfg(not(unix))]
-fn force_guard_group_cleanup(_guard_group: Option<libc::pid_t>) {}
+async fn finish_guard_shutdown(
+    _child: &mut Child,
+    _guard_group: libc::pid_t,
+    _timeout: Duration,
+) -> Result<(), LocalLlamaFault> {
+    Err(LocalLlamaFault::Failed)
+}
 
 #[cfg(unix)]
 fn send_graceful_termination(child: &mut Child) -> std::io::Result<()> {
@@ -805,6 +860,167 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn exact_close_reaps_only_selected_engine_and_repeats_safely() {
+        let (engines, engine, model, settings, events) = fixture("healthy");
+        let (_, other_engine, other_model, other_settings, other_events) = fixture("healthy");
+        engines
+            .endpoint("first", &engine, &model, &settings)
+            .await
+            .unwrap();
+        let other = engines
+            .endpoint("second", &other_engine, &other_model, &other_settings)
+            .await
+            .unwrap();
+        let first_pid = recorded_pid(&events);
+        let second_pid = recorded_pid(&other_events);
+        {
+            let mut owned = engines.engines.lock().await;
+            close_engine(&mut owned, "first").await.unwrap();
+            close_engine(&mut owned, "first").await.unwrap();
+            assert!(!owned.contains_key("first"));
+            assert!(owned.contains_key("second"));
+        }
+        assert!(!process_exists(first_pid));
+        assert!(process_exists(second_pid));
+        assert!(engines.retains_artifacts().await);
+        assert_eq!(
+            engines
+                .endpoint("second", &other_engine, &other_model, &other_settings)
+                .await
+                .unwrap(),
+            other
+        );
+        engines.shutdown().await.unwrap();
+        assert!(!process_exists(second_pid));
+        assert!(!engines.retains_artifacts().await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn uncertain_close_retains_exact_child_and_blocks_replacement() {
+        let (engines, engine, model, settings, events) = fixture("healthy");
+        engines
+            .endpoint("offer", &engine, &model, &settings)
+            .await
+            .unwrap();
+        let pid = recorded_pid(&events);
+        let started = StdInstant::now();
+        {
+            let mut owned = engines.engines.lock().await;
+            owned.get_mut("offer").unwrap().shutdown_timeout = Duration::ZERO;
+            assert_eq!(
+                close_engine(&mut owned, "offer").await,
+                Err(LocalLlamaFault::Timeout)
+            );
+            let retained = owned.get("offer").unwrap();
+            assert_eq!(retained.child.id(), Some(pid as u32));
+            assert!(retained.closing);
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(engines.retains_artifacts().await);
+        assert_eq!(
+            engines.endpoint("offer", &engine, &model, &settings).await,
+            Err(LocalLlamaFault::Timeout)
+        );
+        assert!(process_exists(pid));
+        assert_eq!(
+            event_lines(&events)
+                .iter()
+                .filter(|line| line.starts_with("start:"))
+                .count(),
+            1
+        );
+        engines
+            .engines
+            .lock()
+            .await
+            .get_mut("offer")
+            .unwrap()
+            .shutdown_timeout = Duration::from_millis(250);
+        engines.shutdown().await.unwrap();
+        assert!(!process_exists(pid));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_error_after_external_reap_retains_entry_and_denies_respawn() {
+        let (engines, engine, model, settings, events) = fixture("healthy");
+        engines
+            .endpoint("offer", &engine, &model, &settings)
+            .await
+            .unwrap();
+        let pid = recorded_pid(&events);
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        let deadline = StdInstant::now() + Duration::from_secs(3);
+        // Inject a real ECHILD wait failure by reaping outside Tokio's owner.
+        // This is fault injection, not the production guard/group path.
+        loop {
+            let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            if result == pid {
+                break;
+            }
+            assert_eq!(result, 0);
+            assert!(StdInstant::now() < deadline);
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!process_exists(pid));
+        assert_eq!(engines.shutdown().await, Err(LocalLlamaFault::Failed));
+        assert!(engines.retains_artifacts().await);
+        assert_eq!(
+            engines.endpoint("offer", &engine, &model, &settings).await,
+            Err(LocalLlamaFault::Failed)
+        );
+        assert_eq!(
+            event_lines(&events)
+                .iter()
+                .filter(|line| line.starts_with("start:"))
+                .count(),
+            1
+        );
+        let mut owned = engines.engines.lock().await;
+        assert!(owned.get("offer").unwrap().closing);
+        // The fixture already reaped this exact PID; only test cleanup removes it.
+        owned.remove("offer");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_guard_identity_retains_ownership_without_signalling() {
+        let (engines, engine, model, settings, events) = fixture("healthy");
+        engines
+            .endpoint("offer", &engine, &model, &settings)
+            .await
+            .unwrap();
+        let pid = recorded_pid(&events);
+        {
+            let mut owned = engines.engines.lock().await;
+            owned.get_mut("offer").unwrap().guard_group = Some(0);
+            assert_eq!(
+                close_engine(&mut owned, "offer").await,
+                Err(LocalLlamaFault::Failed)
+            );
+            assert_eq!(owned.get("offer").unwrap().child.id(), Some(pid as u32));
+            owned.get_mut("offer").unwrap().guard_group = None;
+        }
+        assert!(process_exists(pid));
+        engines.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_lock_wait_is_bounded_and_retains_engine() {
+        let (engines, engine, model, settings, events) = fixture("healthy");
+        engines
+            .endpoint("offer", &engine, &model, &settings)
+            .await
+            .unwrap();
+        let pid = recorded_pid(&events);
+        let owned = engines.engines.lock().await;
+        let started = StdInstant::now();
+        assert_eq!(engines.shutdown().await, Err(LocalLlamaFault::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(owned.get("offer").unwrap().child.id(), Some(pid as u32));
+        drop(owned);
+        engines.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn concurrent_start_reuses_one_child_and_repeated_stop_is_idempotent() {
         let (engines, engine, model, settings, events) = fixture("healthy");
         let (first, second) = tokio::join!(
@@ -824,8 +1040,8 @@ mod tests {
             1
         );
 
-        engines.shutdown().await;
-        engines.shutdown().await;
+        engines.shutdown().await.unwrap();
+        engines.shutdown().await.unwrap();
 
         wait_for_event(&events, "term");
         assert_eq!(
@@ -883,7 +1099,7 @@ mod tests {
                 .count(),
             2
         );
-        engines.shutdown().await;
+        engines.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -922,7 +1138,7 @@ mod tests {
             .collect();
         assert_eq!(pids.len(), 2);
         assert!(pids.into_iter().all(|pid| !process_exists(pid)));
-        engines.shutdown().await;
+        engines.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -937,7 +1153,7 @@ mod tests {
         );
         let pid = recorded_pid(&events);
         assert!(!process_exists(pid));
-        engines.shutdown().await;
+        engines.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -951,7 +1167,7 @@ mod tests {
             Err(LocalLlamaFault::Failed)
         );
         assert!(event_lines(&events).is_empty());
-        engines.shutdown().await;
+        engines.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -992,7 +1208,9 @@ mod tests {
             .await,
             Err(LocalLlamaFault::Timeout)
         );
-        terminate_child(&mut child, &mut None, None, Duration::from_millis(100)).await;
+        terminate_child(&mut child, &mut None, None, Duration::from_millis(100))
+            .await
+            .unwrap();
         stop.store(true, Ordering::Relaxed);
         let _ = TcpStream::connect(("127.0.0.1", port));
         server.join().unwrap();
