@@ -70,9 +70,9 @@ volatile proof logs remain outside the repository.
 
 ## Browser contract and device qualification
 
-The task Mac now runs Runtime/relay source `21028a46`, Runtime hash
-`0bb277c4e28ed474ca801e1a5b505326198f824cf5979a88010a8f15a9a96044`
-and relay hash `9068894c129629d67a06e373535b41c59ff979ea1e5c5b95e22e2709e4b90a4d`.
+The task Mac runs Runtime source `6c8b0d96`, hash
+`78a3f9e460a04773b93f6bbfe22fa8c84fa4e3cc145b09f0507a4db85ea88d43`,
+and retains the `21028a46` relay hash `9068894c129629d67a06e373535b41c59ff979ea1e5c5b95e22e2709e4b90a4d`.
 The Exit provider retains hash
 `51d89371b234189c16923aac59737b5f24badec4390866d7abae6c875b11b316`.
 The inspection adapter from `4dd0a216` retains hash
@@ -118,13 +118,16 @@ expiry and quotas. Independent review accepts 20 stream tests, an actual
 Services-issued Browser caller test and 18 relay tests. The relay rejects
 private IPv4-mapped IPv6 and unverified upstream proxy DNS for public-only grants.
 Source `7879f439` adds verified image packaging and lazy acquisition before
-first-party local Engine readiness. Its 25 Rust and 26 packaging/source cases
-pass. Actual image publication, matching host helpers, the current 200 MiB
-buffered Carrier transfer ceiling and fresh installed acquisition stay open.
+first-party local Engine readiness. Source `e61603fe` replaces the confirmed
+200 MiB buffered image limit with bounded disk transfer and streamed verification.
+Its 34 Rust and 28 packaging/source checks pass. A real image exceeded the old
+limit after only 614 MB of input. Actual large-image publication, matching host
+helpers and fresh installed acquisition remain qualification requirements.
 
 An isolated Linux candidate now has a separately built Runtime and ten native
 providers for the consumer and Exit roles. Its Runtime hash is
-`62c329eaa6e4a32e26be40c1783966e939d06d4667cc8913610d961f30623ae0`.
+`ec47564a702d240ecbd08bf43e5d2c83a485bd94a95d197e49bc595a72ee8b05`
+from source `6c8b0d96`.
 Its matching `21028a46` Exit relay hash is
 `a9e79e8db5d8e4f810633a734ced073018ffdfe7db280209d1d9898fb5a5b5b6`.
 Fresh startup exposed a restart-script error: an `already_ready` migration
@@ -137,11 +140,31 @@ opens Browser through Home and checks unsupported-viewer rejection before page
 allocation. This target has no KVM and supplies no local Engine qualification.
 Both owned installations use the same private collaboration configuration.
 Normal People discovery, Inbox contact acceptance and the remote Exit offer
-projection pass. Sending the Services access request fails because this path
-expects a separate managed Home shell, while the configured Gateway already
-owns Carrier. A source repair to use that existing Runtime service is under
-regression review. Installed service approval and remote Browser journeys follow.
-The public live installation remains unchanged.
+projection pass. Source `6c8b0d96` routes Services through that running Runtime;
+its 16 isolated Services regressions pass. Installed testing then found that
+Inbox received requests only on launch and lacked Services approval controls.
+The `5c9c5c4b` Inbox page is installed and hash-verified on both Homes. Normal
+request delivery after Inbox reopening, visible owner approval and consumer
+Exit activation pass. Remote Exit use on two public pages fails before decoded
+media, with a generic Runtime admission error and confirmed post-effect cleanup.
+The actual installed Exit provider returns the expected stream receipt in an
+isolated format check; the precise admission cause still needs target evidence.
+
+Run 64 returns these Runtime and Inbox changes to the local Home journey.
+Controlled navigation, decoded media, native inspection, typing, scrolling and
+viewer reload pass. Reload takes 1406 ms; close takes 718 ms, clears all 13 effects
+and leaves zero Runtime/control obligations. Independent review of runs 63/64
+is pending. Run 57's audio silence remains unexplained.
+
+Reviewed source `92f04e0e` adds Runtime background request/decision receive with
+23 combined regressions. Source `9e6693d6` adds a short owner-approved operator
+writer and native reference click/type. Tests cover the real CDP retry wrapper
+and late-effect handoff: 74 JavaScript and 12 Python cases, plus the common,
+adapter and Runtime authority tests. Its installed native handoff remains pending.
+Source `54df379a` adds signed remote Engine availability probes; full remote page,
+stream and media binding is still being implemented. The combined source
+candidate is building for installed integration. B01-B16 retain all media,
+performance, recovery, device, human and release gates. Public live is unchanged.
 
 The preceding image used dependency repair `cbb1e099`, rootfs
 `d03ec02910defddfda432f0897b6f21b178eff52817df2e7b709bec7e1afa5aa`

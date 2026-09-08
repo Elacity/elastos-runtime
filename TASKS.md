@@ -68,8 +68,10 @@ alongside the local, operator and remote journeys.
   first-party local Engine readiness, including atomic replacement and cached
   byte verification. Its 25 Rust and 26 source/package checks pass. Next prove
   an actual publishable bundle and matching helpers through the existing
-  installer. The buffered 200 MiB Carrier reply ceiling remains a concrete
-  release dependency; existing verified images remain the installed test input.
+  installer. Reviewed source `e61603fe` removes the observed 200 MiB image
+  transfer limit with bounded disk streaming; 34 Rust and 28 script checks pass.
+  Actual large-image transfer and independent fresh installation are next;
+  existing verified images remain the installed test input.
 - **B02.startup / verifying / coordinator; independent review pending.**
   Prerequisites: accepted compatibility contract, image `d03ec029`, and reviewed
   installed runs 50-52. Reuse Runtime, native helpers, image and UI unless a
@@ -102,9 +104,12 @@ alongside the local, operator and remote journeys.
   their non-delegatable authority. Writer admission, revocation, handoff and
   adapter conformance stay open while the coordinator integrates installation
   and remote service work.
-  A bounded owner-approved click/type writer slice passes source tests. Parent
-  review now checks the real CDP wrapper's reconnect replay and native handoff
-  after timeout before accepting that slice for installation.
+  Reviewed source `9e6693d6` adds the bounded owner-approved click/type writer.
+  The corrected real CDP wrapper dispatches each action once; a native pending
+  marker keeps human handoff behind uncertain effects. Its 74 JavaScript and
+  12 Python checks plus Runtime/common/adapter regressions pass. Install the
+  changed guest scripts and adapter, then prove actual ref actions, handoff,
+  revocation and close. Operator adapters and broader workflow gates stay open.
 - **B08/B09.first-remote / active / independent delegated source owner.**
   Prerequisite: accepted Engine/Exit identity and Runtime service contracts.
   Identify the first missing product operation for A/B/A and A/A/B against
@@ -125,11 +130,16 @@ alongside the local, operator and remote journeys.
   parallel. The isolated Linux
   consumer/Exit build and installed Home sign-in now pass. Both test
   installations use the private collaboration configuration. Normal People
-  contact acceptance and remote Exit offer discovery pass. The first installed
-  access request fails at Services' managed Home shell attachment. The coordinator
-  repairs it to reuse the configured Runtime Carrier; a delegated reviewer
-  tests that operation without any managed shell coordinates. Service approval
-  and the Mac/server Browser journey remain pending.
+  contact acceptance and remote Exit offer discovery pass. Runtime `6c8b0d96`
+  fixes configured Carrier use. Installed Inbox `5c9c5c4b` exposes owner approval;
+  ordinary two-Home approval and Exit activation now pass after Inbox reopening.
+  Source `92f04e0e` moves receive progress into Runtime's background worker.
+  The first remote browsing failure is stream admission, before decoded media;
+  the coordinator will repeat it with internal cause logging on the combined
+  candidate. Local run 64 passes media, input, reload and exact close.
+  Engine availability probes pass source review at `54df379a`; the delegated
+  owner now implements full remote page/stream/media binding. Actual remote use,
+  revocation, cleanup and all five placements remain pending.
   The fresh Linux restart repair `2b640973` passes its active target smoke and
   installed Home proof with reused native binaries.
 
