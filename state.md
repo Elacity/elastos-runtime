@@ -197,7 +197,13 @@ The replacement later has a terminal 13-effect receipt, and fresh signed Runtime
 observation confirms zero obligations; its cleanup trigger is unconfirmed.
 The active source repair restores the retained owner and carries the original
 Engine/Exit choices separately from resolved routing. Installed reload recovery
-remains pending. The next proof reuses the verified guest image and helpers.
+remains pending. Installed UI `1a3d72f4` and Runtime `bfd52f56` pass the ordinary
+journey in run 27. A new viewer commits in 14 ms; all 21 Runtime binding samples
+match and the reload sends no page open/close request. Usable display recovery
+misses the five-second deadline. Fresh Home close confirms all 13 effects and
+zero obligations, reaches terminal state at 514 ms, and detaches at 516 ms.
+The next run captures bounded guest signaling diagnostics on these same
+installed artifacts before selecting the Engine repair.
 Guest Node also starts about five seconds after its shell launch;
 initial entropy is 1 and no hardware RNG is selected. That secondary cause needs
 its own experiment. Run 16 includes diagnostic overhead and is excluded from

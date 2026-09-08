@@ -72,7 +72,8 @@ Independent source repair and regression work can proceed in separate file scope
   both controlled navigations, decoded frames, typing, scrolling and exact
   cleanup. Its recovery wrapper then rejects a missing fixture URL before any
   connection cut; this is a harness failure, with product recovery still open.
-- Active local milestone: B06 five-second viewer interruption with the run-17
+- Active local milestone: B06 viewer reload after the accepted bounded interruption.
+  The earlier interruption slice used the run-17
   guest/native artifacts and the installed startup UI repair. Review requires
   the exact controlled URL, frame progress after recovery input, and timely
   restoration when the last cut observation is unfinished. The repaired probe
@@ -108,7 +109,14 @@ Independent source repair and regression work can proceed in separate file scope
   that residual cleanup is unconfirmed. The active repair adopts the retained
   Runtime owner and preserves the requested Engine/Exit choices through durable
   ownership. Review and source tests precede the same installed reload journey;
-  guest image and helpers remain reusable until a diagnosed change needs them.
+  guest image and helpers remain reusable until a diagnosed change needs them. Run 27
+  with installed UI `1a3d72f4` and Runtime `bfd52f56` passes the ordinary journey
+  again. Reload commits a new viewer in 14 ms, keeps all 21 Runtime binding
+  observations and sends no open/close request. Display recovery reaches its
+  five-second deadline. Fresh Home close succeeds in 514 ms and detaches at
+  516 ms, with all 13 effects and zero obligations. The next experiment captures
+  bounded guest signaling evidence during the same reload; the media negotiation
+  cause remains a hypothesis until that evidence is collected.
   Full B05 mixed-transport ordering and motion behavior remain separate gates.
   The probe must observe request failure and
   stopped media, then restore the same page, profile, service selection and
