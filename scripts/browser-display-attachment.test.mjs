@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import net from 'node:net';
 import { once } from 'node:events';
+import { setImmediate as nextTurn } from 'node:timers/promises';
 import { SelkiesPage, MinimalWebSocketClient } from './browser-selkies-control-service.mjs';
 
 const id = 'a'.repeat(32), otherId = 'b'.repeat(32);
@@ -34,6 +35,75 @@ function fixture() {
   const generation = page.displayGeneration;
   const request = { schema: 'elastos.browser.display-attach-request/v1', type: 'display_attach', request_id: id, display_generation: generation };
   return { page, calls, closed, generation, request };
+}
+
+function pendingConnections(f) {
+  const pending = { video: deferred(), audio: deferred() }, started = [], sends = [], closed = [];
+  delete f.page.openLegacySelkiesSession; delete f.page.openLegacySelkiesAudioSession;
+  const socket = channel => ({
+    connect: () => { started.push(channel); return pending[channel].promise; },
+    sendText: text => sends.push([channel, text]), close: () => closed.push(channel),
+  });
+  f.page.createWebSocket = () => socket('video');
+  f.page.createAudioWebSocket = () => socket('audio');
+  return { pending, started, sends, closed };
+}
+
+test('both viewers register before the producer retry tick while video SDP is delayed', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture(), registered = new Map(), sessions = [];
+  delete f.page.openLegacySelkiesSession; delete f.page.openLegacySelkiesAudioSession;
+  const socket = channel => {
+    const ws = { connect: async () => {}, close() {}, sendText(message) {
+      assert.match(message, new RegExp(`^HELLO ${channel === 'video' ? '1' : '3'} `));
+      registered.set(channel, ws);
+      if (channel === 'video') f.page.handleMessage('HELLO'); else f.page.handleAudioMessage('HELLO');
+    } };
+    return ws;
+  };
+  f.page.createWebSocket = () => socket('video'); f.page.createAudioWebSocket = () => socket('audio');
+  Object.assign(f.page.config, { connectTimeoutMs: 1000, signalTimeoutMs: 5000 });
+  // Selkies sends SESSION on producer HELLO and retries NoPeer every 2s.
+  // The video offer follows its successful SESSION; it is not an audio gate.
+  const setupCall = channel => {
+    sessions.push([channel, registered.has(channel)]);
+    if (!registered.has(channel)) { setTimeout(() => setupCall(channel), 2000); return; }
+    setTimeout(() => {
+      const offer = JSON.stringify({ sdp: { type: 'offer', sdp: channel === 'video' ? videoSdp : audioSdp } });
+      if (channel === 'video') f.page.handleMessage(offer); else f.page.handleAudioMessage(offer);
+    }, channel === 'video' ? 100 : 10);
+  };
+  setupCall('video'); setupCall('audio');
+  let completed;
+  const pending = f.page.signal(f.request).then(value => { completed = { value }; }, error => { completed = { error }; });
+  t.after(async () => { f.page.close(); await pending; });
+  await nextTurn();
+  t.mock.timers.tick(2000); await nextTurn();
+  assert.equal(completed, undefined, 'a partial audio offer must not publish the display');
+  t.mock.timers.tick(100); await nextTurn();
+  assert.deepEqual(sessions, [['video', false], ['audio', false], ['video', true], ['audio', true]],
+    'late audio HELLO would defer its SESSION to 4s and exhaust the attachment budget');
+  assert.ok(completed?.value, completed?.error?.message || 'both offers must complete on the first retry cycle');
+  assert.equal(completed.value.initial_offer.sdp, videoSdp);
+  assert.equal(completed.value.audio_offer.sdp, audioSdp);
+  assert.notEqual(f.page.displayGeneration, f.generation);
+});
+
+for (const [video, audio] of [['raw_json', 'peer_routed'], ['peer_routed', 'raw_json']]) {
+  test(`attachment keeps captured video ${video} and audio ${audio} protocols`, async () => {
+    const f = fixture(), called = [], videoOffer = deferred(), audioOffer = deferred();
+    f.page.establishedVideoProtocol = video; f.page.establishedAudioProtocol = audio;
+    const method = (channel, protocol, offer) => async () => { called.push([channel, protocol]); return offer.promise; };
+    f.page.openLegacySelkiesSession = method('video', 'raw_json', videoOffer);
+    f.page.openCurrentSelkiesSession = method('video', 'peer_routed', videoOffer);
+    f.page.openLegacySelkiesAudioSession = method('audio', 'raw_json', audioOffer);
+    f.page.openCurrentSelkiesAudioSession = method('audio', 'peer_routed', audioOffer);
+    const pending = f.page.signal(f.request);
+    f.page.establishedVideoProtocol = f.page.establishedAudioProtocol = 'changed after request';
+    await nextTurn(); assert.deepEqual(called, [['video', video], ['audio', audio]]);
+    audioOffer.resolve({ sdp: { sdp: audioSdp } }); videoOffer.resolve({ sdp: { sdp: videoSdp } });
+    await pending; assert.equal(f.page.displayAvailable, true);
+  });
 }
 
 test('paired attachment preserves the page and returns only fresh display offers', async () => {
@@ -77,12 +147,15 @@ test('initial legacy signals work; attachment requires current generation and ec
   }
 });
 
-test('explicit close wins over late video negotiation', async () => {
-  const f = fixture(), wait = deferred(); f.page.openLegacySelkiesSession = async () => wait.promise;
-  const pending = f.page.signal(f.request); await Promise.resolve(); f.page.close();
-  wait.resolve({ sdp: { sdp: videoSdp } }); await assert.rejects(pending, { code: 'display_attach_failed' });
+test('explicit close fences both pending connections before any late HELLO or offer', async () => {
+  const f = fixture(), c = pendingConnections(f);
+  const pending = f.page.signal(f.request), failed = assert.rejects(pending, { code: 'display_attach_failed' });
+  await nextTurn(); assert.deepEqual(c.started, ['video', 'audio']); f.page.close();
+  c.pending.video.resolve(); c.pending.audio.resolve(); await failed; await nextTurn();
   assert.equal(f.page.displayGeneration, f.generation); assert.equal(f.page.displayAvailable, false);
-  assert.equal(f.closed.length, 1); assert.equal(f.calls.some(row => row[0] === 'open' && row[1] === 'audio'), false);
+  assert.equal(f.closed.length, 1); assert.deepEqual(c.sends, []);
+  assert.equal(f.page.waiters.length, 0); assert.equal(f.page.audioWaiters.length, 0);
+  assert.ok(c.closed.includes('video')); assert.ok(c.closed.includes('audio'));
   f.page.close(); assert.equal(f.closed.length, 1);
 });
 
@@ -111,15 +184,33 @@ test('video signaling loss preserves page ownership for explicit close', () => {
 
 test('attachment deadline preserves owner and prevents late negotiation publication', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  const f = fixture(), wait = deferred(); f.page.openLegacySelkiesSession = async () => wait.promise;
-  const pending = f.page.signal(f.request); await Promise.resolve();
+  const f = fixture(), c = pendingConnections(f);
+  const pending = f.page.signal(f.request); await nextTurn();
+  assert.deepEqual(c.started, ['video', 'audio']);
   const failed = assert.rejects(pending, { code: 'display_attach_failed' });
   t.mock.timers.tick(4000); await failed;
-  wait.resolve({ sdp: { sdp: videoSdp } }); await Promise.resolve(); await Promise.resolve();
+  c.pending.video.resolve(); c.pending.audio.resolve(); await nextTurn();
   assert.equal(f.page.displayGeneration, f.generation); assert.equal(f.page.displayAvailable, false);
   assert.equal(f.page.closed, false); assert.deepEqual(f.closed, []);
-  assert.equal(f.calls.some(row => row[0] === 'open' && row[1] === 'audio'), false);
+  assert.deepEqual(c.sends, []); assert.equal(f.page.waiters.length, 0); assert.equal(f.page.audioWaiters.length, 0);
+  assert.deepEqual(c.closed, ['video', 'audio']);
 });
+
+for (const broken of ['video', 'audio']) {
+  test(`${broken} failure retires both connections and fences the other late completion`, async () => {
+    const f = fixture(), c = pendingConnections(f);
+    const pending = f.page.signal(f.request), failed = assert.rejects(pending, { code: 'display_attach_failed' });
+    await nextTurn(); assert.deepEqual(c.started, ['video', 'audio']);
+    c.pending[broken].reject(new Error('private connection failure')); await failed;
+    c.pending[broken === 'video' ? 'audio' : 'video'].resolve(); await nextTurn();
+    assert.deepEqual(c.sends, []); assert.deepEqual(c.closed, ['video', 'audio']);
+    assert.equal(f.page.waiters.length, 0); assert.equal(f.page.audioWaiters.length, 0);
+    assert.equal(f.page.displayGeneration, f.generation); assert.equal(f.page.displayAvailable, false);
+    assert.equal(f.page.closed, false); assert.deepEqual(f.closed, []);
+    await assert.rejects(f.page.signal(f.request), { code: 'display_attach_failed' });
+    assert.deepEqual(c.started, ['video', 'audio']);
+  });
+}
 
 for (const invalid of [{ request_id: 'bad' }, { display_generation: 'bad' }, { type: 'answer' }, { sdp: '' }, { channel: 'audio' }, { extra: true }]) {
   test(`invalid attachment ${Object.keys(invalid)[0]} acquires no display effects`, () => {
@@ -136,25 +227,25 @@ test('attachment forbids a channel and legacy pages report unsupported before re
 
 test('timed-out negotiation cannot send HELLO or register waiters on the next attempt', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  const f = fixture(), first = deferred(), second = deferred(), sends = [], waits = [];
+  const f = fixture(), first = { video: deferred(), audio: deferred() }, second = { video: deferred(), audio: deferred() }, sends = [], waits = [];
   delete f.page.openLegacySelkiesSession; delete f.page.openLegacySelkiesAudioSession;
-  let sockets = 0;
-  f.page.createWebSocket = () => {
-    const index = ++sockets;
-    return { connect: async () => (index === 1 ? first : second).promise,
-      sendText: value => sends.push([index, value.split(' ')[0]]), close() {} };
+  const sockets = { video: 0, audio: 0 };
+  const socket = channel => {
+    const index = ++sockets[channel];
+    return { connect: async () => (index === 1 ? first : second)[channel].promise,
+      sendText: value => sends.push([channel, index, value.split(' ')[0]]), close() {} };
   };
-  f.page.createAudioWebSocket = () => ({ connect: async () => {}, sendText: () => {}, close() {} });
-  f.page.waitFor = async (_predicate, label) => { waits.push(label); return label.includes('HELLO') ? { kind: 'hello' } : { sdp: { sdp: videoSdp } }; };
-  f.page.waitForAudio = async (_predicate, label) => label.includes('HELLO') ? { kind: 'hello' } : { sdp: { sdp: audioSdp } };
+  f.page.createWebSocket = () => socket('video'); f.page.createAudioWebSocket = () => socket('audio');
+  const waitFor = sdp => async (_predicate, label) => { waits.push(label); return label.includes('HELLO') ? { kind: 'hello' } : { sdp: { sdp } }; };
+  f.page.waitFor = waitFor(videoSdp); f.page.waitForAudio = waitFor(audioSdp);
   f.page.openCurrentSelkiesSession = async () => { throw new Error('Lost legacy protocol'); };
   const a = f.page.signal(f.request); await Promise.resolve();
   const failed = assert.rejects(a, { code: 'display_attach_failed' }); t.mock.timers.tick(4000); await failed;
   const b = f.page.signal({ ...f.request, request_id: otherId }); await Promise.resolve();
-  first.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  first.video.resolve(); first.audio.resolve(); await nextTurn();
   assert.deepEqual(sends, []); assert.deepEqual(waits, []);
-  second.resolve(); await b;
-  assert.deepEqual(sends, [[2, 'HELLO']]); assert.equal(waits.length, 2);
+  second.video.resolve(); second.audio.resolve(); await b;
+  assert.deepEqual(sends, [['video', 2, 'HELLO'], ['audio', 2, 'HELLO']]); assert.equal(waits.length, 4);
   assert.equal(f.page.closed, false); assert.equal(f.page.displayAvailable, true);
 });
 
@@ -239,28 +330,34 @@ async function actualLegacyPage(t, broker) {
 
 test('actual legacy broker keeps retired viewer IDs until producer teardown; attachment retries only UID rejection', async t => {
   const broker = await legacyBroker(t, { releaseMs: { '1': 120, '3': 320 } }), f = await actualLegacyPage(t, broker);
+  assert.deepEqual(broker.accepted, ['1', '3']);
   const result = await f.page.signal(f.request);
   assert.ok(broker.rejected.includes('1'));
   assert.ok(broker.rejected.includes('3'));
-  assert.deepEqual(broker.accepted, ['1', '3', '1', '3']);
+  assert.equal(broker.accepted.length, 4);
+  assert.deepEqual(broker.accepted.slice(2).sort(), ['1', '3']);
   assert.equal(f.page.closed, false); assert.equal(f.page.displayAvailable, true);
   assert.equal(result.initial_offer.type, 'offer'); assert.equal(result.audio_offer.type, 'offer');
   assert.notEqual(result.display_generation, f.generation);
   const next = await f.page.signal({ ...f.request, request_id: otherId, display_generation: result.display_generation });
   assert.notEqual(next.display_generation, result.display_generation);
-  assert.deepEqual(broker.accepted, ['1', '3', '1', '3', '1', '3']);
+  assert.equal(broker.accepted.length, 6);
+  assert.deepEqual(broker.accepted.slice(4).sort(), ['1', '3']);
 });
 
 test('UID error after HELLO acknowledgment is terminal even when its code and reason match', async t => {
   const broker = await legacyBroker(t, { acknowledgeRejected: true }), f = await actualLegacyPage(t, broker);
   await assert.rejects(f.page.signal(f.request), { code: 'display_attach_failed' });
-  assert.deepEqual(broker.rejected, ['1']);
+  assert.ok(broker.rejected.length > 0);
+  assert.equal(new Set(broker.rejected).size, broker.rejected.length, 'neither channel may retry after HELLO');
 });
 
 test('actual broker protocol rejection other than the exact UID release response remains terminal', async t => {
   const broker = await legacyBroker(t, { rejectionReason: 'invalid protocol' }), f = await actualLegacyPage(t, broker);
   await assert.rejects(f.page.signal(f.request), { code: 'display_attach_failed' });
-  assert.deepEqual(broker.rejected, ['1']); assert.equal(f.page.closed, false);
+  assert.ok(broker.rejected.length > 0);
+  assert.equal(new Set(broker.rejected).size, broker.rejected.length, 'neither channel may retry another protocol error');
+  assert.equal(f.page.closed, false);
 });
 
 for (const cancel of ['deadline', 'close']) {

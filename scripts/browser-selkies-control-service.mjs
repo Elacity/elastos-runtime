@@ -2785,9 +2785,12 @@ export class SelkiesPage {
           }
         }
       };
-      const videoOffer = await negotiate("video", videoProtocol);
-      current();
-      const audioOffer = await negotiate("audio", audioProtocol);
+      // Register both viewers before either producer's next SESSION retry;
+      // waiting for video SDP first can cost audio another retry interval.
+      const [videoOffer, audioOffer] = await Promise.all([
+        negotiate("video", videoProtocol),
+        negotiate("audio", audioProtocol),
+      ]);
       current();
       if (this.videoClosed || this.audioClosed) throw new Error("Browser display signaling closed");
       const generation = `display:${crypto.randomBytes(16).toString("hex")}`;
