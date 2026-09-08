@@ -19,7 +19,6 @@ CANONICAL = {
     "custody-provider": "custody",
     "protected-content-decrypt-provider": "protected-content-decrypt",
 }
-PROVISIONAL = ("drm-provider", "rights-provider", "key-provider", "decrypt-provider")
 REQUIRED = (
     "chain-provider",
     "protected-content-protect-provider",
@@ -33,7 +32,7 @@ CUSTODY_HOST_REQUIRED = (
     "ipfs-provider",
     "chain-provider",
 )
-ALL_COMPONENTS = (*REQUIRED, "kubo", "ipfs-provider", "availability-provider", *PROVISIONAL)
+ALL_COMPONENTS = (*REQUIRED, "kubo", "ipfs-provider", "availability-provider")
 
 
 def sha256(data):
@@ -281,11 +280,11 @@ def main():
         if receipt.get("static_ok") is not True:
             raise AssertionError(receipt)
         active = receipt.get("active_path") or {}
-        if active.get("declared_mode") != "pre_cutover_coexistence":
+        if active.get("declared_mode") != "canonical_declared_unproven":
             raise AssertionError(receipt)
         if active.get("status") != "active_proof_pending":
             raise AssertionError(receipt)
-        if set(active.get("provisional_selected") or []) != set(PROVISIONAL):
+        if "provisional_selected" in active:
             raise AssertionError(receipt)
         pending = class_values(receipt, "active_installed_proof_prerequisites")
         for name in (

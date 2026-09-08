@@ -82,8 +82,8 @@ if (declaredHash !== sourceHash) {
 const mermaidDiagrams = [...c4.matchAll(/```mermaid\n([\s\S]*?)\n```/g)].map(
   (match) => match[1],
 );
-if (mermaidDiagrams.length !== 14) {
-  failures.push(`c4.md has ${mermaidDiagrams.length} Mermaid diagrams; expected 14`);
+if (mermaidDiagrams.length !== 15) {
+  failures.push(`c4.md has ${mermaidDiagrams.length} Mermaid diagrams; expected 15`);
 }
 for (const [index, diagram] of mermaidDiagrams.entries()) {
   if (!/^(?:flowchart\s+(?:LR|RL|TB|BT)|sequenceDiagram)\n/.test(diagram)) {
@@ -105,6 +105,7 @@ const expectedViews = [
   "effect",
   "conversation",
   "wallet",
+  "protected",
   "deployment",
 ];
 const actualViews = [...viewer.matchAll(/^\s+id: "([^"]+)"/gm)].map(

@@ -137,16 +137,6 @@ else
     CARGO_TARGET_DIR=$(cd elastos && cargo metadata --locked --offline --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
 fi
 [[ "$CARGO_TARGET_DIR" == /* ]] || die "Cargo target directory must resolve to an absolute path"
-python3 - "$CARGO_TARGET_DIR" "$STAGING" <<'PY'
-import pathlib, shutil, sys
-for value in sys.argv[1:]:
-    path = pathlib.Path(value).resolve()
-    while not path.exists():
-        path = path.parent
-    usage = shutil.disk_usage(path)
-    if usage.free * 10 < usage.total:
-        raise SystemExit(f"At least 10% free space is required on the volume for {value}")
-PY
 export CARGO_TARGET_DIR ELASTOS_RELEASE_VERSION="$VERSION"
 rustup target list --installed | grep -Fxq "$TARGET" || die "Required Rust target is not installed: $TARGET"
 # Native macOS uses the same Cargo cache as normal source-home builds. Linux

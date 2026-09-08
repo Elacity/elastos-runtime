@@ -1,8 +1,8 @@
 //! ElastOS protected-content custody node provider capsule.
 //!
-//! This source-only provider may be registered by Runtime as the inactive
-//! `custody` route. It does not replace the still-active provisional
-//! key-provider product path.
+//! Runtime registers this provider on the Runtime-only `custody` target. It is
+//! the only key-custody authority: each node evaluates rights locally and
+//! releases one recipient-encrypted contribution per authenticated operation.
 
 use std::env;
 use std::io::{self, BufRead, Write};

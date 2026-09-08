@@ -571,9 +571,9 @@ def stage_inputs(values, version, output, preview_platform=None):
                 files[name], origins[name] = record, (Path(path), relative)
     parent = output.parent.resolve()
     parent.mkdir(parents=True, exist_ok=True)
-    usage = shutil.disk_usage(parent)
-    if usage.free - sum(record["size"] for record in files.values()) < usage.total / 10:
-        raise ValueError("publication staging requires at least 10% free after its copy")
+    needed = sum(record["size"] for record in files.values())
+    if shutil.disk_usage(parent).free < needed:
+        raise ValueError(f"publication staging needs {needed} free bytes for its copy")
     with tempfile.TemporaryDirectory(prefix=".platform-import-", dir=parent) as temporary:
         stage = Path(temporary) / "input"
         artifacts = stage / "artifacts"

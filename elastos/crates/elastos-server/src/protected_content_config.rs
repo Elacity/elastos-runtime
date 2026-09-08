@@ -79,8 +79,8 @@ pub enum ProtectedContentConfigCommand {
         #[arg(long)]
         key: PathBuf,
     },
-    /// Provision this host's inactive custody provider state root and export
-    /// its custody node descriptor for the composition ceremony.
+    /// Provision this host's custody provider state root and export its
+    /// custody node descriptor for the composition ceremony.
     ProvisionCustodyNode {
         #[arg(long)]
         data_dir: PathBuf,
@@ -903,8 +903,8 @@ fn canonical_contract_base64<T: CanonicalContract>(value: &T) -> anyhow::Result<
 }
 
 /// Create (if missing) and validate the owner-only directory chain that must
-/// exist before the inactive custody provider state root can be provisioned
-/// or registered at boot.
+/// exist before the custody provider state root can be provisioned or
+/// registered at boot.
 fn provisioned_inactive_custody_root(data_dir: &Path) -> anyhow::Result<PathBuf> {
     validate_existing_data_dir(data_dir)?;
     let protected_root = protected_content_root(data_dir);
@@ -912,7 +912,7 @@ fn provisioned_inactive_custody_root(data_dir: &Path) -> anyhow::Result<PathBuf>
     let inactive_root = inactive_custody_state_root(data_dir);
     let custody_dir = inactive_root
         .parent()
-        .context("inactive custody provider root has no parent directory")?;
+        .context("custody provider state root has no parent directory")?;
     ensure_owner_only_dir(custody_dir, "custody provider root")?;
     Ok(inactive_root)
 }

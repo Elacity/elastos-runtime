@@ -8,11 +8,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context as _};
 use base64::Engine as _;
 use elastos_common::localhost::rooted_localhost_fs_path;
-use elastos_common::protected_content::{
-    DecryptSessionRequestV1, KeyReleaseRequestV1, ReleaseReceiptV1, RightsDecisionReceiptV1,
-    SealedObjectV1, DECRYPT_SESSION_REQUEST_SCHEMA, DECRYPT_SESSION_SCHEMA,
-    KEY_RELEASE_REQUEST_SCHEMA, RELEASE_RECEIPT_SCHEMA, RIGHTS_DECISION_RECEIPT_SCHEMA,
-};
 use elastos_runtime::provider::{
     Provider, ProviderError, ProviderInvocation, ProviderInvocationTransport, ProviderRegistry,
     ProviderTransfer, ResourceRequest, ResourceResponse,
@@ -476,16 +471,6 @@ impl Provider for ObjectProvider {
                 };
                 library_repair(&data_dir, registry, &principal_id, &uri).await
             }
-            request @ (ObjectProviderRequest::Status { .. }
-            | ObjectProviderRequest::Share { .. }
-            | ObjectProviderRequest::SharedAccess { .. }) => {
-                handle_library_request_with_protected_content_status(
-                    data_dir,
-                    request,
-                    self.registry.upgrade(),
-                )
-                .await
-            }
             request @ (ObjectProviderRequest::ListRuntimeCustody { .. }
             | ObjectProviderRequest::ImportRuntimeCustody { .. }
             | ObjectProviderRequest::Buy { .. }
@@ -767,12 +752,6 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
             handle_runtime_custody_library_request(data_dir, registry, request, gateway_authority)
                 .await
         }
-        request @ (ObjectProviderRequest::Status { .. }
-        | ObjectProviderRequest::Share { .. }
-        | ObjectProviderRequest::SharedAccess { .. }) => {
-            handle_library_request_with_protected_content_status(data_dir, request, Some(registry))
-                .await
-        }
         request => tokio::task::spawn_blocking(move || handle_library_request(&data_dir, request))
             .await
             .map_err(|err| anyhow!("object provider task failed: {err}"))
@@ -783,275 +762,6 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
         Ok(data) => provider_ok(data),
         Err(err) => provider_error_from("library_error", &err),
     }
-}
-
-async fn handle_library_request_with_protected_content_status(
-    data_dir: PathBuf,
-    request: ObjectProviderRequest,
-    registry: Option<Arc<ProviderRegistry>>,
-) -> anyhow::Result<Value> {
-    let request_is_shared_access = matches!(request, ObjectProviderRequest::SharedAccess { .. });
-    let mut data = tokio::task::spawn_blocking(move || handle_library_request(&data_dir, request))
-        .await
-        .map_err(|err| anyhow!("object provider task failed: {err}"))
-        .and_then(|result| result)?;
-    if let Some(registry) = registry {
-        if request_is_shared_access {
-            attach_protected_content_open_chain(&registry, &mut data).await?;
-        }
-        attach_protected_content_provider_status(&registry, &mut data).await;
-    }
-    Ok(data)
-}
-
-async fn attach_protected_content_open_chain(
-    registry: &ProviderRegistry,
-    data: &mut Value,
-) -> anyhow::Result<()> {
-    let object_cid = data
-        .get("cid")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("protected shared_access missing cid"))?
-        .to_string();
-    let Some(access) = data.get_mut("access") else {
-        return Ok(());
-    };
-    let key_release_required = access
-        .get("key_release")
-        .and_then(|value| value.get("required"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if !key_release_required {
-        return Ok(());
-    }
-
-    let content_security = access
-        .get("content_security")
-        .cloned()
-        .ok_or_else(|| anyhow!("protected shared_access missing content_security"))?;
-    let sealed_object = protected_content_sealed_object_from_security(&content_security)?;
-    let recipient_proof = access
-        .get("recipient_proof")
-        .cloned()
-        .ok_or_else(|| anyhow!("protected shared_access missing recipient_proof"))?;
-    let principal_id = recipient_proof
-        .get("recipient")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("protected shared_access recipient proof missing recipient"))?
-        .to_string();
-    let session_id = recipient_proof
-        .get("session_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("protected shared_access recipient proof missing session_id"))?
-        .to_string();
-    let now = now_ts();
-    let expires_at = now.saturating_add(900);
-    let action = "view";
-    let reason = "library protected shared_access open";
-
-    let drm_receipt = protected_provider_data(
-        registry,
-        "drm",
-        "open",
-        &json!({
-            "op": "open",
-            "request": {
-                "object": sealed_object,
-                "principal_id": principal_id,
-                "session_id": session_id,
-                "action": action,
-                "reason": reason
-            }
-        }),
-    )
-    .await?;
-    reject_forbidden_protected_content_fields(&drm_receipt)?;
-
-    let rights_receipt_value = protected_provider_data(
-        registry,
-        "rights",
-        "has_access_by_content_id",
-        &json!({
-            "op": "has_access_by_content_id",
-            "request": {
-                "principal_id": principal_id,
-                "session_id": session_id,
-                "content_id": object_cid,
-                "right": action,
-                "reason": reason,
-                "policy_ref": sealed_object.rights_policy_cid
-            }
-        }),
-    )
-    .await?;
-    reject_forbidden_protected_content_fields(&rights_receipt_value)?;
-    let rights_receipt: RightsDecisionReceiptV1 =
-        serde_json::from_value(rights_receipt_value.clone())
-            .context("rights provider returned invalid protected-content receipt")?;
-    if rights_receipt.schema != RIGHTS_DECISION_RECEIPT_SCHEMA || !rights_receipt.allowed {
-        bail!("rights provider did not allow protected shared_access");
-    }
-
-    let key_release_request = KeyReleaseRequestV1 {
-        schema: KEY_RELEASE_REQUEST_SCHEMA.to_string(),
-        request_id: protected_request_id("key-release", &object_cid, &principal_id, now),
-        principal_id: principal_id.clone(),
-        session_id: session_id.clone(),
-        object_cid: object_cid.clone(),
-        action: action.to_string(),
-        rights_receipt,
-        key_envelope: sealed_object.key_envelope.clone(),
-        reason: reason.to_string(),
-        expires_at,
-    };
-    let release_receipt_value = protected_provider_data(
-        registry,
-        "key",
-        "release",
-        &json!({
-            "op": "release",
-            "request": key_release_request
-        }),
-    )
-    .await?;
-    reject_forbidden_protected_content_fields(&release_receipt_value)?;
-    let release_receipt: ReleaseReceiptV1 =
-        serde_json::from_value(release_receipt_value.clone())
-            .context("key provider returned invalid release receipt")?;
-    if release_receipt.schema != RELEASE_RECEIPT_SCHEMA {
-        bail!("key provider returned unsupported release receipt schema");
-    }
-
-    let decrypt_request = DecryptSessionRequestV1 {
-        schema: DECRYPT_SESSION_REQUEST_SCHEMA.to_string(),
-        request_id: protected_request_id("decrypt-session", &object_cid, &principal_id, now),
-        principal_id: principal_id.clone(),
-        session_id: session_id.clone(),
-        object_cid: object_cid.clone(),
-        action: action.to_string(),
-        viewer_interface: sealed_object.viewer.required_interface.clone(),
-        release_receipt,
-        output_kind: "rendered".to_string(),
-        reason: reason.to_string(),
-        expires_at,
-    };
-    let decrypt_session_value = protected_provider_data(
-        registry,
-        "decrypt",
-        "open_session",
-        &json!({
-            "op": "open_session",
-            "request": decrypt_request
-        }),
-    )
-    .await?;
-    reject_forbidden_protected_content_fields(&decrypt_session_value)?;
-    if decrypt_session_value.get("schema").and_then(Value::as_str) != Some(DECRYPT_SESSION_SCHEMA) {
-        bail!("decrypt provider returned unsupported decrypt session schema");
-    }
-
-    if let Some(open) = access.get_mut("open").and_then(Value::as_object_mut) {
-        open.insert(
-            "provider".to_string(),
-            Value::String("decrypt-provider".to_string()),
-        );
-        open.insert(
-            "transport".to_string(),
-            Value::String("runtime-protected-provider-chain".to_string()),
-        );
-        open.insert(
-            "status".to_string(),
-            Value::String("ready_for_protected_viewer_session".to_string()),
-        );
-        open.insert(
-            "protected_content".to_string(),
-            json!({
-                "schema": "elastos.library.protected-open/v1",
-                "action": action,
-                "provider_chain": ["drm-provider.open", "rights-provider.has_access_by_content_id", "key-provider.release", "decrypt-provider.open_session"],
-                "drm_receipt": drm_receipt,
-                "rights_receipt": rights_receipt_value,
-                "key_release_receipt": release_receipt_value,
-                "decrypt_session": decrypt_session_value,
-                "viewer": {
-                    "required_interface": sealed_object.viewer.required_interface,
-                    "handoff": "viewer_capsule_session"
-                },
-                "raw_cek_exposed": false,
-                "raw_plaintext_exposed": false
-            }),
-        );
-    }
-    Ok(())
-}
-
-async fn protected_provider_data(
-    registry: &ProviderRegistry,
-    scheme: &str,
-    op: &str,
-    request: &Value,
-) -> anyhow::Result<Value> {
-    let response = registry
-        .send_raw(scheme, request)
-        .await
-        .map_err(|err| anyhow!("{scheme} provider unavailable for protected {op}: {err}"))?;
-    if response.get("status").and_then(Value::as_str) == Some("error") {
-        let message = response
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("provider returned error");
-        bail!("{scheme} provider rejected protected {op}: {message}");
-    }
-    response
-        .get("data")
-        .cloned()
-        .ok_or_else(|| anyhow!("{scheme} provider protected {op} response missing data"))
-}
-
-fn protected_request_id(kind: &str, object_cid: &str, principal_id: &str, now: u64) -> String {
-    let digest = Sha256::digest(format!("{kind}:{object_cid}:{principal_id}:{now}"));
-    format!("{kind}:{}", hex::encode(&digest[..16]))
-}
-
-fn reject_forbidden_protected_content_fields(value: &Value) -> anyhow::Result<()> {
-    const FORBIDDEN: &[&str] = &[
-        "raw_cek",
-        "cek",
-        "raw_plaintext",
-        "plaintext",
-        "private_key",
-        "provider_credentials",
-        "kms_node_credentials",
-        "wallet_rpc",
-        "chain_rpc",
-        "kubo_api",
-        "kubo_api_url",
-        "ipfs_api",
-        "ipfs_api_url",
-        "elacity_sdk",
-        "elacity_sdk_token",
-        "contract_sdk",
-        "key_backend_sdk",
-    ];
-    let mut stack = vec![value];
-    while let Some(value) = stack.pop() {
-        match value {
-            Value::Object(map) => {
-                for (key, value) in map {
-                    if FORBIDDEN.contains(&key.as_str()) {
-                        bail!("protected provider response exposed forbidden field: {key}");
-                    }
-                    stack.push(value);
-                }
-            }
-            Value::Array(values) => stack.extend(values),
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 async fn handle_library_webspace_request(
@@ -1741,10 +1451,7 @@ fn handle_library_request(
             let shared_at = now_ts();
             let recipients = normalized_share_recipients(&recipients)?;
             let share_policy = normalized_share_policy(policy.as_deref(), recipients.is_empty())?;
-            let key_release = normalized_key_release_policy(
-                key_release_policy.as_deref(),
-                &record.content_security,
-            )?;
+            let key_release = normalized_key_release_policy(key_release_policy.as_deref())?;
             let remote_enforcement = share_remote_enforcement_contract(&share_policy, &key_release);
             record.shared_at = Some(shared_at);
             record.share_policy = Some(share_policy.clone());
@@ -5767,8 +5474,8 @@ fn default_publish_content_security() -> Value {
         "source_storage": "unknown",
         "published_payload": "plain_content",
         "key_release_required": false,
-        "status": "not_required_for_plain_published_content",
-        "required_providers": protected_content_provider_requirements(false),
+        "status": "plain_published_content",
+        "protected_content": "runtime_custody_publish_only",
     })
 }
 
@@ -5777,200 +5484,9 @@ fn default_share_key_release() -> Value {
         "schema": "elastos.library.key-release/v1",
         "required": false,
         "status": "not_required_for_plain_published_content",
-        "required_providers": protected_content_provider_requirements(false),
-        "next": "Protected encrypted-content sharing requires drm/rights/key/decrypt providers before content is opened."
+        "protected_content": "runtime_custody_publish_only",
+        "next": "Library share carries plain published content. Protected content is published through Runtime custody and opened in the viewer, not shared through a key-release policy."
     })
-}
-
-fn protected_content_provider_requirements(required: bool) -> Value {
-    let status = if required {
-        "required_for_encrypted_recipient_payload"
-    } else {
-        "not_required_for_plain_published_content"
-    };
-    json!({
-        "schema": "elastos.library.protected-content-provider-requirements/v1",
-        "required": required,
-        "status": status,
-        "providers": [
-            {
-                "id": "drm-provider",
-                "scheme": "drm",
-                "role": "protected-content open orchestration",
-                "operation": "open",
-                "required": required
-            },
-            {
-                "id": "rights-provider",
-                "scheme": "rights",
-                "role": "recipient rights/ACL decision",
-                "operation": "has_access_by_content_id",
-                "required": required
-            },
-            {
-                "id": "key-provider",
-                "scheme": "key",
-                "role": "recipient-scoped key release",
-                "operation": "release",
-                "required": required
-            },
-            {
-                "id": "decrypt-provider",
-                "scheme": "decrypt",
-                "role": "viewer-scoped decrypt/render session",
-                "operation": "open_session",
-                "required": required
-            }
-        ],
-        "authority_boundary": "Library records grants; drm/rights/key/decrypt providers enforce protected-content access without exposing raw CEKs or broad plaintext authority."
-    })
-}
-
-async fn attach_protected_content_provider_status(registry: &ProviderRegistry, data: &mut Value) {
-    let status = protected_content_provider_status(registry).await;
-    if let Some(object) = data.as_object_mut() {
-        object.insert("protected_content".to_string(), status.clone());
-        if let Some(published) = object.get_mut("published").and_then(Value::as_object_mut) {
-            published.insert("protected_content".to_string(), status);
-        }
-    }
-}
-
-async fn protected_content_provider_status(registry: &ProviderRegistry) -> Value {
-    let providers = [
-        protected_content_provider_runtime_status(registry, "drm-provider", "drm", "open").await,
-        protected_content_provider_runtime_status(
-            registry,
-            "rights-provider",
-            "rights",
-            "has_access_by_content_id",
-        )
-        .await,
-        protected_content_provider_runtime_status(registry, "key-provider", "key", "release").await,
-        protected_content_provider_runtime_status(
-            registry,
-            "decrypt-provider",
-            "decrypt",
-            "open_session",
-        )
-        .await,
-    ];
-    let available_count = providers
-        .iter()
-        .filter(|provider| {
-            provider
-                .get("available")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        })
-        .count();
-    let configured_count = providers
-        .iter()
-        .filter(|provider| {
-            provider
-                .get("configured")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        })
-        .count();
-    let provider_chain_ready = configured_count == providers.len();
-    json!({
-        "schema": "elastos.library.protected-content-provider-status/v1",
-        "authority_boundary": "Apps receive provider readiness and receipts only; drm/rights/key/decrypt providers retain protected-content open, dDRM, key-release, and decrypt authority.",
-        "available_provider_count": available_count,
-        "configured_provider_count": configured_count,
-        "required_provider_count": providers.len(),
-        "providers": providers,
-        "encrypted_recipient_sharing": {
-            "schema": "elastos.library.encrypted-recipient-sharing-readiness/v1",
-            "providers_ready": provider_chain_ready,
-            "production_encrypted_publish_mode_ready": false,
-            "status": if provider_chain_ready {
-                "provider_chain_ready"
-            } else {
-                "blocked_until_drm_rights_key_decrypt_providers_configured"
-            },
-            "required_published_payload": "encrypted_recipient_content",
-            "next": if provider_chain_ready {
-                "Protected-content provider chain is configured. Runtime custody publish mode remains inactive until the protected publish path is activated."
-            } else {
-                "Configure drm/rights/key/decrypt providers before protected-content key release can proceed."
-            }
-        }
-    })
-}
-
-async fn protected_content_provider_runtime_status(
-    registry: &ProviderRegistry,
-    id: &str,
-    scheme: &str,
-    primary_operation: &str,
-) -> Value {
-    if registry.get(scheme).await.is_none() {
-        return json!({
-            "id": id,
-            "scheme": scheme,
-            "primary_operation": primary_operation,
-            "available": false,
-            "configured": false,
-            "status": "provider_not_registered",
-            "next": format!("{id} must be installed and registered on the Runtime provider plane.")
-        });
-    }
-    match registry.send_raw(scheme, &json!({ "op": "status" })).await {
-        Ok(response) => {
-            let data = response
-                .get("data")
-                .filter(|_| response.get("status").and_then(Value::as_str) == Some("ok"))
-                .unwrap_or(&response);
-            let configured = data
-                .get("configured")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            json!({
-                "id": id,
-                "scheme": scheme,
-                "primary_operation": primary_operation,
-                "available": true,
-                "configured": configured,
-                "provider": data.get("provider").and_then(Value::as_str).unwrap_or(scheme),
-                "version": data.get("version").cloned().unwrap_or(Value::Null),
-                "contract_schema": data
-                    .get("contract")
-                    .and_then(|contract| contract.get("schema"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-                "supported_operations": data
-                    .get("supported_operations")
-                    .cloned()
-                    .unwrap_or_else(|| json!([])),
-                "blocked_authority": data
-                    .get("blocked_authority")
-                    .cloned()
-                    .unwrap_or_else(|| json!([])),
-                "status": if configured {
-                    "configured"
-                } else {
-                    "provider_registered_not_configured"
-                },
-                "next": if configured {
-                    "Provider is configured; encrypted publish mode still controls whether Library requests key release."
-                } else {
-                    "Provider is installed but still fail-closed until its backend policy/key/decrypt configuration is complete."
-                }
-            })
-        }
-        Err(err) => json!({
-            "id": id,
-            "scheme": scheme,
-            "primary_operation": primary_operation,
-            "available": false,
-            "configured": false,
-            "status": "provider_status_unavailable",
-            "error": err.to_string(),
-            "next": format!("Inspect {id} registration and provider health.")
-        }),
-    }
 }
 
 fn published_source_storage(
@@ -6018,9 +5534,9 @@ fn published_content_security(
         "source_storage": published_source_storage(data_dir, principal_id, target)?,
         "published_payload": "plain_content",
         "key_release_required": false,
-        "status": "not_required_for_plain_published_content",
-        "required_providers": protected_content_provider_requirements(false),
-        "next": "Publishing currently materializes a plain content payload through content-provider. Encrypted recipient payloads require drm/rights/key/decrypt providers and encrypted-content publish mode."
+        "status": "plain_published_content",
+        "protected_content": "runtime_custody_publish_only",
+        "next": "Publishing materializes a plain content payload through content-provider. Protected content is published through Runtime custody publish."
     }))
 }
 
@@ -6040,83 +5556,18 @@ fn validate_runtime_custody_publish_input(
     Ok(LoadedRuntimeCustodyPublishInput { copies, price })
 }
 
-fn protected_content_sealed_object_from_security(
-    content_security: &Value,
-) -> anyhow::Result<SealedObjectV1> {
-    let sealed = content_security
-        .get("sealed_object")
-        .cloned()
-        .ok_or_else(|| anyhow!("protected content security missing sealed_object"))?;
-    serde_json::from_value(sealed).context("protected content sealed_object is invalid")
-}
-
-fn normalized_key_release_policy(
-    policy: Option<&str>,
-    content_security: &Value,
-) -> anyhow::Result<Value> {
-    let policy = policy
+fn normalized_key_release_policy(policy: Option<&str>) -> anyhow::Result<Value> {
+    match policy
         .map(str::trim)
         .filter(|policy| !policy.is_empty())
-        .unwrap_or("auto");
-    let content_requires_key_release = content_security
-        .get("key_release_required")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    match policy {
-        "auto" if content_requires_key_release => {
-            protected_content_key_release_policy(content_security)
-        }
-        "auto" | "none" | "plain_published_content" => Ok(json!({
-            "schema": "elastos.library.key-release/v1",
-            "required": false,
-            "status": content_security
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("not_required_for_plain_published_content"),
-            "published_payload": content_security
-                .get("published_payload")
-                .and_then(Value::as_str)
-                .unwrap_or("plain_content"),
-            "source_storage": content_security
-                .get("source_storage")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown"),
-            "required_providers": protected_content_provider_requirements(false),
-            "next": "No recipient key release is needed for the current plain published payload. Encrypted recipient payloads require drm/rights/key/decrypt providers."
-        })),
-        "recipient_key_release" | "protected_content" | "encrypted_recipient"
-            if content_requires_key_release =>
-        {
-            protected_content_key_release_policy(content_security)
-        }
+        .unwrap_or("auto")
+    {
+        "auto" | "none" | "plain_published_content" => Ok(default_share_key_release()),
         "recipient_key_release" | "protected_content" | "encrypted_recipient" => bail!(
-            "recipient key release requires drm/rights/key/decrypt providers and encrypted-content publish mode"
+            "protected content is published through Runtime custody publish; it is not a Library share key-release policy"
         ),
         _ => bail!("unsupported library key_release_policy"),
     }
-}
-
-fn protected_content_key_release_policy(content_security: &Value) -> anyhow::Result<Value> {
-    let sealed_object = protected_content_sealed_object_from_security(content_security)?;
-    Ok(json!({
-        "schema": "elastos.library.key-release/v1",
-        "required": true,
-        "status": "provider_receipt_chain_required",
-        "published_payload": content_security
-            .get("published_payload")
-            .and_then(Value::as_str)
-            .unwrap_or("protected_content"),
-        "payload_cid": sealed_object.payload_cid,
-        "sealed_cid": content_security
-            .get("sealed_cid")
-            .cloned()
-            .unwrap_or(Value::Null),
-        "viewer_interface": sealed_object.viewer.required_interface,
-        "key_envelope": sealed_object.key_envelope,
-        "required_providers": protected_content_provider_requirements(true),
-        "authority_boundary": "Library records the recipient grant; drm/rights/key/decrypt providers must issue receipts before a viewer opens protected content.",
-        "next": "Runtime shared_access must invoke drm, rights, key, and decrypt providers before returning a protected viewer session."
-    }))
 }
 
 fn record_availability_label(record: Option<&LibraryPublishRecord>) -> String {
@@ -6177,40 +5628,24 @@ fn normalized_share_policy(policy: Option<&str>, public_link: bool) -> anyhow::R
 }
 
 fn share_remote_enforcement_contract(policy: &str, key_release: &Value) -> Value {
-    let key_release_required = key_release
-        .get("required")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let recipient_proof_required = policy == "recipient_scoped";
     json!({
         "schema": "elastos.library.remote-access-policy/v1",
         "policy": policy,
         "provider_gate": "object-provider shared_access",
         "recipient_proof_required": recipient_proof_required,
-        "key_release_required": key_release_required,
+        "key_release_required": false,
         "key_release_status": key_release
             .get("status")
             .and_then(Value::as_str)
-            .unwrap_or("unknown"),
-        "required_providers": protected_content_provider_requirements(key_release_required),
-        "provider_invocation": {
-            "drm": "drm-provider.open",
-            "rights": "rights-provider.has_access_by_content_id",
-            "key": "key-provider.release",
-            "decrypt": "decrypt-provider.open_session",
-            "transport": "Carrier provider invocation when encrypted payloads are enabled"
-        },
-        "plain_content_fetch": !key_release_required,
-        "status": if key_release_required {
-            "blocked_until_drm_rights_key_decrypt_providers"
-        } else if recipient_proof_required {
+            .unwrap_or("not_required_for_plain_published_content"),
+        "plain_content_fetch": true,
+        "status": if recipient_proof_required {
             "recipient_proof_enforced_by_runtime"
         } else {
             "public_link_ready"
         },
-        "next": if key_release_required {
-            "Attach drm/rights/key/decrypt providers before releasing encrypted payload keys."
-        } else if recipient_proof_required {
+        "next": if recipient_proof_required {
             "Remote recipients must present a Runtime recipient proof before object-provider returns the shared open contract."
         } else {
             "Published plain content is available to holders of the content URI."
@@ -6383,10 +5818,6 @@ fn shared_access_open_contract(
     key_release: &Value,
     recipient_proof_verified: bool,
 ) -> Value {
-    let key_release_required = key_release
-        .get("required")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     json!({
         "schema": "elastos.library.shared-open/v1",
         "uri": format!("elastos://{}", record.cid),
@@ -6402,17 +5833,8 @@ fn shared_access_open_contract(
             .and_then(Value::as_str)
             .unwrap_or("plain_content"),
         "recipient_proof_verified": recipient_proof_verified,
-        "key_release_required": key_release_required,
-        "drm_provider_required": key_release_required,
-        "rights_provider_required": key_release_required,
-        "key_provider_required": key_release_required,
-        "decrypt_provider_required": key_release_required,
-        "required_providers": protected_content_provider_requirements(key_release_required),
-        "status": if key_release_required {
-            "blocked_until_drm_rights_key_decrypt_providers"
-        } else {
-            "ready_for_plain_content_fetch"
-        },
+        "key_release_required": false,
+        "status": "ready_for_plain_content_fetch",
         "remote_enforcement": share_remote_enforcement_contract(policy, key_release),
     })
 }
@@ -7178,37 +6600,6 @@ mod tests {
         assert!(schemes.contains(&"object"));
         assert!(!schemes.contains(&"library"));
         assert_eq!(provider.name(), "object-provider");
-    }
-
-    #[test]
-    fn protected_content_provider_response_rejects_authority_fields() {
-        let forbidden = [
-            "raw_cek",
-            "wallet_rpc",
-            "chain_rpc",
-            "kubo_api",
-            "ipfs_api",
-            "elacity_sdk",
-            "elacity_sdk_token",
-            "contract_sdk",
-            "key_backend_sdk",
-        ];
-        for key in forbidden {
-            let value = json!({
-                "schema": "elastos.test/v1",
-                "nested": [{ key: "must-not-cross-boundary" }]
-            });
-            assert!(
-                reject_forbidden_protected_content_fields(&value).is_err(),
-                "{key} must be rejected before app/viewer handoff"
-            );
-        }
-
-        assert!(reject_forbidden_protected_content_fields(&json!({
-            "schema": "elastos.decrypt.session/v1",
-            "output": "viewer_capsule_session:fixture"
-        }))
-        .is_ok());
     }
 
     #[tokio::test]

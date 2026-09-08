@@ -174,7 +174,6 @@ def inspect(config):
     need(root.is_absolute() and root.is_dir(), "prepared stable fixture root required")
     need(not any(part in ("tmp", "private", "target") for part in root.parts), "use a stable task-owned fixture root")
     need(root.resolve() == root, "fixture root must use its physical path")
-    need(shutil.disk_usage(root).free / shutil.disk_usage(root).total >= 0.1, "free disk is below 10%")
     need(config["old"]["version"] != config["new"]["version"], "same-version input cannot test an update hop")
     need(config["old"]["binary_sha256"] != config["new"]["binary_sha256"], "update requires different binaries")
     for binding in (config["source"], config["old"]["source"], config["new"]["source"]):
@@ -219,9 +218,8 @@ def inspect(config):
         expected = config["publication"][key] if key in ("head", "release") else config["new"][key + "_sha256"]
         need(digest(path) == expected, "publication " + key + " differs")
     fixture_components(paths["components"])
-    disk = shutil.disk_usage(root)
     growth = 2 * sum(paths[key].stat().st_size for key in ("binary", "components"))
-    need((disk.free - growth) / disk.total >= 0.1, "two update copies would breach the 10% disk reserve")
+    need(shutil.disk_usage(root).free >= growth, "two update copies would not fit on the fixture volume")
     head, release = read(paths["head"]), read(paths["release"])
     for envelope in (head, release):
         need(envelope["payload"]["version"] == config["new"]["version"], "publication version differs")

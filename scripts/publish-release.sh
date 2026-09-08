@@ -42,8 +42,7 @@ NC='\033[0m'
 # Wallet/Browser surfaces require chain-provider and wallet-provider authority.
 # Demo-only capsules such as chat-room and GBA are published by passing an
 # explicit --capsules list or through the Rust `demo` publish profile.
-# availability-provider, drm-provider, rights-provider, key-provider,
-# decrypt-provider, and tunnel-provider are supported direct command assets
+# availability-provider and tunnel-provider are supported direct command assets
 # outside the default managed Home. Runtime-only protected providers are
 # support assets selected by the component profile rather than capsule publish.
 DEFAULT_CAPSULES=(
@@ -130,10 +129,6 @@ SUPPORT_BINARY_ASSETS=(
     wallet-provider
     object-provider
     content-block-graph-provider
-    drm-provider
-    rights-provider
-    key-provider
-    decrypt-provider
     protected-content-protect-provider
     media-provider
     model-provider

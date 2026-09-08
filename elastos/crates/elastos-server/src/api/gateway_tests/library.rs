@@ -5717,29 +5717,29 @@ async fn test_library_provider_records_recipient_scoped_share_grants() {
         share["data"]["grants"][0]["key_release"]["status"],
         "not_required_for_plain_published_content"
     );
-    assert_eq!(
-        share["data"]["remote_enforcement"]["required_providers"]["schema"],
-        "elastos.library.protected-content-provider-requirements/v1"
+    assert!(
+        share["data"]["remote_enforcement"]
+            .get("required_providers")
+            .is_none(),
+        "the retired provisional provider requirement projection must be gone"
+    );
+    assert!(
+        share["data"]["remote_enforcement"]
+            .get("provider_invocation")
+            .is_none(),
+        "the retired provisional provider chain must not be projected"
+    );
+    assert!(
+        share["data"].get("protected_content").is_none(),
+        "share must not project provisional protected-content provider readiness"
     );
     assert_eq!(
-        share["data"]["remote_enforcement"]["provider_invocation"]["drm"],
-        "drm-provider.open"
+        share["data"]["remote_enforcement"]["status"],
+        "recipient_proof_enforced_by_runtime"
     );
     assert_eq!(
-        share["data"]["remote_enforcement"]["provider_invocation"]["rights"],
-        "rights-provider.has_access_by_content_id"
-    );
-    assert_eq!(
-        share["data"]["protected_content"]["schema"],
-        "elastos.library.protected-content-provider-status/v1"
-    );
-    assert_eq!(
-        share["data"]["protected_content"]["encrypted_recipient_sharing"]["status"],
-        "blocked_until_drm_rights_key_decrypt_providers_configured"
-    );
-    assert_eq!(
-        share["data"]["protected_content"]["required_provider_count"],
-        4
+        share["data"]["key_release"]["protected_content"],
+        "runtime_custody_publish_only"
     );
 
     let (status_status, status) = post_library(
@@ -5753,13 +5753,15 @@ async fn test_library_provider_records_recipient_scoped_share_grants() {
     .await;
     assert_eq!(status_status, StatusCode::OK);
     assert_eq!(status["status"], "ok");
-    assert_eq!(
-        status["data"]["protected_content"]["schema"],
-        "elastos.library.protected-content-provider-status/v1"
+    assert!(
+        status["data"].get("protected_content").is_none(),
+        "status must not project provisional protected-content provider readiness"
     );
-    assert_eq!(
-        status["data"]["published"]["protected_content"]["encrypted_recipient_sharing"]["status"],
-        "blocked_until_drm_rights_key_decrypt_providers_configured"
+    assert!(
+        status["data"]["published"]
+            .get("protected_content")
+            .is_none(),
+        "published record must not carry provisional provider readiness"
     );
 
     let (access_status, access) = post_library(
@@ -5823,35 +5825,28 @@ async fn test_library_provider_records_recipient_scoped_share_grants() {
         false
     );
     assert_eq!(
-        access["data"]["access"]["open"]["drm_provider_required"],
-        false
-    );
-    assert_eq!(
         access["data"]["access"]["open"]["recipient_proof_verified"],
         true
     );
+    for retired in [
+        "drm_provider_required",
+        "rights_provider_required",
+        "key_provider_required",
+        "decrypt_provider_required",
+        "required_providers",
+    ] {
+        assert!(
+            access["data"]["access"]["open"].get(retired).is_none(),
+            "shared-open must not project {retired} after the cutover"
+        );
+    }
     assert_eq!(
-        access["data"]["access"]["open"]["rights_provider_required"],
-        false
+        access["data"]["access"]["open"]["status"],
+        "ready_for_plain_content_fetch"
     );
-    assert_eq!(
-        access["data"]["access"]["open"]["key_provider_required"],
-        false
-    );
-    assert_eq!(
-        access["data"]["access"]["open"]["decrypt_provider_required"],
-        false
-    );
-    assert_eq!(
-        access["data"]["access"]["open"]["required_providers"]["providers"]
-            .as_array()
-            .unwrap()
-            .len(),
-        4
-    );
-    assert_eq!(
-        access["data"]["protected_content"]["schema"],
-        "elastos.library.protected-content-provider-status/v1"
+    assert!(
+        access["data"].get("protected_content").is_none(),
+        "shared_access must not project provisional provider readiness"
     );
     assert_eq!(
         access["data"]["access"]["key_release"]["status"],
@@ -5967,7 +5962,7 @@ async fn test_library_provider_records_recipient_scoped_share_grants() {
 }
 
 #[tokio::test]
-async fn test_library_provider_rejects_key_release_policy_until_provider_exists() {
+async fn test_library_provider_rejects_recipient_key_release_share_policy() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(library_test_state(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
@@ -6011,10 +6006,14 @@ async fn test_library_provider_rejects_key_release_policy_until_provider_exists(
     .await;
     assert_eq!(share_status, StatusCode::OK);
     assert_eq!(share["status"], "error");
-    assert!(share["message"]
-        .as_str()
-        .unwrap()
-        .contains("drm/rights/key/decrypt providers"));
+    assert!(
+        share["message"]
+            .as_str()
+            .unwrap()
+            .contains("published through Runtime custody publish"),
+        "unexpected message: {}",
+        share["message"]
+    );
 }
 
 #[tokio::test]

@@ -1976,7 +1976,7 @@ async fn prepare(
     update_operation(data_dir, id, |record| {
         record.index_bytes = index.len() as u64
     })?;
-    // Backend identity/pressure is observed per byte window. Runtime floor and
+    // Backend identity/pressure is observed per byte window. Runtime space and
     // authority remain per read; the outstanding charge is not an OS reservation.
     let mut window_bytes = index.len() as u64;
     for expected in &closure.files {
@@ -8025,7 +8025,7 @@ server.serve_forever()
                 + 32 * 1024 * 1024;
             let dir = File::open(&root_path).unwrap();
             let (volume_capacity, initial_free) = volume_bytes(&dir);
-            storage::require_space_floor(volume_capacity, initial_free, u128::from(layout_charge))
+            storage::require_space(volume_capacity, initial_free, u128::from(layout_charge))
                 .unwrap();
             let data = root_path.join("data");
             let seed = root_path.join("seed");
@@ -8389,7 +8389,7 @@ server.serve_forever()
                     combined_allocated_peak = combined_allocated_peak
                         .max(stage.1 + backend.1 + publisher.1 + seed_disk.1);
                     minimum_free = minimum_free.min(volume_bytes(&test_volume).1);
-                    storage::require_space_floor(volume_capacity, minimum_free, 0).unwrap();
+                    storage::require_space(volume_capacity, minimum_free, 0).unwrap();
                     assert!(
                         logs.iter()
                             .all(|log| log.metadata().unwrap().len() <= 65536),
@@ -8461,7 +8461,7 @@ server.serve_forever()
                 combined_allocated_peak = combined_allocated_peak
                     .max(admitted_disk.1 + backend_after.1 + publisher_after.1 + seed_disk.1);
                 minimum_free = minimum_free.min(volume_bytes(&test_volume).1);
-                storage::require_space_floor(volume_capacity, minimum_free, 0).unwrap();
+                storage::require_space(volume_capacity, minimum_free, 0).unwrap();
                 let requests = test_backend.calls.lock().unwrap().clone();
                 let reads = requests.iter().filter(|op| *op == "cat").count();
                 let expected_reads = 1
@@ -10448,24 +10448,24 @@ server.serve_forever()
     }
 
     #[test]
-    fn model_preparation_disk_floor_uses_checked_outstanding_bytes() {
-        assert!(storage::require_space_floor(1000, 200, 100).is_ok());
-        assert!(storage::require_space_floor(1000, 200, 101).is_err());
-        assert!(storage::require_space_floor(1000, 200, 201).is_err());
-        assert!(storage::require_space_floor(0, 0, 0).is_err());
-        assert!(storage::require_space_floor(1000, 1001, 0).is_err());
-        assert!(storage::require_space_floor(u128::MAX, u128::MAX, 0).is_err());
+    fn model_preparation_disk_space_uses_checked_outstanding_bytes() {
+        // No share of the volume is held back: the outstanding bytes need only fit.
+        assert!(storage::require_space(1000, 200, 100).is_ok());
+        assert!(storage::require_space(1000, 200, 200).is_ok());
+        assert!(storage::require_space(1000, 200, 201).is_err());
+        assert!(storage::require_space(0, 0, 0).is_err());
+        assert!(storage::require_space(1000, 1001, 0).is_err());
+        assert!(storage::require_space(u128::MAX, u128::MAX, u128::MAX).is_ok());
     }
 
     #[test]
     fn model_preparation_capacity_cold_growth_stays_within_initial_charge() {
         let payload = 64 * 1024 * 1024;
         let capacity = 1_u128 << 30;
-        let floor = capacity.div_ceil(10);
         let margin = 1024 * 1024;
         let charge = preparation_charge(payload).unwrap();
-        let initial_free = floor + u128::from(charge) + margin;
-        assert!(storage::require_space_floor(capacity, initial_free, charge.into()).is_ok());
+        let initial_free = u128::from(charge) + margin;
+        assert!(storage::require_space(capacity, initial_free, charge.into()).is_ok());
         for completed in [0, payload / 4, payload / 2, payload] {
             let index = if completed == 0 { 0 } else { 717 };
             let delivered = u128::from(completed + index);
@@ -10474,12 +10474,8 @@ server.serve_forever()
             // are deterministic logical-growth facts, not Kubo allocation proof.
             let free = initial_free - 2 * delivered;
             assert!(
-                storage::require_space_floor(
-                    capacity,
-                    free,
-                    u128::from(stage) + u128::from(backend)
-                )
-                .is_ok(),
+                storage::require_space(capacity, free, u128::from(stage) + u128::from(backend))
+                    .is_ok(),
                 "double charged stored backend bytes at completed={completed}"
             );
         }
@@ -10494,7 +10490,6 @@ server.serve_forever()
     fn model_preparation_capacity_separate_cold_volume_and_warm_backend() {
         let payload = 64 * 1024 * 1024;
         let capacity = 1_u128 << 30;
-        let floor = capacity.div_ceil(10);
         let margin = 1024 * 1024;
         let stage_budget = staging_charge(payload).unwrap();
         let backend_budget = preparation_charge(payload).unwrap() - stage_budget;
@@ -10502,14 +10497,13 @@ server.serve_forever()
         let index = 717;
         let delivered = u128::from(completed + index);
         let (stage, backend) = remaining_capacity_charges(payload, completed, index).unwrap();
-        let stage_free = floor + u128::from(stage_budget) + margin - delivered;
-        assert!(storage::require_space_floor(capacity, stage_free, stage.into()).is_ok());
-        let backend_free = floor + u128::from(backend_budget) + margin - delivered;
-        assert!(storage::require_space_floor(capacity, backend_free, backend.into()).is_ok());
+        let stage_free = u128::from(stage_budget) + margin - delivered;
+        assert!(storage::require_space(capacity, stage_free, stage.into()).is_ok());
+        let backend_free = u128::from(backend_budget) + margin - delivered;
+        assert!(storage::require_space(capacity, backend_free, backend.into()).is_ok());
         // A warm backend stores nothing new. Logical credit stays conservative.
-        let warm_free =
-            floor + u128::from(preparation_charge(payload).unwrap()) + margin - delivered;
-        assert!(storage::require_space_floor(
+        let warm_free = u128::from(preparation_charge(payload).unwrap()) + margin - delivered;
+        assert!(storage::require_space(
             capacity,
             warm_free,
             u128::from(stage) + u128::from(backend)
@@ -10520,10 +10514,8 @@ server.serve_forever()
             u128::from(backend),
             u128::from(stage) + u128::from(backend),
         ] {
-            assert!(storage::require_space_floor(capacity, floor + required, required).is_ok());
-            assert!(
-                storage::require_space_floor(capacity, floor + required - 1, required).is_err()
-            );
+            assert!(storage::require_space(capacity, required, required).is_ok());
+            assert!(storage::require_space(capacity, required - 1, required).is_err());
         }
     }
 
@@ -10716,10 +10708,9 @@ server.serve_forever()
     }
 
     #[tokio::test]
-    async fn model_preparation_capacity_windows_runtime_floor_counts_shared_backend_growth() {
+    async fn model_preparation_capacity_windows_runtime_space_counts_shared_backend_growth() {
         let (_root, mut record, _, _) = capacity_window_fixture(true, None).await;
         let capacity = 1_u128 << 30;
-        let floor = capacity.div_ceil(10);
         for completed in [0, 65536, 1024 * 1024, record.total_bytes] {
             record.completed_bytes = completed;
             record.index_bytes = 717;
@@ -10729,23 +10720,20 @@ server.serve_forever()
             for shared in [false, true] {
                 let required = runtime_capacity_charge(&record, shared).unwrap();
                 assert_eq!(required, if shared { stage + backend } else { stage });
-                assert!(storage::require_space_floor(
+                assert!(
+                    storage::require_space(capacity, u128::from(required), required.into()).is_ok()
+                );
+                assert!(storage::require_space(
                     capacity,
-                    floor + u128::from(required),
-                    required.into()
-                )
-                .is_ok());
-                assert!(storage::require_space_floor(
-                    capacity,
-                    floor + u128::from(required) - 1,
+                    u128::from(required) - 1,
                     required.into()
                 )
                 .is_err());
             }
             // A Runtime volume with only the stage allowance cannot pass as shared.
-            assert!(storage::require_space_floor(
+            assert!(storage::require_space(
                 capacity,
-                floor + u128::from(stage),
+                u128::from(stage),
                 runtime_capacity_charge(&record, true).unwrap().into()
             )
             .is_err());

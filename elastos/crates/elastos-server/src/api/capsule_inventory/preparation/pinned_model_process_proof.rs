@@ -228,7 +228,7 @@ async fn model_preparation_streamed_bootstrap_matches_directory_cid() {
     let root = tempfile::tempdir().unwrap();
     let root_path = root.path().canonicalize().unwrap();
     let (capacity, free) = volume_bytes(&File::open(&root_path).unwrap());
-    storage::require_space_floor(capacity, free, 64 * 1024 * 1024).unwrap();
+    storage::require_space(capacity, free, 64 * 1024 * 1024).unwrap();
     let repo = root_path.join("repo");
     let seed = root_path.join("seed");
     fs::create_dir(&seed).unwrap();

@@ -68,15 +68,10 @@ bash scripts/check-wci-alignment.sh
 node scripts/check-elastos-bus-wit.mjs
 node scripts/check-capsule-templates.mjs
 bash scripts/audit-linux-runtime-portability.sh
-bash scripts/protected-content-provider-contract-smoke.sh
 (cd elastos && cargo fmt --all -- --check)
 cargo fmt --manifest-path capsules/chain-provider/Cargo.toml -- --check
 just verify
 ```
-
-`protected-content-provider-contract-smoke.sh` is a fail-closed retirement
-guard for the provisional provider capsules. It does not verify the canonical
-v1 Runtime, rights, custody, and decrypt architecture.
 
 `just verify` is the combined source gate. It runs the Runtime workspace and
 the own-workspace capsules through `just test`, plus the separate

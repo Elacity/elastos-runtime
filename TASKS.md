@@ -12,7 +12,7 @@ Model work in J3, MA, AI, CR and SEC1 is the implementation priority. Codex owns
 
 ## Now
 
-Each row requires a receipt with source/tree, dirty patch, built and installed hashes, target identity, operation, result and next proof. Ports are observations, not installation IDs. Preserve human Homes, keys, pins, data and the 10% disk floor. Publication and public mutation require separate exact-candidate approval.
+Each row requires a receipt with source/tree, dirty patch, built and installed hashes, target identity, operation, result and next proof. Ports are observations, not installation IDs. Preserve human Homes, keys, pins and data. Publication and public mutation require separate exact-candidate approval.
 
 | Order | Open gate and owner | Next proof and stop condition |
 | --- | --- | --- |
@@ -49,7 +49,7 @@ The [Browser acceptance contract](docs/BROWSER_ACCEPTANCE.md) defines B01–B16.
 
 ## Open verification controls
 
-The checks below stay open with their owning journey. They are not additional product scope. Use `scripts/public-install-operator-smoke.sh`, `scripts/public-install-identity-smoke.sh`, `scripts/audit-linux-runtime-portability.sh` and the provisional `scripts/protected-content-provider-contract-smoke.sh` at their applicable installed/release boundaries. Keep source/local Carrier setup proof green with `scripts/local-carrier-setup-smoke.sh`; publish the approved version's binary/artifact set so no-override public installed-path smokes use current code.
+The checks below stay open with their owning journey. They are not additional product scope. Use `scripts/public-install-operator-smoke.sh`, `scripts/public-install-identity-smoke.sh` and `scripts/audit-linux-runtime-portability.sh` at their applicable installed/release boundaries. Keep source/local Carrier setup proof green with `scripts/local-carrier-setup-smoke.sh`; publish the approved version's binary/artifact set so no-override public installed-path smokes use current code.
 
 For J4, retain `scripts/browser-native-supervisor-smoke.sh`, `scripts/browser-native-proxy-engine-smoke.sh`, `scripts/browser-native-supervisor-proxy-smoke.sh`, `scripts/browser-native-operator-config.mjs`, `scripts/browser-native-target-preflight.sh` and `scripts/wallet-connector-transaction-smoke.mjs` for their target proofs. Use artifact-aware `scripts/browser-provider-runbook.mjs --hosted-bakeoff/--native-preflight --manual-ux` and `scripts/browser-provider-runbook-smoke.sh`; `scripts/browser-objective-audit.mjs` remains the completion gate. Freeze new Browser provider implementation until the current blockers are cleared. The deferred provider comparison and current-host stop condition remain in [future work](docs/DEFERRED_WORK.md).
 

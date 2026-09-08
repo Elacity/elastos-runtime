@@ -45,7 +45,7 @@ show_help() {
     echo ""
     echo -e "${BOLD}Capsule locations:${NC}"
     echo "  Core capsules:    elastos/capsules/ + provider capsules"
-    echo "  Provider capsules: capsules/         (did-provider, chain-provider, wallet-provider, object-provider, content-block-graph-provider, drm-provider, rights-provider, key-provider, decrypt-provider, availability-provider, ipfs-provider, site-provider, tunnel-provider)"
+    echo "  Provider capsules: capsules/         (did-provider, chain-provider, wallet-provider, object-provider, content-block-graph-provider, availability-provider, ipfs-provider, site-provider, tunnel-provider)"
     echo "  Data capsules:    capsules/         (gba-emulator, gba-ucity)"
     echo "  Data capsules don't need building — they're static assets."
     echo ""
@@ -104,10 +104,6 @@ APP_CAPSULES=(
     "wallet-provider:capsules/wallet-provider"
     "object-provider:capsules/object-provider"
     "content-block-graph-provider:capsules/content-block-graph-provider"
-    "drm-provider:capsules/drm-provider"
-    "rights-provider:capsules/rights-provider"
-    "key-provider:capsules/key-provider"
-    "decrypt-provider:capsules/decrypt-provider"
     "availability-provider:capsules/availability-provider"
     "operator-drive-adapter:capsules/operator-drive-adapter"
     "ipfs-provider:capsules/ipfs-provider"
@@ -276,6 +272,6 @@ fi
 echo ""
 echo -e "${GREEN}Done.${NC}"
 if [ "$BUILD_ALL" = false ]; then
-    echo -e "${DIM}Run with --all to also build did-provider, chain-provider, wallet-provider, object-provider, content-block-graph-provider, drm-provider, rights-provider, key-provider, decrypt-provider, availability-provider, operator-drive-adapter, and ipfs-provider.${NC}"
+    echo -e "${DIM}Run with --all to also build did-provider, chain-provider, wallet-provider, object-provider, content-block-graph-provider, availability-provider, operator-drive-adapter, and ipfs-provider.${NC}"
 fi
 echo ""

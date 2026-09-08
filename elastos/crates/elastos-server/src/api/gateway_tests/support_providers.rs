@@ -1567,12 +1567,10 @@ impl Provider for MockContentProvider {
                 }
             })),
             (Some("publish"), _, _) => {
-                if request.get("object_kind").and_then(|value| value.as_str()) != Some("sealed") {
-                    mock_content_publish_requests()
-                        .lock()
-                        .unwrap()
-                        .push(request.clone());
-                }
+                mock_content_publish_requests()
+                    .lock()
+                    .unwrap()
+                    .push(request.clone());
                 if request.get("object_kind").and_then(Value::as_str)
                     == Some("protected-content-listing")
                     && *mock_runtime_listing_publish_failure().lock().unwrap()
@@ -1580,9 +1578,6 @@ impl Provider for MockContentProvider {
                     return Err(ProviderError::Provider(
                         "mock protected content listing publish failed".to_string(),
                     ));
-                }
-                if request.get("object_kind").and_then(|value| value.as_str()) == Some("sealed") {
-                    validate_mock_sealed_publish_request(request)?;
                 }
                 if request.get("object_kind").and_then(|value| value.as_str())
                     == Some("protected-content")
@@ -1690,64 +1685,6 @@ impl Provider for MockContentProvider {
     }
 }
 
-fn validate_mock_sealed_publish_request(request: &serde_json::Value) -> Result<(), ProviderError> {
-    let files = request
-        .get("files")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| ProviderError::Provider("sealed publish files are required".into()))?;
-    let sealed_entry = files
-        .iter()
-        .find(|entry| entry.get("path").and_then(|value| value.as_str()) == Some("sealed.json"))
-        .ok_or_else(|| ProviderError::Provider("sealed publish requires sealed.json".into()))?;
-    let sealed_data = sealed_entry
-        .get("data")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| ProviderError::Provider("sealed.json data is required".into()))?;
-    let sealed_bytes = base64::engine::general_purpose::STANDARD
-        .decode(sealed_data)
-        .map_err(|err| ProviderError::Provider(err.to_string()))?;
-    let sealed_object: elastos_common::protected_content::SealedObjectV1 =
-        serde_json::from_slice(&sealed_bytes)
-            .map_err(|err| ProviderError::Provider(err.to_string()))?;
-    let links = request
-        .get("links")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| ProviderError::Provider("sealed publish links are required".into()))?;
-    for (rel, cid) in [
-        (
-            "availability.receipt",
-            sealed_object.availability_receipt_cid.as_str(),
-        ),
-        ("payload", sealed_object.payload_cid.as_str()),
-        ("rights.policy", sealed_object.rights_policy_cid.as_str()),
-    ] {
-        if !links.iter().any(|link| {
-            link.get("rel").and_then(|value| value.as_str()) == Some(rel)
-                && link.get("cid").and_then(|value| value.as_str()) == Some(cid)
-        }) {
-            return Err(ProviderError::Provider(format!(
-                "sealed publish missing {rel} link"
-            )));
-        }
-    }
-    if !links
-        .iter()
-        .any(|link| link.get("rel").and_then(|value| value.as_str()) == Some("provenance"))
-    {
-        return Err(ProviderError::Provider(
-            "sealed publish missing provenance link".into(),
-        ));
-    }
-    if serde_json::to_string(&sealed_object)
-        .map_err(|err| ProviderError::Provider(err.to_string()))?
-        .contains("raw_cek")
-    {
-        return Err(ProviderError::Provider(
-            "sealed publish must not expose raw CEK".into(),
-        ));
-    }
-    Ok(())
-}
 
 struct MockExternalObjectProvider {
     data_dir: std::path::PathBuf,

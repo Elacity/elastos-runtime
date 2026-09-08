@@ -82,11 +82,9 @@ Each top-level ledger has one job:
   replaceable dKMS/dDRM boundary, migration rules, delivery slices, and acceptance
 - [Protected-content v1 contracts](PROTECTED_CONTENT_CONTRACTS_V1.md): canonical
   identity, rights, custody and release schemas
-- [Rights provider](RIGHTS_PROVIDER.md): canonical role and provisional capsule
-  retirement state
-- [Key provider](KEY_PROVIDER.md): provisional provider retirement notice
-- [Decrypt provider](DECRYPT_PROVIDER.md): canonical role and provisional
-  capsule retirement state
+- [Rights evaluation](RIGHTS_PROVIDER.md): Runtime-owned Chain rights evidence
+- [Decrypt provider](DECRYPT_PROVIDER.md): Runtime-only decrypt and media read
+  boundary
 - [Archive policy](ARCHIVE_POLICY.md): archive dependencies and family enablement
 
 ## Browser contracts and decisions

@@ -1170,10 +1170,7 @@ for name in host_components:
 
 # These release providers can remain installed across source-home rebuilds.
 # Keep their prior pins only while the same installed binary still verifies.
-retained_providers = (
-    "operator-drive-adapter", "drm-provider", "rights-provider",
-    "key-provider", "decrypt-provider",
-)
+retained_providers = ("operator-drive-adapter",)
 for name in retained_providers:
     if name in host_components:
         continue

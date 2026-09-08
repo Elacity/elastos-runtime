@@ -1,13 +1,14 @@
 # Decrypt Provider
 
-`decrypt-provider` will be the canonical protected-content decrypt and render
-boundary. Runtime will bind one scoped session to the exact authenticated
-Profile, Wallet-approved action, object, rights evidence, recipient
-authorization, custody epoch, expiry, and provider identity.
+`protected-content-decrypt-provider` is the protected-content decrypt and media
+read boundary, registered by Runtime on the Runtime-only
+`protected-content-decrypt` target. Runtime binds one scoped session to the
+exact authenticated Profile, Wallet-approved action, object, rights evidence,
+recipient authorization, custody epoch, expiry, and provider identity.
 
-The intended path is:
+The path is:
 
-`Runtime coordinator -> decrypt-provider -> decrypt/render backend`
+`Runtime coordinator -> protected-content-decrypt -> scoped viewer session`
 
 Custody providers return recipient-encrypted contributions. Runtime may relay
 those opaque contributions or other sealed material, but it cannot open them.
@@ -27,17 +28,12 @@ through the Runtime-owned protected-content coordinator. Its typed operations
 cover reconstruction, scoped media reads and terminal cleanup. Installation
 and activation evidence belongs in [state.md](../state.md).
 
-The provisional `decrypt-provider` capsule uses
-the old `elastos_common::protected_content` DTO, validates requests, and returns
-`not_configured`. It remains only as a fail-closed retirement surface and must
-be replaced atomically. It does not verify the canonical v1 path.
+The provisional `decrypt-provider` capsule and its `elastos://decrypt` scheme
+were removed at cutover. There is no second decrypt route.
 
 ## Verification
 
-Provisional retirement guard only:
-
 ```bash
-cargo test --manifest-path capsules/decrypt-provider/Cargo.toml
-cargo clippy --manifest-path capsules/decrypt-provider/Cargo.toml -- -D warnings
-bash scripts/protected-content-provider-contract-smoke.sh
+cargo test --manifest-path capsules/protected-content-decrypt-provider/Cargo.toml
+(cd elastos && cargo test -p elastos-server protected_content_runtime)
 ```
