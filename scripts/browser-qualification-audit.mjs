@@ -6,6 +6,7 @@ import { resolve, dirname, basename } from "node:path";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { controlledTonePresent } from "./lib/browser-journey-audio.mjs";
+import { browserJourneyTargetConfig } from "./lib/browser-journey-target.mjs";
 
 export const QUALIFICATION_SCHEMA = "elastos.browser.qualification/v1";
 export const MODES = ["lifecycle", "cold", "warm", "media", "mixed"];
@@ -23,7 +24,8 @@ export function candidateFingerprint(plan, inputs) {
   "candidate_frozen_input_mismatch:" + a.role);
   requireEvidence(inputs.some(f => f.role === "operator_coordinates" && f.path === plan.runtime.operator_coords) &&
     ["scripts/browser-qualification-runner.mjs", "scripts/browser-qualification-audit.mjs",
-      "scripts/lib/browser-qualification-observer.mjs", "scripts/home-passkey-virtual-auth-smoke.mjs"].every(role =>
+      "scripts/lib/browser-qualification-observer.mjs", "scripts/lib/browser-journey-target.mjs",
+      "scripts/home-passkey-virtual-auth-smoke.mjs"].every(role =>
       inputs.some(f => f.role === role && hash(f.sha256))), "frozen_harness_inputs_required");
   return sha256(JSON.stringify({ plan, inputs }));
 }
@@ -195,6 +197,52 @@ export function deriveMedia(rows, { page_id, run, engine_id, exit_id, mode = "me
     samples: rows.length, interactions: actions.length, hidden_cycles: hidden, idle_cycles: idle,
     max_sample_gap_ms: gap, video, audio };
 }
+export function qualificationTarget(runtime) {
+  requireEvidence(runtime.allow_remote_fixture === undefined || typeof runtime.allow_remote_fixture === "boolean",
+    "remote_fixture_option_invalid");
+  requireEvidence(runtime.fixture_admin_origin === undefined ||
+    typeof runtime.fixture_admin_origin === "string",
+  "fixture_admin_origin_invalid");
+  requireEvidence(typeof runtime.fixture_origin === "string" && runtime.fixture_origin.length > 0,
+    "fixture_origin_required");
+  for (const key of ["engine_id", "exit_id"]) requireEvidence(typeof runtime[key] === "string" &&
+    (runtime[key] === "" || /^[A-Za-z0-9:_-]{1,128}$/.test(runtime[key])), "selected_service_identity_required");
+  requireEvidence(runtime.remote_exit_id === undefined || runtime.remote_exit_id === runtime.exit_id,
+    "conflicting_legacy_exit_selection");
+  return browserJourneyTargetConfig({
+    HOME_VIRTUAL_AUTH_BROWSER_ENGINE_ID: runtime.engine_id,
+    HOME_VIRTUAL_AUTH_BROWSER_FIXTURE_ORIGIN: runtime.fixture_origin,
+    HOME_VIRTUAL_AUTH_BROWSER_FIXTURE_ADMIN_ORIGIN: runtime.fixture_admin_origin,
+    HOME_VIRTUAL_AUTH_BROWSER_ALLOW_REMOTE_FIXTURE: runtime.allow_remote_fixture === true ? "1" : "0",
+  });
+}
+export function qualificationVmIdentity(proof, pageId) {
+  requireEvidence(proof?.schema === "elastos.browser.vz-transport-public-proof/v1" && proof.page_id === pageId &&
+    typeof pageId === "string" && /^page:vz-[a-f0-9]{64}$/.test(pageId) &&
+    /^browser-vm-[a-f0-9]{64}$/.test(proof.vm_id) &&
+    /^sha256:[a-f0-9]{64}$/.test(proof.generation) && /^sha256:[a-f0-9]{64}$/.test(proof.binding_hash),
+  "launch_transport_identity_required");
+  return Object.fromEntries(["schema", "page_id", "vm_id", "generation", "binding_hash"].map(k => [k, proof[k]]));
+}
+export function validateLocalLaunchSample(sample, pageId, plan, before) {
+  const control = sample?.control, owner = plan.runtime.resource_roots.find(p => p.role === "vm_control");
+  requireEvidence(sample?.identity_verified === true && finite(sample.rss_bytes) && sample.rss_bytes >= 0 &&
+    sample.rss_bytes <= plan.limits.rss_bytes && finite(sample.cpu_percent) && sample.cpu_percent >= 0 &&
+    sample.cpu_percent <= plan.limits.cpu_percent && Array.isArray(sample.process_ids) &&
+    plan.runtime.resource_roots.every(p => sample.process_ids.includes(p.pid + ":" + p.start)),
+  "launch_resource_identity_required");
+  requireEvidence(owner && control?.schema === "elastos.browser.vm-control-service.status/v1" && control.ok === true &&
+    control.pid === owner.pid && before?.pid === owner.pid &&
+    control.control_service?.schema === "elastos.browser.vm-control-service.identity/v1" &&
+    typeof control.control_service.service_id === "string" && /^service:[a-f0-9]{64}$/.test(control.control_service.service_id) &&
+    isDeepStrictEqual(control.control_service, before.control_service) &&
+    hash(control.config_fingerprint) && control.config_fingerprint === before.config_fingerprint &&
+    control.direct_network === false && control.network_mode === "runtime_net_only" &&
+    control.active_pages > 0 && control.page_ids?.includes(pageId) &&
+    control.lifecycle?.schema === "elastos.browser.lifecycle-status/v1" &&
+    control.lifecycle.sessions?.some(s => s.phase === "ACTIVE_SESSION" && s.warm_vm === false &&
+      s.page_id === "sha256:" + sha256(pageId).slice(0, 16)), "launch_control_identity_required");
+}
 export function validatePlan(plan) {
   requireEvidence(plan?.schema === "elastos.browser.qualification-plan/v1" && MODES.includes(plan.mode), "plan_schema_or_mode");
   requireEvidence(plan.mode !== "warm", "warm_conditioning_unsupported");
@@ -215,9 +263,8 @@ export function validatePlan(plan) {
     "signed_home_reuse_option_invalid");
   requireEvidence(typeof runtime?.viewer_version === "string" && runtime.viewer_version.length > 0 &&
     runtime.viewer_version.length < 120 && typeof runtime.headed === "boolean", "viewer_identity_required");
-  requireEvidence(typeof runtime.engine_id === "string" && typeof runtime.exit_id === "string" &&
-    runtime.engine_id.length <= 256 && runtime.exit_id.length <= 256, "selected_service_identity_required");
-  for (const name of ["base_url", "fixture_origin"]) {
+  qualificationTarget(runtime);
+  for (const name of ["base_url"]) {
     const url = new URL(runtime?.[name]);
     requireEvidence(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) &&
       !url.username && !url.password && url.pathname === "/" && !url.search && !url.hash, "task_loopback_origin_required");
@@ -234,6 +281,8 @@ export function validatePlan(plan) {
   "resource_root_identity_required");
   requireEvidence(runtime.resource_roots.filter(r => r.role === "runtime").length === 1,
     "runtime_process_role_required");
+  requireEvidence(runtime.resource_roots.filter(r => r.role === "vm_control").length === 1,
+    "vm_control_process_role_required");
   requireEvidence(plan.require_operator === true, "combined_operator_journey_required");
   requireEvidence(["local", "wan"].includes(plan.network?.profile) &&
     finite(plan.network.control_rtt_ms) && plan.network.control_rtt_ms >= 0, "network_profile_required");
@@ -312,8 +361,13 @@ export function validateAttempt(attempt, plan) {
     q.launch.clock === "host_monotonic" && finite(q.launch.usable_frame_ms) && q.launch.usable_frame_ms > 0,
   "monotonic_launch_witness_required");
   requireEvidence(q.services?.engine_id === plan.runtime.engine_id && q.services?.exit_id === plan.runtime.exit_id &&
-    attempt.observed_page_ids?.includes(attempt.journey.page_id) && attempt.active_vm_keys?.length > 0,
-  "selected_service_or_local_vm_witness_missing");
+    attempt.observed_page_ids?.includes(attempt.journey.page_id), "selected_service_or_local_vm_witness_missing");
+  requireEvidence(isDeepStrictEqual(qualificationVmIdentity(q.vm_identity, attempt.journey.page_id),
+    qualificationVmIdentity(j.close.receipt.transport_proof, attempt.journey.page_id)), "launch_close_vm_identity_mismatch");
+  validateLocalLaunchSample(attempt.local_launch_sample, attempt.journey.page_id, plan, attempt.before);
+  requireEvidence(attempt.after.pid === attempt.before.pid &&
+    attempt.after.config_fingerprint === attempt.before.config_fingerprint &&
+    isDeepStrictEqual(attempt.after.control_service, attempt.before.control_service), "closed_control_identity_changed");
   if (["media", "mixed"].includes(plan.mode)) {
     const o = q.observation;
     requireEvidence(o?.ok === true && o.duration_ms >= plan.duration_ms &&
@@ -366,12 +420,13 @@ export function auditQualification(receiptPath) {
       Number.isInteger(row.attempt) && row.attempt >= 1 && row.attempt <= 100 &&
       ["resources", "media"].includes(row.kind), "sample_sequence_or_kind");
     lastAt = row.at_ms;
-    const rows = observed.get(row.attempt) || { resources: 0, media: [], parent_times: [] };
+    const rows = observed.get(row.attempt) || { resources: 0, resource_hashes: new Set(), media: [], parent_times: [] };
     if (row.kind === "resources") {
       requireEvidence(row.value?.identity_verified === true && finite(row.value.rss_bytes) &&
         row.value.rss_bytes <= plan.limits.rss_bytes && finite(row.value.cpu_percent) &&
         row.value.cpu_percent <= plan.limits.cpu_percent, "resource_sample_invalid");
       rows.resources++;
+      rows.resource_hashes.add(sha256(JSON.stringify(row.value)));
     } else { rows.media.push(row.value); rows.parent_times.push(row.at_ms); }
     observed.set(row.attempt, rows);
   }
@@ -390,6 +445,7 @@ export function auditQualification(receiptPath) {
     requireEvidence(a.index === index + 1 && a.candidate_fingerprint === r.candidate_fingerprint && !ids.has(j.run), "candidate_or_run_id_mismatch");
     const rows = observed.get(a.index);
     requireEvidence(rows?.resources > 0, "resource_observation_missing");
+    requireEvidence(rows.resource_hashes.has(sha256(JSON.stringify(a.local_launch_sample))), "launch_sample_not_in_raw_evidence");
     requireEvidence(a.log && basename(a.log.file) === a.log.file && hash(a.log.sha256), "journey_log_required");
     const logPath = resolve(dirname(receiptPath), a.log.file);
     requireEvidence(statSync(logPath).size <= 1024 * 1024 && sha256(readFileSync(logPath)) === a.log.sha256,

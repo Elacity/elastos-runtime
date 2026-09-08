@@ -9,7 +9,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { validatePlan, validateAttempt, cleanControl, sha256, boundedJson,
   requireEvidence, QUALIFICATION_SCHEMA } from "./browser-qualification-audit.mjs";
-import { candidateFingerprint, validateInstallation, validateLiveIdentity } from "./browser-qualification-audit.mjs";
+import { candidateFingerprint, validateInstallation, validateLiveIdentity, qualificationTarget } from "./browser-qualification-audit.mjs";
+import { readBrowserJourneyHealth } from "./lib/browser-journey-target.mjs";
 
 const execute = promisify(execFile);
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -23,7 +24,8 @@ export function planTemplate() {
     candidate: { platform: "darwin-arm64", source_commit: "", source_tree: "",
       artifacts: ["runtime", "browser_ui", "engine_adapter", "image_manifest", "rootfs", "kernel",
         "initrd", "host_helper", "relay", "components", "installation_review"].map(role => ({ role, path: "", sha256: "" })) },
-    runtime: { base_url: "", browser_ui_url: "", fixture_origin: "", profile: "", control_socket: "", operator_coords: "",
+    runtime: { base_url: "", browser_ui_url: "", fixture_origin: "", fixture_admin_origin: "", allow_remote_fixture: false,
+      profile: "", control_socket: "", operator_coords: "",
       browser_executable: "", node_path: "", viewer_version: "", headed: true, reuse_signed_home: false, engine_id: "", exit_id: "",
       resource_roots: [{ role: "runtime", pid: null, start: "" }, { role: "vm_control", pid: null, start: "" },
         { role: "exit_relay", pid: null, start: "" }] },
@@ -155,6 +157,7 @@ export function journeyEnvironment(plan, index) {
   const env = { ...process.env };
   for (const key of Object.keys(env)) if (key.startsWith("HOME_VIRTUAL_AUTH_")) delete env[key];
   const p = plan.runtime;
+  const target = qualificationTarget(p);
   Object.assign(env, {
     ELASTOS_BASE_URL: p.base_url, HOME_URL: p.base_url.replace(/\/$/, "") + "/apps/home/",
     HOME_VIRTUAL_AUTH_NAME: "Browser qualification controlled Mac",
@@ -168,7 +171,11 @@ export function journeyEnvironment(plan, index) {
     HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_RECOVERY: "0",
     HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_TURN_TEST_HOME: "",
     HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VZ_TRANSPORT: "1",
-    HOME_VIRTUAL_AUTH_BROWSER_FIXTURE_ORIGIN: p.fixture_origin,
+    HOME_VIRTUAL_AUTH_BROWSER_ENGINE_ID: target.engineId,
+    HOME_VIRTUAL_AUTH_BROWSER_REMOTE_EXIT_ID: p.exit_id,
+    HOME_VIRTUAL_AUTH_BROWSER_FIXTURE_ORIGIN: target.origin,
+    HOME_VIRTUAL_AUTH_BROWSER_FIXTURE_ADMIN_ORIGIN: target.adminOrigin,
+    HOME_VIRTUAL_AUTH_BROWSER_ALLOW_REMOTE_FIXTURE: target.allowRemote ? "1" : "0",
     HOME_VIRTUAL_AUTH_PROFILE: p.profile,
     HOME_VIRTUAL_AUTH_CLEANUP: "0", HOME_VIRTUAL_AUTH_PRESERVE_PROFILE: "1",
     HOME_VIRTUAL_AUTH_REUSE_SIGNED_HOME: p.reuse_signed_home === true ? "1" : "0",
@@ -181,8 +188,12 @@ export function journeyEnvironment(plan, index) {
   if (p.browser_executable) env.ELASTOS_BROWSER_EXECUTABLE = p.browser_executable;
   if (p.node_path) env.NODE_PATH = p.node_path;
   if (p.headed === true) env.HOME_VIRTUAL_AUTH_HEADED = "1";
-  if (p.remote_exit_id) env.HOME_VIRTUAL_AUTH_BROWSER_REMOTE_EXIT_ID = p.remote_exit_id;
   return env;
+}
+export async function qualificationFixtureHealth(plan, fetchImpl = fetch) {
+  const health = await readBrowserJourneyHealth(qualificationTarget(plan.runtime), fetchImpl);
+  requireEvidence(health.qualification === "bounded-v1", "qualification_fixture_hook_missing");
+  return health;
 }
 export async function childProcessTable() {
   const { stdout } = await execute("/bin/ps", ["-axo", "pid=,ppid=,pgid=,lstart="],
@@ -359,7 +370,7 @@ export async function runQualification(planPath, output, { signal = new AbortCon
     for (const path of ["scripts/home-passkey-virtual-auth-smoke.mjs",
       "scripts/lib/browser-journey-fixture.mjs", "scripts/lib/browser-journey-operator.mjs",
       "scripts/lib/browser-journey-audio.mjs", "scripts/lib/browser-journey-recovery.mjs",
-      "scripts/lib/browser-open-failure.mjs",
+      "scripts/lib/browser-open-failure.mjs", "scripts/lib/browser-journey-target.mjs",
       "scripts/lib/browser-journey-viewer-reload.mjs", "scripts/lib/browser-journey-turn-interruption.mjs",
       "scripts/lib/browser-qualification-observer.mjs", "scripts/browser-qualification-runner.mjs",
       "scripts/browser-qualification-audit.mjs"]) {
@@ -375,9 +386,7 @@ export async function runQualification(planPath, output, { signal = new AbortCon
     writeFileSync(join(output, "installation-review.json"), installationBytes, { flag: "wx", mode: 0o600 });
     used += installationBytes.length;
     receipt.live_before = await liveCandidate(plan, frozen);
-    const health = await fetch(plan.runtime.fixture_origin + "/health", { signal: AbortSignal.timeout(3000) }).then(r => r.json());
-    requireEvidence(health.schema === "elastos.browser.journey-fixture/v1" && health.qualification === "bounded-v1",
-      "qualification_fixture_hook_missing");
+    await qualificationFixtureHealth(plan);
     sampleFd = openSync(join(output, "samples.jsonl"), "wx", 0o600);
     const start = performance.now();
     const append = (kind, attempt, value) => {
@@ -396,12 +405,12 @@ export async function runQualification(planPath, output, { signal = new AbortCon
       signal.addEventListener("abort", abort, { once: true });
       let stopSampling = false, sampleTask, logFd, logHash = createHash("sha256"), logBytes = 0;
       const observedChild = {};
+      const launchSamples = new Map();
       try {
         attempt.before = await controlStatus(plan.runtime.control_socket);
         cleanControl(attempt.before, plan.mode === "warm");
         const baseline = await resources(plan.runtime.resource_roots, tracked);
         attempt.resource_peak = { ...baseline };
-        attempt.active_vm_keys = [];
         attempt.observed_page_ids = [];
         logFd = openSync(join(output, "attempt-" + i + ".log"), "wx", 0o600);
         sampleTask = (async () => {
@@ -417,11 +426,12 @@ export async function runQualification(planPath, output, { signal = new AbortCon
               requireEvidence(attempt.observed_page_ids.length < 16, "page_identity_bound");
               attempt.observed_page_ids.push(id);
             }
-            for (const s of control.lifecycle?.sessions || []) if (s.vm_key_hash && !attempt.active_vm_keys.includes(s.vm_key_hash)) {
-              requireEvidence(attempt.active_vm_keys.length < 16, "vm_identity_bound");
-              attempt.active_vm_keys.push(s.vm_key_hash);
+            const sample = { ...value, control };
+            for (const id of control.page_ids || []) if (!launchSamples.has(id)) {
+              requireEvidence(launchSamples.size < 16, "launch_sample_bound");
+              launchSamples.set(id, sample);
             }
-            append("resources", i, { ...value, control });
+            append("resources", i, sample);
             await new Promise(resolve => { const timer = setTimeout(done, 5000);
               function done() { clearTimeout(timer); controller.signal.removeEventListener("abort", done); resolve(); }
               controller.signal.addEventListener("abort", done, { once: true });
@@ -434,6 +444,7 @@ export async function runQualification(planPath, output, { signal = new AbortCon
             writeSync(logFd, chunk); logHash.update(chunk); logBytes += chunk.length; used += chunk.length;
           }, sample: value => append("media", i, value) });
         Object.assign(attempt, child);
+        attempt.local_launch_sample = launchSamples.get(child.journey?.page_id) || null;
         stopSampling = true; controller.abort(); await sampleTask;
         requireEvidence(!attempt.sampling_failure && !child.failure, attempt.sampling_failure || child.failure);
         attempt.after = await controlStatus(plan.runtime.control_socket); cleanControl(attempt.after);

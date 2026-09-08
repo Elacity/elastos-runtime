@@ -1,5 +1,5 @@
 // Observation only: product media remains the Browser's WebRTC receiver.
-import { requireEvidence, MODES, deriveMedia, TERMINAL_EFFECTS } from "../browser-qualification-audit.mjs";
+import { requireEvidence, MODES, deriveMedia, TERMINAL_EFFECTS, qualificationVmIdentity } from "../browser-qualification-audit.mjs";
 
 export function qualificationOptions(env) {
   if (!env.HOME_VIRTUAL_AUTH_BROWSER_QUALIFICATION_MODE) return null;
@@ -374,6 +374,7 @@ export async function createQualificationHarness(context, page, options, now = (
       attempts.find(a => a.request === res.request()) :
       attempts.find(a => a.open_id === decodeURIComponent(path.split("/").at(-1)));
     if (!opened) return;
+    if (frame !== opened.request.frame() || new URL(res.url()).origin !== new URL(opened.request.url()).origin) return;
     if (path.endsWith("/open") ? res.request() !== opened.request :
       !opened.open_id || decodeURIComponent(path.split("/").at(-1)) !== opened.open_id) return;
     const body = await res.json().catch(() => null);
@@ -382,7 +383,13 @@ export async function createQualificationHarness(context, page, options, now = (
       body?.schema === "elastos.browser.open-status/v1" && body.status === "completed" ? body.result : null;
     if (body?.status === "failed" || res.status?.() >= 400) opened.outcome = "failed";
     if (result?.engine_page?.page_id) {
-      opened.outcome = "completed"; opened.page_id = result.engine_page.page_id; match(frame);
+      opened.outcome = "completed"; opened.page_id = result.engine_page.page_id;
+      const vmIdentity = result.engine_page.transport_proof ?
+        qualificationVmIdentity(result.engine_page.transport_proof, opened.page_id) : null;
+      requireEvidence(!opened.vm_identity || JSON.stringify(opened.vm_identity) === JSON.stringify(vmIdentity),
+        "launch_transport_identity_changed");
+      opened.vm_identity = vmIdentity;
+      match(frame);
     }
   };
   const response = res => { void observeResponse(res).catch(() => controller.abort()); };
@@ -396,16 +403,19 @@ export async function createQualificationHarness(context, page, options, now = (
   cancellation?.setRuntimeCleanup(() => cleanupQualificationOpens(attempts));
   const openSnapshot = pageId => ({ schema: "elastos.browser.qualification-observation/v1", mode: options.mode,
     launch: launches.get(pageId) || null, observation: null,
+    vm_identity: attempts.find(a => a.page_id === pageId)?.vm_identity || null,
     open_attempts: attempts.map(a => ({ open_id: a.open_id, page_id: a.page_id, outcome: a.outcome,
       started_ms: a.start - attempts[0].start })) });
   return {
     snapshot: openSnapshot,
     async observe({ appFrame, pageId, readReceipt, readStatus, interact }) {
+      requireEvidence(!controller.signal.aborted, "qualification_cancelled");
       const evidence = openSnapshot(pageId);
       if (attempts.length !== 1 || attempts[0].outcome !== "completed") {
         throw Object.assign(new Error("qualification_open_retry_or_failure"), { qualification: evidence });
       }
       if (["cold", "warm"].includes(options.mode)) requireEvidence(evidence.launch, "qualification_launch_not_observed");
+      qualificationVmIdentity(evidence.vm_identity, pageId);
       evidence.services = await observationCall(() => appFrame.evaluate(() => ({
         engine_id: document.querySelector("#browser-engine")?.value,
         exit_id: document.querySelector("#browser-exit")?.value,

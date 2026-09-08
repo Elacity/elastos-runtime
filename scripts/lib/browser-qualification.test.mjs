@@ -3,16 +3,29 @@ import test from "node:test";
 import vm from "node:vm";
 import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
+import { createServer } from "node:http";
 import { mkdtemp, writeFile, readFile, rm, rename, utimes, realpath } from "node:fs/promises";
 import { writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { validatePlan, validateJourney, validateAttempt, auditQualification, sha256,
-  TERMINAL_EFFECTS, percentile, cleanControl, candidateFingerprint, validateInstallation, validateLiveIdentity, deriveMedia } from "../browser-qualification-audit.mjs";
-import { freezeArtifacts, checkArtifacts, journeyEnvironment, parseProcesses, ownedProcesses, runJourneyChild, executableInode } from "../browser-qualification-runner.mjs";
+  TERMINAL_EFFECTS, percentile, cleanControl, candidateFingerprint, validateInstallation, validateLiveIdentity, deriveMedia, qualificationTarget, qualificationVmIdentity, validateLocalLaunchSample } from "../browser-qualification-audit.mjs";
+import { freezeArtifacts, checkArtifacts, journeyEnvironment, parseProcesses, ownedProcesses, runJourneyChild, executableInode, qualificationFixtureHealth } from "../browser-qualification-runner.mjs";
 import { qualificationOptions, installQualificationReceiver, observationCall, createQualificationHarness, createQualificationCancellation, qualificationInteraction, cleanupQualificationOpens } from "./browser-qualification-observer.mjs";
+import { readBrowserJourneyReceipt } from "./browser-journey-target.mjs";
 import { createBrowserJourneyFixture } from "./browser-journey-fixture.mjs";
 
+const PAGE_ID = "page:vz-" + "d".repeat(64);
+function vmProof() {
+  return { schema: "elastos.browser.vz-transport-public-proof/v1", page_id: PAGE_ID,
+    vm_id: "browser-vm-" + "e".repeat(64), generation: "sha256:" + "f".repeat(64), binding_hash: "sha256:" + "a".repeat(64) };
+}
+function launchSample() {
+  const c = control(); c.active_pages = 1; c.page_ids = [PAGE_ID];
+  c.lifecycle.sessions = [{ phase: "ACTIVE_SESSION", warm_vm: false, vm_key_hash: null,
+    page_id: "sha256:" + sha256(PAGE_ID).slice(0, 16) }];
+  return { identity_verified: true, rss_bytes: 128, cpu_percent: 10, process_ids: ["10:birth-a", "20:birth-b"], control: c };
+}
 function plan(mode = "lifecycle") {
   const p = { schema: "elastos.browser.qualification-plan/v1", mode, count: 100, duration_ms: 1_800_000,
     require_operator: true, candidate: { platform: "darwin-arm64", source_commit: "a".repeat(40),
@@ -22,7 +35,7 @@ function plan(mode = "lifecycle") {
     runtime: { base_url: "http://localhost:61510", browser_ui_url: "http://localhost:61510/apps/browser/browser.js", fixture_origin: "http://localhost:61511",
       profile: "/fixture/profile", control_socket: "/fixture/control.sock", operator_coords: "/fixture/gateway-runtime-coords.json",
       viewer_version: "fixture-chromium", headed: true, engine_id: "local", exit_id: "runtime-default",
-      resource_roots: [{ role: "runtime", pid: 10, start: "birth-a" }, { pid: 20, start: "birth-b" }] },
+      resource_roots: [{ role: "runtime", pid: 10, start: "birth-a" }, { role: "vm_control", pid: 20, start: "birth-b" }] },
     network: { profile: "local", control_rtt_ms: 1 },
     limits: { rss_bytes: 1024 * 1024, cpu_percent: 400, fps: 30, width: 1920, height: 1080 } };
   p.candidate.artifacts.find(a => a.role === "installation_review").sha256 = sha256(JSON.stringify(installation(p)));
@@ -38,7 +51,7 @@ function installation(p) {
 function frozenInputs(p) {
   return [...p.candidate.artifacts, { role: "operator_coordinates", path: p.runtime.operator_coords, sha256: "e".repeat(64) },
     ...["scripts/browser-qualification-runner.mjs", "scripts/browser-qualification-audit.mjs",
-      "scripts/lib/browser-qualification-observer.mjs", "scripts/home-passkey-virtual-auth-smoke.mjs"].map(role =>
+      "scripts/lib/browser-qualification-observer.mjs", "scripts/lib/browser-journey-target.mjs", "scripts/home-passkey-virtual-auth-smoke.mjs"].map(role =>
       ({ role, path: "/fixture/" + role, sha256: "e".repeat(64) }))].map(a => ({ ...a, identity: "1:2:3:4:5" }));
 }
 function liveIdentity(p) {
@@ -61,7 +74,7 @@ const tone = () => ({ ok: true, receiver_unchanged: true, receiver_muted: false,
   track_state: "live", context_state: "running", probe_context_closed: true,
   samples: Array.from({ length: 40 }, (_, i) => ({ at_ms: 500 + i * 50, rms: 0.03, peak_hz: 445.3 })) });
 function journey(id = "fixture-run-0001") {
-  const pageId = "page:vz-fixture";
+  const pageId = PAGE_ID;
   return { page_id: pageId, display_mode: "webrtc_remote_display", controlled_journey: {
     schema: "elastos.browser.controlled-journey/v1", run: id,
     pages: ["main", "nav"].map(name => ({ name, page_id: pageId, load: { type: "load" },
@@ -71,25 +84,27 @@ function journey(id = "fixture-run-0001") {
     inspection: { pages: [{}, {}], after_navigation: { status: 409, body: { code: "stale_inspection" } } },
     viewer_reload: { ok: true }, operator: { ok: true },
     qualification: { schema: "elastos.browser.qualification-observation/v1",
-      open_attempts: [{ outcome: "completed" }],
+      open_attempts: [{ outcome: "completed" }], vm_identity: vmProof(),
       services: { engine_id: "local", exit_id: "runtime-default" },
       launch: { page_id: pageId, clock: "host_monotonic", usable_frame_ms: 1000 } },
     close: { window_detached: true,
       receipt: { schema: "elastos.browser.close-result/v1", closed: true, page_id: pageId, cleanup_id: "cleanup-fixture",
         cleanup: { ok: true, action: "released_exact_runtime_browser_ownership" },
-        transport_proof: { page_id: pageId }, terminal_effects: Object.fromEntries(TERMINAL_EFFECTS.map(k => [k, true])) },
+        transport_proof: vmProof(), terminal_effects: Object.fromEntries(TERMINAL_EFFECTS.map(k => [k, true])) },
       sessions_after_close: { active_sessions: 0, principal_sessions: 0, total_sessions: 0, launching_sessions: 0,
         engine_cleanup_obligations: 0, launch_reconciliation_obligations: 0, recoverable_page: null } } } };
 }
 function control() {
-  return { schema: "elastos.browser.vm-control-service.status/v1", ok: true, direct_network: false,
+  return { schema: "elastos.browser.vm-control-service.status/v1", ok: true, pid: 20,
+    config_fingerprint: "c".repeat(64), control_service: { schema: "elastos.browser.vm-control-service.identity/v1",
+      service_id: "service:" + "b".repeat(64) }, direct_network: false,
     network_mode: "runtime_net_only", active_pages: 0, active_vms: 0, warm_vms: 0, pending_launches: 0,
-    page_ids: [], active_stream_ids: [], pending_stream_ids: [], lifecycle: { sessions: [] } };
+    page_ids: [], active_stream_ids: [], pending_stream_ids: [], lifecycle: { schema: "elastos.browser.lifecycle-status/v1", sessions: [] } };
 }
 function attempt(index = 1, mode = "lifecycle") {
   return { schema: "elastos.browser.qualification-attempt/v1", index, mode, ok: true, child_exit: 0,
     candidate_fingerprint: "f".repeat(64), candidate_unchanged: true, before: control(), after: control(),
-    observed_page_ids: ["page:vz-fixture"], active_vm_keys: ["vm-fixture"],
+    observed_page_ids: [PAGE_ID], local_launch_sample: launchSample(),
     viewer: { version: "fixture-chromium", headed: true },
     resource_peak: { identity_verified: true, rss_bytes: 128, cpu_percent: 10 },
     journey: journey("fixture-run-" + index) };
@@ -123,6 +138,86 @@ test("private installed journey flags select the embedded flow and remove confli
     else process.env.HOME_VIRTUAL_AUTH_BROWSER_OPEN = old;
   }
 });
+test("qualification exports exact canonical services and fixture options while default plans stay local", () => {
+  const keys = ["HOME_VIRTUAL_AUTH_BROWSER_ENGINE_ID", "HOME_VIRTUAL_AUTH_BROWSER_REMOTE_EXIT_ID",
+    "HOME_VIRTUAL_AUTH_BROWSER_FIXTURE_ADMIN_ORIGIN", "HOME_VIRTUAL_AUTH_BROWSER_ALLOW_REMOTE_FIXTURE"];
+  const prior = keys.map(k => process.env[k]);
+  keys.forEach(k => { process.env[k] = "unrelated"; });
+  try {
+    const p = plan(); p.runtime.engine_id = p.runtime.exit_id = "";
+    const defaults = journeyEnvironment(p, 1);
+    assert.deepEqual(keys.map(k => defaults[k]), ["", "", p.runtime.fixture_origin, "0"]);
+    p.runtime.engine_id = "remote-engine-approved"; p.runtime.exit_id = "remote-carrier-approved";
+    p.runtime.fixture_origin = "https://fixture.example";
+    p.runtime.fixture_admin_origin = "http://127.0.0.1:61511"; p.runtime.allow_remote_fixture = true;
+    validatePlan(p);
+    const env = journeyEnvironment(p, 1);
+    assert.deepEqual(keys.map(k => env[k]), [p.runtime.engine_id, p.runtime.exit_id, p.runtime.fixture_admin_origin, "1"]);
+    assert.equal(env.HOME_VIRTUAL_AUTH_BROWSER_FIXTURE_ORIGIN, p.runtime.fixture_origin);
+    p.runtime.remote_exit_id = p.runtime.exit_id; validatePlan(p);
+    p.runtime.remote_exit_id = "other";
+    assert.throws(() => validatePlan(p), /conflicting_legacy_exit/);
+    assert.throws(() => journeyEnvironment(p, 1), /conflicting_legacy_exit/);
+  } finally { keys.forEach((k, i) => { if (prior[i] === undefined) delete process.env[k]; else process.env[k] = prior[i]; }); }
+  for (const change of [r => { r.engine_id = "choice with spaces"; }, r => { r.exit_id = " trimmed "; },
+    r => { r.engine_id = "x".repeat(129); }, r => { r.fixture_origin = "https://fixture.example"; },
+    r => { r.fixture_admin_origin = "https://fixture.example"; }, r => { r.allow_remote_fixture = "true"; },
+    r => { r.fixture_admin_origin = null; }]) {
+    const p = plan(); change(p.runtime); assert.throws(() => validatePlan(p));
+  }
+  for (const key of ["fixture_origin", "fixture_admin_origin"]) for (const origin of [
+    "https://user:password@fixture.example", "https://fixture.example/path", "https://fixture.example/?query=1",
+    "https://fixture.example/#fragment", "https://fixture.example/a/..", " https://fixture.example"]) {
+    const p = plan(); p.runtime.allow_remote_fixture = true; p.runtime[key] = origin;
+    assert.throws(() => validatePlan(p), /exact HTTP/);
+  }
+});
+test("qualification preflight uses the admin server and keeps health, redirect and run binding checks", async () => {
+  const fixture = createBrowserJourneyFixture();
+  await new Promise(r => fixture.listen(0, "127.0.0.1", r));
+  const admin = "http://127.0.0.1:" + fixture.address().port;
+  const redirect = createServer((_req, res) => { res.writeHead(302, { Location: admin + "/health" }); res.end(); });
+  await new Promise(r => redirect.listen(0, "127.0.0.1", r));
+  try {
+    const p = plan(); Object.assign(p.runtime, { fixture_origin: "https://product.example",
+      fixture_admin_origin: admin, allow_remote_fixture: true });
+    assert.equal((await qualificationFixtureHealth(p)).qualification, "bounded-v1");
+    await fetch(admin + "/main?run=qualification-route-test&qualification=1");
+    const receipt = await readBrowserJourneyReceipt(qualificationTarget(p.runtime), "qualification-route-test");
+    assert.equal(receipt.run, "qualification-route-test"); assert.equal(receipt.observation, "bounded-v1");
+    for (const [ok, body] of [[false, { schema: "elastos.browser.journey-fixture/v1", ok: true, qualification: "bounded-v1" }],
+      [true, { schema: "wrong", ok: true, qualification: "bounded-v1" }],
+      [true, { schema: "elastos.browser.journey-fixture/v1", ok: false, qualification: "bounded-v1" }],
+      [true, { schema: "elastos.browser.journey-fixture/v1", ok: true }]]) {
+      await assert.rejects(qualificationFixtureHealth(p, async (url, options) => {
+        assert.equal(url, admin + "/health"); assert.equal(options.credentials, "omit");
+        assert.equal(options.redirect, "error"); assert.ok(options.signal);
+        return { ok, json: async () => body };
+      }));
+    }
+    await assert.rejects(readBrowserJourneyReceipt(qualificationTarget(p.runtime), "qualification-route-test", {
+      fetchImpl: async () => ({ ok: true, json: async () => ({ ...receipt, run: "another-run" }) }),
+    }), /receipt failed/);
+    p.runtime.fixture_admin_origin = "http://127.0.0.1:" + redirect.address().port;
+    await assert.rejects(qualificationFixtureHealth(p), /fetch failed/);
+  } finally {
+    fixture.closeAllConnections(); redirect.closeAllConnections();
+    await Promise.all([new Promise(r => fixture.close(r)), new Promise(r => redirect.close(r))]);
+  }
+});
+test("the canonical target helper is required in frozen inputs and its replacement invalidates the campaign", async () => {
+  const p = plan(), inputs = frozenInputs(p), role = "scripts/lib/browser-journey-target.mjs";
+  assert.throws(() => candidateFingerprint(p, inputs.filter(f => f.role !== role)), /frozen_harness_inputs/);
+  const original = candidateFingerprint(p, inputs); inputs.find(f => f.role === role).sha256 = "a".repeat(64);
+  assert.notEqual(candidateFingerprint(p, inputs), original);
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "qualification-target-freeze-")));
+  try {
+    const path = join(dir, "target.mjs"); await writeFile(path, "old");
+    const frozen = await freezeArtifacts([{ role, path, sha256: sha256("old") }]);
+    await writeFile(join(dir, "replacement"), "old"); await rename(join(dir, "replacement"), path);
+    await assert.rejects(checkArtifacts(frozen), /candidate_changed/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
 test("current close receipt omits already_closed; every terminal effect remains mandatory", () => {
   validateJourney(journey());
   for (const key of TERMINAL_EFFECTS) {
@@ -140,7 +235,7 @@ test("current close receipt omits already_closed; every terminal effect remains 
 test("attempts bind exact viewer, services, observed local VM and monotonic launch", () => {
   validateAttempt(attempt(), plan());
   for (const change of [a => { a.candidate_unchanged = false; }, a => { a.viewer.version = "other"; },
-    a => { a.observed_page_ids = []; }, a => { a.active_vm_keys = []; },
+    a => { a.observed_page_ids = []; }, a => { a.local_launch_sample = null; },
     a => { a.journey.controlled_journey.qualification.services.exit_id = "other"; },
     a => { a.resource_peak.rss_bytes = 9e9; }]) {
     const a = attempt(); change(a); assert.throws(() => validateAttempt(a, plan()));
@@ -148,6 +243,32 @@ test("attempts bind exact viewer, services, observed local VM and monotonic laun
   const cold = attempt(1, "cold");
   cold.journey.controlled_journey.qualification.launch.clock = "wall_clock";
   assert.throws(() => validateAttempt(cold, plan("cold")), /monotonic/);
+});
+test("transport-authority launches require matching real VM proof and sampled ownership even with no reuse key", () => {
+  const a = attempt();
+  assert.equal(a.local_launch_sample.control.active_vms, 0);
+  assert.equal(a.local_launch_sample.control.lifecycle.sessions[0].vm_key_hash, null);
+  validateAttempt(a, plan());
+  for (const key of ["vm_id", "generation", "binding_hash", "page_id"]) {
+    const changed = structuredClone(a);
+    changed.journey.controlled_journey.close.receipt.transport_proof[key] =
+      key === "vm_id" ? "browser-vm-" + "1".repeat(64) : key === "page_id" ? "page:vz-" + "1".repeat(64) : "sha256:" + "1".repeat(64);
+    assert.throws(() => validateAttempt(changed, plan()), key === "page_id" ? /thirteen_effect/ : /identity/);
+  }
+  for (const change of [a => { a.journey.controlled_journey.qualification.vm_identity = null; },
+    a => { a.journey.controlled_journey.qualification.vm_identity.vm_id = "invented-reuse-key"; },
+    a => { a.local_launch_sample = null; a.active_vm_keys = ["legacy-key"]; },
+    a => { a.local_launch_sample.process_ids = ["10:birth-a", "20:replacement-birth"]; },
+    a => { a.local_launch_sample.control.pid = 21; },
+    a => { a.local_launch_sample.control.config_fingerprint = "9".repeat(64); },
+    a => { a.local_launch_sample.control.control_service.service_id = "service:" + "9".repeat(64); },
+    a => { a.local_launch_sample.control.page_ids = ["another-page"]; },
+    a => { a.local_launch_sample.control.lifecycle.sessions[0].page_id = "sha256:another-page"; },
+    a => { a.local_launch_sample.control.lifecycle.sessions[0].phase = "STARTING_VM"; },
+    a => { a.local_launch_sample.control.lifecycle.sessions[0].warm_vm = true; },
+    a => { a.after.control_service.service_id = "service:" + "9".repeat(64); }]) {
+    const changed = structuredClone(a); change(changed); assert.throws(() => validateAttempt(changed, plan()));
+  }
 });
 test("warm conditioning stays unsupported, including an idle warm VM beside a cold allocation", () => {
   const a = attempt(1, "warm");
@@ -215,19 +336,50 @@ test("launch clock excludes Home auth and binds first frame before completed ope
     const open = req("/api/apps/browser/open"); page.emit("request", open);
     await respond(open, { open_id: "open-current" });
     clock = 37_250;
-    callback({ frame }, { page_id: "page:vz-fixture", width: 1920, height: 1080 });
-    const result = { schema: "elastos.browser.open-result/v1", engine_page: { page_id: "page:vz-fixture" } };
+    callback({ frame }, { page_id: PAGE_ID, width: 1920, height: 1080 });
+    const result = { schema: "elastos.browser.open-result/v1", engine_page: { page_id: PAGE_ID, transport_proof: vmProof() } };
     await respond(req("/api/apps/browser/open/open-old", "GET"), {
       schema: "elastos.browser.open-status/v1", status: "completed", result });
-    await assert.rejects(harness.observe({ appFrame: frame, pageId: "page:vz-fixture" }), /open_retry_or_failure/);
+    await assert.rejects(harness.observe({ appFrame: frame, pageId: PAGE_ID }), /open_retry_or_failure/);
     clock = 38_000;
     await respond(req("/api/apps/browser/open/open-current", "GET"), {
       schema: "elastos.browser.open-status/v1", status: "completed", result });
-    const evidence = await harness.observe({ appFrame: frame, pageId: "page:vz-fixture" });
+    const evidence = await harness.observe({ appFrame: frame, pageId: PAGE_ID });
     assert.equal(evidence.launch.usable_frame_ms, 250);
     assert.equal(evidence.launch.clock, "host_monotonic");
+    assert.deepEqual(evidence.vm_identity, vmProof());
   } finally { await harness.stop(); }
   assert.equal(page.listenerCount("request"), 0); assert.equal(page.listenerCount("response"), 0);
+});
+test("launch observer captures only the owning frame's exact transport proof and rejects missing or changed identity", async () => {
+  for (const variant of ["valid", "missing", "wrong-page", "changed"]) {
+    const page = new EventEmitter(), frame = { evaluate: async () => ({ engine_id: "local", exit_id: "runtime-default" }) };
+    const context = { exposeBinding: async () => {}, addInitScript: async () => {} };
+    const h = await createQualificationHarness(context, page, { mode: "lifecycle", duration_ms: 0 });
+    const req = { method: () => "POST", url: () => "http://localhost/api/apps/browser/open", frame: () => frame };
+    const respond = async (request, body) => {
+      page.emit("response", { request: () => request, url: request.url, json: async () => body });
+      await new Promise(setImmediate);
+    };
+    try {
+      page.emit("request", req); await respond(req, { open_id: "exact-open" });
+      const poll = { method: () => "GET", url: () => "http://localhost/api/apps/browser/open/exact-open", frame: () => frame };
+      const proof = vmProof(); if (variant === "wrong-page") proof.page_id = "page:vz-" + "1".repeat(64);
+      const body = { schema: "elastos.browser.open-status/v1", status: "completed", result: {
+        schema: "elastos.browser.open-result/v1", engine_page: { page_id: PAGE_ID,
+          ...(variant === "missing" ? {} : { transport_proof: proof }) } } };
+      await respond({ ...poll, frame: () => ({}) }, body);
+      await respond({ ...poll, url: () => "http://other-origin/api/apps/browser/open/exact-open" }, body);
+      assert.equal(h.snapshot(PAGE_ID).vm_identity, null);
+      await respond(poll, body);
+      if (variant === "changed") {
+        body.result.engine_page.transport_proof.generation = "sha256:" + "1".repeat(64);
+        await respond(poll, body);
+      }
+      if (variant === "valid") assert.deepEqual((await h.observe({ appFrame: frame, pageId: PAGE_ID })).vm_identity, vmProof());
+      else await assert.rejects(h.observe({ appFrame: frame, pageId: PAGE_ID }), /identity|cancelled/);
+    } finally { await h.stop(); }
+  }
 });
 test("qualification fixture retains an active eight-hour run with a 128-event ring and monotonic cursor", async () => {
   let clock = 1_000_000;
@@ -266,7 +418,7 @@ test("qualification audit binds all 100 unique attempts, raw logs and samples; p
       const bytes = JSON.stringify(a); writeFileSync(join(dir, file), bytes);
       refs.push({ file, sha256: sha256(bytes) });
       resources.push(JSON.stringify({ sequence: i, at_ms: i * 60_000, attempt: i, kind: "resources",
-        value: { identity_verified: true, rss_bytes: 128, cpu_percent: 10 } }));
+        value: launchSample() }));
     }
     const sampleBytes = resources.join("\n") + "\n"; writeFileSync(join(dir, "samples.jsonl"), sampleBytes);
     const planBytes = JSON.stringify(p); writeFileSync(join(dir, "plan.json"), planBytes);
@@ -278,6 +430,11 @@ test("qualification audit binds all 100 unique attempts, raw logs and samples; p
     sealBundle(dir, receipt); save(receipt);
     const accepted = auditQualification(path);
     assert.equal(accepted.ok, true); assert.equal(accepted.product_accepted, false);
+    const firstPath = join(dir, refs[0].file), original = readFileSync(firstPath);
+    const first = JSON.parse(original); first.local_launch_sample.rss_bytes++;
+    const changed = JSON.stringify(first); writeFileSync(firstPath, changed); refs[0].sha256 = sha256(changed); save(receipt);
+    assert.throws(() => auditQualification(path), /launch_sample_not_in_raw_evidence/);
+    writeFileSync(firstPath, original); refs[0].sha256 = sha256(original); save(receipt);
     save({ ...receipt, frozen_inputs: undefined });
     assert.throws(() => auditQualification(path), /frozen_inputs/);
     const relabeled = structuredClone(receipt);
@@ -714,7 +871,7 @@ test("raw thirty-minute media and interaction trace drives its summary and retai
     const save = rows => {
       const attemptBytes = JSON.stringify(a); writeFileSync(join(dir, "attempt-1.json"), attemptBytes);
       const samples = [JSON.stringify({ sequence: 1, at_ms: 0, attempt: 1, kind: "resources",
-        value: { identity_verified: true, rss_bytes: 128, cpu_percent: 10 } }), ...rows.map(r => JSON.stringify(r))].join("\n") + "\n";
+        value: launchSample() }), ...rows.map(r => JSON.stringify(r))].join("\n") + "\n";
       writeFileSync(join(dir, "samples.jsonl"), samples);
       const r = { schema: "elastos.browser.qualification/v1", plan: p, plan_sha256: sha256(planBytes),
         completed: true, candidate_unchanged: true, cancelled: false,
