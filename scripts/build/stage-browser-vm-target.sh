@@ -1408,57 +1408,6 @@ if "_elastos_turn_transport_query" not in main_text:
     main_text = main_text.replace(turn_uri_marker, turn_uri_patch, 1)
 if "_elastos_turn_transport_query(url)" not in main_text:
     raise SystemExit("browser-vm-selkies-start: Selkies TURN transport patch incomplete")
-fraction_needle = "from gi.repository import GLib, Gst, GstRtp, GstSdp, GstWebRTC\n    fract = Gst.Fraction(60, 1)"
-fraction_replacement = """from gi.repository import GLib, Gst, GstRtp, GstSdp, GstWebRTC
-    def _elastos_raw_caps_with_framerate(framerate):
-        return Gst.caps_from_string(f"video/x-raw,framerate={int(framerate)}/1")
-    fract = Gst.Fraction()"""
-if "_elastos_raw_caps_with_framerate" not in text:
-    if fraction_needle not in text:
-        raise SystemExit("browser-vm-selkies-start: Selkies Gst.Fraction compatibility patch target not found")
-    text = text.replace(fraction_needle, fraction_replacement, 1)
-initial_caps = """        # Create capabilities for ximagesrc
-        self.ximagesrc_caps = Gst.caps_from_string("video/x-raw")
-        self.ximagesrc_caps.set_value("framerate", Gst.Fraction(self.framerate, 1))
-"""
-patched_initial_caps = """        # Create capabilities for ximagesrc
-        self.ximagesrc_caps = _elastos_raw_caps_with_framerate(self.framerate)
-"""
-if initial_caps in text:
-    text = text.replace(initial_caps, patched_initial_caps, 1)
-text = text.replace(
-    '        self.ximagesrc_caps.set_value("framerate", Gst.Fraction(self.framerate, 1))',
-    '        self.ximagesrc_caps = _elastos_raw_caps_with_framerate(self.framerate)',
-)
-for set_framerate_caps in (
-    """            self.ximagesrc_caps = Gst.caps_from_string("video/x-raw")
-            self.ximagesrc_caps.set_value("framerate", Gst.Fraction(framerate, 1))
-            self.ximagesrc_capsfilter.set_property("caps", self.ximagesrc_caps)
-""",
-    """            self.ximagesrc_caps = Gst.caps_from_string("video/x-raw")
-            self.ximagesrc_caps.set_value("framerate", Gst.Fraction(self.framerate, 1))
-            self.ximagesrc_capsfilter.set_property("caps", self.ximagesrc_caps)
-""",
-):
-    if set_framerate_caps in text:
-        text = text.replace(set_framerate_caps, """            self.ximagesrc_caps = _elastos_raw_caps_with_framerate(framerate)
-            self.ximagesrc_capsfilter.set_property("caps", self.ximagesrc_caps)
-""", 1)
-text = text.replace(
-    '            self.ximagesrc_caps.set_value("framerate", Gst.Fraction(framerate, 1))',
-    '            self.ximagesrc_caps = _elastos_raw_caps_with_framerate(framerate)',
-)
-text = text.replace(
-    '            self.ximagesrc_caps.set_value("framerate", Gst.Fraction(self.framerate, 1))',
-    '            self.ximagesrc_caps = _elastos_raw_caps_with_framerate(self.framerate)',
-)
-for stale_fraction in (
-    "Gst.Fraction(60, 1)",
-    "Gst.Fraction(self.framerate, 1)",
-    "Gst.Fraction(framerate, 1)",
-):
-    if stale_fraction in text:
-        raise SystemExit(f"browser-vm-selkies-start: stale Selkies Gst.Fraction constructor remains: {stale_fraction}")
 marker = '        self.webrtcbin.set_property("latency", 0)\n'
 patch = '''        elastos_ice_transport_policy = os.environ.get("ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY", "").strip().lower()
         if elastos_ice_transport_policy:

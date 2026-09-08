@@ -1572,8 +1572,8 @@ assert(
     browserVmTargetStage.includes("found_media_iface") &&
     browserVmTargetStage.includes('[ -n "$found_media_iface" ] && break') &&
     browserVmTargetStage.includes("patch_selkies_relay_policy") &&
-    browserVmTargetStage.includes("_elastos_raw_caps_with_framerate") &&
-    browserVmTargetStage.includes("stale Selkies Gst.Fraction constructor remains") &&
+    !browserVmTargetStage.includes("_elastos_raw_caps_with_framerate") &&
+    !browserVmTargetStage.includes("fraction_replacement") &&
     browserVmTargetStage.includes("/run/elastos/browser-ice-transport-policy") &&
     browserVmTargetStage.includes("ice-transport-policy") &&
     browserVmTargetStage.includes("elastos_ice_transport_policy") &&
@@ -1623,8 +1623,9 @@ assert(
     browserVmRootfsBuild.includes("require_mounts_clean") &&
     browserVmRootfsBuild.includes("rootfs pseudo-filesystem still mounted") &&
     browserVmRootfsBuild.includes("initrd_dump_diagnostics") &&
-    browserVmRootfsBuild.includes("_elastos_raw_caps_with_framerate") &&
-    browserVmRootfsBuild.includes("Selkies stale Gst.Fraction constructor remains") &&
+    browserVmRootfsBuild.includes("python3-gst-1.0") &&
+    browserVmRootfsBuild.includes("browser-gst-python-smoke.py") &&
+    browserVmRootfsBuild.includes("without raw GI workarounds") &&
     browserVmRootfsBuild.includes("browser-vm-initrd.log") &&
     browserVmRootfsBuild.includes("tail dmesg sync chmod") &&
     browserVmRootfsBuild.includes("initrd_mark_newroot") &&
