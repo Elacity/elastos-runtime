@@ -1651,28 +1651,46 @@ fn init_prewarms_configured_vm_control_service() {
 }
 
 #[test]
-fn init_fails_when_configured_vm_prewarm_fails() {
+fn init_preserves_inventory_when_one_vm_prewarm_fails() {
     let mut provider = BrowserEngineAdapter::new();
+    let healthy_socket = spawn_status_socket_with_path(|_| {
+        json!({
+            "schema":BROWSER_ENGINE_READINESS_SCHEMA, "readiness":{"state":"ready"}
+        })
+    });
 
-    assert_eq!(
-        error_code(provider.init(json!({
-            "adapters": [{
-                "id": "mac-vm-product",
-                "kind": "chromium_microvm",
-                "display_modes": ["webrtc_remote_display"],
-                "supervisor": {
-                    "program": "/bin/sh",
-                    "args": ["-c", "echo prewarm failed >&2; exit 42"],
-                    "timeout_ms": 2000,
-                    "control_socket_path": "/tmp/elastos-browser-vm-prewarm-fail.sock",
-                    "env": {
-                        "ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE": "1"
-                    }
+    let response = serde_json::to_value(provider.init(json!({
+        "adapters": [{
+            "id": "mac-vm-product",
+            "kind": "chromium_microvm",
+            "display_modes": ["webrtc_remote_display"],
+            "supervisor": {
+                "program": "/bin/sh",
+                "args": ["-c", "echo prewarm failed >&2; exit 42"],
+                "timeout_ms": 2000,
+                "control_socket_path": "/tmp/elastos-browser-vm-prewarm-fail.sock",
+                "env": {
+                    "ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE": "1"
                 }
-            }]
-        }))),
+            }
+        }, {
+            "id":"other-engine", "kind":"chromium_microvm", "display_modes":["webrtc_remote_display"],
+            "supervisor":{"program":"/bin/sh", "control_socket_path":healthy_socket}
+        }]
+    })))
+    .unwrap();
+    assert_eq!(response["status"], "ok");
+    assert_eq!(
+        response["data"]["prewarm_results"][0]["code"],
         "engine_process_unavailable"
     );
+    assert_eq!(provider.adapters.len(), 2);
+    let readiness = serde_json::to_value(provider.readiness("mac-vm-product", None)).unwrap();
+    assert_eq!(readiness["data"]["readiness"]["state"], "unavailable");
+    let readiness = serde_json::to_value(provider.readiness("other-engine", None)).unwrap();
+    assert_eq!(readiness["data"]["readiness"]["state"], "ready");
+    assert!(provider.page_control_sessions.is_empty());
+    let _ = std::fs::remove_file(healthy_socket);
 }
 
 #[test]
@@ -3726,4 +3744,43 @@ fn webrtc_answer_validator_rejects_provider_errors() {
         err,
         "WebRTC answer must use elastos.browser.webrtc-answer/v1"
     );
+}
+
+#[test]
+fn readiness_uses_the_typed_host_contract_without_acquiring_a_page() {
+    for (host_readiness, expected) in [
+        (json!({"state":"ready"}), "ready"),
+        (
+            json!({"state":"unavailable","reason":"artifact_invalid"}),
+            "unavailable",
+        ),
+        (json!({"state":"future_state"}), "unavailable"),
+    ] {
+        let socket = spawn_status_socket_with_path(|_| {
+            json!({
+                "schema":BROWSER_ENGINE_READINESS_SCHEMA, "readiness":host_readiness
+            })
+        });
+        let mut provider = BrowserEngineAdapter::new();
+        let initialized = serde_json::to_value(provider.init(json!({"adapters":[{
+            "id":"test-host", "kind":"chromium_microvm", "display_modes":["webrtc_remote_display"],
+            "supervisor":{"program":"/bin/sh", "control_socket_path":socket}
+        }]})))
+        .unwrap();
+        assert_eq!(initialized["status"], "ok");
+        let result = serde_json::to_value(
+            provider.handle(
+                serde_json::from_value(json!({
+                    "op":"readiness", "adapter_id":"test-host", "principal_id":"person:readiness"
+                }))
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(result["data"]["adapter_id"], "test-host");
+        assert_eq!(result["data"]["schema"], BROWSER_ENGINE_READINESS_SCHEMA);
+        assert_eq!(result["data"]["readiness"]["state"], expected);
+        assert!(provider.page_control_sessions.is_empty());
+        let _ = std::fs::remove_file(socket);
+    }
 }

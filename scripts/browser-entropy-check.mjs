@@ -522,7 +522,7 @@ assert(
 assert(
   browserEngineAdapter.includes("elastos.browser.engine.page/v1") &&
     browserEngineAdapter.includes(
-      'const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.0"',
+      'const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.1"',
     ) &&
     browserEngineAdapter.includes(
       "elastos.browser.engine-cleanup-binding/v2",
@@ -1850,7 +1850,7 @@ assert(
     ) &&
     browserStyle.includes('.browser-status[data-visible="true"][data-copyable="true"]') &&
     browserStyle.includes(".browser-status-copy") &&
-    browser.includes("browser.js?v=browser-20260907b") &&
+    browser.includes("browser.js?v=browser-20260907c") &&
     !browser.includes("browser.js?v=browser-20260731a") &&
     !browser.includes("browser.js?v=browser-20260730a") &&
     !browser.includes("browser.js?v=browser-20260728a") &&
@@ -1896,8 +1896,8 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-status.js?v=browser-20260907b") &&
-    browserRemoteDisplay.includes("browser-status.js?v=browser-20260907b") &&
+  browserJs.includes("browser-status.js?v=browser-20260907c") &&
+    browserRemoteDisplay.includes("browser-status.js?v=browser-20260907c") &&
     !browserJs.includes("browser-status.js?v=browser-20260711c") &&
     !browserRemoteDisplay.includes("browser-status.js?v=browser-20260711c") &&
     !browserJs.includes("browser-status.js?v=browser-20260626e") &&
@@ -1912,7 +1912,7 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-remote-display.js?v=browser-20260907b") &&
+  browserJs.includes("browser-remote-display.js?v=browser-20260907c") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260730b") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260728a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260727a") &&

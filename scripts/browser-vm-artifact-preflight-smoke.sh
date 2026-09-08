@@ -238,6 +238,110 @@ if debugfs and mke2fs:
     assert contract["source_kind"] == "ext4_image" and contract["inspectable"] is True
     assert contract["verified_sidecar"] is True and contract["audio_default_ready"] is True
     check("same real ext4 without debugfs", valid, True)
+    # The VZ host fixture is platform-specific; ext4 integrity runs on both hosts.
+    import platform as host_platform
+    if host_platform.system() == "Darwin" and host_platform.machine() == "arm64":
+        # Exercise the read-only host operation with a complete, known fixture set.
+        import http.client
+        import socket
+        import time
+        (data / "bin/initrd").write_bytes(b"fixture-initrd")
+        for name in ("kernel", "initrd"):
+            artifact = data / "bin" / ("vmlinux" if name == "kernel" else name)
+            valid[name] = {"size": artifact.stat().st_size,
+                           "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()}
+        host_helper = data / "bin/browser-vz-engine-supervisor"
+        host_helper.write_text("#!/bin/sh\nprintf '%s\\n' '{\"schema\":\"elastos.browser.vm-host-capabilities/v1\",\"available\":true}'\n")
+        sidecar.write_text(json.dumps(valid))
+
+        def host_check(name, expected):
+            proc = subprocess.run([str(repo / "scripts/browser-vm-artifact-preflight.sh"), "--host-readiness"],
+                                  env={**env, "ELASTOS_DEBUGFS_BIN": debugfs},
+                                  capture_output=True, text=True, timeout=15, check=True)
+            result = json.loads(proc.stdout)
+            assert result == {"schema":"elastos.browser.engine-readiness/v1", "readiness":expected}, (name, result)
+            checks.append(name)
+
+        host_check("complete fixture host readiness", {"state":"ready"})
+        original_kernel = (data / "bin/vmlinux").read_bytes()
+        (data / "bin/vmlinux").write_bytes(b"changed kernel")
+        host_check("host rejects changed kernel", {"state":"unavailable","reason":"artifact_invalid"})
+        (data / "bin/vmlinux").write_bytes(original_kernel)
+        (data / "bin/initrd").unlink()
+        host_check("host rejects missing initrd", {"state":"unavailable","reason":"artifact_invalid"})
+        (data / "bin/initrd").write_bytes(b"fixture-initrd")
+        host_helper.write_text(host_helper.read_text().replace("true", "false"))
+        host_check("host rejects unavailable virtualization", {"state":"unavailable","reason":"host_unsupported"})
+        host_helper.write_text(host_helper.read_text().replace("false", "true"))
+
+        scripts = data / "scripts"
+        scripts.mkdir()
+        shutil.copy2(repo / "scripts/browser-vm-artifact-preflight.sh", scripts)
+        import shlex
+        probe_count = scratch / "readiness-probe-count"
+        installed_probe = scripts / "browser-vm-artifact-preflight.sh"
+        installed_probe.write_text(installed_probe.read_text().replace("set -euo pipefail",
+            "set -euo pipefail\nprintf x >> " + shlex.quote(str(probe_count)), 1))
+        control_socket = str(scratch / "readiness.sock")
+        service_env = {**env, "ELASTOS_DEBUGFS_BIN":debugfs,
+            "ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG":json.dumps({
+                "schema":"elastos.browser.vm-control-service.config/v1",
+                "control_socket_path":control_socket, "launcher_program":str(host_helper),
+                "network_mode":"runtime_net_only", "direct_network":False,
+            })}
+        service = subprocess.Popen([shutil.which("node"), str(repo / "scripts/browser-vm-control-service.mjs")],
+                                   env=service_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        def get(path):
+            client = http.client.HTTPConnection("browser-vm", timeout=12)
+            client.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.sock.settimeout(12)
+            client.sock.connect(control_socket)
+            try:
+                client.request("GET", path)
+                response = client.getresponse()
+                assert response.status == 200
+                return json.loads(response.read())
+            finally:
+                client.close()
+        try:
+            deadline = time.monotonic() + 5
+            while not pathlib.Path(control_socket).exists() and time.monotonic() < deadline and service.poll() is None:
+                time.sleep(0.02)
+            assert pathlib.Path(control_socket).exists(), "control service did not start"
+            assert get("/readiness")["readiness"] == {"state":"ready"}
+            checks.append("control service reports host readiness")
+            assert get("/readiness")["readiness"] == {"state":"ready"}
+            assert probe_count.read_text() == "x"
+            checks.append("unchanged admitted artifacts reuse verified readiness")
+            (data / "bin/vmlinux").write_bytes(b"changed kernel")
+            assert get("/readiness")["readiness"] == {"state":"unavailable","reason":"artifact_invalid"}
+            checks.append("control service notices artifact change")
+            assert probe_count.read_text() == "xx"
+            (data / "bin/vmlinux").write_bytes(original_kernel)
+            status = get("/status")
+            assert status["active_pages"] == status["active_vms"] == status["pending_launches"] == 0
+            checks.append("readiness creates no page or VM")
+            sleeper_pid = scratch / "readiness-sleeper.pid"
+            installed_probe.write_text("#!/bin/sh\necho $$ > " + shlex.quote(str(sleeper_pid)) + "\nexec sleep 30\n")
+            started = time.monotonic()
+            assert get("/readiness")["readiness"] == {"state":"unavailable","reason":"preparation_required"}
+            assert time.monotonic() - started < 10
+            try:
+                os.kill(int(sleeper_pid.read_text()), 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise AssertionError("timed-out readiness probe remained alive")
+            checks.append("slow readiness is bounded and its process is reaped")
+        finally:
+            service.terminate()
+            try:
+                _, stderr = service.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                service.kill()
+                _, stderr = service.communicate(timeout=5)
+            if service.returncode not in (0, -15):
+                raise AssertionError(stderr)
     check("real ext4 missing receipt with debugfs", None, False, debugfs, "sidecar missing")
     check("real ext4 wrong architecture with debugfs", {**valid, "target_platform": "linux-amd64"},
           False, debugfs, "target_platform")

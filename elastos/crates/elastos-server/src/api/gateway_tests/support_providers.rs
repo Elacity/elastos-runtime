@@ -3330,6 +3330,12 @@ impl Provider for MockBrowserEngineProvider {
             .get("principal_id")
             .and_then(|value| value.as_str())
             .is_some());
+        if request["op"] == "readiness" {
+            return Ok(json!({"status": "ok", "data": {
+                "schema": "elastos.browser.engine-readiness/v1",
+                "adapter_id": request["adapter_id"], "readiness": {"state": "ready"}
+            }}));
+        }
         if request.get("op").and_then(|value| value.as_str()) == Some("status")
             && request.get("lifecycle_generation").is_some()
         {
@@ -3530,7 +3536,7 @@ impl Provider for MockBrowserEngineProvider {
                 "data": {
                     "schema": "elastos.browser.engine.page/v1",
                     "provider": "browser-engine-adapter",
-                    "protocol_version": "2.0",
+                    "protocol_version": "2.1",
                     "page_id": page_id,
                     "adapter": adapter,
                     "engine": "selkies_gstreamer",
@@ -3731,7 +3737,7 @@ impl Provider for MockBrowserEngineProvider {
             "status": "ok",
             "data": {
                 "provider": "browser-engine-adapter",
-                "protocol_version": "2.0",
+                "protocol_version": "2.1",
                 "status": "configured",
                 "adapter_count": 2,
                 "adapters": [
@@ -3913,7 +3919,7 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                         "data": {
                             "schema": "elastos.browser.engine.page/v1",
                             "provider": "browser-engine-adapter",
-                            "protocol_version": "2.0",
+                            "protocol_version": "2.1",
                             "page_id": "unsafe page id",
                         }
                     })),
@@ -4133,7 +4139,7 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                             "stream_id": stream_id,
                             "effect": {
                                 "provider": "browser-engine-adapter",
-                                "protocol_version": "2.0",
+                                "protocol_version": "2.1",
                                 "page_id": page_id,
                                 "adapter": "mock-browser-engine",
                                 "engine": "selkies_gstreamer",
@@ -4335,6 +4341,7 @@ impl Provider for MockRejectingBrowserEngineProvider {
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
         match request.get("op").and_then(|value| value.as_str()) {
+            Some("readiness") => MockBrowserEngineProvider.send_raw(request).await,
             Some("launch") => Ok(json!({
                 "status": "error",
                 "code": "display_session_unavailable",
@@ -4357,7 +4364,7 @@ impl Provider for MockRejectingBrowserEngineProvider {
                 "status": "ok",
                 "data": {
                     "provider": "browser-engine-adapter",
-                    "protocol_version": "2.0",
+                    "protocol_version": "2.1",
                     "status": "configured",
                     "adapter_count": 1,
                     "adapters": [{
@@ -4418,7 +4425,7 @@ impl Provider for MockMalformedBrowserEngineProvider {
             "status": "ok",
             "data": {
                 "provider": "browser-engine-adapter",
-                "protocol_version": "2.0",
+                "protocol_version": "2.1",
                 "status": "configured",
                 "adapter_count": 1,
                 "required_byte_transport": "adapter_ipc",

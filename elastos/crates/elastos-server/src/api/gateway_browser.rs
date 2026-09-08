@@ -585,7 +585,14 @@ async fn execute_browser_open(
             let mut body =
                 serde_json::to_value(&error).expect("Browser compatibility error serializes");
             body["message"] = serde_json::json!(error.to_string());
-            body["stage"] = serde_json::json!("engine_compatibility");
+            body["stage"] = serde_json::json!(if matches!(
+                error,
+                BrowserCompatibilityError::EngineNotReady { .. }
+            ) {
+                "engine_readiness"
+            } else {
+                "engine_compatibility"
+            });
             return Err(BrowserOpenFailure::json(StatusCode::BAD_REQUEST, body));
         }
     };

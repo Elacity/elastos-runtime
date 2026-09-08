@@ -94,6 +94,24 @@ Mac and Linux host adapters now query their virtualization APIs for eligibility.
 The Mac unit check ran locally; the Linux-specific KVM query still needs a
 Linux test run.
 
+The current source adds Engine protocol 2.1 readiness before profile preparation
+and launch effects. Runtime retains explicit Engine choice and can automatically
+select another compatible, ready entry from the admitted inventory. VM host
+readiness verifies the image set and host eligibility; successful checks are
+reused while artifact identities remain unchanged. A failed prewarm retains the
+other configured adapters. Browser maps typed readiness failures to repair and
+selection instructions. Installed Runtime, control-service and helper parity,
+normal remote Runtime service admission, and device/media proof remain open.
+Source verification passed 10 shared-contract tests, 80 Engine tests, 225 Browser
+Runtime library tests, 15 Browser startup tests, 43 Browser JavaScript tests and
+26 artifact/control-service cases. The last group includes real ext4 inspection,
+readiness cache reuse, invalidation after a kernel change, and zero page/VM
+acquisition and bounded probe termination. A read-only run of the built VZ helper
+reports preparation required before the official signing step and available
+host support after signing the same development build. That check launched no VM
+and changed no installed artifact. These are source and controlled fixture
+results; independent review and installed acceptance remain open.
+
 Read-only target observations on 2026-09-07 identify a macOS 26.5.2 ARM64
 machine with 24 GiB RAM, 10 logical CPUs and hardware virtualization reported
 available; its Brave version is 152.1.94.119. A Linux AMD64 server reports

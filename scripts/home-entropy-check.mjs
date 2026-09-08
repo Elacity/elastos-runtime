@@ -8534,7 +8534,7 @@ assert(
 assert(
   browserEngineAdapter.includes("elastos.browser.engine.page/v1") &&
     browserEngineAdapter.includes(
-      'const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.0"',
+      'const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.1"',
     ) &&
     browserEngineAdapter.includes(
       "elastos.browser.engine-cleanup-binding/v2",

@@ -79,6 +79,22 @@ const VZ_AUTHORITY_BOOT_ARG_PREFIXES: [&str; 4] = [
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--host-capabilities") {
+        let supported = elastos_vz::is_supported();
+        let entitled = std::env::current_exe()
+            .ok()
+            .is_some_and(|path| verify_virtualization_entitlement(&path).is_ok());
+        println!(
+            "{}",
+            json!({
+                "schema": "elastos.browser.vm-host-capabilities/v1",
+                "available": supported && entitled,
+                "reason": if !supported { Some("host_unsupported") }
+                    else if !entitled { Some("preparation_required") } else { None },
+            })
+        );
+        return;
+    }
     init_tracing();
     if let Err(error) = run().await {
         eprintln!("{error}");

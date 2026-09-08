@@ -5,10 +5,76 @@ import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
 
 const CONFIG_ENV = "ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG";
+let verifiedHostReadiness = null;
+
+function readinessArtifactIdentity(dataDir, launcher) {
+  const artifact = (key, fallback) => process.env[key] || path.join(dataDir, fallback);
+  const files = [
+    launcher,
+    artifact("ELASTOS_BROWSER_VM_ROOTFS", "browser-vm/rootfs.ext4"),
+    artifact("ELASTOS_BROWSER_VM_ROOTFS_MANIFEST", "browser-vm/browser-vm-rootfs-manifest.json"),
+    artifact("ELASTOS_BROWSER_VM_KERNEL", "bin/vmlinux"),
+    artifact("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd"),
+    path.join(dataDir, "scripts/browser-vm-artifact-preflight.sh"),
+  ];
+  if (process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("linux-")) {
+    files.push(artifact("ELASTOS_BROWSER_VM_CROSVM_BIN", "bin/crosvm"), "/dev/kvm");
+  }
+  try {
+    return JSON.stringify(files.map((file) => {
+      const info = fs.statSync(file, { bigint: true });
+      return [file, info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].map(String);
+    }));
+  } catch {
+    return null;
+  }
+}
+
+async function engineReadiness(config) {
+  const unavailable = (reason) => ({
+    schema: "elastos.browser.engine-readiness/v1",
+    readiness: { state: "unavailable", reason },
+  });
+  // Remote providers report their own host readiness through the same Engine
+  // contract. An operator tunnel's local files cannot certify its remote host.
+  if (path.basename(config.launcher_program).startsWith("browser-vm-remote-vz-launcher")) {
+    return unavailable("readiness_unsupported");
+  }
+  const dataDir = process.env.ELASTOS_BROWSER_VM_DATA_DIR;
+  if (!dataDir || !path.isAbsolute(dataDir)) return unavailable("preparation_required");
+  const script = path.join(dataDir, "scripts/browser-vm-artifact-preflight.sh");
+  const identity = readinessArtifactIdentity(dataDir, config.launcher_program);
+  if (identity && verifiedHostReadiness?.identity === identity) return verifiedHostReadiness.result;
+  return new Promise((resolve) => {
+    execFile(script, ["--host-readiness"], {
+      timeout: 8000, maxBuffer: 64 * 1024,
+      env: {
+        ...process.env, ELASTOS_BROWSER_VM_STAGED_ROOTFS: "",
+        ...(process.env.ELASTOS_BROWSER_VM_PLATFORM === "darwin-arm64"
+          ? { ELASTOS_BROWSER_VM_VZ_SUPERVISOR: config.launcher_program } : {}),
+      },
+    }, (error, stdout) => {
+      if (error) return resolve(unavailable("preparation_required"));
+      try {
+        const result = JSON.parse(stdout);
+        if (result.schema !== "elastos.browser.engine-readiness/v1") throw new Error("schema");
+        if (result.readiness?.state === "ready") {
+          if (!identity || readinessArtifactIdentity(dataDir, config.launcher_program) !== identity) {
+            return resolve(unavailable("preparation_required"));
+          }
+          verifiedHostReadiness = { identity, result };
+        }
+        resolve(result);
+      } catch {
+        resolve(unavailable("readiness_unsupported"));
+      }
+    });
+  });
+}
 const OPEN_REQUEST_ENV = "ELASTOS_BROWSER_VM_OPEN_REQUEST";
 const MAX_BROWSER_FILE_UPLOAD_BYTES = 16 * 1024 * 1024;
 const MAX_BROWSER_INPUT_BODY_BYTES =
@@ -3492,6 +3558,10 @@ function main() {
     };
     try {
       const url = new URL(req.url || "/", "http://browser-vm-control");
+      if (req.method === "GET" && url.pathname === "/readiness") {
+        sendJson(200, await engineReadiness(config));
+        return;
+      }
       if (req.method === "GET" && url.pathname === "/status") {
         sendJson(200, {
           schema: "elastos.browser.vm-control-service.status/v1",

@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+mode="${1:-artifact}"
+if [[ "$#" -gt 1 || ( "$mode" != "artifact" && "$mode" != "--host-readiness" ) ]]; then
+  echo "usage: browser-vm-artifact-preflight.sh [--host-readiness]" >&2
+  exit 2
+fi
+
 platform="${ELASTOS_BROWSER_VM_PLATFORM:-}"
 if [[ -z "$platform" ]]; then
   case "$(uname -s)-$(uname -m)" in
@@ -33,7 +39,7 @@ engine_supervisor="${ELASTOS_BROWSER_VM_ENGINE_SUPERVISOR:-${data_dir}/bin/brows
 target_preflight="${ELASTOS_BROWSER_VM_TARGET_PREFLIGHT:-${repo_root}/scripts/browser-vm-target-preflight.sh}"
 debugfs_bin="${ELASTOS_DEBUGFS_BIN:-$(command -v debugfs 2>/dev/null || true)}"
 
-python3 - \
+exec python3 - \
   "$platform" \
   "$data_dir" \
   "$control_socket" \
@@ -46,7 +52,7 @@ python3 - \
   "$control_service" \
   "$engine_supervisor" \
   "$target_preflight" \
-  "$debugfs_bin" <<'PY'
+  "$debugfs_bin" "$mode" <<'PY'
 import json
 import hashlib
 import os
@@ -69,6 +75,7 @@ import sys
     engine_supervisor,
     target_preflight,
     debugfs_bin,
+    mode,
 ) = sys.argv[1:]
 
 REQUIRED_ROOTFS_FILES = {
@@ -483,6 +490,55 @@ missing_for_local_substrate = [
 
 local_substrate_artifacts_ready = not missing_for_local_substrate and rootfs_contract["ok"]
 launch_ready = bool(control["control_socket"]["ok"])
+
+if mode == "--host-readiness":
+    # This operation is read-only. It admits the local host's immutable image
+    # set; control-socket presence is independent of artifact identity.
+    reason = None
+    import platform as host_platform
+    host_id = {("Darwin", "arm64"): "darwin-arm64", ("Linux", "x86_64"): "linux-amd64",
+               ("Linux", "aarch64"): "linux-arm64", ("Linux", "arm64"): "linux-arm64"}.get(
+                   (host_platform.system(), host_platform.machine()))
+    if platform != host_id:
+        reason = "host_unsupported"
+    elif not rootfs_contract.get("verified_sidecar"):
+        reason = "artifact_invalid" if pathlib.Path(rootfs).is_file() else "preparation_required"
+    elif not local_substrate_artifacts_ready:
+        reason = "preparation_required"
+    else:
+        try:
+            receipt = json.loads(pathlib.Path(rootfs_manifest).read_text())
+            initrd = os.environ.get("ELASTOS_BROWSER_VM_INITRAMFS") or str(pathlib.Path(data_dir) / "bin/initrd")
+            for name, artifact in [("kernel", kernel), ("initrd", initrd)]:
+                entry = receipt.get(name, {})
+                actual = pathlib.Path(artifact)
+                if (not actual.is_file() or entry.get("size") != actual.stat().st_size
+                        or entry.get("sha256") != sha256_file(artifact)):
+                    reason = "artifact_invalid"
+                    break
+            if reason is None and platform == "darwin-arm64":
+                probe = subprocess.run([vz_supervisor, "--host-capabilities"],
+                                       capture_output=True, text=True, timeout=2, check=True)
+                host = json.loads(probe.stdout)
+                if host.get("schema") != "elastos.browser.vm-host-capabilities/v1":
+                    reason = "readiness_unsupported"
+                elif host.get("available") is not True:
+                    reason = ("preparation_required" if host.get("reason") == "preparation_required"
+                              else "host_unsupported")
+            elif reason is None and platform in {"linux-arm64", "linux-amd64"}:
+                import fcntl
+                with open("/dev/kvm", "r+b", buffering=0) as kvm:
+                    if fcntl.ioctl(kvm.fileno(), 0xAE00, 0) != 12:
+                        reason = "host_unsupported"
+            elif reason is None:
+                reason = "host_unsupported"
+        except (ValueError, subprocess.SubprocessError, AttributeError):
+            reason = "readiness_unsupported"
+        except OSError:
+            reason = "host_unsupported"
+    readiness = {"state": "unavailable", "reason": reason} if reason else {"state": "ready"}
+    print(json.dumps({"schema": "elastos.browser.engine-readiness/v1", "readiness": readiness}))
+    sys.exit(0)
 
 if launch_ready:
     reason = "Browser VM control socket is available; Runtime can delegate Browser launches."

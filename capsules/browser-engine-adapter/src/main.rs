@@ -6,10 +6,11 @@
 //! through Runtime-owned stream and display sessions.
 
 use elastos_common::browser_protocol::{
-    BrowserDisplayMode, BrowserEngineAdapterCapabilities, BrowserGuaranteeLevel,
-    BrowserProfileDescriptor, BrowserViewport as ViewportRequest,
-    BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA, BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
-    BROWSER_ENGINE_PROTOCOL_VERSION, BROWSER_ENGINE_PROVIDER_ID,
+    BrowserDisplayMode, BrowserEngineAdapterCapabilities, BrowserEngineReadiness,
+    BrowserEngineReadinessReason, BrowserGuaranteeLevel, BrowserProfileDescriptor,
+    BrowserViewport as ViewportRequest, BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA,
+    BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA, BROWSER_ENGINE_PROTOCOL_VERSION,
+    BROWSER_ENGINE_PROVIDER_ID, BROWSER_ENGINE_READINESS_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -47,6 +48,11 @@ enum Request {
     Init {
         #[serde(default)]
         config: Value,
+    },
+    Readiness {
+        adapter_id: String,
+        #[serde(default)]
+        principal_id: Option<String>,
     },
     Status {
         #[serde(default)]
@@ -720,6 +726,10 @@ impl BrowserEngineAdapter {
     fn handle(&mut self, request: Request) -> Response {
         match request {
             Request::Init { config } => self.init(config),
+            Request::Readiness {
+                adapter_id,
+                principal_id,
+            } => self.readiness(&adapter_id, principal_id),
             Request::Status {
                 principal_id,
                 lifecycle_generation,
@@ -837,13 +847,12 @@ impl BrowserEngineAdapter {
                     "result": result,
                 })),
                 Err(err) => {
-                    return Response::error(
-                        "engine_process_unavailable",
-                        format!(
-                            "Browser Engine Adapter prewarm failed for {}: {err}",
-                            adapter.id
-                        ),
-                    )
+                    prewarm_results.push(json!({
+                        "adapter": adapter.id,
+                        "status": "error",
+                        "code": "engine_process_unavailable",
+                        "message": err,
+                    }));
                 }
             }
         }
@@ -906,7 +915,55 @@ impl BrowserEngineAdapter {
             "adapters": self.adapter_summaries(),
             "supported_display_modes": self.supported_display_modes(),
             "supported_guarantee_levels": self.supported_guarantee_levels(),
-            "operations": ["status", "launch", "attach_stream", "close_page", "page_status", "diagnostics", "input", "webrtc_signal"],
+            "operations": ["status", "readiness", "launch", "attach_stream", "close_page", "page_status", "diagnostics", "input", "webrtc_signal"],
+        }))
+    }
+
+    fn readiness(&self, adapter_id: &str, _principal_id: Option<String>) -> Response {
+        if adapter_id.is_empty() || !is_safe_id(adapter_id) {
+            return Response::error(
+                "invalid_request",
+                "Browser readiness requires a valid Engine identity",
+            );
+        }
+        let Some(adapter) = self.select_adapter(Some(adapter_id)) else {
+            return Response::error(
+                "engine_not_found",
+                "The selected Browser Engine is unavailable",
+            );
+        };
+        let readiness = adapter
+            .supervisor
+            .as_ref()
+            .and_then(|supervisor| supervisor.control_socket_path.as_deref())
+            .map(|socket| {
+                supervisor_control_json_bounded(
+                    socket,
+                    "GET",
+                    "/readiness",
+                    None,
+                    std::time::Duration::from_secs(10),
+                    8192,
+                )
+                .map_err(|_| BrowserEngineReadinessReason::ControlUnavailable)
+                .and_then(|value| {
+                    if value.get("schema").and_then(Value::as_str)
+                        != Some(BROWSER_ENGINE_READINESS_SCHEMA)
+                    {
+                        return Err(BrowserEngineReadinessReason::ReadinessUnsupported);
+                    }
+                    serde_json::from_value::<BrowserEngineReadiness>(value["readiness"].clone())
+                        .map_err(|_| BrowserEngineReadinessReason::ReadinessUnsupported)
+                })
+                .unwrap_or_else(|reason| BrowserEngineReadiness::Unavailable { reason })
+            })
+            .unwrap_or(BrowserEngineReadiness::Unavailable {
+                reason: BrowserEngineReadinessReason::PreparationRequired,
+            });
+        Response::ok(json!({
+            "schema": BROWSER_ENGINE_READINESS_SCHEMA,
+            "adapter_id": adapter_id,
+            "readiness": readiness,
         }))
     }
 

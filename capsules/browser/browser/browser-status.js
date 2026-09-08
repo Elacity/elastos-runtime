@@ -68,6 +68,20 @@ export function friendlyOpenError(error) {
       ? "This Browser view needs a streamed display. Open Browser from Home with its default display."
       : "This browser cannot show the Browser session. Use a supported browser or enable WebRTC.";
   }
+  if (outcome?.state === "terminal_pre_effect_failure" && error?.payload?.stage === "engine_readiness") {
+    switch (error?.payload?.reason) {
+      case "artifact_invalid":
+        return "Browser Engine files need repair. Prepare this Engine or choose another approved Engine.";
+      case "host_unsupported":
+        return "The selected Engine needs a compatible host. Choose another approved Engine.";
+      case "readiness_unsupported":
+        return "Browser Engine needs an update to report readiness. Update it or choose another approved Engine.";
+      case "control_unavailable":
+        return "Browser Engine is unavailable. Restore its connection or choose another approved Engine.";
+      default:
+        return "Browser Engine needs preparation. Prepare it or choose another approved Engine.";
+    }
+  }
   if (outcome?.state === "terminal_pre_effect_failure" && error?.payload?.stage === "engine_compatibility") {
     switch (error?.payload?.code) {
       case "incompatible_engine_protocol":

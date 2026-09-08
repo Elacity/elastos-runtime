@@ -1210,7 +1210,7 @@ mod tests {
         serde_json::json!({
             "schema": "elastos.browser.engine.page/v1",
             "provider": "browser-engine-adapter",
-            "protocol_version": "2.0",
+            "protocol_version": "2.1",
             "page_id": authority["page_id"],
             "adapter": "browser-vm-product",
             "engine": "chromium_microvm",

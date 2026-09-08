@@ -6,7 +6,7 @@ import {
   normalizeUrl,
   sameBrowserStreamTarget,
   visibleAddressForUrl,
-} from "./browser-runtime-api.js?v=browser-20260907b";
+} from "./browser-runtime-api.js?v=browser-20260907c";
 import {
   createBrowserClipboardBridge,
 } from "./browser-clipboard.js?v=browser-20260725b";
@@ -26,9 +26,9 @@ import {
   isAuthoritySessionError,
   isMissingRuntimePageError,
   requestedDisplayMode,
-} from "./browser-status.js?v=browser-20260907b";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260907b";
-import { renderServiceSelection } from "./browser-service-selection.js?v=browser-20260907b";
+} from "./browser-status.js?v=browser-20260907c";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260907c";
+import { renderServiceSelection } from "./browser-service-selection.js?v=browser-20260907c";
 
 const STATUS_TTL_MS = 4200;
 const PAGE_STATUS_INTERVAL_MS = 2_500;

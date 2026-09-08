@@ -156,7 +156,7 @@ async fn browser_profile_reset_refuses_live_principal_session() {
         BrowserLaunchEffect {
             page_id: "profile-reset-live-page".to_string(),
             engine_provider: "browser-engine-adapter".to_string(),
-            engine_protocol_version: "2.0".to_string(),
+            engine_protocol_version: "2.1".to_string(),
             engine_adapter: "mock-adapter".to_string(),
             engine: "mock-engine".to_string(),
             provider_cleanup: serde_json::json!({

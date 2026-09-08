@@ -119,7 +119,8 @@ fn incompatible_versions_are_classified_before_version_specific_fields() {
     for version in [
         Value::Null,
         json!("1.0"),
-        json!("2.1"),
+        json!("2.0"),
+        json!("2.2"),
         json!("3.0"),
         json!(2),
     ] {
@@ -242,5 +243,21 @@ fn operator_open_intent_cannot_supply_runtime_or_profile_authority() {
             serde_json::from_value::<BrowserOpenRequest>(substituted).is_err(),
             "{field}"
         );
+    }
+}
+
+#[test]
+fn readiness_accepts_only_the_declared_state_and_reason_fields() {
+    assert_eq!(
+        serde_json::from_value::<BrowserEngineReadiness>(json!({"state":"ready"})).unwrap(),
+        BrowserEngineReadiness::Ready {}
+    );
+    for value in [
+        json!({"state":"ready", "unexpected_authority":true}),
+        json!({"state":"unavailable", "reason":"future_reason"}),
+        json!({"state":"unavailable"}),
+        json!({"state":"future_state"}),
+    ] {
+        assert!(serde_json::from_value::<BrowserEngineReadiness>(value).is_err());
     }
 }

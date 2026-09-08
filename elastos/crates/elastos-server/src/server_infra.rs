@@ -2258,7 +2258,8 @@ mod tests {
     async fn browser_engine_startup_reaps_old_or_mixed_version_before_launch() {
         for status in [
             provider_status(BROWSER_ENGINE_PROVIDER_ID, "1.0"),
-            provider_status(BROWSER_ENGINE_PROVIDER_ID, "2.1"),
+            provider_status(BROWSER_ENGINE_PROVIDER_ID, "2.0"),
+            provider_status(BROWSER_ENGINE_PROVIDER_ID, "2.2"),
             provider_status("other-provider", BROWSER_ENGINE_PROTOCOL_VERSION),
         ] {
             let registry = provider::ProviderRegistry::new();

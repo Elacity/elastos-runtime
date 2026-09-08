@@ -20,7 +20,7 @@ meanings and must be checked at the boundary they identify.
 | --- | --- | --- |
 | Capsule package | `elastos.capsule/v1`, `elastos.runtime-projection/v1`; interface `elastos.browser.page` version `0.5.0` | Runtime admits the package and its declared affordances. These identifiers describe the current package interface, not a release readiness claim. |
 | Runtime web projection | `elastos.browser.runtime/v1` summary and operation-specific result schemas | A verified Browser launch grant binds each request to principal, session and launched Browser instance. The HTTP routes are a Runtime adapter for those resources. |
-| Runtime to Engine | Provider `browser-engine-adapter`, protocol `2.0` | Runtime validates the provider inventory before profile preparation, lifecycle reservation, streams or launch. Engine results and cleanup records retain exact provider and protocol bindings. |
+| Runtime to Engine | Provider `browser-engine-adapter`, protocol `2.1` | Runtime validates the provider inventory before profile preparation, lifecycle reservation, streams or launch. Engine results and cleanup records retain exact provider and protocol bindings. |
 
 The Engine version policy is exact compatibility with the declared protocol.
 Missing, older, newer, or malformed versions produce
@@ -92,9 +92,29 @@ public typed inventory.
 
 `configured` means a provider has configuration. Installed artifact readiness,
 available capacity, permission to use a service, and installed-product
-certification are separate facts. B02 supplies authoritative readiness; B08
-supplies normal remote Engine service admission. Neither is inferred from a
-configuration label.
+certification are separate facts. Before preparing a profile or reserving launch
+effects, Runtime requests `readiness` for a compatible Engine. The result uses
+`elastos.browser.engine-readiness/v1`, binds the selected adapter ID, and carries
+`ready` or `unavailable` with a typed reason. An explicit selection retains its
+identity; automatic selection tries the compatible default, then other compatible
+entries in the admitted inventory. A failed adapter prewarm retains the inventory
+so Runtime can evaluate the other entries.
+
+The VM control service exposes the same readiness report through its private
+`GET /readiness` operation. Its host check verifies the rootfs receipt, kernel and
+initrd identities, actual host architecture, and usable KVM or entitled VZ support.
+It caches a successful result only while file identity, size and nanosecond change
+timestamps match. Changed files require a fresh check. Host inspection is bounded
+at eight seconds, and Runtime bounds candidate readiness requests at twelve
+seconds in total. Installation and repair still need atomic admitted artifact
+sets; service discovery and installed qualification retain their own gates.
+
+Protocol 2.1 requires this readiness operation. Runtime rejects older Engine
+protocols before launch effects. Close active 2.0 sessions before installing the
+new Runtime/Engine pair; durable cleanup bindings keep their exact protocol
+version. Normal remote Runtime service admission remains B08 work. Legacy
+operator tunnel launchers report `readiness_unsupported` until they implement a
+verified remote-host result.
 
 An explicit Engine selection either satisfies the requested display and
 isolation requirement or returns a typed rejection. Automatic selection first
@@ -123,7 +143,10 @@ capability requirements behind the same Runtime page contract.
 Compatibility errors are stable typed codes:
 `incompatible_engine_protocol`, `invalid_engine_status`, `engine_unavailable`,
 `engine_not_found`, `incompatible_engine_capabilities`, and
-`no_compatible_engine`. Open failures carry `stage: engine_compatibility` and
+`no_compatible_engine`. Readiness rejection uses `engine_not_ready`, a typed
+`reason`, and `stage: engine_readiness`; it retains the same terminal pre-effect
+outcome. Browser UI maps those reasons to preparation, repair, update, connection,
+or host-selection instructions. Compatibility failures carry `stage: engine_compatibility` and
 an `elastos.browser.open-outcome/v1` stating that page, VM and stream effects
 were not acquired. Browser UI explains version and capability remedies; agents
 can use the same code and outcome. A cleanup-pending outcome retains priority

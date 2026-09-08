@@ -37,8 +37,11 @@ with and without direct guest inspection. Repair or rebuild the image with
 verified provenance and a matching receipt before qualification. Setup refresh
 currently changes guest files without renewing that receipt; add an atomic,
 provenance-bound update before relying on it for preparation. Runtime still
-needs one artifact admission and control-service readiness result for discovery,
-selection and launch. Linux KVM/Jetson and remote Runtime fixtures
+uses a typed readiness result before profile preparation and launch. Finish
+atomic artifact admission, project that result into service discovery, and prove
+the installed path. Verify cold and unchanged-artifact readiness latency on each
+target, including slower storage. Protocol 2.1 installation requires drained 2.0
+sessions and a matching Engine/control-service/helper set. Linux KVM/Jetson and remote Runtime fixtures
 are still needed. Preserve the existing journey verdicts until those runs pass.
 Browser settings now retain an explicit Engine or Exit selection when its
 offer is absent. Installed verification must cover a service disappearing and

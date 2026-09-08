@@ -15,7 +15,7 @@
       {
         "resource": "elastos://browser-engine/*",
         "actions": ["read", "write"],
-        "operations": ["status", "launch", "attach_stream", "close_page", "page_status", "diagnostics", "input", "webrtc_signal"]
+        "operations": ["status", "readiness", "launch", "attach_stream", "close_page", "page_status", "diagnostics", "input", "webrtc_signal"]
       }
     ],
     "audit_events": [
@@ -41,6 +41,15 @@
           "audit": "summary",
           "resource": "elastos://browser-engine/*",
           "operation": "status"
+        },
+        {
+          "id": "readiness",
+          "description": "Check the selected Engine host before Runtime prepares a Browser launch.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://browser-engine/*",
+          "operation": "readiness"
         },
         {
           "id": "launch",

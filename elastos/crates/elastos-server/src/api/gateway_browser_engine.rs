@@ -1,6 +1,9 @@
 //! Browser engine and Net/Exit summary helpers.
 
 use super::*;
+use elastos_common::browser_protocol::{
+    BrowserEngineReadiness, BrowserEngineReadinessReason, BROWSER_ENGINE_READINESS_SCHEMA,
+};
 
 pub(in crate::api::gateway) async fn resolve_browser_engine_adapter(
     registry: &ProviderRegistry,
@@ -25,9 +28,54 @@ pub(in crate::api::gateway) async fn resolve_browser_engine_adapter(
     let data =
         provider_response_data(&response).ok_or(BrowserCompatibilityError::InvalidEngineStatus)?;
     let inventory = BrowserEngineInventory::from_status(&data)?;
-    inventory
-        .select(requested_adapter, display_mode, guarantee_level)
-        .map(|adapter| adapter.id.clone())
+    // Validate explicit choice and capability errors before probing a host.
+    inventory.select(requested_adapter, display_mode, guarantee_level)?;
+    let mut candidates = inventory
+        .adapters
+        .iter()
+        .filter(|adapter| adapter.supports(display_mode, guarantee_level))
+        .filter(|adapter| requested_adapter.is_none_or(|id| adapter.id == id))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|adapter| !adapter.default);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
+    let mut unavailable_reason = BrowserEngineReadinessReason::ReadinessUnsupported;
+    for adapter in candidates {
+        let request = serde_json::json!({
+            "op": "readiness", "principal_id": principal_id, "adapter_id": adapter.id,
+        });
+        let result =
+            match tokio::time::timeout_at(deadline, registry.send_raw("browser-engine", &request))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(BrowserCompatibilityError::EngineNotReady {
+                        reason: BrowserEngineReadinessReason::ControlUnavailable,
+                    })
+                }
+            };
+        let readiness = result.ok().and_then(|response| {
+            if response.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+                return None;
+            }
+            let data = provider_response_data(&response)?;
+            if data.get("schema").and_then(serde_json::Value::as_str)
+                != Some(BROWSER_ENGINE_READINESS_SCHEMA)
+                || data.get("adapter_id").and_then(serde_json::Value::as_str) != Some(&adapter.id)
+            {
+                return None;
+            }
+            serde_json::from_value::<BrowserEngineReadiness>(data["readiness"].clone()).ok()
+        });
+        match readiness {
+            Some(BrowserEngineReadiness::Ready {}) => return Ok(adapter.id.clone()),
+            Some(BrowserEngineReadiness::Unavailable { reason }) => unavailable_reason = reason,
+            None => unavailable_reason = BrowserEngineReadinessReason::ReadinessUnsupported,
+        }
+    }
+    Err(BrowserCompatibilityError::EngineNotReady {
+        reason: unavailable_reason,
+    })
 }
 
 pub(in crate::api::gateway) async fn browser_engine_summary(

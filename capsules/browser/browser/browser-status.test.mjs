@@ -178,3 +178,21 @@ test("WebRTC diagnostics expose only selected pair types and inbound counters", 
   assert.equal(stats.selected_protocol, "tcp");
   assert.doesNotMatch(JSON.stringify(stats), /must-not-be-projected/);
 });
+
+
+test("readiness failures explain the repair while cleanup retains priority", () => {
+  const expected = new Map([
+    ["artifact_invalid", /files need repair/],
+    ["host_unsupported", /needs a compatible host/],
+    ["readiness_unsupported", /update to report readiness/],
+    ["control_unavailable", /Restore its connection/],
+    ["preparation_required", /needs preparation/],
+  ]);
+  for (const [reason, message] of expected) {
+    const error = openError("terminal_pre_effect_failure");
+    Object.assign(error.payload, { stage:"engine_readiness", code:"engine_not_ready", reason });
+    assert.match(friendlyOpenError(error), message);
+    error.payload.outcome.state = "cleanup_pending";
+    assert.doesNotMatch(friendlyOpenError(error), message);
+  }
+});

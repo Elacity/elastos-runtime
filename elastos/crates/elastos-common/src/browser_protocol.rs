@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 
 pub const BROWSER_ENGINE_PROVIDER_ID: &str = "browser-engine-adapter";
-pub const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.0";
+pub const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.1";
 pub const BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA: &str = "elastos.browser.engine-cleanup-binding/v2";
 pub const BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA: &str = "elastos.browser.engine-cleanup-result/v2";
 pub const MAX_BROWSER_ENGINE_ADAPTERS: usize = 64;
@@ -202,6 +202,34 @@ pub struct BrowserEngineInventory {
     pub wallet_injection: bool,
 }
 
+pub const BROWSER_ENGINE_READINESS_SCHEMA: &str = "elastos.browser.engine-readiness/v1";
+
+/// A host adapter's current preparation result. Capacity and permission are
+/// checked separately. Private host paths stay behind the adapter boundary.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BrowserEngineReadiness {
+    Ready {},
+    Unavailable {
+        reason: BrowserEngineReadinessReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserEngineReadinessReason {
+    #[error("the Engine artifacts need preparation")]
+    PreparationRequired,
+    #[error("the Engine artifact receipt does not match the installed files")]
+    ArtifactInvalid,
+    #[error("this host cannot run the selected Engine")]
+    HostUnsupported,
+    #[error("the Engine control service is unavailable")]
+    ControlUnavailable,
+    #[error("the Engine needs an update to report readiness")]
+    ReadinessUnsupported,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, thiserror::Error)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum BrowserCompatibilityError {
@@ -213,6 +241,10 @@ pub enum BrowserCompatibilityError {
     EngineUnavailable,
     #[error("The selected Browser Engine is unavailable. Choose an available approved Engine.")]
     EngineNotFound,
+    #[error("Browser Engine is not ready: {reason}. Prepare this Engine or choose another approved Engine.")]
+    EngineNotReady {
+        reason: BrowserEngineReadinessReason,
+    },
     #[error(
         "The selected Browser Engine does not support this display and isolation requirement."
     )]
