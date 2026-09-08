@@ -1648,7 +1648,7 @@ assert(
     browserVmRootfsBuild.includes("/opt/gst-web/index.html") &&
     browserVmRootfsBuild.includes("python3 -m pip install") &&
     browserVmRootfsBuild.includes("linux-libc-dev") &&
-    browserVmRootfsBuild.includes("mke2fs -q -t ext4") &&
+    browserVmRootfsBuild.includes('"$mke2fs_bin" -q -t ext4') &&
     !browserVmRootfsBuild.includes("docker ") &&
     !browserVmRootfsBuild.includes("Docker is used here only as an") &&
     browserVmTargetStageSmoke.includes("elastos.browser.vm-target-stage-smoke/v1") &&

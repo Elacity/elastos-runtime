@@ -135,7 +135,7 @@ as_root() {
 }
 
 require_cmd cargo
-require_cmd mke2fs
+mke2fs_bin="$(resolve_cmd mke2fs)"
 require_cmd cpio
 require_cmd gzip
 require_cmd python3
@@ -885,7 +885,7 @@ echo "[browser-vm-rootfs] run rootfs preflight"
 
 echo "[browser-vm-rootfs] pack ext4 image"
 rm -f "$rootfs_image"
-as_root mke2fs -q -t ext4 -d "$rootfs_dir" -F "$rootfs_image" "$rootfs_size"
+as_root "$mke2fs_bin" -q -t ext4 -d "$rootfs_dir" -F "$rootfs_image" "$rootfs_size"
 as_root chown "$(id -u):$(id -g)" "$rootfs_image"
 
 python3 - "$out_dir" "$target_platform" "$rootfs_image" "$kernel_image" "$initrd_image" <<'PY'
