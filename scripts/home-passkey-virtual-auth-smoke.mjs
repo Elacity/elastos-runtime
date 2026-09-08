@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { diagnoseBrowserJourneyRecovery } from "./lib/browser-journey-recovery.mjs";
-import { diagnoseBrowserViewerReload } from "./lib/browser-journey-viewer-reload.mjs";
+import { diagnoseBrowserViewerReload, readBrowserViewerReloadDocument } from "./lib/browser-journey-viewer-reload.mjs";
 
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
@@ -2470,27 +2470,7 @@ async function runControlledBrowserViewerReload(page, appFrame, token, readRecei
         let visible = { viewer: null, video: null };
         try {
           // Read the document identity and media in one execution context.
-          visible = await appFrame.evaluate(() => {
-            const element = document.querySelector("#browser-remote-display");
-            const rect = element?.getBoundingClientRect();
-            const metrics = window.__elastosBrowserRemoteDisplayMetrics;
-            const bytes = metrics?.latestVideoWebrtcStats?.video_bytes_received ?? metrics?.latestWebrtcStats?.video_bytes_received;
-            return {
-              viewer: {
-                page_id: window.__elastosBrowserCurrentPageId || "",
-                browser_instance: new URL(location.href).searchParams.get("browser_instance"),
-                actual_url: document.querySelector("#browser-url")?.value || "",
-                engine_id: document.querySelector("#browser-engine")?.value,
-                exit_id: document.querySelector("#browser-exit")?.value,
-                document_id: performance.timeOrigin,
-              },
-              video: element ? { present: true, hidden: element.hidden, paused: element.paused,
-                ready_state: element.readyState, video_width: element.videoWidth, video_height: element.videoHeight,
-                client_width: Math.round(rect.width), client_height: Math.round(rect.height),
-                decoded_frames: Number(element.webkitDecodedFrameCount || 0),
-                ...(Number.isSafeInteger(bytes) ? { video_bytes_received: bytes } : {}) } : null,
-            };
-          });
+          visible = await appFrame.evaluate(readBrowserViewerReloadDocument);
         } catch (error) {
           if (!/Execution context was destroyed|Cannot find context with specified id/.test(String(error.message))) throw error;
         }

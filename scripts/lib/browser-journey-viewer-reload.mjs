@@ -222,3 +222,28 @@ export async function diagnoseBrowserViewerReload({ expectedUrl, readReceipt, re
   }
   return evidence;
 }
+
+
+/** Read fresh peer counters and the document identity in the same viewer context. */
+export async function readBrowserViewerReloadDocument() {
+  const query = window.__elastosBrowserReadRemoteDisplayMetrics;
+  const metrics = typeof query === "function" ? await query() : null;
+  const element = document.querySelector("#browser-remote-display");
+  const rect = element?.getBoundingClientRect();
+  const bytes = metrics?.latestVideoWebrtcStats?.video_bytes_received ?? metrics?.latestWebrtcStats?.video_bytes_received;
+  return {
+    viewer: {
+      page_id: window.__elastosBrowserCurrentPageId || "",
+      browser_instance: new URL(location.href).searchParams.get("browser_instance"),
+      actual_url: document.querySelector("#browser-url")?.value || "",
+      engine_id: document.querySelector("#browser-engine")?.value,
+      exit_id: document.querySelector("#browser-exit")?.value,
+      document_id: performance.timeOrigin,
+    },
+    video: element ? { present: true, hidden: element.hidden, paused: element.paused,
+      ready_state: element.readyState, video_width: element.videoWidth, video_height: element.videoHeight,
+      client_width: Math.round(rect.width), client_height: Math.round(rect.height),
+      decoded_frames: Number(element.webkitDecodedFrameCount || 0),
+      ...(Number.isSafeInteger(bytes) ? { video_bytes_received: bytes } : {}) } : null,
+  };
+}

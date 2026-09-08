@@ -48,6 +48,7 @@ export function createBrowserRemoteDisplay({
   let disconnectTimer = 0;
   let frameWatchTimer = 0;
   let statsTimer = 0;
+  let pendingMetricsRefresh = null;
   let failureStarted = false;
   let lastVideoProgressAt = 0;
   let lastVideoDecodedFrames = 0;
@@ -180,29 +181,61 @@ export function createBrowserRemoteDisplay({
     latestAudioWebrtcStats = null;
   }
 
+  async function refreshMetrics() {
+    const videoPeer = peerConnection;
+    const audioPeer = audioPeerConnection;
+    const ownerActive = viewerOwnerActive;
+    const current = () => videoPeer && videoPeer === peerConnection &&
+      audioPeer === audioPeerConnection && ownerActive === viewerOwnerActive && ownerActive();
+    if (!current()) return null;
+    if (pendingMetricsRefresh?.videoPeer === videoPeer &&
+        pendingMetricsRefresh.audioPeer === audioPeer &&
+        pendingMetricsRefresh.ownerActive === ownerActive) {
+      return pendingMetricsRefresh.promise;
+    }
+    const pending = { videoPeer, audioPeer, ownerActive, promise: null };
+    pendingMetricsRefresh = pending;
+    pending.promise = (async () => {
+      try {
+        const [videoStats, audioStats] = await Promise.all([
+          collectWebrtcStats(videoPeer),
+          audioPeer ? collectWebrtcStats(audioPeer) : Promise.resolve(null),
+        ]);
+        if (!current() || !videoStats || (audioPeer && !audioStats)) return null;
+        latestVideoWebrtcStats = videoStats;
+        latestAudioWebrtcStats = audioStats;
+        latestWebrtcStats = { ...videoStats, ...(audioStats || {}) };
+        return metricsState();
+      } catch {
+        // An unavailable observation does not change Runtime page ownership.
+        return null;
+      } finally {
+        if (pendingMetricsRefresh === pending) pendingMetricsRefresh = null;
+      }
+    })();
+    return pending.promise;
+  }
+
   function startStatsPolling(nextPeerConnection) {
     stopStatsPolling();
     if (!debugMetrics && !mediaDiagnosticBinding) {
       return;
     }
     const poll = async () => {
-      if (nextPeerConnection !== peerConnection || !nextPeerConnection) {
+      if (!isCurrentDisplayPeer(nextPeerConnection)) {
         return;
       }
       try {
-        latestVideoWebrtcStats = await collectWebrtcStats(nextPeerConnection);
-        latestAudioWebrtcStats = audioPeerConnection
-          ? await collectWebrtcStats(audioPeerConnection)
-          : null;
-        latestWebrtcStats = {
-          ...(latestVideoWebrtcStats || {}),
-          ...(latestAudioWebrtcStats || {}),
-        };
-        updateMetrics(getLastPageStatus() || {});
+        const refreshed = await refreshMetrics();
+        if (refreshed && isCurrentDisplayPeer(nextPeerConnection)) {
+          updateMetrics(getLastPageStatus() || {});
+        }
       } catch {
         // Metrics are diagnostic only; display health is governed by the Runtime session.
       } finally {
-        statsTimer = window.setTimeout(poll, 1000);
+        if (isCurrentDisplayPeer(nextPeerConnection)) {
+          statsTimer = window.setTimeout(poll, 1000);
+        }
       }
     };
     statsTimer = window.setTimeout(poll, 1000);
@@ -1317,6 +1350,7 @@ export function createBrowserRemoteDisplay({
     inputChannelOpen,
     isTrackReady,
     metricsState,
+    refreshMetrics,
     sendInputMessages,
     unlockAudioFromGesture,
   };

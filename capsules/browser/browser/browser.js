@@ -1564,6 +1564,18 @@ remoteDisplay = createBrowserRemoteDisplay({
   updateMetrics: updateMetricsNode,
 });
 
+// A requested diagnostic sample reads the current viewer peers; the HUD keeps its normal cadence.
+async function readRemoteDisplayMetrics() {
+  const owner = currentRuntimePageOwner();
+  if (!runtimeViewerOwnerActive(owner)) return null;
+  const metrics = await remoteDisplay.refreshMetrics();
+  if (!metrics || !runtimeViewerOwnerActive(owner)) return null;
+  updateMetricsNode(lastPageStatus || {});
+  return window.__elastosBrowserRemoteDisplayMetrics || null;
+}
+
+window.__elastosBrowserReadRemoteDisplayMetrics = readRemoteDisplayMetrics;
+
 function closeRemoteDisplay() {
   remoteDisplay?.close();
 }
