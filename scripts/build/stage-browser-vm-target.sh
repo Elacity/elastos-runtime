@@ -1341,7 +1341,25 @@ text = path.read_text()
 main_path = path.with_name("__main__.py")
 if not main_path.is_file():
     raise SystemExit("browser-vm-selkies-start: Selkies __main__.py not found")
-main_text = main_path.read_text()
+def patch_selkies_signaling_retries(source):
+    # Both peers share the asyncio loop with the signaling server. A blocking
+    # retry delay stops HELLO, SDP, and healthy peer traffic on that loop.
+    for handler, peer in (("on_signalling_error", "signalling"),
+                          ("on_audio_signalling_error", "audio_signalling")):
+        before = f"""    async def {handler}(e):
+       if isinstance(e, WebRTCSignallingErrorNoPeer):
+           # Waiting for peer to connect, retry in 2 seconds.
+           time.sleep(2)
+           await {peer}.setup_call()
+"""
+        after = before.replace("time.sleep(2)", "await asyncio.sleep(2)")
+        if before in source:
+            source = source.replace(before, after, 1)
+        elif after not in source:
+            raise SystemExit(f"browser-vm-selkies-start: Selkies {handler} retry patch target not found")
+    return source
+
+main_text = patch_selkies_signaling_retries(main_path.read_text())
 transport_helper_marker = "\ndef parse_rtc_config(data):\n"
 transport_helper_patch = '''
 def _elastos_turn_transport_query(url):
