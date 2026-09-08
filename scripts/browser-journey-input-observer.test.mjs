@@ -85,7 +85,21 @@ test("input observer admits only the exact Browser frame, Runtime origin, page a
   assert.equal(evidence.viewer, undefined);
   assert.equal(evidence.observer.drained, true);
   assert.equal(evidence.observer.stopped, true);
+  assert.deepEqual(evidence.filter_rejections, { foreign_origin: 1, authority_mismatch: 1 });
   assert.doesNotMatch(JSON.stringify(evidence), /private-|home_token|sdp|286/);
+  f.clean();
+});
+
+test("input observer admits omitted Origin only with the same frame, URL, page and authority", async () => {
+  const f = surface(), observer = await f.observe();
+  const valid = f.request({ headers: { "x-elastos-home-token": f.token } });
+  const wrong = f.request({ headers: { "x-elastos-home-token": "foreign-token" } });
+  for (const req of [wrong, valid]) { f.page.emit("request", req); f.page.emit("response", f.response(req)); }
+  const evidence = plain(await observer.stop(false));
+  assert.deepEqual(evidence.requests.map(x => x.phase), ["request", "response"]);
+  assert.equal(evidence.requests[1].accepted, true);
+  assert.equal(evidence.filter_rejections.authority_mismatch, 1);
+  assert.doesNotMatch(JSON.stringify(evidence), /private-|foreign-token/);
   f.clean();
 });
 

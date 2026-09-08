@@ -2515,7 +2515,8 @@ async function observeControlledBrowserInput(page, appFrame, token, pageId) {
   const instance = new URL(appFrame.url()).searchParams.get("browser_instance");
   const inputPath = `/api/apps/browser/pages/${encodeURIComponent(pageId)}/input`;
   const evidence = { schema: "elastos.browser.journey-input-observation/v1", requests: [],
-    dropped_requests: 0, observer: { stopped: false } };
+    dropped_requests: 0, filter_rejections: { foreign_origin: 0, authority_mismatch: 0 },
+    observer: { stopped: false } };
   const requests = new WeakMap(), pending = new Set();
   let sequence = 0, handle, stopped = false, finished, collecting = true;
   const bounded = async (promise, fallback, timeoutMs = 2000) => {
@@ -2532,8 +2533,15 @@ async function observeControlledBrowserInput(page, appFrame, token, pageId) {
     if (!collecting) return;
     try {
       const url = new URL(req.url()), headers = req.headers();
-      if (req.frame() !== appFrame || url.origin !== origin || url.pathname !== inputPath ||
-          req.method() !== "POST" || !["null", origin].includes(headers.origin) || headers["x-elastos-home-token"] !== token) return;
+      if (req.frame() !== appFrame || url.origin !== origin || url.pathname !== inputPath || req.method() !== "POST") return;
+      // Playwright's initial header view can omit Origin. The request URL still
+      // binds the Runtime origin; retain the exact frame, page and launch grant.
+      const rejection = ![undefined, "null", origin].includes(headers.origin) ? "foreign_origin"
+        : headers["x-elastos-home-token"] !== token ? "authority_mismatch" : null;
+      if (rejection) {
+        evidence.filter_rejections[rejection] = Math.min(32, evidence.filter_rejections[rejection] + 1);
+        return;
+      }
       if (sequence >= 16) { evidence.dropped_requests++; return; }
       let event;
       try { event = req.postDataJSON()?.event; } catch {}
