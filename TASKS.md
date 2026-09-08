@@ -45,7 +45,7 @@ Sash's reported failure on the published source remains unverified.
 | Delivery slice / acceptance mapping | Status and owner | Observable exit requirement |
 | --- | --- | --- |
 | B02.install: install and use Browser on a Mac; B01/B02/B03/B05/B06/B07/B11/B15 | Active; coordinator owns the Mac, installed artifacts and integration | An independently provisioned installation acquires one compatible artifact set and opens Browser through Home. Navigation, decoded video, audio, typing, scrolling, reload, interruption and close pass. Startup/input meet measured budgets, failures name the responsible stage, and a stalled launch leaves another admitted session responsive. |
-| B04.operator: a human and an authorized agent operate the same page; B04/B12/B13/B14 | Ready for bounded source work; source owner assigned at dispatch | Actual Engine-page inspection, actions and waits work through Runtime authority. Human/agent handoff retains page, profile and service identity. Native, Playwright and declared Camofox/Camoufox paths pass the shared workflow; stale references and revoked writers are rejected. Profile, files, approvals and accessibility keep their own acceptance cases. |
+| B04.operator: a human and an authorized agent operate the same page; B04/B12/B13/B14 | Active; delegated owner implements operator approval and actions | Actual Engine-page inspection, actions and waits work through Runtime authority. Human/agent handoff retains page, profile and service identity. Native, Playwright and declared Camofox/Camoufox paths pass the shared workflow; stale references and revoked writers are rejected. Profile, files, approvals and accessibility keep their own acceptance cases. |
 | B10.placement: Engine and Exit move independently; B08/B09/B10/B14 | Ready for target discovery and bounded source work; coordinator owns target admission | The same capsule completes the same journey in A/A/A, A/B/A, A/A/B, A/B/B and A/B/C. Product service controls select approved peers; destination/DNS evidence identifies Exit. Physical LAN, supported WAN and relay-required cases prove media, recovery, revocation and cleanup. |
 | B16.qualification: sustained daily use on each claimed role; B01-B16 | Planned; coordinator assembles candidate, independent reviewer checks evidence, humans perform UX acceptance | Exact candidate artifacts pass the original device, media, recovery, concurrency, profile, wallet, authority, installation/update and operator gates. Include 100 lifecycle cycles, 100 cold and 100 warm launches, 30-minute A/V interaction, eight-hour mixed use, manual UX and the objective audit. A second maintainer repeats installation and use. |
 
@@ -79,7 +79,7 @@ alongside the local, operator and remote journeys.
   producer/receiver evidence; concurrent compilation is a hypothesis only.
   The same audio threshold applies to every repeat. Full sustained-use and
   human listening acceptance remain open.
-- **B04.inspect / verifying / coordinator; independent installed review pending.**
+- **B04.operator-admission / active / delegated source owner.**
   Prerequisite: the accepted owner/page contract and existing Engine CDP access.
   Deliver a bounded, capability-negotiated snapshot of the actual Engine page
   with document generation and pagination. Test owner success, foreign-owner
@@ -90,8 +90,12 @@ alongside the local, operator and remote journeys.
   Source `4dd0a216` passes the installed journey in run 60: actual typed field,
   three response pages, stale cursor after UI navigation, reload and 13-effect
   cleanup. Run 61 adds decoded audio and five-second connection-cut recovery.
-  The delegated source owner now works on writer admission and typed actions
-  while the coordinator integrates installation and remote service work.
+  Independent agent review accepts both installed inspection runs. The next
+  slice connects explicit page-owner approval to a separately authenticated
+  operator, then uses the existing typed input path. Home launch tokens retain
+  their non-delegatable authority. Writer admission, revocation, handoff and
+  adapter conformance stay open while the coordinator integrates installation
+  and remote service work.
 - **B08/B09.first-remote / active / independent delegated source owner.**
   Prerequisite: accepted Engine/Exit identity and Runtime service contracts.
   Identify the first missing product operation for A/B/A and A/A/B against
@@ -101,9 +105,13 @@ alongside the local, operator and remote journeys.
   tests can unblock implementation; physical LAN/WAN proof remains required.
   Accepted source slice `cb78ccb9` connects Services to signed People contacts
   and rechecks authority before approval and grant installation. The next
-  bounded slice makes Exit configuration parse and waits for provider
-  acknowledgement before enabling use. Carrier admission and remote Engine
-  offer/invocation follow; the Mac/server journey remains unproved.
+  source slice `faa1e581` makes Exit configuration parse and waits for provider
+  acknowledgement before enabling use. Required decision revisions preserve
+  a newer denial against an old approval. Independent source review accepts
+  71 Home and 32 Exit tests; matching installed activation is next. The source
+  owner proceeds to authenticated Carrier grant admission and bounded
+  revocation. Remote Engine offer/invocation follows. An isolated Linux
+  consumer Runtime build is underway; the Mac/server journey remains unproved.
 
 ### Time and resource control
 

@@ -89,8 +89,8 @@ through the Browser UI. Navigation rejects the old cursor with `stale_inspection
 Viewer reload takes 1077 ms and close clears all 13 effects in 661 ms. Run 61
 adds decoded audio before and after a 5001 ms HTTP/TURN cut; all 39 steady samples
 pass in each audio probe, recovery takes 1753 ms and close takes 802 ms. Both runs
-end with zero Runtime/control obligations. Independent review of this new
-installed inspection evidence is pending. The earlier run 57 audio failure,
+end with zero Runtime/control obligations. Independent agent review accepts
+this bounded installed inspection evidence. The earlier run 57 audio failure,
 full operator behavior and all qualification requirements remain open.
 
 The preceding image used dependency repair `cbb1e099`, rootfs
@@ -123,9 +123,13 @@ Source commit `cb78ccb9` makes Services use the signed contacts accepted through
 People. It rechecks contact and endpoint ownership before approval or grant
 installation. The old implementation failed the signed-contact regression;
 nine Services tests pass after the repair. The coordinator reviewed this source
-slice; installed remote-service proof remains pending. Exit configuration and
-provider activation, Carrier grant admission, and remote Engine offer/invocation
-remain separate implementation gaps.
+slice; installed remote-service proof remains pending. Source `faa1e581` adds
+provider-acknowledged Exit configuration activation and preserves newer pending
+or committed access decisions against stale approvals. Independent source
+review accepts 71 Home and 32 Exit tests, including held or missing ACKs, failed
+state writes and decision ordering. Matching installed activation, authenticated
+Carrier grant admission, bounded revocation and remote Engine offer/invocation
+remain separate proof or implementation requirements.
 
 The fresh artifact acquisition stage at `a1260f19` reports four missing files
 and installs none when the new data root has no selected artifact store.
