@@ -153,6 +153,7 @@ const CHECK_BROWSER_CONTROLLED_JOURNEY =
 const CHECK_BROWSER_CONTROLLED_MEDIA = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_MEDIA === "1";
 const CHECK_BROWSER_CONTROLLED_INSPECTION = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_INSPECTION === "1";
 const CHECK_BROWSER_CONTROLLED_OPERATOR = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_OPERATOR === "1";
+const REUSE_SIGNED_HOME = process.env.HOME_VIRTUAL_AUTH_REUSE_SIGNED_HOME === "1";
 const BROWSER_OPERATOR_COORDS_PATH = process.env.HOME_VIRTUAL_AUTH_BROWSER_OPERATOR_COORDS || "";
 const CHECK_BROWSER_CONTROLLED_RECOVERY = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_RECOVERY === "1";
 const CHECK_BROWSER_VIEWER_RELOAD = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_VIEWER_RELOAD === "1";
@@ -3401,7 +3402,7 @@ function settleTokenWithin(promise, timeoutMs) {
 
 async function statusFromServer(page) {
   return page.evaluate(async () => {
-    const response = await fetch("/api/auth/passkey/status");
+    const response = await fetch("/api/auth/passkey/status", { signal: AbortSignal.timeout(30_000) });
     const text = await response.text();
     let body = {};
     try {
@@ -3431,6 +3432,13 @@ async function ensureSignedWithVirtualPasskey(page) {
   await waitForHomeReady(page);
   let state = await homeState(page);
   if (state.authority === "signed") {
+    if (REUSE_SIGNED_HOME) {
+      assert(CHECK_BROWSER_CONTROLLED_JOURNEY, "Signed Home reuse requires a controlled Browser journey");
+      const refreshed = await refreshCurrentHomeToken(page);
+      assert(refreshed.ok && refreshed.homeToken, "Signed Home session refresh failed");
+      await waitForSignedHome(page);
+      return { created: false, mode: "reused-signed-home", homeToken: refreshed.homeToken };
+    }
     await signOut(page);
     try {
       const homeToken = await signBackIn(page);
@@ -3508,6 +3516,7 @@ async function refreshCurrentHomeToken(page) {
     const response = await fetch("/api/auth/sessions/refresh", {
       method: "POST",
       credentials: "same-origin",
+      signal: AbortSignal.timeout(30_000),
     });
     const text = await response.text();
     let body = {};
@@ -3536,6 +3545,7 @@ async function signOut(page, homeToken = "") {
     const response = await fetch("/api/auth/sessions/sign-out", {
       method: "POST",
       credentials: "same-origin",
+      signal: AbortSignal.timeout(30_000),
       headers,
     });
     const text = await response.text();
@@ -4706,10 +4716,14 @@ async function main() {
     passkey = await currentPasskey(page, homeToken);
     assert(passkey?.proof_binding_id, "signed virtual passkey was not visible through the passkey list", passkey);
 
-    if (CHECK_BROWSER_CONTROLLED_JOURNEY) markStage("home:sign-out");
-    await signOut(page, homeToken);
-    if (CHECK_BROWSER_CONTROLLED_JOURNEY) markStage("home:sign-in-again");
-    homeToken = await signBackIn(page);
+    assert(!REUSE_SIGNED_HOME || CHECK_BROWSER_CONTROLLED_JOURNEY,
+      "Signed Home reuse requires a controlled Browser journey");
+    if (!REUSE_SIGNED_HOME) {
+      if (CHECK_BROWSER_CONTROLLED_JOURNEY) markStage("home:sign-out");
+      await signOut(page, homeToken);
+      if (CHECK_BROWSER_CONTROLLED_JOURNEY) markStage("home:sign-in-again");
+      homeToken = await signBackIn(page);
+    }
     if (CHECK_BROWSER_CONTROLLED_JOURNEY) markStage("home:credential-store");
     const afterSignIn = await currentPasskey(page, homeToken);
     assert(
@@ -4746,6 +4760,7 @@ async function main() {
       home_url: HOME_URL,
       profile_dir: PROFILE_DIR,
       created_mode: created.mode,
+      sign_in_out_round_trip: !REUSE_SIGNED_HOME,
       proof_binding_id: passkey.proof_binding_id,
       principal_id: passkey.principal_id,
       role: passkey.role,
