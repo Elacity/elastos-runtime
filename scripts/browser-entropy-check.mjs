@@ -1999,6 +1999,11 @@ const failRuntimeOwnedPageBlock = sourceBlock(
   "async function failRuntimeOwnedPage(",
   "Browser Runtime-owned failure cleanup",
 );
+const settleRemoteDisplayFailureBlock = sourceBlock(
+  browserMain.slice(browserMain.indexOf("function settleRemoteDisplayFailure(")),
+  "\n) {",
+  "Browser restored viewer failure",
+);
 assert(
   releaseRuntimePageForUnloadBlock.includes("stopPageStatusPolling();") &&
     releaseRuntimePageForUnloadBlock.includes("stopPageHeartbeat();") &&
@@ -2021,7 +2026,11 @@ assert(
     ) &&
     (browserMain.match(/currentPage = null;/g) || []).length === 2 &&
     (browserMain.match(/publishRuntimePageForHost\(null\);/g) || []).length === 1 &&
-    (browserMain.match(/closeRemoteDisplay\(\);/g) || []).length === 2,
+    settleRemoteDisplayFailureBlock.includes("sameRuntimePageOwner(currentRuntimePageOwner(), restoredViewerOwner)") &&
+    settleRemoteDisplayFailureBlock.includes("closeRemoteDisplay();") &&
+    !settleRemoteDisplayFailureBlock.includes("currentPage = null") &&
+    !settleRemoteDisplayFailureBlock.includes("publishRuntimePageForHost(null)") &&
+    (browserMain.match(/closeRemoteDisplay\(\);/g) || []).length === 3,
   "Browser unload and post-ownership failure cleanup must retain Runtime ownership; only a Runtime-proven terminal close may clear the exact page generation, identities, or persistence",
 );
 

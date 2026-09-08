@@ -21,6 +21,7 @@ function start({ expired = false } = {}) {
   const settled = vm.runInNewContext(startup, {
     params: new URLSearchParams(), DEFAULT_URL: "https://ela.city/", addressInput: address,
     updateNavState() {}, setLoading, fetchBrowserSummary: () => summary.promise,
+    restoreRuntimePageViewer: async () => false,
     requestRuntimeOpen: async url => { calls.push(url); setLoading(true); try { await open.promise; } finally { setLoading(false); } },
     isAuthoritySessionError: () => expired, requestHomeRelaunch: () => { calls.push("renew-authority"); return true; },
     friendlyOpenError: error => error.message, showStatus: message => messages.push(message),

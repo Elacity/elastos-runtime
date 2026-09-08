@@ -153,6 +153,7 @@ function createActiveAuthorityExpiryHarness(surface) {
     PAGE_STATUS_FIRST_POLL_MS: 1_200,
     PAGE_STATUS_INTERVAL_MS: 2_500,
     currentPage: page,
+    unloadCleanupStarted: false,
     pageHeartbeatTimer: 0,
     pageStatusTimer: 0,
     relaunchRequested: false,
@@ -298,7 +299,7 @@ function createHarness({
     browserInstanceId: "browser:0123456789abcdef0123456789abcdef",
     launchToken: "launch-token-exact",
     currentPage: recoverable || ownerless ? null : page,
-    currentPageGeneration: 7,
+    currentPageGeneration: 7, unloadCleanupStarted: false,
     currentBrowserEngineId: "engine-exact",
     currentRemoteExitId: "exit-exact",
     browserSummaryPromise: null,
@@ -1150,7 +1151,7 @@ test("pending Home close blocks creation of a replacement Runtime owner", async 
     pendingHomeWindowCloseDelivery: {},
     homeWindowTerminalCloseConfirmed: false,
     currentPage: { page_id: "page-exact" },
-    currentPageGeneration: 7,
+    currentPageGeneration: 7, unloadCleanupStarted: false,
     cleanupPendingError(outcome) {
       const error = new Error("cleanup pending");
       error.cleanupOutcome = outcome;
@@ -1176,7 +1177,7 @@ test("viewer denial preserves an existing page before close or open dispatch", a
     pendingHomeWindowCloseDelivery: null,
     homeWindowTerminalCloseConfirmed: false,
     currentPage: page,
-    currentPageGeneration: 7,
+    currentPageGeneration: 7, unloadCleanupStarted: false,
     currentRemoteExitId: "exit-kept",
     currentBrowserEngineId: "engine-kept",
     selectedRemoteExitId: "exit-next",

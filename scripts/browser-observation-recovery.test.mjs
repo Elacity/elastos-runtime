@@ -39,7 +39,7 @@ function harness() {
   const state = vm.createContext({
     currentPage: { page_id: "page-current", actual_url: "https://fixture.invalid/nav", title: "Before",
       runtime_cleanup: { schema: "elastos.browser.cleanup-handle/v1", id: "cleanup-current" } },
-    currentPageGeneration: 1, pageStatusTimer: 0, pageHeartbeatTimer: 0, pageStatusRefreshTimers: [],
+    unloadCleanupStarted: false, currentPageGeneration: 1, pageStatusTimer: 0, pageHeartbeatTimer: 0, pageStatusRefreshTimers: [],
     relaunchRequested: false, lastPageStatus: null,
     document: { hidden: false }, isAddressEditing: () => false,
     runtimePageOwner, sameRuntimePageOwner, isAuthoritySessionError,
@@ -283,3 +283,25 @@ test("an untagged programming TypeError does not become a transient observation"
   assert.equal(h.failures.length, 1);
   assert.equal(h.mediaOpen(), false);
 });
+
+for (const route of Object.keys(routes)) {
+  for (const outcome of ['success', 'authority', 'terminal']) {
+    test(`${route} completion after viewer unload cannot change the page or resume observation`, async () => {
+      const h = harness(), pending = deferred(), owner = h.state.currentRuntimePageOwner();
+      h.setFetch(() => pending.promise);
+      h.start(route);
+      const observation = h.fire(route);
+      assert.equal(h.requests.length, 1);
+      h.state.unloadCleanupStarted = true;
+      h.state.stopPageStatusPolling();
+      h.state.stopPageHeartbeat();
+      if (outcome === 'success') pending.resolve(response(h.healthyStatus()));
+      else pending.resolve(response({ error: 'old document response' }, outcome === 'authority' ? 401 : 404));
+      await observation;
+      assertRetained(h, owner);
+      assert.deepEqual(h.mutations, []);
+      assert.deepEqual(h.messages, []);
+      assert.equal(h.timers.size, 0);
+    });
+  }
+}
