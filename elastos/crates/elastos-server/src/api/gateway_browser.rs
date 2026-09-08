@@ -9,9 +9,12 @@ use crate::api::browser_engine_protocol::{
     BROWSER_ENGINE_PROTOCOL_VERSION, BROWSER_ENGINE_PROVIDER_ID,
 };
 pub(super) use elastos_common::browser_protocol::{
-    BrowserCompatibilityError, BrowserDisplayMode, BrowserEngineInventory, BrowserGuaranteeLevel,
+    browser_display_generation_valid, browser_display_request_id_valid,
+    validate_browser_display_attach_result, BrowserCompatibilityError, BrowserDisplayAttachment,
+    BrowserDisplayError, BrowserDisplayMode, BrowserEngineInventory, BrowserGuaranteeLevel,
     BrowserInputRequest, BrowserOpenRequest, BrowserPageCloseRequest, BrowserProfileDescriptor,
     BrowserViewport as BrowserViewportRequest, BrowserWebrtcSignalRequest,
+    BROWSER_DISPLAY_ATTACH_REQUEST_SCHEMA,
 };
 use std::sync::{Mutex as StdMutex, Weak};
 use tokio::sync::{watch, Notify};
@@ -215,8 +218,10 @@ pub(super) async fn browser_app_summary(
         Ok(value) => value,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
-    let engine_adapter =
+    let mut engine_adapter =
         browser_engine_summary(state.provider_registry.as_ref(), &context.principal_id).await;
+    // This flag describes Runtime's request parser, never a guest capability.
+    engine_adapter["display_attach_supported"] = serde_json::json!(true);
     let net = browser_net_summary(state.provider_registry.as_ref(), &context.principal_id).await;
     let wallet_accounts = system_wallet_accounts_summary(&state, &authority).await;
     let wallet_status = if wallet_accounts.linked_count > 0 {
@@ -3529,46 +3534,122 @@ pub(super) async fn browser_app_page_webrtc(
             return gateway_provider_error_response("browser", anyhow::anyhow!(message));
         }
     }
-    let call = match browser_provider_resource_call(
-        "browser-engine",
-        "webrtc_signal",
-        "elastos://browser-engine/page/webrtc_signal".to_string(),
-        serde_json::json!({
-            "page_id": page_id,
-            "signal": signal,
-            "channel": channel,
-            "principal_id": principal_id.clone(),
-        }),
-    ) {
-        Ok(call) => call,
-        Err((status, message)) => return (status, message).into_response(),
+    let dispatch = match begin_browser_page_webrtc(
+        &state.data_dir,
+        &page_id,
+        &principal_id,
+        &owner_launch_id,
+        &signal,
+    )
+    .await
+    {
+        Ok(dispatch) => dispatch,
+        Err(error) => return browser_display_error_response(error),
     };
-    let response = match browser_provider_resource_response(&state, call).await {
-        Ok(value) => value,
-        Err((_status, message)) => {
-            return gateway_provider_error_response("browser-engine", anyhow::anyhow!(message));
-        }
-    };
-    if let Some(message) = provider_response_error_message(&response) {
-        return gateway_provider_error_response("browser-engine", anyhow::anyhow!(message));
+    if let Some(cached) = dispatch.cached.clone() {
+        return match finish_browser_page_webrtc(&dispatch, Ok(cached)).await {
+            Ok(value) => Json(value).into_response(),
+            Err(error) => browser_display_error_response(error),
+        };
     }
-    let data = match provider_response_data(&response) {
-        Some(data) => data,
-        None => {
-            return gateway_provider_error_response(
+    let mut request = serde_json::json!({
+        "page_id": page_id, "signal": signal, "principal_id": principal_id,
+    });
+    if signal_type != "display_attach" {
+        request["channel"] = serde_json::json!(channel);
+    }
+    let mut legacy_error = None;
+    let outcome = async {
+        let call = browser_provider_resource_call(
+            "browser-engine",
+            "webrtc_signal",
+            "elastos://browser-engine/page/webrtc_signal".to_string(),
+            request,
+        )
+        .map_err(|_| BrowserDisplayError::Uncertain)?;
+        let response = match browser_provider_resource_response(&state, call).await {
+            Ok(response) => response,
+            Err((_status, message)) => {
+                if signal_type != "display_attach" {
+                    legacy_error = Some(message);
+                }
+                return Err(BrowserDisplayError::Uncertain);
+            }
+        };
+        let mut envelope = &response;
+        for _ in 0..4 {
+            match envelope.get("status").and_then(serde_json::Value::as_str) {
+                Some("error") => {
+                    if signal_type != "display_attach"
+                        && envelope
+                            .get("code")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(BrowserDisplayError::from_code)
+                            .is_none()
+                    {
+                        legacy_error = provider_response_error_message(&response);
+                    }
+                    return Err(envelope
+                        .get("code")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(BrowserDisplayError::from_code)
+                        .unwrap_or(BrowserDisplayError::Uncertain));
+                }
+                Some("ok") => match envelope.get("data") {
+                    Some(data) => envelope = data,
+                    None => break,
+                },
+                _ => break,
+            }
+        }
+        let data = provider_response_data(&response).ok_or(BrowserDisplayError::Uncertain)?;
+        if signal_type == "display_attach" {
+            validate_browser_display_attach_result(
+                &data,
+                &page_id,
+                signal["request_id"].as_str().unwrap_or(""),
+                signal["display_generation"].as_str().unwrap_or(""),
+            )?;
+            Ok(data)
+        } else {
+            let data = match validate_browser_webrtc_response(&signal_type, data) {
+                Ok(data) => data,
+                Err(error) => {
+                    legacy_error = Some(error.to_string());
+                    return Err(BrowserDisplayError::Uncertain);
+                }
+            };
+            if let Some(generation) = signal.get("display_generation") {
+                if data.get("display_generation") != Some(generation)
+                    || data.get("page_id") != Some(&serde_json::json!(page_id))
+                    || (signal_type != "offer"
+                        && data.get("accepted") != Some(&serde_json::json!(true)))
+                {
+                    return Err(BrowserDisplayError::GenerationMismatch);
+                }
+            }
+            Ok(data)
+        }
+    }
+    .await;
+    match finish_browser_page_webrtc(&dispatch, outcome).await {
+        Ok(data) => Json(data).into_response(),
+        Err(BrowserDisplayError::Uncertain) if legacy_error.is_some() => {
+            gateway_provider_error_response(
                 "browser-engine",
-                anyhow::anyhow!("browser-engine provider returned an invalid WebRTC response"),
+                anyhow::anyhow!(legacy_error.unwrap()),
             )
         }
-    };
-    match validate_browser_webrtc_response(&signal_type, data) {
-        Ok(data) => {
-            let _ = touch_browser_page(&state.data_dir, &page_id, &principal_id, &owner_launch_id)
-                .await;
-            Json(data).into_response()
-        }
-        Err(err) => gateway_provider_error_response("browser-engine", err),
+        Err(error) => browser_display_error_response(error),
     }
+}
+
+fn browser_display_error_response(error: BrowserDisplayError) -> Response {
+    (
+        StatusCode::from_u16(error.http_status()).expect("fixed Browser display HTTP status"),
+        Json(serde_json::json!({"code": error.code(), "error": error.message()})),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

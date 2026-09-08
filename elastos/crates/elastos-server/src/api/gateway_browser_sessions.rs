@@ -195,6 +195,7 @@ struct BrowserSessionRecord {
     provider_cleanup: Option<serde_json::Value>,
     browser_page: Option<serde_json::Value>,
     viewer_turn_capability: Option<serde_json::Value>,
+    display_attachment: BrowserDisplayAttachment,
     stream_cleanup: Option<BrowserStreamCleanup>,
     transport_authority: Option<serde_json::Value>,
     state: BrowserSessionState,
@@ -604,6 +605,7 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
             provider_cleanup: None,
             browser_page: None,
             viewer_turn_capability: None,
+            display_attachment: BrowserDisplayAttachment::default(),
             stream_cleanup: None,
             transport_authority: None,
             state: BrowserSessionState::Launching,
@@ -852,6 +854,13 @@ pub(in crate::api::gateway) async fn complete_browser_launch(
         record.engine_adapter = Some(effect.engine_adapter);
         record.engine = Some(effect.engine);
         record.provider_cleanup = Some(effect.provider_cleanup);
+        record.display_attachment = BrowserDisplayAttachment::initial(
+            effect
+                .browser_page
+                .pointer("/display_session/display_generation")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        );
         record.browser_page = Some(effect.browser_page);
         record.viewer_turn_capability = effect.viewer_turn_capability;
         record.stream_cleanup = effect.stream_cleanup;
@@ -1459,6 +1468,13 @@ async fn mark_browser_page_lifecycle(
             && session.owner_launch_id == owner_launch_id
             && session.page_id.as_deref() == Some(page_id)
         {
+            // Pending input/navigation completions cannot revive an owner whose
+            // close has started, even while its exact cleanup is still pending.
+            if session.phase == BrowserLifecyclePhase::Retiring
+                && phase != BrowserLifecyclePhase::Retiring
+            {
+                return false;
+            }
             session.phase = phase;
             session.last_seen_at = Instant::now();
             if phase == BrowserLifecyclePhase::Navigating {
@@ -1785,6 +1801,132 @@ pub(in crate::api::gateway) async fn touch_browser_page_transport_authority(
         }
     }
     None
+}
+
+/// Captured before provider dispatch; cleanup identity fences late responses even
+/// if a page ID is reused. Display attachment never acquires lifecycle resources.
+#[derive(Debug, Clone)]
+pub(in crate::api::gateway) struct BrowserWebrtcDispatch {
+    scope: String,
+    principal_id: String,
+    owner_launch_id: String,
+    page_id: String,
+    cleanup_id: String,
+    generation: String,
+    signal: serde_json::Value,
+    pub(in crate::api::gateway) cached: Option<serde_json::Value>,
+}
+
+pub(in crate::api::gateway) async fn begin_browser_page_webrtc(
+    data_dir: &Path,
+    page_id: &str,
+    principal_id: &str,
+    owner_launch_id: &str,
+    signal: &serde_json::Value,
+) -> Result<BrowserWebrtcDispatch, BrowserDisplayError> {
+    let scope = browser_session_scope(data_dir);
+    let mut registry = BROWSER_SESSION_REGISTRY
+        .get_or_init(Default::default)
+        .lock()
+        .await;
+    let session = registry
+        .sessions
+        .values_mut()
+        .find(|session| {
+            session.scope == scope
+                && session.principal_id == principal_id
+                && session.owner_launch_id == owner_launch_id
+                && session.page_id.as_deref() == Some(page_id)
+                && session.state == BrowserSessionState::Active
+                && session.phase != BrowserLifecyclePhase::Retiring
+        })
+        .ok_or(BrowserDisplayError::OwnerChanged)?;
+    let display_generation = signal
+        .get("display_generation")
+        .and_then(serde_json::Value::as_str);
+    let cached = if signal.get("type").and_then(serde_json::Value::as_str) == Some("display_attach")
+    {
+        session.display_attachment.begin(
+            signal
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            display_generation.unwrap_or(""),
+        )?
+    } else {
+        session
+            .display_attachment
+            .check_signal(display_generation)?;
+        None
+    };
+    session.last_seen_at = Instant::now();
+    Ok(BrowserWebrtcDispatch {
+        scope,
+        principal_id: principal_id.to_string(),
+        owner_launch_id: owner_launch_id.to_string(),
+        page_id: page_id.to_string(),
+        cleanup_id: session.cleanup_id.clone(),
+        generation: session.generation.clone(),
+        signal: signal.clone(),
+        cached,
+    })
+}
+
+pub(in crate::api::gateway) async fn finish_browser_page_webrtc(
+    dispatch: &BrowserWebrtcDispatch,
+    outcome: Result<serde_json::Value, BrowserDisplayError>,
+) -> Result<serde_json::Value, BrowserDisplayError> {
+    let mut registry = BROWSER_SESSION_REGISTRY
+        .get_or_init(Default::default)
+        .lock()
+        .await;
+    let session = registry
+        .sessions
+        .values_mut()
+        .find(|session| {
+            session.scope == dispatch.scope
+                && session.principal_id == dispatch.principal_id
+                && session.owner_launch_id == dispatch.owner_launch_id
+                && session.page_id.as_deref() == Some(dispatch.page_id.as_str())
+                && session.cleanup_id == dispatch.cleanup_id
+                && session.generation == dispatch.generation
+                && session.state == BrowserSessionState::Active
+                && session.phase != BrowserLifecyclePhase::Retiring
+        })
+        .ok_or(BrowserDisplayError::OwnerChanged)?;
+    let value = if dispatch
+        .signal
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        == Some("display_attach")
+    {
+        let value = session.display_attachment.finish(
+            &dispatch.page_id,
+            dispatch.signal["request_id"].as_str().unwrap_or(""),
+            dispatch.signal["display_generation"].as_str().unwrap_or(""),
+            outcome,
+        )?;
+        let display = session
+            .browser_page
+            .as_mut()
+            .and_then(|page| page.get_mut("display_session"))
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or(BrowserDisplayError::Uncertain)?;
+        for key in ["display_generation", "initial_offer", "audio_offer"] {
+            display.insert(key.to_string(), value[key].clone());
+        }
+        value
+    } else {
+        session.display_attachment.check_signal(
+            dispatch
+                .signal
+                .get("display_generation")
+                .and_then(serde_json::Value::as_str),
+        )?;
+        outcome?
+    };
+    session.last_seen_at = Instant::now();
+    Ok(value)
 }
 
 pub(in crate::api::gateway) async fn browser_gateway_session_status(
@@ -3179,6 +3321,9 @@ fn browser_recoverable_active_page(session: &BrowserSessionRecord) -> Option<ser
         "cleanup": browser_cleanup_handle(&session.cleanup_id),
         "engine_page": browser_page,
     });
+    if let Some(attachment) = session.display_attachment.summary() {
+        page["display_attachment"] = attachment;
+    }
     if let Some(selection) = &session.service_selection {
         page["service_selection"] = serde_json::to_value(selection).ok()?;
     }
@@ -3363,6 +3508,7 @@ mod tests {
             }),
             browser_page: page_id.map(|page_id| serde_json::json!({"page_id": page_id})),
             viewer_turn_capability: None,
+            display_attachment: BrowserDisplayAttachment::default(),
             stream_cleanup: None,
             transport_authority: None,
             state,
@@ -3380,6 +3526,219 @@ mod tests {
             last_navigation_at: None,
             last_frame_at: None,
             failure_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn display_attach_late_input_cannot_revive_retiring_owner() {
+        for input_failed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let scope = browser_session_scope(dir.path());
+            let mut record = test_session_record(
+                &scope,
+                Some("page:attach-retiring"),
+                BrowserSessionState::Active,
+                Instant::now(),
+                Instant::now(),
+            );
+            let old_generation = format!("display:{}", "a".repeat(32));
+            record.engine_provider = Some(BROWSER_ENGINE_PROVIDER_ID.to_string());
+            record.browser_page = Some(serde_json::json!({
+                "page_id":"page:attach-retiring", "display_session":{"display_generation":old_generation}
+            }));
+            record.display_attachment =
+                BrowserDisplayAttachment::initial(Some(old_generation.clone()));
+            let cleanup = browser_engine_cleanup(&record).unwrap();
+            let key = format!("{scope}:attach-retiring");
+            let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+            registry
+                .lock()
+                .await
+                .sessions
+                .insert(key.clone(), record.clone());
+            assert!(
+                mark_browser_page_navigating(
+                    dir.path(),
+                    "page:attach-retiring",
+                    "person:local:test",
+                    "launch:test",
+                    None
+                )
+                .await
+            );
+            let signal = serde_json::json!({"type":"display_attach", "request_id":"a".repeat(32), "display_generation":old_generation});
+            let dispatch = begin_browser_page_webrtc(
+                dir.path(),
+                "page:attach-retiring",
+                "person:local:test",
+                "launch:test",
+                &signal,
+            )
+            .await
+            .unwrap();
+            assert!(
+                mark_browser_page_retiring(
+                    dir.path(),
+                    "page:attach-retiring",
+                    "person:local:test",
+                    "launch:test"
+                )
+                .await
+            );
+            record_browser_engine_cleanup_obligation(dir.path(), cleanup.clone(), None)
+                .await
+                .unwrap();
+            // These are the actual completion updates from the pending input route.
+            if input_failed {
+                mark_browser_page_failed(
+                    dir.path(),
+                    "page:attach-retiring",
+                    "person:local:test",
+                    "launch:test",
+                    "late input failure",
+                )
+                .await;
+            } else {
+                mark_browser_page_active(
+                    dir.path(),
+                    "page:attach-retiring",
+                    "person:local:test",
+                    "launch:test",
+                )
+                .await;
+                touch_browser_page(
+                    dir.path(),
+                    "page:attach-retiring",
+                    "person:local:test",
+                    "launch:test",
+                )
+                .await;
+            }
+            assert!(matches!(
+                begin_browser_page_webrtc(
+                    dir.path(),
+                    "page:attach-retiring",
+                    "person:local:test",
+                    "launch:test",
+                    &signal
+                )
+                .await,
+                Err(BrowserDisplayError::OwnerChanged)
+            ));
+            let result = serde_json::json!({"schema":elastos_common::browser_protocol::BROWSER_DISPLAY_ATTACH_RESULT_SCHEMA,
+                "page_id":"page:attach-retiring", "request_id":"a".repeat(32), "previous_display_generation":old_generation,
+                "display_generation":format!("display:{}", "b".repeat(32)),
+                "initial_offer":{"schema":"elastos.browser.webrtc-offer/v1", "type":"offer", "sdp":"v=0"},
+                "audio_offer":{"schema":"elastos.browser.webrtc-offer/v1", "type":"offer", "sdp":"v=0"}});
+            assert_eq!(
+                finish_browser_page_webrtc(&dispatch, Ok(result)).await,
+                Err(BrowserDisplayError::OwnerChanged)
+            );
+            assert_eq!(
+                finish_browser_page_webrtc(&dispatch, Err(BrowserDisplayError::Failed)).await,
+                Err(BrowserDisplayError::OwnerChanged)
+            );
+            assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 1);
+            {
+                let registry = registry.lock().await;
+                assert_eq!(
+                    registry.sessions[&key].phase,
+                    BrowserLifecyclePhase::Retiring
+                );
+                assert_eq!(registry.sessions[&key].browser_page, record.browser_page);
+                assert_eq!(registry.sessions[&key].failure_reason, None);
+            }
+            forget_browser_engine_cleanup_obligation(dir.path(), &cleanup)
+                .await
+                .unwrap();
+            registry.lock().await.sessions.remove(&key);
+        }
+    }
+
+    #[tokio::test]
+    async fn display_attach_late_completion_cannot_update_closed_or_replaced_owner() {
+        for replace in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let scope = browser_session_scope(dir.path());
+            let mut record = test_session_record(
+                &scope,
+                Some("page:attach-test"),
+                BrowserSessionState::Active,
+                Instant::now(),
+                Instant::now(),
+            );
+            let old_generation = format!("display:{}", "a".repeat(32));
+            record.browser_page = Some(
+                serde_json::json!({"page_id":"page:attach-test", "display_session": {"display_generation": old_generation}}),
+            );
+            record.display_attachment =
+                BrowserDisplayAttachment::initial(Some(old_generation.clone()));
+            let key = format!("{scope}:attach-test");
+            let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+            registry
+                .lock()
+                .await
+                .sessions
+                .insert(key.clone(), record.clone());
+            let signal = serde_json::json!({"type":"display_attach", "request_id":"a".repeat(32), "display_generation":old_generation});
+            let dispatch = begin_browser_page_webrtc(
+                dir.path(),
+                "page:attach-test",
+                "person:local:test",
+                "launch:test",
+                &signal,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                begin_browser_page_webrtc(
+                    dir.path(),
+                    "page:attach-test",
+                    "person:foreign",
+                    "launch:test",
+                    &signal
+                )
+                .await,
+                Err(BrowserDisplayError::OwnerChanged)
+            ));
+            assert!(matches!(
+                begin_browser_page_webrtc(
+                    dir.path(),
+                    "page:attach-test",
+                    "person:local:test",
+                    "launch:other",
+                    &signal
+                )
+                .await,
+                Err(BrowserDisplayError::OwnerChanged)
+            ));
+            {
+                let mut registry = registry.lock().await;
+                registry.sessions.remove(&key);
+                if replace {
+                    record.cleanup_id = "browser-cleanup:replacement".to_string();
+                    record.generation = "sha256:replacement".to_string();
+                    registry.sessions.insert(key.clone(), record.clone());
+                }
+            }
+            let result = serde_json::json!({"schema":elastos_common::browser_protocol::BROWSER_DISPLAY_ATTACH_RESULT_SCHEMA,
+                "page_id":"page:attach-test", "request_id":"a".repeat(32), "previous_display_generation":old_generation,
+                "display_generation":format!("display:{}", "b".repeat(32)),
+                "initial_offer":{"schema":"elastos.browser.webrtc-offer/v1","type":"offer","sdp":"v=0"},
+                "audio_offer":{"schema":"elastos.browser.webrtc-offer/v1","type":"offer","sdp":"v=0"}});
+            assert_eq!(
+                finish_browser_page_webrtc(&dispatch, Ok(result)).await,
+                Err(BrowserDisplayError::OwnerChanged)
+            );
+            assert_eq!(
+                finish_browser_page_webrtc(&dispatch, Err(BrowserDisplayError::Failed)).await,
+                Err(BrowserDisplayError::OwnerChanged)
+            );
+            let mut registry = registry.lock().await;
+            if replace {
+                assert_eq!(registry.sessions[&key].browser_page, record.browser_page);
+            }
+            registry.sessions.remove(&key);
         }
     }
 

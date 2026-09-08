@@ -6,9 +6,11 @@
 //! through Runtime-owned stream and display sessions.
 
 use elastos_common::browser_protocol::{
-    BrowserDisplayMode, BrowserEngineAdapterCapabilities, BrowserEngineReadiness,
-    BrowserEngineReadinessReason, BrowserGuaranteeLevel, BrowserProfileDescriptor,
-    BrowserViewport as ViewportRequest, BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA,
+    browser_display_generation_valid, browser_display_request_id_valid, BrowserDisplayAttachment,
+    BrowserDisplayError, BrowserDisplayMode, BrowserEngineAdapterCapabilities,
+    BrowserEngineReadiness, BrowserEngineReadinessReason, BrowserGuaranteeLevel,
+    BrowserProfileDescriptor, BrowserViewport as ViewportRequest,
+    BROWSER_DISPLAY_ATTACH_REQUEST_SCHEMA, BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA,
     BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA, BROWSER_ENGINE_PROTOCOL_VERSION,
     BROWSER_ENGINE_PROVIDER_ID, BROWSER_ENGINE_READINESS_SCHEMA,
 };
@@ -241,6 +243,7 @@ struct DurableControlLaunchIdentity {
 
 #[derive(Debug, Clone)]
 struct PageControlSession {
+    display_attachment: BrowserDisplayAttachment,
     generation: String,
     stream_id: String,
     socket_path: String,
@@ -294,6 +297,7 @@ fn page_control_session_from_cleanup(
 ) -> Result<PageControlSession, String> {
     validate_engine_cleanup_binding(binding)?;
     Ok(PageControlSession {
+        display_attachment: BrowserDisplayAttachment::default(),
         generation: binding.generation.clone(),
         stream_id: binding.stream_id.clone(),
         socket_path: binding.control_socket_path.clone(),
@@ -1730,6 +1734,13 @@ impl BrowserEngineAdapter {
             self.page_control_sessions.insert(
                 result.page_id.clone(),
                 PageControlSession {
+                    display_attachment: BrowserDisplayAttachment::initial(
+                        result
+                            .display_session
+                            .get("display_generation")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    ),
                     generation: lifecycle_generation.to_string(),
                     stream_id: context.stream_session.stream_id.clone(),
                     socket_path: socket_path.clone(),
@@ -2054,7 +2065,7 @@ impl BrowserEngineAdapter {
     }
 
     fn webrtc_signal(
-        &self,
+        &mut self,
         page_id: &str,
         signal: Value,
         channel: Option<String>,
@@ -2069,7 +2080,7 @@ impl BrowserEngineAdapter {
                 return Response::error("invalid_request", err);
             }
         };
-        let Some(session) = self.page_control_session(page_id) else {
+        let Some(session) = self.page_control_sessions.get_mut(page_id) else {
             return Response::error(
                 "engine_process_unavailable",
                 "Browser page has no page-scoped engine control session",
@@ -2078,29 +2089,91 @@ impl BrowserEngineAdapter {
         if !page_control_session_principal_matches(session, principal_id.as_deref()) {
             return Response::error("page_not_found", "browser page not found");
         }
+        let display_error =
+            |error: BrowserDisplayError| Response::error(error.code(), error.message());
+        let generation = signal.get("display_generation").and_then(Value::as_str);
+        let request_id = signal
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let attach = signal_type == "display_attach";
         let channel = match channel.as_deref() {
-            Some("audio") => "audio",
-            Some("video") | None => "video",
+            None if attach => None,
+            Some("audio") if !attach => Some("audio"),
+            Some("video") | None if !attach => Some("video"),
             _ => {
-                return Response::error("invalid_request", "WebRTC channel must be video or audio")
+                return Response::error(
+                    "invalid_request",
+                    "WebRTC channel must be video or audio; display attach replaces both",
+                )
             }
+        };
+        if attach {
+            match session
+                .display_attachment
+                .begin(request_id, generation.unwrap_or(""))
+            {
+                Ok(Some(cached)) => return Response::ok(cached),
+                Ok(None) => {}
+                Err(error) => return display_error(error),
+            }
+        } else if let Err(error) = session.display_attachment.check_signal(generation) {
+            return display_error(error);
         }
-        .to_string();
-        match supervisor_control_json(
-            &session.socket_path,
-            "POST",
-            &format!("/pages/{page_id}/webrtc"),
-            Some(json!({
-                "signal": signal,
-                "channel": channel,
-                "principal_id": principal_id,
-            })),
-        ) {
-            Ok(data) => match validate_webrtc_response(signal_type, &data) {
-                Ok(()) => Response::ok(data),
-                Err(err) => Response::error("invalid_engine_response", err),
+        let mut body = json!({"signal": signal, "principal_id": principal_id});
+        if let Some(channel) = channel {
+            body["channel"] = json!(channel);
+        }
+        let response = if attach {
+            supervisor_control_json_bounded(
+                &session.socket_path,
+                "POST",
+                &format!("/pages/{page_id}/webrtc"),
+                Some(body),
+                std::time::Duration::from_secs(5),
+                1024 * 1024,
+            )
+        } else {
+            supervisor_control_json(
+                &session.socket_path,
+                "POST",
+                &format!("/pages/{page_id}/webrtc"),
+                Some(body),
+            )
+        };
+        let outcome = match response {
+            Ok(data) => Ok(data),
+            Err(error) => match BrowserDisplayError::from_code(&error) {
+                Some(error) => Err(error),
+                None if attach => Err(BrowserDisplayError::Uncertain),
+                None => return Response::error("engine_process_unavailable", error),
             },
-            Err(err) => Response::error("engine_process_unavailable", err),
+        };
+        let outcome = if attach {
+            session.display_attachment.finish(
+                page_id,
+                request_id,
+                generation.unwrap_or(""),
+                outcome,
+            )
+        } else {
+            outcome.and_then(|data| {
+                validate_webrtc_response(signal_type, &data)
+                    .map_err(|_| BrowserDisplayError::Uncertain)?;
+                if let Some(generation) = generation {
+                    if data.get("display_generation").and_then(Value::as_str) != Some(generation)
+                        || data.get("page_id").and_then(Value::as_str) != Some(page_id)
+                        || (signal_type != "offer" && data.get("accepted") != Some(&json!(true)))
+                    {
+                        return Err(BrowserDisplayError::GenerationMismatch);
+                    }
+                }
+                Ok(data)
+            })
+        };
+        match outcome {
+            Ok(data) => Response::ok(data),
+            Err(error) => display_error(error),
         }
     }
 

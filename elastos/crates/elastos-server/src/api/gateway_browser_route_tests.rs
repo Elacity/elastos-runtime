@@ -7616,3 +7616,385 @@ async fn test_browser_readiness_denial_precedes_profile_and_launch_effects() {
         assert!(!dir.path().join("browser-streams").exists());
     }
 }
+
+const DISPLAY_ATTACH_TEST_OLD: &str = "display:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const DISPLAY_ATTACH_TEST_NEW: &str = "display:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const DISPLAY_ATTACH_TEST_REQUEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+struct DisplayAttachRouteProvider {
+    signals: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    lose_first_reply: std::sync::atomic::AtomicBool,
+    gate: TokioMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    entered: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl Provider for DisplayAttachRouteProvider {
+    async fn handle(&self, request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        MockBrowserEngineProvider.handle(request).await
+    }
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["browser-engine"]
+    }
+    fn name(&self) -> &'static str {
+        "mock-browser-engine"
+    }
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        if request["op"] == "webrtc_signal" {
+            self.signals.lock().await.push(request.clone());
+            if request["signal"]["type"] == "display_attach" {
+                assert_eq!(
+                    request["signal"]["schema"],
+                    "elastos.browser.display-attach-request/v1"
+                );
+                assert!(request.get("channel").is_none());
+                let gate = self.gate.lock().await.take();
+                self.entered.notify_one();
+                if let Some(gate) = gate {
+                    gate.await.unwrap();
+                }
+                if self
+                    .lose_first_reply
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(ProviderError::Provider(
+                        "private-control-path credential=secret".to_string(),
+                    ));
+                }
+                return Ok(json!({"status":"ok", "data":{
+                    "schema":"elastos.browser.display-attach-result/v1", "page_id":request["page_id"],
+                    "request_id":request["signal"]["request_id"], "previous_display_generation":request["signal"]["display_generation"],
+                    "display_generation":DISPLAY_ATTACH_TEST_NEW,
+                    "initial_offer":{"schema":"elastos.browser.webrtc-offer/v1","type":"offer","sdp":"v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n","candidates":[]},
+                    "audio_offer":{"schema":"elastos.browser.webrtc-offer/v1","type":"offer","sdp":"v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n","candidates":[]}
+                }}));
+            }
+            return Ok(
+                json!({"status":"ok","data":{"schema":"elastos.browser.webrtc-signal-ack/v1",
+                "page_id":request["page_id"],"type":request["signal"]["type"],"accepted":true,
+                "display_generation":request["signal"].get("display_generation").cloned().unwrap_or(json!(DISPLAY_ATTACH_TEST_OLD))}}),
+            );
+        }
+        let mut response = MockBrowserEngineProvider.send_raw(request).await?;
+        if request["op"] == "launch" {
+            response["data"]["display_session"]["display_generation"] =
+                json!(DISPLAY_ATTACH_TEST_OLD);
+        }
+        if request["op"] == "status" {
+            // A provider cannot disable or supply Runtime's parser feature flag.
+            response["data"]["display_attach_supported"] = json!(false);
+        }
+        Ok(response)
+    }
+}
+
+async fn display_attach_test_app(
+    dir: &std::path::Path,
+    lose_first_reply: bool,
+    gate: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> (axum::Router, Arc<DisplayAttachRouteProvider>) {
+    let provider = Arc::new(DisplayAttachRouteProvider {
+        signals: Arc::new(TokioMutex::new(Vec::new())),
+        lose_first_reply: std::sync::atomic::AtomicBool::new(lose_first_reply),
+        gate: TokioMutex::new(gate),
+        entered: tokio::sync::Notify::new(),
+    });
+    seed_test_browser_capsules(dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("net", Arc::new(MockNetProvider))
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "exit",
+            Arc::new(MockAttachedExitProvider {
+                relay_ipc_path: None,
+                stream_id: mock_attached_stream_id(dir),
+            }),
+        )
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider("browser-engine", provider.clone())
+        .await
+        .unwrap();
+    let mut state = test_state(dir);
+    state.provider_registry = Some(registry);
+    (gateway_router(state), provider)
+}
+
+fn display_attach_test_body() -> serde_json::Value {
+    json!({"type":"display_attach","request_id":DISPLAY_ATTACH_TEST_REQUEST,"display_generation":DISPLAY_ATTACH_TEST_OLD})
+}
+
+async fn display_attach_post(
+    app: axum::Router,
+    token: &str,
+    page_id: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(format!(
+                    "/api/apps/browser/pages/{}/webrtc",
+                    page_id.replace(':', "%3A")
+                ))
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&body)
+            .unwrap_or_else(|_| json!({"error":String::from_utf8_lossy(&body)})),
+    )
+}
+
+#[tokio::test]
+async fn display_attach_route_reconciles_uncertain_then_replays_and_preserves_recovery_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let (app, provider) = display_attach_test_app(dir.path(), true, None).await;
+    let opened =
+        open_mock_browser_page_result(app.clone(), &token, "display attach recovery").await;
+    let page_id = opened["engine_page"]["page_id"].as_str().unwrap();
+    assert_eq!(
+        opened["engine_page"]["display_session"]["display_generation"],
+        DISPLAY_ATTACH_TEST_OLD
+    );
+    // Existing 2.1 initial clients can omit generation even with a new guest.
+    let legacy = json!({"type":"answer","sdp":"v=0\r\ns=legacy\r\n"});
+    assert_eq!(
+        display_attach_post(app.clone(), &token, page_id, legacy.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (status, uncertain) =
+        display_attach_post(app.clone(), &token, page_id, display_attach_test_body()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(uncertain["code"], "display_attach_uncertain");
+    assert!(!uncertain.to_string().contains("secret"));
+    assert!(!uncertain.to_string().contains("private-control"));
+    let pending_summary = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/apps/browser/summary")
+                .header("x-elastos-home-token", &token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let pending_summary: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(pending_summary.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        pending_summary["sessions"]["recoverable_page"]["display_attachment"],
+        json!({
+            "schema":"elastos.browser.display-attachment/v1", "state":"pending", "request_id":DISPLAY_ATTACH_TEST_REQUEST,
+            "previous_display_generation":DISPLAY_ATTACH_TEST_OLD
+        })
+    );
+    let mut different = display_attach_test_body();
+    different["request_id"] = json!("b".repeat(32));
+    assert_eq!(
+        display_attach_post(app.clone(), &token, page_id, different)
+            .await
+            .1["code"],
+        "display_attach_busy"
+    );
+    let (status, receipt) =
+        display_attach_post(app.clone(), &token, page_id, display_attach_test_body()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(receipt["display_generation"], DISPLAY_ATTACH_TEST_NEW);
+    let replay =
+        display_attach_post(app.clone(), &token, page_id, display_attach_test_body()).await;
+    assert_eq!(replay, (StatusCode::OK, receipt.clone()));
+    assert_eq!(provider.signals.lock().await.len(), 3);
+    assert_eq!(
+        display_attach_post(app.clone(), &token, page_id, legacy)
+            .await
+            .1["code"],
+        "display_generation_mismatch"
+    );
+    for kind in ["answer", "candidate", "end_of_candidates"] {
+        let mut signal = match kind {
+            "answer" => json!({"type":kind,"sdp":"v=0\r\ns=new\r\n"}),
+            "candidate" => {
+                json!({"type":kind,"candidate":{"candidate":"candidate:1 1 udp 1 127.0.0.1 10000 typ relay","sdpMLineIndex":0}})
+            }
+            _ => json!({"type":kind}),
+        };
+        signal["display_generation"] = json!(DISPLAY_ATTACH_TEST_OLD);
+        assert_eq!(
+            display_attach_post(app.clone(), &token, page_id, signal.clone())
+                .await
+                .1["code"],
+            "display_generation_mismatch"
+        );
+        signal["display_generation"] = json!(DISPLAY_ATTACH_TEST_NEW);
+        assert_eq!(
+            display_attach_post(app.clone(), &token, page_id, signal)
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/apps/browser/summary")
+                .header("x-elastos-home-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let summary: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(summary["engine_adapter"]["display_attach_supported"], true);
+    let recovered = &summary["sessions"]["recoverable_page"];
+    assert_eq!(recovered["page_id"], page_id);
+    assert_eq!(recovered["display_attachment"]["state"], "ready");
+    assert_eq!(
+        recovered["engine_page"]["display_session"]["display_generation"],
+        DISPLAY_ATTACH_TEST_NEW
+    );
+    assert_eq!(
+        recovered["engine_page"]["display_session"]["initial_offer"],
+        receipt["initial_offer"]
+    );
+    assert_eq!(
+        recovered["engine_page"]["stream_id"],
+        opened["engine_page"]["stream_id"]
+    );
+    assert_eq!(recovered["cleanup"], opened["runtime_cleanup"]);
+    assert_eq!(summary["sessions"]["active_sessions"], 1);
+    assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
+}
+
+#[tokio::test]
+async fn display_attach_route_legacy_and_foreign_are_rejected_before_provider_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = passkey_authority(dir.path());
+    let foreign = passkey_authority_with_name_role(
+        dir.path(),
+        Some("Attach Guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &owner);
+    let foreign_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &foreign);
+    let app = gateway_router(browser_engine_attached_test_state(dir.path()).await);
+    let page_id = open_mock_browser_page(app.clone(), &token, "legacy attach unsupported").await;
+    let response =
+        display_attach_post(app.clone(), &token, &page_id, display_attach_test_body()).await;
+    assert_eq!(response.0, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.1["code"], "display_attach_unsupported");
+    assert_eq!(
+        display_attach_post(
+            app.clone(),
+            &foreign_token,
+            &page_id,
+            display_attach_test_body()
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let mut malformed = display_attach_test_body();
+    malformed["channel"] = json!("video");
+    assert_eq!(
+        display_attach_post(app.clone(), &token, &page_id, malformed)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        display_attach_post(app, &token, &page_id, json!({"type":"answer","sdp":"v=0"}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(browser_page_session_count(dir.path()).await, 1);
+}
+
+#[tokio::test]
+async fn display_attach_route_concurrent_request_is_bounded_and_close_wins_late_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &owner);
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (app, provider) = display_attach_test_app(dir.path(), false, Some(gate)).await;
+    let opened =
+        open_mock_browser_page_result(app.clone(), &token, "close during display attach").await;
+    let page_id = opened["engine_page"]["page_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pending = tokio::spawn({
+        let app = app.clone();
+        let token = token.clone();
+        let page_id = page_id.clone();
+        async move { display_attach_post(app, &token, &page_id, display_attach_test_body()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), provider.entered.notified())
+        .await
+        .unwrap();
+    let mut different = display_attach_test_body();
+    different["request_id"] = json!("b".repeat(32));
+    assert_eq!(
+        display_attach_post(app.clone(), &token, &page_id, different)
+            .await
+            .1["code"],
+        "display_attach_busy"
+    );
+    assert_eq!(provider.signals.lock().await.len(), 1);
+    let close = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(format!(
+                    "/api/apps/browser/pages/{}/close",
+                    page_id.replace(':', "%3A")
+                ))
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(browser_close_body(
+                    opened["runtime_cleanup"]["id"].as_str().unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(close.status(), StatusCode::OK);
+    release.send(()).unwrap();
+    let late = pending.await.unwrap();
+    assert_eq!(late.0, StatusCode::CONFLICT);
+    assert_eq!(late.1["code"], "display_owner_changed");
+    assert_eq!(browser_page_session_count(dir.path()).await, 0);
+    assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
+}

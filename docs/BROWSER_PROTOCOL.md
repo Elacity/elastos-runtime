@@ -44,7 +44,7 @@ second dispatch path.
 | Resource | Operations and input | Result/ownership |
 | --- | --- | --- |
 | `elastos://browser/page` | Open with `BrowserOpenRequest`: URL, optional reason, selected Engine/Exit IDs, Browser instance, viewport, display mode, isolation guarantee, and async preference. Navigate and input use the exact acquired page. | Open result, pending open handle, page status, and terminal outcome. Runtime derives principal, session, profile and provider route from authority. |
-| `elastos://browser/display` | Attach to an acquired page; signaling uses `BrowserWebrtcSignalRequest` with offer/answer/candidate/end-of-candidates, channel and bounded signaling data. | A page-bound `elastos.browser.display-session/v1`; WebRTC product media and authorized input. |
+| `elastos://browser/display` | Attach to an acquired page; signaling uses `BrowserWebrtcSignalRequest` with display attachment, offer/answer/candidate/end-of-candidates, channel and bounded signaling data. | A page-bound `elastos.browser.display-session/v1`; WebRTC product media and authorized input. |
 | `elastos://browser/exit` | Select an admitted Exit offer for the next launch. Current open input carries `remote_exit_id`; omission selects the local Exit policy. | The launch lifecycle records the exact Exit identity. Net validates destination policy and Exit owns stream execution. |
 | `elastos://browser/profile` | Inspect the projected profile facts and explicitly reset an idle profile. | Principal-owned profile state, separate from package and page lifetime. Reset requires the owning authority and closed pages. |
 | `elastos://browser/wallet-bridge` | Request a website operation through the current page's origin and Runtime authority. | Wallet/Inbox owns account and signing approval. Browser receives the permitted outcome. |
@@ -174,6 +174,53 @@ page alone is insufficient to start another page. Unavailable or missing scope
 evidence keeps startup pending. Fresh open still passes the existing Runtime
 admission checks. Viewer reload adopts an active page and connects its display;
 viewer unload ends that document's observations while Runtime retains ownership.
+
+### Fresh viewer attachment
+
+Runtime advertises `engine_adapter.display_attach_supported: true` when its web
+adapter accepts fresh display attachment. The retained Engine display also needs
+a `display_generation` of `display:` followed by 32 lowercase hexadecimal digits.
+Browser checks both facts. Initial signaling remains compatible with existing
+2.1 Engines; the optional generation alone does not enable a new Runtime request.
+
+A new viewer uses the existing page signaling route with `type: display_attach`,
+a 32-digit lowercase hexadecimal `request_id`, and the expected
+`display_generation`. Runtime normalizes this as
+`elastos.browser.display-attach-request/v1`. Attachment carries no channel, SDP
+or candidate. The existing page grant authorizes it. Runtime and the adapter
+retain one attempt; matching retries join or replay that request before checking
+the current generation. A different request stays pending while the outcome of
+the first is uncertain.
+
+A successful `elastos.browser.display-attach-result/v1` has exactly seven fields:
+`schema`, `page_id`, `request_id`, `previous_display_generation`, a fresh
+`display_generation`, `initial_offer`, and `audio_offer`. Each offer uses
+`elastos.browser.webrtc-offer/v1`. Runtime updates these display fields inside
+its retained authority. Page, profile, VM, service choices, transport streams
+and cleanup generation keep their existing owners. The Engine retires the old
+video/audio signaling pair and creates a fresh pair for that same page.
+
+After attachment starts, each answer, candidate and end-of-candidates message
+carries its display generation, and the acknowledgment echoes it. Engine and
+Runtime reject stale generations. Viewer callbacks also retain their exact
+peer identity so a late response cannot affect a later connection. Close keeps
+priority over late attachment completion.
+
+Recovery summary exposes an optional `display_attachment` object with schema
+`elastos.browser.display-attachment/v1`, `state` (`pending`, `ready` or `failed`),
+`request_id`, `previous_display_generation` and optional `error_code`. A new
+viewer reconciles a pending attempt with that exact request identity. This
+bounded in-process receipt does not qualify Runtime restart recovery; restart
+continues through durable page ownership and cleanup reconciliation.
+
+The typed errors `display_attach_busy`, `display_generation_mismatch` and
+`display_owner_changed` use HTTP 409; `display_attach_unsupported` uses 501;
+`display_attach_failed` and `display_attach_uncertain` use 503. Guest control,
+VM proxy and Engine adapter preserve this allowlisted code across the existing
+route. The Engine bounds paired offer preparation to four seconds; the adapter
+bounds the control exchange to five seconds. Timeout retains the same uncertain
+request for reconciliation. These operation limits are separate from the B06
+five-second user recovery gate and its installed evidence.
 
 Provider timeouts bound individual calls. The current implementation has a
 five-minute stale-heartbeat threshold, a fifteen-minute retained open-job TTL,
