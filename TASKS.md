@@ -90,10 +90,12 @@ alongside the local, operator and remote journeys.
   human listening acceptance remain open.
   Run 72 adds a second failure: the received tone fades late in the probe while
   the track stays live/unmuted and before/after packet counters show zero loss.
-  Record bounded audio RTP counters alongside PCM to distinguish producer silence
-  from concealed or delayed receiver audio. Preserve the current thresholds.
-  Independent runs 73/74 cover reload/interruption plus native operator handoff
-  with audio explicitly outside those runs; the combined media gate stays open.
+  Source `c5630e40` adds exact-receiver RTP counters alongside PCM and retains
+  the thresholds. Independently reviewed runs 75/76 pass tone before and after
+  reload/interruption plus native operator handoff and exact cleanup. Their
+  short probes establish the combined local journey. Diagnose the intermittent
+  failures with synchronized producer/receiver evidence during sustained use;
+  full media qualification remains open.
 - **B04.operator-admission / active / delegated source owner.**
   Prerequisite: the accepted owner/page contract and existing Engine CDP access.
   Deliver a bounded, capability-negotiated snapshot of the actual Engine page

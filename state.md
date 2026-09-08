@@ -184,8 +184,8 @@ rootfs and initrd, while reusing Runtime `0244cc0c` and matching native helpers.
 Run 70 passes local controlled browsing, decoded media, inspection, separate
 operator attach, owner approval, native reference click/type, human handoff and
 revoked-input rejection. Close takes 747 ms, clears all 13 effects and leaves zero
-Runtime/control obligations. This bounded operator proof awaits independent
-installed review. Full adapter and human qualification remain open.
+Runtime/control obligations. Independent agent review accepts this bounded
+operator proof. Full adapter and human qualification remain open.
 
 Run 68 fails viewer reload before operator admission. Its original evidence lacks
 the failed binding predicate. Source `649132fc` retains named, redacted predicate
@@ -194,20 +194,32 @@ Run 73 passes reload and native operator handoff together: decoded video resumes
 in 1600 ms and close clears all effects in 741 ms. Run 74 passes the five-second
 HTTP/TURN interruption and native operator handoff, recovering in 1167 ms and
 closing in 771 ms. Both end with zero Runtime/control obligations; controlled
-audio is outside these diagnostic runs. Independent review and the full combined
-media/recovery qualification remain open, including the unexplained run 68 failure.
+audio is outside these diagnostic runs. Independent agent review accepts both
+scoped results. Run 75 then passes the full tone, reload and operator journey,
+with reload in 3277 ms and close in 783 ms. Run 76 passes tone before and after
+the connection cut, input/video recovery in 1637 ms and close in 749 ms. Both
+clear all 13 effects and leave zero Runtime/control obligations. Independent
+review accepts these short combined journeys. The unexplained run 68 failure
+and sustained qualification remain open.
 
 Run 72 fails the controlled audio check when the received tone fades near the
 end of its 2.5-second sample. The receiver stays live and unmuted; before/after
 packet counters report zero loss. These observations do not identify the cause.
-The next audio experiment records bounded receiver statistics alongside PCM.
+Source `c5630e40` records bounded statistics from the exact audio receiver
+alongside PCM. All four run 75/76 probe windows show increasing packets and
+energy with unchanged concealment counters. Concealment rises during run 76's
+intentional cut despite zero reported packet loss. Earlier failures still need
+a matched producer/receiver observation; passing repeats retain those failures.
 Its exact close clears all effects in 919 ms. Run 71 separately fails during
 Home sign-out before Browser allocation. Source `35bf30ea` bounds auth fetches
 and offers explicit signed-Home reuse for focused Browser journeys, with five
 source tests. Default Home sign-in/sign-out qualification stays unchanged.
 Source `54df379a` adds signed remote Engine availability probes; full remote page,
 stream and media binding is still being implemented. The combined source
-candidate is installed; combined recovery and remote Engine journeys are next. B01-B16 retain all media,
+candidate is installed; remote Engine and sustained journeys are next. The
+updated Engine image package is complete locally, with SHA-256
+`761e7d35f1dca8c6d8785cc7dc5724c9dd458fe86c8dba0069a63658f4e5f4c3`.
+Fresh acquisition and second-maintainer installation remain pending. B01-B16 retain all media,
 performance, recovery, device, human and release gates. Public live is unchanged.
 
 The preceding image used dependency repair `cbb1e099`, rootfs
