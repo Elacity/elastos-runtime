@@ -5010,7 +5010,11 @@ async function browserRefInput(page, event, isCurrent) {
         if (!Array.isArray(quad) || quad.length !== 8 || quad.some(n => !Number.isFinite(n))) throw browserOperatorError("operator_target_unavailable");
         const x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4;
         const y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
-        if (!Number.isFinite(browserPage.width) || !Number.isFinite(browserPage.height) || x < 0 || y < 0 || x >= browserPage.width || y >= browserPage.height) throw browserOperatorError("operator_target_unavailable");
+        // CDP quads and input use CSS viewport coordinates. Read the current
+        // viewport; the owned page has no cached width/height contract.
+        const viewport = (await call("Page.getLayoutMetrics")).cssVisualViewport;
+        if (!Number.isFinite(viewport?.clientWidth) || !Number.isFinite(viewport?.clientHeight) ||
+            x < 0 || y < 0 || x >= viewport.clientWidth || y >= viewport.clientHeight) throw browserOperatorError("operator_target_unavailable");
         const hit = await call("DOM.getNodeForLocation", { x: Math.floor(x), y: Math.floor(y), includeUserAgentShadowDOM: false });
         if (hit.backendNodeId !== binding.backendDOMNodeId) throw browserOperatorError("operator_target_unavailable");
         await dispatchBrowserInputEvent(browserPage, { type: "click", x, y }, 1500, {

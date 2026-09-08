@@ -142,6 +142,14 @@ export async function runBrowserOperatorJourney({ runtimeOrigin, runtimeCoords, 
   }
   function completed(response, event) {
     const body = response.body;
+    evidence.input_responses ||= [];
+    evidence.input_responses.push({ action: event.action, status: response.status,
+      result_schema_matches: body?.schema === "elastos.browser.ref-input-result/v1",
+      accepted: body?.accepted === true,
+      outcome: ["completed", "uncertain", "rejected"].includes(body?.outcome) ? body.outcome : "unknown",
+      page_matches: body?.page_id === pageId, admission_matches: body?.admission_id === admissionId,
+      request_matches: body?.request_id === event.request_id,
+      generation_matches: body?.document_generation === event.document_generation });
     requireEvidence(response.status === 200 && body?.schema === "elastos.browser.ref-input-result/v1" &&
       body.page_id === pageId && body.admission_id === admissionId && body.request_id === event.request_id &&
       body.document_generation === event.document_generation && body.accepted === true &&

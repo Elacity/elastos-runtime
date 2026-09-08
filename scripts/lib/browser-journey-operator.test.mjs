@@ -218,6 +218,11 @@ for (const [name, options, code] of failures) test(`${name}: fails with cleanup 
   await assert.rejects(f.run(), error => {
     assert.equal(error.message, code);
     assert.equal(error.evidence.ok, false); assert.equal(error.evidence.close.attempted, true);
+    if (name === "uncertain click is never replayed") {
+      assert.deepEqual(error.evidence.input_responses, [{ action: "click", status: 200,
+        result_schema_matches: true, accepted: false, outcome: "uncertain",
+        page_matches: true, admission_matches: true, request_matches: true, generation_matches: true }]);
+    }
     for (const secret of [ownerSecret, attachSecret, sessionSecret, capSecret]) assert.ok(!JSON.stringify(error.evidence).includes(secret));
     return true;
   });

@@ -9,11 +9,13 @@ function harness({ actualWrapper = false } = {}) {
   const calls = [], gates = [];
   const frame = { id:"frame", loaderId:"loader", url:"https://fixture.test/nav" };
   const snapshot = {id:"b".repeat(32),generation:"a".repeat(32),expires:30010,backendNodes:[{backendDOMNodeId:7,frameId:"frame"}]};
-  const page = {pageId:"page:owned",closed:false,browserPage:{debugger_url:"ws://private/page",width:1920,height:1080,
+  let viewport = { clientWidth: 1920, clientHeight: 1080 };
+  const page = {pageId:"page:owned",closed:false,browserPage:{debugger_url:"ws://private/page",
     _inspection:{generation:snapshot.generation,snapshot,binding:"frame:loader:https://fixture.test/nav"}}};
   const cdp = {closed:false,async request(method,params={}){
     calls.push({method,params});if(hook) await hook(method,params);
     if(method==="Page.getFrameTree") return {frameTree:{frame}};
+    if(method==="Page.getLayoutMetrics") return {cssVisualViewport:viewport};
     if(method==="DOM.describeNode") return {node:{backendNodeId:params.backendNodeId??focused,nodeName:"INPUT",attributes:["type","text"]}};
     if(method==="DOM.getContentQuads") return {quads:[[10,10,100,10,100,40,10,40]]};
     if(method==="DOM.getNodeForLocation") return {backendNodeId:7};
@@ -49,10 +51,33 @@ function harness({ actualWrapper = false } = {}) {
     acquire:()=>context.browserOperatorLease(page,lease,current),
     input:ev=>context.browserRefInput(page,ev,current),
     queue:action=>context.withBrowserInputWriter(page,current,action),
-    hook:fn=>{hook=fn;},advance:n=>{now+=n;},unload:()=>{active=false;},focus:n=>{focused=n;},
+    hook:fn=>{hook=fn;},viewport:value=>{viewport=value;},advance:n=>{now+=n;},unload:()=>{active=false;},focus:n=>{focused=n;},
     close:()=>{if(page.operatorLease){clearTimeout(page.operatorLease.timer);page.operatorLease.active=false;}}};
 }
 const effects=h=>h.calls.filter(c=>c.method.startsWith("Input.dispatch")||c.method==="Input.insertText");
+
+test("ref click reads the live viewport from a page without cached dimensions",async()=>{
+  const h=harness();try{
+    assert.equal(h.page.browserPage.width,undefined);
+    assert.equal(h.page.browserPage.height,undefined);
+    await h.acquire();assert.equal((await h.input(h.event())).accepted,true);
+    assert.equal(h.calls.filter(c=>c.method==="Page.getLayoutMetrics").length,1);
+    assert.equal(effects(h).length,3);
+  }finally{h.close();}
+});
+
+for(const viewport of [undefined,{}, {clientWidth:NaN,clientHeight:1080},
+  {clientWidth:1920,clientHeight:Infinity},{clientWidth:0,clientHeight:1080},
+  {clientWidth:55,clientHeight:1080},{clientWidth:1920,clientHeight:25}]){
+  test(`ref click rejects missing or out-of-bounds live viewport ${JSON.stringify(viewport)}`,async()=>{
+    const h=harness();try{
+      // A stale, larger cached size cannot authorize a click outside the live viewport.
+      Object.assign(h.page.browserPage,{width:1920,height:1080});h.viewport(viewport);
+      await h.acquire();await assert.rejects(h.input(h.event()),{code:"operator_target_unavailable"});
+      assert.equal(effects(h).length,0);
+    }finally{h.close();}
+  });
+}
 
 test("native ref click and text reuse existing typed Engine input; replay has no effect",async()=>{
   const h=harness();try{

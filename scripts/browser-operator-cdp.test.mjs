@@ -57,6 +57,7 @@ async function harness(action, lostConnection, testContext) {
       const message=JSON.parse(raw), {id,method,params}=message;
       let result={};
       if(method==="Page.getFrameTree")result={frameTree:{frame}};
+      if(method==="Page.getLayoutMetrics")result={cssVisualViewport:{clientWidth:1920,clientHeight:1080}};
       if(method==="DOM.describeNode")result={node:{backendNodeId:7,nodeName:"INPUT",attributes:["type","text"]}};
       if(method==="DOM.getContentQuads")result={quads:[[10,10,100,10,100,40,10,40]]};
       if(method==="DOM.getNodeForLocation")result={backendNodeId:7};
@@ -86,7 +87,7 @@ async function harness(action, lostConnection, testContext) {
     '\nglobalThis.RealCdpClient=CdpClient;',context);
   const client=new context.RealCdpClient("ws://private-cdp/page",15000);ownedClient=client;await client.connect(1000);
   const snapshot={id:"b".repeat(32),expires:30010,backendNodes:[{backendDOMNodeId:7,frameId:"frame"}]};
-  const page={pageId:"page:owned",closed:false,browserPage:{debugger_url:"ws://private-cdp/page",_cdp:client,width:1920,height:1080,
+  const page={pageId:"page:owned",closed:false,browserPage:{debugger_url:"ws://private-cdp/page",_cdp:client,
     _inspection:{generation:"a".repeat(32),snapshot,binding:"frame:loader:https://controlled.test/form"}}};
   const lease={command:"acquire",admission_id:"c".repeat(32),document_generation:"a".repeat(32),actions:["click","type"],duration_ms:30000};
   await context.browserOperatorLease(page,lease,()=>true);
