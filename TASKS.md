@@ -125,9 +125,18 @@ Independent source repair and regression work can proceed in separate file scope
   video/audio answers but still has zero frames at the five-second deadline.
   Its ordinary journey and exact close pass. The next B06 slice adds a typed
   fresh display attachment, with a separate display generation, while retaining
-  page, cleanup, profile, VM and Runtime stream ownership. Review the shared
-  request/result contract before parallel Runtime/adapter and Engine/UI work;
-  the coordinator keeps sole ownership of installed Mac tests.
+  page, cleanup, profile, VM and Runtime stream ownership. The shared optional
+  attachment contract is implemented in Runtime, adapter, Engine and viewer.
+  Independent review accepts Engine `88717e13`, VM proxy `f0d4a8bb`, and the
+  viewer owner guards at their reviewed source hashes. Engine tests cover real
+  socket cancellation and stale continuation; proxy tests traverse HTTP and Unix
+  sockets; viewer tests cover success and failure during retained pending close.
+  Runtime retirement and absolute control deadlines remain under repair and
+  review, together with viewer peer-scoped signaling. The changed guest image
+  builds from the verified `56ce99e4` inputs plus the reviewed Engine control
+  overlay; unrelated RNG work remains excluded. Installed run 30 will repeat the
+  same journey and reload gate. The coordinator owns the shared Mac instance;
+  independent source work and review use separate file scopes.
   Full B05 mixed-transport ordering and motion behavior remain separate gates.
   The probe must observe request failure and
   stopped media, then restore the same page, profile, service selection and

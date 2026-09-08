@@ -212,7 +212,13 @@ frames during the five-second reload window. The ordinary journey and exact
 13-effect close pass. A fresh Engine display attachment is the next repair.
 GStreamer result handling remains a source diagnosis; these logs do not expose
 its remote-description result. Runs 28/29 include diagnostic overhead and do
-not contribute formal latency distributions.
+not contribute formal latency distributions. Fresh attachment source now has
+independent acceptance for Engine `88717e13`, VM proxy `f0d4a8bb`, and viewer
+ownership guards. Source tests preserve typed errors, exact owner state and
+close priority across delayed responses. The guest image build passes with the
+reviewed control overlay on the verified `56ce99e4` input archive. Runtime and
+peer signaling review, artifact installation and the same reload journey remain
+pending; these source results do not establish installed reload recovery.
 Guest Node also starts about five seconds after its shell launch;
 initial entropy is 1 and no hardware RNG is selected. That secondary cause needs
 its own experiment. Run 16 includes diagnostic overhead and is excluded from
