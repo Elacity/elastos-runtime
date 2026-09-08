@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
-import { readBrowserViewerReloadDocument } from './lib/browser-journey-viewer-reload.mjs';
+import { readBrowserViewerReloadDocument, browserViewerSignalMetadata } from './lib/browser-journey-viewer-reload.mjs';
 const source = readFileSync(new URL('../capsules/browser/browser/browser.js', import.meta.url), 'utf8');
 const start = source.indexOf('async function readRemoteDisplayMetrics(');
 const end = source.indexOf('\n}', start) + 2;
@@ -72,4 +72,13 @@ test('layout and frame state are sampled after the fresh counters finish', async
   const value = await pending;
   assert.equal(value.video.client_width, 0); assert.equal(value.video.client_height, 0);
   assert.equal(value.video.decoded_frames, 99); assert.equal(value.video.video_bytes_received, 999);
+});
+
+
+test('signaling evidence preserves only allowlisted stage metadata', () => {
+  assert.deepEqual(browserViewerSignalMetadata({ type: 'display_attach', code: 'display_attach_failed',
+    sdp: 'private', candidate: 'private', url: 'private', token: 'private' }),
+    { signal_type: 'display_attach', error_code: 'display_attach_failed' });
+  assert.deepEqual(browserViewerSignalMetadata({ schema: 'elastos.browser.display-attach-result/v1', initial_offer: { sdp: 'private' } }), { attached: true });
+  assert.deepEqual(browserViewerSignalMetadata({ type: ['answer'], code: ['display_attach_busy'], attached: 'true' }), {});
 });

@@ -73,7 +73,7 @@ export async function diagnoseBrowserViewerReload({ expectedUrl, readReceipt, re
   function record(event) {
     if (event?.source_matches !== true) return;
     const navigation = event.kind === "navigation" && event.phase === "commit";
-    if (!navigation && (!["opening", "closing", "renewal", "probe", "status", "heartbeat"].includes(event.kind) ||
+    if (!navigation && (!["opening", "closing", "renewal", "probe", "status", "heartbeat", "signaling"].includes(event.kind) ||
       !["request", "response", "failed"].includes(event.phase))) return;
     if (["opening", "closing"].includes(event.kind)) {
       forbidden = true;
@@ -81,6 +81,7 @@ export async function diagnoseBrowserViewerReload({ expectedUrl, readReceipt, re
     }
     if (evidence.requests.length === 64) { evidence.dropped_requests++; return; }
     evidence.requests.push({ at_ms: elapsed(), phase, kind: event.kind, event: event.phase,
+      ...browserViewerSignalMetadata(event),
       ...(text(event.request_id) ? { request_hash: hash(event.request_id) } : {}),
       ...(count(event.document_generation) ? { document_generation: event.document_generation } : {}),
       ...(count(event.status) && event.status <= 599 ? { status: event.status } : {}) });
@@ -124,6 +125,7 @@ export async function diagnoseBrowserViewerReload({ expectedUrl, readReceipt, re
     }
     evidence.samples.push({ at_ms: elapsed(), phase, binding_matches: true,
       viewer_ready: Boolean(media), viewer_has_page: Boolean(viewer?.page_id),
+      ...(typeof viewer?.status_text === "string" ? { viewer_status: viewer.status_text.slice(0, 240) } : {}),
       video_present: raw?.video?.present === true,
       ...(count(raw?.video?.ready_state) ? { video_ready_state: raw.video.ready_state } : {}),
       ...(count(raw?.video?.decoded_frames) ? { video_decoded_frames: raw.video.decoded_frames } : {}),
@@ -239,11 +241,27 @@ export async function readBrowserViewerReloadDocument() {
       engine_id: document.querySelector("#browser-engine")?.value,
       exit_id: document.querySelector("#browser-exit")?.value,
       document_id: performance.timeOrigin,
+      status_text: (document.querySelector("#browser-status .browser-status-message")?.textContent || "").slice(0, 240),
     },
     video: element ? { present: true, hidden: element.hidden, paused: element.paused,
       ready_state: element.readyState, video_width: element.videoWidth, video_height: element.videoHeight,
       client_width: Math.round(rect.width), client_height: Math.round(rect.height),
       decoded_frames: Number(element.webkitDecodedFrameCount || 0),
       ...(Number.isSafeInteger(bytes) ? { video_bytes_received: bytes } : {}) } : null,
+  };
+}
+
+
+/** Keep signaling stage evidence bounded; SDP, candidates and authority remain private. */
+export function browserViewerSignalMetadata(payload) {
+  const types = ["display_attach", "offer", "answer", "candidate", "end_of_candidates"];
+  const codes = ["display_attach_busy", "display_generation_mismatch", "display_owner_changed",
+    "display_attach_unsupported", "display_attach_failed", "display_attach_uncertain"];
+  const type = payload?.signal_type ?? payload?.type;
+  const code = payload?.error_code ?? payload?.code;
+  return {
+    ...(types.includes(type) ? { signal_type: type } : {}),
+    ...(codes.includes(code) ? { error_code: code } : {}),
+    ...(payload?.schema === "elastos.browser.display-attach-result/v1" || payload?.attached === true ? { attached: true } : {}),
   };
 }

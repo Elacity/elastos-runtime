@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { diagnoseBrowserJourneyRecovery } from "./lib/browser-journey-recovery.mjs";
-import { diagnoseBrowserViewerReload, readBrowserViewerReloadDocument } from "./lib/browser-journey-viewer-reload.mjs";
+import { diagnoseBrowserViewerReload, readBrowserViewerReloadDocument, browserViewerSignalMetadata } from "./lib/browser-journey-viewer-reload.mjs";
 
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
@@ -2296,6 +2296,7 @@ async function observeControlledBrowserRequests(page, appFrame, token, record,
     sourceChain.unshift(index);
   }
   const requests = new WeakMap();
+  const pendingResponses = new Set();
   let sequence = 0, documentGeneration = 0;
   const request = req => {
     if (req.frame() !== appFrame) return;
@@ -2305,14 +2306,30 @@ async function observeControlledBrowserRequests(page, appFrame, token, record,
       : /^\/api\/apps\/browser\/open(?:\/|$)/.test(url.pathname) && req.method() === "POST" ? "opening"
       : /\/pages\/[^/]+\/close$/.test(url.pathname) ? "closing"
       : /\/pages\/[^/]+\/status$/.test(url.pathname) ? "status"
-      : /\/pages\/[^/]+\/heartbeat$/.test(url.pathname) ? "heartbeat" : null;
+      : /\/pages\/[^/]+\/heartbeat$/.test(url.pathname) ? "heartbeat"
+      : recordNavigation && /\/pages\/[^/]+\/webrtc$/.test(url.pathname) ? "signaling" : null;
     if (!kind) return;
-    const event = { kind, request_id: `viewer-request-${++sequence}`, source_matches: true, document_generation: documentGeneration };
+    let details = {};
+    if (kind === "signaling") {
+      try { details = browserViewerSignalMetadata(req.postDataJSON()); } catch {}
+    }
+    const event = { kind, ...details, request_id: `viewer-request-${++sequence}`, source_matches: true, document_generation: documentGeneration };
     requests.set(req, event);
     record({ ...event, phase: "request" });
   };
   const failed = req => { const event = requests.get(req); if (event) record({ ...event, phase: "failed" }); };
-  const response = res => { const event = requests.get(res.request()); if (event) record({ ...event, phase: "response", status: res.status() }); };
+  const response = res => {
+    const event = requests.get(res.request());
+    if (!event) return;
+    if (event.kind !== "signaling" || (event.signal_type !== "display_attach" && res.status() < 400)) {
+      record({ ...event, phase: "response", status: res.status() });
+      return;
+    }
+    const pending = res.json().then(body => browserViewerSignalMetadata(body), () => ({}))
+      .then(details => record({ ...event, ...details, phase: "response", status: res.status() }))
+      .finally(() => pendingResponses.delete(pending));
+    pendingResponses.add(pending);
+  };
   const navigation = frame => {
     if (recordNavigation && frame === appFrame) record({ kind: "navigation", phase: "commit",
       request_id: `viewer-navigation-${++documentGeneration}`, source_matches: true, document_generation: documentGeneration });
@@ -2332,7 +2349,7 @@ async function observeControlledBrowserRequests(page, appFrame, token, record,
         finally { await handle.dispose(); }
       });
     }
-    return cleanup;
+    return Promise.all([cleanup, Promise.allSettled([...pendingResponses])]);
   };
   const onAbort = () => { void stop().catch(() => {}); };
   signal?.addEventListener("abort", onAbort, { once: true });
