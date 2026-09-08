@@ -806,6 +806,7 @@ for module in \
   virtio \
   virtio_ring \
   virtio_pci \
+  virtio_rng \
   virtio_console \
   virtio_net \
   virtio_blk \

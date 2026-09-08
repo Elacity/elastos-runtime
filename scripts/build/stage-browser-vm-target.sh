@@ -490,7 +490,7 @@ mount_if_needed tmpfs shm /dev/shm "mode=1777,nosuid,nodev"
 mount_if_needed tmpfs tmpfs /tmp "mode=1777,nosuid,nodev"
 rootfs_checkpoint "runtime filesystems mounted"
 
-for module in virtio virtio_ring virtio_pci virtio_console virtio_net; do
+for module in virtio virtio_ring virtio_pci virtio_rng virtio_console virtio_net; do
   modprobe "$module" 2>/dev/null || true
 done
 
