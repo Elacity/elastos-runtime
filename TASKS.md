@@ -30,7 +30,9 @@ Active priority index:
 - released line: `origin/main@8ac18bec` is `v0.7.0`. Keep follow-up work on
   `origin/upstream/0.7.1-dev` until the reviewed 0.7.1 line is ready. The
   checked publish flow still owns release stamping
-- published integration remains `origin/feat/0.7.1-integration@12d38266`.
+- published integration is `origin/feat/0.7.1-integration@5ba1faa0`.
+  Reconcile its equivalent setup guard change with the local history before
+  publication; preserve the published commit.
   Local merge `91209988` preserves the five reviewed model/delivery groups
   through `ed275ba0` and the three reviewed auth commits through `43b8f830`.
   Earlier candidate `900d7e5c` remains the broad installed UIUX and
@@ -79,11 +81,13 @@ acceptance. Browser implementation belongs to its separate owner.
    peak memory/disk and cold delivery at the intended scale while retaining
    the 10% free-space floor.
    Exact Qwen and installed acceptance remain in the gates below.
-2. [ ] Expose the same Runtime model facts through Marketplace Models, System,
-   Assistant and Home Agent for Use, progress, cancel, retry, Keep and selection.
-   Use the existing catalog, inventory and pickers. Preserve drafts and runs.
-   Runtime Keep/release, caller-scoped retention and exact-offer dispatch
-   readiness pass source tests; connect these facts to the shared views.
+2. [ ] Connect Assistant and Home Agent selectors to the shared Runtime model
+   facts. Marketplace Models and System management pass browser fixture tests
+   for Use, progress, cancel, retry, Keep and exact dispatch readiness.
+   Preserve explicit selected identity and drafts when an offer disappears or
+   refresh fails; another offer requires deliberate selection. Cached labels
+   provide display context, not current readiness. Use the existing catalog,
+   inventory and pickers; verify the combined views in the isolated Home.
    Selection may prepare the chosen model; inference requires that exact
    admitted model and a ready provider. Prove offline/error states,
    incompatibility, busy-safe eviction and shared-view idempotence. Use Runtime's

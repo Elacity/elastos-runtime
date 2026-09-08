@@ -1,0 +1,9 @@
+.model-management[hidden] { display: none; }
+.model-management { min-width: 0; color: var(--ink); }
+.model-row { padding: 16px 0; border-top: 1px solid var(--line); min-width: 0; }
+.model-row h2 { font-size: 18px; margin: 0 0 12px; }
+.model-row p { overflow-wrap: anywhere; line-height: 1.5; margin: 8px 0; }
+.model-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; }
+.model-keep { display: inline-flex; align-items: center; gap: 8px; }
+.model-keep input { accent-color: var(--accent); }
+.model-row progress { width: 100%; max-width: 440px; accent-color: var(--accent); }

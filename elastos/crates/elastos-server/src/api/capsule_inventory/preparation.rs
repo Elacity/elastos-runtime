@@ -2117,12 +2117,23 @@ mod tests {
                 "/../../../capsules/marketplace/capsule.json"
             )))
             .unwrap();
-            // Bind the existing typed catalog/status seams for this route fixture.
-            for (id, op) in [("catalog.list", "list"), ("content.status", "status")] {
-                manifest["interfaces"][0]["methods"].as_array_mut().unwrap().push(serde_json::json!({
-                    "id":id, "operation":op, "resource":RESOURCE, "risk":"read", "approval":"runtime_policy", "audit":"summary"
-                }));
-            }
+            assert_eq!(
+                manifest["interfaces"][0]["methods"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|method| method["id"] == "content.status"
+                        && method["operation"] == "status"
+                        && method["resource"] == RESOURCE
+                        && method["risk"] == "read"
+                        && method["approval"] == "runtime_policy")
+                    .count(),
+                1
+            );
+            // Status uses the real capsule declaration; only catalog.list is fixture-specific.
+            manifest["interfaces"][0]["methods"].as_array_mut().unwrap().push(serde_json::json!({
+                "id":"catalog.list", "operation":"list", "resource":RESOURCE, "risk":"read", "approval":"runtime_policy", "audit":"summary"
+            }));
             std::fs::write(
                 dir.join("capsule.json"),
                 serde_json::to_vec(&manifest).unwrap(),

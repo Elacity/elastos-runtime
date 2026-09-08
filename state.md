@@ -15,7 +15,9 @@ volatile proof logs remain outside the repository.
   changelog, manifest bumps, and lock refresh. Installed artifacts report
   `0.7.0` only after the checked publish flow stamps
   `ELASTOS_RELEASE_VERSION`; unstamped source builds report `0.7.0-dev`.
-- Published integration remains `origin/feat/0.7.1-integration@12d38266`.
+- Published integration is `origin/feat/0.7.1-integration@5ba1faa0`.
+  Its setup guard is equivalent to the local guard; ancestry reconciliation
+  remains a publication prerequisite.
   Local merge `91209988`, tree `16f8f020`, preserves the five reviewed groups:
   artifact verification `c95cf4c9`, local-engine lifecycle `7c4fc929`, hosted
   evidence `fcb8fc5e`, Responses and honest cancellation `0d768415`, and delivery
@@ -232,8 +234,8 @@ The integrated source includes these durable facts:
   These prove metadata consistency and publisher verification,
   including rejection paths; the composed preparation proof is recorded below.
   Installed Homes remain unchanged. Model-provider consumes Runtime-owned
-  private artifact/offer configuration, and Marketplace/System model
-  selection remains future work. Model and Assistant Truth below records the
+  private artifact/offer configuration. Marketplace and System source views
+  consume the shared projection. Model and Assistant Truth below records the
   existing Qwen operator bootstrap.
 - The signed, complete-closure CID model path is required in the current
   closeout, alongside onboarding and window policy. People select or use a
@@ -367,7 +369,22 @@ The integrated source includes these durable facts:
   four explicit process tests excluded from that server run. Separate native
   Init and same-process refresh tests pass with the existing pinned provider.
   Strict Runtime/server all-target Clippy, formatting and entropy checks pass.
-  Shared UI and installed acceptance remain open; installed Homes are unchanged.
+  Assistant/Home Agent selection and installed acceptance remain open;
+  installed Homes are unchanged.
+- Marketplace Models and System model management use one vendored helper with
+  their existing catalog/interface reads and typed content operations. They
+  display verified publisher/CID metadata, preparation progress, cancel/retry,
+  caller Keep and exact dispatch readiness. Typed operation results use flat
+  readiness fields; catalog rows carry the nested `model_runtime` projection.
+  Polling is limited to visible active preparation and stops at its local bound
+  or an error. Current request, CID and operation checks reject stale results.
+  An unconfirmed Use retains its request identity and requires a successful
+  read before another attempt. Keep changes require a confirmed response;
+  release preserves bytes. Browser fixture tests cover both actual pages and
+  manifests, lost replies, visibility, correlation, malformed data, focus,
+  errors and desktop/narrow layouts. Existing app/media and System behavior
+  checks pass. Assistant/Home Agent selection, safe eviction and installed
+  model acceptance remain open. Installed Homes and user data are unchanged.
 - Large-model publication needs a bounded operator/provider bootstrap path or a
   separately verified publisher repair. The current generic directory publisher
   reads whole files and builds a base64 JSON array. Cold-proof capacity must

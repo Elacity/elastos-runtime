@@ -51,6 +51,11 @@
     { id: "shells", label: "Home views", icon: "system" },
   ];
 
+  const models = window.ElastosModelManagement.create({
+    root: document.querySelector("[data-model-management]"), capsule: "marketplace", token: homeToken,
+    buttonClass: "store-pill",
+  });
+
   const icons = {
     package: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16.5 9.4l-9-5.19M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>',
     play: '<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>',
@@ -64,6 +69,7 @@
   };
 
   const CAPSULE_ICON_ROUTE = /^\/apps\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+\.png$/;
+  document.querySelector("[data-model-icon]").innerHTML = icons.package;
 
   boot();
 
@@ -451,6 +457,7 @@
   }
 
   function normalizeDestination(id) {
+    if (id === "models") return "models";
     if (id === "media") return "media";
     if (id === "installed") return "installed";
     if (categories.some((category) => category.id === id)) return id;
@@ -458,6 +465,7 @@
   }
 
   function destinationTitle(id) {
+    if (id === "models") return "Models";
     if (id === "media") return "Media";
     if (id === "installed") return "Installed";
     const category = categories.find((entry) => entry.id === id);
@@ -467,6 +475,7 @@
 
   function selectDestination(id, options = {}) {
     state.destination = normalizeDestination(id);
+    models.setVisible(state.destination === "models");
     document.querySelectorAll("[data-destination]").forEach((node) => {
       const selected = node.dataset.destination === state.destination;
       node.classList.toggle("selected", selected);
@@ -499,6 +508,12 @@
   }
 
   function renderSurfaceState() {
+    if (state.destination === "models") {
+      els.loadingState.classList.add("hidden");
+      els.loadError.classList.add("hidden");
+      els.storeSections.classList.add("hidden");
+      return true;
+    }
     const surface = surfaceState();
     els.loadingState.classList.toggle("hidden", !surface.loading);
     if (surface.loading) {

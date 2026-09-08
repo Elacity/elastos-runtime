@@ -52,6 +52,9 @@ const technicalInspectStatusNode = document.querySelector("#technical-inspect-st
 const technicalInspectRefreshButton = document.querySelector("#technical-inspect-refresh");
 const deviceDidCopyButton = document.querySelector("#device-did-copy");
 const frameHomeToken = readLaunchToken();
+const models = window.ElastosModelManagement.create({
+  root: document.querySelector("[data-model-management]"), capsule: "system", token: frameHomeToken,
+});
 const homeParentOrigin = readQueryParam("home_origin");
 const HOME_HOST_ID = "home";
 const HOME_GUI_SHELL_ID = "home-gui";
@@ -142,6 +145,7 @@ const SETTINGS_SEARCH_KEYWORDS = Object.freeze({
   shell: ["shell", "desktop", "terminal", "home gui", "home cli"],
   security: ["security", "recovery", "access", "guest", "inspection", "technical"],
   catalog: ["catalog", "apps", "services", "capsules"],
+  models: ["models", "use", "keep", "preparation"],
   about: ["about", "device", "version", "source", "network", "did"],
 });
 const ALLOWED_SETTINGS_TABS = new Set(Object.keys(SETTINGS_SEARCH_KEYWORDS));
@@ -297,6 +301,7 @@ function activateSettingsTab(settings) {
   if (!tab) {
     return;
   }
+  models.setVisible(tab === "models");
   for (const item of document.querySelectorAll(".settings-sidebar-item")) {
     item.classList.toggle("active", item.dataset.settings === tab);
   }

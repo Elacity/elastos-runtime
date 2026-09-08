@@ -9,9 +9,9 @@ replication policy and availability receipts remain in
 
 Runtime source projects installed capsules and can verify one locally supplied,
 operator-pinned signed model catalog snapshot. Its typed preparation path can
-admit that exact package through bounded local Content reads. Shared model
-selection, retention controls, real-model packaging and network catalog updates
-remain planned work.
+admit that exact package through bounded local Content reads. Marketplace and
+System source views expose preparation and Keep controls. Assistant/Home Agent
+selection, real-model packaging and network catalog updates remain planned work.
 
 The implemented content plane already provides `elastos://content` publish,
 fetch, status, ensure, repair, and unpublish operations. It records signed local
@@ -265,7 +265,7 @@ The following separates implemented primitives from remaining package work:
 | Existing surface | Current state and required extension |
 | --- | --- |
 | `elastos/crates/elastos-common/src/manifest.rs` | The bounded passive metadata profile above is implemented. Preparation must verify its declared facts against the complete fetched package before admission. |
-| `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | The catalog projects installed inventory plus signed model metadata and caller-scoped admission, Keep and dispatch readiness. The preparation inventory owns reservations and admission receipts. Shared UI remains open. |
+| `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | The catalog projects installed inventory plus signed model metadata and caller-scoped admission, Keep and dispatch readiness. The preparation inventory owns reservations and admission receipts. Marketplace/System consume these facts; Assistant/Home Agent selection remains open. |
 | `elastos/crates/elastos-server/src/content.rs` | Preparation uses the explicit bounded local-fetch loop. Ordinary `fetch_bytes_via_provider` and `materialize_data_capsule` still drain whole files. `import_exact` and aggregate `import_object` remain capped at 64 MiB and 512 files; these are separate paths. |
 | `elastos/crates/elastos-runtime/src/provider/registry.rs` | Bounded reads validate and consume the native range once for Bytes and Stream. Ordinary `open_provider_stream` still decodes the full response into `ProviderStreamSession.bytes`; consumer chunking alone does not bound producer memory or cancel network work. |
 | `capsules/ipfs-provider/src/main.rs` | Explicit bounded Cat enforces finite bytes/time and uses the existing backend lifecycle. Ordinary `cat` and `cat_to_path` still read the entire file before encoding or writing. |
@@ -318,9 +318,13 @@ policy slices:
    eviction still requires a proved closure receipt for every retained engine
    and run. Keep/release intents are implemented independently of activation;
    shared UI and installed retention proof remain open.
-4. **Shared model experience.** Add Models within existing Marketplace and model
-   management within System; extend Assistant/Home Agent selectors. Test the
-   same records across
+4. **Shared model experience.** Marketplace Models and System management use one
+   vendored presentation/intent helper and the existing typed content methods.
+   Catalog rows carry nested readiness; operation replies carry flat readiness.
+   Visible in-flight preparation has bounded polling; request and CID ownership
+   reject stale replies. An unconfirmed Use keeps its request identity until a
+   successful read reconciles it. Keep is a caller retention choice, not deletion.
+   Extend Assistant/Home Agent selectors and test the same records across
    all views; Use/Keep/release intent shapes; Preparing, progress, cancel, retry,
    failed/offline/incompatible/ready states; selection while preparing; draft/run
    preservation; and inference disabled until the selected model is ready.
