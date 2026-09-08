@@ -70,22 +70,18 @@ volatile proof logs remain outside the repository.
 
 ## Browser contract and device qualification
 
-The task Mac runs Runtime source `6c8b0d96`, hash
-`78a3f9e460a04773b93f6bbfe22fa8c84fa4e3cc145b09f0507a4db85ea88d43`,
-and retains the `21028a46` relay hash `9068894c129629d67a06e373535b41c59ff979ea1e5c5b95e22e2709e4b90a4d`.
-The Exit provider retains hash
-`51d89371b234189c16923aac59737b5f24badec4390866d7abae6c875b11b316`.
-The inspection adapter from `4dd0a216` retains hash
-`d6b372c0754ebedbe05a1b80de2df61c898e3b23170e9bcd807713c3daf09426`.
-Its rootfs is `32dde56898859e05c00b0eb753c2365a65015a859cef1c71401245e0eff91ded`
-and initrd is `47fca80f800d616f00f0da3e090bf3ddcea196d6486ae763cbe7ab6b1ce87ccd`.
-The reviewed Engine helper has hash
-`02a0b1601c6d8a1a7fc34ddcd3f3c95e5524dc8648102b61d19810a0a8a97d69`
-in source, installed host helper, rootfs and initrd. The image change replaces
-that one script; all other 4,592 initrd entries remain identical. The kernel,
-VZ helper, Browser UI and corrected media dependencies were reused. Image-set,
-filesystem, provider and restart checks pass; four served Browser assets match
-source and installed bytes.
+The task Mac runs Runtime source `0244cc0c`, hash
+`91457075a95661b70242b9ce379f2054868e95f2d643a80c766218bc28ab78f8`.
+The `92f04e0e` Engine adapter is
+`3c9a7d4816f0cfb4d7c1f511a93a3d33279aea5101c14d8ba71e1ed5082ac651`.
+Its rootfs is `a0a5dddedbf6230eaf647e80e60f7c280df5ef39a2a527bb50f28c8fe94311f8`
+and initrd is `b770af7ee0d6d4fede3d7208d1568bc1df5befc3e54c802b7ba58dd26493850d`.
+The Engine helper hash is
+`9b272fc67eb082388c138d8d2a85e12c2a2f9f99a240f7fc4041d3d1b21b452e`.
+The image reuses the verified Chromium and media dependencies, replaces three
+guest files, and changes only the matching helper in the initrd. Image-set,
+filesystem, provider and restart checks pass. The Exit provider, relay, kernel,
+VZ helper and Browser UI are reused from their preceding verified receipts.
 
 Run 60 passes the ordinary installed journey and native Engine inspection:
 18 accessibility nodes over three response pages include the exact text entered
@@ -121,13 +117,15 @@ Source `7879f439` adds verified image packaging and lazy acquisition before
 first-party local Engine readiness. Source `e61603fe` replaces the confirmed
 200 MiB buffered image limit with bounded disk transfer and streamed verification.
 Its 34 Rust and 28 packaging/source checks pass. A real image exceeded the old
-limit after only 614 MB of input. Actual large-image publication, matching host
-helpers and fresh installed acquisition remain qualification requirements.
+limit after only 614 MB of input. The actual image package is 897,973,643 bytes with SHA-256
+`143f7103d54e08665674a5e3d65026e050ac6cfd7b78c62dbaff4c8a0ead989f`.
+It passes package and image verification. Publication and fresh automatic
+installed acquisition remain qualification requirements.
 
 An isolated Linux candidate now has a separately built Runtime and ten native
 providers for the consumer and Exit roles. Its Runtime hash is
-`ec47564a702d240ecbd08bf43e5d2c83a485bd94a95d197e49bc595a72ee8b05`
-from source `6c8b0d96`.
+`0dd634d6fe8361ba8984e334dca1423bc7a26408eede4c9a8c005c3b8df05b1c`
+from source `0244cc0c`.
 Its matching `21028a46` Exit relay hash is
 `a9e79e8db5d8e4f810633a734ced073018ffdfe7db280209d1d9898fb5a5b5b6`.
 Fresh startup exposed a restart-script error: an `already_ready` migration
@@ -145,16 +143,34 @@ its 16 isolated Services regressions pass. Installed testing then found that
 Inbox received requests only on launch and lacked Services approval controls.
 The `5c9c5c4b` Inbox page is installed and hash-verified on both Homes. Normal
 request delivery after Inbox reopening, visible owner approval and consumer
-Exit activation pass. Remote Exit use on two public pages fails before decoded
-media, with a generic Runtime admission error and confirmed post-effect cleanup.
-The actual installed Exit provider returns the expected stream receipt in an
-isolated format check; the precise admission cause still needs target evidence.
+Exit activation pass. Installed cause logging identifies the first remote use
+failure: the grant's two concurrent connections cannot serve a normal page.
+Source `0244cc0c` gives new owner approvals 64 connections per person/grant and
+a host limit of 256. Signed limits are validated and enforced at both ends;
+existing grants keep their limits until renewed. Independent review accepts
+31 passing test executions (30 distinct tests).
+
+The installed A/A/B path now loads Example Domain through the selected Linux
+Exit with 738 decoded WebRTC frames. Navigation changes the native document
+and reaches 3,884 decoded frames. Owner denial and renewal reach the consumer
+while its Services/Inbox windows remain closed. After denial, the provider
+rejects further connections; the exact page closes with all 13 effects absent
+and final control counts zero. Remote controlled audio/input, complete placement
+coverage and human UX remain open. Revocation currently reaches a generic Engine
+error after replacement allocation, and navigation status can retain “Opening”
+after content changes; both need their own user-facing repair.
 
 Run 64 returns these Runtime and Inbox changes to the local Home journey.
 Controlled navigation, decoded media, native inspection, typing, scrolling and
 viewer reload pass. Reload takes 1406 ms; close takes 718 ms, clears all 13 effects
-and leaves zero Runtime/control obligations. Independent review of runs 63/64
-is pending. Run 57's audio silence remains unexplained.
+and leaves zero Runtime/control obligations. Independent review accepts runs 63/64 after 104 assertions and 40 evidence
+hash checks. Run 57's audio silence remains unexplained.
+
+Run 65 exercises the combined operator image: decoded media, navigation, typing,
+scrolling, native inspection and reload pass. Its exact close clears all 13
+effects in 675 ms and ends with zero Runtime/control counts. The harness fails
+its final baseline equality check; its full verdict stays failed pending review
+and correction of that condition.
 
 Reviewed source `92f04e0e` adds Runtime background request/decision receive with
 23 combined regressions. Source `9e6693d6` adds a short owner-approved operator
@@ -163,7 +179,7 @@ and late-effect handoff: 74 JavaScript and 12 Python cases, plus the common,
 adapter and Runtime authority tests. Its installed native handoff remains pending.
 Source `54df379a` adds signed remote Engine availability probes; full remote page,
 stream and media binding is still being implemented. The combined source
-candidate is building for installed integration. B01-B16 retain all media,
+candidate is installed; the representative operator journey is next. B01-B16 retain all media,
 performance, recovery, device, human and release gates. Public live is unchanged.
 
 The preceding image used dependency repair `cbb1e099`, rootfs

@@ -70,7 +70,8 @@ alongside the local, operator and remote journeys.
   an actual publishable bundle and matching helpers through the existing
   installer. Reviewed source `e61603fe` removes the observed 200 MiB image
   transfer limit with bounded disk streaming; 34 Rust and 28 script checks pass.
-  Actual large-image transfer and independent fresh installation are next;
+  The verified 898 MB real image package is ready. Actual large-image transfer
+  and independent fresh installation are next;
   existing verified images remain the installed test input.
 - **B02.startup / verifying / coordinator; independent review pending.**
   Prerequisites: accepted compatibility contract, image `d03ec029`, and reviewed
@@ -107,8 +108,7 @@ alongside the local, operator and remote journeys.
   Reviewed source `9e6693d6` adds the bounded owner-approved click/type writer.
   The corrected real CDP wrapper dispatches each action once; a native pending
   marker keeps human handoff behind uncertain effects. Its 74 JavaScript and
-  12 Python checks plus Runtime/common/adapter regressions pass. Install the
-  changed guest scripts and adapter, then prove actual ref actions, handoff,
+  12 Python checks plus Runtime/common/adapter regressions pass. The changed guest scripts and adapter are installed. Prove actual ref actions, handoff,
   revocation and close. Operator adapters and broader workflow gates stay open.
 - **B08/B09.first-remote / active / independent delegated source owner.**
   Prerequisite: accepted Engine/Exit identity and Runtime service contracts.
@@ -134,12 +134,19 @@ alongside the local, operator and remote journeys.
   fixes configured Carrier use. Installed Inbox `5c9c5c4b` exposes owner approval;
   ordinary two-Home approval and Exit activation now pass after Inbox reopening.
   Source `92f04e0e` moves receive progress into Runtime's background worker.
-  The first remote browsing failure is stream admission, before decoded media;
-  the coordinator will repeat it with internal cause logging on the combined
-  candidate. Local run 64 passes media, input, reload and exact close.
-  Engine availability probes pass source review at `54df379a`; the delegated
-  owner now implements full remote page/stream/media binding. Actual remote use,
-  revocation, cleanup and all five placements remain pending.
+  Installed diagnosis found the two-connection grant quota. Source `0244cc0c`
+  preserves approved limits and admits normal page concurrency. A/A/B now loads
+  Example Domain, decodes WebRTC frames, navigates, rejects use after owner
+  denial, and closes all 13 effects with zero control counts. Background grant
+  denial/renewal passes with consumer Services/Inbox closed. Controlled remote
+  audio/input and full revocation UX remain pending. In particular, reject a
+  known revoked Exit before replacement Engine allocation and identify that
+  authority failure clearly; finish navigation status when content is ready.
+  Local runs 63/64 have independent acceptance. Combined-image run 65 confirms
+  media/input/reload and actual cleanup but fails a harness baseline equality;
+  resolve that condition before counting a full pass. Engine availability probes
+  pass source review at `54df379a`; the delegated owner implements full remote
+  page/stream/media binding. All five placements retain their full requirements.
   The fresh Linux restart repair `2b640973` passes its active target smoke and
   installed Home proof with reused native binaries.
 
