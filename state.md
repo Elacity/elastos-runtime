@@ -70,9 +70,11 @@ volatile proof logs remain outside the repository.
 
 ## Browser contract and device qualification
 
-The task Mac now runs inspection source `4dd0a216`, Runtime hash
-`cc5603ecd197ebc9b9807252147dc7af754af1602276ce1b22137547351272ff`
-and adapter hash `d6b372c0754ebedbe05a1b80de2df61c898e3b23170e9bcd807713c3daf09426`.
+The task Mac now runs Runtime/Exit source `788e5414`, Runtime hash
+`88e7e2f47deb87b56d85d4405f7c941bc38e2d69366d7e4f9e2e880af1149c6e`
+and Exit hash `51d89371b234189c16923aac59737b5f24badec4390866d7abae6c875b11b316`.
+The inspection adapter from `4dd0a216` retains hash
+`d6b372c0754ebedbe05a1b80de2df61c898e3b23170e9bcd807713c3daf09426`.
 Its rootfs is `32dde56898859e05c00b0eb753c2365a65015a859cef1c71401245e0eff91ded`
 and initrd is `47fca80f800d616f00f0da3e090bf3ddcea196d6486ae763cbe7ab6b1ce87ccd`.
 The reviewed Engine helper has hash
@@ -92,6 +94,29 @@ pass in each audio probe, recovery takes 1753 ms and close takes 802 ms. Both ru
 end with zero Runtime/control obligations. Independent agent review accepts
 this bounded installed inspection evidence. The earlier run 57 audio failure,
 full operator behavior and all qualification requirements remain open.
+
+Run 62 returns the Runtime/Exit activation change to the installed journey,
+reusing twelve Browser artifacts. Core browsing, native inspection, stale
+references, viewer reload and cleanup pass. Both decoded-tone probes, before
+and after reload, pass all 39 steady samples. Reload takes 3156 ms and close
+clears all 13 effects in 664 ms. Independent agent review accepts this bounded
+run; ordinary cross-Runtime service approval is still required to prove
+installed activation.
+
+An isolated Linux candidate now has a separately built Runtime and ten native
+providers for the consumer and Exit roles. Its Runtime hash is
+`dac82b80ca03349f32282750e8c515a0f0c70d84f7898d4b36f1deb14a9678ad`.
+Fresh startup exposed a restart-script error: an `already_ready` migration
+creates no rollback, while the script required one. Source `2b640973` corrects
+that case and retains rejection of unproved missing backups. The full Linux
+restart smoke passes, including repeat start, failure cleanup and artifact
+parity. Native binaries were reused for this script repair. Installed Home and
+Services return matching HTTP 200 content; Brave creates a separate test owner,
+opens Browser through Home and checks unsupported-viewer rejection before page
+allocation. This target has no KVM and supplies no local Engine qualification.
+Both owned installations now accept the same private collaboration configuration;
+normal contact acceptance, service approval and remote Browser journeys are next.
+The public live installation remains unchanged.
 
 The preceding image used dependency repair `cbb1e099`, rootfs
 `d03ec02910defddfda432f0897b6f21b178eff52817df2e7b709bec7e1afa5aa`

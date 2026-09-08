@@ -58,12 +58,16 @@ alongside the local, operator and remote journeys.
 
 ### Next executable slices
 
-- **B02.acquire / active / coordinator.** The empty-data-root artifact step
+- **B02.acquire / active / delegated source owner; coordinator integrates.** The empty-data-root artifact step
   acquires no image and reports four missing files. Explicit selection of the
   verified local store installs a matching set without rebuilding. Complete
   Runtime artifact acquisition through the existing package installer and
   repeat the fresh Home journey. A developer-supplied store is useful integration
   evidence but leaves the out-of-box acceptance requirement open.
+  Acquisition and packaging source work now has an independent owner. Reuse
+  verified existing images, prepare a complete compatible package through the
+  Runtime installer, and connect acquisition before local Engine readiness.
+  Published image/helper metadata and large-artifact transport remain dependencies.
 - **B02.startup / verifying / coordinator; independent review pending.**
   Prerequisites: accepted compatibility contract, image `d03ec029`, and reviewed
   installed runs 50-52. Reuse Runtime, native helpers, image and UI unless a
@@ -110,8 +114,12 @@ alongside the local, operator and remote journeys.
   a newer denial against an old approval. Independent source review accepts
   71 Home and 32 Exit tests; matching installed activation is next. The source
   owner proceeds to authenticated Carrier grant admission and bounded
-  revocation. Remote Engine offer/invocation follows. An isolated Linux
-  consumer Runtime build is underway; the Mac/server journey remains unproved.
+  revocation. Remote Engine offer/invocation follows. The isolated Linux
+  consumer/Exit build and installed Home sign-in now pass. Both test
+  installations accept the private collaboration configuration; normal
+  People/Services approval and the Mac/server Browser journey remain unproved.
+  The fresh Linux restart repair `2b640973` passes its active target smoke and
+  installed Home proof with reused native binaries.
 
 ### Time and resource control
 
@@ -130,7 +138,7 @@ requirement. Candidate-only platforms remain explicit in the support matrix;
 the deadline does not change a platform's support verdict.
 
 One coordinator owns the shared Mac Runtime, viewer, VM, builder, ports and
-fixture. The two existing source agents receive separate file scopes and can
+fixture. Three source agents receive separate file scopes and can
 cross-review completed slices. Long jobs on that Mac are scheduled, because
 concurrent mutations would invalidate evidence. Reuse the verified image and
 matching artifacts; inspect standard dependency correctness before adding
