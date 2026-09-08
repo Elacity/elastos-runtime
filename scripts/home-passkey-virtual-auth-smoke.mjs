@@ -2655,6 +2655,18 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
   const run = randomUUID();
   const receiptUrl = `${fixture.origin}/receipt?run=${run}`;
   const result = { schema: "elastos.browser.controlled-journey/v1", run, pages: [] };
+  const openRoutes = new Map();
+  const captureRoute = async response => {
+    if (!/^\/api\/apps\/browser\/open(?:\/[^/]+)?$/.test(new URL(response.url()).pathname)) return;
+    try { if (response.request().frame() !== appFrame) return; } catch { return; }
+    const body = await response.json().catch(() => null);
+    const opened = body?.schema === "elastos.browser.open-result/v1" ? body :
+      body?.schema === "elastos.browser.open-status/v1" && body.status === "completed" ? body.result : null;
+    if (opened?.engine_page?.page_id && openRoutes.size < 16) {
+      openRoutes.set(opened.engine_page.page_id, publicBrowserStreamSession(opened.stream_session));
+    }
+  };
+  page.on("response", captureRoute);
   const readReceipt = async ({ signal } = {}) => {
     const response = await fetch(receiptUrl, { signal: signal || AbortSignal.timeout(5_000) });
     const body = await response.json();
@@ -2679,6 +2691,12 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
     await appFrame.locator("#browser-url").waitFor({ state: "visible", timeout: 15_000 });
     await appFrame.waitForFunction(() => document.querySelector("#browser-url")?.disabled === false,
       null, { timeout: BROWSER_UI_PAGE_ID_TIMEOUT_MS });
+    if (BROWSER_REMOTE_EXIT_ID) {
+      await appFrame.locator("#browser-exit").selectOption(BROWSER_REMOTE_EXIT_ID);
+      assert(await appFrame.locator("#browser-exit").inputValue() === BROWSER_REMOTE_EXIT_ID,
+        "Controlled Browser did not select the requested remote Exit");
+      result.remote_exit_id = BROWSER_REMOTE_EXIT_ID;
+    }
     const settled = failures.filter(entry => {
       const outcome = entry.body?.error?.outcome || entry.body?.outcome;
       return entry.frame === appFrame && entry.open_id && outcome?.schema === "elastos.browser.open-outcome/v1" &&
@@ -2699,6 +2717,13 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
       }, value => value.ok && value.schema === "elastos.browser.page-status/v1" && value.actual_url === url,
       `Runtime navigates to ${name}`, BROWSER_UI_PAGE_ID_TIMEOUT_MS);
       const statusReadyMs = Math.round(performance.now() - navigationStarted);
+      if (BROWSER_REMOTE_EXIT_ID) {
+        const route = await waitForJourneyEvidence(async () => openRoutes.get(status.page_id),
+          value => Boolean(value), "remote Exit open receipt");
+        assert(route.backend === BROWSER_REMOTE_EXIT_ID,
+          "Controlled Browser used a different Exit", { expected: BROWSER_REMOTE_EXIT_ID, route });
+        result.exit_route = route;
+      }
       assert(status.direct_network === false && status.display_session?.media_transport === "runtime_relay" &&
         runtimeRelayIceContractOk(status.display_session), "Controlled Browser lost Runtime relay authority", status);
       await appFrame.waitForFunction(expected => document.querySelector("#browser-url")?.value === expected,
@@ -2813,6 +2838,7 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
     error.details = { stage: smokeStage, ...error.details };
     failure = error;
   } finally {
+    page.off("response", captureRoute);
     await stopInputObservation(Boolean(failure));
     try {
       result.close = await closeControlledBrowserWindow(page, appFrame, windowLocator, token, baseline,
