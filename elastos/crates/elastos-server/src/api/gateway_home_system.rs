@@ -3716,6 +3716,8 @@ pub(super) fn append_home_service_access_notifications(
         if existing_ids.contains(&id) {
             continue;
         }
+        let engine_request = request.service_kind == crate::carrier::ENGINE_SERVICE_KIND
+            && request.service_uri == crate::carrier::ENGINE_SERVICE_URI;
         notifications.unread_count += 1;
         notifications.attention_count += 1;
         notifications.entries.push(HomeNotificationEntrySummary {
@@ -3723,13 +3725,21 @@ pub(super) fn append_home_service_access_notifications(
             source_app: SERVICES_CAPSULE_ID.to_string(),
             kind: "service_access_request".to_string(),
             title: format!(
-                "{} requests your Browser Exit Node",
-                request.requester_display_name
+                "{} requests your {}",
+                request.requester_display_name,
+                if engine_request { "Browser Engine" } else { "Browser Exit Node" }
             ),
-            body: format!(
-                "{} wants to use {}. Approval records your intent; Browser access still requires an installed remote Exit grant.",
-                request.requester_display_name, request.service_display_name
-            ),
+            body: if engine_request {
+                format!(
+                    "{} wants to use {}. Approval allows the requested Browser Engine operations through your Runtime.",
+                    request.requester_display_name, request.service_display_name
+                )
+            } else {
+                format!(
+                    "{} wants to use {}. Approval records your intent; Browser access still requires an installed remote Exit grant.",
+                    request.requester_display_name, request.service_display_name
+                )
+            },
             action_ref: Some(HomeNotificationActionSummary {
                 app: SERVICES_CAPSULE_ID.to_string(),
                 action_id: format!("service-approve-request:{}", request.request_id),

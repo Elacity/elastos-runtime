@@ -8455,6 +8455,66 @@ fn services_engine_offer(fixture: &ServicesContactFixture) -> String {
     )
 }
 
+#[tokio::test]
+async fn test_services_inbox_request_copy_matches_engine_or_exit_and_exact_approval() {
+    for (engine, service_name, offer_name, approval_text) in [
+        (
+            true,
+            "Browser Engine",
+            "Bob's Browser Engine",
+            "Approval allows the requested Browser Engine operations through your Runtime.",
+        ),
+        (
+            false,
+            "Browser Exit Node",
+            "Bob's Browser Exit",
+            "Approval records your intent; Browser access still requires an installed remote Exit grant.",
+        ),
+    ] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+        let (trusted_key, _) = generate_keypair();
+        let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+        let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus, network).await;
+        accept_services_contact_pair(&alice, &bob);
+        let action = if engine {
+            services_contact_pending_engine_request(left.path(), right.path(), &alice, &bob).await
+        } else {
+            services_contact_pending_request(left.path(), right.path(), &alice, &bob).await
+        };
+        let token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+        let (status, inbox) =
+            home_test_get_json(&bob.app, "/api/apps/inbox/summary", &token, "null").await;
+        assert_eq!(status, StatusCode::OK);
+        let entries = inbox["notifications"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["kind"] == "service_access_request")
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1, "{inbox}");
+        let entry = entries[0];
+        assert_eq!(entry["title"], format!("Alice requests your {service_name}"));
+        assert_eq!(
+            entry["body"],
+            format!("Alice wants to use {offer_name}. {approval_text}")
+        );
+        assert_eq!(entry["source_app"], SERVICES_CAPSULE_ID);
+        assert_eq!(entry["action_ref"]["app"], SERVICES_CAPSULE_ID);
+        assert_eq!(entry["action_ref"]["action_id"], action);
+        assert_eq!(
+            entry["id"],
+            format!(
+                "service-access-request:{}",
+                action.strip_prefix("service-approve-request:").unwrap()
+            )
+        );
+        assert_eq!(entry["read"], false);
+    }
+}
+
 async fn services_contact_pending_engine_request(
     left: &std::path::Path,
     right: &std::path::Path,
