@@ -2244,12 +2244,13 @@ window.addEventListener("pagehide", releaseRuntimePageForUnload);
 
 const initialUrl = params.get("url") || DEFAULT_URL;
 addressInput.value = initialUrl;
-updateNavState();
+setLoading(true);
 fetchBrowserSummary()
   .then(() => requestRuntimeOpen(initialUrl, { history: "replace" }))
   .catch((error) => {
     if (isAuthoritySessionError(error) && requestHomeRelaunch(friendlyOpenError(error))) {
       return;
     }
+    setLoading(false);
     showStatus(friendlyOpenError(error), { sticky: true });
   });
