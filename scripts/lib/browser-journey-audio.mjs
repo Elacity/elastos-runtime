@@ -2,6 +2,16 @@
 // the tone; this probe reads decoded PCM and never creates playback audio.
 export function installBrowserJourneyAudioProbe() {
   const elements = [];
+  const peers = [];
+  const NativePeer = window.RTCPeerConnection;
+  if (typeof NativePeer === "function") window.RTCPeerConnection = new Proxy(NativePeer, {
+    construct(target, args, newTarget) {
+      const peer = Reflect.construct(target, args, newTarget);
+      peers.push(peer);
+      if (peers.length > 8) peers.shift();
+      return peer;
+    },
+  });
   const NativeAudio = window.Audio;
   window.Audio = new Proxy(NativeAudio, {
     construct(target, args) {
@@ -22,6 +32,63 @@ export function installBrowserJourneyAudioProbe() {
     const samples = [], started = performance.now();
     const result = { ok: false, samples, track_id: track.id,
       receiver_metrics_before: window.__elastosBrowserRemoteDisplayMetrics || null };
+    const rtp = result.inbound_audio_rtp = { status: "receiver_unavailable", receiver_match_count: 0,
+      requests: 0, samples: [] };
+    let binding, rtpStopped = false, rtpPending = false, nextRtpAt = 0, reportId;
+    try {
+      const matches = peers.flatMap(peer => peer.connectionState === "closed" ? [] :
+        peer.getReceivers().filter(receiver => receiver.track === track).map(receiver => ({ peer, receiver })));
+      rtp.receiver_match_count = matches.length;
+      if (matches.length === 1 && stream.getAudioTracks().length === 1 &&
+          typeof matches[0].receiver.getStats === "function") {
+        binding = matches[0];
+        rtp.status = "observing";
+      }
+    } catch { rtp.status = "receiver_lookup_failed"; }
+    const receiverCurrent = () => audio.srcObject === stream && track.readyState === "live" &&
+      stream.getAudioTracks().length === 1 && stream.getAudioTracks()[0] === track &&
+      binding.peer.connectionState !== "closed" && binding.receiver.track === track &&
+      binding.peer.getReceivers().includes(binding.receiver);
+    // Start at most one query every 200 ms. Never await stats on the PCM path:
+    // a stalled getStats must neither stretch the probe nor alter tone evidence.
+    const sampleRtp = async () => {
+      const requestedAt = performance.now() - started;
+      if (!binding || rtpStopped || rtpPending || requestedAt < nextRtpAt ||
+          requestedAt >= 2500 || rtp.requests >= 13) return;
+      nextRtpAt = requestedAt + 200;
+      rtp.requests++;
+      rtpPending = true;
+      try {
+        if (!receiverCurrent()) { rtp.status = "receiver_changed"; binding = null; return; }
+        const reports = await binding.receiver.getStats();
+        if (rtpStopped || performance.now() - started >= 2500) return;
+        if (!receiverCurrent()) { rtp.status = "receiver_changed"; binding = null; return; }
+        const inbound = [...reports.values()].filter(item => item.type === "inbound-rtp" &&
+          (item.kind === "audio" || item.mediaType === "audio"));
+        const sample = { requested_at_ms: requestedAt, at_ms: performance.now() - started };
+        const item = inbound[0];
+        if (inbound.length !== 1 || (item.trackIdentifier !== undefined && item.trackIdentifier !== track.id)) {
+          sample.status = "report_unavailable";
+        } else if (reportId !== undefined && item.id !== reportId) {
+          sample.status = "report_changed";
+          binding = null;
+        } else {
+          reportId = item.id;
+          sample.status = "observed";
+          // Receiver.getStats scopes reports to this exact track. Keep report IDs,
+          // codecs, candidates and all other nonnumeric fields private.
+          for (const key of ["timestamp", "bytesReceived", "packetsReceived", "packetsLost", "packetsDiscarded",
+            "totalAudioEnergy", "totalSamplesReceived", "totalSamplesDuration", "concealedSamples",
+            "silentConcealedSamples", "concealmentEvents", "jitterBufferDelay", "jitterBufferEmittedCount"]) {
+            if (typeof item[key] === "number" && Number.isFinite(item[key])) sample[key] = item[key];
+          }
+        }
+        rtp.samples.push(sample);
+        rtp.status = sample.status;
+      } catch {
+        if (!rtpStopped && performance.now() - started < 2500) rtp.status = "get_stats_failed";
+      } finally { rtpPending = false; }
+    };
     try {
       await Promise.race([context.resume(), new Promise((_, reject) => {
         resumeTimer = setTimeout(() => reject(new Error("probe context resume timeout")), 3000);
@@ -45,6 +112,7 @@ export function installBrowserJourneyAudioProbe() {
         for (let i = 1; i < spectrum.length; i++) if (spectrum[i] > spectrum[peak]) peak = i;
         samples.push({ at_ms: performance.now() - started, rms: Math.sqrt(energy / pcm.length),
           peak_hz: peak * context.sampleRate / analyser.fftSize });
+        void sampleRtp();
         await new Promise(resolve => setTimeout(resolve, 50));
       }
       Object.assign(result, { ok: true, duration_ms: performance.now() - started,
@@ -56,6 +124,8 @@ export function installBrowserJourneyAudioProbe() {
     } catch (error) {
       Object.assign(result, { stage: "decoded_audio", error: error.message });
     } finally {
+      rtpStopped = true;
+      rtp.pending_at_stop = rtpPending;
       clearTimeout(resumeTimer);
       source?.disconnect();
       analyser?.disconnect();
