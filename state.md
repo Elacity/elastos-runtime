@@ -219,6 +219,38 @@ effects and leaves zero Runtime/control obligations. Run 81 retains its failed
 reload verdict and successful exact cleanup. Run 68 retains its original failure;
 the later reproduction establishes the repaired ordering defect.
 
+Reviewed source `caa5d90f` binds remote Engine preparation, launch, media, input,
+and retirement to Runtime service authority. All 45 focused regressions pass;
+independent review accepts the final source after cancel/launch admission,
+reservation identity and retirement retry repairs. Both task Runtimes are
+installed with matching build and installed hashes. The Mac Runtime is
+`2d3603f65aa418244a321ef6766ae14349cbf9a9e08b0b3ede64b6f549a5324b`;
+the Linux Runtime is
+`06658eef9f0796f081e3a0894c838644a0880e093bb91ad399c467d48e1562fd`.
+Both serve viewer code
+`f42217e02d39983924ab9311633c6a91696d8f8eb635317c3ffe7d185944a6e7`.
+The matching native helpers are reused. The next installed proof uses Linux
+Home, the Mac Engine and the Linux Exit through normal service approval.
+Source acceptance and installation leave remote product qualification open.
+
+Source `6896fee5` supplies an opt-in, 60-second audio queue observer. Independent
+review and matching GStreamer tests accept its bounded counters and detachment;
+media properties are unchanged. A task image adds only the observer and its
+launch flag, while retaining the verified kernel, initrd and native helpers.
+On Runtime `0244cc0c`, diagnostic runs 84/85 pass controlled video, tone,
+navigation, input, reload, native operator handoff and all 13 close effects,
+with zero Runtime/control obligations. Run 84's post-close disk capture misses
+the producer log. Run 85's live capture proves queue-local startup sequence
+gaps, followed by stable measured tone windows. Its receiver records zero new
+loss during both tone checks. This does not explain lifecycle probe 02's
+sustained audio loss; synchronized failure evidence and full media qualification
+remain open. The diagnostic image is an experiment, not a release candidate.
+
+Run 83 retains a failed controlled remote Exit attempt: the selected Exit
+rejects the private fixture address before allocating a page, stream or VM.
+The next controlled fixture uses its task host's public address with the same
+destination restrictions. No firewall or public-live change is made.
+
 Run 77 fails startup with an open conflict whose exact plain-text reason was
 absent from the original evidence. Its native terminal record later confirms all
 13 cleanup effects, outside the failed journey's close bound. Source `64cebf15`

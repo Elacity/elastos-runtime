@@ -97,6 +97,11 @@ alongside the local, operator and remote journeys.
   short probes establish the combined local journey. Diagnose the intermittent
   failures with synchronized producer/receiver evidence during sustained use;
   full media qualification remains open.
+  Reviewed observer `6896fee5` passes source and real GStreamer checks. Installed
+  diagnostic runs 84/85 pass the short combined journey on unchanged media
+  settings. Run 85 localizes startup sequence gaps to the queue, while both
+  measured tone windows stay stable. Keep the sustained failure open; capture
+  producer and receiver timing during a failing run before changing media.
 - **B04.operator-admission / active / delegated source owner.**
   Prerequisite: the accepted owner/page contract and existing Engine CDP access.
   Deliver a bounded, capability-negotiated snapshot of the actual Engine page
@@ -131,6 +136,12 @@ alongside the local, operator and remote journeys.
   implementation requirement is actual framework adapter conformance; repeat
   native admission only when changed inputs or a diagnosed defect require it.
 - **B08/B09.first-remote / active / independent delegated source owner.**
+  Current integration milestone: `caa5d90f` is independently accepted after
+  45 focused tests and installed on both task Runtimes. The coordinator now
+  owns the Linux Home → Mac Engine → Linux Exit journey, including normal
+  service approval, decoded media, controlled input and exact cleanup. The
+  verified helpers and image are reused. Full remote placements and recovery
+  remain open; the following paragraphs retain earlier evidence.
   Prerequisite: accepted Engine/Exit identity and Runtime service contracts.
   Identify the first missing product operation for A/B/A and A/A/B against
   available peers, then repair that component with a bounded regression.
