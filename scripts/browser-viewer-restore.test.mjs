@@ -17,7 +17,7 @@ function summary() {
     cleanup: { schema: 'elastos.browser.cleanup-handle/v1', id: 'cleanup-one' },
     service_selection: { schema: 'elastos.browser.service-selection/v1', engine_id: 'selected-engine', exit_id: 'selected-exit' },
     engine_page: { schema: 'elastos.browser.engine.page/v1', page_id: 'page-one', actual_url: 'https://old.invalid/',
-      adapter: 'actual-engine', display_session: { mode: 'webrtc_remote_display', width: 1280, height: 720 } },
+      adapter: 'actual-engine', display_session: { mode: 'webrtc_remote_display', width: 1280, height: 720, source: 'runtime-recovery', runtime_turn: { generation: 'owned-generation' } } },
   } } };
 }
 function harness() {
@@ -43,7 +43,7 @@ function harness() {
     failRuntimeOwnedPage: async (...args) => { failures.push(args); return { state: 'pending' }; },
     fetchJson: async path => { requests.push(path); return { schema: 'elastos.browser.page-status/v1', page_id: 'page-one',
       actual_url: 'https://current.invalid/form', title: 'Retained form', direct_network: false,
-      display_session: { mode: 'webrtc_remote_display', width: 1280, height: 720, source: 'fresh-status' } }; },
+      display_session: { mode: 'webrtc_remote_display', width: 1280, height: 720, source: 'diagnostic-status', ice_servers: [{ credential_present: true }] } }; },
   });
   for (const name of ['currentRuntimePageOwner', 'recoverableRuntimePage', 'fetchPageStatus', 'restoreRuntimePageViewer', 'settleRemoteDisplayFailure']) {
     vm.runInContext(declaration(name), state);
@@ -64,7 +64,8 @@ test('startup restores exact owner, fresh URL, and Runtime-selected services wit
   assert.deepEqual(h.calls.find(row => row[0] === 'exit'), ['exit', 'selected-exit']);
   const connection = h.calls.find(row => row[0] === 'connect');
   assert.equal(connection[2], 'https://current.invalid/form');
-  assert.equal(connection[3].source, 'fresh-status');
+  assert.equal(connection[3], original.sessions.recoverable_page.engine_page.display_session);
+  assert.equal(connection[3].runtime_turn.generation, 'owned-generation');
   assert.deepEqual(h.failures, []);
 });
 
@@ -184,3 +185,11 @@ for (const flag of ['unloadCleanupStarted', 'homeWindowCloseInFlight', 'homeWind
     assert.equal(h.state.currentPage, null);
   });
 }
+
+test('diagnostic status cannot replace missing recovered display authority', async () => {
+  const h = harness(), value = summary(); delete value.sessions.recoverable_page.engine_page.display_session;
+  await assert.rejects(h.restore(value), /could not restore the Browser display/);
+  assert.equal(h.state.currentPage.runtime_cleanup.id, 'cleanup-one');
+  assert.equal(h.calls.some(row => row[0] === 'connect'), false);
+  assert.deepEqual(h.failures, []);
+});

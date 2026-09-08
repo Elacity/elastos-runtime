@@ -2345,9 +2345,10 @@ async function restoreRuntimePageViewer(summary) {
   showStatus("Restoring the Browser display...", { sticky: true });
   startPageHeartbeat();
   try {
-    const status = await fetchPageStatus({ history: "replace", forceAddress: true });
+    await fetchPageStatus({ history: "replace", forceAddress: true });
     if (unloadCleanupStarted || !sameRuntimePageOwner(currentRuntimePageOwner(), owner)) return true;
-    const display = status?.display_session || currentPage.display_session;
+    // Page status is diagnostic; the recovered page retains Runtime display authority.
+    const display = currentPage.display_session;
     if (display?.mode !== "webrtc_remote_display") {
       throw new Error("Runtime could not restore the Browser display.");
     }
