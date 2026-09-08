@@ -394,11 +394,6 @@ impl Runtime {
         provider.stop(handle).await
     }
 
-    /// Check if a capsule type is supported by any provider
-    pub fn supports_capsule_type(&self, capsule_type: &CapsuleType) -> bool {
-        self.get_provider(capsule_type).is_some()
-    }
-
     /// Register a running capsule with the runtime
     ///
     /// This is used by external code (like main.rs for MicroVM capsules) to
@@ -421,21 +416,6 @@ impl Runtime {
     pub async fn list_capsules(&self) -> Vec<RunningCapsuleInfo> {
         let capsules = self.running_capsules.read().await;
         capsules.values().cloned().collect()
-    }
-
-    /// Get a specific capsule by ID
-    pub async fn get_capsule(&self, id: &str) -> Option<RunningCapsuleInfo> {
-        let capsules = self.running_capsules.read().await;
-        capsules.get(id).cloned()
-    }
-
-    /// Update a capsule's status
-    pub async fn update_capsule_status(&self, id: &str, status: &str) {
-        let mut capsules = self.running_capsules.write().await;
-        if let Some(info) = capsules.get_mut(id) {
-            info.status = status.to_string();
-            tracing::debug!("Updated capsule {} status to: {}", id, status);
-        }
     }
 
     /// Stop a capsule by its ID

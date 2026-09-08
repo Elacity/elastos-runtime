@@ -819,9 +819,6 @@ impl RuntimeClient {
         Ok(resp_envelope.response)
     }
 
-    /// Default timeout for `call_with_timeout` (30 seconds).
-    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-
     /// Get runtime info
     pub fn get_runtime_info(&mut self) -> io::Result<(String, usize)> {
         match self.call(RuntimeRequest::GetRuntimeInfo)? {

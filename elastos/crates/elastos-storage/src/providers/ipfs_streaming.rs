@@ -398,42 +398,6 @@ impl IpfsStreamingProvider {
 
         Ok(())
     }
-
-    /// Download and verify a file using block-level CID verification
-    ///
-    /// This downloads as CAR (Content Addressable aRchive) format which includes
-    /// block CIDs for verification during download.
-    pub async fn download_verified(
-        &self,
-        cid: &str,
-        dest: &Path,
-        progress: Option<StreamingProgress>,
-    ) -> Result<()> {
-        // For now, use regular streaming download
-        // CAR-based verification would require additional dependencies (iroh-car)
-        // and is more complex to implement correctly
-        //
-        // The content-addressed nature of IPFS already provides integrity:
-        // - The CID is a cryptographic hash of the content
-        // - If we get different content, it would have a different CID
-        // - Gateways verify this internally
-        //
-        // For production use with untrusted gateways, we could:
-        // 1. Download as CAR and verify block CIDs
-        // 2. Hash the final file and compare to CID
-        // 3. Use a local IPFS node (most secure)
-
-        self.download_streaming(cid, dest, progress).await?;
-
-        // Optionally verify by hashing the downloaded file
-        // This adds overhead for 2GB files, so we skip it for now
-        // In production, consider:
-        // - Using local IPFS node which verifies internally
-        // - Adding optional hash verification flag
-        // - Using CAR format for streaming verification
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]

@@ -46,25 +46,10 @@ pub struct DocumentsDocumentView {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct DocumentsCreateRequest {
-    #[serde(default)]
-    pub title: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct DocumentsSaveRequest {
     pub title: String,
     pub body: String,
     pub if_revision: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DocumentsSaveAsRequest {
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub file_name: Option<String>,
-    pub body: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

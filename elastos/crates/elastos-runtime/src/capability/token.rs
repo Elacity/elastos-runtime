@@ -31,17 +31,6 @@ impl TokenId {
     pub fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
-
-    /// Create from hex string
-    pub fn from_hex(hex_str: &str) -> Result<Self, String> {
-        let bytes = hex::decode(hex_str).map_err(|e| format!("Invalid hex: {}", e))?;
-        if bytes.len() != 16 {
-            return Err(format!("Expected 16 bytes, got {}", bytes.len()));
-        }
-        let mut arr = [0u8; 16];
-        arr.copy_from_slice(&bytes);
-        Ok(Self(arr))
-    }
 }
 
 impl Default for TokenId {
