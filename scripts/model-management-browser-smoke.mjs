@@ -26,7 +26,7 @@ let delayCatalog = null;
 const fixtureErrors = [];
 function preparation() {
   return phase === "unprepared" ? null : { operation_id: operation, cid: selectedCid, state: phase,
-    total_bytes: 1024, completed_bytes: phase === "admitted" ? 1024 : 256,
+    total_bytes: 1024, completed_bytes: phase === "capacity_pending" ? 0 : ["admitted", "reclaimed"].includes(phase) ? 1024 : 256,
     cancel_requested: false, admitted: phase === "admitted", activation_pending: false };
 }
 function runtime() {
@@ -121,6 +121,19 @@ try {
     await frame.getByRole("button", { name: "Models", exact: true }).click({ timeout: 3000 });
     await frame.getByRole("heading", { name: "Fixture model", exact: true }).waitFor();
     assert.match(await frame.locator("[data-model-management]").innerText(), /did:key:zFixturePublisher/);
+    phase = "capacity_pending";
+    await frame.getByRole("button", { name: "Refresh models" }).click();
+    await frame.getByText("Waiting for local capacity…", { exact: true }).waitFor();
+    assert.equal(await frame.getByRole("button", { name: "Cancel preparation" }).count(), 1);
+    assert.equal(calls.filter(c => c.method === "content.use").length, 0, "pending status never starts another Use");
+    phase = "reclaimed";
+    await frame.getByRole("button", { name: "Refresh models" }).click();
+    await frame.getByText("Model removed from local cache.", { exact: true }).waitFor();
+    assert.equal(await frame.getByRole("button", { name: "Use", exact: true }).isEnabled(), true);
+    assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).isEnabled(), false);
+    phase = "unprepared";
+    await frame.getByRole("button", { name: "Refresh models" }).click();
+    await frame.getByText("Not prepared", { exact: true }).waitFor();
     let releaseUse;
     const useReceived = new Promise(resolveUse => { delayUse = reply => { releaseUse = reply; resolveUse(); }; });
     await frame.getByRole("button", { name: "Use", exact: true }).evaluate(button => { button.click(); button.click(); });

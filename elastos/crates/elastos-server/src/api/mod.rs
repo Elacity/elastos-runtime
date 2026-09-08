@@ -12,7 +12,9 @@ pub mod browser_sessions;
 pub(crate) mod capsule_inventory;
 // Runtime startup composition; this is not a capsule operation or HTTP route.
 #[cfg(unix)]
-pub use capsule_inventory::preparation::append_admitted_model_startup_offers;
+pub use capsule_inventory::preparation::{
+    append_admitted_model_startup_offers, settle_pending_model_startup,
+};
 pub mod gateway;
 pub(crate) mod gateway_local_control;
 pub mod handlers;

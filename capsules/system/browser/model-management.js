@@ -1,8 +1,8 @@
 /* Shared model presentation. Runtime owns admission, execution and retention. */
 (() => {
   const CID = /^bafybei[a-z2-7]{52}$/;
-  const STATES = new Set(["reserved", "preparing", "verifying", "admission_pending", "admitted", "failed", "uncertain", "cancelled", "expired"]);
-  const active = p => p && ["reserved", "preparing", "verifying", "admission_pending", "uncertain"].includes(p.state);
+  const STATES = new Set(["capacity_pending", "reserved", "preparing", "verifying", "admission_pending", "admitted", "reclaimed", "failed", "uncertain", "cancelled", "expired"]);
+  const active = p => p && ["capacity_pending", "reserved", "preparing", "verifying", "admission_pending", "uncertain"].includes(p.state);
   const text = (v, max = 256) => typeof v === "string" && v.length > 0 && v.length <= max && !/[\u0000-\u001f]/.test(v);
   function check(ok) { if (!ok) throw new Error("Invalid model response"); }
   function parseRuntime(r, cid) {
@@ -203,15 +203,15 @@
         row.append(element("h2", model.title), element("p", `Verified publisher: ${model.publisher_did}`),
           element("p", `Content ID: ${model.cid}`, "model-identity"), element("p", `${model.content_size_bytes.toLocaleString()} bytes`));
         const label = message ? "Current status unavailable" : r.dispatch_ready ? "Ready to use" : r.admitted ? "Prepared. The model offer is unavailable."
-          : active(p) ? (p.cancel_requested ? "Cancelling preparation…" : p.state === "uncertain" ? "Waiting for preparation to settle…" : "Preparing…")
-            : p ? ({ cancelled: "Preparation cancelled.", failed: "Preparation failed.", expired: "Preparation expired." }[p.state] || "Waiting to prepare…") : "Not prepared";
+          : active(p) ? (p.cancel_requested ? "Cancelling preparation…" : p.state === "capacity_pending" ? "Waiting for local capacity…" : p.state === "uncertain" ? "Waiting for preparation to settle…" : "Preparing…")
+            : p ? ({ reclaimed: "Model removed from local cache.", cancelled: "Preparation cancelled.", failed: "Preparation failed.", expired: "Preparation expired." }[p.state] || "Waiting to prepare…") : "Not prepared";
         row.append(element("p", label));
         if (active(p)) {
           const progress = element("progress"); progress.max = p.total_bytes || 1; progress.value = p.completed_bytes;
           progress.setAttribute("aria-label", "Preparation progress"); row.append(progress, element("p", `${p.completed_bytes.toLocaleString()} of ${p.total_bytes.toLocaleString()} bytes`));
         }
         const controls = element("div", "", "model-controls");
-        const use = button(p || unresolvedUse ? "Retry" : "Use", () => void act("use"), active(p) || reconcileRequired);
+        const use = button((p && p.state !== "reclaimed") || unresolvedUse ? "Retry" : "Use", () => void act("use"), active(p) || reconcileRequired);
         use.dataset.modelControl = "use";
         if (!active(p) && !r.dispatch_ready) controls.append(use);
         if (active(p)) { const cancel = button("Cancel preparation", () => void act("cancel"), p.cancel_requested || reconcileRequired); cancel.dataset.modelControl = "cancel"; controls.append(cancel); }

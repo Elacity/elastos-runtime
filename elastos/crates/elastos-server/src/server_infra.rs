@@ -853,20 +853,32 @@ async fn setup_server_infrastructure_impl(
         Ok(Some(path)) => {
             match model_provider_startup_config(&data_dir, &provider_registry).await {
                 Ok((model_config, worker)) => {
-                    match provider::ProviderBridge::spawn(&path, model_config).await {
+                    match provider::ProviderBridge::spawn(&path, model_config.clone()).await {
                         Ok(bridge) => {
                             let bridge = Arc::new(bridge);
-                            match start_model_provider(
-                                &provider_registry,
-                                bridge,
-                                MODEL_PROVIDER_STATUS_TIMEOUT,
-                            )
-                            .await
-                            {
+                            let startup = async {
+                                #[cfg(unix)]
+                                api::settle_pending_model_startup(
+                                    &data_dir,
+                                    &bridge,
+                                    &model_config,
+                                    worker.as_ref(),
+                                )
+                                .await?;
+                                start_model_provider(
+                                    &provider_registry,
+                                    bridge.clone(),
+                                    MODEL_PROVIDER_STATUS_TIMEOUT,
+                                )
+                                .await
+                            }
+                            .await;
+                            match startup {
                                 Ok(()) => {
                                     tracing::info!("model-provider capsule from {}", path.display())
                                 }
                                 Err(_) => {
+                                    let _ = bridge.shutdown().await;
                                     tracing::warn!("Skipping model-provider because startup failed")
                                 }
                             }

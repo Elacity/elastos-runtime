@@ -266,6 +266,43 @@ impl Inventory {
             "preparation state exceeds its byte bound"
         );
         self.check_loaded()?;
+        let previous = self.snapshot()?;
+        for owner in previous.records.iter().filter(|r| r.activation.is_some()) {
+            ensure!(
+                state
+                    .records
+                    .iter()
+                    .any(|r| r.operation_id == owner.operation_id
+                        && r.activation == owner.activation),
+                "original activation binding changed"
+            );
+        }
+        if let Some(retirement) = &previous.retirement {
+            match &state.retirement {
+                Some(next) => ensure!(
+                    next.operation_id == retirement.operation_id
+                        && next.admission_id == retirement.admission_id
+                        && (retirement.phase == super::RetirementPhase::WithdrawalPending
+                            || next.phase == super::RetirementPhase::Withdrawn),
+                    "retirement target changed"
+                ),
+                None => ensure!(
+                    retirement.phase == super::RetirementPhase::Withdrawn
+                        && state
+                            .records
+                            .iter()
+                            .filter(|r| r.admission_id == retirement.admission_id)
+                            .all(|r| matches!(
+                                r.state,
+                                super::PreparationState::Reclaimed
+                                    | super::PreparationState::Cancelled
+                                    | super::PreparationState::Expired
+                                    | super::PreparationState::Failed
+                            ) && r.reserved_bytes == 0),
+                    "unresolved retirement removed"
+                ),
+            }
+        }
         let mut next = open_at(
             &self.dir,
             NEXT,
@@ -314,6 +351,11 @@ impl Inventory {
 
     pub(super) fn require_space(&self, reserved_bytes: u64) -> anyhow::Result<()> {
         require_available_space(&self.dir, reserved_bytes)
+    }
+
+    pub(super) fn space_fits(&self, reserved_bytes: u64) -> anyhow::Result<bool> {
+        let (capacity, available, required) = space_observation(&self.dir, reserved_bytes)?;
+        space_floor_fits(capacity, available, required)
     }
 
     pub(super) fn volume(&self) -> anyhow::Result<u64> {
@@ -411,6 +453,30 @@ impl Inventory {
             }
             Err(err) if missing(&err) => Ok(()),
             Err(err) => Err(err),
+        }
+    }
+
+    // Only a durable withdrawn retirement may call this idempotent removal.
+    pub(super) fn remove_admitted(&self, id: &str) -> anyhow::Result<()> {
+        self.revalidate()?;
+        let name = CString::new(format!("admitted-{id}"))?;
+        ensure!(admitted_name(name.to_str()?), "invalid admission identity");
+        match self.admitted(id) {
+            Ok(stage) => {
+                stage.validate_tree(&mut 300)?;
+                stage.remove_contents()?;
+                stage.check()?;
+                if unsafe {
+                    libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
+                } != 0
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                self.dir.sync_all()?;
+                self.revalidate()
+            }
+            Err(error) if missing(&error) => Ok(()),
+            Err(error) => Err(error),
         }
     }
 }
@@ -613,6 +679,11 @@ impl Stage {
 }
 
 fn require_available_space(dir: &File, reserved_bytes: u64) -> anyhow::Result<()> {
+    let (capacity, available, required) = space_observation(dir, reserved_bytes)?;
+    require_space_floor(capacity, available, required)
+}
+
+fn space_observation(dir: &File, reserved_bytes: u64) -> anyhow::Result<(u128, u128, u128)> {
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     if unsafe { libc::fstatvfs(dir.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -629,7 +700,22 @@ fn require_available_space(dir: &File, reserved_bytes: u64) -> anyhow::Result<()
         .checked_add(u128::from(MAX_STATE_BYTES) * 2)
         .and_then(|bytes| bytes.checked_add(unit.checked_mul(4)?))
         .context("preparation disk reservation overflow")?;
-    require_space_floor(capacity, available, required)
+    Ok((capacity, available, required))
+}
+
+pub(super) fn space_floor_fits(
+    capacity: u128,
+    available: u128,
+    reserved: u128,
+) -> anyhow::Result<bool> {
+    ensure!(
+        capacity > 0 && available <= capacity,
+        "invalid preparation disk capacity"
+    );
+    let Some(remaining) = available.checked_sub(reserved) else {
+        return Ok(false);
+    };
+    Ok(remaining.checked_mul(10).context("disk floor overflow")? >= capacity)
 }
 
 pub(super) fn require_space_floor(
@@ -637,15 +723,10 @@ pub(super) fn require_space_floor(
     available: u128,
     reserved: u128,
 ) -> anyhow::Result<()> {
+    let fits = space_floor_fits(capacity, available, reserved)?;
+    ensure!(available >= reserved, "insufficient preparation space");
     ensure!(
-        capacity > 0 && available <= capacity,
-        "invalid preparation disk capacity"
-    );
-    let remaining = available
-        .checked_sub(reserved)
-        .context("insufficient preparation space")?;
-    ensure!(
-        remaining.checked_mul(10).context("disk floor overflow")? >= capacity,
+        fits,
         "preparation requires ten percent free space after reservation"
     );
     Ok(())

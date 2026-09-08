@@ -1191,10 +1191,14 @@ impl ProviderRegistry {
         {
             return Err(unavailable());
         }
-        let response = provider.send_raw(&request).await.map_err(|error| {
-            tracing::debug!(?error, "private model activation failed");
-            unavailable()
-        })?;
+        let response =
+            tokio::time::timeout(super::bridge::REQUEST_TIMEOUT, provider.send_raw(&request))
+                .await
+                .map_err(|_| unavailable())?
+                .map_err(|error| {
+                    tracing::debug!(?error, "private model activation failed");
+                    unavailable()
+                })?;
         let data = &response["data"];
         if response["status"] != "ok"
             || data["provider"] != "model-provider"
@@ -1227,9 +1231,10 @@ impl ProviderRegistry {
             let offers = data["offers"].as_array().ok_or_else(unavailable)?;
             if response.as_object().is_none_or(|object| object.len() != 2)
                 || response["status"] != "ok"
-                || data.as_object().is_none_or(|object| object.len() != 3)
+                || data.as_object().is_none_or(|object| object.len() != 4)
                 || data["schema"] != "elastos.model.offers-list/v1"
                 || data["provider"] != "model-provider"
+                || data["protocol_version"] != "elastos.model-provider/v1"
                 || offers.len() > 64
             {
                 return Err(unavailable());
@@ -2694,7 +2699,8 @@ mod tests {
             .await
             .unwrap();
         let valid = serde_json::json!({"status":"ok", "data":{
-            "schema":"elastos.model.offers-list/v1", "provider":"model-provider", "offers":[]
+            "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
+            "protocol_version":"elastos.model-provider/v1", "offers":[]
         }});
         *provider.response.lock().await = Some(valid.clone());
         assert_eq!(
@@ -2704,6 +2710,8 @@ mod tests {
         for (field, value) in [
             ("schema", serde_json::json!("unknown")),
             ("provider", serde_json::json!("other")),
+            ("protocol_version", serde_json::json!("unknown")),
+            ("protocol_version", serde_json::Value::Null),
             (
                 "offers",
                 serde_json::json!(vec![serde_json::Value::Null; 65]),
@@ -2715,6 +2723,13 @@ mod tests {
             *provider.response.lock().await = Some(response);
             assert!(registry.local_model_offers().await.is_err(), "{field}");
         }
+        let mut missing_protocol = valid.clone();
+        missing_protocol["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol_version");
+        *provider.response.lock().await = Some(missing_protocol);
+        assert!(registry.local_model_offers().await.is_err());
         *provider.response.lock().await =
             Some(serde_json::json!({"status":"error", "error":"/private/model"}));
         let error = registry.local_model_offers().await.unwrap_err().to_string();
@@ -2810,6 +2825,31 @@ mod tests {
                 .to_string(),
             ProviderError::Provider("model activation pending".into()).to_string()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_refresh_withheld_init_reply_is_bounded_and_keeps_slot() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = Arc::new(PrivateIpfsMock::default());
+        provider.hold.store(true, Ordering::Release);
+        registry
+            .register_sub_provider("model", provider.clone())
+            .await
+            .unwrap();
+        let executing = registry.clone();
+        let pending = tokio::spawn(async move {
+            executing
+                .refresh_local_model_configuration(&super::super::BridgeProviderConfig::default())
+                .await
+        });
+        provider.entered.notified().await;
+        assert!(registry.sub_providers.try_write().is_err());
+        tokio::time::advance(super::super::bridge::REQUEST_TIMEOUT).await;
+        assert!(pending.await.unwrap().is_err());
+        assert!(Arc::ptr_eq(
+            &registry.get_sub_provider("model").await.unwrap(),
+            &(provider.clone() as Arc<dyn Provider>)
+        ));
     }
 
     #[tokio::test]
