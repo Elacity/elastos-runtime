@@ -348,6 +348,11 @@ pub(crate) async fn call(
     operation: &str,
     mut request: Value,
 ) -> Result<Value> {
+    let operation = super::browser_engine_binding::EXECUTION_OPERATIONS
+        .iter()
+        .copied()
+        .find(|supported| *supported == operation)
+        .context("Engine operation unsupported")?;
     anyhow::ensure!(
         grant["operations"]
             .as_array()
@@ -383,13 +388,123 @@ pub(crate) async fn call(
                 }),
             }),
         })
-        .await?;
+        .await
+        .map_err(|_| {
+            // Provider errors can contain private tickets or backend details.
+            // Preserve the fixed operation and stage at this public boundary.
+            tracing::warn!(
+                operation,
+                stage = "carrier_provider_invocation",
+                "Remote Engine call failed"
+            );
+            anyhow::anyhow!("Remote Engine {operation} failed at carrier_provider_invocation")
+        })?;
     Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EngineCallInvoker {
+        fail: bool,
+        calls: std::sync::Mutex<Vec<ProviderInvocation>>,
+    }
+
+    #[async_trait::async_trait]
+    impl elastos_runtime::provider::ProviderCarrierInvoker for EngineCallInvoker {
+        async fn invoke_carrier_provider(
+            &self,
+            _: &ProviderCarrierRoute,
+            invocation: &ProviderInvocation,
+            _: Value,
+        ) -> std::result::Result<Value, elastos_runtime::provider::ProviderError> {
+            self.calls.lock().unwrap().push(invocation.clone());
+            if self.fail {
+                Err(elastos_runtime::provider::ProviderError::Provider(
+                    "Carrier provider invocation failed: ticket[0] connect failed; ticket:private-secret turn:private-credential".into(),
+                ))
+            } else {
+                Ok(json!({"status":"ok","data":{"receipt":"unchanged"}}))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_call_failure_identifies_operation_without_provider_secrets() {
+        let registry = ProviderRegistry::new();
+        let invoker = Arc::new(EngineCallInvoker {
+            fail: true,
+            calls: Default::default(),
+        });
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let grant = json!({"peer_did":iroh::SecretKey::from_bytes(&[19;32]).public().to_string(),
+            "connect_ticket":"ticket:private-secret","grant_id":"grant:approved","principal_id":"consumer",
+            "operations":super::super::browser_engine_binding::EXECUTION_OPERATIONS});
+        for operation in super::super::browser_engine_binding::EXECUTION_OPERATIONS {
+            let error = call(&registry, &grant, operation, json!({}))
+                .await
+                .unwrap_err();
+            let expected =
+                format!("Remote Engine {operation} failed at carrier_provider_invocation");
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(format!("{error:#}"), expected);
+        }
+        let calls = invoker.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            super::super::browser_engine_binding::EXECUTION_OPERATIONS.len()
+        );
+        for (invocation, operation) in calls
+            .iter()
+            .zip(super::super::browser_engine_binding::EXECUTION_OPERATIONS)
+        {
+            assert_eq!(invocation.op, *operation);
+            assert_eq!(invocation.source, "browser");
+            assert_eq!(invocation.target, "browser-engine");
+            assert_eq!(invocation.request["grant_id"], "grant:approved");
+            assert_eq!(invocation.request["principal_id"], "consumer");
+            let ProviderInvocationTransport::Carrier(route) = &invocation.transport else {
+                panic!("Expected Carrier transport");
+            };
+            assert_eq!(
+                route.timeout_ms(),
+                Some(if matches!(*operation, "prepare_launch" | "launch") {
+                    60_000
+                } else {
+                    5_000
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_call_keeps_success_and_rejects_unapproved_or_unknown_operations() {
+        let registry = ProviderRegistry::new();
+        let invoker = Arc::new(EngineCallInvoker {
+            fail: false,
+            calls: Default::default(),
+        });
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let mut grant = json!({"peer_did":iroh::SecretKey::from_bytes(&[20;32]).public().to_string(),
+            "connect_ticket":"ticket:private-secret","grant_id":"grant:approved","principal_id":"consumer",
+            "operations":["readiness","private-unknown-operation"]});
+        let result = call(&registry, &grant, "readiness", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["data"], json!({"receipt":"unchanged"}));
+        let error = call(&registry, &grant, "private-unknown-operation", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Engine operation unsupported");
+        grant["operations"] = json!([]);
+        let error = call(&registry, &grant, "launch", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Engine operation was not approved");
+        assert_eq!(invoker.calls.lock().unwrap().len(), 1);
+    }
 
     #[test]
     fn engine_grant_binds_endpoint_principal_revision_expiry_and_read_only_operations() {
