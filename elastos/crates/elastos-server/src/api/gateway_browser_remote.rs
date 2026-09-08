@@ -918,20 +918,29 @@ async fn supervise(page: Arc<ServedPage>) {
             return;
         }
         let stale = page.last_seen.lock().await.elapsed() >= Duration::from_secs(50);
-        let current = if stale {
-            false
+        let retirement_reason = if stale {
+            Some("owner_heartbeat_expired")
         } else {
             let root = page.gateway.data_dir.clone();
             let network = page.network.clone();
             let owner = page.owner.clone();
-            tokio::time::timeout(Duration::from_secs(1), tokio::task::spawn_blocking(move || {
+            let observation = tokio::time::timeout(Duration::from_secs(1), tokio::task::spawn_blocking(move || {
                 let source = owner.requester_endpoint.parse::<iroh::PublicKey>().ok()?;
                 let current = crate::api::gateway::authorize_home_service_engine(&root, &network, &source,
                     &json!({"op":"page_status","principal_id":owner.requester_principal_id,"grant_id":owner.grant_id}), now_ts()).ok()?;
                 (current.revision == owner.grant_revision && current.execution_allowed).then_some(())
-            })).await.is_ok_and(|result| result.is_ok_and(|result| result.is_some()))
+            })).await;
+            match observation {
+                Ok(Ok(Some(()))) => None,
+                Ok(Ok(None)) => Some("authority_rejected_or_changed"),
+                Ok(Err(_)) => Some("authority_worker_failed"),
+                Err(_) => Some("authority_observation_deadline"),
+            }
         };
-        if !current {
+        if let Some(reason) = retirement_reason {
+            if !page.closing.load(Ordering::Acquire) {
+                tracing::warn!(reason, "Remote Engine owner retired");
+            }
             page.closing.store(true, Ordering::Release);
         }
         if page.closing.load(Ordering::Acquire) {

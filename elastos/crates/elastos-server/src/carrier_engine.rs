@@ -159,6 +159,7 @@ pub(super) async fn invoke(
 ) -> Value {
     let operation = data["operation"].as_str().unwrap_or_default();
     if !matches!(operation, "status" | "readiness") || data["request"].get("page_id").is_some() {
+        let mut stage = "execution_envelope";
         let outcome = async {
             anyhow::ensure!(
                 serde_json::to_vec(data)?.len() <= 256 * 1024
@@ -168,6 +169,7 @@ pub(super) async fn invoke(
                     && super::browser_engine_binding::EXECUTION_OPERATIONS.contains(&operation),
                 "Engine execution envelope invalid"
             );
+            stage = "invocation_contract";
             super::validate_carrier_provider_invocation(
                 "browser",
                 "browser-engine",
@@ -177,6 +179,7 @@ pub(super) async fn invoke(
             )
             .map_err(anyhow::Error::msg)?;
             if operation == "close_page" && data["request"]["cancel_preparation"] == true {
+                stage = "cancellation_authority";
                 let root = data_dir.to_owned();
                 let request = data["request"].clone();
                 tokio::time::timeout(
@@ -190,6 +193,7 @@ pub(super) async fn invoke(
                 .await
                 .context("Engine cancellation authority deadline")???;
             }
+            stage = "grant_authority";
             let grant = if matches!(operation, "close_page" | "status") {
                 None
             } else {
@@ -205,6 +209,7 @@ pub(super) async fn invoke(
                     .await?,
                 )
             };
+            stage = "runtime_operation";
             let response = crate::api::gateway::invoke_remote_browser_engine(
                 data_dir,
                 registry.clone(),
@@ -218,6 +223,7 @@ pub(super) async fn invoke(
             )
             .await?;
             if let Some(grant) = grant {
+                stage = "post_operation_authority";
                 anyhow::ensure!(
                     read_authority(
                         data_dir,
@@ -232,7 +238,7 @@ pub(super) async fn invoke(
             }
             Ok::<_, anyhow::Error>(response)
         };
-        return match tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             Duration::from_secs(if matches!(operation, "prepare_launch" | "launch") {
                 55
             } else {
@@ -240,12 +246,11 @@ pub(super) async fn invoke(
             }),
             outcome,
         )
-        .await
-        {
+        .await;
+        return match outcome {
             Ok(Ok(result)) => json!({"ok":true,"result":result}),
-            _ => {
-                json!({"ok":false,"code":"browser_engine_unavailable","error":"Runtime Engine operation is unavailable or pending settlement"})
-            }
+            Ok(Err(_)) => execution_failure(operation, stage, "rejected"),
+            Err(_) => execution_failure(operation, stage, "deadline"),
         };
     }
     let outcome = async {
@@ -323,6 +328,34 @@ pub(super) async fn invoke(
         _ => json!({"ok":false,"code":"browser_engine_unavailable",
             "error":"Runtime Engine grant or readiness is unavailable"}),
     }
+}
+
+fn execution_failure(operation: &str, stage: &str, outcome: &str) -> Value {
+    // Fixed contract labels identify the boundary without logging provider
+    // errors, request fields, tickets or native host paths.
+    let operation = super::browser_engine_binding::EXECUTION_OPERATIONS
+        .iter()
+        .copied()
+        .find(|supported| *supported == operation)
+        .unwrap_or("unsupported");
+    let stage = match stage {
+        "execution_envelope"
+        | "invocation_contract"
+        | "cancellation_authority"
+        | "grant_authority"
+        | "runtime_operation"
+        | "post_operation_authority" => stage,
+        _ => "unknown",
+    };
+    let outcome = if outcome == "deadline" {
+        "deadline"
+    } else {
+        "rejected"
+    };
+    tracing::warn!(operation, stage, outcome, "Remote Engine execution failed");
+    json!({"ok":false,"code":"browser_engine_unavailable",
+        "error":"Runtime Engine operation is unavailable or pending settlement",
+        "operation":operation,"stage":stage,"outcome":outcome})
 }
 
 pub(crate) async fn probe(
@@ -405,6 +438,21 @@ pub(crate) async fn call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_execution_failure_keeps_only_fixed_diagnostic_labels() {
+        let value = execution_failure("input", "runtime_operation", "deadline");
+        assert_eq!(value["operation"], "input");
+        assert_eq!(value["stage"], "runtime_operation");
+        assert_eq!(value["outcome"], "deadline");
+        assert_eq!(value["ok"], false);
+        let value = execution_failure("ticket:private", "/private/host", "secret");
+        assert_eq!(value["operation"], "unsupported");
+        assert_eq!(value["stage"], "unknown");
+        assert_eq!(value["outcome"], "rejected");
+        assert!(!value.to_string().contains("private"));
+        assert!(!value.to_string().contains("secret"));
+    }
 
     struct EngineCallInvoker {
         fail: bool,
