@@ -2,6 +2,13 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+control_only=0
+if [[ "$#" == 1 && "$1" == "--control-only" ]]; then
+  control_only=1
+elif [[ "$#" != 0 ]]; then
+  echo "usage: browser-selkies-control-service-smoke.sh [--control-only]" >&2
+  exit 2
+fi
 tmp_dir="$(mktemp -d)"
 selkies_pid=""
 cdp_pid=""
@@ -2344,10 +2351,46 @@ if (response.accepted !== true || response.direct_network !== false) throw new E
 if (inserted !== "Paste Text 123") throw new Error(`paste_text did not use CDP Input.insertText: ${inserted}`);
 ' "$paste_response" "$tmp_dir/fake-cdp-ready.json.inserted-text"
 
+if [[ "$control_only" == 1 ]]; then
+  printf '%s\n' '{"schema":"elastos.browser.selkies-control-service-smoke/v1","ok":true,"scope":"control-service","adapter_cleanup_verified":false}'
+  exit 0
+fi
+
+# The shared control bridge owns page channels. This smoke owns Chromium,
+# Selkies, and the proxy, so the bridge cannot certify their terminal cleanup.
+# Keep the product display checks and require the adapter to reject that
+# incomplete close response instead of inventing a supervisor receipt here.
+preflight_status=0
 scripts/browser-selkies-target-preflight.sh \
   --out-dir "$tmp_dir/target-preflight" \
   --control-socket "$tmp_dir/target-preflight.sock" \
   --runtime-fetch-proxy-url "http://127.0.0.1:$runtime_proxy_port" \
   --selkies-ws-url "ws://127.0.0.1:$selkies_port/signaling" \
   --browser-cdp-endpoint "http://127.0.0.1:$cdp_port" \
-  --ice-server "stun:stun.example.invalid:3478" >/dev/null
+  --ice-server "stun:stun.example.invalid:3478" \
+  >"$tmp_dir/target-preflight.stdout" 2>"$tmp_dir/target-preflight.stderr" || preflight_status=$?
+if ! "$node_bin" - "$preflight_status" "$tmp_dir/target-preflight.stderr" <<'NODE'
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const [status, stderrPath] = process.argv.slice(2);
+const stderr = fs.readFileSync(stderrPath, "utf8");
+// The unchanged display smoke reports each failed response as JSON and throws
+// its first failure after shutdown. Require close to be the only failing gate.
+const responses = [...stderr.matchAll(/^\{[\s\S]*?^\}/gm)].map(match => JSON.parse(match[0]));
+assert.equal(Number(status), 1, "shared bridge preflight must fail at terminal cleanup");
+assert.deepEqual(responses, [{
+  status: "error",
+  code: "engine_close_indeterminate",
+  message: "Browser supervisor did not return an exact typed terminal cleanup receipt",
+}]);
+assert.deepEqual(stderr.match(/^(?:\w*Error):[^\n]*/gm), ["Error: adapter close_page failed"],
+  "launch, display validation, and shutdown must pass before accepting the expected close rejection");
+NODE
+then
+  cat "$tmp_dir/target-preflight.stdout" "$tmp_dir/target-preflight.stderr" >&2
+  exit 1
+fi
+for fixture_pid in "$selkies_pid" "$cdp_pid" "$proxy_pid"; do
+  kill -0 "$fixture_pid"
+done
+printf '%s\n' '{"schema":"elastos.browser.selkies-control-service-smoke/v1","ok":true,"scope":"control-service-and-adapter-close-rejection","unowned_cleanup_rejected":true,"adapter_cleanup_verified":false}'
