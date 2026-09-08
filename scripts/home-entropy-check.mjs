@@ -1994,11 +1994,13 @@ assert(
   "The shortcuts overlay documents only surfaces that exist: no Wallet row until the wallet rail lands",
 );
 assert(
-  !/agent|harness/i.test(shellStages) &&
-    !/agent|harness/i.test(shellExpose) &&
+  shellStages.includes("export function bindAgentSpace(hooks)") &&
+    !/import[^;]*(shell-assistant-face|agent-|home-agent)/.test(shellStages) &&
+    !/harness|agent-shelf|shelf-handover|home-agent/i.test(shellStages) &&
+    !/harness|agent-shelf|shelf-handover|home-agent|assistant-face/i.test(shellExpose) &&
     !shellWindows.includes("AgentWorkspace") &&
     !homeGuiTemplateHtml.includes("agent"),
-  "Stages and Mission Control migrate without the agent harness: no Agent Space, no shelf morph, no workspace snapshot hook",
+  "Stages list the Agent room as a Space and only ask the face to open or close it: no harness, shelf morph, capsule import or workspace snapshot hook in Stages or Mission Control",
 );
 assert(
   !/fetch\(/.test(shellStages) &&

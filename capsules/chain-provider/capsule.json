@@ -7,6 +7,7 @@
   "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
+  "icon": "icons",
   "provides": "elastos://chain/*",
   "authority": {
     "reason": "Provides typed chain status, proofs, transaction intents, broadcasts, and managed node lifecycle without exposing raw node RPC URLs to app capsules.",

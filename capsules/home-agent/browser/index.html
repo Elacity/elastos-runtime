@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent - ElastOS</title>
+    <script src="./elastos-theme.js"></script>
+    <link rel="stylesheet" href="./elastos-ui.css" />
+    <link rel="stylesheet" href="./vendor/katex/katex.min.css" />
+    <link rel="stylesheet" href="./home-agent.css" />
+    <link rel="stylesheet" href="./agent-harness.css" />
+    <script type="module" src="./home-agent.js"></script>
+  </head>
+  <body>
+<!-- Home Agent: the URUX harness and Shelf composer, unchanged, hosted as a
+     capsule. Home GUI owns the morph and the place this frame appears in. -->
+<canvas
+  id="agent-home-drop-canvas"
+  class="agent-home-drop-canvas"
+  hidden
+  aria-hidden="true"
+></canvas>
+<section
+  id="agent-harness"
+  class="agent-harness"
+  hidden
+  aria-hidden="true"
+  aria-label="Agent"
+>
+  <button
+    type="button"
+    id="agent-harness-scrim"
+    class="agent-harness-scrim"
+    hidden
+    aria-hidden="true"
+    tabindex="-1"
+    aria-label="Close sessions"
+  ></button>
+  <aside id="agent-harness-sidebar" class="agent-harness-sidebar" aria-label="Agent sessions">
+    <div class="agent-harness-sidebar-head">
+      <img class="agent-harness-brand" src="./elastos-logo.svg" alt="ElastOS" width="107" height="17" />
+      <div class="agent-harness-sidebar-actions">
+        <button
+          id="agent-harness-panel-toggle"
+          class="agent-harness-icon-btn agent-harness-panel-toggle"
+          type="button"
+          aria-label="Close sidebar"
+          title="Close sidebar"
+        >
+          <span class="agent-harness-icon-panel" aria-hidden="true"></span>
+        </button>
+        <button
+          id="agent-harness-search-open"
+          class="agent-harness-icon-btn agent-harness-search-open"
+          type="button"
+          aria-label="Search chats"
+          title="Search chats"
+          aria-haspopup="dialog"
+          aria-controls="agent-session-search"
+        >
+          <span class="agent-harness-icon-search" aria-hidden="true"></span>
+        </button>
+      </div>
+    </div>
+    <div class="agent-harness-nav-cluster">
+      <button id="agent-harness-new-chat" class="agent-harness-new-chat" type="button" title="Start a new chat">
+        <span aria-hidden="true">+</span>
+        <span>New chat</span>
+      </button>
+      <button
+        id="agent-harness-home"
+        class="agent-harness-home"
+        type="button"
+        title="Return to Home OS (Esc)"
+      >
+        <span class="agent-harness-home-mark" aria-hidden="true"></span>
+        <span>Home</span>
+      </button>
+      <nav class="agent-harness-nav" aria-label="Agent destinations">
+        <button type="button" class="agent-harness-nav-row" data-sidebar-nav="configure">
+          <span class="agent-harness-nav-mark" data-nav-icon="configure" aria-hidden="true"></span>
+          <span>Settings</span>
+        </button>
+      </nav>
+    </div>
+    <div class="agent-projects-block" data-agent-projects>
+      <div class="agent-projects-head">
+        <span class="agent-projects-label">Projects</span>
+        <button
+          type="button"
+          class="agent-projects-add"
+          data-project-add
+          aria-label="New project"
+          title="Group chats around a project"
+        >
+          +
+        </button>
+      </div>
+      <form
+        class="agent-projects-create"
+        data-project-create
+        hidden
+        method="post"
+        action="#"
+        onsubmit="return false;"
+      >
+        <input
+          class="agent-projects-create-input"
+          data-project-create-input
+          type="text"
+          maxlength="48"
+          placeholder="Project name"
+          autocomplete="off"
+          spellcheck="false"
+          aria-label="Project name — Enter to add, Esc to cancel"
+        />
+        <!-- Hidden submit so Enter can submit; onsubmit=return false blocks navigation. -->
+        <button type="submit" class="agent-projects-create-submit" tabindex="-1" aria-hidden="true">
+          Add
+        </button>
+        <button type="button" class="agent-projects-create-cancel" data-project-create-cancel aria-label="Cancel">
+          ×
+        </button>
+      </form>
+      <div class="agent-projects-list" data-projects-list></div>
+    </div>
+    <div class="agent-harness-sessions" id="agent-harness-session-list"></div>
+  </aside>
+  <div
+    id="agent-session-search"
+    class="agent-session-search"
+    hidden
+    inert
+    aria-hidden="true"
+  >
+    <div
+      class="agent-session-search-panel"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Search chats"
+    >
+      <div class="agent-session-search-bar">
+        <span class="agent-session-search-glyph" aria-hidden="true"></span>
+        <input
+          id="agent-session-search-input"
+          class="agent-session-search-input"
+          type="search"
+          placeholder="Search chats"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button
+          id="agent-session-search-close"
+          class="agent-session-search-close"
+          type="button"
+          aria-label="Close search"
+        >
+          <span aria-hidden="true">×</span>
+        </button>
+      </div>
+      <div
+        id="agent-session-search-results"
+        class="agent-session-search-results"
+        role="listbox"
+        aria-label="Chat results"
+      ></div>
+    </div>
+  </div>
+  <div class="agent-harness-main">
+    <div class="agent-harness-mobile-bar">
+      <button
+        id="agent-harness-drawer-open"
+        class="agent-harness-drawer-toggle"
+        type="button"
+        aria-label="Open sessions"
+        aria-expanded="false"
+        aria-controls="agent-harness-sidebar"
+        title="Sessions"
+      >
+        <span class="agent-harness-icon-panel" aria-hidden="true"></span>
+      </button>
+      <h2 id="agent-harness-title" class="agent-harness-title">New chat</h2>
+      <button
+        id="agent-harness-search-open-main"
+        class="agent-harness-icon-btn agent-harness-search-open"
+        type="button"
+        aria-label="Search chats"
+        title="Search chats"
+        aria-haspopup="dialog"
+        aria-controls="agent-session-search"
+      >
+        <span class="agent-harness-icon-search" aria-hidden="true"></span>
+      </button>
+    </div>
+    <div class="agent-harness-stream-viewport">
+      <p
+        class="agent-stream-status"
+        data-agent-stream-status
+        data-tone="idle"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        hidden
+      ></p>
+      <div
+        id="agent-harness-stream"
+        class="agent-harness-stream"
+        role="log"
+        aria-live="off"
+        aria-relevant="additions"
+      >
+        <div class="agent-harness-stream-column" id="agent-harness-stream-column"></div>
+        <button
+          type="button"
+          class="agent-jump-latest"
+          data-agent-jump-latest
+          hidden
+        >
+          Jump to latest
+        </button>
+      </div>
+    </div>
+    <section
+      class="agent-harness-page"
+      data-harness-page
+      role="region"
+      aria-label="Agent page"
+      tabindex="-1"
+      hidden
+    >
+      <div class="agent-harness-page-column">
+        <header class="agent-harness-page-head">
+          <div class="agent-harness-page-heading">
+            <h2 class="agent-harness-page-title" data-page-title>Settings</h2>
+            <p class="agent-harness-page-sub" data-page-sub hidden></p>
+          </div>
+          <button
+            type="button"
+            class="agent-harness-page-close"
+            data-page-close
+            aria-label="Back to chat"
+            title="Back to chat (Esc)"
+          ></button>
+        </header>
+
+        <div class="agent-harness-page-section" data-page-section="configure" hidden>
+          <nav class="agent-configure-sections" aria-label="Settings sections">
+            <button type="button" class="agent-configure-chip is-active" data-configure-section="models">
+              Models
+            </button>
+            <button type="button" class="agent-configure-chip" data-configure-section="prompt">
+              Prompt
+            </button>
+          </nav>
+
+          <div data-configure-panel="models">
+            <p class="agent-models-section-title">Model offers on this Home</p>
+            <div
+              class="agent-model-menu-list"
+              data-models-installed
+              role="listbox"
+              aria-label="Model offers on this Home"
+            ></div>
+            <p class="agent-harness-page-foot">
+              Offers are installed as services from Store · UI ≠ authority
+            </p>
+          </div>
+
+          <div data-configure-panel="prompt" hidden>
+            <div class="agent-prompt-panel" data-prompt-panel>
+              <label class="agent-prompt-label" for="agent-system-prompt">System prompt</label>
+              <textarea
+                id="agent-system-prompt"
+                class="agent-prompt-textarea"
+                data-system-prompt
+                rows="8"
+                maxlength="8000"
+                spellcheck="true"
+                placeholder="Principles-safe default — knowledge only, no tools."
+              ></textarea>
+              <div class="agent-prompt-actions">
+                <button type="button" class="agent-prompt-reset" data-system-prompt-reset>
+                  Reset to default
+                </button>
+                <span class="agent-prompt-count" data-system-prompt-count></span>
+              </div>
+              <label class="agent-prompt-label" for="agent-home-notes">Notes on this Home</label>
+              <textarea
+                id="agent-home-notes"
+                class="agent-prompt-textarea"
+                data-agent-notes
+                rows="4"
+                maxlength="4000"
+                spellcheck="true"
+                placeholder="Sticky facts for Live turns — host-persisted on this Home only. Not cloud memory."
+              ></textarea>
+              <p class="agent-harness-page-foot">
+                Notes append to the system prompt for Live · never leave this Home · UI ≠ authority
+              </p>
+              <div class="agent-prompt-params">
+                <label class="agent-prompt-param">
+                  <span>Context budget (tokens)</span>
+                  <input
+                    type="number"
+                    min="16"
+                    max="8192"
+                    step="16"
+                    data-agent-max-tokens
+                    inputmode="numeric"
+                  />
+                </label>
+              </div>
+              <p class="agent-harness-page-foot">
+                Prompt, notes and budget shape the transcript this Home sends · sampling is the offer's · UI ≠ authority
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+</section>
+
+<footer
+  class="taskbar"
+  aria-label="Shelf"
+  data-agent-shelf="1"
+>
+  <div class="taskbar-inner">
+    <div class="shelf-morph-stage" id="shelf-morph-stage">
+      <!-- The composer — the only face here; Home's Shelf morphs to it and hands over -->
+      <div class="shelf-face shelf-face-agent" data-shelf-face="agent">
+        <!-- Follow-ups while a turn is busy — ChatGPT-style bumps above the composer. -->
+        <div
+          class="agent-queue"
+          data-agent-queue
+          hidden
+          aria-label="Queued follow-up prompts"
+        ></div>
+        <div class="agent-composer" role="form" aria-label="Agent composer">
+          <label class="agent-composer-field shelf-morph-enter" data-morph-enter="0">
+            <span class="visually-hidden">Message</span>
+            <textarea
+              id="agent-composer-input"
+              class="agent-composer-input"
+              rows="1"
+              placeholder="Ask on this machine"
+              autocomplete="off"
+              spellcheck="true"
+            ></textarea>
+          </label>
+          <div
+            class="agent-composer-attachments shelf-morph-enter"
+            data-morph-enter="0"
+            data-agent-attachments
+            hidden
+          ></div>
+          <input
+            id="agent-attach-input"
+            class="visually-hidden"
+            type="file"
+            multiple
+            tabindex="-1"
+            aria-hidden="true"
+          />
+          <div class="agent-attach-menu" data-agent-attach-menu hidden>
+            <p class="agent-attach-menu-label">Attach</p>
+            <div class="agent-attach-menu-list" data-attach-desktop-list></div>
+            <button type="button" class="agent-attach-menu-item" data-attach-device-files>
+              Choose files on this device…
+            </button>
+            <p class="agent-attach-menu-foot">
+              Text extracts size-capped · Desktop needs library.read · images vision-unsupported
+            </p>
+          </div>
+          <div class="agent-composer-toolbar shelf-morph-enter" data-morph-enter="1">
+            <!-- ChatGPT-like: left = Home + attach + tool intent; right = model + mic + send -->
+            <div class="agent-composer-tools-left">
+              <button
+                id="agent-shelf-flip-back"
+                class="agent-flip-back"
+                type="button"
+                aria-label="Back to Home"
+                title="Back to Home (Esc)"
+              >
+                Home
+              </button>
+              <button
+                id="agent-attach-btn"
+                class="agent-tool-btn"
+                type="button"
+                aria-label="Attach"
+                title="Attach Desktop object or local file (UI ≠ authority)"
+              >
+                <span aria-hidden="true">+</span>
+              </button>
+              <button
+                type="button"
+                class="agent-think-btn"
+                data-truth-thinking-toggle
+                aria-pressed="true"
+                aria-label="Show model thinking"
+                title="Show model thinking blocks"
+              >
+                Think
+              </button>
+            </div>
+            <div class="agent-composer-tools-right">
+              <div class="agent-model-wrap">
+                <button
+                  id="agent-model-picker"
+                  class="agent-model-btn"
+                  type="button"
+                  aria-haspopup="dialog"
+                  aria-expanded="false"
+                  aria-controls="agent-model-menu"
+                  title="Model offer on this Home"
+                >
+                  <span class="agent-model-name">No model</span>
+                  <span class="agent-model-tier" hidden></span>
+                  <span class="agent-model-chevron" aria-hidden="true"></span>
+                </button>
+              </div>
+              <button
+                id="agent-composer-mic"
+                class="agent-tool-btn agent-mic-btn"
+                type="button"
+                disabled
+                aria-disabled="true"
+                aria-pressed="false"
+                aria-label="Voice dictation"
+                title="Dictate into the composer. You can edit before Send."
+                data-dictation-state="idle"
+              >
+                <span class="agent-mic-mark" aria-hidden="true"></span>
+              </button>
+              <button
+                id="agent-composer-send"
+                class="agent-send-btn"
+                type="button"
+                aria-label="Send"
+                title="Enter a message to send"
+                data-mode="send"
+                disabled
+              >
+                <span class="agent-send-mark" aria-hidden="true"></span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<!-- Agent composer menus live on body so dock transform/overflow cannot clip them. -->
+<div
+  id="agent-model-menu"
+  class="agent-model-menu"
+  role="dialog"
+  aria-label="Choose a model offer"
+  tabindex="-1"
+  hidden
+>
+  <div class="agent-model-menu-list" data-model-menu-list role="listbox" aria-label="Models"></div>
+  <button type="button" class="agent-model-menu-add" data-model-add>All models</button>
+</div>
+
+<div
+  id="agent-session-actions"
+  class="agent-session-actions"
+  role="menu"
+  aria-label="Chat actions"
+  tabindex="-1"
+  hidden
+>
+  <div class="agent-session-actions-list" data-session-actions-list></div>
+</div>
+  </body>
+</html>

@@ -68,7 +68,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-elastos
+          prefix-key: ${{ runner.os }}-elastos-bd
+          # Shared intermediate build dir (root .cargo/config.toml build-dir)
+          cache-directories: target-build
       # clippy runs the full type-check pass, so a separate `cargo check`
       # would be redundant.
       - name: cargo clippy
@@ -88,7 +90,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-elastos-test
+          prefix-key: ${{ runner.os }}-elastos-test-bd
+          # Shared intermediate build dir (root .cargo/config.toml build-dir)
+          cache-directories: target-build
       # The three provider workspaces are release-built from cold on every
       # run otherwise; with the cache restored, cargo only re-fingerprints
       # the workspace members and reuses every dependency artifact.
@@ -99,9 +103,9 @@ jobs:
             capsules/protected-content-protect-provider/target
             capsules/protected-content-decrypt-provider/target
             capsules/custody-provider/target
-          key: providers-target-${{ runner.os }}-${{ hashFiles('capsules/protected-content-protect-provider/Cargo.lock', 'capsules/protected-content-decrypt-provider/Cargo.lock', 'capsules/custody-provider/Cargo.lock', 'rust-toolchain.toml') }}
+          key: providers-bd-target-${{ runner.os }}-${{ hashFiles('capsules/protected-content-protect-provider/Cargo.lock', 'capsules/protected-content-decrypt-provider/Cargo.lock', 'capsules/custody-provider/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            providers-target-${{ runner.os }}-
+            providers-bd-target-${{ runner.os }}-
       - name: build provider process binaries for tests
         run: |
           cargo build --release --manifest-path capsules/protected-content-protect-provider/Cargo.toml --target-dir capsules/protected-content-protect-provider/target
@@ -133,9 +137,9 @@ jobs:
         with:
           # Registry/index cache only: this job never builds the elastos
           # workspace, and the capsule build artifacts live in the shared
-          # target-capsules dir cached below.
+          # intermediate build dir cached below.
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-capsules
+          prefix-key: ${{ runner.os }}-capsules-bd
           cache-targets: false
       # The capsule workspaces overlap almost entirely in dependencies, so
       # `just test-capsules` builds them into one shared target dir; caching
@@ -145,20 +149,21 @@ jobs:
       - name: cache capsule build artifacts
         uses: actions/cache@v4
         with:
-          path: target-capsules
-          key: capsules-target-${{ runner.os }}-${{ hashFiles('capsules/*/Cargo.lock', 'rust-toolchain.toml') }}
+          # The shared intermediates (root .cargo/config.toml build-dir);
+          # final artifacts stay in each capsule's own small target dir.
+          path: target-build
+          key: capsules-bd-target-${{ runner.os }}-${{ hashFiles('capsules/*/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            capsules-target-${{ runner.os }}-
+            capsules-bd-target-${{ runner.os }}-
       # The elastos workspace suite never builds or tests own-workspace
       # capsules; this mirrors `just test-capsules`.
       - name: test own-workspace capsules
         run: |
           set -euo pipefail
-          root="$PWD"
           for lock in capsules/*/Cargo.lock; do
               capsule="$(dirname "$lock")"
               echo "== testing $capsule =="
-              (cd "$capsule" && cargo test --target-dir "${root}/target-capsules")
+              (cd "$capsule" && cargo test)
           done
 
   # The source-home jobs run only once the test phase is green, in parallel
@@ -187,7 +192,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-${{ runner.arch }}-elastos
+          prefix-key: ${{ runner.os }}-${{ runner.arch }}-elastos-bd
+          # Shared intermediate build dir (root .cargo/config.toml build-dir)
+          cache-directories: target-build
       - name: require 16 GiB free disk
         run: |
           set -euo pipefail
@@ -257,7 +264,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-elastos
+          prefix-key: ${{ runner.os }}-elastos-bd
+          # Shared intermediate build dir (root .cargo/config.toml build-dir)
+          cache-directories: target-build
       # dist.ipfs.tech is intermittently slow or unreachable from GitHub's
       # macOS runners, and setup's downloader makes a single 600s attempt.
       # Cache the verified release tarball and pre-seed bin/kubo so setup

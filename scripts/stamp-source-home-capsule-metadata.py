@@ -143,6 +143,25 @@ def materialize_provider_contracts(data_dir, root, capsules):
             shutil.rmtree(installed_root)
         installed_root.mkdir(parents=True)
         atomic_copy_file(source_manifest_path, installed_root / "capsule.json")
+        copy_declared_icon_set(source_manifest_path.parent, installed_root, source_manifest)
+
+
+ICON_SIZES = (32, 64, 128, 256)
+
+
+def copy_declared_icon_set(source_root, installed_root, manifest):
+    """A provider owns its icon like an app does; the contract dir carries the
+    declared `icon-{32,64,128,256}.png` set so the gateway can serve it."""
+    icon_dir = str(manifest.get("icon") or "").strip().strip("/")
+    if not icon_dir:
+        return
+    if ".." in Path(icon_dir).parts:
+        raise SystemExit(f"{manifest.get('name')} icon path escapes the capsule: {icon_dir!r}")
+    for size in ICON_SIZES:
+        source = source_root / icon_dir / f"icon-{size}.png"
+        if not source.is_file():
+            raise SystemExit(f"{manifest.get('name')} declares icon {icon_dir!r} but {source.name} is missing")
+        atomic_copy_file(source, installed_root / icon_dir / f"icon-{size}.png")
 
 
 def stamp_component_capsules(components_path, data_dir, root, platform, capsules):

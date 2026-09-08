@@ -128,14 +128,20 @@ img {
   backdrop-filter: none;
 }
 
+.home-unlock[data-surface="lock-face"],
+.home-unlock[data-surface="lock-face"][data-mode="prompt"],
+.home-unlock[data-flow="picker"] {
+  display: block;
+  padding: 0;
+  background-color: #050608;
+  background-image: none;
+  backdrop-filter: none;
+}
+
 .home-unlock-face {
-  display: grid;
-  justify-items: center;
-  align-content: space-between;
-  width: min(420px, 100%);
-  min-height: min(640px, calc(100vh - 48px));
-  min-height: min(640px, calc(100dvh - 48px));
-  padding: 28px 0 36px;
+  position: relative;
+  min-height: 100dvh;
+  color: #f5f5f7;
   text-align: center;
 }
 
@@ -143,68 +149,122 @@ img {
   display: none;
 }
 
+.home-unlock-ground,
+.home-unlock-vignette {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+
+.home-unlock-ground {
+  background: var(--home-unlock-ground, none) center / cover no-repeat #050608;
+}
+
+.home-unlock-vignette {
+  background:
+    linear-gradient(to bottom, rgba(0, 0, 0, 0.28), transparent 22%, transparent 72%, rgba(0, 0, 0, 0.34)),
+    radial-gradient(ellipse at 50% 42%, rgba(0, 0, 0, 0.12), rgba(0, 0, 0, 0.48) 58%, rgba(0, 0, 0, 0.68));
+}
+
+.home-unlock-picker {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-height: 100dvh;
+  padding:
+    max(20px, env(safe-area-inset-top, 0px))
+    24px
+    max(28px, env(safe-area-inset-bottom, 0px));
+}
+
 .home-unlock-brand {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 10px;
-  padding: 0 18px;
-  color: rgba(255, 255, 255, 0.92);
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 0;
+  padding-top: 1.5vh;
 }
 
 .home-unlock-brand-mark {
-  width: 32px;
-  height: 32px;
+  display: block;
+  width: 30px;
+  height: 20px;
+  overflow: hidden;
+  flex: 0 0 30px;
 }
 
-.home-unlock-clock {
-  display: grid;
-  gap: 10px;
-  align-content: center;
+.home-unlock-brand-mark img {
+  display: block;
+  height: 20px;
+  width: auto;
+  max-width: none;
 }
 
-.home-unlock-date,
-.home-unlock-time {
+.home-unlock-brand-word {
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+.home-unlock .home-unlock-clock {
+  flex: 0 0 auto;
+  margin-top: clamp(28px, 7vh, 72px);
+  user-select: none;
+}
+
+/* Scoped under .home-unlock so these outrank the generic `.home-unlock p` card copy rule. */
+.home-unlock .home-unlock-date {
   margin: 0;
-  color: rgba(255, 255, 255, 0.95);
-}
-
-.home-unlock-date {
-  font-size: 24px;
+  color: rgba(245, 245, 247, 0.94);
+  font-size: clamp(22px, 3.2vw, 28px);
   font-weight: 500;
   letter-spacing: 0;
+  line-height: 1.15;
+  text-shadow: 0 1px 18px rgba(0, 0, 0, 0.4);
 }
 
-.home-unlock-time {
-  font-size: 80px;
-  line-height: 0.95;
-  font-weight: 600;
+.home-unlock .home-unlock-time {
+  margin: 6px 0 0;
+  color: #f5f5f7;
+  font-size: clamp(72px, 12.5vw, 112px);
+  font-weight: 500;
   letter-spacing: 0;
+  line-height: 0.94;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 3px 28px rgba(0, 0, 0, 0.38);
 }
 
 .home-unlock-account {
-  display: grid;
-  justify-items: center;
-  gap: 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: max-content;
+  max-width: min(220px, 72vw);
+  margin-top: auto;
+  padding-top: clamp(32px, 8vh, 80px);
+  padding-bottom: clamp(12px, 4vh, 40px);
 }
 
 .home-unlock-person {
-  display: inline-grid;
-  place-items: center;
-  width: 132px;
-  height: 132px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  appearance: none;
+  width: 72px;
+  height: 72px;
+  padding: 0;
+  border: 0;
   border-radius: 999px;
-  background: rgba(7, 10, 14, 0.44);
-  box-shadow: 0 18px 36px rgba(0, 0, 0, 0.28);
+  background: transparent;
+  color: inherit;
   cursor: pointer;
 }
 
 .home-unlock-person:disabled {
   cursor: default;
-  opacity: 0.5;
+  opacity: 0.55;
+}
+
+.home-unlock-person:active {
+  transform: scale(0.98);
 }
 
 .home-unlock-person:focus-visible {
@@ -213,34 +273,42 @@ img {
 }
 
 .home-unlock-avatar {
-  display: inline-grid;
-  place-items: center;
-  width: 96px;
-  height: 96px;
+  width: 72px;
+  height: 72px;
+  margin: 0 auto;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.08);
-  color: rgba(255, 255, 255, 0.92);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: #101820;
+  color: #fff;
+  font-size: 28px;
+  font-weight: 650;
+  letter-spacing: 0;
+  box-shadow:
+    0 0 0 1.5px rgba(96, 165, 250, 0.88),
+    0 8px 28px rgba(0, 0, 0, 0.28);
 }
 
 .home-unlock-avatar-monogram {
-  font-size: 42px;
+  font-weight: 650;
   line-height: 1;
-  font-weight: 600;
-  letter-spacing: 0;
   text-transform: lowercase;
 }
 
-.home-unlock-account-name {
-  margin: 0;
-  min-height: 24px;
-  padding: 0 18px;
-  color: rgba(255, 255, 255, 0.94);
-  font-size: 20px;
-  font-weight: 500;
+.home-unlock .home-unlock-account-name {
+  display: block;
+  margin: 10px 0 0;
+  color: #f5f5f7;
+  font-size: 14px;
+  font-weight: 600;
   letter-spacing: 0;
+  text-align: center;
+  pointer-events: none;
+  text-shadow: 0 1px 10px rgba(0, 0, 0, 0.35);
 }
 
-.home-unlock-account-name[hidden] {
+.home-unlock .home-unlock-account-name[hidden] {
   visibility: hidden;
 }
 
@@ -391,7 +459,7 @@ img {
   color: var(--brand-strong);
   font-size: 12px;
   font-weight: 800;
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
   text-transform: uppercase;
 }
 
@@ -533,8 +601,31 @@ img {
   100% { opacity: 1; transform: scale(1); }
 }
 
-.home-unlock[data-flow="picker"] .home-unlock-face {
-  animation: home-unlock-chrome-in 220ms ease-out both;
+/* Animate the face's children, not the face: a filled transform on the face
+   would make it the containing block for the fixed ground/vignette layers. */
+.home-unlock[data-flow="picker"] .home-unlock-brand,
+.home-unlock[data-flow="picker"] .home-unlock-clock,
+.home-unlock[data-flow="picker"] .home-unlock-account {
+  animation: home-unlock-chrome-in 280ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.home-unlock[data-flow="picker"] .home-unlock-vignette {
+  animation: home-unlock-fade 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.home-unlock[data-flow="picker"] .home-unlock-clock {
+  animation-delay: 40ms;
+}
+
+.home-unlock[data-flow="picker"] .home-unlock-account {
+  animation-delay: 80ms;
+}
+
+.home-unlock[data-flow="picker"].home-unlock-leaving .home-unlock-brand,
+.home-unlock[data-flow="picker"].home-unlock-leaving .home-unlock-clock,
+.home-unlock[data-flow="picker"].home-unlock-leaving .home-unlock-account,
+.home-unlock[data-flow="picker"].home-unlock-leaving .home-unlock-vignette {
+  animation: none;
 }
 
 .home-unlock.home-unlock-leaving {
@@ -554,7 +645,10 @@ img {
 @media (prefers-reduced-motion: reduce) {
   .home-unlock,
   .home-unlock-card,
-  .home-unlock[data-flow="picker"] .home-unlock-face,
+  .home-unlock[data-flow="picker"] .home-unlock-brand,
+  .home-unlock[data-flow="picker"] .home-unlock-clock,
+  .home-unlock[data-flow="picker"] .home-unlock-account,
+  .home-unlock[data-flow="picker"] .home-unlock-vignette,
   .home-unlock.home-unlock-leaving {
     animation: none;
   }

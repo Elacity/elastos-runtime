@@ -1,0 +1,205 @@
+/* Home Agent — base sheet.
+   The Home GUI style.css rules the composer pill relies on (tokens, taskbar
+   pill glass, the agent face), followed by the few lines that make a capsule
+   of it. Home GUI still owns the morph and the place; this document is the
+   room and the composer inside it. */
+
+:root {
+  color-scheme: dark;
+  --accent: var(--el-accent, var(--brand));
+  --bg: #050608;
+  --panel: rgba(22, 24, 29, 0.78);
+  --panel-strong: rgba(22, 24, 29, 0.92);
+  --text: #f5f7fa;
+  --brand: #f6921a;
+  --shadow-soft: 0 12px 28px rgba(0, 0, 0, 0.22);
+  --popover-radius: 14px;
+  --popover-shadow: var(--shadow-soft);
+  --dock-fill: hsla(216, 8%, 18%, 0.78);
+  --hairline: rgba(255, 255, 255, 0.14);
+  /* Shelf scale: slightly larger than the original 60/50/40 for XDR density. */
+  --taskbar-h: 72px;
+  --taskbar-offset: 12px;
+  --dock-icon-slot: 58px;
+  /* Shell chrome motion — water, not switches. */
+  --shell-motion-enter: 160ms;
+  --shell-motion-enter-ease: cubic-bezier(0.2, 0, 0, 1);
+}
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--el-font);
+}
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+:root[data-el-theme="light"] {
+  color-scheme: light;
+  --bg: #e8ecf3;
+  --panel: rgba(255, 255, 255, 0.82);
+  --panel-strong: rgba(255, 255, 255, 0.96);
+  --text: #1d2438;
+  --shadow-soft: 0 12px 28px rgba(34, 49, 88, 0.14);
+  --dock-fill: rgba(231, 238, 245, 0.8);
+  --hairline: rgba(29, 36, 56, 0.16);
+  --menu-fill: rgba(248, 250, 253, 0.97);
+}
+:root {
+  --menu-fill: rgba(22, 24, 29, 0.96);
+}
+:root[data-el-theme="light"] {
+}
+.visually-hidden {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+.taskbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: calc(var(--taskbar-offset) + env(safe-area-inset-bottom, 0px));
+  z-index: 100100;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  margin-inline: auto;
+  width: max-content;
+  max-width: calc(100vw - 48px);
+  height: var(--taskbar-h);
+  padding-left: 14px;
+  padding-right: 14px;
+  border-radius: 22px;
+  background-color: var(--dock-fill);
+  box-shadow:
+    inset 0 0 0 0.5px var(--hairline),
+    0 0 0 0.5px rgba(0, 0, 0, 0.2),
+    0 4px 16px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(10px);
+  transition: transform 220ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .taskbar {
+    transition: none;
+  }
+}
+.taskbar-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  /* Dock-mag icons must paint above the pill. */
+  overflow: visible;
+}
+
+@media (max-width: 640px) {
+  .taskbar {
+    max-width: calc(100vw - 20px);
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+  .taskbar-inner {
+    gap: 8px;
+  }
+
+}
+
+/* Global resets the URUX sheet applied to every element (verbatim). */
+* {
+  box-sizing: border-box;
+}
+button,
+input {
+  font: inherit;
+}
+button {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+}
+
+/* ---- capsule frame -------------------------------------------------------- */
+html, body {
+  margin: 0;
+  min-height: 100%;
+  background: transparent;
+}
+
+/* Tokens the harness reads that URUX resolved from the wider Home sheet. */
+:root {
+  --surface: var(--panel-strong, var(--panel));
+}
+
+/* The composer pill shows only once Home's pill has morphed to its geometry
+   and handed over; before that Home's glass is the pill the user sees.
+   Coming in, it fades up over the 200ms Home's glass takes to go clear, so
+   the last of the stretch is hidden inside one glass, not a cut between two.
+   Going out, it holds through the 140ms leave while the composer fades on it,
+   then fades over the 200ms Home's glass takes to return above it (LEAVE_MS
+   in shell-assistant-face): a crossfade, so a frame of clock drift between
+   the two documents never shows as a blank pill.
+   Written against html so it outranks agent-harness.css's own .taskbar. */
+html:not([data-shelf-handover="1"]) .taskbar {
+  visibility: hidden;
+  opacity: 0;
+  transition:
+    transform 220ms cubic-bezier(0.2, 0, 0, 1),
+    opacity 200ms cubic-bezier(0.42, 0, 0.58, 1) 140ms,
+    visibility 0s linear 340ms;
+}
+html[data-shelf-handover="1"] .taskbar {
+  visibility: visible;
+  opacity: 1;
+  transition:
+    transform 220ms cubic-bezier(0.2, 0, 0, 1),
+    opacity 200ms cubic-bezier(0.42, 0, 0.58, 1);
+}
+
+/* Only the composer face exists here: once the face class goes (after the
+   pill has faded out, see lowerRoom) the pill stays gone — never a frame of
+   idle dock. */
+html .taskbar:not(.is-agent-face) {
+  visibility: hidden;
+  opacity: 0;
+  transition: none;
+}
+
+/* The composer chrome rises only on a pill the user can see: held back until
+   the handover, and out again within the leave. */
+html:not([data-shelf-handover="1"]) .taskbar.is-agent-face .shelf-morph-enter {
+  opacity: 0;
+  transform: translateY(10px) scale(0.97);
+  filter: blur(5px);
+  transition-duration: 120ms;
+  transition-delay: 0ms;
+}

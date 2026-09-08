@@ -52,6 +52,8 @@ mod gateway_capsule_catalog;
 mod gateway_collaboration_presence;
 #[path = "gateway_esp.rs"]
 mod gateway_esp;
+#[path = "gateway_home_agent.rs"]
+mod gateway_home_agent;
 #[path = "gateway_home_runtime.rs"]
 mod gateway_home_runtime;
 #[path = "gateway_home_system.rs"]
@@ -99,6 +101,7 @@ pub(crate) fn principal_root_protected_object_inventory(
 ) -> Vec<crate::auth::PrincipalRootProtectedObjectDeclarationV1> {
     let mut inventory =
         gateway_assistant::principal_root_protected_object_inventory(localhost_root);
+    inventory.extend(gateway_home_agent::principal_root_protected_object_inventory(localhost_root));
     inventory
         .extend(gateway_home_system::principal_root_protected_object_inventory(localhost_root));
     inventory.extend(
@@ -696,6 +699,14 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
                 .put(gateway_assistant::assistant_workspace_put)
                 .layer(DefaultBodyLimit::max(
                     gateway_assistant::ASSISTANT_WORKSPACE_MAX_BYTES,
+                )),
+        )
+        .route(
+            "/api/apps/home-agent/workspace",
+            get(gateway_home_agent::home_agent_workspace_get)
+                .put(gateway_home_agent::home_agent_workspace_put)
+                .layer(DefaultBodyLimit::max(
+                    gateway_home_agent::HOME_AGENT_WORKSPACE_MAX_BYTES,
                 )),
         )
         .route("/api/apps/system/summary", get(system_summary))

@@ -19,6 +19,10 @@ const LIBRARY_DOWNLOAD_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const LIBRARY_UPLOAD_SESSION_SCHEMA: &str = "elastos.object.upload-session/v1";
 const LIBRARY_UPLOAD_SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 const ASSISTANT_CAPSULE_ID: &str = "assistant";
+/// The Home Agent capsule reaches the model provider through the same typed
+/// contract as Assistant; every run is bound and audited to the capsule the
+/// launch token was issued for.
+const HOME_AGENT_CAPSULE_ID: &str = "home-agent";
 const MODEL_TEXT_OUTPUT_SCHEMA: &str = "elastos.model.output.text/v1";
 const MODEL_OBJECT_OUTPUT_SCHEMA: &str = "elastos.model.output.object/v1";
 const MODEL_CONTENT_OUTPUT_SCHEMA: &str = "elastos.model.output.content/v1";
@@ -1580,7 +1584,7 @@ pub(super) async fn gateway_provider_proxy(
         },
         "model" => match op.as_str() {
             "offers_list" | "runs_create" | "runs_get" | "runs_events" | "runs_cancel" => {
-                &[ASSISTANT_CAPSULE_ID]
+                &[ASSISTANT_CAPSULE_ID, HOME_AGENT_CAPSULE_ID]
             }
             _ => {
                 return (
@@ -1612,6 +1616,9 @@ pub(super) async fn gateway_provider_proxy(
     let context = required.context.clone();
     let principal_id = context.principal_id.clone();
     let session_id = context.session_id.clone();
+    /* The verified capsule behind the launch token: model runs are bound and
+    audited to it, never to a fixed name. */
+    let launch_capsule_id = required.launch_context.executable_actor.clone();
     let registry = match state.provider_registry.as_ref().cloned() {
         Some(registry) => registry,
         None => {
@@ -1644,10 +1651,11 @@ pub(super) async fn gateway_provider_proxy(
             .into_response();
     }
     if scheme == "model" {
-        request = match normalize_model_provider_request(&op, &request, &context) {
-            Ok(value) => value,
-            Err((status, message)) => return (status, message).into_response(),
-        };
+        request =
+            match normalize_model_provider_request(&op, &request, &context, &launch_capsule_id) {
+                Ok(value) => value,
+                Err((status, message)) => return (status, message).into_response(),
+            };
     } else {
         request["op"] = serde_json::Value::String(op.clone());
     }
@@ -1778,7 +1786,7 @@ pub(super) async fn gateway_provider_proxy(
         if let Err(err) = append_provider_effect_audit(
             &state.data_dir,
             ProviderEffectAuditInput {
-                capsule_id: ASSISTANT_CAPSULE_ID,
+                capsule_id: &launch_capsule_id,
                 event_type: audit.requested_event,
                 principal_id: &principal_id,
                 session_id: &session_id,
@@ -1918,7 +1926,7 @@ pub(super) async fn gateway_provider_proxy(
         if let Err(err) = append_provider_effect_audit(
             &state.data_dir,
             ProviderEffectAuditInput {
-                capsule_id: ASSISTANT_CAPSULE_ID,
+                capsule_id: &launch_capsule_id,
                 event_type: if completed {
                     audit.completed_event
                 } else {
@@ -3433,6 +3441,7 @@ fn normalize_model_provider_request(
     op: &str,
     request: &serde_json::Value,
     context: &HomeLaunchTokenContext,
+    capsule_id: &str,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     match op {
         "offers_list" => {
@@ -3452,7 +3461,7 @@ fn normalize_model_provider_request(
                 schema: RUNTIME_CREATE_BINDING_SCHEMA.to_string(),
                 principal_id: context.principal_id.clone(),
                 session_id: context.session_id.clone(),
-                capsule_id: ASSISTANT_CAPSULE_ID.to_string(),
+                capsule_id: capsule_id.to_string(),
                 grant_id: context.grant_id.clone(),
                 request_id: parsed.request_id,
                 offer_id: parsed.offer_id.clone(),
@@ -3482,7 +3491,7 @@ fn normalize_model_provider_request(
                 schema: RUNTIME_ACCESS_BINDING_SCHEMA.to_string(),
                 principal_id: context.principal_id.clone(),
                 session_id: context.session_id.clone(),
-                capsule_id: ASSISTANT_CAPSULE_ID.to_string(),
+                capsule_id: capsule_id.to_string(),
                 grant_id: context.grant_id.clone(),
                 request_id: parsed.request_id,
                 run_id: parsed.run_id.clone(),
@@ -3503,7 +3512,7 @@ fn normalize_model_provider_request(
                 schema: RUNTIME_ACCESS_BINDING_SCHEMA.to_string(),
                 principal_id: context.principal_id.clone(),
                 session_id: context.session_id.clone(),
-                capsule_id: ASSISTANT_CAPSULE_ID.to_string(),
+                capsule_id: capsule_id.to_string(),
                 grant_id: context.grant_id.clone(),
                 request_id: parsed.request_id,
                 run_id: parsed.run_id.clone(),
