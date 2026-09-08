@@ -603,9 +603,10 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function withTimeout(label, timeoutMs, promise) {
+function withTimeout(label, timeoutMs, promise, onTimeout = () => {}) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
+      onTimeout();
       reject(new Error(`${label} timed out after ${timeoutMs} ms`));
     }, timeoutMs);
     Promise.resolve(promise)
@@ -2000,6 +2001,8 @@ export class MinimalWebSocketClient {
     this.errorHandler = () => {};
     this.closeHandler = () => {};
     this.closed = true;
+    this.closeCode = null;
+    this.closeReason = null;
   }
 
   async connect(timeoutMs) {
@@ -2012,6 +2015,8 @@ export class MinimalWebSocketClient {
     this.socket = socket;
     this.closed = true;
     this.buffer = Buffer.alloc(0);
+    this.closeCode = null;
+    this.closeReason = null;
     const current = () => {
       if (this.socket !== socket || socket.destroyed) throw new Error("Selkies WebSocket connect canceled");
     };
@@ -2147,6 +2152,8 @@ export class MinimalWebSocketClient {
       if (frame.opcode === 0x1) {
         this.textHandler(frame.payload.toString("utf8"));
       } else if (frame.opcode === 0x8) {
+        this.closeCode = frame.payload.length >= 2 ? frame.payload.readUInt16BE(0) : null;
+        this.closeReason = frame.payload.length >= 2 ? frame.payload.subarray(2).toString("utf8") : null;
         this.close();
         return;
       } else if (frame.opcode === 0x9) {
@@ -2413,7 +2420,9 @@ export class SelkiesPage {
     const socket = this.audioWs;
     const current = () => {
       if (this.closed || this.audioWs !== socket || this.audioClosed) throw new Error("Selkies signaling session changed");
+      this.checkDisplayAttachmentDeadline();
     };
+    current();
     await socket.connect(this.config.connectTimeoutMs);
     current();
     socket.sendText("HELLO client " + JSON.stringify({ client_type: "controller", client_slot: 3, client_strict_viewer: false }));
@@ -2436,7 +2445,9 @@ export class SelkiesPage {
     const socket = this.audioWs;
     const current = () => {
       if (this.closed || this.audioWs !== socket || this.audioClosed) throw new Error("Selkies signaling session changed");
+      this.checkDisplayAttachmentDeadline();
     };
+    current();
     await socket.connect(this.config.connectTimeoutMs);
     current();
     const helloMeta = Buffer.from(JSON.stringify({
@@ -2445,6 +2456,7 @@ export class SelkiesPage {
     })).toString("base64");
     socket.sendText(`HELLO 3 ${helloMeta}`);
     await this.waitForAudio((message) => message.kind === "hello", "legacy Selkies audio HELLO");
+    socket.legacyHelloAccepted = true;
     current();
     const offer = await this.waitForAudio(
       (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
@@ -2460,7 +2472,9 @@ export class SelkiesPage {
     const socket = this.ws;
     const current = () => {
       if (this.closed || this.ws !== socket || this.videoClosed) throw new Error("Selkies signaling session changed");
+      this.checkDisplayAttachmentDeadline();
     };
+    current();
     await socket.connect(this.config.connectTimeoutMs);
     current();
     socket.sendText("HELLO client " + JSON.stringify({ client_type: "controller", client_slot: 1, client_strict_viewer: false }));
@@ -2483,7 +2497,9 @@ export class SelkiesPage {
     const socket = this.ws;
     const current = () => {
       if (this.closed || this.ws !== socket || this.videoClosed) throw new Error("Selkies signaling session changed");
+      this.checkDisplayAttachmentDeadline();
     };
+    current();
     await socket.connect(this.config.connectTimeoutMs);
     current();
     const helloMeta = Buffer.from(JSON.stringify({
@@ -2492,6 +2508,7 @@ export class SelkiesPage {
     })).toString("base64");
     socket.sendText(`HELLO 1 ${helloMeta}`);
     await this.waitFor((message) => message.kind === "hello", "legacy Selkies HELLO");
+    socket.legacyHelloAccepted = true;
     current();
     const offer = await this.waitFor(
       (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
@@ -2690,6 +2707,13 @@ export class SelkiesPage {
     });
   }
 
+  checkDisplayAttachmentDeadline() {
+    const attachment = this.displayAttachment;
+    if (attachment && (!attachment.pending || performance.now() >= attachment.deadline)) {
+      throw new Error("Browser display attachment expired");
+    }
+  }
+
   attachDisplay(signal) {
     const failure = (code, message) => Object.assign(new Error(message), { code });
     if (signal?.type !== "display_attach" || typeof signal.request_id !== "string" ||
@@ -2711,7 +2735,7 @@ export class SelkiesPage {
       throw failure("display_generation_mismatch", "Browser display generation changed");
     }
     if (!this.displaySession) throw failure("display_attach_unsupported", "Browser display attachment is unavailable");
-    const attachment = { requestId: signal.request_id, previousGeneration: this.displayGeneration, pending: true };
+    const attachment = { requestId: signal.request_id, previousGeneration: this.displayGeneration, pending: true, deadline: performance.now() + 4000 };
     const videoProtocol = this.establishedVideoProtocol;
     const audioProtocol = this.establishedAudioProtocol;
     this.displayAttachment = attachment;
@@ -2721,6 +2745,7 @@ export class SelkiesPage {
       if (this.closed || this.displayAttachment !== attachment || !attachment.pending) {
         throw failure("display_attach_failed", "Browser display attachment was canceled");
       }
+      this.checkDisplayAttachmentDeadline();
     };
     const retire = () => {
       // Detach both identities before close callbacks can observe the old pair.
@@ -2739,11 +2764,30 @@ export class SelkiesPage {
       this.resetSignaling();
       this.resetAudioSignaling();
       const size = browserDisplayMetrics(this.config);
-      const videoOffer = await (videoProtocol === "raw_json"
-        ? this.openLegacySelkiesSession(size) : this.openCurrentSelkiesSession());
+      const negotiate = async (channel, protocol) => {
+        for (;;) {
+          current();
+          const socket = channel === "video" ? this.ws : this.audioWs;
+          try {
+            return await (channel === "video"
+              ? (protocol === "raw_json" ? this.openLegacySelkiesSession(size) : this.openCurrentSelkiesSession())
+              : (protocol === "raw_json" ? this.openLegacySelkiesAudioSession(size) : this.openCurrentSelkiesAudioSession()));
+          } catch (error) {
+            current();
+            // The legacy broker closes the producer before releasing its fixed
+            // viewer UID. A socket close alone does not acknowledge that release.
+            // Retry only its explicit UID rejection, within this same 4s attempt.
+            if (protocol !== "raw_json" || socket?.legacyHelloAccepted === true || socket?.closeCode !== 1002 || socket?.closeReason !== "invalid peer uid") throw error;
+            await new Promise(resolve => setTimeout(resolve, 50));
+            current();
+            if (channel === "video") this.resetSignaling();
+            else this.resetAudioSignaling();
+          }
+        }
+      };
+      const videoOffer = await negotiate("video", videoProtocol);
       current();
-      const audioOffer = await (audioProtocol === "raw_json"
-        ? this.openLegacySelkiesAudioSession(size) : this.openCurrentSelkiesAudioSession());
+      const audioOffer = await negotiate("audio", audioProtocol);
       current();
       if (this.videoClosed || this.audioClosed) throw new Error("Browser display signaling closed");
       const generation = `display:${crypto.randomBytes(16).toString("hex")}`;
@@ -2762,7 +2806,7 @@ export class SelkiesPage {
       this.displayAvailable = true;
       return result;
     });
-    attachment.promise = withTimeout("Browser display attachment", 4000, prepare)
+    attachment.promise = withTimeout("Browser display attachment", 4000, prepare, () => { attachment.pending = false; })
       .catch(() => {
         attachment.pending = false;
         if (this.displayAttachment === attachment) retire();

@@ -170,3 +170,149 @@ test('actual socket close cancels a stalled HTTP handshake and drains the connec
     assert.equal(ws.socket.destroyed, true); assert.equal(ws.closed, true); assert.equal(sockets.size, 0);
   } finally { ws.close(); for (const socket of sockets) socket.destroy(); await new Promise(resolve => server.close(resolve)); }
 });
+
+async function legacyBroker(t, { releaseMs = 120, rejectionReason = 'invalid peer uid', acknowledgeRejected = false } = {}) {
+  const peers = new Map(), sockets = new Set(), timers = new Set(), rejected = [], accepted = [];
+  const frame = (opcode, payload) => {
+    payload = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+    assert.ok(payload.length < 126);
+    return Buffer.concat([Buffer.from([0x80 | opcode, payload.length]), payload]);
+  };
+  const server = net.createServer(socket => {
+    sockets.add(socket); let buffer = Buffer.alloc(0), upgraded = false, uid = null;
+    socket.on('error', () => {});
+    socket.on('close', () => {
+      sockets.delete(socket);
+      if (uid && peers.get(uid) === socket) {
+        const timer = setTimeout(() => { timers.delete(timer); if (peers.get(uid) === socket) peers.delete(uid); }, typeof releaseMs === 'number' ? releaseMs : releaseMs[uid]);
+        timers.add(timer);
+      }
+    });
+    socket.on('data', chunk => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (!upgraded) {
+        const end = buffer.indexOf('\r\n\r\n'); if (end < 0) return;
+        buffer = buffer.subarray(end + 4); upgraded = true;
+        socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
+      }
+      while (buffer.length >= 2) {
+        const opcode = buffer[0] & 15, masked = !!(buffer[1] & 128);
+        let length = buffer[1] & 127, offset = 2;
+        if (length === 126) { if (buffer.length < 4) return; length = buffer.readUInt16BE(2); offset = 4; }
+        assert.notEqual(length, 127); assert.equal(masked, true);
+        if (buffer.length < offset + 4 + length) return;
+        const mask = buffer.subarray(offset, offset + 4), payload = Buffer.from(buffer.subarray(offset + 4, offset + 4 + length));
+        buffer = buffer.subarray(offset + 4 + length);
+        for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
+        if (opcode === 8) { socket.end(frame(8, Buffer.alloc(0))); return; }
+        if (opcode !== 1) continue;
+        const words = payload.toString().split(' '); assert.equal(words[0], 'HELLO');
+        const requested = words[1];
+        if (peers.has(requested)) {
+          rejected.push(requested);
+          assert.notEqual(peers.get(requested), socket);
+          const code = Buffer.alloc(2); code.writeUInt16BE(1002);
+          if (acknowledgeRejected) socket.write(frame(1, 'HELLO'));
+          socket.end(frame(8, Buffer.concat([code, Buffer.from(rejectionReason)]))); return;
+        }
+        uid = requested; peers.set(uid, socket); accepted.push(uid);
+        socket.write(Buffer.concat([frame(1, 'HELLO'), frame(1, JSON.stringify({ sdp: { type: 'offer', sdp: uid === '1' ? videoSdp : audioSdp } }))]));
+      }
+    });
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(async () => { for (const socket of sockets) socket.destroy(); await new Promise(resolve => server.close(resolve)); for (const timer of timers) clearTimeout(timer); });
+  return { url: new URL(`ws://127.0.0.1:${server.address().port}`), rejected, accepted };
+}
+
+async function actualLegacyPage(t, broker) {
+  const f = fixture();
+  delete f.page.createWebSocket; delete f.page.createAudioWebSocket;
+  delete f.page.openLegacySelkiesSession; delete f.page.openLegacySelkiesAudioSession;
+  Object.assign(f.page.config, { selkiesWsUrl: broker.url, connectTimeoutMs: 1000, signalTimeoutMs: 1000 });
+  f.page.resetSignaling(); f.page.resetAudioSignaling();
+  await f.page.openLegacySelkiesSession({ scale: 1 });
+  await f.page.openLegacySelkiesAudioSession({ scale: 1 });
+  t.after(() => f.page.close());
+  return f;
+}
+
+test('actual legacy broker keeps retired viewer IDs until producer teardown; attachment retries only UID rejection', async t => {
+  const broker = await legacyBroker(t, { releaseMs: { '1': 120, '3': 320 } }), f = await actualLegacyPage(t, broker);
+  const result = await f.page.signal(f.request);
+  assert.ok(broker.rejected.includes('1'));
+  assert.ok(broker.rejected.includes('3'));
+  assert.deepEqual(broker.accepted, ['1', '3', '1', '3']);
+  assert.equal(f.page.closed, false); assert.equal(f.page.displayAvailable, true);
+  assert.equal(result.initial_offer.type, 'offer'); assert.equal(result.audio_offer.type, 'offer');
+  assert.notEqual(result.display_generation, f.generation);
+  const next = await f.page.signal({ ...f.request, request_id: otherId, display_generation: result.display_generation });
+  assert.notEqual(next.display_generation, result.display_generation);
+  assert.deepEqual(broker.accepted, ['1', '3', '1', '3', '1', '3']);
+});
+
+test('UID error after HELLO acknowledgment is terminal even when its code and reason match', async t => {
+  const broker = await legacyBroker(t, { acknowledgeRejected: true }), f = await actualLegacyPage(t, broker);
+  await assert.rejects(f.page.signal(f.request), { code: 'display_attach_failed' });
+  assert.deepEqual(broker.rejected, ['1']);
+});
+
+test('actual broker protocol rejection other than the exact UID release response remains terminal', async t => {
+  const broker = await legacyBroker(t, { rejectionReason: 'invalid protocol' }), f = await actualLegacyPage(t, broker);
+  await assert.rejects(f.page.signal(f.request), { code: 'display_attach_failed' });
+  assert.deepEqual(broker.rejected, ['1']); assert.equal(f.page.closed, false);
+});
+
+for (const cancel of ['deadline', 'close']) {
+  test(`legacy UID release retry obeys the original ${cancel} and cannot open a later socket`, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const f = fixture(); let attempts = 0;
+    f.page.openLegacySelkiesSession = async () => {
+      attempts++; f.page.ws.closeCode = 1002; f.page.ws.closeReason = 'invalid peer uid'; throw new Error('closed during HELLO');
+    };
+    const pending = f.page.signal(f.request), failed = assert.rejects(pending, { code: 'display_attach_failed' });
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    assert.equal(attempts, 1);
+    if (cancel === 'close') f.page.close();
+    t.mock.timers.tick(cancel === 'close' ? 50 : 4000);
+    await failed; for (let i = 0; i < 6; i++) await Promise.resolve();
+    assert.equal(attempts, 1); assert.equal(f.page.displayGeneration, f.generation); assert.equal(f.page.displayAvailable, false);
+    if (cancel === 'deadline') { await assert.rejects(f.page.signal(f.request), { code: 'display_attach_failed' }); assert.equal(attempts, 1); }
+  });
+}
+
+test('overdue retry cannot acquire a socket when the event loop resumes after the attachment deadline', async () => {
+  const f = fixture(); let attempts = 0;
+  f.page.openLegacySelkiesSession = async () => {
+    attempts++; f.page.ws.closeCode = 1002; f.page.ws.closeReason = 'invalid peer uid'; throw new Error('closed during HELLO');
+  };
+  const pending = f.page.signal(f.request), failed = assert.rejects(pending, { code: 'display_attach_failed' });
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.equal(attempts, 1);
+  // Both the 50ms retry and 4s cancellation timer become overdue. The retry's
+  // timer is due first, so elapsed monotonic time must fence its continuation.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4050);
+  await failed; assert.equal(attempts, 1); assert.equal(f.page.displayGeneration, f.generation);
+});
+
+for (const method of ['openLegacySelkiesSession', 'openLegacySelkiesAudioSession', 'openCurrentSelkiesSession', 'openCurrentSelkiesAudioSession']) {
+  test(`${method} checks elapsed attachment time before HELLO after connection`, async () => {
+    const f = fixture(), connected = deferred(), sends = [];
+    delete f.page.openLegacySelkiesSession; delete f.page.openLegacySelkiesAudioSession;
+    const socket = { connect: () => connected.promise, close() {}, sendText: value => sends.push(value) };
+    if (method.includes('Audio')) f.page.audioWs = socket; else f.page.ws = socket;
+    f.page.displayAttachment = { pending: true, deadline: performance.now() + 4000 };
+    const pending = f.page[method]({ scale: 1 }), failed = assert.rejects(pending, /expired/);
+    f.page.displayAttachment.deadline = performance.now() - 1; connected.resolve();
+    await failed; assert.deepEqual(sends, []); assert.equal(f.page.waiters.length, 0); assert.equal(f.page.audioWaiters.length, 0);
+  });
+}
+
+test('offers completed after elapsed attachment deadline cannot publish a generation', async () => {
+  const f = fixture(), offer = deferred(), entered = deferred();
+  f.page.openLegacySelkiesAudioSession = async () => { entered.resolve(); return offer.promise; };
+  const pending = f.page.signal(f.request), failed = assert.rejects(pending, { code: 'display_attach_failed' });
+  await entered.promise; f.page.displayAttachment.deadline = performance.now() - 1;
+  offer.resolve({ sdp: { sdp: audioSdp } }); await failed;
+  assert.equal(f.page.displayGeneration, f.generation); assert.equal(f.page.displayAvailable, false);
+});
