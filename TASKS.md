@@ -116,7 +116,18 @@ Independent source repair and regression work can proceed in separate file scope
   five-second deadline. Fresh Home close succeeds in 514 ms and detaches at
   516 ms, with all 13 effects and zero obligations. The next experiment captures
   bounded guest signaling evidence during the same reload; the media negotiation
-  cause remains a hypothesis until that evidence is collected.
+  cause remains a hypothesis until that evidence is collected. Run 28 retains
+  the viewer owner with zero decoded frames and only the original video/audio
+  answers in the guest log. It exposes a UI mistake: status carries a redacted
+  diagnostic display, while recovery carries Runtime display authority. UI
+  repair `f2c41bc2` uses that recovered authority and keeps fresh status for URL
+  observations; 152 combined tests pass. Run 29 reaches the Engine with new
+  video/audio answers but still has zero frames at the five-second deadline.
+  Its ordinary journey and exact close pass. The next B06 slice adds a typed
+  fresh display attachment, with a separate display generation, while retaining
+  page, cleanup, profile, VM and Runtime stream ownership. Review the shared
+  request/result contract before parallel Runtime/adapter and Engine/UI work;
+  the coordinator keeps sole ownership of installed Mac tests.
   Full B05 mixed-transport ordering and motion behavior remain separate gates.
   The probe must observe request failure and
   stopped media, then restore the same page, profile, service selection and

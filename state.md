@@ -203,7 +203,16 @@ match and the reload sends no page open/close request. Usable display recovery
 misses the five-second deadline. Fresh Home close confirms all 13 effects and
 zero obligations, reaches terminal state at 514 ms, and detaches at 516 ms.
 The next run captures bounded guest signaling diagnostics on these same
-installed artifacts before selecting the Engine repair.
+installed artifacts before selecting the Engine repair. Run 28 records retained
+viewer ownership, zero frames and only the original video/audio answers. Its
+source diagnosis finds that reload used redacted status display data. Installed
+UI `f2c41bc2` restores from Runtime display authority; 152 combined UI tests pass.
+Run 29 now forwards new video/audio answers to the Engine but still decodes zero
+frames during the five-second reload window. The ordinary journey and exact
+13-effect close pass. A fresh Engine display attachment is the next repair.
+GStreamer result handling remains a source diagnosis; these logs do not expose
+its remote-description result. Runs 28/29 include diagnostic overhead and do
+not contribute formal latency distributions.
 Guest Node also starts about five seconds after its shell launch;
 initial entropy is 1 and no hardware RNG is selected. That secondary cause needs
 its own experiment. Run 16 includes diagnostic overhead and is excluded from
