@@ -70,34 +70,55 @@ volatile proof logs remain outside the repository.
 
 ## Browser contract and device qualification
 
-The current task Mac runs Runtime `caa5d90f`, SHA-256
-`2d3603f65aa418244a321ef6766ae14349cbf9a9e08b0b3ede64b6f549a5324b`.
+The current task Mac runs Runtime `690170bc`, SHA-256
+`f5b012ae4f704bf22cb94aa51699f29082839727b4ddbd4493b7b14d26c557bf`.
 The Linux consumer/Exit runs the operation diagnostic `70dccb34`, SHA-256
 `1701fad008811fd3dffd4d4c75d7ec6657fea9f598bf2bfcc4420369eb2d63ae`.
-Both installed and served artifact checks pass. The Mac retains the `cb03a719`
-Engine helper and the bounded audio-observer image from `6896fee5`; its rootfs
-is `ef1c0efcbdbb5d0c5d3ad195705385b76aed66933335d6a50e4ab2ec46bd6280`
-and initrd is `05afae8f72394956f1eed1c20cd25774bde323fde75043b7b7882d9768cb3d1f`.
+Both installed and served artifact checks pass. The Mac now has the `2cdc9535`
+operator invitation, reference-fill adapter, Browser UI and Engine helper.
+The matching adapter hash is
+`192139afe6b274a25bc258648aa84cb98309b708ad3a7d86996ba9095be93c57`.
+Its rootfs is `58c82e397fa97d900159ba1a0a7854505cb1bce1f5e11a2c2a8e40e5a7f03971`
+and initrd is `d928d9f69e7929049575cb1f4c6366f87f66c62cf11921faddb5bb2963c5462c`.
+One guest helper changed in the rootfs and initrd; the kernel and media
+dependencies were reused. The bounded audio observer from `6896fee5` remains.
 This diagnostic image and the debug Runtime builds supply bounded functional
 evidence; release performance and device qualification remain open.
 
-Local installed journeys pass decoded media, navigation, input, native operator
-handoff and exact cleanup. The first A/B/A attempt fails at Carrier connection
-before page allocation. A later attempt reaches an Exit policy refusal because
-the controlled fixture uses a port outside the configured local Exit policy;
-its exact window close leaves zero Runtime and VM obligations. Remote selection
-and readiness precede that refusal in the source path. Remote page execution,
-decoded frames and the complete placement suite still require proof.
+Earlier exact local artifact sets pass decoded media, navigation, input, native
+operator handoff and cleanup. After the controlled fixture received an exact
+Exit destination exception and the current Engine request received approval,
+A/B/A loads its first page and decodes WebRTC frames. Runtime evidence binds
+that page to the selected remote Engine. Navigation then fails at the remote
+input operation; later status and close calls fail and the page retires. Final
+Runtime/control counts return to zero, but the acquired page lacks its complete
+13-effect close receipt. The full remote journey remains failed. The initial
+Carrier connection failure also remains unexplained. The installed `690170bc`
+repeat again reaches a decoded remote page, then reports a five-second deadline
+at `input/runtime_operation`. Subsequent status calls also wait at that stage.
+Guest evidence records `Page.navigate` and `Runtime.evaluate` timeouts; the new
+owner-watchdog retirement warning is absent. Final counts are zero and the
+owned window closes, while the complete acquired-page close receipt remains
+missing. The native provider serializes commands until each response drains,
+which can hold status and close behind navigation. This explains a possible
+secondary delay; the first navigation stall still needs a causal test. Existing
+deadlines and lifecycle policy remain unchanged.
 
 Source `2cdc9535` adds explicit owner invitation, separately authenticated
 operator inspection, reference replacement/clear and detach. Independent review
-accepts 103 Node and 27 Rust checks. Matching Runtime, adapter, Browser UI and
-guest-helper installation and the actual Camofox workflow are next. Full
+accepts 103 Node and 27 Rust checks. The matching set is installed. Source
+`74d5b272` adds a bounded adapter exercised by the unchanged Playwright SDK;
+58 focused Node checks pass independent review. Actual installed Camofox and
+Playwright owner approval, fill, clear, revocation and detach are next. Full
 Playwright/Camoufox, profiles, daily workflows, update, authority, media,
 endurance, device and human acceptance retain their original requirements.
 A bounded idle sample also finds roughly one CPU core used by the task Runtime
 with zero Browser pages/VMs; collaboration verification/projection appears in
-the active stacks. Its cause and the intermittent audio failures remain open.
+the active stacks. A synthetic debug benchmark with the installed record count
+uses about 1.38 CPU seconds for five full validation reads. Signature tampering
+is rejected and the measured paths make zero state writes. This cost alone
+does not explain the full idle observation. Its cause and the intermittent
+audio failures remain open.
 
 The following paragraphs retain earlier bounded evidence. The earlier operator
 checkpoint used Runtime source `0244cc0c`, hash

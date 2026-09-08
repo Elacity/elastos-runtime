@@ -47,7 +47,7 @@ Sash's reported failure on the published source remains unverified.
 | --- | --- | --- |
 | B02.install: install and use Browser on a Mac; B01/B02/B03/B05/B06/B07/B11/B15 | Active; coordinator owns the Mac, installed artifacts and integration | An independently provisioned installation acquires one compatible artifact set and opens Browser through Home. Navigation, decoded video, audio, typing, scrolling, reload, interruption and close pass. Startup/input meet measured budgets, failures name the responsible stage, and a stalled launch leaves another admitted session responsive. |
 | B04.operator: a human and an authorized agent operate the same page; B04/B12/B13/B14 | Active; delegated owner implements operator approval and actions | Actual Engine-page inspection, actions and waits work through Runtime authority. Human/agent handoff retains page, profile and service identity. Native, Playwright and declared Camofox/Camoufox paths pass the shared workflow; stale references and revoked writers are rejected. Profile, files, approvals and accessibility keep their own acceptance cases. |
-| B10.placement: Engine and Exit move independently; B08/B09/B10/B14 | Ready for target discovery and bounded source work; coordinator owns target admission | The same capsule completes the same journey in A/A/A, A/B/A, A/A/B, A/B/B and A/B/C. Product service controls select approved peers; destination/DNS evidence identifies Exit. Physical LAN, supported WAN and relay-required cases prove media, recovery, revocation and cleanup. |
+| B10.placement: Engine and Exit move independently; B08/B09/B10/B14 | Active on the admitted Mac Engine and Linux consumer/Exit; coordinator owns target execution | The same capsule completes the same journey in A/A/A, A/B/A, A/A/B, A/B/B and A/B/C. Product service controls select approved peers; destination/DNS evidence identifies Exit. Physical LAN, supported WAN and relay-required cases prove media, recovery, revocation and cleanup. |
 | B16.qualification: sustained daily use on each claimed role; B01-B16 | Planned; coordinator assembles candidate, independent reviewer checks evidence, humans perform UX acceptance | Exact candidate artifacts pass the original device, media, recovery, concurrency, profile, wallet, authority, installation/update and operator gates. Include 100 lifecycle cycles, 100 cold and 100 warm launches, 30-minute A/V interaction, eight-hour mixed use, manual UX and the objective audit. A second maintainer repeats installation and use. |
 
 These delivery slices run through accepted contract outputs, rather than waiting
@@ -135,19 +135,38 @@ alongside the local, operator and remote journeys.
   human handoff and revoked writer rejection after viewer reload. The next
   implementation requirement is actual framework adapter conformance; repeat
   native admission only when changed inputs or a diagnosed defect require it.
+  Source `2cdc9535` owner invitation, separate operator approval, reference fill
+  and clear passes 103 Node and 27 Rust checks and is installed with matching
+  Runtime, adapter, Browser UI and guest helper. The unchanged Playwright SDK
+  exercises the bounded adapter in `74d5b272`; 58 checks pass independent review.
+  Complete the actual installed Camofox and Playwright approval, fill, clear,
+  revocation and detach workflow. General selectors, waits, full actionability,
+  files, profiles and declared Camoufox conformance remain open.
 - **B08/B09.first-remote / active / independent delegated source owner.**
   `caa5d90f` is independently accepted after 45 focused tests. Normal Engine
   sharing, request, approval and selection pass. The first Linux Home → Mac
   Engine → Linux Exit attempt fails at Carrier connection before allocation.
-  Consumer-only diagnostic `70dccb34` is installed with the Mac artifacts
-  reused. The latest repeat reaches the controlled fixture's Exit port-policy
-  refusal and closes its exact window with zero Runtime/VM obligations.
-  Admit that fixture through the existing exact-destination test policy, then
-  repeat the same journey. The original Carrier failure remains unexplained;
-  remote page execution, media, all placements and recovery require proof.
+  Consumer-only diagnostic `70dccb34` is installed. An exact destination policy
+  admits the controlled fixture. The current Engine request receives normal
+  owner approval. A/B/A then loads its first page with exact remote Engine
+  binding and decoded WebRTC frames, before navigation fails at remote input.
+  Later status and close calls fail and the page retires. Final counts are
+  zero; the acquired page's complete 13-effect receipt remains missing.
+  Mac diagnostic `690170bc` preserves the existing deadlines and lifecycle
+  policy while reporting the fixed execution and retirement stages. Its repeat
+  reaches decoded remote media, then fails at `input/runtime_operation` after
+  five seconds. Guest CDP navigation also times out; the owner-watchdog warning
+  is absent. Trace the native serialized control path and guest navigation,
+  compare the same candidate locally, and repair the first responsible
+  component before repeating the remote journey. Final zero counts do not
+  replace the missing acquired-page close receipt. The original Carrier
+  connection failure remains unexplained.
+  Full media, placement, recovery and cleanup requirements remain open.
   Source `1a47ddc6` binds canonical journey Engine/window receipts; `30fa0a68`
-  corrects its introduced inventory-read deadline. Restored-window foreground
-  selection/close remains a separate test defect. Preserve both failed runs.
+  corrects its introduced inventory-read deadline. Source `8feb264c` selects
+  and raises the exact owned window through Home controls; 332 unit checks and
+  an actual overlapping-window fixture pass. The installed pre-effect close
+  passes. Preserve the earlier failed runs and qualify broader Home restoration.
   The following paragraphs retain earlier evidence.
   Prerequisite: accepted Engine/Exit identity and Runtime service contracts.
   Identify the first missing product operation for A/B/A and A/A/B against
@@ -213,6 +232,30 @@ alongside the local, operator and remote journeys.
   The full cycle, launch-distribution, media and eight-hour workloads retain
   their original requirements. Visible-input latency and synchronized A/V
   offset measurements remain explicit gaps in the current runner.
+  Reviewed source `c17776f5` binds exact Engine/Exit and fixture configuration,
+  the actual launch/close VM identity, and sampled process/control identity.
+  Its 337 Node checks pass. Run one installed probe before the campaigns;
+  warm conditioning remains unsupported. One qualifying 100-cold-launch
+  campaign can also supply the 100 lifecycle facts when all cleanup criteria
+  are retained. The current mixed workload's idle periods mean that its first
+  half hour cannot substitute for the uninterrupted 30-minute media run.
+
+- **B12/B13/B15.remaining-features / ready source work; target proof scheduled by
+  coordinator.** These goals include implementation gaps as well as testing.
+  B12 first proves cookies, local storage and committed IndexedDB across an
+  explicit close and reopen of the same principal/profile. The opt-in fixture
+  passes independent source review, including commit/abort and read-without-write
+  cases; actual Engine persistence remains unverified. Encrypted checkpoint transfer, recovery
+  and ephemeral-profile deletion still need implementation and proof. B13 first
+  uses the existing object-granted upload path with a bounded file and an exact
+  destination hash. Complete downloads to selected storage, large-transfer
+  progress/cancel/integrity, actual Wallet consent flows and human screen-reader
+  access to Engine-page controls retain their acceptance requirements. B15
+  first binds a real distributable image and matching helpers in the existing
+  component manifest and installer. Cross-component health settlement,
+  supported profile migration/rollback and upstream Engine security maintenance
+  remain open. Source preparation can proceed while a fixed installed candidate
+  runs; deployment and disruptive tests require the target owner's next slot.
 
 ### Time and resource control
 
