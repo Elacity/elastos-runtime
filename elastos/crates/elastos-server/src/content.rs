@@ -209,6 +209,7 @@ struct ContentFetchTransfer {
     range: Option<ProviderByteRange>,
     progress: Option<ProviderProgress>,
     bounded_read: bool,
+    max_bytes: Option<u64>,
 }
 
 impl ContentFetchTransfer {
@@ -278,10 +279,32 @@ impl ContentFetchTransfer {
             }
             None => None,
         };
+        let max_bytes = request
+            .get("max_bytes")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .filter(|n| (1..=65536).contains(n))
+                    .ok_or_else(|| {
+                        ProviderError::Provider("invalid complete metadata bound".into())
+                    })
+            })
+            .transpose()?;
+        if max_bytes.is_some()
+            && (request.get("bounded_read") != Some(&Value::Bool(true))
+                || request.get("path").and_then(Value::as_str) != Some(OBJECT_MANIFEST_PATH)
+                || range.is_some()
+                || progress.as_ref().and_then(|p| p.expected_bytes).is_some())
+        {
+            return Err(ProviderError::Provider(
+                "complete metadata requires a local bounded whole index".into(),
+            ));
+        }
         Ok(Self {
             transfer,
             range,
             progress,
+            max_bytes,
             bounded_read: match request.get("bounded_read") {
                 None | Some(Value::Bool(false)) => false,
                 Some(Value::Bool(true)) => true,
@@ -2625,6 +2648,52 @@ pub async fn publish_bytes_via_provider(
     content_response_cid(&response)
 }
 
+/// Complete one bounded model read through the existing local Content path.
+/// Preparation owns aggregate accounting, ordering, integrity and settlement.
+pub(crate) async fn fetch_model_part(
+    registry: &ProviderRegistry,
+    cid: &str,
+    path: &str,
+    range: Option<(u64, u64)>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut request = json!({"op":"fetch", "cid":cid, "path":path,
+        "bounded_read":true, "transfer":"stream"});
+    let limit = if let Some((offset, length)) = range {
+        anyhow::ensure!((1..=65536).contains(&length), "invalid model read bound");
+        request["range"] = json!({"start":offset,"end":offset.checked_add(length - 1)
+            .ok_or_else(|| anyhow::anyhow!("model range overflow"))?});
+        length
+    } else {
+        anyhow::ensure!(
+            path == CONTENT_OBJECT_MANIFEST_PATH,
+            "complete model index required"
+        );
+        request["max_bytes"] = json!(65536);
+        65536
+    };
+    let mut stream = registry
+        .open_provider_stream(
+            ProviderInvocation {
+                source: "runtime-model-preparation".into(),
+                target: "content".into(),
+                op: "fetch".into(),
+                request,
+                transfer: ProviderTransfer::Stream,
+                range: None,
+                progress: None,
+                transport: ProviderInvocationTransport::Local,
+            },
+            ProviderStreamOptions::default(),
+        )
+        .await?;
+    let bytes = stream.drain_to_vec()?;
+    anyhow::ensure!(bytes.len() as u64 <= limit, "model read exceeds bound");
+    if range.is_some() {
+        anyhow::ensure!(bytes.len() as u64 == limit, "incomplete model range");
+    }
+    Ok(bytes)
+}
+
 pub async fn fetch_bytes_via_provider(
     registry: &ProviderRegistry,
     cid: &str,
@@ -3055,6 +3124,9 @@ impl ContentProvider {
         });
         if transfer.bounded_read {
             ipfs_request["bounded_read"] = Value::Bool(true);
+        }
+        if let Some(max_bytes) = transfer.max_bytes {
+            ipfs_request["max_bytes"] = json!(max_bytes);
         }
         if !path.is_empty() {
             ipfs_request["path"] = Value::String(path.to_string());
@@ -11465,6 +11537,133 @@ mod tests {
                 }))
                 .await
                 .is_err());
+        }
+        assert!(ipfs.requests.lock().await.is_empty());
+        assert!(registry.get("availability").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn content_complete_metadata_preserves_exact_bytes_without_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let content = Arc::new(ContentProvider::new(
+            root.path().to_path_buf(),
+            Arc::downgrade(&registry),
+        ));
+        registry
+            .register_sub_provider("content", content)
+            .await
+            .unwrap();
+        let bytes = b" \n{ \"files\": [] }\t\n";
+        let valid = provider_ok(json!({
+            "data":base64::engine::general_purpose::STANDARD.encode(bytes),
+            "_runtime_complete_metadata":{
+                "schema":"elastos.provider.complete-metadata/v1", "cid":TEST_CID,
+                "path":OBJECT_MANIFEST_PATH, "max_bytes":65536,
+                "actual_bytes":bytes.len(), "completed":true
+            }
+        }));
+        let backend = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(valid.clone()),
+        });
+        registry
+            .register_sub_provider("ipfs", backend.clone())
+            .await
+            .unwrap();
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({}))),
+        });
+        registry.register(availability.clone()).await;
+        let invocation = |transfer, name| ProviderInvocation {
+            source: "fixture-runtime".into(),
+            target: "content".into(),
+            op: "fetch".into(),
+            request: json!({"op":"fetch", "cid":TEST_CID, "path":OBJECT_MANIFEST_PATH,
+                "bounded_read":true, "max_bytes":65536, "transfer":name}),
+            transfer,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Local,
+        };
+        for (transfer, name) in [
+            (ProviderTransfer::Bytes, "bytes"),
+            (ProviderTransfer::Stream, "stream"),
+        ] {
+            let response = registry
+                .invoke_provider(invocation(transfer, name))
+                .await
+                .unwrap();
+            let actual = if name == "bytes" {
+                base64::engine::general_purpose::STANDARD
+                    .decode(response["data"]["data"].as_str().unwrap())
+                    .unwrap()
+            } else {
+                decode_test_stream_payload(&response["data"]["stream"])
+            };
+            assert_eq!(actual, bytes);
+            assert!(!response.to_string().contains("_runtime_complete_metadata"));
+            assert!(!response.to_string().contains("_runtime_applied_range"));
+        }
+        let mut failures = vec![
+            provider_error("bounded_read_failed", "Bounded content read failed"),
+            provider_ok(json!({"data":base64::engine::general_purpose::STANDARD.encode(bytes)})),
+        ];
+        for (field, value) in [
+            ("cid", json!("other-cid")),
+            ("path", json!("other.json")),
+            ("completed", json!(false)),
+            ("actual_bytes", json!(bytes.len() + 1)),
+            ("max_bytes", json!(65535)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["data"]["_runtime_complete_metadata"][field] = value;
+            failures.push(invalid);
+        }
+        let count = 2 + failures.len();
+        for failure in failures {
+            *backend.response.lock().await = failure;
+            assert!(registry
+                .invoke_provider(invocation(ProviderTransfer::Bytes, "bytes"))
+                .await
+                .is_err());
+        }
+        let sent = backend.requests.lock().await;
+        assert_eq!(sent.len(), count);
+        for request in sent.iter() {
+            assert_eq!(request["cid"], TEST_CID);
+            assert_eq!(request["path"], OBJECT_MANIFEST_PATH);
+            assert_eq!(request["max_bytes"], 65536);
+            assert_eq!(request["bounded_read"], true);
+            assert!(request["_runtime_invocation"]["range"].is_null());
+            assert!(request["_runtime_invocation"]["progress"]["expected_bytes"].is_null());
+        }
+        assert!(availability.requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn content_complete_metadata_invalid_contract_has_no_provider_effect() {
+        let (_root, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let request = json!({"op":"fetch", "cid":TEST_CID, "path":OBJECT_MANIFEST_PATH,
+            "bounded_read":true, "max_bytes":65536});
+        for (field, value) in [
+            ("max_bytes", Value::Null),
+            ("max_bytes", json!("65536")),
+            ("max_bytes", json!(0)),
+            ("max_bytes", json!(65537)),
+            ("range", json!({"start":0,"end":3})),
+            (
+                "progress",
+                json!({"request_id":"metadata","expected_bytes":4}),
+            ),
+            ("path", json!("weights.gguf")),
+            ("bounded_read", json!(false)),
+            ("transfer", json!("json")),
+        ] {
+            let mut invalid = request.clone();
+            invalid[field] = value;
+            assert!(content.send_raw(&invalid).await.is_err(), "{field}");
         }
         assert!(ipfs.requests.lock().await.is_empty());
         assert!(registry.get("availability").await.is_none());

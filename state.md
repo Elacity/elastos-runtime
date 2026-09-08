@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-09-07 UTC
+Last updated: 2026-09-08 UTC
 
 This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
@@ -229,8 +229,8 @@ The integrated source includes these durable facts:
   catalog tests and the final 25-test server capsule-catalog regression.
   Workspace/Chain formatting, Home/public-copy entropy and diff checks pass.
   These prove metadata consistency and publisher verification,
-  including rejection paths; full package CID and payload verification await
-  preparation. Installed Homes remain unchanged. Model-provider still consumes
+  including rejection paths; the composed preparation proof is recorded below.
+  Installed Homes remain unchanged. Model-provider still consumes
   static private artifact/offer configuration, and Marketplace/System model
   selection remains future work. Model and Assistant Truth below records the
   existing Qwen operator bootstrap.
@@ -250,17 +250,63 @@ The integrated source includes these durable facts:
   pin, retry or fallback. Runtime checks the private CID/path/range receipt and
   exact byte count, consumes the range once, and removes that receipt from Bytes
   and Stream output. Remote bounded calls fail before dispatch.
-- Source verification passes all 27 native tests, 4 Runtime and 2 server bounded
-  tests, all 55 provider tests and 11 content-fetch regressions under Rust 1.91
-  with warnings denied. The stalled-body fixture observes the connection end
+- Complete `_elastos_object.json` reads use `max_bytes` up to 64 KiB, with
+  Kubo length capped at one extra byte. EOF within the cap and an exact private
+  CID/path/completed/length receipt are required. Runtime preserves whitespace
+  and strips the receipt. Conflicting ranges or expected lengths fail, while
+  unrelated provider operations retain their own `max_bytes` semantics.
+  The stalled-body fixture observes the connection end
   after the deadline and a distinct next read succeeding; the existing bridge
-  test preserves response association after caller cancellation. Workspace,
-  Chain and native formatting, Home/public-copy entropy and diff checks pass.
-- Ordinary whole-object paths still buffer complete payloads. The bounded read
-  is a source prerequisite, not full model preparation or package identity proof.
-  Preparation approval, operation status/cancel and cleanup, complete closure
-  verification, atomic admission, offer binding, shared model UI and real cold
-  Qwen acceptance remain open. Installed Homes remain unchanged.
+  test preserves response association after caller cancellation.
+- The candidate preserves reviewed onboarding, window/selection and
+  conditional-save source checks alongside signed catalog metadata and bounded
+  reads. Combined installed acceptance remains open.
+- Runtime preparation connects the inventory to Content and typed catalog
+  invocation, with native package identity and capacity verification. Source
+  receipts cover the accepted final composite; intermediate whole-server trees
+  were not tested separately. Analyser's latest
+  regular run passes 25 tests, with the explicit process prerequisite ignored
+  in that run and exercised separately. Registry, full-charge and aggregate-budget
+  preflight pass; `Reserved` carries the full charge and exact-CID aliases remain
+  single-charged. The seeded-cache 16 MiB
+  lower-layer real-Kubo/native process test transfers the complete object index and ranged files, checks
+  exact source bytes and digests, and reproduces the full package CID. Normal
+  CLI import and streamed hashing agree, with unchanged backend allocation and
+  successful fixture cleanup. Memory and disk observations are qualified
+  samples and high-water marks; cold-network and Qwen proof remain open.
+- Typed local Registry readiness/hash/capacity methods reject generic raw, provider-plane
+  and Carrier calls before transmission. Readiness probes the bounded pinned
+  version after the existing Kubo lifecycle runs. Descriptors are checked before
+  effects and responses are sanitized. The hash helper is production code on
+  supported platforms; ordinary operations retain their behavior. Current
+  parent verification passes native 43 tests (one explicit prerequisite test
+  ignored), the separately invoked real-Kubo process test and Registry 46/46.
+  Earlier Content metadata 2/2, bounded reads 2/2 and content-fetch 11/11
+  remain verified. Workspace/Chain/native formatting, Home/public-copy entropy
+  and diff checks pass. The parent's final strict native Clippy all-targets
+  rerun also passes.
+- Private capacity observation checks the ready backend's actual repository
+  and same-volume datastores, validates bounded numeric facts and preserves
+  the 10% free-space floor. Backend directories allow current-owner `0755`
+  while rejecting special or group/world write bits; staging remains `0700`.
+  The real-Kubo process proof passes with repo mode `0755`, 264 calls and
+  16,777,382 transferred bytes, with cleanup, child reap and EOF confirmed.
+  This observation does not reserve capacity or establish peak usage.
+- Separately invoked 1 MiB and 8 MiB process tests passed through the production preparation
+  owner, real Content, Registry, native provider bridge and isolated offline
+  Kubo. Fresh Use admitted 1,049,332 payload bytes plus a 717-byte index in
+  426 ms, with 22 Content reads and 48 provider requests. Reopened-owner CID
+  reuse made zero Content reads. Fixture cleanup and both child reaps passed.
+  The 8 MiB run admitted 8,389,356 payload bytes plus a 717-byte index in
+  2.066 seconds, with 133 Content reads and 270 provider requests. Reuse again
+  made zero Content reads. Backend allocated bytes rose from 8,470,528 to
+  8,474,624; sampled staging/admitted allocation was 8,605,696 bytes and the
+  full reservation was 33,753,284 bytes. Cleanup and both child reaps passed.
+  Both runs used signed synthetic packages seeded in offline local cache.
+  Continuous peak-capacity and scaled cold-delivery proof remain open.
+  One inventory worker retains accounting through drain and
+  exact admission reconciliation. Offer binding, shared Use/Keep/selection
+  UI and cold exact-Qwen acceptance follow. Installed Homes remain unchanged.
 
 ## Protected-content Contract Truth
 
@@ -1022,6 +1068,8 @@ complete. Installed proof and the atomic authority cutover remain open.
   observed-absence proof. Independent reproduction confirms the same result
   and exited fixture processes. Fake signaling proves fixture behavior;
   hosted product completion and installed Browser media remain open.
+  Browser repairs belong to a separate session. This remains external
+  acceptance evidence for the model/onboarding closeout.
 - Home fixtures use the current auth DOM and Runtime summary/presence shapes.
   Restored-lifecycle testing stops on captured bootstrap errors and accepts an
   optional browser executable; System keeps its boot/error assertions without

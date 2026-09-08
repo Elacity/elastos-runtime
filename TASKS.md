@@ -12,17 +12,18 @@ Do not add new product surface area until the `Now` section is materially tighte
 
 ## Now
 
-Build order: finish the reviewed onboarding and window source closeout, then
-implement and verify CID model preparation. Install that combined source for
-isolated acceptance, then complete human review before explicit publication
-approval. Source work and installed acceptance are separate phases.
+Goal: prepare this branch for final manual Brave acceptance of first-run
+creation/recovery, capsule window and selection policies, and one CID-addressed
+local Qwen Use/Keep/selection path. Complete model integration, then combined
+isolated acceptance and human review. Browser repairs belong to another session;
+their acceptance evidence remains visible and separate.
 
 Active priority index:
 
-- current priority: finish guided onboarding, then per-capsule window behavior,
-  then CID-addressed Qwen discovery, selection, preparation and inference plus
-  isolated owner acceptance using the [installed provenance in state.md](state.md).
-  Model delivery and publication for review are part of this closeout.
+- current priority: finish the one model preparation/admission path, exact
+  provider/offer and UI binding, then cold-model and combined isolated acceptance
+  using the [installed provenance in state.md](state.md).
+  Reviewed onboarding/window/save source work remains part of this closeout.
   Complete artifact parity, source review and final human Brave checks before
   explicit GitHub publication.
   Live deployment, data migration and paid calls require separate authorization
@@ -59,118 +60,88 @@ and the broad manual Brave journey are complete on `900d7e5c`. The journey
 found open first-run, Browser startup, model, collaboration, and
 protected-content prerequisites. It did not change the pending Wallet approval.
 
-Open gates, in order. Gates 2 through 4 use the combined source after gate 1;
-installed onboarding and window acceptance do not block CID source work.
+Open gates, in order. Source integration comes before combined isolated
+acceptance. Browser implementation belongs to its separate owner.
 
-1. [ ] Implement the first CID-addressed local Qwen path in
-   [Content capsule distribution](docs/CONTENT_CAPSULE_DISTRIBUTION.md): one
-   currently verified package, Marketplace Models browse/details/Use, System
-   model management and the existing Assistant/Home Agent model pickers.
-   Selection may prepare that exact model; Settings offers Keep on this device
-   or release local retention. Runtime owns transfer and atomic admission behind
-   these actions, rather than a traditional download/install or file-picker UI.
-   All projections use the same Runtime catalog, admission and inventory facts.
-   Build on the verified bounded local-read primitive. Close typed preparation,
-   approval, operation status/cancel, full closure verification, atomic admission
-   and engine-availability prerequisites; a stream label or catalog row is insufficient.
-   Prove progress, cancel, retry, failure/offline state, readiness,
-   incompatibility, busy-safe retention release, restart and idempotence, with
-   at least 10% free disk and bounded partial cleanup. Catalog selection may
-   prepare content; inference requires the exact admitted model and ready
-   provider, without substituting another model. Preserve runs and drafts.
-   Real publisher trust, signed closure/catalog and availability need explicit
-   deployment evidence; fixtures cannot supply production identities. Git
-   carries code, tests, docs and manifests, while GGUF and private keys stay out.
-2. [ ] Install the combined reviewed source and complete guided onboarding
-   acceptance on disposable fresh roots: owner and enabled-guest Create/Recover,
-   verified-kit import, separate
-   Recovery Kit Save/Later, focus and reload. Prove intent binding, initial
-   Profile creation, prompt-loss retry, rejected-name correction and exact
-   cached completion through installed passkeys,
-   including cancellation, uncertain replies, wrong kit or actor and partial
-   Wallet restore. Preserve existing identities, kits and data. Runtime owns
-   reserved-name validation, grants and recovery authority; native identity
-   contracts and existing optional internal registration dispatch remain intact.
-   Migration of unfinished test accounts and real rollout remain separate.
-   Verify that Recover import keeps focus and incomplete sign-in returns to
-   System import from typed readiness,
-   including unknown readiness, explicit reminders and Chat guidance.
-3. [ ] Complete installed current-navigation restore and window acceptance
-   across the inventory of 41 current capsule manifests; source receipts are in
-   [state.md](state.md). Capsule policy controls presentation within one
-   principal's Home session. Verify reuse with current deep links and preserved
-   drafts, explicit independent windows, launch races and saved positions.
-   Preserve provider, owned Home, shell and Agent roles.
-   Verify installed picker binding to the exact opener, current document and
-   chooser, acknowledgement before close, and stale/replaced/duplicate denial.
-   Browser Open reuses the relevant window; explicit New Window owns an
-   independent session. Include asynchronous upload and chooser replacement.
-   The matching guest control service must be installed in its initrd with
-   capsule artifacts; source JS parity alone cannot prove this path.
-   Verify repeated Save actions through one System window and restore of
-   current Documents, Library, Archive, GBA and Chat selections with fresh
-   Runtime authority. Retain settled selectors after failed or stale replies;
-   keep pickers, drafts and effects outside restore state. Complete the separate
-   public share-reader navigation check.
-   Verify installed GBA same-game conflict/reconciliation and Documents
-   two-window saves: stored winner, retained losing draft, paused autosave,
-   lost-create response and explicit stored-document recovery with newer edits.
-   Keep two-file crash recovery explicit: a body write can precede failed metadata
-   publication, so recovery requires a fresh read and a deliberate save.
-   Verify installed independent selected Player sessions. Its multiple policy
-   suppresses generic blank New Window; selected launches retain their mint ID.
-   Reconcile the Selkies service's v1 close result with the required
-   generation-bound v2 terminal receipt, retaining observed-absence proof.
-   This hosted cleanup gate stays separate from isolated Mac/VZ Browser
-   lifecycle and media proof.
-4. [ ] Complete the installed model and first-owner checks below before final
-   human Brave review and explicit GitHub publication approval.
-   Prove cold model selection-to-real-Qwen reply on a fresh install, exact
-   receipts and source review.
-   The Mac proof owner also completes behavior acceptance on the installed
-   model Home; exact installed artifact provenance is in [state.md](state.md).
-   Complete installed draft preservation, unknown create-acceptance handling,
-   reload and restart recovery, retained terminal results, and cleanup.
-   Backend stop or honest unknown settlement remains the cancellation rule,
-   with one terminal result and no duplicate dispatch. Keep each explicit
-   run's terminal and dispatch evidence distinct.
-   Managed-engine stream closure alone is not backend-stop proof.
-   Also run focused Recovery, Profile, navigation and Terminal tests.
-   Add Browser media only when the target
-   supplies accepted evidence. Finish with hash-bound receipts for the exact
-   tree; functional run evidence and artifact parity remain separate.
-   Complete first-owner acceptance on the isolated host: verify guided
-   enrollment and separate Recovery Kit Save/Later, one-use operator-admitted
-   HTTPS origin/RP, typed denials, competing attempts and human reload/recovery
-   behavior.
-   Preserve existing accounts and recovery material.
-   Windows secure enrollment acceptance remains open. Same-principal linking
-   is a separate follow-up, not a dependency of this source closeout.
-   Complete artifact parity, source review and final human Brave acceptance
-   before explicit authorization to publish the candidate to GitHub for review.
-   If PR52, PR54, or PR55 changes upstream,
-   compare patches and trees before rebuilding the tail, keep unique fixes, and
-   omit patch-equivalent copies. Finish with a reviewed source revision and
-   green source gates. Release and installed readiness remain separate.
-5. [ ] The protected-content owner completes installed prerequisites on the
-   reviewed candidate: stable receipts on localhost, seed, and the third custody
-   node; one signed owner-only 2-of-3 composition across three distinct operators
-   and failure domains; and exact private Chain configuration. Each custody node
-   uses its own two to five explicit unique RPC sources and requires two exact
-   agreeing finalized results. Prove three replicas with repair, funded creator
-   and buyer accounts, exact KID, object and CentralStorage binding, the
-   `AuthorityGateway.buyAccess` receipt, allowed, denied and unbound reads, and
-   restart, replay, tamper rejection and cleanup in the full two-Runtime
-   mint-to-play journey. Before peer acceptance, the Carrier owner must land the
-   bounded request-frame gate below. Under explicit install approval, enable the
-   inactive path only on the test scope for human acceptance. After review, make
-   one atomic rollout that selects the Runtime-owned path and removes the
-   provisional `drm`, `rights`, `key`, and `decrypt` surfaces without fallback.
-   Finish with the reviewed rollout and an explicit release decision. The full
-   contract and acceptance details are in
-   [docs/PROTECTED_CONTENT.md](docs/PROTECTED_CONTENT.md).
+1. [ ] Complete scaled resource proof for the existing Runtime preparation and
+   admission path before a large-model transfer. Source verification passes
+   25 preparation tests plus explicit 1 MiB and 8 MiB signed synthetic-package
+   process tests through real Content, Registry and native IPFS. These prove
+   fresh Use, bounded index/file reads, exact package CID admission, reopened
+   owner reuse without Content reads, and fixture cleanup. Full-charge and
+   aggregate-budget preflight, cancellation and restart reconciliation pass.
+   The 8 MiB preparation took 2.066 seconds; allocation measurements are
+   samples, not continuous peaks. Prove bounded peak memory/disk and cold
+   delivery at the intended scale while retaining the 10% free-space floor.
+   Exact Qwen and installed acceptance remain in the gates below.
+2. [ ] Bind the exact admitted artifact to the existing model provider and
+   offer. Expose the same Runtime facts through Marketplace Models, System,
+   Assistant and Home Agent for Use, progress, cancel, retry, Keep and selection.
+   Use the existing catalog, inventory and pickers. Preserve drafts and runs.
+   Selection may prepare the chosen model; inference requires that exact
+   admitted model and a ready provider. Prove offline/error states,
+   incompatibility, busy-safe retention release and idempotence. Keep public
+   readiness unavailable until atomic admission and offer binding are complete.
+3. [ ] Package the exact existing Qwen model and verified engine for isolated
+   setup with a real pinned signed catalog and complete closure, publisher trust
+   and honest availability evidence. Distinguish verified upstream references
+   from conversion facts that the publisher attests. Git carries code, tests,
+   docs and manifests; large model bytes and private keys stay in operator
+   storage. Prove a cold exact-model reply, restart without another transfer,
+   cancel/cleanup, and retention while idle and busy. Source fixtures establish
+   neither production publisher identity nor installed model readiness.
+4. [ ] Install the combined reviewed source on the authorized isolated Homes
+   and verify exact artifact parity before guided Brave acceptance. Preserve
+   current accounts, Wallets, passkeys, profiles and content; use disposable
+   fresh profiles for first-run checks.
+   Complete owner and enabled-guest Create/Recover, verified-kit import,
+   separate Recovery Kit Save/Later, focus and reload. Include intent binding,
+   initial Profile creation, prompt-loss retry, rejected-name correction,
+   cached completion, cancellation, uncertain replies, wrong kit or actor and
+   partial Wallet restore. Verify the typed System import guidance after
+   incomplete sign-in, unknown readiness, reminders and Chat.
+   Complete window and current-selection policy across all 41 capsule
+   manifests below: reuse with current deep links and drafts, explicit
+   independent windows, launch races and saved positions. Verify exact
+   opener/document/chooser binding, acknowledgement before close, and
+   stale/replaced/duplicate denial, including asynchronous upload.
+   Use the Browser owner's reviewed artifacts and evidence for Browser window,
+   chooser, guest-service and lifecycle cases.
+   Verify repeated Save through one System window and current Documents,
+   Library, Archive, GBA and Chat selection restore with fresh Runtime authority.
+   Keep pickers, drafts and effects outside restored selectors. Complete
+   public share-reader navigation, GBA same-game conflict/reconciliation,
+   Documents two-window saves and selected Player sessions. Preserve the
+   stored winner and losing draft, pause autosave on conflict, and require
+   deliberate recovery after an uncertain create or body-before-metadata write.
+   Complete installed model draft/run preservation, uncertain outcome,
+   cancellation, restart and exact terminal-result checks. Backend stop or
+   honest unknown settlement remains the cancellation rule; stream closure
+   alone does not prove backend stop.
+   Include isolated first-owner origin/RP admission and typed denials.
+   Windows enrollment and same-principal linking remain separate follow-up.
+5. [ ] Reconcile source and installed proof, docs and reviewable commit groups.
+   Preserve reviewed history; compare changed upstream patches before adding
+   them. Finish the relevant source gates, exact artifact receipts and a concise
+   manual Brave checklist for Anders covering onboarding, recovery, windows,
+   selection, saves and the one Qwen Use/Keep path. Publish for review only
+   after his review and explicit approval. Keep release and deployment decisions
+   separate from source or isolated acceptance.
 
-Window coverage for gate 3. The 41 manifests include ten single, six hybrid and
+External Browser evidence remains open: the hosted service smoke fails at
+`engine_close_indeterminate` because its v1 close result does not meet the
+generation-bound v2 terminal-receipt contract. The Browser owner supplies the
+repair and matching acceptance evidence. Preserve that failure and its limits;
+passing source checks here do not establish whole-Browser readiness.
+
+Funded protected-content rollout remains later, under the
+[protected-content acceptance contract](docs/PROTECTED_CONTENT.md). Its owner
+retains the signed three-operator custody composition, Chain configuration,
+three-replica repair, funded mint/buy/read/restart proof, stable target receipts
+and explicit atomic-cutover authorization gates. Hosted services, Jetson and
+standing mandates also remain later.
+
+Window coverage for gate 4. The 41 manifests include ten single, six hybrid and
 one multiple policy. Complete installed People/Inbox/Wallet deep-link and draft
 proof and current-navigation restore acceptance. Source receipts are in
 [state.md](state.md).

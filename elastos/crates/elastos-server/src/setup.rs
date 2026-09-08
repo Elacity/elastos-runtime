@@ -46,6 +46,30 @@ pub struct ComponentsManifest {
 pub struct ModelCatalogConfig {
     pub head_cid: String,
     pub publisher_dids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_use: Option<ModelLocalUseConfig>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ModelLocalUseConfig {
+    #[serde(deserialize_with = "deserialize_model_local_use_budget")]
+    pub max_cache_bytes: u64,
+    #[serde(deserialize_with = "deserialize_model_local_use_budget")]
+    pub max_model_memory_bytes: u64,
+}
+
+fn deserialize_model_local_use_budget<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 || value > i64::MAX as u64 {
+        return Err(serde::de::Error::custom(
+            "model local-use budget is out of range",
+        ));
+    }
+    Ok(value)
 }
 
 /// A setup-materialized component.

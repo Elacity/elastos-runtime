@@ -22,6 +22,12 @@ pub(super) use read_model::{
 
 const CAPSULE_INTERFACE_INVOKE_RESULT_SCHEMA: &str = "elastos.capsules.invoke-result/v1";
 
+#[cfg(unix)]
+pub(super) type ModelPreparationOwner =
+    Arc<crate::api::capsule_inventory::preparation::PreparationOwner>;
+#[cfg(not(unix))]
+pub(super) type ModelPreparationOwner = Arc<()>;
+
 pub(super) async fn capsule_catalog(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -111,6 +117,7 @@ pub(super) async fn capsule_contract_audit(
 pub(super) async fn capsule_interface_invoke(
     State(state): State<GatewayState>,
     headers: HeaderMap,
+    owner: Option<Extension<ModelPreparationOwner>>,
     Json(request): Json<CapsuleInterfaceInvokeRequest>,
 ) -> Response {
     let resolved = match resolve_capsule_affordance(&state.data_dir, &request) {
@@ -226,25 +233,34 @@ pub(super) async fn capsule_interface_invoke(
             return capsule_invoke_error(&resolved, request_id, status, code, message);
         }
     };
-    let output =
-        match dispatch_capsule_affordance(&state, &context, &request, runtime_binding).await {
-            Ok(output) => output,
-            Err((status, code, message)) => {
-                let _ = append_provider_effect_audit(
-                    &state.data_dir,
-                    ProviderEffectAuditInput {
-                        capsule_id: &resolved.capsule,
-                        event_type: "capsule.affordance.failed",
-                        principal_id: &context.principal_id,
-                        session_id: &context.session_id,
-                        request_id,
-                        result: "failed",
-                        reason: &message,
-                    },
-                );
-                return capsule_invoke_error(&resolved, request_id, status, code, &message);
-            }
-        };
+    let output = match dispatch_capsule_affordance(
+        &state,
+        &context,
+        &request,
+        runtime_binding,
+        &resolved,
+        &headers,
+        owner.as_ref().map(|extension| &extension.0),
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err((status, code, message)) => {
+            let _ = append_provider_effect_audit(
+                &state.data_dir,
+                ProviderEffectAuditInput {
+                    capsule_id: &resolved.capsule,
+                    event_type: "capsule.affordance.failed",
+                    principal_id: &context.principal_id,
+                    session_id: &context.session_id,
+                    request_id,
+                    result: "failed",
+                    reason: &message,
+                },
+            );
+            return capsule_invoke_error(&resolved, request_id, status, code, &message);
+        }
+    };
 
     if let Err(err) = append_provider_effect_audit(
         &state.data_dir,
@@ -369,6 +385,9 @@ async fn dispatch_capsule_affordance(
     context: &HomeLaunchTokenContext,
     request: &CapsuleInterfaceInvokeRequest,
     binding: RuntimeCapsuleAffordanceBinding,
+    resolved: &ResolvedCapsuleAffordance,
+    headers: &HeaderMap,
+    owner: Option<&ModelPreparationOwner>,
 ) -> Result<serde_json::Value, (StatusCode, &'static str, String)> {
     match binding {
         RuntimeCapsuleAffordanceBinding::CatalogList => {
@@ -384,6 +403,77 @@ async fn dispatch_capsule_affordance(
         }
         RuntimeCapsuleAffordanceBinding::CapsuleLaunch => {
             dispatch_capsule_launch_affordance(state, context, request).await
+        }
+        RuntimeCapsuleAffordanceBinding::ModelPreparation => {
+            #[cfg(unix)]
+            {
+                use crate::api::capsule_inventory::preparation::{PreparationCaller, Revalidate};
+                let invoke = || -> anyhow::Result<serde_json::Value> {
+                    let owner =
+                        owner.ok_or_else(|| anyhow::anyhow!("preparation owner unavailable"))?;
+                    let data = state.data_dir.clone();
+                    let headers = headers.clone();
+                    let expected_context = context.clone();
+                    let expected_method = serde_json::to_value(&resolved.method)?;
+                    let guard_request = CapsuleInterfaceInvokeRequest {
+                        request_id: request.request_id.clone(),
+                        capsule: request.capsule.clone(),
+                        interface: request.interface.clone(),
+                        method: request.method.clone(),
+                        input: request.input.clone(),
+                    };
+                    // The invocation owner retains the admitted token privately,
+                    // revalidating current launch authority and the exact method
+                    // between effects. No bearer token enters inventory storage.
+                    let revalidate: Revalidate = Arc::new(move || {
+                        let (_, current) = require_home_launch_token_for_any_app_context(
+                            &data,
+                            &headers,
+                            &[guard_request.capsule.as_str()],
+                        )?;
+                        anyhow::ensure!(
+                            current == expected_context,
+                            "preparation authority changed"
+                        );
+                        let current = resolve_capsule_affordance(&data, &guard_request)?;
+                        anyhow::ensure!(
+                            serde_json::to_value(&current.method)? == expected_method,
+                            "preparation method changed"
+                        );
+                        Ok(())
+                    });
+                    owner.invoke(
+                        &state.data_dir,
+                        state.provider_registry.clone(),
+                        PreparationCaller {
+                            context,
+                            capsule: &resolved.capsule,
+                            interface: &resolved.interface_id,
+                            method: &resolved.method,
+                        },
+                        &request.request_id,
+                        &request.input,
+                        revalidate,
+                    )
+                };
+                invoke().map_err(|error| {
+                    tracing::debug!(error = ?error, "private model preparation invocation failed");
+                    (
+                        StatusCode::CONFLICT,
+                        "preparation_unavailable",
+                        "Model preparation is unavailable.".into(),
+                    )
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (resolved, headers, owner);
+                Err((
+                    StatusCode::NOT_IMPLEMENTED,
+                    "preparation_unavailable",
+                    "Model preparation is unavailable.".into(),
+                ))
+            }
         }
     }
 }
@@ -1386,6 +1476,7 @@ mod tests {
         let runtime_response = capsule_interface_invoke(
             State(state.clone()),
             headers.clone(),
+            None,
             Json(CapsuleInterfaceInvokeRequest {
                 request_id: "test-runtime-request".to_string(),
                 capsule: "marketplace".to_string(),
@@ -1400,6 +1491,7 @@ mod tests {
         let provider_response = capsule_interface_invoke(
             State(state),
             headers,
+            None,
             Json(CapsuleInterfaceInvokeRequest {
                 request_id: "test-provider-request".to_string(),
                 capsule: "marketplace".to_string(),

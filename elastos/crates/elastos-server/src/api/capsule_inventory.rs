@@ -7,6 +7,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
+pub(in crate::api) mod preparation;
+
 const DEV_CAPSULES_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../capsules");
 const MODEL_CATALOG_FILE: &str = "model-catalog.json";
 const MODEL_CATALOG_DOMAIN: &str = "elastos.model.catalog.v1";
@@ -17,6 +20,7 @@ pub(crate) struct VerifiedModelCatalogEntry {
     pub publisher_did: String,
     pub manifest: CapsuleManifest,
     pub size_bytes: u64,
+    pub object_manifest: Value,
 }
 
 #[derive(Deserialize)]
@@ -185,6 +189,7 @@ fn verify_model_catalog(
             publisher_did: signed.signer_did.clone(),
             manifest,
             size_bytes,
+            object_manifest: entry.object_manifest,
         });
     }
     Ok(verified)
@@ -397,6 +402,7 @@ pub(crate) mod tests {
             crate::setup::ModelCatalogConfig {
                 head_cid: head_cid(&bytes),
                 publisher_dids: vec![signer_did],
+                local_use: None,
             },
             bytes,
         )

@@ -8,14 +8,16 @@ replication policy and availability receipts remain in
 [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md).
 
 Runtime source projects installed capsules and can verify one locally supplied,
-operator-pinned signed model catalog snapshot. Selection-to-preparation,
-model-content packaging and network catalog updates remain planned work.
+operator-pinned signed model catalog snapshot. Its typed preparation path can
+admit that exact package through bounded local Content reads. Shared model
+selection, retention controls, real-model packaging and network catalog updates
+remain planned work.
 
 The implemented content plane already provides `elastos://content` publish,
 fetch, status, ensure, repair, and unpublish operations. It records signed local
 availability receipts, keeps raw IPFS access system-only, and serves verified
 gateway CID reads. These form the package-delivery foundation. The signed
-network delivery and package admission contract remain open.
+network delivery and deployed package acceptance remain open.
 
 ## Decision
 
@@ -179,8 +181,8 @@ digests. Catalog validation checks its ordered unique file list and content
 digest, canonical `capsule.json` bytes, entrypoint and notice references. It
 rejects traversal, aliases and missing references. Limits are 32 files, 256-byte
 relative paths, a 64 KiB capsule manifest, 1 MiB per auxiliary file and 16 GiB
-total declared content. Payload bytes and the complete package CID still need
-verification during preparation.
+total declared content. Preparation verifies payload bytes and the complete
+package CID before admission.
 
 Operator configuration in `components.json.model_catalog` pins the exact raw
 CIDv1/SHA-256 head and one to eight trusted publisher DIDs. Runtime reads the
@@ -198,7 +200,8 @@ provider readiness and deployed availability require their own proof.
 ## Implemented bounded local reads
 
 The existing Content fetch request accepts strict `bounded_read: true` with a
-closed byte range. Runtime routes it locally to native IPFS Cat. Each read has
+closed byte range, or `max_bytes` for complete `_elastos_object.json` metadata.
+These modes are mutually exclusive. Runtime routes them locally to native IPFS Cat. Each read has
 a 64 KiB cap and a five-second total HTTP/body deadline. Native Cat borrows the
 ready backend and refreshes its existing activity record. It uses encoded query
 parameters with redirects and proxy inheritance disabled, and performs no
@@ -210,11 +213,34 @@ the receipt from Bytes and Stream output. Missing or conflicting receipts fail;
 bounded Content failures do not enter ordinary availability fallback. Remote
 bounded calls are outside this local contract.
 
+Complete metadata uses a maximum of 64 KiB and requests at most that cap plus
+one byte from Kubo. Success requires EOF within the cap. Runtime checks the
+private CID/path/completed/length receipt and preserves the exact bytes,
+including whitespace, before removing the receipt. Range or expected-length
+claims cannot accompany this mode. Other provider operations retain ownership
+of their own `max_bytes` fields.
+
 Source tests prove deadline-driven socket closure, a distinct next read and the
-existing bridge's serialized response drain. This bounds one dispatched read;
-preparation status, cancellation and cleanup still need an owned operation.
-The receipt does not verify package identity or payload hashes. The current
-per-read cap is a source proof limit; large-package throughput remains unmeasured.
+existing bridge's serialized response drain. The read receipt establishes the
+bounded transfer; preparation separately verifies file hashes and package CID.
+One inventory worker owns preparation, status, cancellation and restart
+reconciliation. It reserves the full staging/backend/index charge before a new
+operation, checks aggregate budget and current authority, and keeps charges
+until provider work drains or an uncertain admission is reconciled. Verified
+staging enters admission by exclusive same-filesystem rename. Exact-CID reuse
+retains one artifact charge with separate actor/request bindings.
+
+Private native/Registry capacity observation uses the ready backend's actual
+repository and same-volume datastores. It returns bounded facts and enforces the 10%
+free-space floor. Current-owner backend directories may use `0755` with no
+special or group/world write bits; staging remains owner-only `0700`.
+This filesystem observation is separate from the inventory reservation.
+Explicit isolated process tests exercise fresh Use through real Content,
+Registry, the native bridge and offline Kubo, including atomic admission,
+reopened-owner reuse without Content reads and cleanup. The signed synthetic
+packages are seeded in local cache. Current proof and measurements are in
+[state.md](../state.md); scaled cold delivery, continuous peak usage, exact
+Qwen, inference and installed acceptance remain open.
 
 ## Source prerequisites and bounded implementation plan
 
@@ -223,8 +249,8 @@ The following separates implemented primitives from remaining package work:
 | Existing surface | Current state and required extension |
 | --- | --- |
 | `elastos/crates/elastos-common/src/manifest.rs` | The bounded passive metadata profile above is implemented. Preparation must verify its declared facts against the complete fetched package before admission. |
-| `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | The catalog projects installed inventory plus verified, unprepared model metadata. Extend existing inventory admission/receipt ownership for preparation; source-directory presence and a signed metadata row alone are insufficient. |
-| `elastos/crates/elastos-server/src/content.rs` | Explicit bounded fetch delegates to local IPFS without fallback. Ordinary `fetch_bytes_via_provider` and `materialize_data_capsule` still drain whole files. `import_exact` and aggregate `import_object` remain capped at 64 MiB and 512 files. Preparation must use a bounded transfer loop instead of these whole-buffer paths. |
+| `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | The catalog projects installed inventory plus verified, unprepared model metadata. The preparation inventory now owns reservations and admission receipts. Shared admission/offer projections remain to be connected. |
+| `elastos/crates/elastos-server/src/content.rs` | Preparation uses the explicit bounded local-fetch loop. Ordinary `fetch_bytes_via_provider` and `materialize_data_capsule` still drain whole files. `import_exact` and aggregate `import_object` remain capped at 64 MiB and 512 files; these are separate paths. |
 | `elastos/crates/elastos-runtime/src/provider/registry.rs` | Bounded reads validate and consume the native range once for Bytes and Stream. Ordinary `open_provider_stream` still decodes the full response into `ProviderStreamSession.bytes`; consumer chunking alone does not bound producer memory or cancel network work. |
 | `capsules/ipfs-provider/src/main.rs` | Explicit bounded Cat enforces finite bytes/time and uses the existing backend lifecycle. Ordinary `cat` and `cat_to_path` still read the entire file before encoding or writing. |
 | `elastos/crates/elastos-server/src/api/gateway_site.rs` | Gateway CID reads buffer content before enforcing the 100 MiB file limit. Ordinary browser file responses are not a model-transfer route. |
@@ -250,17 +276,16 @@ transfer. Cancellation and cleanup leave other packages and user data intact.
 Proposed local commit order, after the separate onboarding/recovery and window
 policy slices:
 
-1. **Package admission contract.** Build on the verified catalog metadata and
-   existing inventory/Runtime ownership for one Qwen package. Add narrowly typed
-   preparation, status/cancel and retention intents at this Runtime boundary:
-   the current catalog is read-only and content fetch does not authorize an
-   installation. Inputs identify the exact catalog entry/CID or owned operation;
+1. **Package admission contract.** The typed preparation, status/cancel and
+   inventory path is implemented; shared retention intents remain open.
+   Content fetch alone does not authorize installation.
+   Inputs identify the exact catalog entry/CID or owned operation;
    Runtime derives principal, trust, provider and paths. Keep one inventory and
    its admission receipts, not an independent Store registry or second journal.
    Test canonical closure identity, signature/trust/revocation, size/license/
    provenance/compatibility rejection, caller isolation and bounded projections.
-2. **Bounded content transfer and atomic preparation.** Build on the verified
-   local-read primitive with one Runtime-owned transfer and admission operation.
+2. **Scaled transfer proof.** Extend the verified small-package production
+   preparation proof to the intended model scale and cold delivery.
    Test a deterministic streamed fixture larger than old whole-file limits with
    bounded peak buffers, slow/oversized/ignored-range failures, mid-read cancel,
    retry, concurrent duplicate selection, low disk, crash/restart and exact
@@ -268,7 +293,14 @@ policy slices:
 3. **Admission-to-offer binding.** Reuse the installed engine receipt, private
    artifact verification, ProviderRegistry and model run journal. Derive offers
    from admitted records; reinitialize the existing provider only when idle and
-   safe, preserving active and unknown-settlement runs. Test absent/incompatible
+   safe, preserving active and unknown-settlement runs. The current coordinator
+   rejects a second Init, so this requires a guarded change within that owner.
+   Its serialized coordinator must check the run journal and adapter workers
+   and apply reinitialization in the same operation. Ordinary idle counts exclude
+   terminal unknown-settlement runs; preserve those records and their artifact
+   bindings until settlement is proved. Registry shutdown alone is not an idle
+   admission gate. Keep one provider slot
+   and the same journal across restart. Test absent/incompatible
    engine, tampered artifacts, duplicate admission, restart without transfer,
    busy retention release and exact CID-to-offer/run binding. This is not a new
    inference provider or a capsule-facing config operation.

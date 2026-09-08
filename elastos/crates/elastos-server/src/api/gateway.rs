@@ -972,7 +972,9 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route("/api/capsules/contracts/audit", get(capsule_contract_audit))
         .route(
             "/api/capsules/interfaces/invoke",
-            post(capsule_interface_invoke),
+            post(capsule_interface_invoke).layer(Extension(
+                gateway_capsule_catalog::ModelPreparationOwner::default(),
+            )),
         )
         .route("/api/apps/marketplace/catalog", get(marketplace_catalog))
         .route("/api/apps/services/summary", get(services_summary))

@@ -8,6 +8,7 @@ use super::*;
 pub(super) enum RuntimeCapsuleAffordanceBinding {
     CatalogList,
     CapsuleLaunch,
+    ModelPreparation,
 }
 
 impl RuntimeCapsuleAffordanceBinding {
@@ -15,6 +16,7 @@ impl RuntimeCapsuleAffordanceBinding {
         match self {
             Self::CatalogList => "runtime.catalog.list",
             Self::CapsuleLaunch => "runtime.capsule.launch",
+            Self::ModelPreparation => "runtime.content.preparation",
         }
     }
 }
@@ -48,6 +50,9 @@ pub(super) fn runtime_capsule_affordance_binding(
     match (resource, operation) {
         ("elastos://capsules/*", "list") => Some(RuntimeCapsuleAffordanceBinding::CatalogList),
         ("elastos://capsules/*", "launch") => Some(RuntimeCapsuleAffordanceBinding::CapsuleLaunch),
+        ("elastos://capsules/*", "use" | "status" | "cancel") => {
+            Some(RuntimeCapsuleAffordanceBinding::ModelPreparation)
+        }
         _ => None,
     }
 }
