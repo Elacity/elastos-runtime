@@ -1483,15 +1483,6 @@ turn_patch = '''        if elastos_ice_transport_policy:
             self.webrtcbin.set_property("ice-transport-policy", policy_value)
             logger.info("confirmed ICE transport policy after TURN setup: %s", elastos_ice_transport_policy)
 '''
-local_address_marker = '        self.pipeline.add(self.webrtcbin)\n'
-local_address_patch = '''        if os.environ.get("ELASTOS_BROWSER_VM_VZ_TRANSPORT", "").strip() == "vsock_v1":
-            self._elastos_vz_ice_agent = self.webrtcbin.get_property("ice-agent")
-            if self._elastos_vz_ice_agent is None:
-                raise GSTWebRTCAppError("VZ ICE agent is unavailable")
-            if not self._elastos_vz_ice_agent.emit("add-local-ip-address", "127.0.0.1"):
-                raise GSTWebRTCAppError("VZ ICE loopback address was rejected")
-            logger.info("using explicit VZ ICE local address: 127.0.0.1")
-'''
 if "elastos_ice_transport_policy" not in text:
     if marker not in text:
         raise SystemExit("browser-vm-selkies-start: Selkies relay patch target not found")
@@ -1502,17 +1493,41 @@ if "confirmed ICE transport policy after TURN setup" not in text:
     text = text.replace(turn_marker, turn_marker + turn_patch, 1)
 if "confirmed ICE transport policy after TURN setup" not in text:
     raise SystemExit("browser-vm-selkies-start: Selkies relay policy patch incomplete")
-if local_address_patch in text:
-    text = text.replace(local_address_patch, "", 1)
-if local_address_marker not in text:
-    raise SystemExit("browser-vm-selkies-start: Selkies ICE local address patch target not found")
-text = text.replace(
-    local_address_marker,
-    local_address_marker + local_address_patch,
-    1,
-)
-if 'self._elastos_vz_ice_agent.emit("add-local-ip-address", "127.0.0.1")' not in text:
-    raise SystemExit("browser-vm-selkies-start: Selkies VZ ICE local address patch incomplete")
+def patch_selkies_vz_ice_ownership(source):
+    marker = '        self.pipeline.add(self.webrtcbin)\n'
+    old_hook = '''        if os.environ.get("ELASTOS_BROWSER_VM_VZ_TRANSPORT", "").strip() == "vsock_v1":
+            self._elastos_vz_ice_agent = self.webrtcbin.get_property("ice-agent")
+            if self._elastos_vz_ice_agent is None:
+                raise GSTWebRTCAppError("VZ ICE agent is unavailable")
+            if not self._elastos_vz_ice_agent.emit("add-local-ip-address", "127.0.0.1"):
+                raise GSTWebRTCAppError("VZ ICE loopback address was rejected")
+            logger.info("using explicit VZ ICE local address: 127.0.0.1")
+'''
+    reference = '''            # This fresh, unstarted agent has two owners: webrtcbin and
+            # its Python wrapper. GStreamer 1.22 leaves the default floating;
+            # PyGObject sinks the bin's reference instead of adding its own.
+            # Restore only that missing reference. Already-owned agents need none.
+            if self._elastos_vz_ice_agent.__grefcount__ == 1:
+                self._elastos_vz_ice_agent._ref()
+'''
+    hook = old_hook.replace('            if not self._elastos_vz_ice_agent.emit(',
+                            reference + '            if not self._elastos_vz_ice_agent.emit(', 1)
+    for previous in (hook, old_hook):
+        if source.count(previous) > 1:
+            raise SystemExit("browser-vm-selkies-start: duplicate VZ ICE hook")
+        source = source.replace(previous, "", 1)
+    if source.count(marker) != 1 or "self._elastos_vz_ice_agent" in source.replace(
+            '        self._elastos_vz_ice_agent = None\n', ""):
+        raise SystemExit("browser-vm-selkies-start: Selkies ICE ownership patch target changed")
+    source = source.replace(marker, marker + hook, 1)
+    stopped = '        logger.info("pipeline stopped")\n'
+    release = '        self._elastos_vz_ice_agent = None\n'
+    if source.count(stopped) != 1:
+        raise SystemExit("browser-vm-selkies-start: Selkies pipeline stop patch target changed")
+    source = source.replace(release + stopped, stopped, 1)
+    return source.replace(stopped, release + stopped, 1)
+
+text = patch_selkies_vz_ice_ownership(text)
 ice_log_marker = '        logger.debug("received ICE candidate: %d %s", mlineindex, candidate)\n'
 ice_log_patch = '        logger.info("emitting ICE candidate: %d %s", mlineindex, candidate)\n'
 if ice_log_patch not in text:
