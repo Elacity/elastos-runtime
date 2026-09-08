@@ -1032,7 +1032,7 @@ assert(
     !browserSourceHomeConfig.includes("preferred_display_mode") &&
     browserSourceHomeConfig.includes("relay_ipc") &&
     browserSourceHomeConfig.includes("relay_ipc: true") &&
-    browserSourceHomeConfig.includes("-relay.sock") &&
+    browserSourceHomeConfig.includes('runtimeSocketPath(args, "exit-relay")') &&
     browserSourceHomeConfig.includes("browser-local-exit.json") &&
     browserSourceHomeConfig.includes("elastos.browser.local-exit.config/v1") &&
     browserSourceHomeConfig.includes("runtimeGatewayPrivateTargets") &&
@@ -1041,7 +1041,7 @@ assert(
     browserSourceHomeConfig.includes('ports: [80, 443]') &&
     browserSourceHomeConfig.includes("relay_ipc_path") &&
     browserSourceHomeConfig.includes("control_socket_path") &&
-    browserSourceHomeConfig.includes("/tmp/elastos-browser-vm-control-${args.platform}.sock") &&
+    browserSourceHomeConfig.includes('runtimeSocketPath(args, "vm-control")') &&
     browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_CONTROL_SOCKET") &&
     !browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_PROFILE_DISK_ROOT") &&
     browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS") &&

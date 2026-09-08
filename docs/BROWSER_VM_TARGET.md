@@ -253,9 +253,14 @@ be backed by a local crosvm/VZ substrate or by a remote/operator VM provider
 reached through approved Runtime/Carrier/SSH-tunnel plumbing. Browser UI still
 talks only to Runtime, and the Browser Engine Adapter still requires
 `runtime_net_only`, `direct_network=false`, and `media_transport=runtime_relay`.
-Source-home config writes a stable `/tmp/elastos-browser-vm-control-<platform>.sock`
-control socket by default so the Browser VM supervisor has a single launch
-target instead of relying on ambient shell state.
+Source-home config defaults to
+`/tmp/elastos-browser-<platform>-<data-dir-hash>-vm-control.sock`. The hash uses
+the first 16 hex characters of SHA-256 over the normalized absolute Runtime
+data-directory path, so each Runtime has a stable launch target. The Mac VM
+proof reads `browser-vm-product.supervisor.control_socket_path` from the target
+data directory's `config/browser-engine-adapter.json`; an explicit
+`ELASTOS_BROWSER_VM_CONTROL_SOCKET` overrides that selection. A missing or
+invalid configured socket stops the proof before it contacts Home.
 
 `scripts/browser-vm-control-service.mjs` is the local Unix-socket control-plane
 contract. It serves `GET /status`, `POST /pages`, page-scoped `POST /shutdown`,
