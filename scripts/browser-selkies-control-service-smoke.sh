@@ -491,7 +491,7 @@ server.on("upgrade", (req, socket) => {
         const projection = message.params || {};
         if (
           projection.offline !== false ||
-          projection.latency !== 0 ||
+          projection.latency !== 1 ||
           projection.downloadThroughput !== -1 ||
           projection.uploadThroughput !== -1 ||
           projection.connectionType !== "other"
@@ -1306,7 +1306,7 @@ if (response.active_pages !== 0) throw new Error("failed open leaked an active S
 const projection = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
 if (
   projection.offline !== false ||
-  projection.latency !== 0 ||
+  projection.latency !== 1 ||
   projection.downloadThroughput !== -1 ||
   projection.uploadThroughput !== -1 ||
   projection.connectionType !== "other"

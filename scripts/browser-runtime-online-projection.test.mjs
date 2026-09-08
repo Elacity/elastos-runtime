@@ -45,7 +45,7 @@ test("Runtime online projection returns a bounded verified state", async () => {
       method: "Network.overrideNetworkState",
       params: {
         offline: false,
-        latency: 0,
+        latency: 1,
         downloadThroughput: -1,
         uploadThroughput: -1,
         connectionType: "other",
@@ -63,6 +63,28 @@ test("Runtime online projection returns a bounded verified state", async () => {
       },
     },
   ]);
+});
+
+test("a no-NIC guest keeps an explicit online override", async () => {
+  let online = false;
+  const cdp = {
+    async request(method, params) {
+      if (method === "Network.overrideNetworkState") {
+        // Chromium's SetNetworkStateOverride clears an all-disabled override,
+        // restoring the guest's actual offline state. Connection type alone
+        // does not activate it.
+        const enabled = params.offline || params.latency > 0 ||
+          params.downloadThroughput >= 0 || params.uploadThroughput >= 0;
+        online = enabled && !params.offline;
+      }
+      if (method === "Runtime.evaluate") {
+        return { result: { value: JSON.stringify({ online }) } };
+      }
+      return {};
+    },
+  };
+  const state = await projectRuntimeProxyOnlineState(cdp, new URL("http://127.0.0.1:19094/"));
+  assert.equal(state.online, true);
 });
 
 test("online projection brackets initial navigation and follows later navigation", () => {

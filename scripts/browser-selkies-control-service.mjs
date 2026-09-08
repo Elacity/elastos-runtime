@@ -3023,7 +3023,11 @@ export async function projectRuntimeProxyOnlineState(cdp, runtimeFetchProxyUrl) 
   await cdp.request("Network.enable");
   await cdp.request("Network.overrideNetworkState", {
     offline: false,
-    latency: 0,
+    // Chromium clears an override when latency is zero and both throughputs
+    // are disabled. Keep a 1 ms navigator RTT hint so a no-NIC guest stays
+    // online through Runtime. This command changes navigator state only;
+    // Runtime's proxy still owns traffic and applies no CDP throttling.
+    latency: 1,
     downloadThroughput: -1,
     uploadThroughput: -1,
     connectionType: "other",
