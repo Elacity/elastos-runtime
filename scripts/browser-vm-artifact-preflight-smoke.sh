@@ -162,42 +162,100 @@ if (result.rootfs_contract?.audio_default_ready !== true) throw new Error("stage
 if (result.substrate?.kernel?.ok !== true) throw new Error("darwin substrate must include kernel readiness");
 NODE
 
-if command -v debugfs >/dev/null 2>&1 && command -v mke2fs >/dev/null 2>&1 && [[ "$(uname -s)" == "Linux" ]]; then
-  mkdir -p "$tmp_dir/bin"
-  for executable in browser-native-proxy-engine browser-vm-runtime-relay node chromium; do
-    cp /bin/true "$tmp_dir/bin/$executable"
-    chmod 755 "$tmp_dir/bin/$executable"
-  done
-  cp /bin/true "$tmp_dir/bin/browser-vm-guest-control-bridge"
-  printf '\nelastos.browser.vm-guest-control-bridge.config/v1\ncontrol_socket_ready_timeout_ms\ncontrol_request_timeout_ms\n' >> "$tmp_dir/bin/browser-vm-guest-control-bridge"
-  chmod 755 "$tmp_dir/bin/browser-vm-guest-control-bridge"
-  printf '#!/usr/bin/env node\n' > "$tmp_dir/bin/browser-selkies-control-service.mjs"
-  "$repo_root/scripts/build/stage-browser-vm-target.sh" \
-    --out-dir "$tmp_dir/stage" \
-    --native-proxy-bin "$tmp_dir/bin/browser-native-proxy-engine" \
-    --runtime-relay-bin "$tmp_dir/bin/browser-vm-runtime-relay" \
-    --guest-control-bridge-bin "$tmp_dir/bin/browser-vm-guest-control-bridge" \
-    --control-service "$tmp_dir/bin/browser-selkies-control-service.mjs" \
-    --node-bin "$tmp_dir/bin/node" \
-    --chromium-bin "$tmp_dir/bin/chromium" >/dev/null
+OUTPUT="$output" python3 - "$repo_root" "$tmp_dir" "$target" <<'PYTEST'
+import copy
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
 
-  for executable in Xvfb python3 pipewire pipewire-pulse wireplumber pw-cli gst-inspect-1.0; do
-    cp /bin/true "$tmp_dir/stage/rootfs/usr/bin/$executable"
-    chmod 755 "$tmp_dir/stage/rootfs/usr/bin/$executable"
-  done
-  mke2fs -q -t ext4 -d "$tmp_dir/stage/rootfs" -F "$tmp_dir/data/browser-vm/rootfs.ext4" 2048M
+repo, scratch, target = map(pathlib.Path, sys.argv[1:])
+data = scratch / "data"
+image = data / "browser-vm/rootfs.ext4"
+sidecar = image.with_name("browser-vm-rootfs-manifest.json")
+preflight = json.loads(os.environ["OUTPUT"])["rootfs_contract"]["preflight"]
+env = {key: value for key, value in os.environ.items()
+       if not key.startswith("ELASTOS_BROWSER_VM_")}
+env.update(ELASTOS_BROWSER_VM_PLATFORM="darwin-arm64",
+           ELASTOS_BROWSER_VM_DATA_DIR=str(data))
+debugfs = os.environ.get("ELASTOS_DEBUGFS_BIN") or shutil.which("debugfs")
+mke2fs = shutil.which("mke2fs")
+checks = []
 
-  ext4_output="$(ELASTOS_BROWSER_VM_PLATFORM=darwin-arm64 \
-    ELASTOS_BROWSER_VM_DATA_DIR="$tmp_dir/data" \
-    "$repo_root/scripts/browser-vm-artifact-preflight.sh")"
-  OUTPUT="$ext4_output" node - <<'NODE'
-const result = JSON.parse(process.env.OUTPUT);
-if (result.rootfs_contract?.source_kind !== "ext4_image") throw new Error(`expected ext4 inspection: ${process.env.OUTPUT}`);
-if (result.rootfs_contract?.ok !== true) throw new Error(`ext4 rootfs contract should pass: ${process.env.OUTPUT}`);
-if (result.rootfs_contract?.optional_audio?.pipewire?.ok !== true) throw new Error("ext4 optional audio deps should be reported");
-if (result.rootfs_contract?.audio_default_ready !== true) throw new Error("ext4 rootfs should be audio-default-ready");
-if (result.local_substrate_artifacts_ready !== true) throw new Error(`ext4 artifacts should be ready: ${process.env.OUTPUT}`);
-NODE
-fi
 
-printf '%s\n' '{"schema":"elastos.browser.vm-artifact-preflight-smoke/v1","ok":true}'
+def receipt():
+    return {"schema": "elastos.browser.vm-rootfs-build/v1", "ok": True,
+            "target_platform": "linux-arm64", "size": image.stat().st_size,
+            "sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
+            "preflight": copy.deepcopy(preflight)}
+
+
+def check(name, manifest, expected, inspector=None, error=None):
+    if manifest is None:
+        sidecar.unlink(missing_ok=True)
+    else:
+        sidecar.write_text(json.dumps(manifest))
+    proc = subprocess.run([str(repo / "scripts/browser-vm-artifact-preflight.sh")],
+                          env={**env, "ELASTOS_DEBUGFS_BIN": inspector or str(scratch / "absent-debugfs")},
+                          capture_output=True, text=True, timeout=15)
+    result = json.loads(proc.stdout)
+    contract = result["rootfs_contract"]
+    assert contract["ok"] is expected, (name, result)
+    assert result["local_substrate_artifacts_ready"] is expected, (name, result)
+    assert proc.returncode == (0 if expected else 1), (name, result, proc.stderr)
+    if error:
+        assert any(error in item for item in contract["errors"]), (name, result)
+    checks.append(name)
+    return contract
+
+
+image.write_bytes(b"disposable manifest validation fixture")
+valid = receipt()
+check("valid receipt without debugfs", valid, True)
+check("missing receipt", None, False, error="sidecar missing")
+check("non-object receipt", [], False, error="JSON object")
+check("bounded receipt", {"padding": "x" * (1024 * 1024)}, False, error="1 MiB")
+check("wrong architecture", {**valid, "target_platform": "linux-amd64"}, False, error="target_platform")
+check("wrong size", {**valid, "size": 1}, False, error="image size")
+check("wrong digest", {**valid, "sha256": "0" * 64}, False, error="sha256 does not match")
+check("invalid digest", {**valid, "sha256": ["0" * 64]}, False, error="SHA-256 digest")
+missing_dependency = copy.deepcopy(valid)
+del missing_dependency["preflight"]["required"]["chromium"]
+check("missing guest dependency evidence", missing_dependency, False, error="requires chromium")
+missing_audio = copy.deepcopy(valid)
+missing_audio["preflight"]["optional_audio"]["pipewire"]["ok"] = False
+check("contradictory audio evidence", missing_audio, False, error="requires pipewire")
+
+if debugfs and mke2fs:
+    image.unlink()
+    subprocess.run([mke2fs, "-q", "-t", "ext4", "-d", str(target), "-F", str(image), "64M"],
+                   check=True, capture_output=True, text=True, timeout=30)
+    valid = receipt()
+    contract = check("real ext4 with verified receipt", valid, True, debugfs)
+    assert contract["source_kind"] == "ext4_image" and contract["inspectable"] is True
+    assert contract["verified_sidecar"] is True and contract["audio_default_ready"] is True
+    check("same real ext4 without debugfs", valid, True)
+    check("real ext4 missing receipt with debugfs", None, False, debugfs, "sidecar missing")
+    check("real ext4 wrong architecture with debugfs", {**valid, "target_platform": "linux-amd64"},
+          False, debugfs, "target_platform")
+    # Change an unused final byte so guest-file checks alone would still pass.
+    with image.open("r+b") as handle:
+        handle.seek(-1, 2)
+        previous = handle.read(1)
+        handle.seek(-1, 2)
+        handle.write(bytes([previous[0] ^ 1]))
+    for inspector in (debugfs, None):
+        check(f"changed real ext4 (debugfs={bool(inspector)})", valid, False,
+              inspector, "sha256 does not match")
+    # A valid identity still needs intact guest files when direct inspection is available.
+    subprocess.run([debugfs, "-w", "-R", "rm /opt/elastos/bin/chromium", str(image)],
+                   check=True, capture_output=True, text=True, timeout=10)
+    contract = check("verified identity with missing guest file", receipt(), False, debugfs)
+    assert "chromium" in contract["missing"] and contract["verified_sidecar"] is True
+
+print(json.dumps({"schema": "elastos.browser.vm-artifact-preflight-smoke/v1", "ok": True,
+                  "checks": checks, "real_ext4_checked": bool(debugfs and mke2fs)}))
+PYTEST

@@ -99,9 +99,14 @@ That mode adds the guest Xvfb, Python, PipeWire, PipeWire Pulse, WirePlumber,
 `pw-cli`, and `gst-inspect-1.0` checks required by the Selkies/WebRTC display
 and audio path. Use it for debootstrap-built rootfs trees and any ext4 manifest
 that will ship to Mac VZ or Linux crosvm targets. `browser-vm-artifact-preflight.sh`
-enforces the same complete contract for `rootfs.ext4` through `debugfs` when
-available, or through the rootfs sidecar manifest when direct ext4 inspection is
-not available.
+requires a rootfs sidecar manifest with matching architecture, image size and
+SHA-256, plus successful evidence for each guest and audio dependency. When
+`debugfs` is available, it inspects the guest files after verifying that receipt.
+Staged directories use the build-time target check; installed ext4 images need
+the image receipt. Publisher authorization, host eligibility, control-service
+readiness and product media remain separate admission and qualification gates.
+An image refresh must retain its source provenance and produce a matching
+receipt for the changed bytes before the image passes this check.
 
 This is a static target-image gate. It also checks that `browser-vm-init`
 starts the guest Runtime relay, starts the VM-local Selkies/Chromium stack, and

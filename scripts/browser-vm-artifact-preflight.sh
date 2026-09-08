@@ -306,7 +306,13 @@ def inspect_ext4_sidecar_manifest(image):
         return result
 
     try:
-        manifest = json.loads(manifest_path.read_text())
+        with manifest_path.open("rb") as handle:
+            contents = handle.read(1024 * 1024 + 1)
+        if len(contents) > 1024 * 1024:
+            raise ValueError("sidecar exceeds 1 MiB")
+        manifest = json.loads(contents)
+        if not isinstance(manifest, dict):
+            raise ValueError("sidecar must be a JSON object")
     except Exception as exc:
         result["errors"].append(f"rootfs manifest sidecar JSON invalid: {exc}")
         return result
@@ -325,10 +331,17 @@ def inspect_ext4_sidecar_manifest(image):
         result["errors"].append(f"rootfs manifest size {manifest.get('size')!r} does not match image size {actual_size}")
 
     expected_sha256 = manifest.get("sha256")
-    if not expected_sha256:
-        result["errors"].append("rootfs manifest sidecar missing sha256")
-    elif sha256_file(image) != expected_sha256:
-        result["errors"].append("rootfs image sha256 does not match sidecar manifest")
+    if (not isinstance(expected_sha256, str) or len(expected_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in expected_sha256)):
+        result["errors"].append("rootfs manifest sidecar requires a lowercase SHA-256 digest")
+    else:
+        try:
+            actual_sha256 = sha256_file(image)
+            result["image_identity"] = {"size": actual_size, "sha256": actual_sha256}
+            if actual_sha256 != expected_sha256:
+                result["errors"].append("rootfs image sha256 does not match sidecar manifest")
+        except OSError as exc:
+            result["errors"].append(f"rootfs image unreadable: {exc}")
 
     preflight = manifest.get("preflight")
     if not isinstance(preflight, dict):
@@ -346,6 +359,14 @@ def inspect_ext4_sidecar_manifest(image):
     result["manifest"] = preflight.get("manifest") if isinstance(preflight.get("manifest"), dict) else {}
     result["preflight"] = preflight
 
+    for name in REQUIRED_ROOTFS_FILES:
+        entry = result["required"].get(name)
+        if not isinstance(entry, dict) or entry.get("ok") is not True:
+            result["errors"].append(f"rootfs manifest target preflight requires {name}")
+    for name in AUDIO_ROOTFS_FILES:
+        entry = result["optional_audio"].get(name)
+        if not isinstance(entry, dict) or entry.get("ok") is not True:
+            result["errors"].append(f"rootfs manifest target preflight requires {name}")
     if result["audio_default_ready"] is not True:
         result["errors"].append("rootfs manifest target preflight reports audio_default_ready=false")
     if result["missing"]:
@@ -362,26 +383,13 @@ def inspect_ext4_sidecar_manifest(image):
 
 
 def inspect_ext4_rootfs(image):
-    result = {
-        "ok": False,
-        "inspectable": False,
-        "source_kind": "ext4_image",
-        "source": image,
-        "debugfs": path_stat(debugfs_bin, executable=True),
-        "required": {},
-        "optional_audio": {},
-        "audio_default_ready": False,
-        "missing": [],
-        "errors": [],
-    }
-    if not pathlib.Path(image).is_file():
-        result["errors"].append("rootfs image missing")
+    # Guest file inspection supplements the image receipt on every host.
+    # Availability of debugfs does not change the artifact identity requirement.
+    result = inspect_ext4_sidecar_manifest(image)
+    result["debugfs"] = path_stat(debugfs_bin, executable=True)
+    if not result["ok"] or not result["debugfs"]["ok"]:
         return result
-    if not debugfs_bin or not pathlib.Path(debugfs_bin).exists():
-        result = inspect_ext4_sidecar_manifest(image)
-        result["debugfs"] = path_stat(debugfs_bin, executable=True)
-        return result
-
+    result["source_kind"] = "ext4_image"
     result["inspectable"] = True
     for name, guest_path in REQUIRED_ROOTFS_FILES.items():
         ok = ext4_has(image, guest_path)

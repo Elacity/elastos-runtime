@@ -32,9 +32,13 @@ The role matrix and current protocol are in
 [BROWSER_PROTOCOL.md](docs/BROWSER_PROTOCOL.md). Remaining B01 acceptance needs
 installed artifact admission, approved remote-service
 selection, and hash-bound device-role proof. The inspected Mac's existing VM
-image failed its manifest hash check; repair or rebuild and verify the image
-or reconcile its artifact provenance before qualification. Direct file and
-script inspection passed. Linux KVM/Jetson and remote Runtime fixtures
+image failed its manifest hash check. Rootfs preflight now checks the receipt
+with and without direct guest inspection. Repair or rebuild the image with
+verified provenance and a matching receipt before qualification. Setup refresh
+currently changes guest files without renewing that receipt; add an atomic,
+provenance-bound update before relying on it for preparation. Runtime still
+needs one artifact admission and control-service readiness result for discovery,
+selection and launch. Linux KVM/Jetson and remote Runtime fixtures
 are still needed. Preserve the existing journey verdicts until those runs pass.
 Browser settings now retain an explicit Engine or Exit selection when its
 offer is absent. Installed verification must cover a service disappearing and

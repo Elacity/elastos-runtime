@@ -108,11 +108,16 @@ selection. Every matrix row remains pending installed qualification for the
 Browser maturity changes. Existing installed observations retain their original
 source bindings and verdicts.
 
-The existing Mac VM artifact preflight rejected the image because its SHA-256
-differs from the sidecar manifest. Direct read-only inspection with `debugfs`
-passed the VM file and script contract. Its embedded Browser control helper
-differs from current source, so source parity and the stale artifact receipt
-still require repair. The user's active test Home also lacks the required
+The existing Mac image has a SHA-256 that differs from its sidecar manifest.
+The previous rootfs preflight skipped the receipt when `debugfs` was available
+and passed that image. The revised check rejects it in both inspection modes.
+Seventeen regression cases passed, including a real 64 MiB ext4 fixture, changed
+image bytes, missing receipts, wrong architecture and missing guest dependencies.
+Read-only checks of the existing 8 GiB image took about three seconds per hash
+on this Mac. Runtime admission and its cached identity still need implementation;
+these checks do not establish launch or media readiness. The embedded Browser
+control helper also differs from current source, so source parity and the
+artifact receipt still require repair. The user's active test Home lacks the required
 VM helper and image set. Neither installation supplies a current B01 product
 acceptance receipt. This identifies local repair work; it does not establish
 the cause of another operator's startup failure.
