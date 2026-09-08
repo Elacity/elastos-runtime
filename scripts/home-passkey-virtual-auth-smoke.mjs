@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
+import { diagnoseBrowserJourneyRecovery } from "./lib/browser-journey-recovery.mjs";
 
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
@@ -146,6 +147,7 @@ const CHECK_BROWSER_EMBEDDED_UI_INPUT =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_EMBEDDED_UI_INPUT === "1";
 const CHECK_BROWSER_CONTROLLED_JOURNEY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_JOURNEY === "1";
+const CHECK_BROWSER_CONTROLLED_RECOVERY = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_RECOVERY === "1";
 const REQUIRE_BROWSER_VZ_TRANSPORT = process.env.HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VZ_TRANSPORT === "1";
 const BROWSER_JOURNEY_FIXTURE_ORIGIN = process.env.HOME_VIRTUAL_AUTH_BROWSER_FIXTURE_ORIGIN ||
   "http://localhost:61511";
@@ -2258,13 +2260,146 @@ async function closeControlledBrowserWindow(page, appFrame, windowLocator, token
   }
 }
 
+async function browserRecoveryCdpSession(page, appFrame) {
+  let ancestorDepth = 0;
+  for (let frame = appFrame; frame; frame = frame.parentFrame(), ancestorDepth++) {
+    try {
+      const session = await page.context().newCDPSession(frame.parentFrame() ? frame : page);
+      return { session, ancestorDepth };
+    } catch (error) {
+      if (!frame.parentFrame() || !String(error.message).includes("This frame does not have a separate CDP session")) throw error;
+    }
+  }
+  throw new Error("Browser viewer CDP session is unavailable");
+}
+
+async function runControlledBrowserRecovery(page, appFrame, token, readReceipt, expectedUrl) {
+  markStage("browser:controlled-recovery");
+  const instance = new URL(appFrame.url()).searchParams.get("browser_instance");
+  assert(instance, "Recovery probe requires the current Browser instance");
+  const runtimeOrigin = new URL(appFrame.url()).origin;
+  const summaryUrl = new URL(`/api/apps/browser/summary?browser_instance=${encodeURIComponent(instance)}`, runtimeOrigin);
+  const probeId = randomUUID();
+  const sourceChain = [];
+  for (let frame = appFrame; frame.parentFrame(); frame = frame.parentFrame()) {
+    const element = await frame.frameElement();
+    const index = await frame.parentFrame().evaluate(node =>
+      Array.from(document.querySelectorAll("iframe,frame")).indexOf(node), element);
+    await element.dispose();
+    assert(index >= 0, "Recovery observer could not identify the Browser frame");
+    sourceChain.unshift(index);
+  }
+  const { session: cdp, ancestorDepth } = await browserRecoveryCdpSession(page, appFrame);
+  try {
+    const evidence = await diagnoseBrowserJourneyRecovery({
+      cdp,
+      expectedUrl,
+      readBinding: async ({ signal }) => {
+        // This observer uses the same scoped authority outside the cut viewer.
+        const response = await fetch(summaryUrl, { headers: { Origin: "null", "x-elastos-home-token": token }, signal });
+        assert(response.ok, "Recovery Runtime summary failed");
+        const body = await response.json();
+        const viewer = await appFrame.evaluate(() => ({
+          page_id: window.__elastosBrowserCurrentPageId || "",
+          browser_instance: new URL(location.href).searchParams.get("browser_instance"),
+          actual_url: document.querySelector("#browser-url")?.value || "",
+          engine_id: document.querySelector("#browser-engine")?.value,
+          exit_id: document.querySelector("#browser-exit")?.value,
+        }));
+        const statusResponse = await fetch(new URL(`/api/apps/browser/pages/${encodeURIComponent(viewer.page_id)}/status`, runtimeOrigin),
+          { headers: { Origin: "null", "x-elastos-home-token": token }, signal });
+        assert(statusResponse.ok, "Recovery page status failed");
+        return { sessions: body.sessions, page_status: await statusResponse.json(), ...viewer };
+      },
+      readVideo: async () => {
+        const metrics = await browserRemoteVideoMetrics(appFrame);
+        const display = await browserRemoteDisplayMetrics(appFrame);
+        const bytes = display?.latestVideoWebrtcStats?.video_bytes_received ?? display?.latestWebrtcStats?.video_bytes_received;
+        return { ...metrics, ...(Number.isSafeInteger(bytes) ? { video_bytes_received: bytes } : {}) };
+      },
+      readReceipt,
+      extendInput: (suffix, { timeoutMs }) => appFrame.locator("#browser-keyboard-capture")
+        .pressSequentially(suffix, { timeout: Math.ceil(timeoutMs) }),
+      probeViewerRequest: ({ timeoutMs }) => appFrame.evaluate(async ({ probeId, timeoutMs }) => {
+        const id = window.__elastosBrowserCurrentPageId;
+        const token = new URLSearchParams(location.hash.slice(1)).get("home_token");
+        try {
+          const response = await fetch(`/api/apps/browser/pages/${encodeURIComponent(id)}/status?recovery_probe=${probeId}`,
+            { cache: "no-store", headers: { "x-elastos-home-token": token }, signal: AbortSignal.timeout(Math.ceil(timeoutMs)) });
+          await response.text();
+        } catch {}
+      }, { probeId, timeoutMs }),
+      observeRequests: async record => {
+        const requests = new WeakMap();
+        let sequence = 0;
+        const request = req => {
+          if (req.frame() !== appFrame) return;
+          const url = new URL(req.url());
+          if (url.origin !== runtimeOrigin) return;
+          const kind = url.searchParams.get("recovery_probe") === probeId ? "probe"
+            : /^\/api\/apps\/browser\/open(?:\/|$)/.test(url.pathname) && req.method() === "POST" ? "opening"
+            : /\/pages\/[^/]+\/close$/.test(url.pathname) ? "closing"
+            : /\/pages\/[^/]+\/status$/.test(url.pathname) ? "status"
+            : /\/pages\/[^/]+\/heartbeat$/.test(url.pathname) ? "heartbeat" : null;
+          if (!kind) return;
+          const event = { kind, request_id: `viewer-request-${++sequence}`, source_matches: true };
+          requests.set(req, event);
+          record({ ...event, phase: "request" });
+        };
+        const failed = req => { const event = requests.get(req); if (event) record({ ...event, phase: "failed" }); };
+        const response = res => { const event = requests.get(res.request()); if (event) record({ ...event, phase: "response", status: res.status() }); };
+        const bindingName = `__browserRecovery_${probeId.replaceAll("-", "")}`;
+        await page.exposeBinding(bindingName, (source, event) => {
+          if (source.frame === page.mainFrame()) record(event);
+        });
+        const messages = await page.evaluateHandle(({ sourceChain, token, instance, bindingName }) => {
+          const source = sourceChain.reduce((frame, index) => frame.frames[index], window);
+          const pending = new Set();
+          let overflow = false;
+          const listener = event => {
+            const data = event.data;
+            if (event.source !== source || event.origin !== "null" || data?.homeToken !== token ||
+              data.browserInstance !== instance || data.type !== "elastos.home.browser-authority-renew.request/v1" ||
+              typeof data.requestId !== "string" || data.requestId.length > 512) return;
+            if (pending.size >= 64) { overflow = true; return; }
+            const promise = window[bindingName]({ kind: "renewal", phase: "request", request_id: data.requestId, source_matches: true });
+            pending.add(promise);
+            promise.finally(() => pending.delete(promise)).catch(() => {});
+          };
+          window.addEventListener("message", listener);
+          return { stop: async () => {
+            window.removeEventListener("message", listener);
+            await Promise.allSettled(pending);
+            if (overflow) throw new Error("Recovery authority observer overflow");
+          } };
+        }, { sourceChain, token, instance, bindingName });
+        page.on("request", request);
+        page.on("requestfailed", failed);
+        page.on("response", response);
+        return async () => {
+          page.off("request", request);
+          page.off("requestfailed", failed);
+          page.off("response", response);
+          try { await messages.evaluate(observer => observer.stop()); }
+          finally { await messages.dispose(); }
+        };
+      },
+    });
+    return { ...evidence, cdp_ancestor_depth: ancestorDepth };
+  } catch (error) {
+    error.details = { ...error.details, recovery: { ...error.evidence,
+      failure: error.evidence?.failure || "probe_setup_or_observation_failed", cdp_ancestor_depth: ancestorDepth } };
+    throw error;
+  }
+}
+
 async function runControlledBrowserJourney(page, appFrame, windowLocator, token, baseline, failures) {
   const fixture = new URL(BROWSER_JOURNEY_FIXTURE_ORIGIN);
   const run = randomUUID();
   const receiptUrl = `${fixture.origin}/receipt?run=${run}`;
   const result = { schema: "elastos.browser.controlled-journey/v1", run, pages: [] };
-  const readReceipt = async () => {
-    const response = await fetch(receiptUrl, { signal: AbortSignal.timeout(5_000) });
+  const readReceipt = async ({ signal } = {}) => {
+    const response = await fetch(receiptUrl, { signal: signal || AbortSignal.timeout(5_000) });
     const body = await response.json();
     if (response.status === 404 && body.error === "unknown run") {
       return { schema: "elastos.browser.journey-receipt/v1", run, events: [] };
@@ -2341,6 +2476,7 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
     const afterInput = await waitForJourneyEvidence(() => browserRemoteVideoMetrics(appFrame),
       value => value.decoded_frames > current.video.decoded.decoded_frames, "decoded frames after input");
     result.input = { text, receipt, video_after_input: afterInput };
+    if (CHECK_BROWSER_CONTROLLED_RECOVERY) result.recovery = await runControlledBrowserRecovery(page, appFrame, token, readReceipt, result.pages.at(-1).url);
   } catch (error) {
     error.details = { stage: smokeStage, ...error.details };
     failure = error;
@@ -4053,6 +4189,8 @@ async function revokeCurrentPasskey(page, proofBindingId, homeToken) {
 }
 
 async function main() {
+  assert(!CHECK_BROWSER_CONTROLLED_RECOVERY || CHECK_BROWSER_CONTROLLED_JOURNEY,
+    "Controlled Browser recovery requires the controlled journey");
   assert(!CHECK_BROWSER_CONTROLLED_JOURNEY || (INCLUDE_BROWSER && CHECK_BROWSER_EMBEDDED_UI_INPUT &&
     !OPEN_BROWSER && !CHECK_BROWSER_UI_INPUT && !CHECK_BROWSER_UI_SETUP && !CHECK_BROWSER_VIEWER_PREFLIGHT),
   "Controlled journey requires BROWSER=1 and BROWSER_EMBEDDED_UI_INPUT=1, with other Browser runs disabled");

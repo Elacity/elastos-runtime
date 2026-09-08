@@ -221,6 +221,7 @@ test("journey success pins close to its last page while earlier failure retains 
     const baseline = {};
     const window = {};
     const journey = harnessFunction("runControlledBrowserJourney", {
+      CHECK_BROWSER_CONTROLLED_RECOVERY: false,
       BROWSER_JOURNEY_FIXTURE_ORIGIN: "http://localhost:61511", BROWSER_OPEN_DISPLAY_MODE: "webrtc_remote_display",
       BROWSER_UI_PAGE_ID_TIMEOUT_MS: 180_000, BROWSER_REMOTE_VIDEO_TIMEOUT_MS: 30_000,
       randomUUID: () => runId, AbortSignal, smokeStage: "input", markStage: () => {},
@@ -444,4 +445,31 @@ test("startup close accepts already_absent only with the exact UI handle and Run
     }
     surface.assertClean();
   }
+});
+
+
+test("recovery probe selects the owning CDP ancestor only for shared-frame sessions", async () => {
+  const select = harnessFunction("browserRecoveryCdpSession");
+  for (const owner of [0, 1, 2]) {
+    const main = { parentFrame: () => null };
+    const gui = { parentFrame: () => main };
+    const browser = { parentFrame: () => gui };
+    const seen = [];
+    const session = {};
+    const page = { context: () => ({ newCDPSession: async target => {
+      seen.push(target);
+      if (seen.length - 1 === owner) return session;
+      throw new Error("This frame does not have a separate CDP session, it is a part of the parent frame's session");
+    } }) };
+    const result = await select(page, browser);
+    assert.equal(result.session, session);
+    assert.equal(result.ancestorDepth, owner);
+    assert.deepEqual(seen, [browser, gui, page].slice(0, owner + 1));
+  }
+  const error = new Error("Browser connection terminated");
+  let attempts = 0;
+  const frame = { parentFrame: () => ({}) };
+  const page = { context: () => ({ newCDPSession: async () => { attempts++; throw error; } }) };
+  await assert.rejects(select(page, frame), value => value === error);
+  assert.equal(attempts, 1);
 });
