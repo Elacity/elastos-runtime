@@ -2533,7 +2533,7 @@ async function observeControlledBrowserInput(page, appFrame, token, pageId) {
     try {
       const url = new URL(req.url()), headers = req.headers();
       if (req.frame() !== appFrame || url.origin !== origin || url.pathname !== inputPath ||
-          req.method() !== "POST" || headers.origin !== "null" || headers["x-elastos-home-token"] !== token) return;
+          req.method() !== "POST" || !["null", origin].includes(headers.origin) || headers["x-elastos-home-token"] !== token) return;
       if (sequence >= 16) { evidence.dropped_requests++; return; }
       let event;
       try { event = req.postDataJSON()?.event; } catch {}

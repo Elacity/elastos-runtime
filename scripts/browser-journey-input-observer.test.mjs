@@ -67,12 +67,13 @@ test("input observer admits only the exact Browser frame, Runtime origin, page a
     { url: inputUrl.replace("localhost", "foreign.invalid") },
     { url: inputUrl.replace(encodeURIComponent(f.pageId), "page%3Aforeign") },
     { url: inputUrl.replace("/input", "/status") }, { method: "GET" },
-    { headers: { origin: "http://localhost:61510", "x-elastos-home-token": f.token } },
+    { headers: { origin: "http://foreign.invalid", "x-elastos-home-token": f.token } },
     { headers: { origin: "null", "x-elastos-home-token": "foreign-token" } },
   ]) {
     const req = f.request(options); f.page.emit("request", req); f.page.emit("response", f.response(req));
   }
-  const click = f.request({ event: { type: "click", x: 286, y: 220 } }), text = f.request();
+  const click = f.request({ event: { type: "click", x: 286, y: 220 } });
+  const text = f.request({ headers: { origin: "http://localhost:61510", "x-elastos-home-token": f.token } });
   for (const req of [click, text]) { f.page.emit("request", req); f.page.emit("response", f.response(req)); }
   const evidence = plain(await observer.stop(false));
   assert.deepEqual(evidence.requests.filter(x => x.phase === "request").map(x => x.event_type), ["click", "paste_text"]);
