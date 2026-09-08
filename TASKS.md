@@ -32,8 +32,9 @@ B01-B16 remain the acceptance baseline. Their broad checkboxes track full
 qualification; the delivery slices below drive current work. B01 stays open for
 its support matrix while its accepted contract unblocks dependent work.
 
-The task Mac passes the requested Home-to-close journey in three independently
-reviewed runs on the corrected guest image. Current evidence and artifact
+The task Mac passes the requested Home-to-close journey, including decoded
+audio, reload and separately authorized native operator actions. Run 82 has
+independent acceptance after the restored-address publication repair. Current evidence and artifact
 identity are in [state.md](state.md#browser-contract-and-device-qualification).
 The initrd-only RNG activation removes an observed five-second bootstrap delay;
 current launcher samples range from about 9 to 11 seconds. A decoded-audio
@@ -124,6 +125,11 @@ alongside the local, operator and remote journeys.
   marker keeps human handoff behind uncertain effects. Its 74 JavaScript and
   12 Python checks plus Runtime/common/adapter regressions pass. The changed guest scripts and adapter are installed. Prove actual ref actions, handoff,
   revocation and close. Operator adapters and broader workflow gates stay open.
+  Independent review now accepts combined runs 70, 73-76 and 82 in their stated
+  media/recovery scopes. Run 82 confirms separate attach, reference actions,
+  human handoff and revoked writer rejection after viewer reload. The next
+  implementation requirement is actual framework adapter conformance; repeat
+  native admission only when changed inputs or a diagnosed defect require it.
 - **B08/B09.first-remote / active / independent delegated source owner.**
   Prerequisite: accepted Engine/Exit identity and Runtime service contracts.
   Identify the first missing product operation for A/B/A and A/A/B against
@@ -163,6 +169,32 @@ alongside the local, operator and remote journeys.
   page/stream/media binding. All five placements retain their full requirements.
   The fresh Linux restart repair `2b640973` passes its active target smoke and
   installed Home proof with reused native binaries.
+- **B06.restored-address / accepted bounded repair / coordinator; agent reviewed.**
+  Run 81 reproduces the reload binding failure: Browser publishes the restored
+  page before its fresh address is ready. Source `417cda95` retains internal
+  cleanup ownership immediately and publishes the public page after address
+  restoration and an owner recheck. The deferred-response regression fails on
+  the old ordering; 200 focused checks pass after repair. Run 82 passes decoded
+  media, navigation, input, reload in 1584 ms, native operator handoff and close
+  in 811 ms with all 13 effects and zero Runtime/control obligations. The image
+  and native binaries were reused. Earlier startup run 77 and Home setup runs
+  78-80 remain failed; a fresh viewer profile passes 81/82 but does not establish
+  the cause of the older profile's setup failures. Full B06 remains open.
+- **B16.execution-runner / active / coordinator; source agent reviewed.**
+  Source `16299f1b` supplies a bounded installed lifecycle probe with frozen
+  artifacts, process identities, exact cleanup and retained failures. Source
+  `35b41c64` adds reviewed sustained input/time/frame consistency checks. A
+  single probe cannot qualify lifecycle repetitions. The first installed probe
+  completes the controlled journey and cleanup, then rejects the planned Brave
+  vendor version against the actual Chromium version reported by the viewer.
+  The coordinator corrects that plan field and repeats the same frozen journey.
+  The repeat reaches decoded video, typing and inspection, then fails the tone
+  check with increasing audio packet loss. Exact close still clears all 13
+  effects and leaves the Runtime/control empty. Diagnose the audio producer and
+  receiver together before assigning a passing endurance result.
+  The full cycle, launch-distribution, media and eight-hour workloads retain
+  their original requirements. Visible-input latency and synchronized A/V
+  offset measurements remain explicit gaps in the current runner.
 
 ### Time and resource control
 

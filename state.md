@@ -158,7 +158,9 @@ rejects further connections; the exact page closes with all 13 effects absent
 and final control counts zero. Remote controlled audio/input, complete placement
 coverage and human UX remain open. Revocation currently reaches a generic Engine
 error after replacement allocation, and navigation status can retain “Opening”
-after content changes; both need their own user-facing repair.
+after content changes. Source `855624dd` clears the completed navigation status;
+run 82 verifies that UI behavior. The pre-allocation revocation check and its
+user-facing authority error remain open.
 
 Run 64 returns these Runtime and Inbox changes to the local Home journey.
 Controlled navigation, decoded media, native inspection, typing, scrolling and
@@ -201,6 +203,44 @@ the connection cut, input/video recovery in 1637 ms and close in 749 ms. Both
 clear all 13 effects and leave zero Runtime/control obligations. Independent
 review accepts these short combined journeys. The unexplained run 68 failure
 and sustained qualification remain open.
+
+Run 81 reproduces the reload binding failure with a fresh viewer profile and
+identifies the public page being exposed before its restored address. Source
+`417cda95` preserves immediate internal cleanup ownership and delays public page
+publication until the fresh address and owner recheck are complete. The old
+ordering fails its deferred-response regression; 200 focused checks pass after
+repair. The installed Browser UI has SHA-256
+`5b065c0df1fac8a79c4e7e84ebb490309c3a275075050ef72f97974d8b831258`;
+the verified image and native binaries are unchanged. Independent agent review
+accepts the source and run 82: the full controlled media/navigation/input journey,
+viewer reload in 1584 ms, separately approved native reference actions, human
+handoff and revoked writer rejection pass. Close takes 811 ms, confirms all 13
+effects and leaves zero Runtime/control obligations. Run 81 retains its failed
+reload verdict and successful exact cleanup. Run 68 retains its original failure;
+the later reproduction establishes the repaired ordering defect.
+
+Run 77 fails startup with an open conflict whose exact plain-text reason was
+absent from the original evidence. Its native terminal record later confirms all
+13 cleanup effects, outside the failed journey's close bound. Source `64cebf15`
+records a bounded typed reason for a repeated plain-text conflict. Runs 78-80
+fail during Home setup before Browser allocation. A fresh task viewer profile
+passes Home in 81/82 with the same Runtime principal; that observation leaves
+the prior profile/setup failure's cause open.
+
+Source `16299f1b` adds installed lifecycle execution with artifact/process binding
+and exact cleanup. Independent review accepts that bounded probe path. Reviewed
+source `35b41c64` checks sustained input cadence, host/receiver elapsed-time
+agreement and frame deltas against reported continuity. Source tests establish
+the recorder's behavior; real endurance, synchronized A/V offset, input-to-visible
+latency and required human acceptance remain pending. The first installed
+lifecycle probe completes the journey and cleanup but fails viewer identity:
+the plan supplied Brave's vendor version while the harness reports Chromium's
+version. That plan mismatch is retained and corrected for the next probe.
+The repeat fails the decoded tone after controlled navigation, video, typing
+and inspection. Audio packet loss increases during that sample; the receiver
+stays connected and live. Its exact close clears all 13 effects in 1312 ms and
+leaves zero Runtime/control obligations. The source and installed artifacts
+remain unchanged; this failure joins the open intermittent audio diagnosis.
 
 Run 72 fails the controlled audio check when the received tone fades near the
 end of its 2.5-second sample. The receiver stays live and unmuted; before/after
