@@ -146,6 +146,31 @@ Independent source repair and regression work can proceed in separate file scope
   an on-demand query of the current viewer peer's counters, with owner and peer
   fences. The next run preserves the same five-second, frame, byte, exact-input
   and cleanup criteria and reuses the installed Runtime, adapter and image set.
+  Fresh diagnostic source `4ed67aa0` passes independent review. Installed run 31
+  then has zero new frames within five seconds, with normal browsing and exact
+  cleanup still passing. This is an intermittent attachment failure rather than
+  evidence that the earlier fresh-media result is repeatable. Harness `a24c5498`
+  adds bounded typed signaling and UI status evidence. Run 32 on the same
+  installed artifacts passes reload in 3168 ms: fresh attachment and both answers
+  return HTTP 200, exact text and frame/byte progress pass on the retained owner,
+  and close confirms all 13 effects in 545 ms with zero obligations. Independent agent
+  review accepts this bounded run. Repeat run 33 fails at fresh Engine attachment: HTTP
+  503 in 27 ms, before new answers or media. Guest evidence identifies the legacy
+  broker rejecting viewer UID 1 while its old producer is still retiring. Normal
+  browsing and all 13 cleanup effects still pass. Reviewed source `b7ec14fc`
+  retries only that exact rejection before HELLO acknowledgment, within the
+  original four-second attachment deadline, including an explicit monotonic
+  check when the event loop is delayed. A socket regression covers delayed
+  video and audio retirement, repeated attachment, cancellation and terminal
+  errors. Rebuild the changed guest control from the verified image inputs,
+  reuse the matching Runtime, adapter and UI, then repeat the installed journey.
+  Guest log requests also refresh synchronous audio diagnostics; runs with that
+  observer remain outside formal latency distributions. Full B06 remains open.
+  In parallel, B02 has an installed readiness counterexample: valid, absent and
+  nonexistent Mac TURN program settings all report ready in fresh child checks.
+  These checks change only child environments and acquire no page or VM. The
+  readiness source now checks the executable and its cache identity, then will
+  repeat the negative checks and the same installed Browser journey.
   Full B05 mixed-transport ordering and motion behavior remain separate gates.
   The probe must observe request failure and
   stopped media, then restore the same page, profile, service selection and

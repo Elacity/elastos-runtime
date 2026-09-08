@@ -227,7 +227,28 @@ five-second deadline: after input, decoded frames advance from 57 to 76 while
 the cached byte counter remains 13208 until its next one-second refresh. Fresh
 on-demand viewer diagnostics are the next measurement repair; the original
 recovery thresholds remain unchanged. Runtime, adapter, image and native helper
-artifacts remain reusable for this UI/diagnostic slice.
+artifacts remain reusable for this UI/diagnostic slice. Installed fresh metrics
+`4ed67aa0` retain the same five-second criteria. Run 31 receives zero new frames,
+so repeatability is still unresolved. Run 32 with typed signaling and UI status
+evidence passes in 3168 ms on those same artifacts: attachment and two answers
+return HTTP 200, exact text plus fresh frame/byte progress pass, and all 13
+cleanup effects settle in 545 ms with zero obligations. Independent agent review accepts
+this bounded run; repeated recovery remains open.
+Run 33 then fails fresh attachment with HTTP 503 in 27 ms. The guest signaling
+broker rejects fixed viewer UID 1 before the old producer finishes retirement.
+Normal browsing and exact cleanup pass. Source `b7ec14fc` passes 28
+attachment regressions, the Selkies smoke and independent agent review. It retries
+only the exact legacy UID rejection before HELLO acknowledgment, inside the
+existing four-second deadline. Installed proof is pending a guest rebuild with
+that single changed input. Runtime, adapter and Browser UI remain reusable.
+Guest log reads refresh synchronous audio diagnostics, so observer runs remain
+excluded from formal latency distributions.
+A separate B02 child-process check finds that the installed Mac host-readiness
+script reports ready with valid, absent and nonexistent TURN program settings.
+The installed configuration stays unchanged and the check acquires no page or
+VM. A source repair to readiness and its cache has 20 passing regressions and
+29 passing artifact smoke checks. Independent agent review accepts the source;
+installed proof remains open.
 Guest Node also starts about five seconds after its shell launch;
 initial entropy is 1 and no hardware RNG is selected. That secondary cause needs
 its own experiment. Run 16 includes diagnostic overhead and is excluded from
