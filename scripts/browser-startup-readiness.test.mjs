@@ -19,6 +19,7 @@ function start({ expired = false } = {}) {
   const readiness = { loading: false };
   const setLoading = loading => { readiness.loading = loading; address.disabled = loading; };
   const settled = vm.runInNewContext(startup, {
+    unloadCleanupStarted: false, homeWindowCloseInFlight: false, homeWindowTerminalCloseConfirmed: false,
     params: new URLSearchParams(), DEFAULT_URL: "https://ela.city/", addressInput: address,
     updateNavState() {}, setLoading, fetchBrowserSummary: () => summary.promise,
     restoreRuntimePageViewer: async () => false,

@@ -40,7 +40,8 @@ function harness() {
     currentPage: { page_id: "page-current", actual_url: "https://fixture.invalid/nav", title: "Before",
       runtime_cleanup: { schema: "elastos.browser.cleanup-handle/v1", id: "cleanup-current" } },
     unloadCleanupStarted: false, currentPageGeneration: 1, pageStatusTimer: 0, pageHeartbeatTimer: 0, pageStatusRefreshTimers: [],
-    relaunchRequested: false, lastPageStatus: null,
+    relaunchRequested: false, lastPageStatus: null, homeWindowCloseInFlight: false,
+    homeWindowTerminalCloseConfirmed: false, pendingHomeWindowCloseDelivery: null,
     document: { hidden: false }, isAddressEditing: () => false,
     runtimePageOwner, sameRuntimePageOwner, isAuthoritySessionError,
     friendlyOpenError: error => error.message,
@@ -69,7 +70,7 @@ function harness() {
   }).fetchJson;
   const constants = browserSource.match(/^const PAGE_(?:STATUS|HEARTBEAT)_[A-Z_]+ = .*;$/gm);
   assert.ok(constants?.length);
-  const functions = ["currentRuntimePageOwner", "stopPageStatusPolling", "stopPageStatusRefresh", "stopPageHeartbeat",
+  const functions = ["currentRuntimePageOwner", "runtimeViewerOwnerActive", "stopPageStatusPolling", "stopPageStatusRefresh", "stopPageHeartbeat",
     "requestFreshRuntimeAuthority", "runtimeOwnedFailureSummary", "failRuntimeOwnedPage", "fetchPageStatus",
     "handlePageObservationFailure", "schedulePageStatusRefresh", "startPageStatusPolling", "startPageHeartbeat"];
   vm.runInContext(constants.join("\n") + "\n" + functions.map(name => declaration(browserSource, name)).join("\n"), state);

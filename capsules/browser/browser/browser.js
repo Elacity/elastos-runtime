@@ -435,6 +435,13 @@ function currentRuntimePageOwner() {
   return runtimePageOwner(currentPage, currentPageGeneration);
 }
 
+function runtimeViewerOwnerActive(owner) {
+  return !unloadCleanupStarted && !homeWindowCloseInFlight && !homeWindowTerminalCloseConfirmed &&
+    sameRuntimePageOwner(currentRuntimePageOwner(), owner) &&
+    !runtimePageCleanup.status(owner) &&
+    !sameRuntimePageOwner(pendingHomeWindowCloseDelivery?.owner, owner);
+}
+
 function finalizeRuntimePageClose(owner) {
   if (sameRuntimePageOwner(currentRuntimePageOwner(), owner)) {
     currentPage = null;
@@ -1045,7 +1052,7 @@ async function fetchPageStatus({
     `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/status${query}`,
     { method: "GET" },
   );
-  if (unloadCleanupStarted || !sameRuntimePageOwner(currentRuntimePageOwner(), owner)) return null;
+  if (!runtimeViewerOwnerActive(owner)) return null;
   if (
     status?.schema !== "elastos.browser.page-status/v1" ||
     status.page_id !== currentPage.page_id
@@ -1532,6 +1539,7 @@ remoteDisplay = createBrowserRemoteDisplay({
   friendlyOpenError,
   getCurrentDisplayMode: () => currentDisplayMode,
   getLastPageStatus: () => lastPageStatus,
+  supportsDisplayGeneration: () => browserSummary?.engine_adapter?.display_attach_supported === true,
   handleRemoteInputChannelMessage,
   handleRemoteInputChannelTeardown: teardownRemoteClipboard,
   onRecoveryRequired: settleRemoteDisplayFailure,
@@ -2300,6 +2308,48 @@ bindBrowserInputSurface({
   unlockRemoteAudioFromGesture,
 });
 
+async function attachRecoveredDisplay(summary, owner) {
+  if (!runtimeViewerOwnerActive(owner)) return null;
+  const display = currentPage?.display_session;
+  const validGeneration = value => typeof value === "string" && /^display:[a-f0-9]{32}$/.test(value);
+  const validRequest = value => typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
+  if (summary?.engine_adapter?.display_attach_supported !== true || !validGeneration(display?.display_generation)) {
+    throw new Error("Browser needs an update to restore this display. Close Browser to finish the session.");
+  }
+  const pending = summary.sessions.recoverable_page.display_attachment;
+  if (pending && (pending.schema !== "elastos.browser.display-attachment/v1" ||
+      !["pending", "ready", "failed"].includes(pending.state) ||
+      !validRequest(pending.request_id) || !validGeneration(pending.previous_display_generation))) {
+    throw new Error("Runtime could not check the pending Browser display attachment.");
+  }
+  const request = {
+    type: "display_attach",
+    request_id: pending?.state === "pending" ? pending.request_id : crypto.randomUUID().replaceAll("-", ""),
+    display_generation: pending?.state === "pending" ? pending.previous_display_generation : display.display_generation,
+  };
+  let result;
+  try {
+    result = await fetchJson(`/api/apps/browser/pages/${encodeURIComponent(owner.page_id)}/webrtc`, {
+      method: "POST", body: request,
+    });
+  } catch (error) {
+    if (!runtimeViewerOwnerActive(owner)) return null;
+    throw error;
+  }
+  if (!runtimeViewerOwnerActive(owner)) return null;
+  const offerValid = offer => offer?.schema === "elastos.browser.webrtc-offer/v1" && offer.type === "offer" &&
+    typeof offer.sdp === "string" && offer.sdp.length > 0 && offer.sdp.length <= 256 * 1024 &&
+    (offer.candidates === undefined || (Array.isArray(offer.candidates) && offer.candidates.length <= 256));
+  if (result?.schema !== "elastos.browser.display-attach-result/v1" || result.page_id !== owner.page_id ||
+      result.request_id !== request.request_id || result.previous_display_generation !== request.display_generation ||
+      !validGeneration(result.display_generation) || result.display_generation === request.display_generation ||
+      !offerValid(result.initial_offer) || !offerValid(result.audio_offer)) {
+    throw new Error("Runtime could not restore the Browser display.");
+  }
+  return { ...display, display_generation: result.display_generation,
+    initial_offer: result.initial_offer, audio_offer: result.audio_offer };
+}
+
 async function restoreRuntimePageViewer(summary) {
   if (unloadCleanupStarted || homeWindowCloseInFlight || homeWindowTerminalCloseConfirmed || currentPage) return true;
   const sessions = summary?.sessions;
@@ -2346,10 +2396,14 @@ async function restoreRuntimePageViewer(summary) {
   startPageHeartbeat();
   try {
     await fetchPageStatus({ history: "replace", forceAddress: true });
-    if (unloadCleanupStarted || !sameRuntimePageOwner(currentRuntimePageOwner(), owner)) return true;
-    // Page status is diagnostic; the recovered page retains Runtime display authority.
-    const display = currentPage.display_session;
-    if (display?.mode !== "webrtc_remote_display") {
+    if (!runtimeViewerOwnerActive(owner)) return true;
+    // Page status is diagnostic; attach replaces offers within retained Runtime authority.
+    if (currentPage.display_session?.mode !== "webrtc_remote_display") {
+      throw new Error("Runtime could not restore the Browser display.");
+    }
+    const display = await attachRecoveredDisplay(summary, owner);
+    if (!display || !runtimeViewerOwnerActive(owner)) return true;
+    if (display.mode !== "webrtc_remote_display") {
       throw new Error("Runtime could not restore the Browser display.");
     }
     currentPage = { ...currentPage, display_session: display };
@@ -2359,8 +2413,11 @@ async function restoreRuntimePageViewer(summary) {
     startPageStatusPolling();
     await connectRemoteDisplay(display, currentPage);
     return true;
+  } catch (error) {
+    if (!runtimeViewerOwnerActive(owner)) return true;
+    throw error;
   } finally {
-    if (!unloadCleanupStarted && sameRuntimePageOwner(currentRuntimePageOwner(), owner)) setLoading(false);
+    if (runtimeViewerOwnerActive(owner)) setLoading(false);
   }
 }
 
@@ -2379,6 +2436,7 @@ fetchBrowserSummary()
     return requestRuntimeOpen(initialUrl, { history: "replace" });
   })
   .catch((error) => {
+    if (unloadCleanupStarted || homeWindowCloseInFlight || homeWindowTerminalCloseConfirmed) return;
     if (isAuthoritySessionError(error) && requestHomeRelaunch(friendlyOpenError(error))) {
       return;
     }
