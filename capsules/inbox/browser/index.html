@@ -1049,6 +1049,9 @@
       } else if (typeof actionId === "string" && actionId.startsWith("contact-accept-request:")) {
         actions.appendChild(createActionButton("Accept", actionId, "primary"));
         actions.appendChild(createActionButton("Decline", "contact-decline-request:" + actionId.slice("contact-accept-request:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("service-approve-request:")) {
+        actions.appendChild(createActionButton("Approve", actionId, "primary"));
+        actions.appendChild(createActionButton("Deny", "service-deny-request:" + actionId.slice("service-approve-request:".length), "danger"));
       } else if (typeof actionId === "string" && actionId.startsWith("wallet-approve-request:")) {
         const requestId = actionId.slice("wallet-approve-request:".length);
         actions.appendChild(createButton("Approve", (button) => approveWalletRequest(button, requestId), "primary"));
@@ -1071,7 +1074,7 @@
         actions.appendChild(createActionButton("Reject", "wallet-price-http-deny:" + actionId.slice("wallet-price-http-approve:".length), "danger"));
       }
 
-      if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request" && entry.kind !== "contact_request") {
+      if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request" && entry.kind !== "contact_request" && entry.kind !== "service_access_request") {
         actions.appendChild(createActionButton("Dismiss", "notification-dismiss:" + entry.id));
       }
     }
@@ -1319,7 +1322,7 @@
       const unreadIds = state.entries
         .filter((entry) => entry && entry.id && !entry.read
           && entry.kind !== "wallet_approval_request"
-          && entry.kind !== "contact_request")
+          && entry.kind !== "contact_request" && entry.kind !== "service_access_request")
         .map((entry) => entry.id);
       if (unreadIds.length === 0) {
         return;
