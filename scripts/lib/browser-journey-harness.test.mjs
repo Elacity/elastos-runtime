@@ -11,7 +11,7 @@ function harnessFunction(name, globals = {}) {
   assert.ok(start >= 0, name);
   const next = source.slice(start + 1).search(/\n(?:async )?function /);
   const declaration = source.slice(start, start + 1 + next);
-  return vm.runInNewContext(`(${declaration})`, { URL, Date, performance, ...globals });
+  return vm.runInNewContext(`(${declaration})`, { URL, Date, performance, CHECK_BROWSER_CONTROLLED_MEDIA: false, ...globals });
 }
 
 test("controlled fixture isolates runs, records bounded events and rejects malformed requests", async () => {

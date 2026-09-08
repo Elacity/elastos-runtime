@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
+import { installBrowserJourneyAudioProbe, controlledTonePresent } from "./lib/browser-journey-audio.mjs";
 import { diagnoseBrowserJourneyRecovery } from "./lib/browser-journey-recovery.mjs";
 import { diagnoseBrowserViewerReload, readBrowserViewerReloadDocument, browserViewerSignalMetadata } from "./lib/browser-journey-viewer-reload.mjs";
 
@@ -148,6 +149,7 @@ const CHECK_BROWSER_EMBEDDED_UI_INPUT =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_EMBEDDED_UI_INPUT === "1";
 const CHECK_BROWSER_CONTROLLED_JOURNEY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_JOURNEY === "1";
+const CHECK_BROWSER_CONTROLLED_MEDIA = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_MEDIA === "1";
 const CHECK_BROWSER_CONTROLLED_RECOVERY = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_RECOVERY === "1";
 const CHECK_BROWSER_VIEWER_RELOAD = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_VIEWER_RELOAD === "1";
 const BROWSER_CONTROLLED_TURN_TEST_HOME = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_TURN_TEST_HOME || "";
@@ -2685,7 +2687,7 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
     result.prior_open_settlements = settled.map(({ open_id, body }) => ({ open_id, settlement: body }));
     for (const name of ["main", "nav"]) {
       markStage(`browser:controlled-${name}`);
-      const url = `${fixture.origin}/${name}?run=${run}`;
+      const url = `${fixture.origin}/${name}?run=${run}${CHECK_BROWSER_CONTROLLED_MEDIA ? "&media=1" : ""}`;
       const navigationStarted = performance.now();
       await appFrame.locator("#browser-url").fill(url);
       await appFrame.locator("#browser-url").press("Enter");
@@ -2730,6 +2732,20 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
         "Engine page receives typed text");
       if (typed.length === 1) await stopInputObservation(false);
     }
+    if (CHECK_BROWSER_CONTROLLED_MEDIA) {
+      markStage("browser:decoded-audio");
+      const toneReceipt = await waitForJourneyEvidence(readReceipt,
+        value => value.events.some(event => event.page === "nav" && event.type === "audio" &&
+          event.audio_state === "running" && event.frequency_hz === 440), "controlled Engine tone starts");
+      result.audio = await appFrame.evaluate(() => window.__readBrowserJourneyAudio());
+      result.audio.fixture_event = toneReceipt.events.find(event => event.page === "nav" && event.type === "audio");
+      if (!controlledTonePresent(result.audio)) {
+        result.audio.receiver_metrics = await browserRemoteDisplayMetrics(appFrame).catch(() => null);
+        result.audio.engine_diagnostics = await checkBrowserPageDiagnostics(appFrame, token, current.page_id)
+          .catch(error => ({ error: error.message, details: error.details }));
+      }
+      assert(controlledTonePresent(result.audio), "Controlled 440 Hz tone was not decoded by the product receiver", result.audio);
+    }
     markStage("browser:scroll");
     await appFrame.locator("#browser-remote-display").hover();
     await page.mouse.wheel(0, 640);
@@ -2741,6 +2757,12 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
     result.input = { text, receipt, video_after_input: afterInput };
     if (CHECK_BROWSER_CONTROLLED_RECOVERY) result.recovery = await runControlledBrowserRecovery(page, appFrame, token, readReceipt, result.pages.at(-1).url);
     if (CHECK_BROWSER_VIEWER_RELOAD) result.viewer_reload = await runControlledBrowserViewerReload(page, appFrame, token, readReceipt, result.pages.at(-1).url);
+    if (CHECK_BROWSER_CONTROLLED_MEDIA && (CHECK_BROWSER_CONTROLLED_RECOVERY || CHECK_BROWSER_VIEWER_RELOAD)) {
+      markStage("browser:decoded-audio-after-recovery");
+      result.audio_after_recovery = await appFrame.evaluate(() => window.__readBrowserJourneyAudio());
+      assert(controlledTonePresent(result.audio_after_recovery),
+        "Controlled tone did not resume at the product audio receiver", result.audio_after_recovery);
+    }
   } catch (error) {
     error.details = { stage: smokeStage, ...error.details };
     failure = error;
@@ -4456,6 +4478,8 @@ async function revokeCurrentPasskey(page, proofBindingId, homeToken) {
 async function main() {
   assert(!BROWSER_CONTROLLED_TURN_TEST_HOME || CHECK_BROWSER_CONTROLLED_RECOVERY,
     "The task TURN interruption requires controlled Browser recovery");
+  assert(!CHECK_BROWSER_CONTROLLED_MEDIA || CHECK_BROWSER_CONTROLLED_JOURNEY,
+    "Controlled audio proof requires the controlled Browser journey");
   assert(!CHECK_BROWSER_VIEWER_RELOAD || CHECK_BROWSER_CONTROLLED_JOURNEY,
     "Browser viewer reload requires the controlled journey");
   assert(!CHECK_BROWSER_CONTROLLED_RECOVERY || CHECK_BROWSER_CONTROLLED_JOURNEY,
@@ -4494,6 +4518,7 @@ async function main() {
     ignoreHTTPSErrors: true,
     viewport: { width: 1280, height: 900 },
   });
+  if (CHECK_BROWSER_CONTROLLED_MEDIA) await context.addInitScript(installBrowserJourneyAudioProbe);
   let page = context.pages()[0] || await context.newPage();
   let created = null;
   let passkey = null;

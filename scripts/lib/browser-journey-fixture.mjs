@@ -9,7 +9,7 @@ const MAX_EVENTS = 128;
 const TTL_MS = 10 * 60_000;
 const RUN_ID = /^[a-zA-Z0-9_-]{8,64}$/;
 
-function fixturePage(page, run) {
+function fixturePage(page, run, media = false) {
   return `<!doctype html><html lang="en"><meta charset="utf-8">
 <title>Browser journey ${page}</title>
 <style>
@@ -26,6 +26,7 @@ function fixturePage(page, run) {
   <input id="journey-input" maxlength="96" autocomplete="off">
   <a id="journey-next" href="/nav?run=${run}">Open navigation page</a>
   <div id="journey-motion" aria-label="Continuous test motion"></div>
+  ${media ? "<p>Click the text field to start a quiet 440 Hz audio test tone.</p>" : ""}
   <p>Scroll down to move this page.</p>
   <p style="margin-top: 2400px">End of controlled scroll content</p>
 </main>
@@ -34,6 +35,18 @@ function fixturePage(page, run) {
   const run = ${JSON.stringify(run)};
   const page = ${JSON.stringify(page)};
   const input = document.querySelector('#journey-input');
+  let toneContext = null;
+  if (${media}) input.addEventListener('pointerdown', async () => {
+    toneContext = new AudioContext();
+    const tone = toneContext.createOscillator();
+    const gain = toneContext.createGain();
+    tone.frequency.value = 440;
+    gain.gain.value = 0.05;
+    tone.connect(gain).connect(toneContext.destination);
+    tone.start();
+    await toneContext.resume();
+    report('audio');
+  }, { once: true });
   let sent = 0;
   let pending = Promise.resolve();
   function report(type) {
@@ -41,6 +54,7 @@ function fixturePage(page, run) {
     sent++;
     const rect = input.getBoundingClientRect();
     const event = { type, page, value: input.value, scroll_x: scrollX, scroll_y: scrollY,
+      ...(type === "audio" ? { audio_state: toneContext.state, frequency_hz: 440 } : {}),
       input_rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
     document.querySelector('#journey-observation').textContent =
       'Text: ' + input.value + ' | Scroll: ' + Math.round(scrollY);
@@ -86,7 +100,7 @@ export function createBrowserJourneyFixture() {
           runs.set(run, { created_at: Date.now(), events: [] });
         }
         res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-        res.end(fixturePage(url.pathname.slice(1), run));
+        res.end(fixturePage(url.pathname.slice(1), run, url.searchParams.get("media") === "1"));
         return;
       }
       const record = runs.get(run);
@@ -107,16 +121,20 @@ export function createBrowserJourneyFixture() {
       }
       const event = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       const rect = event?.input_rect;
-      if (!event || !["load", "input", "scroll"].includes(event.type) ||
+      if (!event || !["load", "input", "scroll", "audio"].includes(event.type) ||
           !["main", "nav"].includes(event.page) || typeof event.value !== "string" ||
           event.value.length > 96 || !rect ||
           ![event.scroll_x, event.scroll_y, rect.x, rect.y, rect.width, rect.height]
             .every(value => Number.isFinite(value) && Math.abs(value) <= 100_000)) {
         json(400, { error: "invalid event" }); return;
       }
+      if (event.type === "audio" && (event.audio_state !== "running" || event.frequency_hz !== 440)) {
+        json(400, { error: "invalid audio event" }); return;
+      }
       if (record.events.length >= MAX_EVENTS) { json(429, { error: "fixture event capacity" }); return; }
       record.events.push({ sequence: record.events.length + 1, received_at: Date.now(),
         type: event.type, page: event.page, value: event.value,
+        ...(event.type === "audio" ? { audio_state: event.audio_state, frequency_hz: event.frequency_hz } : {}),
         scroll_x: event.scroll_x, scroll_y: event.scroll_y,
         input_rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } });
       json(200, { ok: true });
