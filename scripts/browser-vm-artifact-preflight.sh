@@ -2,8 +2,8 @@
 set -euo pipefail
 
 mode="${1:-artifact}"
-if [[ "$#" -gt 1 || ( "$mode" != "artifact" && "$mode" != "--host-readiness" ) ]]; then
-  echo "usage: browser-vm-artifact-preflight.sh [--host-readiness]" >&2
+if [[ "$#" -gt 1 || ( "$mode" != "artifact" && "$mode" != "--host-readiness" && "$mode" != "--verify-image-set" ) ]]; then
+  echo "usage: browser-vm-artifact-preflight.sh [--host-readiness|--verify-image-set]" >&2
   exit 2
 fi
 
@@ -365,6 +365,7 @@ def inspect_ext4_sidecar_manifest(image):
     result["missing"] = preflight.get("missing") if isinstance(preflight.get("missing"), list) else []
     result["manifest"] = preflight.get("manifest") if isinstance(preflight.get("manifest"), dict) else {}
     result["preflight"] = preflight
+    result["build_receipt"] = manifest
 
     for name in REQUIRED_ROOTFS_FILES:
         entry = result["required"].get(name)
@@ -455,6 +456,36 @@ def inspect_rootfs():
 
 rootfs_contract = inspect_rootfs()
 
+
+def verify_image_set():
+    if not rootfs_contract.get("verified_sidecar") or not rootfs_contract.get("ok"):
+        return "artifact_invalid" if pathlib.Path(rootfs).is_file() else "preparation_required"
+    receipt = rootfs_contract["build_receipt"]
+    default_initrd = "bin/initrd" if platform == "darwin-arm64" else "browser-vm/initrd"
+    initrd_key = "ELASTOS_BROWSER_VM_INITRAMFS" if platform == "darwin-arm64" else "ELASTOS_BROWSER_VM_INITRD"
+    initrd = os.environ.get(initrd_key) or str(pathlib.Path(data_dir) / default_initrd)
+    try:
+        for name, artifact in [("kernel", kernel), ("initrd", initrd)]:
+            entry = receipt.get(name)
+            actual = pathlib.Path(artifact)
+            if not actual.is_file():
+                return "preparation_required"
+            if (not isinstance(entry, dict) or type(entry.get("size")) is not int
+                    or entry["size"] != actual.stat().st_size
+                    or entry.get("sha256") != sha256_file(artifact)):
+                return "artifact_invalid"
+    except OSError:
+        return "artifact_invalid"
+    return None
+
+
+if mode == "--verify-image-set":
+    reason = verify_image_set()
+    print(json.dumps({"schema": "elastos.browser.vm-image-set/v1",
+                      "ok": reason is None, "reason": reason,
+                      "rootfs_contract": rootfs_contract}))
+    sys.exit(1 if reason else 0)
+
 control = {
     "control_socket": path_stat(control_socket, socket=True),
     "control_service": path_stat(control_service, executable=True),
@@ -501,21 +532,12 @@ if mode == "--host-readiness":
                    (host_platform.system(), host_platform.machine()))
     if platform != host_id:
         reason = "host_unsupported"
-    elif not rootfs_contract.get("verified_sidecar"):
-        reason = "artifact_invalid" if pathlib.Path(rootfs).is_file() else "preparation_required"
+    elif image_reason := verify_image_set():
+        reason = image_reason
     elif not local_substrate_artifacts_ready:
         reason = "preparation_required"
     else:
         try:
-            receipt = json.loads(pathlib.Path(rootfs_manifest).read_text())
-            initrd = os.environ.get("ELASTOS_BROWSER_VM_INITRAMFS") or str(pathlib.Path(data_dir) / "bin/initrd")
-            for name, artifact in [("kernel", kernel), ("initrd", initrd)]:
-                entry = receipt.get(name, {})
-                actual = pathlib.Path(artifact)
-                if (not actual.is_file() or entry.get("size") != actual.stat().st_size
-                        or entry.get("sha256") != sha256_file(artifact)):
-                    reason = "artifact_invalid"
-                    break
             if reason is None and platform == "darwin-arm64":
                 probe = subprocess.run([vz_supervisor, "--host-capabilities"],
                                        capture_output=True, text=True, timeout=2, check=True)

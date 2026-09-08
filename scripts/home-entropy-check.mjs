@@ -9907,22 +9907,15 @@ assert(
     ) &&
     browserSelkiesRuntimeExitSmoke.includes("--cleanup-after-verify") &&
     setupSourceHome.includes("install_browser_runtime_helpers") &&
+    !setupSourceHome.includes("refresh_browser_vm_rootfs_files") &&
+    !setupSourceHome.includes("refresh_browser_vm_initrd_control_service") &&
     !setupSourceHome.includes("browser-per-launch-selkies-supervisor.mjs") &&
     !setupSourceHome.includes("browser-selkies-runtime-exit-target.sh") &&
     !setupSourceHome.includes("browser-hosted-product-operator-config.mjs") &&
     !setupSourceHome.includes("browser-hosted-product-supervisor.mjs") &&
     setupSourceHome.includes("browser-selkies-control-service.mjs") &&
-    setupSourceHome.includes("browser-vm-selkies-start") &&
     setupSourceHome.includes("build Browser VZ engine supervisor") &&
     setupSourceHome.includes("-p elastos-vz --bin browser-vz-engine-supervisor") &&
-    setupSourceHome.includes("extract_browser_vm_selkies_start") &&
-    setupSourceHome.includes("resolve_browser_vm_native_proxy_source") &&
-    setupSourceHome.includes("validate_linux_guest_binary") &&
-    setupSourceHome.includes("/opt/elastos/bin/browser-native-proxy-engine") &&
-    setupSourceHome.includes("refresh_browser_vm_initrd_control_service") &&
-    setupSourceHome.includes("refresh_browser_vm_rootfs_files") &&
-    setupSourceHome.includes("ELASTOS_DEBUGFS_BIN") &&
-    setupSourceHome.includes("debugfs") &&
     read("scripts/browser-hosted-product-target-preflight.sh").includes(
       "browser-hosted-product-display-smoke.sh",
     ) &&

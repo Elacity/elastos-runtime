@@ -238,6 +238,32 @@ if debugfs and mke2fs:
     assert contract["source_kind"] == "ext4_image" and contract["inspectable"] is True
     assert contract["verified_sidecar"] is True and contract["audio_default_ready"] is True
     check("same real ext4 without debugfs", valid, True)
+    # Target maintenance must report guest drift before touching host helpers
+    # or rewriting the image/receipt. Use a real cpio initrd with an old helper.
+    import gzip
+    initrd_tree = scratch / "initrd-tree"
+    (initrd_tree / "bin").mkdir(parents=True)
+    (initrd_tree / "bin/browser-selkies-control-service.mjs").write_text("old control helper")
+    packed = subprocess.run(["cpio", "-o", "--format=newc"], cwd=initrd_tree,
+        input=b"bin/browser-selkies-control-service.mjs\n", capture_output=True, check=True).stdout
+    for rel in ["bin/initrd", "browser-vm/initrd"]:
+        (data / rel).write_bytes(gzip.compress(packed))
+    maintenance_receipt = copy.deepcopy(valid)
+    for name, rel in [("kernel", "bin/vmlinux"), ("initrd", "bin/initrd")]:
+        artifact = data / rel
+        maintenance_receipt[name] = {"size": artifact.stat().st_size,
+                                    "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()}
+    sidecar.write_text(json.dumps(maintenance_receipt))
+    preserved = {p: hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in [image, sidecar, data / "bin/initrd", data / "browser-vm/initrd"]}
+    refresh = subprocess.run([str(repo / "scripts/browser-vm-target-refresh.sh"),
+        "--source-dir", str(repo), "--data-dir", str(data)],
+        env={**env, "ELASTOS_DEBUGFS_BIN":debugfs}, capture_output=True, text=True, timeout=30)
+    assert refresh.returncode == 1 and "Rebuild and install the complete image set" in refresh.stderr, (refresh.stdout, refresh.stderr)
+    assert all(hashlib.sha256(p.read_bytes()).hexdigest() == digest for p,digest in preserved.items())
+    assert not (data / "scripts").exists() and not (data / "backups").exists()
+    checks.append("guest drift preserves real ext4, initrd, receipt and host helpers")
+    sidecar.write_text(json.dumps(valid))
     # The VZ host fixture is platform-specific; ext4 integrity runs on both hosts.
     import platform as host_platform
     if host_platform.system() == "Darwin" and host_platform.machine() == "arm64":
@@ -268,7 +294,7 @@ if debugfs and mke2fs:
         host_check("host rejects changed kernel", {"state":"unavailable","reason":"artifact_invalid"})
         (data / "bin/vmlinux").write_bytes(original_kernel)
         (data / "bin/initrd").unlink()
-        host_check("host rejects missing initrd", {"state":"unavailable","reason":"artifact_invalid"})
+        host_check("host rejects missing initrd", {"state":"unavailable","reason":"preparation_required"})
         (data / "bin/initrd").write_bytes(b"fixture-initrd")
         host_helper.write_text(host_helper.read_text().replace("true", "false"))
         host_check("host rejects unavailable virtualization", {"state":"unavailable","reason":"host_unsupported"})

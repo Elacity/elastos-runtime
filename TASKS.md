@@ -34,9 +34,11 @@ installed artifact admission, approved remote-service
 selection, and hash-bound device-role proof. The inspected Mac's existing VM
 image failed its manifest hash check. Rootfs preflight now checks the receipt
 with and without direct guest inspection. Repair or rebuild the image with
-verified provenance and a matching receipt before qualification. Setup refresh
-currently changes guest files without renewing that receipt; add an atomic,
-provenance-bound update before relying on it for preparation. Runtime still
+verified provenance and a matching receipt before qualification. Source-home setup now verifies a complete image set and preserves its bytes;
+managed projections carry the matching receipt. Host maintenance reports guest
+drift before any mutation. Build guest changes through the image builder. Add
+automatic artifact acquisition and an atomic, provenance-bound host/guest update
+before relying on this developer setup for ordinary installation. Runtime still
 uses a typed readiness result before profile preparation and launch. Finish
 atomic artifact admission, project that result into service discovery, and prove
 the installed path. Verify cold and unchanged-artifact readiness latency on each

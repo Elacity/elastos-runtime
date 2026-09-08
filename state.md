@@ -126,13 +126,31 @@ selection. Every matrix row remains pending installed qualification for the
 Browser maturity changes. Existing installed observations retain their original
 source bindings and verdicts.
 
+Source-home setup now verifies rootfs, kernel and initrd as one build-manifest
+set before creating artifact links. It includes the manifest in managed Runtime
+projections and preserves existing and shared files. Automatic guest patching
+and its guest-helper cross-build were removed from setup; guest changes use the
+image builder. Target maintenance verifies image integrity and guest parity
+before host-helper writes. Its guest mismatch path preserves the image, initrd
+and receipt. This replaces the known setup path that changed image bytes while
+leaving a stale receipt. Automatic package acquisition, publisher admission,
+source-bound guest builds, atomic host/guest updates and product proof remain open.
+The shared image-set check and readiness cache use the same initrd selection as
+the Linux crosvm and Mac VZ launchers. Seventeen setup cases and 27 artifact/control
+cases passed, including a real ext4/cpio maintenance rejection that preserves
+guest and host files. The repository entropy, display-mode and formatting gates
+passed. A read-only admission attempt against the existing Mac artifact store
+rejected the changed image in 2.9 seconds; source hashes and the isolated test
+Home remained unchanged. These are installation-source and rejection results;
+positive installed Browser operation and independent review remain open.
+
 The existing Mac image has a SHA-256 that differs from its sidecar manifest.
 The previous rootfs preflight skipped the receipt when `debugfs` was available
 and passed that image. The revised check rejects it in both inspection modes.
 Seventeen regression cases passed, including a real 64 MiB ext4 fixture, changed
 image bytes, missing receipts, wrong architecture and missing guest dependencies.
 Read-only checks of the existing 8 GiB image took about three seconds per hash
-on this Mac. Runtime admission and its cached identity still need implementation;
+on this Mac. Runtime package admission still needs implementation;
 these checks do not establish launch or media readiness. The embedded Browser
 control helper also differs from current source, so source parity and the
 artifact receipt still require repair. The user's active test Home lacks the required

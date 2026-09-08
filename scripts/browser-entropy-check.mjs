@@ -1141,31 +1141,18 @@ assert(
     setupSourceHome.includes("browser-vm-artifact-preflight.sh") &&
     setupSourceHome.includes("browser-vm-target-preflight.sh") &&
     setupSourceHome.includes("setup-source-home-browser-artifacts.sh") &&
+    !setupSourceHome.includes("refresh_browser_vm_rootfs_files") &&
+    !setupSourceHome.includes("refresh_browser_vm_initrd_control_service") &&
     setupSourceHomeBrowserArtifacts.includes("elastos.setup-source-home.browser-artifacts/v1") &&
     setupSourceHomeBrowserArtifacts.includes("managed-runtimes") &&
     setupSourceHomeBrowserArtifacts.includes("browser-vm/rootfs.ext4") &&
     setupSourceHomeBrowserArtifacts.includes("bin/crosvm") &&
     setupSourceHomeBrowserArtifacts.includes("browser-vm/initrd") &&
     setupSourceHomeBrowserArtifacts.includes("bin/initrd") &&
+    setupSourceHomeBrowserArtifacts.includes("--verify-image-set") &&
+    setupSourceHomeBrowserArtifacts.includes("browser-vm/browser-vm-rootfs-manifest.json") &&
     setupSourceHomeBrowserArtifactsSmoke.includes("elastos.setup-source-home.browser-artifacts-smoke/v1") &&
-    setupSourceHomeBrowserArtifactsSmoke.includes("existing real kernel file must not be replaced") &&
-    setupSourceHomeBrowserArtifactsSmoke.includes("Linux managed setup must not create the Mac VZ initrd path") &&
-    setupSourceHomeBrowserArtifactsSmoke.includes("Mac managed setup must not create a crosvm link") &&
     setupSourceHome.includes("browser-selkies-control-service.mjs") &&
-    setupSourceHome.includes("browser-vm-selkies-start") &&
-    setupSourceHome.includes("browser-vm-init") &&
-    setupSourceHome.includes("extract_browser_vm_init") &&
-    setupSourceHome.includes("extract_browser_vm_selkies_start") &&
-    setupSourceHome.includes("write_browser_vm_target_manifest") &&
-    setupSourceHome.includes('"guarantee_level": "mechanism_microvm"') &&
-    setupSourceHome.includes("/etc/elastos/browser-vm-target.json") &&
-    setupSourceHome.includes("resolve_browser_vm_native_proxy_source") &&
-    setupSourceHome.includes("validate_linux_guest_binary") &&
-    setupSourceHome.includes("/opt/elastos/bin/browser-native-proxy-engine") &&
-    setupSourceHome.includes("refresh_browser_vm_initrd_control_service") &&
-    setupSourceHome.includes("refresh_browser_vm_rootfs_files") &&
-    setupSourceHome.includes("ELASTOS_DEBUGFS_BIN") &&
-    setupSourceHome.includes("debugfs") &&
     setupSourceHome.includes("ELASTOS_NODE_BIN") &&
     setupSourceHome.includes("ELASTOS_BROWSER_VM_CONTROL_LAUNCHER") &&
     setupSourceHome.includes("existing_remote_browser_vm_config") &&
@@ -1684,8 +1671,8 @@ assert(
     browserVmTargetDoc.includes("full bootable rootfs must also pass runtime dependency mode") &&
     browserVmTargetDoc.includes("--target-dir /path/to/full-rootfs --require-runtime-deps") &&
     browserVmTargetDoc.includes("PipeWire, PipeWire Pulse, WirePlumber") &&
-    browserVmTargetDoc.includes("Refresh-only is not") &&
-    browserVmTargetDoc.includes("sufficient for package/dependency changes") &&
+    browserVmTargetDoc.includes("Guest drift requires a rebuilt image set") &&
+    browserVmTargetDoc.includes("preserves guest bytes") &&
     browserVmTargetDoc.includes("browser-vm-runtime-relay") &&
     browserVmTargetDoc.includes("browser-vm-guest-control-bridge") &&
     browserVmTargetDoc.includes("browser-vm-selkies-start") &&

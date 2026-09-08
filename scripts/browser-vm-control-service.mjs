@@ -13,15 +13,17 @@ let verifiedHostReadiness = null;
 
 function readinessArtifactIdentity(dataDir, launcher) {
   const artifact = (key, fallback) => process.env[key] || path.join(dataDir, fallback);
+  const linux = process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("linux-") ?? process.platform === "linux";
   const files = [
     launcher,
     artifact("ELASTOS_BROWSER_VM_ROOTFS", "browser-vm/rootfs.ext4"),
     artifact("ELASTOS_BROWSER_VM_ROOTFS_MANIFEST", "browser-vm/browser-vm-rootfs-manifest.json"),
     artifact("ELASTOS_BROWSER_VM_KERNEL", "bin/vmlinux"),
-    artifact("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd"),
+    linux ? artifact("ELASTOS_BROWSER_VM_INITRD", "browser-vm/initrd")
+      : artifact("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd"),
     path.join(dataDir, "scripts/browser-vm-artifact-preflight.sh"),
   ];
-  if (process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("linux-")) {
+  if (linux) {
     files.push(artifact("ELASTOS_BROWSER_VM_CROSVM_BIN", "bin/crosvm"), "/dev/kvm");
   }
   try {
@@ -54,7 +56,7 @@ async function engineReadiness(config) {
       timeout: 8000, maxBuffer: 64 * 1024,
       env: {
         ...process.env, ELASTOS_BROWSER_VM_STAGED_ROOTFS: "",
-        ...(process.env.ELASTOS_BROWSER_VM_PLATFORM === "darwin-arm64"
+        ...((process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("darwin-") ?? process.platform === "darwin")
           ? { ELASTOS_BROWSER_VM_VZ_SUPERVISOR: config.launcher_program } : {}),
       },
     }, (error, stdout) => {
