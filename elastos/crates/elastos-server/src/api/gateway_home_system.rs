@@ -271,6 +271,10 @@ struct HomeServiceAccessRequestRecord {
     created_at: u64,
     updated_at: u64,
     status: String,
+    #[serde(default)]
+    authenticated_request: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grant_expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -2440,7 +2444,7 @@ fn home_services_send_access_request(
     let requester_handle = profile.handle.clone();
     let created_at = now_ts();
     let request_id = home_services_new_access_request_id(target_peer_id)?;
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "schema": "elastos.service-access-request/v1",
         "kind": "service_access_request",
         "request_id": &request_id,
@@ -2457,6 +2461,7 @@ fn home_services_send_access_request(
         "grant_scope": &offer.grant_scope,
         "created_at": created_at,
     });
+    crate::carrier::sign_service_message(data_dir, &mut payload)?;
     let delivery = services_peer_provider_request_blocking(
         &runtime.client,
         &runtime.api_url,
@@ -2502,7 +2507,7 @@ fn home_services_require_remote_request_delivery(
 fn home_services_send_access_decision(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
-    discovery_service: Option<
+    _discovery_service: Option<
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
     request: &HomeServiceAccessRequestRecord,
@@ -2515,19 +2520,6 @@ fn home_services_send_access_decision(
     let target_peer_id = request.requester_peer_id.trim();
     if target_peer_id.is_empty() {
         anyhow::bail!("service access request has no requester peer route");
-    }
-    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
-    if !contacts
-        .contacts
-        .values()
-        .any(|contact| contact.peer_id == target_peer_id && contact.did == request.requester_did)
-    {
-        anyhow::bail!(
-            "service access request person is not connected through People at this endpoint"
-        );
-    }
-    if decision == "approved" && !home_services_local_exit_shared(data_dir, context)? {
-        anyhow::bail!("service offer is no longer shared");
     }
     let runtime = services_attach_peer_runtime_blocking(data_dir)?;
     services_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
@@ -2567,10 +2559,12 @@ fn home_services_send_access_decision(
             "connect_ticket": &runtime.connect_ticket,
             "allowed_schemes": ["tcp", "tls"],
             "allowed_ports": [80, 443],
+            "expires_at": request.grant_expires_at,
             "max_active_streams": 4,
             "max_active_streams_per_principal": 2,
         });
     }
+    crate::carrier::sign_service_message(data_dir, &mut payload)?;
     let delivery = services_peer_provider_request_blocking(
         &runtime.client,
         &runtime.api_url,
@@ -2656,10 +2650,8 @@ fn home_services_sync_access_decisions(
         .unwrap_or_default();
     let mut changed = false;
     for message in messages {
-        let Some(content) = message.get("content").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Ok(payload) = serde_json::from_str::<serde_json::Value>(content) else {
+        let Ok(payload) = crate::carrier::verify_service_message(&message, "provider_peer_id")
+        else {
             continue;
         };
         if !payload
@@ -3007,6 +2999,86 @@ fn home_services_remote_exit_id(display_name: &str, request_id: &str) -> String 
     }
 }
 
+pub(crate) fn authorize_home_service_exit(
+    data_dir: &std::path::Path,
+    network: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+    source: &iroh::PublicKey,
+    request: &serde_json::Value,
+    now: u64,
+) -> anyhow::Result<crate::carrier::BrowserExitGrant> {
+    let principals = crate::auth::active_passkey_principals(data_dir)?;
+    anyhow::ensure!(
+        principals.len() <= 64,
+        "Exit authority scope is unavailable"
+    );
+    let local_did = crate::collaboration_profile_authority::load_existing_device_did(data_dir)?
+        .ok_or_else(|| anyhow::anyhow!("Exit signing identity unavailable"))?;
+    let mut authorized = None;
+    for principal in principals {
+        let context = HomeLaunchTokenContext {
+            principal_id: principal.principal_id,
+            proof_binding_id: Some(principal.proof_binding_id),
+            session_id: String::new(),
+            grant_id: String::new(),
+        };
+        let state = home_services_requests_state(data_dir, &context)?;
+        for record in state.requests.values().filter(|record| {
+            request["grant_id"].as_str()
+                == Some(home_services_remote_exit_grant_id(&record.request_id).as_str())
+        }) {
+            anyhow::ensure!(
+                record.authenticated_request
+                    && record.status == "approved"
+                    && record.service_uri == HOME_BROWSER_EXIT_PEER_SERVICE_URI
+                    && record.service_kind == HOME_REMOTE_EXIT_SERVICE_KIND
+                    && home_services_local_exit_shared(data_dir, &context)?,
+                "Exit grant is not active"
+            );
+            let profile = load_profile_authority_for_context(data_dir, &context)?
+                .ok_or_else(|| anyhow::anyhow!("Exit profile authority unavailable"))?;
+            let store = crate::collaboration_contact_store::CollaborationContactStore::new(
+                data_dir,
+                &context.principal_id,
+                &home_browser_localhost_root(&context),
+                network.clone(),
+                &profile,
+                &local_did,
+            )?;
+            anyhow::ensure!(
+                store.snapshot()?.contacts().iter().any(
+                    |contact| crate::carrier::did_to_public_key(
+                        contact.remote_presence_device_did()
+                    ) == Some(*source)
+                        && record.requester_did.as_deref()
+                            == Some(contact.remote_presence_device_did())
+                ),
+                "Exit requester is no longer an accepted contact"
+            );
+            let grant = crate::carrier::BrowserExitGrant {
+                provider_principal_id: context.principal_id.clone(),
+                requester_principal_id: record
+                    .requester_principal_id
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Exit requester principal required"))?,
+                requester_endpoint: record
+                    .requester_peer_id
+                    .parse::<iroh::PublicKey>()
+                    .ok()
+                    .ok_or_else(|| anyhow::anyhow!("Exit requester identity invalid"))?,
+                grant_id: home_services_remote_exit_grant_id(&record.request_id),
+                revision: record.updated_at,
+                expires_at: record
+                    .grant_expires_at
+                    .ok_or_else(|| anyhow::anyhow!("Exit grant expiry required"))?,
+            };
+            grant.validate(source, request, now)?;
+            anyhow::ensure!(authorized.is_none(), "Exit grant ownership is ambiguous");
+            authorized = Some(grant);
+        }
+    }
+    authorized.ok_or_else(|| anyhow::anyhow!("Exit grant was not issued by this Runtime"))
+}
+
 fn home_services_remote_exit_grant_id(request_id: &str) -> String {
     let digest = Sha256::digest(request_id.as_bytes());
     format!("services-remote-exit-grant-{}", hex::encode(&digest[..8]))
@@ -3044,6 +3116,20 @@ fn home_services_remote_exit_grant(
             "approved Browser Exit grant provider endpoint differs from the requested contact"
         );
     }
+    let revision = payload["created_at"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("Exit grant revision required"))?;
+    let expires_at = grant["expires_at"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("Exit grant expiry required"))?;
+    if grant["grant_id"].as_str()
+        != Some(home_services_remote_exit_grant_id(&record.request_id).as_str())
+        || expires_at <= now_ts()
+        || expires_at <= revision
+        || expires_at - revision > crate::carrier::EXIT_GRANT_TTL_SECS
+    {
+        anyhow::bail!("approved Browser Exit grant is expired or invalid");
+    }
     let id = home_services_remote_exit_id(&record.service_display_name, &record.request_id);
     let grant_id = home_services_remote_exit_grant_id(&record.request_id);
     Ok(serde_json::json!({
@@ -3056,6 +3142,7 @@ fn home_services_remote_exit_grant(
         "allowed_hosts": ["*"],
         "allowed_schemes": ["tcp", "tls"],
         "allowed_ports": [80, 443],
+        "expires_at": expires_at,
         "max_active_streams": 4,
         "max_active_streams_per_principal": 2,
     }))
@@ -3119,10 +3206,8 @@ pub(super) fn home_services_sync_access_requests(
     let mut state = home_services_requests_state(data_dir, context)?;
     let mut changed = false;
     for message in messages {
-        let Some(content) = message.get("content").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Ok(payload) = serde_json::from_str::<serde_json::Value>(content) else {
+        let Ok(payload) = crate::carrier::verify_service_message(&message, "requester_peer_id")
+        else {
             continue;
         };
         if !contacts.contacts.values().any(|contact| {
@@ -3211,15 +3296,17 @@ fn home_services_merge_access_request(
     let created_at = payload
         .get("created_at")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(now);
-    let existing_status = state
-        .requests
-        .get(&request_id)
-        .map(|request| request.status.clone());
-    let status = match existing_status.as_deref() {
-        Some("approved") | Some("denied") => existing_status.unwrap_or_default(),
-        _ => "pending".to_string(),
-    };
+        .unwrap_or(0);
+    if created_at == 0
+        || created_at > now.saturating_add(30)
+        || now.saturating_sub(created_at) > crate::carrier::EXIT_GRANT_TTL_SECS
+        || state.requests.contains_key(&request_id)
+    {
+        // Request IDs bind an immutable, authenticated requester and scope.
+        // A replay cannot change a previously approved record or its revision.
+        return false;
+    }
+    let status = "pending".to_string();
     let record = HomeServiceAccessRequestRecord {
         request_id: request_id.clone(),
         offer_id: home_services_payload_text(payload, "offer_id", 256).unwrap_or_default(),
@@ -3239,6 +3326,8 @@ fn home_services_merge_access_request(
             .map(|previous| previous.updated_at.max(now))
             .unwrap_or(now),
         status,
+        authenticated_request: true,
+        grant_expires_at: None,
     };
     let changed = state
         .requests
@@ -3364,6 +3453,29 @@ fn home_services_mark_access_request(
     {
         anyhow::bail!("service access decision clock is ahead; retry later");
     }
+    if !matches!(status, "approved" | "denied") || !request.authenticated_request {
+        anyhow::bail!("service request requires an authenticated requester");
+    }
+    if status == "approved" {
+        let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
+        if !contacts.contacts.values().any(|contact| {
+            contact.peer_id == request.requester_peer_id && contact.did == request.requester_did
+        }) || !home_services_local_exit_shared(data_dir, context)?
+        {
+            anyhow::bail!("service request person or shared offer is no longer available");
+        }
+    }
+    let mut request = request;
+    request.status = status.to_string();
+    request.updated_at = revision;
+    request.grant_expires_at = (status == "approved")
+        .then(|| revision.saturating_add(crate::carrier::EXIT_GRANT_TTL_SECS));
+    state
+        .requests
+        .insert(request_id.to_string(), request.clone());
+    state.updated_at = revision;
+    // The provider owns revocation even when the requester cannot receive gossip.
+    home_save_services_requests_state(data_dir, context, &state)?;
     home_services_send_access_decision(
         data_dir,
         context,
@@ -3379,14 +3491,7 @@ fn home_services_mark_access_request(
             err.context("service access request delivery failed")
         }
     })?;
-    let Some(request) = state.requests.get_mut(request_id) else {
-        anyhow::bail!("service request not found");
-    };
-    request.status = status.to_string();
-    request.updated_at = revision;
     let requester = request.requester_display_name.clone();
-    state.updated_at = request.updated_at;
-    home_save_services_requests_state(data_dir, context, &state)?;
     Ok(match status {
         "approved" => format!(
             "Approved Browser Exit request from {requester}. A private remote Exit grant was sent to the requester."

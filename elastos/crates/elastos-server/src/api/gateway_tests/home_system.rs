@@ -2387,6 +2387,337 @@ async fn test_services_exit_activation_waits_for_provider_ack() {
     assert_eq!(*alice.exit_provider.applied.lock().await, prior_config);
 }
 
+struct ServicesCarrierRelayProvider {
+    path: std::path::PathBuf,
+    calls: Arc<std::sync::Mutex<Vec<Value>>>,
+}
+
+#[async_trait::async_trait]
+impl elastos_runtime::provider::Provider for ServicesCarrierRelayProvider {
+    async fn handle(
+        &self,
+        _: elastos_runtime::provider::ResourceRequest,
+    ) -> Result<elastos_runtime::provider::ResourceResponse, elastos_runtime::provider::ProviderError>
+    {
+        Err(elastos_runtime::provider::ProviderError::Provider(
+            "raw test Exit only".into(),
+        ))
+    }
+    fn schemes(&self) -> Vec<&'static str> {
+        vec![]
+    }
+    fn name(&self) -> &'static str {
+        "services-carrier-relay-test"
+    }
+    async fn send_raw(
+        &self,
+        request: &Value,
+    ) -> Result<Value, elastos_runtime::provider::ProviderError> {
+        self.calls.lock().unwrap().push(request.clone());
+        if request["op"] == "close_stream" {
+            return Ok(json!({"status":"ok"}));
+        }
+        assert_eq!(request["op"], "open_stream");
+        Ok(
+            json!({"status":"ok", "data":{"schema":"elastos.exit.stream-session/v1",
+            "stream_id":"provider:stream:1", "target":"tls://example.com:443",
+            "relay_ipc":{"schema":"elastos.exit.relay-ipc/v1", "kind":"unix_socket",
+                "path":self.path, "stream_id":"provider:stream:1"}}}),
+        )
+    }
+}
+
+#[tokio::test]
+async fn test_services_carrier_exit_admission_requires_current_issued_contact_grant() {
+    use crate::api::gateway::gateway_browser::{
+        browser_attach_runtime_stream_path, close_browser_runtime_stream_listener,
+    };
+    use iroh::Watcher as _;
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network.clone()).await;
+    accept_services_contact_pair(&alice, &bob);
+    let action = services_contact_pending_request(left.path(), right.path(), &alice, &bob).await;
+    let request_id = action.strip_prefix("service-approve-request:").unwrap();
+    let grant_id = format!(
+        "services-remote-exit-grant-{}",
+        hex::encode(&Sha256::digest(request_id.as_bytes())[..8])
+    );
+    let source = alice.peer_id.parse::<iroh::PublicKey>().unwrap();
+    let request = json!({"grant_id":grant_id,"principal_id":alice.authority.principal_id,
+        "stream_id":"consumer:stream:1","target":"tls://example.com:443"});
+    let authorize = |request: &Value, source: &iroh::PublicKey| {
+        crate::api::gateway::authorize_home_service_exit(
+            right.path(),
+            &network,
+            source,
+            request,
+            now_ts(),
+        )
+    };
+    assert!(
+        authorize(&request, &source).is_err(),
+        "contact acceptance and pending request do not grant use"
+    );
+    let token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/inbox/actions",
+        json!({"action_id":action}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let grant = authorize(&request, &source).unwrap();
+    assert_eq!(grant.provider_principal_id, bob.authority.principal_id);
+    assert_eq!(grant.requester_principal_id, alice.authority.principal_id);
+    assert_eq!(
+        grant.expires_at - grant.revision,
+        crate::carrier::EXIT_GRANT_TTL_SECS
+    );
+    for field in ["principal_id", "grant_id"] {
+        let mut forged = request.clone();
+        forged[field] = json!("forged");
+        assert!(authorize(&forged, &source).is_err());
+    }
+    assert!(authorize(&request, &iroh::SecretKey::from_bytes(&[231; 32]).public()).is_err());
+    assert!(crate::api::gateway::authorize_home_service_exit(
+        right.path(),
+        &network,
+        &source,
+        &request,
+        grant.expires_at
+    )
+    .is_err());
+    // Actual Carrier TLS identity + saved provider grant + local relay byte path.
+    let relay_path = right.path().join("exit-test.sock");
+    let listener = tokio::net::UnixListener::bind(&relay_path).unwrap();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+    registry
+        .register_sub_provider(
+            "exit",
+            Arc::new(ServicesCarrierRelayProvider {
+                path: relay_path,
+                calls: calls.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    let (_, alice_did) = elastos_identity::load_or_create_did(left.path()).unwrap();
+    let (_, bob_did) = elastos_identity::load_or_create_did(right.path()).unwrap();
+    let local = crate::carrier::start_isolated_carrier_node_with_registry(
+        &alice.device_key,
+        &alice_did,
+        left.path().to_path_buf(),
+        None,
+    )
+    .await
+    .unwrap();
+    let remote = crate::carrier::start_isolated_carrier_node_with_registry(
+        &bob.device_key,
+        &bob_did,
+        right.path().to_path_buf(),
+        Some(Arc::downgrade(&registry)),
+    )
+    .await
+    .unwrap();
+    let addr = remote.endpoint.watch_addr().get();
+    let ticket = data_encoding::BASE32_NOPAD
+        .encode(&serde_json::to_vec(&json!({"topic":null, "endpoints":[addr]})).unwrap())
+        .to_lowercase();
+    let mut local = crate::carrier::CarrierRuntimeService::new(local);
+    let mut remote = crate::carrier::CarrierRuntimeService::new(remote);
+    remote.configure_browser_exit_network(network.clone()).await;
+    let endpoint = local.endpoint().unwrap();
+    let wire = crate::carrier::BrowserCarrierStreamRequest {
+        connect_ticket: ticket,
+        peer_did: Some(bob.peer_id.clone()),
+        carrier_service: "elastos://exit/open_stream".into(),
+        grant_id: grant_id.clone(),
+        stream_id: "consumer:stream:1".into(),
+        target: "tls://example.com:443".into(),
+        principal_id: Some(alice.authority.principal_id.clone()),
+        reason: Some("caller text ignored".into()),
+        timeout_ms: Some(5000),
+    };
+    let receipt = json!({"schema":"elastos.exit.remote-carrier-session/v1", "byte_transport":"carrier_stream",
+        "stream_id":wire.stream_id, "target":wire.target, "principal_id":wire.principal_id,
+        "carrier":{"schema":"elastos.exit.remote-carrier/v1", "transport":"carrier_stream",
+            "connect_ticket":wire.connect_ticket, "peer_did":wire.peer_did,
+            "carrier_service":wire.carrier_service, "grant_id":wire.grant_id}});
+    let mut header = serde_json::to_vec(&json!({"schema":"elastos.exit.relay-open/v1", "stream_id":wire.stream_id,"target":wire.target})).unwrap();
+    header.extend_from_slice(b"\nping");
+    // A newly created anonymous endpoint cannot use the calling Runtime's grant.
+    let anonymous_dir = tempfile::tempdir().unwrap();
+    let (anonymous_key, anonymous_did) = elastos_identity::derive_did(&[232; 32]);
+    let anonymous_node = crate::carrier::start_isolated_carrier_node_with_registry(
+        &anonymous_key,
+        &anonymous_did,
+        anonymous_dir.path().to_path_buf(),
+        None,
+    )
+    .await
+    .unwrap();
+    let mut anonymous = crate::carrier::CarrierRuntimeService::new(anonymous_node);
+    let wrong = browser_attach_runtime_stream_path(
+        anonymous_dir.path(),
+        receipt.clone(),
+        anonymous.endpoint().as_ref(),
+    )
+    .await
+    .unwrap();
+    let wrong_path = std::path::PathBuf::from(
+        wrong["adapter_ipc"]["runtime_stream_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let mut wrong_stream = tokio::net::UnixStream::connect(&wrong_path).await.unwrap();
+    wrong_stream.write_all(&header).await.unwrap();
+    let mut byte = [0];
+    let ended = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wrong_stream.read(&mut byte),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(ended, Ok(0) | Err(_)));
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "a substituted endpoint must not reach Exit"
+    );
+    close_browser_runtime_stream_listener(anonymous_dir.path(), &wire.stream_id)
+        .await
+        .unwrap();
+    assert!(!wrong_path.exists());
+    anonymous.shutdown().await.unwrap();
+    let relay_task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio::io::BufReader::new(socket);
+        let mut line = String::new();
+        socket.read_line(&mut line).await.unwrap();
+        let header: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(header["stream_id"], "provider:stream:1");
+        assert_eq!(header["target"], "tls://example.com:443");
+        let mut ping = [0; 4];
+        socket.read_exact(&mut ping).await.unwrap();
+        assert_eq!(&ping, b"ping");
+        socket.get_mut().write_all(b"pong").await.unwrap();
+        let mut rest = Vec::new();
+        socket.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+    });
+    let attached = browser_attach_runtime_stream_path(left.path(), receipt, Some(&endpoint))
+        .await
+        .unwrap();
+    let runtime_path = std::path::PathBuf::from(
+        attached["adapter_ipc"]["runtime_stream_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let mut stream = tokio::net::UnixStream::connect(&runtime_path)
+        .await
+        .unwrap();
+    stream.write_all(&header).await.unwrap();
+    let mut pong = [0; 4];
+    stream.read_exact(&mut pong).await.unwrap();
+    assert_eq!(&pong, b"pong");
+    assert!(
+        crate::carrier::open_browser_carrier_stream_on_endpoint(&endpoint, &wire)
+            .await
+            .is_err(),
+        "duplicate stream has no new provider effect"
+    );
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        calls.lock().unwrap()[0]["principal_id"],
+        bob.authority.principal_id
+    );
+    bus.lock()
+        .await
+        .local_only_message_substrings
+        .push("service_access_decision".into());
+    let deny = action.replacen("service-approve-request:", "service-deny-request:", 1);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/inbox/actions",
+        json!({"action_id":deny}),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "delivery failure must be reported: {body}"
+    );
+    assert!(
+        authorize(&request, &source).is_err(),
+        "provider denial takes effect before consumer config refresh"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), relay_task)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut byte = [0];
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut byte))
+        .await
+        .unwrap();
+    assert!(
+        matches!(ended, Ok(0) | Err(_)),
+        "revoked Carrier stream must terminate"
+    );
+    assert!(
+        crate::carrier::open_browser_carrier_stream_on_endpoint(&endpoint, &wire)
+            .await
+            .is_err(),
+        "denial rejects new opens before consumer refresh"
+    );
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["op"] == "open_stream")
+            .count(),
+        1
+    );
+    close_browser_runtime_stream_listener(left.path(), &wire.stream_id)
+        .await
+        .unwrap();
+    assert!(
+        !runtime_path.exists(),
+        "exact Browser stream close removes its listener"
+    );
+    remote.shutdown().await.unwrap();
+    local.shutdown().await.unwrap();
+    bus.lock().await.local_only_message_substrings.clear();
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/inbox/actions",
+        json!({"action_id":action}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(authorize(&request, &source).is_ok());
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &bob.authority.people_token,
+        "/api/apps/people/contacts/remove",
+        json!({"contact_id":home_people_contact_id(&alice.profile.document().profile_did)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        authorize(&request, &source).is_err(),
+        "removing the accepted contact revokes the issued grant"
+    );
+}
+
 #[tokio::test]
 async fn test_services_exit_decision_order_preserves_pending_and_committed_denial() {
     for pending in [true, false] {
@@ -2445,6 +2776,7 @@ async fn test_services_exit_decision_order_preserves_pending_and_committed_denia
             if changed_grant {
                 payload["remote_exit_grant"]["connect_ticket"] = json!("different-test-ticket");
             }
+            crate::carrier::sign_service_message(right.path(), &mut payload).unwrap();
             replay["content"] = json!(payload.to_string());
             bus.lock()
                 .await
@@ -2493,6 +2825,7 @@ async fn test_services_exit_decision_order_preserves_pending_and_committed_denia
                 "the provider orders consecutive decisions even within one second"
             );
             denied["created_at"] = json!(revision);
+            crate::carrier::sign_service_message(right.path(), &mut denied).unwrap();
             message["content"] = json!(denied.to_string());
         }
         if pending {
@@ -2524,6 +2857,7 @@ async fn test_services_exit_decision_order_preserves_pending_and_committed_denia
             } else {
                 payload["created_at"] = timestamp;
             }
+            crate::carrier::sign_service_message(right.path(), &mut payload).unwrap();
             replay["content"] = json!(payload.to_string());
             bus.lock()
                 .await

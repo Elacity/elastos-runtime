@@ -673,20 +673,25 @@ async fn execute_browser_open(
             }
         };
     let stream_cleanup = browser_stream_cleanup(&stream_session);
-    let stream_session =
-        match browser_attach_runtime_stream_path(&state.data_dir, stream_session).await {
-            Ok(receipt) => receipt,
-            Err(err) => {
-                let outcome = release_browser_open_resources(
-                    state,
-                    &launch_reservation,
-                    stream_cleanup.clone(),
-                    false,
-                )
-                .await;
-                return Err(BrowserOpenFailure::provider("browser", err).with_outcome(outcome));
-            }
-        };
+    let stream_session = match browser_attach_runtime_stream_path(
+        &state.data_dir,
+        stream_session,
+        state.carrier_endpoint.as_ref(),
+    )
+    .await
+    {
+        Ok(receipt) => receipt,
+        Err(err) => {
+            let outcome = release_browser_open_resources(
+                state,
+                &launch_reservation,
+                stream_cleanup.clone(),
+                false,
+            )
+            .await;
+            return Err(BrowserOpenFailure::provider("browser", err).with_outcome(outcome));
+        }
+    };
     let engine_stream_id = match stream_session
         .get("stream_id")
         .and_then(serde_json::Value::as_str)

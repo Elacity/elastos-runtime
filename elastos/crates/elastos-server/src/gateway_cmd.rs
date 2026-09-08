@@ -132,6 +132,9 @@ where
         if let Some(port) = collaboration_context.presence_product_port.clone() {
             sup_inner.set_collaboration_presence_product_port(port);
         }
+        if let Some(endpoint) = collaboration_context.carrier_endpoint.clone() {
+            sup_inner.set_carrier_endpoint(endpoint);
+        }
         if let Some(service) = collaboration_context.discovery_service.clone() {
             sup_inner.set_collaboration_discovery_service(service);
         }

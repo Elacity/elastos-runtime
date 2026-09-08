@@ -1437,6 +1437,7 @@ mod tests {
             provider_registry: None,
             collaboration_chat_product_port: None,
             collaboration_presence_product_port: None,
+            carrier_endpoint: None,
             collaboration_discovery_service: None,
             identity_manager: Arc::new(OnceLock::new()),
             cache_dir: data_dir.path().join("cache"),

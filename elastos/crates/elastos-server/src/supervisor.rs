@@ -205,6 +205,7 @@ pub struct Supervisor {
     /// Opaque presence port from the same Runtime-owned collaboration service.
     collaboration_presence_product_port:
         Option<crate::collaboration_presence::CollaborationPresenceProductPort>,
+    carrier_endpoint: Option<iroh::Endpoint>,
     /// Opaque discovery service from the same Runtime-owned collaboration service.
     collaboration_discovery_service:
         Option<crate::collaboration_discovery_runtime::CollaborationDiscoveryService>,
@@ -384,6 +385,7 @@ impl Supervisor {
             provider_registry: None,
             collaboration_chat_product_port: None,
             collaboration_presence_product_port: None,
+            carrier_endpoint: None,
             collaboration_discovery_service: None,
             capability_manager: None,
             pending_store: None,
@@ -422,6 +424,10 @@ impl Supervisor {
         port: crate::collaboration_presence::CollaborationPresenceProductPort,
     ) {
         self.collaboration_presence_product_port = Some(port);
+    }
+
+    pub fn set_carrier_endpoint(&mut self, endpoint: iroh::Endpoint) {
+        self.carrier_endpoint = Some(endpoint);
     }
 
     pub fn set_collaboration_discovery_service(
@@ -1524,6 +1530,7 @@ impl Supervisor {
         let collaboration_chat_product_port = self.collaboration_chat_product_port.clone();
         let collaboration_presence_product_port = self.collaboration_presence_product_port.clone();
         let collaboration_discovery_service = self.collaboration_discovery_service.clone();
+        let carrier_endpoint = self.carrier_endpoint.clone();
 
         let task = tokio::spawn({
             let listen_addr = listen_addr.clone();
@@ -1538,6 +1545,7 @@ impl Supervisor {
                             chat_product_port: collaboration_chat_product_port,
                             presence_product_port: collaboration_presence_product_port,
                             discovery_service: collaboration_discovery_service,
+                            carrier_endpoint,
                         },
                         cache_path,
                         data_dir,

@@ -269,6 +269,17 @@ pub async fn start_collaboration_runtime_service(
 }
 
 impl CollaborationRuntimeService {
+    pub async fn configure_browser_exit_carrier(
+        &self,
+        carrier: &crate::carrier::CarrierRuntimeService,
+    ) {
+        if let Some(discovery) = self.discovery_service.as_ref() {
+            carrier
+                .configure_browser_exit_network(discovery.network_profile())
+                .await;
+        }
+    }
+
     /// Return the opaque Chat product port retained by this configured service.
     pub fn chat_product_port(&self) -> CollaborationChatProductPort {
         self.product_port
@@ -291,6 +302,7 @@ impl CollaborationRuntimeService {
 
     pub fn gateway_context(&self) -> crate::api::gateway::GatewayCollaborationContext {
         crate::api::gateway::GatewayCollaborationContext {
+            carrier_endpoint: None,
             chat_product_port: Some(self.chat_product_port()),
             presence_product_port: Some(self.presence_product_port()),
             discovery_service: Some(self.discovery_service()),
@@ -1154,6 +1166,7 @@ mod tests {
             collaboration_chat_product_port: gateway_context.chat_product_port.clone(),
             collaboration_presence_product_port: gateway_context.presence_product_port.clone(),
             collaboration_discovery_service: gateway_context.discovery_service.clone(),
+            carrier_endpoint: gateway_context.carrier_endpoint.clone(),
             identity_manager: Arc::new(std::sync::OnceLock::new()),
             cache_dir: temp.path().join("gateway-cache"),
             data_dir: temp.path().to_path_buf(),
@@ -1256,6 +1269,7 @@ mod tests {
             provider_registry: None,
             collaboration_chat_product_port: Some(chat_port.clone()),
             collaboration_presence_product_port: Some(presence_port.clone()),
+            carrier_endpoint: None,
             collaboration_discovery_service: None,
             identity_manager: Arc::new(std::sync::OnceLock::new()),
             cache_dir: temp.path().join("gateway-cache"),

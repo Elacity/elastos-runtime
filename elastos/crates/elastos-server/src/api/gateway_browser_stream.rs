@@ -2,7 +2,7 @@
 
 use super::*;
 #[cfg(unix)]
-use crate::carrier::{open_browser_carrier_stream, BrowserCarrierStreamRequest};
+use crate::carrier::{open_browser_carrier_stream_on_endpoint, BrowserCarrierStreamRequest};
 use anyhow::Context as _;
 #[cfg(unix)]
 use std::net::IpAddr;
@@ -411,6 +411,7 @@ pub(in crate::api::gateway) async fn browser_reserve_stream_session(
 pub(in crate::api::gateway) async fn browser_attach_runtime_stream_path(
     data_dir: &FsPath,
     mut receipt: serde_json::Value,
+    carrier_endpoint: Option<&iroh::Endpoint>,
 ) -> anyhow::Result<serde_json::Value> {
     let byte_transport = receipt
         .get("byte_transport")
@@ -425,7 +426,12 @@ pub(in crate::api::gateway) async fn browser_attach_runtime_stream_path(
             if receipt.get("schema").and_then(|value| value.as_str())
                 == Some(EXIT_REMOTE_CARRIER_SESSION_SCHEMA) =>
         {
-            BrowserRuntimeStreamTarget::Carrier(browser_carrier_exit_route(&receipt)?)
+            BrowserRuntimeStreamTarget::Carrier {
+                route: browser_carrier_exit_route(&receipt)?,
+                endpoint: carrier_endpoint
+                    .context("Browser remote Exit requires the owning Runtime Carrier endpoint")?
+                    .clone(),
+            }
         }
         _ => return Ok(receipt),
     };
@@ -778,7 +784,10 @@ struct BrowserCarrierExitRoute {
 #[derive(Debug, Clone)]
 enum BrowserRuntimeStreamTarget {
     LocalRelay(Option<BrowserExitRelay>),
-    Carrier(BrowserCarrierExitRoute),
+    Carrier {
+        route: BrowserCarrierExitRoute,
+        endpoint: iroh::Endpoint,
+    },
 }
 
 #[cfg(unix)]
@@ -926,6 +935,9 @@ fn browser_carrier_stream_public_ip(ip: IpAddr) -> anyhow::Result<()> {
             }
         }
         IpAddr::V6(ip) => {
+            if let Some(ipv4) = ip.to_ipv4_mapped() {
+                return browser_carrier_stream_public_ip(IpAddr::V4(ipv4));
+            }
             if ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_unique_local()
@@ -1194,12 +1206,13 @@ async fn bridge_browser_runtime_stream_to_carrier(
     session_path: &FsPath,
     mut stream: UnixStream,
     route: BrowserCarrierExitRoute,
+    endpoint: &iroh::Endpoint,
 ) -> anyhow::Result<()> {
     let (open_line, open_log) = read_browser_relay_open_line(&mut stream).await?;
     let request = browser_carrier_stream_request_for_open(&route, &open_log)?;
     let stream_id = request.stream_id.clone();
     let target = request.target.clone();
-    let mut carrier_stream = open_browser_carrier_stream(&request).await?;
+    let mut carrier_stream = open_browser_carrier_stream_on_endpoint(endpoint, &request).await?;
     carrier_stream.send.write_all(&open_line).await?;
     let (carrier_send, carrier_recv) = (&mut carrier_stream.send, &mut carrier_stream.recv);
     let (mut stream_read, mut stream_write) = stream.into_split();
@@ -1320,11 +1333,12 @@ async fn spawn_browser_runtime_stream_listener_with_accept_timeout(
                                     );
                                 }
                             }
-                            BrowserRuntimeStreamTarget::Carrier(route) => {
+                            BrowserRuntimeStreamTarget::Carrier {route, endpoint} => {
                                 if let Err(err) = bridge_browser_runtime_stream_to_carrier(
                                     &session_path,
                                     stream,
                                     route,
+                                    &endpoint,
                                 )
                                 .await
                                 {
@@ -1682,12 +1696,7 @@ fn scrub_browser_stream_authority_fields(value: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use elastos_runtime::provider::{Provider, ProviderError, ResourceRequest, ResourceResponse};
-    #[cfg(unix)]
-    use iroh::Watcher as _;
     use serde_json::json;
-    #[cfg(unix)]
-    use std::sync::Arc;
 
     #[test]
     fn engine_stream_session_keeps_relay_ipc_for_vm_launch() {
@@ -1750,7 +1759,7 @@ mod tests {
             }
         });
 
-        let attached = browser_attach_runtime_stream_path(dir.path(), receipt)
+        let attached = browser_attach_runtime_stream_path(dir.path(), receipt, None)
             .await
             .unwrap();
         let adapter_ipc = attached.get("adapter_ipc").unwrap();
@@ -1987,7 +1996,7 @@ mod tests {
             }
         });
 
-        let attached = browser_attach_runtime_stream_path(dir.path(), receipt)
+        let attached = browser_attach_runtime_stream_path(dir.path(), receipt, None)
             .await
             .unwrap();
         let adapter_ipc = attached.get("adapter_ipc").unwrap();
@@ -2164,6 +2173,9 @@ mod tests {
             ("tcp://localhost:61180", "localhost"),
             ("tcp://127.0.0.1:80", "127.0.0.1"),
             ("tls://printer.local:443", "printer.local"),
+            ("tls://[::ffff:7f00:1]:443", "::ffff:7f00:1"),
+            ("tls://[::ffff:a00:1]:443", "::ffff:a00:1"),
+            ("tls://[::ffff:a9fe:101]:443", "::ffff:a9fe:101"),
         ] {
             let open_log = BrowserRelayOpenLog {
                 schema: "elastos.exit.relay-open/v1".to_string(),
@@ -2187,170 +2199,32 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    struct MockGatewayCarrierExitProvider {
-        relay_path: String,
-    }
-
-    #[cfg(unix)]
-    #[async_trait::async_trait]
-    impl Provider for MockGatewayCarrierExitProvider {
-        async fn handle(
-            &self,
-            _request: ResourceRequest,
-        ) -> Result<ResourceResponse, ProviderError> {
-            Err(ProviderError::Provider(
-                "mock gateway carrier exit provider only supports raw operations".into(),
-            ))
-        }
-
-        fn schemes(&self) -> Vec<&'static str> {
-            Vec::new()
-        }
-
-        fn name(&self) -> &'static str {
-            "mock-gateway-carrier-exit-provider"
-        }
-
-        async fn send_raw(
-            &self,
-            request: &serde_json::Value,
-        ) -> Result<serde_json::Value, ProviderError> {
-            assert_eq!(
-                request.get("op").and_then(|value| value.as_str()),
-                Some("open_stream")
-            );
-            assert_eq!(
-                request.get("target").and_then(|value| value.as_str()),
-                Some("tls://www.whatismyip.com:443")
-            );
-            Ok(serde_json::json!({
-                "status": "ok",
-                "data": {
-                    "schema": EXIT_STREAM_SESSION_SCHEMA,
-                    "backend": "remote-local-exit",
-                    "stream_id": "stream:remote-local:test",
-                    "target": "tls://www.whatismyip.com:443",
-                    "byte_transport": "adapter_ipc",
-                    "relay_ipc": {
-                        "schema": "elastos.exit.relay-ipc/v1",
-                        "kind": "unix_socket",
-                        "path": self.relay_path,
-                        "stream_id": "stream:remote-local:test"
-                    }
-                }
-            }))
-        }
-    }
-
-    #[cfg(unix)]
-    fn browser_gateway_test_carrier_ticket(endpoint: &iroh::Endpoint) -> String {
-        let mut watcher = endpoint.watch_addr();
-        let addr = watcher.get();
-        let ticket_json = serde_json::json!({
-            "topic": null,
-            "endpoints": [addr],
-        });
-        let ticket_bytes = serde_json::to_vec(&ticket_json).unwrap_or_default();
-        let mut ticket_str = data_encoding::BASE32_NOPAD.encode(&ticket_bytes);
-        ticket_str.make_ascii_lowercase();
-        ticket_str
+    #[test]
+    fn carrier_public_mapped_address_remains_allowed() {
+        assert!(browser_carrier_stream_public_ip("::ffff:93.184.216.34".parse().unwrap()).is_ok());
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn carrier_runtime_bridge_forwards_relay_open_line_to_seed_exit() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        let remote_dir = tempfile::tempdir().unwrap();
-        let relay_path = remote_dir.path().join("remote-exit.sock");
-        let relay_listener = UnixListener::bind(&relay_path).unwrap();
-        let relay_task = tokio::spawn(async move {
-            let (mut relay, _addr) = relay_listener.accept().await.unwrap();
-            let mut open_line = Vec::new();
-            loop {
-                let mut byte = [0_u8; 1];
-                relay.read_exact(&mut byte).await.unwrap();
-                open_line.push(byte[0]);
-                if byte[0] == b'\n' {
-                    break;
-                }
-            }
-            let parsed = serde_json::from_slice::<serde_json::Value>(
-                open_line
-                    .strip_suffix(b"\n")
-                    .unwrap_or(open_line.as_slice()),
-            )
-            .unwrap();
-            assert_eq!(
-                parsed.get("schema").and_then(|value| value.as_str()),
-                Some("elastos.exit.relay-open/v1")
-            );
-            assert_eq!(
-                parsed.get("target").and_then(|value| value.as_str()),
-                Some("tls://www.whatismyip.com:443")
-            );
-
-            let mut request = [0_u8; 4];
-            relay.read_exact(&mut request).await.unwrap();
-            assert_eq!(&request, b"ping");
-            relay.write_all(b"pong").await.unwrap();
+    async fn carrier_stream_without_runtime_endpoint_has_no_listener_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let stream_id = "stream:missing-runtime-endpoint";
+        let receipt = json!({
+            "schema": EXIT_REMOTE_CARRIER_SESSION_SCHEMA, "byte_transport":"carrier_stream",
+            "stream_id":stream_id, "target":"tls://example.com:443", "principal_id":"person:test",
+            "carrier":{"schema":"elastos.exit.remote-carrier/v1", "transport":"carrier_stream",
+                "connect_ticket":"ticket:test", "carrier_service":"elastos://exit/open_stream", "grant_id":"grant:test"}
         });
-
-        let registry = Arc::new(ProviderRegistry::new());
-        registry
-            .register_sub_provider(
-                "exit",
-                Arc::new(MockGatewayCarrierExitProvider {
-                    relay_path: relay_path.to_string_lossy().to_string(),
-                }),
-            )
+        let error = browser_attach_runtime_stream_path(dir.path(), receipt, None)
             .await
-            .unwrap();
-        let (remote_sk, remote_did) = elastos_identity::derive_did(&[57_u8; 32]);
-        let remote_node = crate::carrier::start_carrier_node_with_registry(
-            &remote_sk,
-            &remote_did,
-            remote_dir.path().to_path_buf(),
-            Some(Arc::downgrade(&registry)),
-        )
-        .await
-        .unwrap();
-        let route = BrowserCarrierExitRoute {
-            connect_ticket: browser_gateway_test_carrier_ticket(&remote_node.endpoint),
-            peer_did: Some(remote_did),
-            carrier_service: "elastos://exit/open_stream".to_string(),
-            grant_id: "operator-grant:seed:test".to_string(),
-            principal_id: Some("person:local:test".to_string()),
-            reason: Some("open browser page".to_string()),
-        };
-
-        let (mut browser_side, runtime_side) = UnixStream::pair().unwrap();
-        let session_path = remote_dir.path().join("runtime-stream.sock");
-        let bridge_task = tokio::spawn(async move {
-            bridge_browser_runtime_stream_to_carrier(&session_path, runtime_side, route).await
-        });
-        let relay_open = serde_json::json!({
-            "schema": "elastos.exit.relay-open/v1",
-            "stream_id": "stream:native-proxy:whatismyip:1",
-            "target": "tls://www.whatismyip.com:443",
-            "scheme": "tls",
-            "host": "www.whatismyip.com",
-            "reason": "test Browser relay open"
-        });
-        browser_side
-            .write_all(format!("{relay_open}\n").as_bytes())
-            .await
-            .unwrap();
-        browser_side.write_all(b"ping").await.unwrap();
-        browser_side.shutdown().await.unwrap();
-
-        let mut response = [0_u8; 4];
-        browser_side.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"pong");
-
-        bridge_task.await.unwrap().unwrap();
-        relay_task.await.unwrap();
-        remote_node.endpoint.close().await;
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("owning Runtime Carrier endpoint"));
+        let path = browser_runtime_stream_socket_path(dir.path(), stream_id).unwrap();
+        assert!(!path.exists());
+        if let Some(listeners) = BROWSER_RUNTIME_STREAM_LISTENERS.get() {
+            assert!(!listeners.lock().await.contains_key(&path));
+        }
     }
 }

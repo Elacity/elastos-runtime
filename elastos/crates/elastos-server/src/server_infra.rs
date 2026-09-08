@@ -1448,10 +1448,18 @@ async fn setup_server_infrastructure_impl(
             provider_registry.clone(),
         )
         .await?;
-    let collaboration_context = collaboration_service
+    if let (Some(collaboration), Some(carrier)) =
+        (collaboration_service.as_ref(), carrier_service.as_ref())
+    {
+        collaboration.configure_browser_exit_carrier(carrier).await;
+    }
+    let mut collaboration_context = collaboration_service
         .as_ref()
         .map(|service| service.gateway_context())
         .unwrap_or_default();
+    collaboration_context.carrier_endpoint = carrier_service
+        .as_ref()
+        .and_then(|service| service.endpoint());
 
     maybe_spawn_content_repair_scheduler(provider_registry.clone());
 
