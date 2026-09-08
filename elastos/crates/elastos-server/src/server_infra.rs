@@ -102,15 +102,7 @@ fn model_provider_bridge_config(data_dir: &Path) -> anyhow::Result<provider::Bri
     })
 }
 
-fn derive_protected_content_runtime_issuer(
-    device_key: &[u8; 32],
-) -> anyhow::Result<elastos_protected_content_contracts::RuntimeOperationIssuerKeyV1> {
-    let (runtime_signing_key, _) = elastos_identity::derive_did(device_key);
-    elastos_protected_content_contracts::RuntimeOperationIssuerKeyV1::new(
-        runtime_signing_key.verifying_key().to_bytes(),
-    )
-    .map_err(|_| anyhow::anyhow!("active Runtime operation issuer is invalid"))
-}
+use elastos_server::protected_content_runtime::derive_protected_content_runtime_issuer;
 
 fn chain_provider_bridge_config_without_protected_network(
     runtime_operation_issuer: &elastos_protected_content_contracts::RuntimeOperationIssuerKeyV1,
@@ -943,7 +935,9 @@ async fn setup_server_infrastructure_impl(
             Ok(None) => tracing::info!("media-provider is installed but unconfigured"),
             Err(_) => tracing::warn!("Skipping media-provider due to invalid private config"),
         },
-        Ok(None) => {}
+        Ok(None) => tracing::warn!(
+            "media-provider binary is not installed; protected-content media sessions will fail closed"
+        ),
         Err(_) => tracing::warn!("Skipping media-provider due to verification failure"),
     }
 
@@ -1317,7 +1311,16 @@ async fn setup_server_infrastructure_impl(
             tracing::info!(
                 "protected-content-decrypt-provider registered on Runtime-only target protected-content-decrypt; provisional decrypt-provider remains on elastos://decrypt"
             );
+            elastos_server::protected_content_runtime::reconcile_runtime_custody_viewers_after_decrypt_boot(
+                &data_dir,
+                provider_registry.clone(),
+            )
+            .await;
         }
+    } else {
+        tracing::warn!(
+            "protected-content-decrypt-provider binary is not installed; protected-content open and play will fail closed"
+        );
     }
 
     if let Some(path) = crate::find_installed_provider_binary("protected-content-protect-provider")
@@ -1340,6 +1343,10 @@ async fn setup_server_infrastructure_impl(
                 path.display()
             );
         }
+    } else {
+        tracing::warn!(
+            "protected-content-protect-provider binary is not installed; protected-content mint will fail closed"
+        );
     }
 
     if let Some(path) = crate::find_installed_provider_binary("custody-provider") {
@@ -1365,6 +1372,10 @@ async fn setup_server_infrastructure_impl(
                 "custody-provider registered as inactive Runtime custody route; provisional key-provider remains the product path"
             );
         }
+    } else {
+        tracing::warn!(
+            "custody-provider binary is not installed; the inactive Runtime custody route will be unavailable"
+        );
     }
 
     // Built-in Carrier node — ALWAYS starts, not conditional on spawn_host_providers.

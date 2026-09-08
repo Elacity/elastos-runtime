@@ -146,6 +146,7 @@ verify:
     node scripts/check-capsule-templates.mjs
     ./scripts/vendor-ui-tokens.sh --check
     node scripts/home-entropy-check.mjs
+    node scripts/home-agent-shell-smoke.mjs
     node scripts/carrier-dependency-generation-check.mjs
     just product-ui-source
     node scripts/home-clipboard-source-gate.mjs

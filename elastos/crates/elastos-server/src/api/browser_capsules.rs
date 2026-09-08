@@ -377,8 +377,12 @@ fn asset_serving_root(capsule_dir: &Path, entrypoint: &str) -> PathBuf {
     }
 }
 
+/// Capsules that never serve a browser document (content data, providers) may
+/// still declare an icon set; only those declared variants are servable.
 fn declared_content_icon_paths(manifest: &CapsuleManifest) -> Vec<String> {
-    if manifest.role != CapsuleRole::Content || manifest.capsule_type != CapsuleType::Data {
+    let content_data =
+        manifest.role == CapsuleRole::Content && manifest.capsule_type == CapsuleType::Data;
+    if !content_data && manifest.role != CapsuleRole::Provider {
         return Vec::new();
     }
     let prefix = format!("/apps/{}/", manifest.name);
@@ -599,6 +603,46 @@ mod tests {
         fs::write(
             capsule_dir.join("capsule.json"),
             serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let icon_dir = capsule_dir.join(icon);
+        fs::create_dir_all(&icon_dir).unwrap();
+        for size in [32_u32, 64, 128, 256] {
+            fs::write(
+                icon_dir.join(format!("icon-{size}.png")),
+                format!("icon-{size}"),
+            )
+            .unwrap();
+        }
+    }
+
+    fn write_test_icon_provider_capsule(data_dir: &Path, name: &str, icon: &str) {
+        activate_test_capsule(data_dir, name);
+        let capsule_dir = data_dir.join("capsules").join(name);
+        fs::create_dir_all(&capsule_dir).unwrap();
+        fs::write(
+            capsule_dir.join("capsule.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "elastos.capsule/v1",
+                "name": name,
+                "version": "0.1.0",
+                "description": "Service with icons",
+                "author": "elastos",
+                "role": "provider",
+                "type": "microvm",
+                "entrypoint": "rootfs.ext4",
+                "provides": "elastos://model/*",
+                "authority": {
+                    "reason": "Test provider.",
+                    "capabilities": [
+                        { "resource": "elastos://model/*", "actions": ["read"], "operations": ["offers_list"] }
+                    ],
+                    "audit_events": ["model.offers_list"]
+                },
+                "icon": icon,
+                "permissions": {}
+            }))
+            .unwrap(),
         )
         .unwrap();
         let icon_dir = capsule_dir.join(icon);
@@ -897,6 +941,59 @@ mod tests {
                 .unwrap();
             assert_eq!(bytes.as_ref(), format!("icon-{size}").as_bytes());
         }
+    }
+
+    #[tokio::test]
+    async fn declared_provider_icons_are_servable_and_nothing_else_is() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_icon_provider_capsule(data_dir.path(), "model-provider", "icons");
+        fs::write(
+            data_dir.path().join("capsules/model-provider/rootfs.ext4"),
+            "rootfs",
+        )
+        .unwrap();
+
+        for size in [32_u32, 64, 128, 256] {
+            let response = serve_browser_capsule_path(
+                data_dir.path(),
+                &test_request_headers(),
+                "model-provider",
+                Some(&format!("icons/icon-{size}.png")),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), format!("icon-{size}").as_bytes());
+        }
+
+        let rootfs = serve_browser_capsule_path(
+            data_dir.path(),
+            &test_request_headers(),
+            "model-provider",
+            Some("rootfs.ext4"),
+        )
+        .await;
+        assert_eq!(rootfs.status(), StatusCode::NOT_FOUND);
+
+        let manifest = serve_browser_capsule_path(
+            data_dir.path(),
+            &test_request_headers(),
+            "model-provider",
+            Some("capsule.json"),
+        )
+        .await;
+        assert_eq!(manifest.status(), StatusCode::NOT_FOUND);
+
+        let document = serve_browser_capsule_path(
+            data_dir.path(),
+            &test_request_headers(),
+            "model-provider",
+            None,
+        )
+        .await;
+        assert_eq!(document.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

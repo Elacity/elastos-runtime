@@ -295,6 +295,26 @@
   </div>
 </aside>
 
+<!-- Assistant Space: the room the Shelf morph reveals. Home GUI owns the place
+     and the breathe; the surface inside is the Assistant capsule, launched
+     through the same authority-carrying path as windows and rails. -->
+<section
+  id="assistant-space"
+  class="assistant-space"
+  role="region"
+  aria-label="Assistant"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <iframe id="assistant-space-frame" class="assistant-space-frame" title="Assistant" hidden></iframe>
+  <div id="assistant-space-error" class="assistant-space-error" hidden>
+    <p class="assistant-space-error-title">Assistant could not open</p>
+    <p id="assistant-space-error-detail" class="assistant-space-error-detail"></p>
+    <button id="assistant-space-retry" class="assistant-composer-back" type="button">Try again</button>
+  </div>
+</section>
+
 <aside
   id="wallet-rail"
   class="wallet-rail"
@@ -554,7 +574,26 @@
         </div>
       </div>
     </aside>
-    <div class="taskbar-primary">
+    <!-- Assistant face: the Shelf morphs into the Assistant's composer. Home GUI
+       owns only the morph and this empty glass; the composer itself, the draft,
+       the session and the run belong to the capsule in the Assistant Space,
+       whose pill takes this one's place once the stretch lands. -->
+  <section id="assistant-face" class="assistant-face" aria-hidden="true" inert hidden></section>
+  <div class="taskbar-primary">
+      <button
+        id="assistant-toggle"
+        class="taskbar-item taskbar-item-assistant"
+        type="button"
+        aria-label="Ask Assistant"
+        aria-controls="assistant-face"
+        aria-expanded="false"
+        data-label="Assistant"
+        hidden
+      >
+        <span class="taskbar-icon">
+          <span class="taskbar-item-icon"></span>
+        </span>
+      </button>
       <button
         id="launcher-toggle"
         class="taskbar-item taskbar-item-launcher"

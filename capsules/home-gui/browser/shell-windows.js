@@ -39,6 +39,7 @@ import {
   exitFullscreenStage,
   forgetClosedFullscreenSpace,
   getActiveStageId,
+  isAgentSpace,
   isDesktopSpace,
   neighborSpaceAfterClosing,
   playCloseFullscreenSpaceMotion,
@@ -48,6 +49,7 @@ import {
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
 } from "./shell-stages.js?v=home-20260813a";
+import { showAssistantFace } from "./shell-assistant-face.js?v=home-20260813a";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -77,6 +79,7 @@ const DOCUMENTS_WINDOW_CLOSE_REQUEST_TYPE =
 const DOCUMENTS_WINDOW_CLOSE_RESULT_TYPE =
   "elastos.documents.window-close.result/v1";
 const OPAQUE_CAPSULE_ORIGIN = "null";
+const HOME_AGENT_TARGET_ID = "home-agent";
 const MAX_SESSION_WINDOWS = 24;
 const SINGLE_SESSION_TARGETS = new Set(["people", "inbox", "wallet"]);
 
@@ -250,8 +253,12 @@ export function snapshotBrowserSession() {
 /* Fullscreen Spaces are keyed by window id, which does not survive a reload.
    Persist them as fs:<target>:<instance> and remap to live ids on restore. */
 function stableSpaceKeyForId(spaceId) {
-  if (!spaceId || isDesktopSpace(spaceId)) {
-    return spaceId || desktopStageId();
+  /* The Agent room is opened by the user, never by a restored session. */
+  if (!spaceId || isAgentSpace(spaceId)) {
+    return desktopStageId();
+  }
+  if (isDesktopSpace(spaceId)) {
+    return spaceId;
   }
   const entry = shellState.windows.get(spaceId);
   if (!entry?.fullscreenStage) {
@@ -311,6 +318,7 @@ export function normalizeRestorableSession(summary, storedSession, options = {})
     const targetId = typeof item?.target === "string" ? item.target : "";
     if (
       !targetId ||
+      targetId === HOME_AGENT_TARGET_ID ||
       (SINGLE_SESSION_TARGETS.has(targetId) && seenTargets.has(targetId)) ||
       !targetById(summary, targetId)
     ) {
@@ -1271,6 +1279,10 @@ export function openTarget(targetId, options = {}) {
   if (windowHooks?.holdHomeSetupAct?.(targetId) === true) {
     return;
   }
+  if (targetId === HOME_AGENT_TARGET_ID) {
+    showAssistantFace();
+    return;
+  }
   if (SINGLE_SESSION_TARGETS.has(targetId) && browserWindowCount(targetId) > 0) {
     activateTargetGroup(targetId);
     return;
@@ -1354,6 +1366,13 @@ export function showDesktopHome() {
 }
 
 export function handleTaskbarTargetClick(targetId) {
+  if (windowHooks?.holdHomeSetupAct?.(targetId) === true) {
+    return;
+  }
+  if (targetId === HOME_AGENT_TARGET_ID) {
+    showAssistantFace();
+    return;
+  }
   if (ignoreRepeatedAction(`taskbar-target:${targetId}`)) {
     return;
   }

@@ -171,7 +171,8 @@ pub(crate) const RUNTIME_PURCHASE_SCHEMA_V1: &str = "elastos.library.runtime-cus
 static RUNTIME_VIEWER_LIFECYCLE_GUARDS: OnceLock<
     StdMutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>,
 > = OnceLock::new();
-const CUSTODY_COMPOSITION_SCHEMA_V1: &str = "elastos.protected-content.custody-composition/v1";
+pub(crate) const CUSTODY_COMPOSITION_SCHEMA_V1: &str =
+    "elastos.protected-content.custody-composition/v1";
 const MAX_CUSTODY_COMPOSITION_BYTES: usize = 64 * 1024;
 const MAX_CUSTODY_COMPOSITION_BLOB_BYTES: usize = 16 * 1024;
 const MAX_CUSTODY_COMPOSITION_PEER_DID_BYTES: usize = 256;
@@ -312,29 +313,29 @@ struct RuntimePreparedMediaProviderOutput {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum RuntimeCustodyRouteTransportConfig {
+pub(crate) enum RuntimeCustodyRouteTransportConfig {
     Local,
     CarrierPeerDid { peer_did: String },
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RuntimeCustodyRouteBindingConfig {
-    node_public_key_base64: String,
-    owner_state_root_base64: String,
-    transport: RuntimeCustodyRouteTransportConfig,
+pub(crate) struct RuntimeCustodyRouteBindingConfig {
+    pub(crate) node_public_key_base64: String,
+    pub(crate) owner_state_root_base64: String,
+    pub(crate) transport: RuntimeCustodyRouteTransportConfig,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RuntimeCustodyCompositionConfigFile {
-    schema: String,
-    expected_policy_authority_base64: String,
-    expected_committee_authorization_identity_base64: String,
-    signed_pool_base64: String,
-    signed_epoch_base64: String,
-    signed_committee_authorization_base64: String,
-    routes: Vec<RuntimeCustodyRouteBindingConfig>,
+pub(crate) struct RuntimeCustodyCompositionConfigFile {
+    pub(crate) schema: String,
+    pub(crate) expected_policy_authority_base64: String,
+    pub(crate) expected_committee_authorization_identity_base64: String,
+    pub(crate) signed_pool_base64: String,
+    pub(crate) signed_epoch_base64: String,
+    pub(crate) signed_committee_authorization_base64: String,
+    pub(crate) routes: Vec<RuntimeCustodyRouteBindingConfig>,
 }
 
 struct RuntimeValidatedCustodyRouteBinding {
@@ -1466,15 +1467,25 @@ async fn register_inactive_custody_runtime_provider_target(
         .await
 }
 
-fn inactive_custody_state_root(data_dir: &Path) -> std::path::PathBuf {
+/// Derive the Runtime operation issuer custody and decrypt providers must
+/// trust for the Runtime rooted at this device key.
+pub fn derive_protected_content_runtime_issuer(
+    device_key: &[u8; 32],
+) -> anyhow::Result<RuntimeOperationIssuerKeyV1> {
+    let (runtime_signing_key, _) = elastos_identity::derive_did(device_key);
+    RuntimeOperationIssuerKeyV1::new(runtime_signing_key.verifying_key().to_bytes())
+        .map_err(|_| anyhow::anyhow!("active Runtime operation issuer is invalid"))
+}
+
+pub(crate) fn inactive_custody_state_root(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join(INACTIVE_CUSTODY_ROOT)
 }
 
-fn protected_content_root(data_dir: &Path) -> PathBuf {
+pub(crate) fn protected_content_root(data_dir: &Path) -> PathBuf {
     data_dir.join(PROTECTED_CONTENT_ROOT)
 }
 
-fn runtime_custody_composition_config_path(data_dir: &Path) -> PathBuf {
+pub(crate) fn runtime_custody_composition_config_path(data_dir: &Path) -> PathBuf {
     data_dir.join(CUSTODY_COMPOSITION_CONFIG_FILE)
 }
 
@@ -1486,7 +1497,7 @@ fn invalid_inactive_custody_config(reason: impl std::fmt::Display) -> anyhow::Er
     anyhow::anyhow!("inactive custody provider configuration is missing or unsafe: {reason}")
 }
 
-fn validate_owner_only_directory(path: &Path, label: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_owner_only_directory(path: &Path, label: &str) -> anyhow::Result<()> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         let _ = error;
         invalid_inactive_custody_config(format!("{label} is unavailable"))
@@ -2296,7 +2307,7 @@ fn decode_node_public_key_base64(encoded: &str, field: &str) -> anyhow::Result<N
     })
 }
 
-fn decode_canonical_peer_did(peer_did: &str) -> anyhow::Result<String> {
+pub(crate) fn decode_canonical_peer_did(peer_did: &str) -> anyhow::Result<String> {
     if peer_did.is_empty() || peer_did.len() > MAX_CUSTODY_COMPOSITION_PEER_DID_BYTES {
         anyhow::bail!(
             "{}",
@@ -6768,6 +6779,23 @@ pub async fn reconcile_runtime_custody_viewers_after_decrypt_registration(
         }
     }
     Ok(())
+}
+
+/// Boot-path hook after successful Runtime-only decrypt registration.
+/// Viewer records created before decrypt came up are the state this reconcile
+/// exists for. Boot keeps serving when reconciliation fails closed.
+pub async fn reconcile_runtime_custody_viewers_after_decrypt_boot(
+    data_dir: &Path,
+    registry: Arc<ProviderRegistry>,
+) {
+    if let Err(error) =
+        reconcile_runtime_custody_viewers_after_decrypt_registration(data_dir, registry).await
+    {
+        tracing::warn!(
+            error = %error,
+            "Runtime custody viewer reconciliation after decrypt registration failed closed"
+        );
+    }
 }
 
 fn reconstructed_buy_receipt(

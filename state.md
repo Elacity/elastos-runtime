@@ -1,69 +1,47 @@
 # State
 
-Last updated: 2026-08-31 UTC
+Last updated: 2026-09-03 UTC
 
-This file records public-safe current truth for released 0.6.0 and active
+This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
 volatile proof logs remain outside the repository.
 
 ## Release Posture
 
-- A fresh fetch records `main` at `d358dedb` as the released 0.6 source and
-  `origin/upstream/0.7-dev` at `e481b153` as the current 0.7 integration line.
-- The local 0.7.0 release-preparation commit on top of `e481b153` sets the
-  coordinated workspace version to `0.7.0`, gives every capsule manifest
-  changed since 0.6.0 a minor bump (new capsules keep their initial manifest
-  versions), cuts the `0.7.0` changelog entry, and refreshes
-  `elastos/Cargo.lock`. Installed artifacts report `0.7.0` only after the
-  checked publish flow stamps `ELASTOS_RELEASE_VERSION`; unstamped source
-  builds report `0.7.0-dev`.
-- Published feature evidence is
-  `origin/feat/protected-content-runtime-lifecycle@854d9dc9`,
-  `origin/feat/protected-content-uiux-reconstruction` (PR39),
-  `origin/feat/0.7-uiux-candidate@8b547590`,
-  `origin/feat/dkms-esp-port@27d85c6f`, and
-  `origin/feat/0.7-product-documentation@74cd4e42`.
+- A fresh fetch records `origin/main` at `8ac18bec` as the released `v0.7.0`
+  source and `origin/upstream/0.7.1-dev` at `c511b133` as the active
+  integration line.
+- Released `v0.7.0` already carries the coordinated workspace version,
+  changelog, manifest bumps, and lock refresh. Installed artifacts report
+  `0.7.0` only after the checked publish flow stamps
+  `ELASTOS_RELEASE_VERSION`; unstamped source builds report `0.7.0-dev`.
+- Local candidate `900d7e5c` has tree `c9a9effe` and is 30 commits ahead of
+  `origin/upstream/0.7.1-dev@c511b133`. It contains the reviewed PR52 source at
+  `origin/feat/protected-content-installed-provisioning@4d688cc5`, PR54 at
+  `origin/feat/home-first-run-seed-0.7.1@2a49ea57`, and the PR55 Home Agent
+  source from `origin/feat/home-shelf-assistant-face-0.7.1@923193bb`. PR54 and
+  PR55 remain the original feature review slices. The tested candidate still
+  needs publication and combined team review before a merge decision.
 - The published protected-content stack is contracts `0c56c56a`, custody
-  `2f844cef`, key reconstruction `467a6c03`, custody provider `1b7fa732`, Wallet
-  rights `c9e82e75`, Runtime `a8ac6dc8`, and rights `3627da01`. Every tip is an
-  ancestor of the published lifecycle and is already present in the active
-  integration. The latest published protected-branch repairs need no new
-  extraction.
-- PR39 includes the Home audit fixes, the named principal-root write policy,
-  checkout-bound test fixtures and the privacy-reviewed audit workbook at
-  `d06d64f3`. All seven CI jobs pass on that revision, including macOS,
-  both Linux source-home targets and the release build. New local inclusions
-  require CI on their exact revision; installed product acceptance stays separate.
-- The local source includes the CPU watcher optimization from `e4d897f6`.
-  Unchanged executable metadata skips binary hashing; a changed stamp triggers
-  a streamed digest. Focused tests cover idle ticks, replacement and deletion.
-  Installed CPU measurement remains open.
-- The source-merge scope preserves reviewed history and includes the exact
-  PR43 commit `58ebfb23`. PR39 then feeds `upstream/0.7-dev`, which feeds
-  `main`; fetching refs establishes the current heads before each step. A
-  merge commit preserves the original commits rather than squashing them.
-  Main integration, release publication and installed cutover are separate
-  actions. The deferred scope remains explicit in [TASKS.md](TASKS.md).
-- The published audit changes include Home and Terminal repairs, create-only
-  Library writes, document close protection, Assistant and model-init repairs,
-  declared-content icons, private diagnostics, socket-root protection, and Mac
-  restart safety.
-  The history review preserved the product tree and incorporated the published
-  CI/setup changes. Installed acceptance still belongs to exact artifact
-  receipts and recorded GUI outcomes.
-- Upstream `90bbe15b` records Irzhy's verified Base 8453 evidence and changes
-  Chain provider source, tests and protected-content documentation.
-  The branch preserves the published
-  protected-content repairs and includes that evidence once. It also retains
-  upstream collaboration and Browser local-exit orphan cleanup.
-- Irzhy's updated PR43 repair, `58ebfb23`, is included in the local source.
-  Runtime adopts fully completed mint records after a lost intent completion
-  mark. Ambiguous or partial records fail closed; partial custody cleanup and
-  installed mint/restart acceptance remain open. The current named-policy
-  helper already resolves the auth lint warning; the updated PR43 drops its
-  earlier lint suppression.
-- The protected-content source path remains inactive. Installed proof and one
-  atomic cutover remain open.
+  `2f844cef`, key reconstruction `467a6c03`, custody provider `1b7fa732`,
+  Wallet rights `c9e82e75`, Runtime `a8ac6dc8`, and rights `3627da01`.
+  Every tip is an ancestor of the published lifecycle and is already present
+  in the active integration. The latest published protected-branch repairs
+  need no new extraction.
+- `main` and `origin/upstream/0.7.1-dev` already include the reviewed Home
+  audit fixes, the named principal-root write policy, checkout-bound test
+  fixtures, the privacy-reviewed audit workbook, the completed-mint adoption
+  repair from `58ebfb23`, and the equivalent CPU watcher optimization at
+  `8e53174f`. The reviewed donor `e4d897f6` is the source comparison, not an
+  ancestor. The candidate source passes formatting, alignment, Home and Browser
+  entropy, Home shell, People discovery, the 26-case Browser close handshake,
+  and Home Agent shell checks. Remote CI remains separate from these local
+  checks.
+- `origin/upstream/0.7.1-dev` also carries Irzhy's verified Base 8453 probe
+  evidence, shared build-artifact staging, upstream collaboration work, and
+  Browser local-exit orphan cleanup. The protected-content source path remains
+  inactive. Installed proof on isolated localhost, the seed and third custody
+  node, and one atomic cutover remain open.
 - Commits `3026992b`, `ed7a8bfc`, and `7f6e47f9` provide portable listing
   publication and import, buyer purchase, and buyer open, read, and close
   without creator Runtime mint state. The package binds the public custody
@@ -96,6 +74,39 @@ volatile proof logs remain outside the repository.
   Older Assistant and migration donors retain explicit deferred tasks.
   Preserve unique history and original dirty files until their owners approve
   cleanup; published source does not make every older hunk equivalent.
+
+## Installed candidate proof
+
+- The isolated localhost installation at `localhost:61380` has source commit
+  `900d7e5c` and tree `c9a9effe`. This is installed acceptance for that local
+  candidate. It is not seed, third-node, or cutover proof.
+- The manual Brave journey opened and inspected System, Home launcher and
+  windows, Profile and People, Chat, Inbox, Wallet, Marketplace, Services,
+  Library, Archive, Documents, Player, standalone Assistant, Home Agent, GBA
+  Emulator, Nonogram Advance, uCity, and Browser. Home fullscreen fills the
+  workspace and returns to the saved layout.
+- Both games render and their expected controls work. Browser opened
+  `ela.city` through the VZ adapter and closed with no per-launch supervisor or
+  TURN server residue. Startup took about 34.5 seconds. Transient TURN
+  authentication failures occurred before allocation succeeded, so startup
+  latency and those diagnostics need follow-up.
+- Home Agent opens from the desktop and from Ask Assistant into the Home-owned
+  Agent Space. The installation has no configured model offer and reports that
+  state directly. This does not prove model inference.
+- People reports discovery as unavailable because the isolated Home has no
+  collaboration configuration. The pending Wallet approval remained unchanged
+  during the journey.
+- Protected-content acceptance is blocked on one real three-node custody
+  composition, private Chain and RPC configuration, three replicas, funded
+  creator and buyer accounts, and installed two-Runtime proof. No mint, buy,
+  playback, seed, third-node, or cutover claim follows from this localhost run.
+- First-run work remains open. Recovery Kit navigation and readiness are slow
+  and indirect. Profile creation should carry the display name into the form
+  and guide the exact create action.
+- Standalone Assistant and Home Agent are both installed pending an explicit
+  product decision. The final default product should present one clear Agent
+  surface. Multiple local Brave app copies can create duplicate Dock and
+  recent-app entries; this is local operator hygiene, not product architecture.
 
 ## Integrated Source Truth
 
@@ -197,8 +208,8 @@ The active local branch preserves the verified deployed read behavior:
 - An unknown KID reverts with `UnboundContentId(bytes16)`; a bound KID without
   access returns `false`.
 
-`origin/upstream/0.7-dev@90bbe15b` records Irzhy's deployed Base 8453 probe
-evidence, already included in this branch:
+`origin/upstream/0.7.1-dev@c511b133` includes Irzhy's deployed Base 8453 probe
+evidence from `90bbe15b`, already present in this branch:
 
 - `CentralStorage.bindIP(bytes16,address,uint256)` accepts acknowledged
   contracts only and is called by `AssetFactory.registerNewAsset`.
@@ -244,9 +255,8 @@ complete. Installed proof and the atomic authority cutover remain open.
 ## Capsule Execution Truth
 
 - [docs/CAPSULE_MODEL.md](docs/CAPSULE_MODEL.md#isolation-boundary)
-  defines the cross-branch isolated-execution contract. It is a 0.6
-  architecture requirement introduced by 0.6, not proof that every first-party
-  app is already a Component.
+  defines the standing cross-branch isolated-execution contract, not proof that
+  every first-party app is already a Component.
 - The ESP branch proves a useful substrate slice: the Component runner and
   conformance fixture use no linked WASI, environment, filesystem preopen,
   FIFO, raw socket, or gateway authority, and every guest effect is linked
@@ -327,8 +337,8 @@ complete. Installed proof and the atomic authority cutover remain open.
 
 ## Browser Truth
 
-- Browser is included in 0.6.0 as a bounded Runtime Browser, not as a fully
-  reliable general-purpose Browser claim.
+- Browser is included as a bounded Runtime Browser, not as a fully reliable
+  general-purpose Browser claim.
 - Browser launch, TURN/media-relay connection, Runtime-mediated traffic, exact
   terminal close, and zero-residue behavior require fresh target evidence for
   the exact integrated commit. Human-visible video, input, scrolling, and audio
@@ -338,8 +348,7 @@ complete. Installed proof and the atomic authority cutover remain open.
   and exactly one `eth_requestAccounts` handoff producing one pending Wallet
   account-access approval.
 - One failed Browser restart followed by a successful open, lost `ela.city`
-  login state across restart, and slow performance remain explicit post-0.6
-  follow-ups.
+  login state across restart, and slow performance remain explicit follow-ups.
 - Runtime owns Browser launch settlement and exact cleanup obligations. The
   close path acknowledges authority renewal, binds close to the exact Browser
   instance, and keeps nonterminal cleanup ownership durable.
@@ -350,7 +359,7 @@ complete. Installed proof and the atomic authority cutover remain open.
   `storage_posture=principal_owned_reset_scoped_unprotected`.
 - Principal-root object protection exists for selected Home/runtime state; this does not include Browser VM Chromium profile disks yet.
 - Product-readiness claims remain gated on target-specific objective audit and
-  matching manual UX evidence; inclusion in 0.6.0 does not waive that gate.
+  matching manual UX evidence; source inclusion does not waive that gate.
 
 ## Browser Provider Evidence
 
@@ -425,22 +434,49 @@ complete. Installed proof and the atomic authority cutover remain open.
   boundary.
 - A missing installed components manifest or model-provider entry leaves the
   provider unconfigured and unavailable. Runtime does not select a fallback.
-- Missing model-provider config is an honest zero-offer state: Runtime may
-  start/register the provider with no offers, writes no config file, and
-  Assistant shows that no model offers are available.
+- The current localhost installation has no
+  `providers/model-provider/config.json`, so the provider reports an honest
+  zero-offer state. The current provider can call an OpenAI-compatible Chat
+  Completions backend. It does not yet own a local engine lifecycle, implement
+  a provider-internal OpenAI Responses API adapter, or publish a remote model
+  service.
+- The current source does not integrate the Codex SDK. Codex remains a later
+  agent-execution adapter behind typed agent operations and explicit
+  filesystem, network, tool, and approval grants. It is not a model offer.
 - `model-provider` now accepts the Runtime Init envelope fields
   `base_path`, `allowed_paths`, `read_only`, `encryption_key`, and `extra`
   without weakening strict unknown-field handling. The zero-offer stdio Init
   test passes with the Runtime envelope in source tests.
-- Assistant is a standalone first-party capsule. Chat, Build, and Studio use
-  only typed Runtime model resources and the protected Assistant workspace;
-  transcript copy goes only through the trusted Home Clipboard path.
+- Assistant is a standalone first-party capsule with its own protected
+  workspace. Its tested Chat, Build, and Studio behavior uses typed model
+  offers and runs. Transcript copy goes only through the trusted Home
+  Clipboard path.
+- Home Agent is the Home-owned Agent face. Home GUI owns the Shelf transition
+  to its composer, Agent Space, and `launchHomeTarget`. `home-agent` owns
+  sessions, transcript, composer, and settings. Runtime owns the protected,
+  revisioned workspace and model-proxy binding.
+- Home Agent uses the typed `offers_list`, `runs_create`, `runs_events`, and
+  `runs_cancel` operations. Its Home message contract is pinned. The source has
+  one Shelf and one Home-owned Agent face, and the Agent room stays in the
+  Space ring. Fixes `450db538` and `900d7e5c` keep activation, message routing,
+  and saved layout upgrades on that canonical path without a duplicate generic
+  window.
+- Runtime accepts one opaque, bounded workspace envelope for this local
+  contract. Typed document schemas remain future work when a cross-authority
+  operation needs them.
 - Assistant model messages render a self-contained safe markdown subset with
   escaped HTML, inert links, headings/lists/blockquotes/tables, fenced and
   inline code, and inline/display math through vendored KaTeX 0.18.3. Focused
   source proof lives in `scripts/assistant-shell-smoke.mjs`. The Home audit
   records observed UI behavior separately; configured model-run and advanced
   workflow acceptance remain open.
+- Home Agent is the canonical Home-integrated Agent surface. Standalone
+  Assistant remains installed while the product inventories and tests its
+  distinct working behavior. It can remain as an explicitly scoped optional
+  app, or its useful behavior can move before removal. Future Home Agent tools,
+  Library reads, web search, Studio, Usage, and sampling controls require their
+  typed Runtime operations first. The zero-offer Home Agent state is installed
+  proof of honest absence, not configured inference.
 
 ## System Truth
 
@@ -709,15 +745,15 @@ complete. Installed proof and the atomic authority cutover remain open.
 - Public-install branch-binary smokes must pin the installer-selected components manifest.
 - Public-install branch-binary smokes prevent source checkout `components.json` from leaking into installed-path proof.
 - Public-install branch-binary smokes fail if the selected gateway lacks the current `home` setup profile.
-- Branch-override public smokes require a staged or published 0.6.0-compatible
+- Branch-override public smokes require a staged or published release-compatible
   manifest with the current `home` profile and checksummed artifacts.
 - Source/local Carrier setup proof stays in `scripts/local-carrier-setup-smoke.sh`.
-- Public install proof for an integrated candidate requires a staged or published
-  0.6.0-compatible manifest with the current `home` profile and checksummed
-  artifacts.
+- Public install proof for an integrated candidate requires a staged or
+  published release-compatible manifest with the current `home` profile and
+  checksummed artifacts.
 - Set `ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1` only when the publisher relay
   path itself is under review.
-- Integrated 0.7 installed-path proof waits for one reviewed source tree and
+- Integrated installed-path proof waits for one reviewed source tree and
   matching stable installation receipts on each target role.
 
 ## Open Blockers

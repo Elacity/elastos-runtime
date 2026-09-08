@@ -16,10 +16,15 @@ mod test_support;
 mod wire;
 
 pub use custody::{
-    CustodyProviderRequestOpV1, CustodyProviderRequestV1, CustodyProviderRequestValidationErrorV1,
-    CustodyProviderResponseStatusV1, CustodyProviderResponseV1, ValidatedCustodyProviderRequestV1,
-    ValidatedCustodyProvisionNodeShareRequestV1, ValidatedCustodyReleaseContributionRequestV1,
-    CUSTODY_PROVIDER_REQUEST_SCHEMA_V1, CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1,
+    parse_and_verify_provisioning_output, provisioning_receipt, CustodyProviderRequestOpV1,
+    CustodyProviderRequestV1, CustodyProviderRequestValidationErrorV1,
+    CustodyProviderResponseStatusV1, CustodyProviderResponseV1,
+    ProvisionedCustodyProviderPublicKeys, ProvisioningOutputError,
+    ValidatedCustodyProviderRequestV1, ValidatedCustodyProvisionNodeShareRequestV1,
+    ValidatedCustodyReleaseContributionRequestV1,
+    CUSTODY_PROVIDER_PROVISIONING_RECEIPT_PROVIDER_ID_V1,
+    CUSTODY_PROVIDER_PROVISIONING_RECEIPT_SCHEMA_V1, CUSTODY_PROVIDER_REQUEST_SCHEMA_V1,
+    CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1,
 };
 pub use decrypt::{
     DecryptProviderRequestOpV1, DecryptProviderRequestV1, DecryptProviderResponseStatusV1,

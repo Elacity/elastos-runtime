@@ -1872,6 +1872,7 @@ mod tests {
             size_mb: None,
             description: None,
             provider_runtime: None,
+            capsule_metadata: None,
             platforms,
         }
     }

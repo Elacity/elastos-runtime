@@ -55,6 +55,23 @@ class FakeClassList {
   }
 }
 
+// Plain-object style with the two CSSOM methods the shell uses for inline
+// custom properties; keys stay enumerable so rect stubs can read them.
+function fakeStyleDeclaration() {
+  const style = {};
+  Object.defineProperty(style, "setProperty", {
+    value: (name, value) => {
+      style[name] = value;
+    },
+  });
+  Object.defineProperty(style, "removeProperty", {
+    value: (name) => {
+      delete style[name];
+    },
+  });
+  return style;
+}
+
 class FakeElement {
   constructor(selector = "", withTemplateContent = true) {
     this.selector = selector;
@@ -63,7 +80,7 @@ class FakeElement {
     this.queries = new Map();
     this.listeners = new Map();
     this.dataset = {};
-    this.style = {};
+    this.style = fakeStyleDeclaration();
     this.hidden = false;
     this.inert = false;
     this.disabled = false;
@@ -134,6 +151,10 @@ class FakeElement {
     for (const child of children) {
       child.parentElement = this;
     }
+  }
+
+  get childElementCount() {
+    return this.children.length;
   }
 
   querySelector(selector) {
@@ -470,6 +491,8 @@ const firstRunSummary = {
 };
 
 shellCore.initializeShellLayout(firstRunSummary);
+shellCore.shellState.currentSummary = firstRunSummary;
+shellSurface.renderDesktop(firstRunSummary);
 assert(
   JSON.stringify(shellCore.shellState.shellLayoutState.taskbar) === JSON.stringify([
     "browser",
@@ -488,13 +511,14 @@ assert(
     "browser",
     "system",
     "documents",
+    "object-target",
   ]),
-  "fresh layout did not hide all non-object visible targets and keep object targets visible",
+  "fresh layout did not hide every visible target (first run is an empty desktop)",
   shellCore.shellState.shellLayoutState.desktopHidden,
 );
 assert(
-  shellCore.isTargetOnDesktop("object-target") === true,
-  "fresh layout hid an object target from the desktop",
+  shellCore.isTargetOnDesktop("object-target") === false,
+  "fresh layout left an object target on the desktop",
   shellCore.shellState.shellLayoutState.desktopHidden,
 );
 assert(
@@ -503,11 +527,17 @@ assert(
   shellCore.shellState.shellLayoutState.desktopHidden,
 );
 assert(
-  JSON.stringify(shellCore.shellState.shellLayoutState.desktop) === JSON.stringify({
-    "object-target": { x: 12, y: 12 },
-  }),
-  "fresh layout did not seed only the visible desktop entry positions",
+  JSON.stringify(shellCore.shellState.shellLayoutState.desktop) === JSON.stringify({}),
+  "fresh layout seeded desktop entry positions for an empty desktop",
   shellCore.shellState.shellLayoutState.desktop,
+);
+assert(
+  elementForSelector("#desktop-first-run-hint").hidden === false,
+  "fresh empty desktop did not show the launcher hint",
+  {
+    visibleTargets: firstRunSummary.targets.map((target) => target.target),
+    desktopChildren: elementForSelector("#desktop-shortcuts").children.length,
+  },
 );
 
 const storedEmptyTaskbarSummary = {
@@ -535,8 +565,15 @@ assert(
   shellCore.shellState.shellLayoutState.taskbar,
 );
 assert(
-  JSON.stringify(shellCore.shellState.shellLayoutState.desktopHidden) === JSON.stringify(["wallet", "browser"]),
-  "stored desktopHidden changed without required normalization",
+  JSON.stringify(shellCore.shellState.shellLayoutState.desktopHidden) === JSON.stringify([
+    "wallet",
+    "browser",
+    "chat-room",
+    "system",
+    "documents",
+    "object-target",
+  ]),
+  "targets absent from an existing desktop layout did not start hidden",
   shellCore.shellState.shellLayoutState.desktopHidden,
 );
 assert(
@@ -549,6 +586,41 @@ assert(
   }),
   "stored desktop positions were not preserved for saved hidden targets",
   shellCore.shellState.shellLayoutState.desktop,
+);
+
+const upgradedLayoutSummary = {
+  authority: { signed_in: true },
+  targets: [
+    { target: "home-agent", title: "Home Agent", route: "/apps/home-agent/" },
+    { target: "wallet", title: "Wallet", route: "/apps/wallet/" },
+  ],
+  browser_state: {
+    principal_id: "principal:upgraded-layout",
+    layout: {
+      desktop: { wallet: { x: 12, y: 12 } },
+      taskbar: ["wallet"],
+      desktopHidden: [],
+      desktopIconsVisible: true,
+    },
+  },
+};
+
+shellCore.initializeShellLayout(upgradedLayoutSummary);
+assert(
+  JSON.stringify(shellCore.shellState.shellLayoutState.desktopHidden) === JSON.stringify(["home-agent"]),
+  "newly installed target became visible on an existing desktop",
+  shellCore.shellState.shellLayoutState,
+);
+assert(
+  shellCore.isTargetOnDesktop("wallet") === true &&
+    JSON.stringify(shellCore.shellState.shellLayoutState.desktop.wallet) === JSON.stringify({ x: 12, y: 12 }),
+  "existing visible desktop target or its position changed during upgrade",
+  shellCore.shellState.shellLayoutState,
+);
+assert(
+  JSON.stringify(shellCore.shellState.shellLayoutState.taskbar) === JSON.stringify(["wallet"]),
+  "saved taskbar pins changed while hiding a newly installed target",
+  shellCore.shellState.shellLayoutState.taskbar,
 );
 
 const peopleStyle = readFileSync(
@@ -1055,6 +1127,25 @@ const restored = shellWindows.normalizeRestorableSession(summary, {
   ],
 });
 
+const restoredWithHomeAgent = shellWindows.normalizeRestorableSession(
+  {
+    ...summary,
+    targets: [
+      ...summary.targets,
+      { target: "home-agent", title: "Home Agent", route: "/apps/home-agent/" },
+    ],
+  },
+  {
+    root_shell: "home-gui",
+    windows: [{ target: "home-agent", active: true }],
+  },
+);
+assert(
+  restoredWithHomeAgent.length === 0,
+  "Home Agent was restored as a normal browser window",
+  restoredWithHomeAgent,
+);
+
 const rootlessSessionRestoredIntoGui = shellWindows.normalizeRestorableSession(summary, {
   windows: [
     { target: "browser", query: { url: "https://example.com/rootless" } },
@@ -1131,6 +1222,14 @@ shellWindows.configureWindowHooks({
     };
   },
 });
+
+shellWindows.openTarget("home-agent");
+shellWindows.handleTaskbarTargetClick("home-agent");
+assert(
+  restoredBrowserLaunches.length === 0 && shellCore.shellState.windows.size === 0,
+  "Home Agent activation created a normal browser window or launch",
+  { launches: restoredBrowserLaunches, windows: [...shellCore.shellState.windows.keys()] },
+);
 
 {
   const spotlight = elementForSelector("#spotlight");
