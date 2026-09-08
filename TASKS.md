@@ -100,8 +100,15 @@ Independent source repair and regression work can proceed in separate file scope
   in 1404 ms on the same page and service bindings. Fresh UI close confirms all
   13 effects and zero Runtime obligations. Guest/native artifacts are reused.
   This accepts the bounded interruption milestone and makes viewer-document
-  reload the next local B06 experiment. Source inspection predicts startup will
-  close the retained page; reproduce that first effect before repairing attach.
+  reload the next local B06 experiment. Run 26 reproduces the first failure:
+  56 ms after the new viewer document commits, startup closes the retained
+  page and opens a replacement. Home close remains pending during that open.
+  A later terminal receipt confirms all 13 replacement effects cleaned up;
+  fresh signed Runtime observation confirms zero obligations. The trigger for
+  that residual cleanup is unconfirmed. The active repair adopts the retained
+  Runtime owner and preserves the requested Engine/Exit choices through durable
+  ownership. Review and source tests precede the same installed reload journey;
+  guest image and helpers remain reusable until a diagnosed change needs them.
   Full B05 mixed-transport ordering and motion behavior remain separate gates.
   The probe must observe request failure and
   stopped media, then restore the same page, profile, service selection and

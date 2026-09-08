@@ -190,9 +190,14 @@ in 1404 ms. All 29 observations preserve bindings. Fresh UI close confirms all
 13 effects and zero Runtime sessions/cleanup obligations, and the relay safeguard
 exits. This is accepted evidence for the bounded interruption case. Full
 B01/B05/B06, mixed-transport input ordering, media/device, percentile and human
-qualification remain open. Viewer-document reload is the next local experiment:
-source startup currently closes a recoverable page before replacing it, which
-needs installed reproduction and a separate attach/recovery repair.
+qualification remain open. Run 26 reproduces viewer-document reload failure:
+startup closes the retained page 56 ms after document commit and creates an
+unwanted replacement. Home close remains pending during the replacement open.
+The replacement later has a terminal 13-effect receipt, and fresh signed Runtime
+observation confirms zero obligations; its cleanup trigger is unconfirmed.
+The active source repair restores the retained owner and carries the original
+Engine/Exit choices separately from resolved routing. Installed reload recovery
+remains pending. The next proof reuses the verified guest image and helpers.
 Guest Node also starts about five seconds after its shell launch;
 initial entropy is 1 and no hardware RNG is selected. That secondary cause needs
 its own experiment. Run 16 includes diagnostic overhead and is excluded from
