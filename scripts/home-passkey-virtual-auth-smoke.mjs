@@ -2095,12 +2095,31 @@ async function assertBrowserWindowIdentity(identity, appFrame, token) {
 }
 
 async function clickBrowserWindowClose(identity, appFrame, token) {
+  await focusCapturedBrowserWindow(identity, appFrame, token);
   await assertBrowserWindowIdentity(identity, appFrame, token);
   // ElementHandle.click cannot retarget another window during auto-wait.
   const button = await identity.section.$('[data-action="close"]');
   assert(button && /^(Close|Retry Browser close)$/.test(await button.getAttribute("aria-label")),
     "Captured Browser window has no ordinary close control");
   try { await button.click(); } finally { await button.dispose(); }
+}
+
+async function focusCapturedBrowserWindow(identity, appFrame, token) {
+  await assertBrowserWindowIdentity(identity, appFrame, token);
+  const actionable = await identity.section.evaluate(node => {
+    const button = node.querySelector('[data-action="close"]');
+    const rect = button?.getBoundingClientRect();
+    return node.classList.contains("window-active") && rect?.width > 0 && rect?.height > 0 &&
+      button.contains(node.ownerDocument.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2));
+  });
+  if (actionable) return;
+  // Home's per-window Shelf action raises this window without toggling another Browser.
+  await identity.parent.locator('#taskbar-targets [data-target="browser"]').first().click({ button: "right", timeout: 5_000 });
+  await identity.parent.locator(`#desktop-context-menu [data-context-action="focus-window:${identity.windowId}"]`)
+    .click({ timeout: 5_000 });
+  await identity.parent.waitForFunction(node => node.isConnected && node.classList.contains("window-active"),
+    identity.section, { timeout: 5_000 });
+  await assertBrowserWindowIdentity(identity, appFrame, token);
 }
 
 async function waitForBrowserWindowDetached(identity) {
@@ -3087,6 +3106,7 @@ async function checkBrowserEmbeddedUiInput(page, baselineToken) {
     windowIdentity = await captureBrowserWindowIdentity(appFrame);
     windowLocator = windowIdentity.locator;
     browserToken = windowIdentity.token;
+    await focusCapturedBrowserWindow(windowIdentity, appFrame, browserToken);
     await windowLocator.waitFor({ state: "visible", timeout: 30_000 });
     await windowIdentity.parent.waitForFunction(node => {
       return node.isConnected && node.classList.contains("window-active") &&
@@ -3749,6 +3769,44 @@ async function openDesktopAppWindow(page, target, onFrame = null) {
   if (setupVisible) {
     await setupLater.click();
   }
+  if (target === "browser") {
+    // Match Home's foreground choice once. DOM order can differ from z-order,
+    // and a later restored window must not replace the chosen frame.
+    const selected = (await homeGuiFrame.evaluateHandle(() => {
+      const windows = [...document.querySelectorAll('section.window[data-target="browser"]')];
+      const active = windows.filter(node => node.classList.contains("window-active"));
+      if (active.length > 1) throw new Error("Home has ambiguous active Browser windows");
+      const visible = windows.filter(node => !node.classList.contains("hidden"));
+      return active[0] || (visible.length ? visible : windows)
+        .sort((a, b) => Number(b.style.zIndex || 0) - Number(a.style.zIndex || 0))[0] || null;
+    })).asElement();
+    let handle;
+    if (selected) {
+      handle = await selected.$("iframe.window-frame");
+    } else {
+      const shelf = homeGuiFrame.locator('#taskbar-targets [data-target="browser"]').first();
+      if (await shelf.isVisible()) await shelf.click();
+      else {
+        await homeGuiFrame.locator("#launcher-toggle").click();
+        await homeGuiFrame.locator('#launcher-grid [data-target="browser"]').first().click();
+      }
+      // There was no Browser at selection. Ambiguous concurrent creations fail
+      // the strict locator instead of assigning another window's authority.
+      const created = homeGuiFrame.locator('section.window[data-target="browser"] iframe.window-frame');
+      await created.waitFor({ state: "attached", timeout: 20_000 });
+      handle = await created.elementHandle();
+    }
+    const appFrame = handle ? await handle.contentFrame() : null;
+    assert(appFrame, "Selected Home Browser window has no content frame");
+    if (onFrame) await onFrame(appFrame);
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && !appFrame.url().includes("/apps/browser/")) await delay(100);
+    assert(appFrame.url().includes("/apps/browser/"), "Selected Home Browser window did not load its capsule document");
+    const identity = await captureBrowserWindowIdentity(appFrame);
+    await focusCapturedBrowserWindow(identity, appFrame, identity.token);
+    await handle.waitForElementState("visible", { timeout: 20_000 });
+    return appFrame;
+  }
   const shelfItem = homeGuiFrame.locator(`#taskbar-targets [data-target="${target}"]`).first();
   const existingWindow = homeGuiFrame.locator(`section.window[data-target="${target}"]`).last();
   const alreadyActive = await existingWindow.isVisible() &&
@@ -3765,12 +3823,7 @@ async function openDesktopAppWindow(page, target, onFrame = null) {
     await card.waitFor({ state: "visible", timeout: 10_000 });
     await card.click();
   }
-  // The desktop restores persisted windows at boot and restore can steal
-  // focus from the window the launcher just opened, so bind to the newest
-  // window for the target rather than whichever one holds the active class.
-  const windowFrameEl = homeGuiFrame
-    .locator(`section.window[data-target="${target}"] iframe.window-frame`)
-    .last();
+  const windowFrameEl = homeGuiFrame.locator(`section.window[data-target="${target}"] iframe.window-frame`).last();
   await windowFrameEl.waitFor({ state: onFrame ? "attached" : "visible", timeout: 20_000 });
   const handle = await windowFrameEl.elementHandle();
   const appFrame = handle ? await handle.contentFrame() : null;

@@ -144,34 +144,28 @@ test("error-state redaction covers frame fragments and direct token fields", () 
   assert.match(source, /JSON\.stringify\(redactSensitive\(state\), null, 2\)/);
 });
 
-test("launcher reuses a visible restored window without toggling its Shelf item", async () => {
+test("launcher reuses the selected Browser through exact focus without toggling its Shelf item", async () => {
   const actions = [];
   const frame = { url: () => "http://localhost/apps/browser/" };
-  const frameElement = { waitFor: async () => {}, elementHandle: async () => ({ contentFrame: async () => frame }) };
-  let active = true;
-  const existing = { isVisible: async () => true,
-    evaluate: async callback => callback({ classList: { contains: name => name === "window-active" && active } }),
-  };
+  const handle = { contentFrame: async () => frame, waitForElementState: async () => {} };
+  const selected = { $: async () => handle };
   const gui = {
     getByRole: () => ({ waitFor: async () => { const error = new Error(); error.name = "TimeoutError"; throw error; } }),
-    locator: selector => {
-      if (selector.includes("#taskbar-targets")) return { first: () => ({
-        isVisible: async () => true, click: async () => actions.push("toggle-shelf"),
-      }) };
-      if (selector.includes("iframe.window-frame")) return { last: () => frameElement };
-      return { last: () => existing };
-    },
+    evaluateHandle: async () => ({ asElement: () => selected }),
+    locator: () => { throw new Error("Existing Browser must not toggle generic Shelf"); },
   };
+  const identity = { token: "selected-token" };
   const open = harnessFunction("openDesktopAppWindow", {
     HOME_URL: "http://localhost/apps/home/", waitForSignedHome: async () => {},
     waitForCapsuleFrame: async () => gui, assert: (condition, message) => assert.ok(condition, message),
+    captureBrowserWindowIdentity: async actual => { assert.equal(actual, frame); return identity; },
+    focusCapturedBrowserWindow: async (actual, selectedFrame, token) => {
+      assert.equal(actual, identity); assert.equal(selectedFrame, frame); assert.equal(token, identity.token); actions.push("focus-exact");
+    },
   });
   const page = { url: () => "http://localhost/apps/home/", goto: async () => actions.push("reload-home") };
-  assert.equal(await open(page, "browser"), frame);
-  assert.deepEqual(actions, []);
-  active = false;
-  assert.equal(await open(page, "browser"), frame);
-  assert.deepEqual(actions, ["toggle-shelf"]);
+  assert.equal(await open(page, "browser", actual => { assert.equal(actual, frame); actions.push("captured"); }), frame);
+  assert.deepEqual(actions, ["captured", "focus-exact"]);
 });
 
 function closeHarnessSurface() {
@@ -193,7 +187,10 @@ function closeHarnessSurface() {
   };
   const frame = { url: () => "http://localhost/apps/browser/?browser_instance=instance-one#home_token=browser-token",
     parentFrame: () => gui, frameElement: async () => iframe, waitForFunction: async () => {} };
-  const node = { isConnected: true, dataset: { windowId: "browser--2" }, querySelector: () => iframe };
+  const closeNode = { getBoundingClientRect: () => ({ x: 0, y: 0, width: 20, height: 20 }), contains: node => node === closeNode };
+  const node = { isConnected: true, dataset: { windowId: "browser--2" },
+    classList: { contains: name => name === "window-active" }, ownerDocument: { elementFromPoint: () => closeNode },
+    querySelector: selector => selector.includes("close") ? closeNode : iframe };
   const iframe = { contentWindow: source, isConnected: true, closest: () => node,
     getAttribute: async () => frame.url(), evaluateHandle: async callback => ({ asElement: () => {
       assert.equal(callback(iframe), node); return section;
@@ -201,6 +198,7 @@ function closeHarnessSurface() {
   const section = { node, getAttribute: async () => node.dataset.windowId,
     evaluate: async (callback, args) => callback(node, args),
     $: async selector => {
+      if (selector === "iframe.window-frame") return iframe;
       assert.equal(selector, '[data-action="close"]');
       return { getAttribute: async () => "Close", dispose: async () => {}, click: async () => {
         actions.push("ui-close"); await surface.click();
@@ -266,6 +264,7 @@ function browserIdentityGlobals() {
   globals.launchTokenFromRoute = harnessFunction("launchTokenFromRoute", globals);
   globals.assertIsolatedLaunchRoute = harnessFunction("assertIsolatedLaunchRoute", globals);
   globals.assertBrowserWindowIdentity = harnessFunction("assertBrowserWindowIdentity", globals);
+  globals.focusCapturedBrowserWindow = harnessFunction("focusCapturedBrowserWindow", globals);
   return globals;
 }
 
@@ -353,16 +352,20 @@ test("launcher visibility failure retains exact Frame B for caller cleanup while
   surface.gui.locator = selector => {
     if (selector.includes("data-window-id=")) return pinnedLocator(selector);
     if (selector.includes("#taskbar-targets")) return { first: () => ({ isVisible: async () => true }) };
-    if (selector.includes("iframe.window-frame")) return { last: () => ({
+    if (selector.includes("iframe.window-frame")) return {
       waitFor: async options => { assert.equal(options.state, "attached"); },
       elementHandle: async () => surface.iframe,
-    }) };
-    return { last: () => ({ isVisible: async () => true,
+    };
+    return { isVisible: async () => true,
       evaluate: async callback => callback({ classList: { contains: () => true } }),
-    }) };
+    };
   };
+  const evaluateMessages = surface.gui.evaluateHandle;
+  surface.gui.evaluateHandle = async (callback, args) => callback.toString().includes("document.querySelectorAll")
+    ? { asElement: () => surface.section } : evaluateMessages(callback, args);
   const globals = browserIdentityGlobals();
   const open = harnessFunction("openDesktopAppWindow", { ...globals,
+    captureBrowserWindowIdentity: harnessFunction("captureBrowserWindowIdentity", globals),
     waitForSignedHome: async () => {}, waitForCapsuleFrame: async () => surface.gui,
   });
   const empty = { schema: "elastos.browser.session-capacity/v1", status: "configured", recoverable_page: null,
