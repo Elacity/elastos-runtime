@@ -355,9 +355,13 @@ The integrated source includes these durable facts:
   (four explicit process prerequisites ignored) and the capsule binding test.
   The model provider retains each engine handle until bounded close confirms
   reaping and, for production guards, process-group absence. Uncertain closure
-  blocks replacement. The 14 engine unit tests and five process tests pass,
-  including the production guard cases; strict all-target Clippy passes.
-  Runtime offer retirement, run/Keep/reference checks, byte eviction and
+  blocks replacement. Provider-source tests verify exact admitted-offer retirement
+  through private Init provenance and immutable offer configuration, retained
+  ownership on uncertain close, operator offers
+  and historical results, including lost replies and racing creates. The native
+  library suite and five process tests pass; the real-model prerequisite remains
+  ignored. Runtime/Registry/inventory retirement, run/Keep/reference checks,
+  byte eviction and
   installed full-Qwen proof remain open.
 - Runtime derives one caller-scoped `model_runtime` projection for catalog GET,
   typed catalog list and preparation status. It reports admission, Keep,

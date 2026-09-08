@@ -478,6 +478,17 @@ impl LiveAdapterExecutor {
         workers || self.local_llama.retains_artifacts().await
     }
 
+    pub(crate) fn retained_worker_ids(&self) -> Vec<String> {
+        self.workers.lock().unwrap().keys().cloned().collect()
+    }
+
+    pub(crate) async fn close_local_model_offer(
+        &self,
+        offer_id: &str,
+    ) -> Result<(), LocalLlamaFault> {
+        self.local_llama.close_offer(offer_id).await
+    }
+
     pub fn new(runtime: Handle, updates: mpsc::Sender<WorkerUpdate>) -> Self {
         Self {
             runtime,

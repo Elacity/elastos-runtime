@@ -318,8 +318,11 @@ policy slices:
    Identical Init is idempotent; unresolved bindings survive expiry and restart.
    Busy activation retains admitted files for retry without transfer. Provider
    close retains exact engine ownership until bounded reaping and process-group
-   closure succeed; uncertainty blocks replacement. Actual byte eviction still
-   requires Runtime offer retirement and run/Keep/reference checks. Keep/release
+   closure succeed; uncertainty blocks replacement. Provider-source tests verify
+   retirement by exact offer ID and immutable configuration through private Init,
+   preserving operator offers and historical results. Actual byte eviction still
+   requires Runtime/Registry/inventory retirement and run/Keep/reference checks.
+   Keep/release
    intents are implemented independently of activation; installed full-Qwen
    retention and safe eviction proof remain open.
 4. **Shared model experience.** Marketplace Models and System management use one

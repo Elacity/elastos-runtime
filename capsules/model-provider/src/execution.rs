@@ -140,7 +140,21 @@ impl ProviderCoordinator {
                 }
                 if let Some(provider) = self.provider.as_mut() {
                     let execution_owned = provider.adapters().retains_execution().await;
-                    provider.refresh_config(init.config, execution_owned)?;
+                    let workers = provider.adapters().retained_worker_ids();
+                    let refresh = provider.plan_refresh(init.config, execution_owned, &workers)?;
+                    provider.begin_retirement(&refresh);
+                    if let Some(id) = &refresh.retire_offer {
+                        provider
+                            .adapters()
+                            .close_local_model_offer(id)
+                            .await
+                            .map_err(|_| {
+                                ProviderFault::selection_unavailable(
+                                    "model retirement closure unconfirmed",
+                                )
+                            })?;
+                    }
+                    provider.apply_refresh(refresh);
                     return self.status_response();
                 }
                 let adapter = LiveAdapterExecutor::new(self.handle.clone(), self.update_tx.clone());
@@ -963,6 +977,377 @@ mod tests {
             before.execution_binding_hash
         );
         release.store(true, Ordering::Relaxed);
+        provider.shutdown_on_eof();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coordinator_retires_exact_admitted_offer_preserving_operator_and_terminal_run() {
+        let root = temp_root("retire-admitted-offer");
+        let (mut admitted, events, root) = local_llama_offer(&root, "healthy");
+        admitted.id = "chosen-local-content".into();
+        let server = start_server(vec![sse_action(
+            &[json!({"choices":[{"delta":{"content":"operator survives"}}]}).to_string()],
+            true,
+        )]);
+        let mut operator = local_text_offer(&server.base_url);
+        // The ID spelling is not provenance, including for an operator offer.
+        operator.id = format!("model:{}", "b".repeat(64));
+        let admission = json!({
+            "offer_id": admitted.id,
+        });
+        let mut provider = ProviderCoordinatorHandle::start();
+        let mut initial = init_request(&root, vec![operator.clone(), admitted.clone()]);
+        initial.value["config"]["extra"]["runtime_admitted_offers"] = json!([admission]);
+        let initialized = provider.request(initial).unwrap();
+        assert_eq!(
+            initialized["status"], "ok",
+            "Runtime admission projection rejected: {initialized}"
+        );
+
+        let input = text_input("retained result");
+        let binding = create_binding("request:retirement-history", &admitted, &input);
+        let created = create_run(&provider, &admitted, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+        assert_eq!(terminal["data"]["status"], "completed");
+        assert_eq!(
+            terminal["data"]["terminal"]["output"]["text"],
+            "reply:retained result"
+        );
+        let pid: i32 = fake_llama_events(&events)
+            .iter()
+            .find_map(|line| line.strip_prefix("start:")?.parse().ok())
+            .unwrap();
+
+        let retire = || {
+            let mut request = init_request(&root, vec![operator.clone()]);
+            request.value["config"]["extra"]["runtime_admitted_offers"] = json!([]);
+            request
+        };
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            // Drop every withdrawal reply, including the first effectful one.
+            // A terminal journal result can precede the worker's exit update.
+            let (respond_to, lost_reply) = oneshot::channel();
+            drop(lost_reply);
+            provider
+                .requests
+                .blocking_send(CoordinatorCommand::Request {
+                    envelope: retire(),
+                    respond_to,
+                })
+                .unwrap();
+            // The same channel orders this read after the withdrawal.
+            let listed = send_request(
+                &provider,
+                ProviderOperation::OffersList,
+                json!({"op":"offers_list"}),
+            );
+            assert_eq!(listed["status"], "ok");
+            if listed["data"]["offers"] == json!([operator.summary()]) {
+                break;
+            }
+            assert_eq!(listed["data"]["offers"].as_array().unwrap().len(), 2);
+            assert!(
+                Instant::now() < deadline,
+                "retirement did not settle: {listed}"
+            );
+            thread::yield_now();
+        }
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "retired engine still alive"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        let events_after_close = fake_llama_events(&events);
+        assert_eq!(provider.request(retire()).unwrap()["status"], "ok");
+        assert_eq!(fake_llama_events(&events), events_after_close);
+        let listed = send_request(
+            &provider,
+            ProviderOperation::OffersList,
+            json!({"op":"offers_list"}),
+        );
+        assert_eq!(listed["data"]["offers"], json!([operator.summary()]));
+        assert_eq!(
+            get_run(&provider, run_id, &access_binding(&binding))["data"]["terminal"],
+            terminal["data"]["terminal"]
+        );
+        let new_binding = create_binding("request:retired-new", &admitted, &input);
+        assert_eq!(
+            create_run(&provider, &admitted, &new_binding, &input)["status"],
+            "error"
+        );
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| line.starts_with("start:"))
+                .count(),
+            1
+        );
+
+        let operator_input = text_input("operator check");
+        let operator_binding = create_binding(
+            "request:operator-after-retirement",
+            &operator,
+            &operator_input,
+        );
+        let operator_run = create_run(&provider, &operator, &operator_binding, &operator_input);
+        let operator_terminal = wait_for_terminal(
+            &provider,
+            operator_run["data"]["run_id"].as_str().unwrap(),
+            &access_binding(&operator_binding),
+        );
+        assert_eq!(
+            operator_terminal["data"]["terminal"]["output"]["text"],
+            "operator survives"
+        );
+        provider.shutdown_on_eof();
+
+        let mut restarted = ProviderCoordinatorHandle::start();
+        assert_eq!(restarted.request(retire()).unwrap()["status"], "ok");
+        assert_eq!(
+            get_run(&restarted, run_id, &access_binding(&binding))["data"]["terminal"],
+            terminal["data"]["terminal"]
+        );
+        restarted.shutdown_on_eof();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_retirement_close_error_preserves_ownership_and_other_offers() {
+        async fn request(
+            coordinator: &mut ProviderCoordinator,
+            envelope: ProviderEnvelope,
+        ) -> Value {
+            let (respond_to, response) = oneshot::channel();
+            assert!(
+                !coordinator
+                    .handle_command(CoordinatorCommand::Request {
+                        envelope,
+                        respond_to
+                    })
+                    .await
+            );
+            response.await.unwrap()
+        }
+        async fn finish_workers(coordinator: &mut ProviderCoordinator) {
+            let deadline = tokio::time::Instant::now() + FIXTURE_EVENT_TIMEOUT;
+            while !coordinator
+                .provider
+                .as_ref()
+                .unwrap()
+                .adapters()
+                .retained_worker_ids()
+                .is_empty()
+            {
+                let update = tokio::time::timeout_at(deadline, coordinator.updates.recv())
+                    .await
+                    .expect("worker did not settle")
+                    .expect("worker updates closed");
+                coordinator.handle_update(update).await;
+            }
+        }
+        let root = temp_root("retirement-close-error");
+        let (admitted, events, root) = local_llama_offer(&root, "healthy");
+        let server = start_server(vec![sse_action(
+            &[json!({"choices":[{"delta":{"content":"operator unaffected"}}]}).to_string()],
+            true,
+        )]);
+        let mut operator = local_text_offer(&server.base_url);
+        operator.id = "operator".into();
+        let (update_tx, updates) = mpsc::channel(UPDATE_CHANNEL_CAPACITY);
+        let (_request_tx, requests) = mpsc::channel(REQUEST_CHANNEL_CAPACITY);
+        let mut coordinator = ProviderCoordinator {
+            provider: None,
+            handle: tokio::runtime::Handle::current(),
+            requests,
+            updates,
+            update_tx,
+        };
+        let initial = || {
+            let mut init = init_request(&root, vec![admitted.clone(), operator.clone()]);
+            init.value["config"]["extra"]["runtime_admitted_offers"] = json!([{
+                "offer_id":admitted.id,
+            }]);
+            init
+        };
+        assert_eq!(request(&mut coordinator, initial()).await["status"], "ok");
+        let input = text_input("retained result");
+        let binding = create_binding("request:close-error-history", &admitted, &input);
+        let create = |offer: &ConfiguredOffer, binding: &RuntimeCreateBinding| ProviderEnvelope {
+            operation: ProviderOperation::RunsCreate,
+            value: json!({
+                "op":"runs_create", "offer_id":offer.id, "operation":offer.operation,
+                "input":input, "runtime_binding":binding,
+            }),
+        };
+        let created = request(&mut coordinator, create(&admitted, &binding)).await;
+        assert_eq!(created["status"], "ok");
+        finish_workers(&mut coordinator).await;
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let history = || ProviderEnvelope {
+            operation: ProviderOperation::RunsGet,
+            value: json!({
+                "op":"runs_get", "run_id":run_id, "runtime_binding":access_binding(&binding),
+            }),
+        };
+        let terminal = request(&mut coordinator, history()).await;
+        assert_eq!(terminal["data"]["status"], "completed");
+        let pid: i32 = fake_llama_events(&events)
+            .iter()
+            .find_map(|line| line.strip_prefix("start:")?.parse().ok())
+            .unwrap();
+        // The same real ECHILD injection as the engine-owner test. Reap the
+        // exact fixture child outside Tokio; the coordinator must retain uncertainty.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            if result == pid {
+                break;
+            }
+            assert_eq!(result, 0);
+            assert!(Instant::now() < deadline, "fixture child did not exit");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let retire = || init_request(&root, vec![operator.clone()]);
+        let failed = request(&mut coordinator, retire()).await;
+        assert_eq!(failed["code"], "selection_unavailable");
+        assert_eq!(failed["message"], "model offer is not available");
+        assert!(
+            coordinator
+                .provider
+                .as_ref()
+                .unwrap()
+                .adapters()
+                .retains_execution()
+                .await
+        );
+        assert_eq!(
+            request(&mut coordinator, initial()).await["code"],
+            "selection_unavailable"
+        );
+        let fresh = create_binding("request:close-error-new", &admitted, &input);
+        assert_eq!(
+            request(&mut coordinator, create(&admitted, &fresh)).await["code"],
+            "selection_unavailable"
+        );
+        let listed = request(
+            &mut coordinator,
+            ProviderEnvelope {
+                operation: ProviderOperation::OffersList,
+                value: json!({"op":"offers_list"}),
+            },
+        )
+        .await;
+        assert_eq!(listed["data"]["offers"], json!([operator.summary()]));
+        assert_eq!(
+            request(&mut coordinator, history()).await["data"]["terminal"],
+            terminal["data"]["terminal"]
+        );
+        let operator_binding = create_binding("request:operator-close-error", &operator, &input);
+        let other = request(&mut coordinator, create(&operator, &operator_binding)).await;
+        assert_eq!(other["status"], "ok");
+        finish_workers(&mut coordinator).await;
+        let other = request(&mut coordinator, ProviderEnvelope { operation: ProviderOperation::RunsGet, value: json!({
+            "op":"runs_get", "run_id":other["data"]["run_id"], "runtime_binding":access_binding(&operator_binding),
+        }) }).await;
+        assert_eq!(
+            other["data"]["terminal"]["output"]["text"],
+            "operator unaffected"
+        );
+        // ECHILD cannot confirm the original owner's close, so retries stay pending.
+        let retried = request(&mut coordinator, retire()).await;
+        assert_eq!(retried["code"], "selection_unavailable");
+        assert_eq!(retried["message"], "model offer is not available");
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| line.starts_with("start:"))
+                .count(),
+            1
+        );
+        assert!(
+            coordinator
+                .provider
+                .as_ref()
+                .unwrap()
+                .adapters()
+                .retains_execution()
+                .await
+        );
+        assert_eq!(
+            request(&mut coordinator, history()).await["data"]["terminal"],
+            terminal["data"]["terminal"]
+        );
+        coordinator.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coordinator_retirement_races_create_without_unowned_execution() {
+        let root = temp_root("retirement-create-race");
+        let (offer, events, root) = local_llama_offer(&root, "healthy");
+        let mut provider = ProviderCoordinatorHandle::start();
+        let mut init = init_request(&root, vec![offer.clone()]);
+        init.value["config"]["extra"]["runtime_admitted_offers"] = json!([{
+            "offer_id": offer.id,
+        }]);
+        assert_eq!(provider.request(init).unwrap()["status"], "ok");
+        let input = text_input("stall");
+        let binding = create_binding("request:retirement-race", &offer, &input);
+        let create = ProviderEnvelope {
+            operation: ProviderOperation::RunsCreate,
+            value: json!({
+                "op":"runs_create", "offer_id":offer.id, "operation":offer.operation,
+                "input":input, "runtime_binding":binding,
+            }),
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let dispatch = |request| {
+            let barrier = Arc::clone(&barrier);
+            let requests = provider.requests.clone();
+            thread::spawn(move || {
+                let (respond_to, response) = oneshot::channel();
+                barrier.wait();
+                requests
+                    .blocking_send(CoordinatorCommand::Request {
+                        envelope: request,
+                        respond_to,
+                    })
+                    .unwrap();
+                response.blocking_recv().unwrap()
+            })
+        };
+        let create = dispatch(create);
+        let retirement = dispatch(init_request(&root, vec![]));
+        barrier.wait();
+        let created = create.join().unwrap();
+        let retired = retirement.join().unwrap();
+        if retired["status"] == "ok" {
+            assert_eq!(created["code"], "selection_unavailable");
+            assert!(fake_llama_events(&events).is_empty());
+        } else {
+            assert_eq!(retired["code"], "selection_unavailable");
+            assert_eq!(created["status"], "ok");
+            wait_for_fake_llama_event(&events, "request:stall");
+            assert_eq!(
+                provider.request(init_request(&root, vec![])).unwrap()["code"],
+                "selection_unavailable"
+            );
+            assert_eq!(
+                fake_llama_events(&events)
+                    .iter()
+                    .filter(|event| event.starts_with("start:"))
+                    .count(),
+                1
+            );
+        }
         provider.shutdown_on_eof();
     }
 
@@ -2073,7 +2458,12 @@ mod tests {
     #[test]
     fn artifact_status_redirect_preserves_active_state_and_private_location_stays_hidden() {
         let redirect_target = "http://127.0.0.1:9/private-status";
-        let server = start_server(vec![redirect_action(redirect_target.to_string())]);
+        // Initial get plus the two public reads may each reach the next poll.
+        let server = start_server(
+            (0..3)
+                .map(|_| redirect_action(redirect_target.to_string()))
+                .collect(),
+        );
         let offer = artifact_offer_with_cancel_timeout(&server.base_url, 1_000);
         let root = temp_root("artifact-status-redirect");
         let input = artifact_input("status");
@@ -2112,6 +2502,11 @@ mod tests {
         assert_no_private_leakage(&public, &["private-status", "127.0.0.1:9", "Location"]);
 
         provider.shutdown_on_eof();
+        let requests = server.requests.lock().unwrap();
+        assert!((1..=3).contains(&requests.len()));
+        assert!(requests
+            .iter()
+            .all(|request| request.starts_with("GET /status?job_id=job-123 HTTP/1.1\r\n")));
     }
 
     #[test]

@@ -164,6 +164,13 @@ impl LocalLlamaEngines {
         Ok(endpoint)
     }
 
+    pub(crate) async fn close_offer(&self, offer_id: &str) -> Result<(), LocalLlamaFault> {
+        let mut engines = tokio::time::timeout(GUARD_EXIT_GRACE, self.engines.lock())
+            .await
+            .map_err(|_| LocalLlamaFault::Timeout)?;
+        close_engine(&mut engines, offer_id).await
+    }
+
     pub(crate) async fn shutdown(&self) -> Result<(), LocalLlamaFault> {
         let mut engines = tokio::time::timeout(GUARD_EXIT_GRACE, self.engines.lock())
             .await

@@ -99,6 +99,16 @@ pub struct ProviderInitExtra {
     pub journal_dir: Option<String>,
     #[serde(default)]
     pub offers: Vec<ConfiguredOffer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_admitted_offers: Vec<RuntimeAdmittedOffer>,
+}
+
+/// Private Init provenance projected by Runtime from its verified inventory.
+/// It grants neither content deletion nor inference authority.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeAdmittedOffer {
+    pub offer_id: String,
 }
 
 impl ProviderInitExtra {
@@ -124,6 +134,23 @@ impl ProviderInitExtra {
             offer.validate_local_artifacts(bridge)?;
             if !offer_ids.insert(offer.id.as_str()) {
                 anyhow::bail!("duplicate model offer id in provider config");
+            }
+        }
+        if self.runtime_admitted_offers.len() > MAX_OFFER_COUNT {
+            anyhow::bail!("too many Runtime model admissions");
+        }
+        let mut admitted_ids = BTreeSet::new();
+        for admission in &self.runtime_admitted_offers {
+            let offer = self
+                .offers
+                .iter()
+                .find(|o| o.id == admission.offer_id)
+                .ok_or_else(|| anyhow::anyhow!("Runtime admission offer unavailable"))?;
+            if !offer.enabled
+                || !matches!(offer.adapter, AdapterConfig::LocalLlamaCppText { .. })
+                || !admitted_ids.insert(&admission.offer_id)
+            {
+                anyhow::bail!("invalid Runtime model admission binding");
             }
         }
         Ok(())
@@ -858,6 +885,7 @@ mod tests {
         fs::set_permissions(&engine, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&model, fs::Permissions::from_mode(0o600)).unwrap();
         let extra = ProviderInitExtra {
+            runtime_admitted_offers: Vec::new(),
             provider_id: Some("model-provider".to_string()),
             journal_dir: Some(root.join("journal").to_string_lossy().into_owned()),
             offers: vec![local_llama_offer(&engine, &model)],
@@ -869,6 +897,39 @@ mod tests {
         };
 
         extra.validate(&bridge).unwrap();
+
+        let mut admitted = extra.clone();
+        let binding = RuntimeAdmittedOffer {
+            offer_id: admitted.offers[0].id.clone(),
+        };
+        admitted.runtime_admitted_offers = vec![binding.clone()];
+        admitted.validate(&bridge).unwrap();
+        for invalid in [
+            json!({}),
+            json!({"offer_id": binding.offer_id, "package_cid": "unused"}),
+            json!({"offer_id": binding.offer_id, "admission_id": "unused"}),
+            json!({"offer_id": binding.offer_id, "execution_binding_hash": "unused"}),
+        ] {
+            assert!(serde_json::from_value::<RuntimeAdmittedOffer>(invalid).is_err());
+        }
+        let mut invalid = admitted.clone();
+        invalid.runtime_admitted_offers.push(binding.clone());
+        assert!(invalid.validate(&bridge).is_err());
+        invalid.runtime_admitted_offers = vec![binding.clone(); MAX_OFFER_COUNT + 1];
+        assert!(invalid.validate(&bridge).is_err());
+        for id in ["", "missing"] {
+            let mut invalid = admitted.clone();
+            invalid.runtime_admitted_offers[0].offer_id = id.into();
+            assert!(invalid.validate(&bridge).is_err());
+        }
+        let mut invalid = admitted.clone();
+        invalid.offers[0].enabled = false;
+        assert!(invalid.validate(&bridge).is_err());
+        invalid.offers[0] = base_offer();
+        assert!(
+            invalid.validate(&bridge).is_err(),
+            "hosted offer acquired retirement provenance"
+        );
 
         let outside = crate::test_support::temp_root_path("model-provider-config", "outside");
         fs::create_dir_all(&outside).unwrap();
@@ -923,6 +984,7 @@ mod tests {
     #[test]
     fn adapter_config_rejects_unsafe_urls_and_secret_length() {
         let config = ProviderInitExtra {
+            runtime_admitted_offers: Vec::new(),
             provider_id: None,
             journal_dir: Some("/tmp/model-provider".to_string()),
             offers: vec![ConfiguredOffer {

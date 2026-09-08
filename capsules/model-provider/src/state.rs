@@ -25,6 +25,12 @@ pub struct ModelProviderState<A: AdapterExecutor> {
     adapters: A,
 }
 
+pub(crate) struct ConfigRefresh {
+    config: BridgeProviderConfig,
+    offers: BTreeMap<String, ConfiguredOffer>,
+    pub(crate) retire_offer: Option<String>,
+}
+
 impl<A: AdapterExecutor> ModelProviderState<A> {
     pub fn from_init(config: BridgeProviderConfig, adapters: A) -> Result<Self, ProviderFault> {
         config.validate().map_err(|err| {
@@ -72,13 +78,14 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         self.offers.values().filter(|offer| offer.enabled).count()
     }
 
-    /// Called only by the serialized coordinator. Retain the same journal and
-    /// adapter owner; this boundary adds offers, it does not evict artifacts.
-    pub(crate) fn refresh_config(
-        &mut self,
+    /// Validate the complete proposal before the serialized coordinator closes
+    /// any exact engine. Configuration and journal ownership remain unchanged.
+    pub(crate) fn plan_refresh(
+        &self,
         config: BridgeProviderConfig,
         execution_owned: bool,
-    ) -> Result<(), ProviderFault> {
+        retained_workers: &[String],
+    ) -> Result<ConfigRefresh, ProviderFault> {
         if self.config.base_path != config.base_path
             || self.config.allowed_paths != config.allowed_paths
             || self.config.read_only != config.read_only
@@ -92,9 +99,11 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         let mut new_identity = config.extra.clone();
         if let Some(value) = old_identity.as_object_mut() {
             let _ = value.remove("offers");
+            let _ = value.remove("runtime_admitted_offers");
         }
         if let Some(value) = new_identity.as_object_mut() {
             let _ = value.remove("offers");
+            let _ = value.remove("runtime_admitted_offers");
         }
         if old_identity != new_identity {
             return Err(ProviderFault::invalid_request(
@@ -109,39 +118,99 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         extra
             .validate(&config)
             .map_err(|_| ProviderFault::invalid_request("invalid model configuration"))?;
+        let previous: ProviderInitExtra = serde_json::from_value(self.config.extra.clone())
+            .map_err(|_| ProviderFault::internal("stored model configuration unavailable"))?;
+        let old_admissions: BTreeMap<_, _> = previous
+            .runtime_admitted_offers
+            .iter()
+            .map(|a| (a.offer_id.as_str(), a))
+            .collect();
+        let admissions: BTreeMap<_, _> = extra
+            .runtime_admitted_offers
+            .iter()
+            .map(|a| (a.offer_id.as_str(), a))
+            .collect();
         let offers: BTreeMap<_, _> = extra
             .offers
             .into_iter()
             .map(|o| (o.id.clone(), o))
             .collect();
-        // This includes every authoritative operator offer. Even an idle refresh
-        // cannot remove or change an existing offer, including its private adapter.
-        if self
-            .offers
-            .iter()
-            .any(|(id, offer)| offers.get(id) != Some(offer))
-        {
+        let mut retired = Vec::new();
+        for old in &previous.offers {
+            if let Some(proposed) = offers.get(&old.id) {
+                if proposed != old
+                    || admissions.get(old.id.as_str()) != old_admissions.get(old.id.as_str())
+                {
+                    return Err(ProviderFault::invalid_request(
+                        "existing model offers changed",
+                    ));
+                }
+                // A failed close disabled this exact offer. Only the same
+                // withdrawal can reconcile it; stale Init cannot re-enable it.
+                if old.enabled && self.offers.get(&old.id).is_some_and(|o| !o.enabled) {
+                    return Err(ProviderFault::selection_unavailable(
+                        "model retirement pending",
+                    ));
+                }
+            } else if old_admissions.contains_key(old.id.as_str()) {
+                retired.push(old.id.clone());
+            } else {
+                return Err(ProviderFault::invalid_request(
+                    "existing model offers changed",
+                ));
+            }
+        }
+        let addition = offers.keys().any(|id| !self.offers.contains_key(id));
+        if retired.len() > 1 || (!retired.is_empty() && addition) {
             return Err(ProviderFault::invalid_request(
-                "existing model offers changed",
+                "retire one model offer per Init",
             ));
         }
-        if self.offers == offers {
-            return Ok(());
-        }
-        if execution_owned
-            || self
-                .journal
-                .scan_runs()?
-                .iter()
-                .any(|(_, r)| !r.status.is_terminal() || r.status == RunStatus::SettlementUnknown)
+        let retire_offer = retired.pop();
+        if let Some(id) = &retire_offer {
+            let runs = self.journal.scan_runs()?;
+            if runs.iter().any(|(_, run)| {
+                run.offer.id == *id
+                    && (!run.status.is_terminal() || run.status == RunStatus::SettlementUnknown)
+            }) || retained_workers.iter().any(|worker| {
+                runs.iter()
+                    .find(|(_, run)| run.run_id == *worker)
+                    .is_none_or(|(_, run)| run.offer.id == *id)
+            }) {
+                return Err(ProviderFault::selection_unavailable(
+                    "model retirement pending",
+                ));
+            }
+        } else if addition
+            && (execution_owned
+                || self.journal.scan_runs()?.iter().any(|(_, r)| {
+                    !r.status.is_terminal() || r.status == RunStatus::SettlementUnknown
+                }))
         {
             return Err(ProviderFault::selection_unavailable(
                 "model activation pending",
             ));
         }
-        self.offers = offers;
-        self.config = config;
-        Ok(())
+        Ok(ConfigRefresh {
+            config,
+            offers,
+            retire_offer,
+        })
+    }
+
+    pub(crate) fn begin_retirement(&mut self, refresh: &ConfigRefresh) {
+        if let Some(offer) = refresh
+            .retire_offer
+            .as_ref()
+            .and_then(|id| self.offers.get_mut(id))
+        {
+            offer.enabled = false;
+        }
+    }
+
+    pub(crate) fn apply_refresh(&mut self, refresh: ConfigRefresh) {
+        self.offers = refresh.offers;
+        self.config = refresh.config;
     }
 
     pub(crate) fn adapters(&self) -> &A {
@@ -1601,7 +1670,7 @@ mod tests {
         let root = temp_root("refresh-unknown");
         let original = offer("operator");
         let adapters = FakeAdapters::default();
-        let mut state = init_state(&root, vec![original.clone()], adapters.clone());
+        let state = init_state(&root, vec![original.clone()], adapters.clone());
         let binding = create_binding(
             "request:unknown-refresh",
             &original.id,
@@ -1629,15 +1698,18 @@ mod tests {
         state.journal.prune_expired_terminal_runs().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         let same = state.config.clone();
-        state.refresh_config(same.clone(), true).unwrap();
+        state.plan_refresh(same.clone(), true, &[]).unwrap();
         let mut addition = same.clone();
         addition.extra["offers"] = json!([original.clone(), offer("admitted")]);
         assert_eq!(
-            state.refresh_config(addition, false).unwrap_err().code(),
+            match state.plan_refresh(addition, false, &[]) {
+                Err(error) => error.code(),
+                Ok(_) => panic!("unresolved binding allowed an addition"),
+            },
             "selection_unavailable"
         );
         drop(state);
-        let mut restarted = ModelProviderState::from_init(same.clone(), adapters.clone()).unwrap();
+        let restarted = ModelProviderState::from_init(same.clone(), adapters.clone()).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         let mut drift = same.clone();
         drift.extra["offers"][0]["adapter"]["model"] = json!("changed-selector");
@@ -1645,9 +1717,190 @@ mod tests {
         let mut missing = same.clone();
         missing.extra["offers"] = json!([]);
         assert!(ModelProviderState::from_init(missing, adapters.clone()).is_err());
-        restarted.refresh_config(same, false).unwrap();
+        restarted.plan_refresh(same, false, &[]).unwrap();
         assert_eq!(std::fs::read(path).unwrap(), bytes);
         assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    fn retirement_state() -> ModelProviderState<FakeAdapters> {
+        use crate::config::{LocalArtifactConfig, LocalLlamaSettings};
+        let root = temp_root("retirement");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let (engine, model, _) = crate::test_support::write_fake_llama_server(&root, "healthy");
+        let mut local = offer("admitted");
+        local.adapter = AdapterConfig::LocalLlamaCppText {
+            engine: LocalArtifactConfig {
+                path: engine.to_string_lossy().into_owned(),
+                sha256: crate::test_support::sha256_file(&engine),
+            },
+            model: LocalArtifactConfig {
+                path: model.to_string_lossy().into_owned(),
+                sha256: crate::test_support::sha256_file(&model),
+            },
+            settings: LocalLlamaSettings {
+                context_size: 256,
+                parallel: 1,
+                threads: 1,
+                batch_threads: 1,
+                gpu_layers: 0,
+                health_timeout_ms: 1000,
+                shutdown_timeout_ms: 250,
+                enable_thinking: false,
+            },
+        };
+        ModelProviderState::from_init(BridgeProviderConfig {
+            base_path: root.to_string_lossy().into_owned(),
+            allowed_paths: Vec::new(), read_only: false, encryption_key: String::new(),
+            extra: json!({"offers": [local.clone(), offer("operator")], "runtime_admitted_offers": [{"offer_id": local.id}]}),
+        }, FakeAdapters::default()).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn withdrawal(state: &ModelProviderState<FakeAdapters>) -> BridgeProviderConfig {
+        let mut config = state.config.clone();
+        config.extra["offers"] = json!([state.offers["operator"].clone()]);
+        config.extra["runtime_admitted_offers"] = json!([]);
+        config
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_validates_entire_proposal_and_preserves_operator_provenance() {
+        let state = retirement_state();
+        for (field, value) in [
+            ("/offers/0/title", json!("changed admitted offer")),
+            ("/offers/0/policy/runtime_ms_limit", json!(60_000)),
+            ("/offers/0/adapter/settings/threads", json!(2)),
+            (
+                "/offers/0/adapter/model/sha256",
+                json!(format!("sha256:{}", "b".repeat(64))),
+            ),
+        ] {
+            let mut invalid = state.config.clone();
+            *invalid.extra.pointer_mut(field).unwrap() = value;
+            assert!(
+                state.plan_refresh(invalid, false, &[]).is_err(),
+                "admitted offer changed at {field}"
+            );
+        }
+        let mut invalid = withdrawal(&state);
+        invalid.extra["offers"][0]["title"] = json!("changed operator");
+        assert!(state.plan_refresh(invalid, false, &[]).is_err());
+        let mut invalid = withdrawal(&state);
+        invalid.extra["offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(offer("new")));
+        assert!(state.plan_refresh(invalid, false, &[]).is_err());
+        let mut invalid = state.config.clone();
+        invalid.extra["runtime_admitted_offers"] = json!([]);
+        assert!(state.plan_refresh(invalid.clone(), false, &[]).is_err());
+        // The exact local offer first configured without provenance stays operator-owned.
+        let unmarked = ModelProviderState::from_init(invalid, FakeAdapters::default()).unwrap();
+        assert!(unmarked
+            .plan_refresh(state.config.clone(), false, &[])
+            .is_err());
+        assert!(unmarked
+            .plan_refresh(withdrawal(&unmarked), false, &[])
+            .is_err());
+        assert!(state.offers["admitted"].enabled);
+        assert_eq!(*state.adapters.dispatch_calls.lock().unwrap(), 0);
+        assert!(state.journal.scan_runs().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_pending_close_blocks_dispatch_and_stale_reenable_until_exact_retry() {
+        let mut state = retirement_state();
+        let old = state.config.clone();
+        let desired = withdrawal(&state);
+        let planned = state.plan_refresh(desired.clone(), true, &[]).unwrap();
+        state.begin_retirement(&planned);
+        // This is the retained state when engine closure returns an error.
+        assert!(state.plan_refresh(old.clone(), false, &[]).is_err());
+        let input = json!({"prompt":"blocked"});
+        let request = RunsCreateRequest {
+            op: "runs_create".into(),
+            offer_id: "admitted".into(),
+            operation: "text.generate".into(),
+            runtime_binding: create_binding("request:retirement-blocked", "admitted", &input),
+            input,
+        };
+        assert_eq!(
+            state.handle_runs_create(request).unwrap_err().code(),
+            "selection_unavailable"
+        );
+        assert_eq!(state.config.extra, old.extra);
+        assert!(state.offers["operator"].enabled);
+        assert_eq!(*state.adapters.dispatch_calls.lock().unwrap(), 0);
+        let retried = state.plan_refresh(desired.clone(), true, &[]).unwrap();
+        assert_eq!(retried.retire_offer.as_deref(), Some("admitted"));
+        state.apply_refresh(retried);
+        assert!(!state.offers.contains_key("admitted"));
+        assert!(state
+            .plan_refresh(desired, false, &[])
+            .unwrap()
+            .retire_offer
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_retains_unresolved_binding_after_expiry_and_restart_and_worker_exit() {
+        let mut state = retirement_state();
+        let desired = withdrawal(&state);
+        let local = state.offers["admitted"].clone();
+        let binding = create_binding(
+            "request:retained-retirement",
+            &local.id,
+            &json!({"prompt":"x"}),
+        );
+        let mut run = prepared_run_for_offer(binding, &local, now_ms());
+        state.journal.store_run(&run).unwrap();
+        let path = run_path(&state.config.base_path, &run.run_id);
+        let before = std::fs::read(&path).unwrap();
+        assert!(state.plan_refresh(desired.clone(), false, &[]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        transition_terminal(
+            &local,
+            &mut run,
+            RunStatus::SettlementUnknown,
+            None,
+            Some(RunError {
+                class: ErrorClass::SettlementUnknown,
+                code: "settlement_unknown".into(),
+                message: "model settlement is unknown".into(),
+            }),
+        )
+        .unwrap();
+        expire_terminal_run(&mut run);
+        state.journal.store_run(&run).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        state.journal.prune_expired_terminal_runs().unwrap();
+        assert!(state.plan_refresh(desired.clone(), false, &[]).is_err());
+        assert!(ModelProviderState::from_init(desired.clone(), FakeAdapters::default()).is_err());
+        state =
+            ModelProviderState::from_init(state.config.clone(), FakeAdapters::default()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(state.plan_refresh(desired.clone(), false, &[]).is_err());
+        // A retained worker blocks even after its journal has a known terminal result.
+        run.status = RunStatus::Failed;
+        run.error = Some(RunError {
+            class: ErrorClass::BackendFailed,
+            code: "backend_failed".into(),
+            message: "model execution failed".into(),
+        });
+        state.journal.store_run(&run).unwrap();
+        assert!(state
+            .plan_refresh(desired.clone(), false, &[run.run_id])
+            .is_err());
+        assert!(state
+            .plan_refresh(desired.clone(), false, &["missing-worker-record".into()])
+            .is_err());
+        assert!(state.plan_refresh(desired, false, &[]).is_ok());
+        assert_eq!(*state.adapters.dispatch_calls.lock().unwrap(), 0);
     }
 
     fn run_with_id_for_offer(
