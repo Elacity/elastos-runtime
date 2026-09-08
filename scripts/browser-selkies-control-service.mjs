@@ -11,6 +11,14 @@ import tls from "node:tls";
 import { fileURLToPath, URL } from "node:url";
 
 const CONFIG_ENV = "ELASTOS_BROWSER_SELKIES_CONTROL_CONFIG";
+const DISPLAY_CONTROL_HTTP_STATUS = Object.freeze({
+  display_attach_busy: 409,
+  display_generation_mismatch: 409,
+  display_owner_changed: 409,
+  display_attach_unsupported: 501,
+  display_attach_failed: 503,
+  display_attach_uncertain: 503,
+});
 const HOSTED_PRODUCT_OPEN_SCHEMA = "elastos.browser.hosted-product.open/v1";
 const VM_GUEST_OPEN_SCHEMA = "elastos.browser.vm-guest.open/v1";
 const VM_LOG_DIR = "/var/log/elastos";
@@ -1982,7 +1990,7 @@ function readJsonRequest(req) {
   });
 }
 
-class MinimalWebSocketClient {
+export class MinimalWebSocketClient {
   constructor(url, { basicAuth } = {}) {
     this.url = url;
     this.basicAuth = basicAuth;
@@ -1997,90 +2005,84 @@ class MinimalWebSocketClient {
   async connect(timeoutMs) {
     const port = Number(this.url.port || (this.url.protocol === "wss:" ? 443 : 80));
     const host = this.url.hostname;
-    const path = `${this.url.pathname || "/"}${this.url.search || ""}`;
-    this.socket = await new Promise((resolve, reject) => {
-      const connect = this.url.protocol === "wss:" ? tls.connect : net.connect;
-      const socket = connect({ host, port, servername: host });
-      const timer = setTimeout(() => {
-        socket.destroy(new Error("Selkies WebSocket connect timed out"));
-      }, timeoutMs);
-      socket.once("connect", () => {
-        clearTimeout(timer);
-        resolve(socket);
+    const requestPath = `${this.url.pathname || "/"}${this.url.search || ""}`;
+    if (this.socket && !this.socket.destroyed) throw new Error("Selkies WebSocket is already connecting");
+    const connectSocket = this.url.protocol === "wss:" ? tls.connect : net.connect;
+    const socket = connectSocket({ host, port, servername: host });
+    this.socket = socket;
+    this.closed = true;
+    this.buffer = Buffer.alloc(0);
+    const current = () => {
+      if (this.socket !== socket || socket.destroyed) throw new Error("Selkies WebSocket connect canceled");
+    };
+    socket.on("error", error => {
+      if (this.socket === socket) { this.closed = true; this.errorHandler(error); }
+    });
+    socket.on("close", () => {
+      if (this.socket === socket) { this.closed = true; this.closeHandler(); }
+    });
+    try {
+      await new Promise((resolve, reject) => {
+        const cleanup = () => {
+          clearTimeout(timer);
+          socket.off("connect", ready); socket.off("error", failed); socket.off("close", closed);
+        };
+        const ready = () => { cleanup(); resolve(); };
+        const failed = error => { cleanup(); reject(error); };
+        const closed = () => failed(new Error("Selkies WebSocket closed during connect"));
+        const timer = setTimeout(() => { failed(new Error("Selkies WebSocket connect timed out")); socket.destroy(); }, timeoutMs);
+        socket.once("connect", ready); socket.once("error", failed); socket.once("close", closed);
       });
-      socket.once("error", reject);
-    });
-    const key = crypto.randomBytes(16).toString("base64");
-    const headers = [
-      `GET ${path} HTTP/1.1`,
-      `Host: ${host}:${port}`,
-      "Upgrade: websocket",
-      "Connection: Upgrade",
-      `Sec-WebSocket-Key: ${key}`,
-      "Sec-WebSocket-Version: 13",
-    ];
-    if (this.basicAuth?.user && this.basicAuth?.password) {
-      const value = Buffer.from(`${this.basicAuth.user}:${this.basicAuth.password}`).toString("base64");
-      headers.push(`Authorization: Basic ${value}`);
-    }
-    this.socket.write(`${headers.join("\r\n")}\r\n\r\n`);
-    await this.readHandshake(timeoutMs);
-    this.closed = false;
-    this.socket.on("data", (chunk) => {
-      try {
-        this.handleData(chunk);
-      } catch (error) {
-        this.errorHandler(error);
-        this.close();
+      current();
+      const key = crypto.randomBytes(16).toString("base64");
+      const headers = [
+        `GET ${requestPath} HTTP/1.1`, `Host: ${host}:${port}`, "Upgrade: websocket", "Connection: Upgrade",
+        `Sec-WebSocket-Key: ${key}`, "Sec-WebSocket-Version: 13",
+      ];
+      if (this.basicAuth?.user && this.basicAuth?.password) {
+        const value = Buffer.from(`${this.basicAuth.user}:${this.basicAuth.password}`).toString("base64");
+        headers.push(`Authorization: Basic ${value}`);
       }
-    });
-    this.socket.on("error", (error) => {
-      this.closed = true;
-      this.errorHandler(error);
-    });
-    this.socket.on("close", () => {
-      this.closed = true;
-      this.closeHandler();
-    });
-    if (this.buffer.length > 0) {
-      this.handleData(Buffer.alloc(0));
+      socket.write(`${headers.join("\r\n")}\r\n\r\n`);
+      await this.readHandshake(timeoutMs, socket);
+      current();
+      this.closed = false;
+      socket.on("data", chunk => {
+        if (this.socket !== socket || this.closed) return;
+        try { this.handleData(chunk); }
+        catch (error) { this.errorHandler(error); this.close(); }
+      });
+      if (this.buffer.length > 0) this.handleData(Buffer.alloc(0));
+    } catch (error) {
+      socket.destroy();
+      throw error;
     }
   }
 
-  readHandshake(timeoutMs) {
+  readHandshake(timeoutMs, socket = this.socket) {
     return new Promise((resolve, reject) => {
       let data = Buffer.alloc(0);
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error("Selkies WebSocket handshake timed out"));
-      }, timeoutMs);
       const cleanup = () => {
         clearTimeout(timer);
-        this.socket.off("data", onData);
-        this.socket.off("error", onError);
+        socket.off("data", onData); socket.off("error", onError); socket.off("close", onClose);
       };
-      const onError = (error) => {
-        cleanup();
-        reject(error);
-      };
-      const onData = (chunk) => {
+      const onError = error => { cleanup(); reject(error); };
+      const onClose = () => onError(new Error("Selkies WebSocket closed during handshake"));
+      const onData = chunk => {
         data = Buffer.concat([data, chunk]);
         const end = data.indexOf("\r\n\r\n");
-        if (end < 0) {
-          return;
-        }
+        if (end < 0) return;
         const head = data.subarray(0, end).toString("utf8");
         if (!head.startsWith("HTTP/1.1 101") && !head.startsWith("HTTP/1.0 101")) {
-          cleanup();
-          reject(new Error(`Selkies WebSocket handshake failed: ${head.split("\r\n")[0]}`));
+          onError(new Error(`Selkies WebSocket handshake failed: ${head.split("\r\n")[0]}`));
           return;
         }
+        if (this.socket !== socket || socket.destroyed) { onClose(); return; }
         this.buffer = data.subarray(end + 4);
-        cleanup();
-        resolve();
+        cleanup(); resolve();
       };
-      this.socket.on("data", onData);
-      this.socket.on("error", onError);
+      const timer = setTimeout(() => onError(new Error("Selkies WebSocket handshake timed out")), timeoutMs);
+      socket.on("data", onData); socket.on("error", onError); socket.on("close", onClose);
     });
   }
 
@@ -2131,7 +2133,7 @@ class MinimalWebSocketClient {
       // The socket may already be closing; TCP teardown below is still required.
     }
     this.closed = true;
-    this.socket.end();
+    this.socket.destroy();
   }
 
   handleData(chunk) {
@@ -2196,7 +2198,7 @@ function readFrame(buffer) {
   return { opcode, payload, consumed: offset + length };
 }
 
-class SelkiesPage {
+export class SelkiesPage {
   constructor(config, launchRequest, onClosed = () => {}, options = {}) {
     this.config = config;
     this.launchRequest = launchRequest;
@@ -2223,6 +2225,12 @@ class SelkiesPage {
     this.audioRemoteCandidateHistory = [];
     this.webrtcMedia = { audio: false, video: false };
     this.displaySession = null;
+    this.displayGeneration = `display:${crypto.randomBytes(16).toString("hex")}`;
+    this.displayAttachment = null;
+    this.establishedVideoProtocol = null;
+    this.establishedAudioProtocol = null;
+    this.displayAvailable = false;
+    this.legacyDisplaySignalsAllowed = true;
     this.signalingStats = {
       opened_at: null,
       last_selkies_message_at: null,
@@ -2238,6 +2246,7 @@ class SelkiesPage {
       last_selkies_candidate: null,
     };
     this.closed = false;
+    this.videoClosed = false;
     this.audioClosed = false;
     this.resetSignaling();
     this.resetAudioSignaling();
@@ -2281,6 +2290,9 @@ class SelkiesPage {
       audioOffer.sdp.sdp,
     );
     this.displaySession = result.display_session || null;
+    this.displayAvailable = true;
+    this.establishedVideoProtocol = this.signalingEnvelope;
+    this.establishedAudioProtocol = this.audioSignalingEnvelope;
     return result;
   }
 
@@ -2293,7 +2305,7 @@ class SelkiesPage {
     });
     ws.onClose(() => {
       if (this.ws === ws) {
-        this.markClosed();
+        this.markVideoClosed();
       }
     });
     return ws;
@@ -2330,7 +2342,7 @@ class SelkiesPage {
     this.waiters = [];
     this.remoteCandidates = [];
     this.remoteCandidateHistory = [];
-    this.closed = false;
+    this.videoClosed = false;
   }
 
   resetAudioSignaling() {
@@ -2398,63 +2410,94 @@ class SelkiesPage {
   }
 
   async openCurrentSelkiesAudioSession() {
-    await this.audioWs.connect(this.config.connectTimeoutMs);
-    this.audioWs.sendText("HELLO client " + JSON.stringify({ client_type: "controller", client_slot: 3, client_strict_viewer: false }));
+    const socket = this.audioWs;
+    const current = () => {
+      if (this.closed || this.audioWs !== socket || this.audioClosed) throw new Error("Selkies signaling session changed");
+    };
+    await socket.connect(this.config.connectTimeoutMs);
+    current();
+    socket.sendText("HELLO client " + JSON.stringify({ client_type: "controller", client_slot: 3, client_strict_viewer: false }));
     await this.waitForAudio((message) => message.kind === "hello", "Selkies audio HELLO");
-    this.audioWs.sendText("SESSION server");
+    current();
+    socket.sendText("SESSION server");
     const session = await this.waitForAudio((message) => message.kind === "session_ok", "Selkies audio SESSION_OK");
+    current();
     this.audioServerPeerId = session.serverPeerId;
     this.audioSignalingEnvelope = "peer_routed";
-    return await this.waitForAudio(
+    const offer = await this.waitForAudio(
       (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
       "Selkies audio SDP offer",
     );
+    current();
+    return offer;
   }
 
   async openLegacySelkiesAudioSession(displaySize) {
-    await this.audioWs.connect(this.config.connectTimeoutMs);
+    const socket = this.audioWs;
+    const current = () => {
+      if (this.closed || this.audioWs !== socket || this.audioClosed) throw new Error("Selkies signaling session changed");
+    };
+    await socket.connect(this.config.connectTimeoutMs);
+    current();
     const helloMeta = Buffer.from(JSON.stringify({
       res: `${this.config.displaySurface.stream.width}x${this.config.displaySurface.stream.height}`,
       scale: displaySize.scale || 1,
     })).toString("base64");
-    this.audioWs.sendText(`HELLO 3 ${helloMeta}`);
+    socket.sendText(`HELLO 3 ${helloMeta}`);
     await this.waitForAudio((message) => message.kind === "hello", "legacy Selkies audio HELLO");
+    current();
     const offer = await this.waitForAudio(
       (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
       "legacy Selkies audio SDP offer",
     );
+    current();
     this.audioServerPeerId = offer.from || "2";
     this.audioSignalingEnvelope = "raw_json";
     return offer;
   }
 
   async openCurrentSelkiesSession() {
-    await this.ws.connect(this.config.connectTimeoutMs);
-    this.ws.sendText("HELLO client " + JSON.stringify({ client_type: "controller", client_slot: 1, client_strict_viewer: false }));
+    const socket = this.ws;
+    const current = () => {
+      if (this.closed || this.ws !== socket || this.videoClosed) throw new Error("Selkies signaling session changed");
+    };
+    await socket.connect(this.config.connectTimeoutMs);
+    current();
+    socket.sendText("HELLO client " + JSON.stringify({ client_type: "controller", client_slot: 1, client_strict_viewer: false }));
     await this.waitFor((message) => message.kind === "hello", "Selkies HELLO");
-    this.ws.sendText("SESSION server");
+    current();
+    socket.sendText("SESSION server");
     const session = await this.waitFor((message) => message.kind === "session_ok", "Selkies SESSION_OK");
+    current();
     this.serverPeerId = session.serverPeerId;
     this.signalingEnvelope = "peer_routed";
     const offer = await this.waitFor(
       (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
       "Selkies SDP offer",
     );
+    current();
     return offer;
   }
 
   async openLegacySelkiesSession(displaySize) {
-    await this.ws.connect(this.config.connectTimeoutMs);
+    const socket = this.ws;
+    const current = () => {
+      if (this.closed || this.ws !== socket || this.videoClosed) throw new Error("Selkies signaling session changed");
+    };
+    await socket.connect(this.config.connectTimeoutMs);
+    current();
     const helloMeta = Buffer.from(JSON.stringify({
       res: `${this.config.displaySurface.stream.width}x${this.config.displaySurface.stream.height}`,
       scale: displaySize.scale || 1,
     })).toString("base64");
-    this.ws.sendText(`HELLO 1 ${helloMeta}`);
+    socket.sendText(`HELLO 1 ${helloMeta}`);
     await this.waitFor((message) => message.kind === "hello", "legacy Selkies HELLO");
+    current();
     const offer = await this.waitFor(
       (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
       "legacy Selkies SDP offer",
     );
+    current();
     this.serverPeerId = offer.from || "1";
     this.signalingEnvelope = "raw_json";
     return offer;
@@ -2493,6 +2536,7 @@ class SelkiesPage {
       display_session: {
         schema: "elastos.browser.display-session/v1",
         session_id: `display:${this.launchRequest.stream_id}`,
+        display_generation: this.displayGeneration,
         mode: "webrtc_remote_display",
         width: this.config.displaySurface.stream.width,
         height: this.config.displaySurface.stream.height,
@@ -2574,7 +2618,7 @@ class SelkiesPage {
         this.waiters = this.waiters.filter((entry) => entry !== waiter);
         clearTimeout(waiter.timer);
         waiter.resolve(message);
-      } else if (this.closed) {
+      } else if (this.closed || this.videoClosed) {
         this.waiters = this.waiters.filter((entry) => entry !== waiter);
         clearTimeout(waiter.timer);
         waiter.reject(new Error(`Selkies WebSocket closed while waiting for ${waiter.label}`));
@@ -2604,7 +2648,7 @@ class SelkiesPage {
       const [message] = this.messages.splice(matchIndex, 1);
       return Promise.resolve(message);
     }
-    if (this.closed) {
+    if (this.closed || this.videoClosed) {
       return Promise.reject(new Error(`Selkies WebSocket closed while waiting for ${label}`));
     }
     return new Promise((resolve, reject) => {
@@ -2646,7 +2690,100 @@ class SelkiesPage {
     });
   }
 
-  signal(signal, channel = "video") {
+  attachDisplay(signal) {
+    const failure = (code, message) => Object.assign(new Error(message), { code });
+    if (signal?.type !== "display_attach" || typeof signal.request_id !== "string" ||
+        !/^[a-f0-9]{32}$/.test(signal.request_id) || typeof signal.display_generation !== "string" ||
+        !/^display:[a-f0-9]{32}$/.test(signal.display_generation) ||
+        Object.keys(signal).some(key => !["schema", "type", "request_id", "display_generation"].includes(key))) {
+      throw failure("invalid_request", "Browser display attachment request is invalid");
+    }
+    if (this.closed) throw failure("display_attach_failed", "Browser page is closed");
+    const previous = this.displayAttachment;
+    if (previous?.requestId === signal.request_id) {
+      if (previous.previousGeneration !== signal.display_generation) {
+        throw failure("display_generation_mismatch", "Browser display request identity changed");
+      }
+      return previous.promise;
+    }
+    if (previous?.pending) throw failure("display_attach_busy", "Browser display attachment is pending");
+    if (signal.display_generation !== this.displayGeneration) {
+      throw failure("display_generation_mismatch", "Browser display generation changed");
+    }
+    if (!this.displaySession) throw failure("display_attach_unsupported", "Browser display attachment is unavailable");
+    const attachment = { requestId: signal.request_id, previousGeneration: this.displayGeneration, pending: true };
+    const videoProtocol = this.establishedVideoProtocol;
+    const audioProtocol = this.establishedAudioProtocol;
+    this.displayAttachment = attachment;
+    this.displayAvailable = false;
+    this.legacyDisplaySignalsAllowed = false;
+    const current = () => {
+      if (this.closed || this.displayAttachment !== attachment || !attachment.pending) {
+        throw failure("display_attach_failed", "Browser display attachment was canceled");
+      }
+    };
+    const retire = () => {
+      // Detach both identities before close callbacks can observe the old pair.
+      const video = this.ws, audio = this.audioWs;
+      this.ws = null;
+      this.audioWs = null;
+      this.markVideoClosed();
+      this.markAudioClosed();
+      for (const socket of [video, audio]) {
+        try { socket?.close(); } catch (_) {}
+      }
+    };
+    const prepare = Promise.resolve().then(async () => {
+      current();
+      retire();
+      this.resetSignaling();
+      this.resetAudioSignaling();
+      const size = browserDisplayMetrics(this.config);
+      const videoOffer = await (videoProtocol === "raw_json"
+        ? this.openLegacySelkiesSession(size) : this.openCurrentSelkiesSession());
+      current();
+      const audioOffer = await (audioProtocol === "raw_json"
+        ? this.openLegacySelkiesAudioSession(size) : this.openCurrentSelkiesAudioSession());
+      current();
+      if (this.videoClosed || this.audioClosed) throw new Error("Browser display signaling closed");
+      const generation = `display:${crypto.randomBytes(16).toString("hex")}`;
+      const display = this.supervisorResult(videoOffer.sdp.sdp, this.browserPage, this.wallet, audioOffer.sdp.sdp).display_session;
+      const result = {
+        schema: "elastos.browser.display-attach-result/v1",
+        page_id: this.pageId,
+        request_id: attachment.requestId,
+        previous_display_generation: attachment.previousGeneration,
+        display_generation: generation,
+        initial_offer: display.initial_offer,
+        audio_offer: display.audio_offer,
+      };
+      this.displayGeneration = generation;
+      this.displaySession = { ...display, display_generation: generation };
+      this.displayAvailable = true;
+      return result;
+    });
+    attachment.promise = withTimeout("Browser display attachment", 4000, prepare)
+      .catch(() => {
+        attachment.pending = false;
+        if (this.displayAttachment === attachment) retire();
+        throw failure("display_attach_failed", "Browser display attachment failed");
+      })
+      .finally(() => { attachment.pending = false; });
+    return attachment.promise;
+  }
+
+  signal(signal, channel) {
+    if (signal?.schema === "elastos.browser.display-attach-request/v1") {
+      if (channel !== undefined) throw Object.assign(new Error("Display attachment replaces both channels"), { code: "invalid_request" });
+      return this.attachDisplay(signal);
+    }
+    if (this.closed || !this.displayAvailable) {
+      throw Object.assign(new Error("Browser display is unavailable"), { code: "display_attach_failed" });
+    }
+    if (signal?.display_generation !== this.displayGeneration &&
+        !(signal?.display_generation === undefined && this.legacyDisplaySignalsAllowed)) {
+      throw Object.assign(new Error("Browser display generation changed"), { code: "display_generation_mismatch" });
+    }
     if (channel === "audio") {
       return this.signalAudio(signal);
     }
@@ -2720,6 +2857,7 @@ class SelkiesPage {
       ...this.signalingStats,
       pending_selkies_candidates: this.remoteCandidates.length,
       websocket_closed: this.closed,
+      video_signaling_closed: this.videoClosed,
     };
   }
 
@@ -2735,6 +2873,7 @@ class SelkiesPage {
       page_id: this.pageId,
       type,
       accepted: true,
+      display_generation: this.displayGeneration,
       candidates,
       end_of_candidates: false,
     };
@@ -2752,6 +2891,7 @@ class SelkiesPage {
       page_id: this.pageId,
       type,
       accepted: true,
+      display_generation: this.displayGeneration,
       candidates,
       end_of_candidates: false,
     };
@@ -2759,9 +2899,9 @@ class SelkiesPage {
 
   close() {
     this.markClosed();
-    this.ws.close();
+    this.ws?.close();
     this.markAudioClosed();
-    this.audioWs.close();
+    this.audioWs?.close();
     if (this.browserPage?.target_id) {
       closeBrowserPage(this.config.browserControl, this.browserPage).catch(() => {});
     }
@@ -2772,7 +2912,14 @@ class SelkiesPage {
       return;
     }
     this.closed = true;
+    this.displayAvailable = false;
     this.onClosed(this);
+    this.flushWaiters();
+  }
+
+  markVideoClosed() {
+    this.videoClosed = true;
+    this.displayAvailable = false;
     this.flushWaiters();
   }
 
@@ -5102,7 +5249,7 @@ async function main() {
       }
       const body = await readJsonRequest(req);
       if (req.method === "POST" && op === "webrtc") {
-        httpJson(res, 200, page.signal(body.signal, body.channel || "video"));
+        httpJson(res, 200, await page.signal(body.signal, body.channel));
         return;
       }
       if (req.method === "POST" && op === "input") {
@@ -5217,7 +5364,12 @@ async function main() {
         message: error instanceof Error ? error.message : String(error),
         stack: error instanceof Error ? error.stack || null : null,
       });
-      httpJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+      const displayStatus = Object.hasOwn(DISPLAY_CONTROL_HTTP_STATUS, error?.code)
+        ? DISPLAY_CONTROL_HTTP_STATUS[error.code] : null;
+      httpJson(res, displayStatus || (error?.code === "invalid_request" ? 400 : 500), {
+        error: error instanceof Error ? error.message : String(error),
+        ...(displayStatus ? { code: error.code } : {}),
+      });
     }
   });
   server.on("clientError", (error, socket) => {
