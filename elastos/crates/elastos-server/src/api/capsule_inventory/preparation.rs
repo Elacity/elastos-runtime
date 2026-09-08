@@ -758,14 +758,21 @@ impl PreparationOwner {
                     tracing::debug!(error = ?error, "private model preparation settlement uncertain");
                 }
             }
-            // The composer acquires this same inventory worker lock. Admission
-            // is already durable; activation failure retains that exact artifact.
-            drop(worker_lock);
-            if let Err(error) =
-                activate_admitted_model(&data, &registry, &operation, &stopping, &revalidate).await
+            // Admission and activation share this exact inventory worker guard.
+            // Short snapshot locks remain available during provider I/O.
+            if let Err(error) = activate_admitted_model(
+                &data,
+                &registry,
+                &operation,
+                &stopping,
+                &revalidate,
+                &worker_lock,
+            )
+            .await
             {
                 tracing::debug!(?error, "private model activation pending");
             }
+            drop(worker_lock);
         }));
         Ok(project(&current))
     }
@@ -777,6 +784,7 @@ async fn activate_admitted_model(
     operation: &str,
     stopping: &AtomicBool,
     revalidate: &Revalidate,
+    worker: &std::fs::File,
 ) -> anyhow::Result<()> {
     let record = load_operation(data_dir, operation)?;
     if record.state != PreparationState::Admitted {
@@ -790,7 +798,8 @@ async fn activate_admitted_model(
         "model activation stopped"
     );
     current_entry(data_dir, &record)?;
-    let config = crate::api::model_provider_config(data_dir, registry).await?;
+    let mut config = crate::api::model_provider_bridge_config(data_dir)?;
+    append_admitted_model_offers_locked(data_dir, registry, &mut config, worker).await?;
     revalidate()?;
     ensure!(
         !stopping.load(Ordering::Acquire),
@@ -1345,21 +1354,30 @@ pub(in crate::api) async fn model_runtime_projection(
 
 /// Compose admitted offers for Runtime-owned model-provider Init. This function
 /// has no capsule route; public inference still uses the existing model grant.
+/// The caller retains the returned worker guard through provider spawn/Init.
 pub async fn append_admitted_model_startup_offers(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
     config: &mut elastos_runtime::provider::BridgeProviderConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<std::fs::File>> {
     // A Home without preparation inventory keeps its operator offers unchanged.
     match std::fs::symlink_metadata(data_dir.join("model-preparation")) {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
         Ok(_) => {}
     }
-    let (snapshot, _worker) = {
-        let inventory = Inventory::open(data_dir, false)?;
-        (inventory.load()?, inventory.worker_lock()?)
-    };
+    let worker = Inventory::open(data_dir, false)?.worker_lock()?;
+    append_admitted_model_offers_locked(data_dir, registry, config, &worker).await?;
+    Ok(Some(worker))
+}
+
+async fn append_admitted_model_offers_locked(
+    data_dir: &Path,
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    config: &mut elastos_runtime::provider::BridgeProviderConfig,
+    _worker: &std::fs::File,
+) -> anyhow::Result<()> {
+    let snapshot = Inventory::open(data_dir, false)?.load()?;
     if !snapshot
         .records
         .iter()
@@ -1378,6 +1396,7 @@ pub async fn append_admitted_model_startup_offers(
         .as_array()
         .context("model startup offers unavailable")?
         .clone();
+    let mut admitted = Vec::new();
     for entry in entries {
         // Aliases authorize reuse of one artifact; they do not create duplicate
         // offers or transfer ownership between preparation request records.
@@ -1434,10 +1453,12 @@ pub async fn append_admitted_model_startup_offers(
                 "model":{"path":stage.path.join(&weights.path), "sha256":format!("sha256:{}",weights.sha256)},
                 "settings":settings
         });
+        admitted.push(serde_json::json!({"offer_id":offer["id"]}));
         offers.push(offer);
     }
     let mut extra = config.extra.clone();
     extra["offers"] = serde_json::Value::Array(offers);
+    extra["runtime_admitted_offers"] = serde_json::Value::Array(admitted);
     ensure!(
         serde_json::to_vec(&extra)?.len() <= 256 * 1024,
         "model startup config exceeds bound"
@@ -1935,7 +1956,7 @@ mod tests {
             let mut configured = config(root.path());
             // Derive the expected ID/policy once through the actual composer.
             // A catalog poll must not repeat its payload verification or Init.
-            append_admitted_model_startup_offers(root.path(), &registry, &mut configured)
+            let _ = append_admitted_model_startup_offers(root.path(), &registry, &mut configured)
                 .await
                 .unwrap();
             let mut offer = configured.extra["offers"][1].clone();
@@ -2083,7 +2104,7 @@ mod tests {
             registry: &elastos_runtime::provider::ProviderRegistry,
         ) -> (serde_json::Value, Arc<ReadinessOffersFixture>) {
             let mut configured = config(root);
-            append_admitted_model_startup_offers(root, registry, &mut configured)
+            let _ = append_admitted_model_startup_offers(root, registry, &mut configured)
                 .await
                 .unwrap();
             let mut offer = configured.extra["offers"][1].clone();
@@ -2673,6 +2694,9 @@ mod tests {
         struct ModelActivationFixture {
             busy: AtomicBool,
             calls: Mutex<Vec<serde_json::Value>>,
+            hold: AtomicBool,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
         }
 
         #[async_trait::async_trait]
@@ -2698,6 +2722,10 @@ mod tests {
             ) -> Result<serde_json::Value, elastos_runtime::provider::ProviderError> {
                 assert_eq!(request["op"], "init");
                 self.calls.lock().unwrap().push(request.clone());
+                if self.hold.load(Ordering::Acquire) {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
                 Ok(if self.busy.load(Ordering::Acquire) {
                     serde_json::json!({"status":"error", "code":"selection_unavailable"})
                 } else {
@@ -2705,6 +2733,202 @@ mod tests {
                         "protocol_version":"elastos.model-provider/v1", "offers_ready":1}})
                 })
             }
+        }
+
+        #[tokio::test]
+        async fn model_refresh_holds_inventory_worker_through_projected_registry_init() {
+            let (root, record, _, registry) = staged_fixture(now().unwrap(), true).await;
+            let _engine = install_engine(root.path());
+            let operator = serde_json::json!({
+                "id":"operator-owned", "title":"Operator model", "enabled":false,
+                "operation":"image.generate", "input_modalities":["application/json"],
+                "output_modalities":["application/json"],
+                "policy":{"concurrency_limit":1,"input_bytes_limit":32768,
+                    "inline_output_bytes_limit":65536,"event_bytes_limit":4096,
+                    "runtime_ms_limit":120000,"retention_secs":3600,
+                    "cancel_settlement_timeout_ms":15000},
+                "adapter":{"kind":"http_job_artifact", "create_url":"https://operator.invalid/create",
+                    "status_url":"https://operator.invalid/status", "cancel_url":null,
+                    "bearer_token":null, "poll_interval_ms":1000}
+            });
+            let config_dir = root.path().join("providers/model-provider");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            for dir in [root.path().join("providers"), config_dir.clone()] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let config_path = config_dir.join("config.json");
+            let operator_bytes =
+                serde_json::to_vec(&serde_json::json!({"offers":[operator.clone()]})).unwrap();
+            std::fs::write(&config_path, &operator_bytes).unwrap();
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let model = Arc::new(ModelActivationFixture::default());
+            model.hold.store(true, Ordering::Release);
+            registry
+                .register_sub_provider("model", model.clone())
+                .await
+                .unwrap();
+            let slot = registry
+                .registration_for_uri("elastos://model/")
+                .await
+                .unwrap();
+            let owner = PreparationOwner::default();
+            owner
+                .invoke(
+                    root.path(),
+                    Some(registry.clone()),
+                    caller(&context(), &method("status")),
+                    "status",
+                    &serde_json::json!({"operation_id":record.operation_id}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            let entered =
+                tokio::time::timeout(std::time::Duration::from_secs(5), model.entered.notified())
+                    .await;
+            let worker_held = Inventory::open(root.path(), false)
+                .unwrap()
+                .worker_lock()
+                .is_err();
+            let status = load_operation(root.path(), &record.operation_id).unwrap();
+            let kept = retention_intent(root.path(), &context(), &record.package_cid, true);
+            let calls = model.calls.lock().unwrap().clone();
+            // Poll the real replacement operation once; it must wait on Init's slot guard.
+            let replacement_blocked = tokio::select! {
+                biased;
+                _ = registry.unregister_sub_provider("model") => false,
+                _ = std::future::ready(()) => true,
+            };
+            // Always release and join before RED assertions so fixture cleanup owns all work.
+            model.release.notify_one();
+            join_worker(&owner).await;
+            assert!(
+                entered.is_ok(),
+                "activation did not enter the Registry Init barrier"
+            );
+            assert_eq!(calls.len(), 1);
+            assert!(
+                replacement_blocked,
+                "Registry replacement passed an in-flight Init"
+            );
+            assert_eq!(status.state, PreparationState::Admitted);
+            assert_eq!(
+                kept.unwrap()["kept"],
+                true,
+                "Keep must remain responsive during Init"
+            );
+            let offers = calls[0]["config"]["extra"]["offers"].as_array().unwrap();
+            assert_eq!(offers.len(), 2);
+            assert_eq!(offers[0], operator);
+            let projection = &calls[0]["config"]["extra"]["runtime_admitted_offers"];
+            let expected = serde_json::json!([{"offer_id":offers[1]["id"]}]);
+            assert_eq!(std::fs::read(&config_path).unwrap(), operator_bytes);
+            assert_eq!(
+                registry
+                    .registration_for_uri("elastos://model/")
+                    .await
+                    .unwrap(),
+                slot
+            );
+            assert!(Inventory::open(root.path(), false)
+                .unwrap()
+                .worker_lock()
+                .is_ok());
+            assert!(worker_held && projection == &expected,
+                "activation must retain inventory worker through Init and project only the admitted offer: worker_held={worker_held}, projection={projection}, expected={expected}");
+        }
+
+        #[tokio::test]
+        async fn model_startup_guard_retained_across_init_result_and_retry() {
+            let (root, record, _, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            // Composition failure releases the existing worker guard for retry.
+            assert!(crate::api::model_provider_config(root.path(), &registry)
+                .await
+                .is_err());
+            assert!(Inventory::open(root.path(), false)
+                .unwrap()
+                .worker_lock()
+                .is_ok());
+            let _engine = install_engine(root.path());
+            let model = Arc::new(ModelActivationFixture::default());
+            model.hold.store(true, Ordering::Release);
+            registry
+                .register_sub_provider("model", model.clone())
+                .await
+                .unwrap();
+            let bytes = std::fs::read(
+                root.path()
+                    .join("model-preparation")
+                    .join(format!("admitted-{}", record.admission_id))
+                    .join("weights.gguf"),
+            )
+            .unwrap();
+            for busy in [true, false] {
+                model.busy.store(busy, Ordering::Release);
+                let (config, worker) = crate::api::model_provider_config(root.path(), &registry)
+                    .await
+                    .unwrap();
+                assert!(worker.is_some());
+                assert!(Inventory::open(root.path(), false)
+                    .unwrap()
+                    .worker_lock()
+                    .is_err());
+                let init = registry.refresh_local_model_configuration(&config);
+                let during_init = async {
+                    let entered = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        model.entered.notified(),
+                    )
+                    .await;
+                    let held = Inventory::open(root.path(), false)
+                        .unwrap()
+                        .worker_lock()
+                        .is_err();
+                    let snapshot = Inventory::open(root.path(), false).unwrap().load();
+                    model.release.notify_one();
+                    assert!(entered.is_ok());
+                    assert!(held);
+                    assert!(
+                        snapshot.is_ok(),
+                        "short inventory lock must remain available"
+                    );
+                };
+                let (result, ()) = tokio::join!(init, during_init);
+                assert_eq!(result.is_err(), busy);
+                // Startup's caller owns this File until the Init result is handled.
+                assert!(Inventory::open(root.path(), false)
+                    .unwrap()
+                    .worker_lock()
+                    .is_err());
+                drop(worker);
+                assert!(Inventory::open(root.path(), false)
+                    .unwrap()
+                    .worker_lock()
+                    .is_ok());
+                assert_eq!(
+                    load_operation(root.path(), &record.operation_id)
+                        .unwrap()
+                        .reserved_bytes,
+                    record.reserved_bytes
+                );
+            }
+            let calls = model.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0], calls[1]);
+            assert_eq!(
+                calls[0]["config"]["extra"]["runtime_admitted_offers"],
+                serde_json::json!([{"offer_id":calls[0]["config"]["extra"]["offers"][0]["id"]}])
+            );
+            assert_eq!(
+                std::fs::read(
+                    root.path()
+                        .join("model-preparation")
+                        .join(format!("admitted-{}", record.admission_id))
+                        .join("weights.gguf")
+                )
+                .unwrap(),
+                bytes
+            );
         }
 
         #[tokio::test]
@@ -2734,6 +2958,10 @@ mod tests {
                 .unwrap();
             join_worker(&owner).await;
             let pending = load_operation(root.path(), &record.operation_id).unwrap();
+            assert!(Inventory::open(root.path(), false)
+                .unwrap()
+                .worker_lock()
+                .is_ok());
             assert_eq!(pending.state, PreparationState::Admitted);
             assert_eq!(pending.projection()["activation_pending"], true);
             assert_eq!(pending.reserved_bytes, record.reserved_bytes);
@@ -2757,6 +2985,10 @@ mod tests {
                     .unwrap();
                 join_worker(&owner).await;
                 let admitted = load_operation(root.path(), &record.operation_id).unwrap();
+                assert!(Inventory::open(root.path(), false)
+                    .unwrap()
+                    .worker_lock()
+                    .is_ok());
                 assert_eq!(admitted.state, PreparationState::Admitted);
                 assert_eq!(admitted.projection()["activation_pending"], false);
                 assert!(admitted.projection().get("inference_ready").is_none());
@@ -2858,7 +3090,7 @@ mod tests {
             let registry = elastos_runtime::provider::ProviderRegistry::new();
             let mut actual = config(empty.path());
             let before = serde_json::to_value(&actual).unwrap();
-            append_admitted_model_startup_offers(empty.path(), &registry, &mut actual)
+            let _ = append_admitted_model_startup_offers(empty.path(), &registry, &mut actual)
                 .await
                 .unwrap();
             assert_eq!(serde_json::to_value(&actual).unwrap(), before);
@@ -2867,7 +3099,7 @@ mod tests {
             let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
             let mut actual = config(root.path());
             let before = actual.extra.clone();
-            append_admitted_model_startup_offers(root.path(), &registry, &mut actual)
+            let _ = append_admitted_model_startup_offers(root.path(), &registry, &mut actual)
                 .await
                 .unwrap();
             assert_eq!(actual.extra, before, "pending rename is not admitted");
@@ -2891,7 +3123,7 @@ mod tests {
             let _engine = install_engine(root.path());
             let mut first = config(root.path());
             let operator = first.extra["offers"][0].clone();
-            append_admitted_model_startup_offers(root.path(), &registry, &mut first)
+            let _ = append_admitted_model_startup_offers(root.path(), &registry, &mut first)
                 .await
                 .unwrap();
             assert_eq!(first.extra["offers"].as_array().unwrap().len(), 2);
@@ -2938,7 +3170,7 @@ mod tests {
             let state_path = root.path().join("model-preparation/state.json");
             let persisted = std::fs::read(&state_path).unwrap();
             let mut restarted = config(root.path());
-            append_admitted_model_startup_offers(root.path(), &registry, &mut restarted)
+            let _ = append_admitted_model_startup_offers(root.path(), &registry, &mut restarted)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2980,7 +3212,7 @@ mod tests {
             admit(root.path(), &record);
             let _engine = install_engine(root.path());
             let mut expected = config(root.path());
-            append_admitted_model_startup_offers(root.path(), &registry, &mut expected)
+            let _ = append_admitted_model_startup_offers(root.path(), &registry, &mut expected)
                 .await
                 .unwrap();
             let records = Inventory::open(root.path(), false)
@@ -3004,7 +3236,8 @@ mod tests {
                 backend.release.notify_one();
             };
             let (result, ()) = tokio::join!(verify, keep);
-            result.expect("independent Keep must not invalidate unchanged startup admission");
+            let _ =
+                result.expect("independent Keep must not invalidate unchanged startup admission");
             assert_eq!(actual.extra, expected.extra);
             let current = Inventory::open(root.path(), false).unwrap().load().unwrap();
             assert_eq!(current.records, records);
@@ -3043,7 +3276,7 @@ mod tests {
                 admit(root.path(), &record);
                 let _engine = install_engine(root.path());
                 let mut actual = config(root.path());
-                append_admitted_model_startup_offers(root.path(), &registry, &mut actual)
+                let _ = append_admitted_model_startup_offers(root.path(), &registry, &mut actual)
                     .await
                     .unwrap();
                 ids.push(actual.extra["offers"][1]["id"].clone());
@@ -3077,7 +3310,7 @@ mod tests {
             change_config(root.path(), |config| {
                 config["model_catalog"] = serde_json::Value::Null
             });
-            append_admitted_model_startup_offers(root.path(), &registry, &mut actual)
+            let _ = append_admitted_model_startup_offers(root.path(), &registry, &mut actual)
                 .await
                 .unwrap();
             assert_eq!(
@@ -3192,11 +3425,12 @@ mod tests {
             let _engine = install_engine(root.path());
             let mut actual = config(root.path());
             actual.extra["offers"] = serde_json::json!([]);
-            append_admitted_model_startup_offers(root.path(), &registry, &mut actual)
+            let worker = append_admitted_model_startup_offers(root.path(), &registry, &mut actual)
                 .await
                 .unwrap();
             let id = actual.extra["offers"][0]["id"].clone();
             let bridge = ProviderBridge::spawn(&binary, actual).await.unwrap();
+            drop(worker);
             let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 let status = bridge.send_raw(&serde_json::json!({"op":"status"})).await?;
                 let offers = bridge

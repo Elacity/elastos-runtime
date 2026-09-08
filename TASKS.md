@@ -89,7 +89,9 @@ acceptance. Browser implementation belongs to its separate owner.
    idempotence. Preparation belongs to Models; composers require the chosen
    offer's current readiness before a new dispatch. Actual inference needs its
    own run evidence. Provider-source tests verify immutable admitted-offer retirement
-   and retained ownership on uncertain close. Complete Runtime/Registry/inventory
+   and retained ownership on uncertain close. Runtime holds the inventory worker
+   lock through startup and refresh Init, and projects verified admitted-offer
+   provenance while preserving operator configuration. Complete Runtime/Registry/inventory
    retirement and run/Keep/reference checks before model-byte eviction.
 3. [ ] Package the exact existing Qwen model and verified engine for isolated
    setup with a real pinned signed catalog and complete closure, publisher trust

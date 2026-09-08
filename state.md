@@ -330,7 +330,13 @@ The integrated source includes these durable facts:
   existing model provider includes that ID and its execution settings in the
   run binding. Its Runtime-owned profile is limited to the verified
   Darwin-arm64 engine settings. Startup and admission share one private config
-  composer with canonical base and journal paths. Additive Init refresh keeps
+  composer with canonical base and journal paths. Runtime retains the inventory
+  worker lock through startup Init/registration and refresh Init/result handling;
+  short inventory transactions remain available for status and Keep. The composer
+  projects private admitted-offer IDs only after verification and preserves
+  operator configuration. Focused source and native-provider Init/refresh tests
+  pass; they do not establish full-Qwen inference or installed acceptance.
+  Additive Init refresh keeps
   the same provider process, Registry slot and journal, with exact existing
   operator offers. The serialized coordinator checks and applies the config;
   active workers, cached engines and unresolved runs block additions. Exact

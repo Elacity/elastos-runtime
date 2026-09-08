@@ -852,7 +852,7 @@ async fn setup_server_infrastructure_impl(
     match binaries::resolve_verified_native_provider_binary("model-provider") {
         Ok(Some(path)) => {
             match model_provider_startup_config(&data_dir, &provider_registry).await {
-                Ok(model_config) => {
+                Ok((model_config, worker)) => {
                     match provider::ProviderBridge::spawn(&path, model_config).await {
                         Ok(bridge) => {
                             let bridge = Arc::new(bridge);
@@ -873,6 +873,7 @@ async fn setup_server_infrastructure_impl(
                         }
                         Err(_) => tracing::warn!("Skipping model-provider because startup failed"),
                     }
+                    drop(worker);
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -2861,9 +2862,10 @@ mod tests {
         let path = write_model_provider_operator_config(&tempdir, raw);
         let expected = model_provider_bridge_config(tempdir.path()).unwrap();
         let registry = provider::ProviderRegistry::new();
-        let actual = model_provider_startup_config(tempdir.path(), &registry)
+        let (actual, worker) = model_provider_startup_config(tempdir.path(), &registry)
             .await
             .unwrap();
+        assert!(worker.is_none());
         assert_eq!(
             serde_json::to_value(&actual).unwrap(),
             serde_json::to_value(&expected).unwrap()
@@ -2884,9 +2886,10 @@ mod tests {
         std::os::unix::fs::symlink(tempdir.path(), &alias).unwrap();
         let registry = provider::ProviderRegistry::new();
         let initial = model_provider_bridge_config(&alias).unwrap();
-        let refreshed = model_provider_startup_config(&alias, &registry)
+        let (refreshed, worker) = model_provider_startup_config(&alias, &registry)
             .await
             .unwrap();
+        assert!(worker.is_none());
         let canonical =
             model_provider_bridge_config(&tempdir.path().canonicalize().unwrap()).unwrap();
         assert_eq!(

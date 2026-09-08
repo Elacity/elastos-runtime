@@ -312,7 +312,11 @@ policy slices:
    retry, concurrent duplicate selection, low disk, crash/restart and exact
    partial cleanup. Include proof that provider work stops, not just UI progress.
 3. **Retention closure.** Additive activation is implemented through the existing
-   Init boundary. Its serialized coordinator keeps one process, Registry slot
+   Init boundary. Runtime holds the existing inventory worker lock through startup
+   Init/registration and refresh Init/result handling. The shared composer emits
+   private provenance for verified admitted offers and preserves operator config;
+   short inventory transactions remain available for status and Keep.
+   Its serialized coordinator keeps one process, Registry slot
    and journal, preserves exact existing offers, and blocks additions while
    workers, cached engines or unresolved runs retain execution ownership.
    Identical Init is idempotent; unresolved bindings survive expiry and restart.

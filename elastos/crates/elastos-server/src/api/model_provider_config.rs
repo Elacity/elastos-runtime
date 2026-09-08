@@ -50,21 +50,24 @@ pub fn model_provider_bridge_config(
     })
 }
 
+/// Return verified Init config with the existing inventory worker guard.
+/// Startup retains the guard through provider spawn, Init and registration.
 pub async fn model_provider_config(
     data_dir: &Path,
     registry: &provider::ProviderRegistry,
-) -> anyhow::Result<provider::BridgeProviderConfig> {
+) -> anyhow::Result<(provider::BridgeProviderConfig, Option<fs::File>)> {
     let config = model_provider_bridge_config(data_dir)?;
     #[cfg(unix)]
     {
         let mut config = config;
-        super::append_admitted_model_startup_offers(data_dir, registry, &mut config).await?;
-        Ok(config)
+        let worker =
+            super::append_admitted_model_startup_offers(data_dir, registry, &mut config).await?;
+        Ok((config, worker))
     }
     #[cfg(not(unix))]
     {
         let _ = registry;
-        Ok(config)
+        Ok((config, None))
     }
 }
 
