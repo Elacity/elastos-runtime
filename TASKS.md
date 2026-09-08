@@ -64,10 +64,12 @@ alongside the local, operator and remote journeys.
   Runtime artifact acquisition through the existing package installer and
   repeat the fresh Home journey. A developer-supplied store is useful integration
   evidence but leaves the out-of-box acceptance requirement open.
-  Acquisition and packaging source work now has an independent owner. Reuse
-  verified existing images, prepare a complete compatible package through the
-  Runtime installer, and connect acquisition before local Engine readiness.
-  Published image/helper metadata and large-artifact transport remain dependencies.
+  Reviewed source `7879f439` connects verified packaging and acquisition before
+  first-party local Engine readiness, including atomic replacement and cached
+  byte verification. Its 25 Rust and 26 source/package checks pass. Next prove
+  an actual publishable bundle and matching helpers through the existing
+  installer. The buffered 200 MiB Carrier reply ceiling remains a concrete
+  release dependency; existing verified images remain the installed test input.
 - **B02.startup / verifying / coordinator; independent review pending.**
   Prerequisites: accepted compatibility contract, image `d03ec029`, and reviewed
   installed runs 50-52. Reuse Runtime, native helpers, image and UI unless a
@@ -100,6 +102,9 @@ alongside the local, operator and remote journeys.
   their non-delegatable authority. Writer admission, revocation, handoff and
   adapter conformance stay open while the coordinator integrates installation
   and remote service work.
+  A bounded owner-approved click/type writer slice passes source tests. Parent
+  review now checks the real CDP wrapper's reconnect replay and native handoff
+  after timeout before accepting that slice for installation.
 - **B08/B09.first-remote / active / independent delegated source owner.**
   Prerequisite: accepted Engine/Exit identity and Runtime service contracts.
   Identify the first missing product operation for A/B/A and A/A/B against
@@ -113,11 +118,18 @@ alongside the local, operator and remote journeys.
   acknowledgement before enabling use. Required decision revisions preserve
   a newer denial against an old approval. Independent source review accepts
   71 Home and 32 Exit tests; matching installed activation is next. The source
-  owner proceeds to authenticated Carrier grant admission and bounded
-  revocation. Remote Engine offer/invocation follows. The isolated Linux
+  owner has completed authenticated Carrier grant admission and bounded
+  revocation in `21028a46`, with independent review. Both installed Runtime
+  roles and the relay match that candidate; local run 63 passes video/audio,
+  input, reload and exact close. Remote Engine offer/invocation proceeds in
+  parallel. The isolated Linux
   consumer/Exit build and installed Home sign-in now pass. Both test
-  installations accept the private collaboration configuration; normal
-  People/Services approval and the Mac/server Browser journey remain unproved.
+  installations use the private collaboration configuration. Normal People
+  contact acceptance and remote Exit offer discovery pass. The first installed
+  access request fails at Services' managed Home shell attachment. The coordinator
+  repairs it to reuse the configured Runtime Carrier; a delegated reviewer
+  tests that operation without any managed shell coordinates. Service approval
+  and the Mac/server Browser journey remain pending.
   The fresh Linux restart repair `2b640973` passes its active target smoke and
   installed Home proof with reused native binaries.
 

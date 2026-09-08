@@ -70,9 +70,11 @@ volatile proof logs remain outside the repository.
 
 ## Browser contract and device qualification
 
-The task Mac now runs Runtime/Exit source `788e5414`, Runtime hash
-`88e7e2f47deb87b56d85d4405f7c941bc38e2d69366d7e4f9e2e880af1149c6e`
-and Exit hash `51d89371b234189c16923aac59737b5f24badec4390866d7abae6c875b11b316`.
+The task Mac now runs Runtime/relay source `21028a46`, Runtime hash
+`0bb277c4e28ed474ca801e1a5b505326198f824cf5979a88010a8f15a9a96044`
+and relay hash `9068894c129629d67a06e373535b41c59ff979ea1e5c5b95e22e2709e4b90a4d`.
+The Exit provider retains hash
+`51d89371b234189c16923aac59737b5f24badec4390866d7abae6c875b11b316`.
 The inspection adapter from `4dd0a216` retains hash
 `d6b372c0754ebedbe05a1b80de2df61c898e3b23170e9bcd807713c3daf09426`.
 Its rootfs is `32dde56898859e05c00b0eb753c2365a65015a859cef1c71401245e0eff91ded`
@@ -103,9 +105,28 @@ clears all 13 effects in 664 ms. Independent agent review accepts this bounded
 run; ordinary cross-Runtime service approval is still required to prove
 installed activation.
 
+Run 63 passes the same local journey on the authenticated Carrier candidate:
+decoded video/audio, navigation, typing, scrolling, inspection and viewer reload.
+Reload takes 3143 ms; close clears all 13 effects in 658 ms and leaves zero
+Runtime/control obligations. Thirteen existing artifacts are reused. This
+proves local regression behavior after the Carrier change; remote placement
+requires its own installed journey.
+
+Source `21028a46` binds remote Exit use to the running Runtime endpoint,
+signed Services approval, current accepted contact, exact principal and grant,
+expiry and quotas. Independent review accepts 20 stream tests, an actual
+Services-issued Browser caller test and 18 relay tests. The relay rejects
+private IPv4-mapped IPv6 and unverified upstream proxy DNS for public-only grants.
+Source `7879f439` adds verified image packaging and lazy acquisition before
+first-party local Engine readiness. Its 25 Rust and 26 packaging/source cases
+pass. Actual image publication, matching host helpers, the current 200 MiB
+buffered Carrier transfer ceiling and fresh installed acquisition stay open.
+
 An isolated Linux candidate now has a separately built Runtime and ten native
 providers for the consumer and Exit roles. Its Runtime hash is
-`dac82b80ca03349f32282750e8c515a0f0c70d84f7898d4b36f1deb14a9678ad`.
+`62c329eaa6e4a32e26be40c1783966e939d06d4667cc8913610d961f30623ae0`.
+Its matching `21028a46` Exit relay hash is
+`a9e79e8db5d8e4f810633a734ced073018ffdfe7db280209d1d9898fb5a5b5b6`.
 Fresh startup exposed a restart-script error: an `already_ready` migration
 creates no rollback, while the script required one. Source `2b640973` corrects
 that case and retains rejection of unproved missing backups. The full Linux
@@ -114,8 +135,12 @@ parity. Native binaries were reused for this script repair. Installed Home and
 Services return matching HTTP 200 content; Brave creates a separate test owner,
 opens Browser through Home and checks unsupported-viewer rejection before page
 allocation. This target has no KVM and supplies no local Engine qualification.
-Both owned installations now accept the same private collaboration configuration;
-normal contact acceptance, service approval and remote Browser journeys are next.
+Both owned installations use the same private collaboration configuration.
+Normal People discovery, Inbox contact acceptance and the remote Exit offer
+projection pass. Sending the Services access request fails because this path
+expects a separate managed Home shell, while the configured Gateway already
+owns Carrier. A source repair to use that existing Runtime service is under
+regression review. Installed service approval and remote Browser journeys follow.
 The public live installation remains unchanged.
 
 The preceding image used dependency repair `cbb1e099`, rootfs
