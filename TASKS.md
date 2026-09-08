@@ -42,15 +42,21 @@ receipts; source-only RNG work remains outside this image.
 | B01 shared compatibility/ownership contract | Accepted prerequisite; full B01 stays open | Use the contract for B02/B03/B05/B06 and operator work. |
 | Requested local Home-to-close journey | Runs 41 and 42 independently accepted on the current image | Keep this bounded milestone accepted while qualifying recovery and devices. |
 | B02 Mac TURN admission | Installed valid/absent/nonexistent program cases accepted | Complete automatic artifact admission and fresh-install proof. |
-| B03 passive retained diagnostics | Installed log reads capture the reload failure without audio commands | Reproduce the ICE object lifetime defect with matching guest libraries. |
+| B03 passive retained diagnostics | Installed log reads capture the reload failure without audio commands | Matching-library reproduction confirms the defect; install reviewed source `77983efd` and repeat the journey. |
 | B05 acknowledged click then text | Installed click and first character each return accepted Runtime results in run 43 | Keep composition, motion, mixed transports and manual interaction open. |
-| B06 viewer reload | Run 42 passes in 1066 ms; run 41 crashes the media producer during video pipeline recreation | Repair the smallest proven object-lifetime defect and repeat the journey. |
+| B06 viewer reload | Run 42 passes in 1066 ms; run 41 crashes the media producer during video pipeline recreation | The guarded Python reference repair passes both ownership cases; verify its installed image. |
 | B06 five-second interruption | Run 44 passes a 5001 ms cut, recovery in 1911 ms and cleanup in 624 ms | Independent review accepts this bounded result; retain full recovery cases and leases. |
 
 B04 can now implement owner-authorized inspection of the actual Engine page
 against the accepted contract. Its next slice needs capability negotiation,
 bounded snapshots, pagination and document generations. Writer leases, delegated
 operators and Playwright/Camofox/Camoufox adapters retain their full gates.
+
+ICE repair `77983efd` reproduces the dangling wrapper on the first teardown
+with the exact guest library versions. The guarded repair releases all 400
+agents over 100 cycles in each of two ownership cases. Six source guard tests,
+the stage smoke and independent review pass. Its image build preserves the
+previous guest baseline and excludes the unrelated entropy change.
 
 The fractional-timer regression fails before the probe correction; 254 related
 checks pass after it. The recovery threshold remains five seconds. Source tests

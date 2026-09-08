@@ -78,7 +78,10 @@ Runtime, adapter, VZ helper, kernel and Browser UI were reused and verified.
 Runs 41 and 42 pass the requested Home-to-close journey. Run 42 also passes
 viewer reload in 1066 ms and exact cleanup in 600 ms. Run 41 instead crashes the
 Selkies producer while recreating its video pipeline: GObject assertions precede
-a fatal allocation failure. The ICE wrapper lifetime is under source diagnosis.
+a fatal allocation failure. The matching-library reproduction confirms a dangling ICE wrapper. Reviewed
+source `77983efd` restores only the missing native reference and releases the
+wrapper on stop. Both reference-ownership cases pass 100 cycles each, releasing
+all 400 agents. The image update is building; installed proof is pending.
 Independent agent review accepts both core journeys and the single bounded
 reload in run 42. Repeated recovery qualification remains open.
 Run 43 confirms accepted Runtime click/text responses and normal browsing, then
