@@ -123,7 +123,12 @@ export async function diagnoseBrowserViewerReload({ expectedUrl, readReceipt, re
       }
     }
     evidence.samples.push({ at_ms: elapsed(), phase, binding_matches: true,
-      viewer_ready: Boolean(media), ...(viewer ? { document_hash: hash(viewer.document_id) } : {}),
+      viewer_ready: Boolean(media), viewer_has_page: Boolean(viewer?.page_id),
+      video_present: raw?.video?.present === true,
+      ...(count(raw?.video?.ready_state) ? { video_ready_state: raw.video.ready_state } : {}),
+      ...(count(raw?.video?.decoded_frames) ? { video_decoded_frames: raw.video.decoded_frames } : {}),
+      video_bytes_reported: count(raw?.video?.video_bytes_received),
+      ...(viewer ? { document_hash: hash(viewer.document_id) } : {}),
       ...(media || {}) });
     if (evidence.samples.length > 32) evidence.samples.shift();
     return media;

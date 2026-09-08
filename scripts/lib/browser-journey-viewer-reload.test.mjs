@@ -314,3 +314,16 @@ for (const options of [{ stopError: true }, { stopHangs: true }]) {
     assert.equal(evidence.observer.stopped, false);
   });
 }
+
+test("pending media evidence distinguishes retained viewer, absent media and missing byte reports", async () => {
+  for (const noMedia of [true, false]) {
+    const { evidence } = await fails(noMedia ? { noMedia: true } : { removeBytes: true }, "reload_deadline");
+    const sample = evidence.samples.find(row => row.phase === "reload");
+    assert.equal(sample.viewer_has_page, true);
+    assert.equal(sample.viewer_ready, false);
+    assert.equal(sample.video_present, !noMedia);
+    assert.equal(sample.video_bytes_reported, false);
+    if (noMedia) assert.equal(sample.video_ready_state, undefined);
+    else { assert.equal(sample.video_ready_state, 4); assert.ok(sample.video_decoded_frames > 0); }
+  }
+});
