@@ -74,8 +74,12 @@ acceptance. Browser implementation belongs to its separate owner.
    samples, not continuous peaks. Prove bounded peak memory/disk and cold
    delivery at the intended scale while retaining the 10% free-space floor.
    Exact Qwen and installed acceptance remain in the gates below.
-2. [ ] Bind the exact admitted artifact to the existing model provider and
-   offer. Expose the same Runtime facts through Marketplace Models, System,
+2. [ ] Refresh admitted offers within the existing model provider after startup.
+   Check the journal and workers and apply configuration in one serialized
+   operation; preserve operator offers, active runs and unresolved settlement.
+   Keep the same process, slot and journal across restart. Startup binding is
+   source-verified; live refresh can progress while scaled cold-delivery proof
+   remains open. Expose the same Runtime facts through Marketplace Models, System,
    Assistant and Home Agent for Use, progress, cancel, retry, Keep and selection.
    Use the existing catalog, inventory and pickers. Preserve drafts and runs.
    Selection may prepare the chosen model; inference requires that exact
@@ -90,6 +94,11 @@ acceptance. Browser implementation belongs to its separate owner.
    storage. Prove a cold exact-model reply, restart without another transfer,
    cancel/cleanup, and retention while idle and busy. Source fixtures establish
    neither production publisher identity nor installed model readiness.
+   The generic directory publisher still reads whole files into a base64 JSON
+   array. Use bounded operator/provider import with a recorded bootstrap receipt,
+   or separately fix and prove that publisher before sending a large model
+   through it. Reserve the complete proof layout, including any separate
+   publisher backend copy, above the 10% free-space floor.
 4. [ ] Install the combined reviewed source on the authorized isolated Homes
    and verify exact artifact parity before guided Brave acceptance. Preserve
    current accounts, Wallets, passkeys, profiles and content; use disposable

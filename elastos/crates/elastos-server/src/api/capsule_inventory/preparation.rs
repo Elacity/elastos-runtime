@@ -935,28 +935,9 @@ async fn finish_admission(
         !reconcile_existing || renamed,
         "admission rename is not present"
     );
-    let index = stage.read_index()?;
-    ensure!(
-        index.len() as u64 == record.index_bytes
-            && serde_json::from_slice::<serde_json::Value>(&index)?
-                == current_entry(data_dir, &record)?.object_manifest,
-        "stored index differs from signed catalog"
-    );
-    let mut files: Vec<_> = closure
-        .files
-        .iter()
-        .map(|f| (f.path.clone(), f.size))
-        .collect();
-    files.push(("_elastos_object.json".into(), record.index_bytes));
-    files.sort();
-    let actual = registry
-        .hash_local_ipfs_directory(&stage.path, &files, record.total_bytes + record.index_bytes)
-        .await?;
+    let entry = current_entry(data_dir, &record)?;
+    verify_package_identity(registry, &stage, &record, &entry, closure).await?;
     require_admission(data_dir, id, stop, revalidate, reconcile_existing)?;
-    ensure!(
-        actual == record.package_cid,
-        "independent package CID mismatch"
-    );
     stage.check()?;
     let inventory = Inventory::open(data_dir, false)?;
     let mut snapshot = inventory.load()?;
@@ -981,6 +962,171 @@ async fn finish_admission(
         .context("preparation unavailable")?
         .state = PreparationState::Admitted;
     inventory.save(&snapshot)
+}
+
+async fn verify_package_identity(
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    stage: &storage::Stage,
+    record: &PreparationRecord,
+    entry: &super::VerifiedModelCatalogEntry,
+    closure: &crate::content::ContentObjectManifest,
+) -> anyhow::Result<()> {
+    let index = stage.read_index()?;
+    ensure!(
+        index.len() as u64 == record.index_bytes
+            && serde_json::from_slice::<serde_json::Value>(&index)? == entry.object_manifest,
+        "stored index differs from signed catalog"
+    );
+    let mut files: Vec<_> = closure
+        .files
+        .iter()
+        .map(|f| (f.path.clone(), f.size))
+        .collect();
+    files.push(("_elastos_object.json".into(), record.index_bytes));
+    files.sort();
+    let actual = registry
+        .hash_local_ipfs_directory(&stage.path, &files, record.total_bytes + record.index_bytes)
+        .await?;
+    ensure!(
+        actual == record.package_cid,
+        "independent package CID mismatch"
+    );
+    stage.check()
+}
+
+fn local_model_startup_profile(platform: &str) -> anyhow::Result<serde_json::Value> {
+    ensure!(
+        platform == "darwin-arm64",
+        "admitted model host profile is unavailable"
+    );
+    // Runtime-owned profile from the verified local Qwen/engine proof. Catalog
+    // metadata cannot tune execution. Other hosts require their own proof.
+    Ok(serde_json::json!({
+        "context_size":4096, "parallel":1, "threads":8, "batch_threads":8,
+        "gpu_layers":99, "health_timeout_ms":120000,
+        "shutdown_timeout_ms":5000, "enable_thinking":false
+    }))
+}
+
+/// Compose the existing model-provider Init at Runtime startup. This function
+/// has no capsule route; public inference still uses the existing model grant.
+pub async fn append_admitted_model_startup_offers(
+    data_dir: &Path,
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    config: &mut elastos_runtime::provider::BridgeProviderConfig,
+) -> anyhow::Result<()> {
+    // A Home without preparation inventory keeps its operator offers unchanged.
+    match std::fs::symlink_metadata(data_dir.join("model-preparation")) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+        Ok(_) => {}
+    }
+    let (snapshot, _worker) = {
+        let inventory = Inventory::open(data_dir, false)?;
+        (inventory.load()?, inventory.worker_lock()?)
+    };
+    if !snapshot
+        .records
+        .iter()
+        .any(|r| r.state == PreparationState::Admitted)
+    {
+        return Ok(());
+    }
+    let manifest_bytes =
+        super::read_model_catalog_file(data_dir, "components.json", 4 * 1024 * 1024)?;
+    let manifest: crate::setup::ComponentsManifest = serde_json::from_slice(&manifest_bytes)?;
+    let Some(trust) = manifest.model_catalog.as_ref() else {
+        return Ok(());
+    };
+    let entries = super::model_catalog_entries(data_dir)?.context("model catalog unavailable")?;
+    let mut offers = config.extra["offers"]
+        .as_array()
+        .context("model startup offers unavailable")?
+        .clone();
+    for entry in entries {
+        // Aliases authorize reuse of one artifact; they do not create duplicate
+        // offers or transfer ownership between preparation request records.
+        let Some(record) = snapshot.records.iter().find(|r| {
+            r.state == PreparationState::Admitted
+                && r.package_cid == entry.cid
+                && r.catalog_head_cid == trust.head_cid
+        }) else {
+            continue;
+        };
+        let entry = current_entry(data_dir, record)?;
+        require_cache_budget(data_dir, &snapshot)?;
+        let settings = local_model_startup_profile(&crate::setup::detect_platform())?;
+        let engine = crate::setup::verified_local_model_engine(data_dir, &manifest)?;
+        let stage = Inventory::open(data_dir, false)?.admitted(&record.admission_id)?;
+        let closure = crate::content::parse_content_object_manifest(
+            &entry.cid,
+            &serde_json::to_vec(&entry.object_manifest)?,
+        )?;
+        for file in &closure.files {
+            stage.verify_model_file(file, file.path == entry.manifest.entrypoint)?;
+        }
+        verify_package_identity(registry, &stage, record, &entry, &closure).await?;
+        current_entry(data_dir, record)?;
+        ensure!(
+            super::read_model_catalog_file(data_dir, "components.json", 4 * 1024 * 1024)?
+                == manifest_bytes
+                && crate::setup::verified_local_model_engine(data_dir, &manifest)? == engine,
+            "model startup engine or policy changed"
+        );
+        let current = Inventory::open(data_dir, false)?.load()?;
+        ensure!(
+            current == snapshot,
+            "model admission changed during startup"
+        );
+        let weights = closure
+            .files
+            .iter()
+            .find(|f| f.path == entry.manifest.entrypoint)
+            .context("model entrypoint is unavailable")?;
+        let identity = serde_json::json!({
+            "schema":"elastos.model.admitted-offer/v1",
+            "cid":entry.cid, "entrypoint":weights.path, "weights_sha256":weights.sha256,
+            "engine_receipt_sha256":engine.receipt_sha256, "engine_sha256":engine.sha256,
+        });
+        let id = format!(
+            "model:{}",
+            hex::encode(Sha256::digest(serde_json::to_vec(&identity)?))
+        );
+        ensure!(
+            offers.len() < 64
+                && !offers
+                    .iter()
+                    .any(|offer| offer["id"].as_str() == Some(id.as_str())),
+            "admitted model offer conflicts with operator configuration"
+        );
+        // The provider's execution binding includes this CID-bound offer ID,
+        // artifact digests and policy. Paths and request aliases are not identity.
+        offers.push(serde_json::json!({
+            "id":id, "title":entry.manifest.name, "operation":"text.generate",
+            "input_modalities":["text/plain"], "output_modalities":["text/plain"],
+            "enabled":true,
+            "policy":{
+                "concurrency_limit":1, "input_bytes_limit":32768,
+                "inline_output_bytes_limit":65536, "event_bytes_limit":4096,
+                "runtime_ms_limit":120000, "retention_secs":3600,
+                "cancel_settlement_timeout_ms":15000
+            },
+            "adapter":{
+                "kind":"local_llama_cpp_text",
+                "engine":{"path":engine.path, "sha256":engine.sha256},
+                "model":{"path":stage.path.join(&weights.path), "sha256":format!("sha256:{}",weights.sha256)},
+                "settings":settings
+            }
+        }));
+    }
+    let mut extra = config.extra.clone();
+    extra["offers"] = serde_json::Value::Array(offers);
+    ensure!(
+        serde_json::to_vec(&extra)?.len() <= 256 * 1024,
+        "model startup config exceeds bound"
+    );
+    config.extra = extra;
+    Ok(())
 }
 
 fn settle_failure(data_dir: &Path, id: &str, drained: bool) -> anyhow::Result<()> {
@@ -1210,12 +1356,22 @@ mod tests {
         serde_json::Value,
         std::collections::BTreeMap<String, Vec<u8>>,
     ) {
+        package_fixture_with_provenance(weights, b"fixture provenance")
+    }
+
+    fn package_fixture_with_provenance(
+        weights: Vec<u8>,
+        provenance: &[u8],
+    ) -> (
+        serde_json::Value,
+        std::collections::BTreeMap<String, Vec<u8>>,
+    ) {
         let mut payload = super::super::tests::model_catalog_fixture();
         let mut files: std::collections::BTreeMap<String, Vec<u8>> =
             std::collections::BTreeMap::from([
                 ("LICENSE".into(), b"fixture license".to_vec()),
                 ("LICENSE.base".into(), b"fixture base license".to_vec()),
-                ("PROVENANCE.md".into(), b"fixture provenance".to_vec()),
+                ("PROVENANCE.md".into(), provenance.to_vec()),
                 (
                     "capsule.json".into(),
                     serde_json::to_vec(&payload["entries"][0]["capsule_manifest"]).unwrap(),
@@ -1259,8 +1415,22 @@ mod tests {
         Arc<PreparationBackend>,
         Arc<elastos_runtime::provider::ProviderRegistry>,
     ) {
-        let root = tempfile::tempdir().unwrap();
         let (payload, files) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+        staged_package_fixture(created_at, renamed, payload, files).await
+    }
+
+    async fn staged_package_fixture(
+        created_at: u64,
+        renamed: bool,
+        payload: serde_json::Value,
+        files: std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> (
+        tempfile::TempDir,
+        PreparationRecord,
+        Arc<PreparationBackend>,
+        Arc<elastos_runtime::provider::ProviderRegistry>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
         write_preparation_catalog(root.path(), &payload);
         let cid = payload["entries"][0]["cid"].as_str().unwrap().to_owned();
         let mut record = reserve_at(
@@ -1297,6 +1467,413 @@ mod tests {
             .await
             .unwrap();
         (root, record, backend, registry)
+    }
+
+    #[test]
+    fn model_startup_profile_is_runtime_owned_and_rejects_unproved_hosts() {
+        assert_eq!(
+            local_model_startup_profile("darwin-arm64").unwrap(),
+            serde_json::json!({
+                "context_size":4096, "parallel":1, "threads":8, "batch_threads":8,
+                "gpu_layers":99, "health_timeout_ms":120000,
+                "shutdown_timeout_ms":5000, "enable_thinking":false
+            })
+        );
+        for platform in ["linux-arm64", "linux-amd64", "darwin-amd64", "*"] {
+            assert!(local_model_startup_profile(platform).is_err());
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    mod startup_binding {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        struct EngineFixture(std::path::PathBuf);
+
+        impl Drop for EngineFixture {
+            fn drop(&mut self) {
+                // Only this disposable fixture bundle needs write permission
+                // restored so TempDir can remove its protected receipt/files.
+                std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+
+        fn install_engine(root: &Path) -> EngineFixture {
+            let relative = "libexec/fixture-engine";
+            let bundle = root.join(relative);
+            std::fs::create_dir_all(&bundle).unwrap();
+            let bytes = b"fixture engine bytes; never executed";
+            let digest = format!("sha256:{:x}", Sha256::digest(bytes));
+            let archive = format!("sha256:{}", "a".repeat(64));
+            let platform = crate::setup::detect_platform();
+            std::fs::write(bundle.join("llama-server"), bytes).unwrap();
+            std::fs::write(
+                bundle.join(".elastos-engine.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema":"elastos.local-model-engine/v2", "version":"fixture-v1",
+                    "platform":platform, "archive_sha256":archive,
+                    "entries":[{"path":"llama-server", "sha256":digest, "type":"file"}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            change_config(root, |config| {
+                config["external"]["llama-server"] = serde_json::json!({
+                    "version":"fixture-v1", "platforms":{platform:{
+                        "install_path":relative, "binary_path":"llama-server", "checksum":archive
+                    }}
+                });
+            });
+            for (name, mode) in [("llama-server", 0o500), (".elastos-engine.json", 0o400)] {
+                std::fs::set_permissions(bundle.join(name), std::fs::Permissions::from_mode(mode))
+                    .unwrap();
+            }
+            std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o500)).unwrap();
+            EngineFixture(bundle)
+        }
+
+        fn config(root: &Path) -> elastos_runtime::provider::BridgeProviderConfig {
+            elastos_runtime::provider::BridgeProviderConfig {
+                base_path: root.canonicalize().unwrap().to_string_lossy().into_owned(),
+                extra: serde_json::json!({
+                    "provider_id":"model-provider",
+                    "journal_dir":root.join("providers/model-provider/journal"),
+                    "offers":[{"id":"operator-owned", "enabled":false}]
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn admit(root: &Path, record: &PreparationRecord) {
+            update_operation(root, &record.operation_id, |r| {
+                r.state = PreparationState::Admitted
+            })
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn model_startup_binding_requires_admission_and_preserves_operator_config() {
+            let empty = tempfile::tempdir().unwrap();
+            let registry = elastos_runtime::provider::ProviderRegistry::new();
+            let mut actual = config(empty.path());
+            let before = serde_json::to_value(&actual).unwrap();
+            append_admitted_model_startup_offers(empty.path(), &registry, &mut actual)
+                .await
+                .unwrap();
+            assert_eq!(serde_json::to_value(&actual).unwrap(), before);
+            assert!(!empty.path().join("model-preparation").exists());
+
+            let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+            let mut actual = config(root.path());
+            let before = actual.extra.clone();
+            append_admitted_model_startup_offers(root.path(), &registry, &mut actual)
+                .await
+                .unwrap();
+            assert_eq!(actual.extra, before, "pending rename is not admitted");
+            admit(root.path(), &record);
+            assert!(
+                append_admitted_model_startup_offers(root.path(), &registry, &mut actual)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                actual.extra, before,
+                "missing engine preserves configured offers"
+            );
+            assert!(backend.calls.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn model_startup_binding_consumes_admission_with_stable_restart_and_alias_identity() {
+            let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            let _engine = install_engine(root.path());
+            let mut first = config(root.path());
+            let operator = first.extra["offers"][0].clone();
+            append_admitted_model_startup_offers(root.path(), &registry, &mut first)
+                .await
+                .unwrap();
+            assert_eq!(first.extra["offers"].as_array().unwrap().len(), 2);
+            assert_eq!(first.extra["offers"][0], operator);
+            let offer = &first.extra["offers"][1];
+            assert_eq!(offer["operation"], "text.generate");
+            assert_eq!(offer["adapter"]["kind"], "local_llama_cpp_text");
+            assert_eq!(
+                offer["adapter"]["settings"],
+                local_model_startup_profile("darwin-arm64").unwrap()
+            );
+            assert_eq!(
+                offer["adapter"]["model"]["sha256"],
+                format!("sha256:{:x}", Sha256::digest(b"GGUF\x03\0\0\0fixture"))
+            );
+            assert_eq!(
+                offer["adapter"]["model"]["path"],
+                root.path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("model-preparation")
+                    .join(format!("admitted-{}", record.operation_id))
+                    .join("weights.gguf")
+                    .to_string_lossy()
+                    .as_ref()
+            );
+            assert_eq!(
+                backend.calls.lock().unwrap().as_slice(),
+                ["runtime_hash_staged_directory"]
+            );
+
+            {
+                let inventory = Inventory::open(root.path(), false).unwrap();
+                let mut state = inventory.load().unwrap();
+                let mut alias = state.records[0].clone();
+                alias.request_binding.principal = "person:second-owner".into();
+                alias.request_binding.request_id = "alias-request".into();
+                alias.request_binding = binding(&alias);
+                alias.operation_id = operation_id(&alias).unwrap();
+                alias.reserved_bytes = 0;
+                state.records.push(alias);
+                inventory.save(&state).unwrap();
+            }
+            let state_path = root.path().join("model-preparation/state.json");
+            let persisted = std::fs::read(&state_path).unwrap();
+            let mut restarted = config(root.path());
+            append_admitted_model_startup_offers(root.path(), &registry, &mut restarted)
+                .await
+                .unwrap();
+            assert_eq!(
+                restarted.extra, first.extra,
+                "aliases/restart must not create another offer"
+            );
+            assert_eq!(std::fs::read(&state_path).unwrap(), persisted);
+            assert!(!root
+                .path()
+                .join("providers/model-provider/journal")
+                .exists());
+
+            let mut collision = config(root.path());
+            collision.extra["offers"]
+                .as_array_mut()
+                .unwrap()
+                .push(offer.clone());
+            let before = collision.extra.clone();
+            assert!(
+                append_admitted_model_startup_offers(root.path(), &registry, &mut collision)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                collision.extra, before,
+                "operator IDs cannot be overwritten"
+            );
+
+            let inventory = Inventory::open(root.path(), false).unwrap();
+            let mut invalid = inventory.load().unwrap();
+            invalid.records[1].request_binding.principal = "person:forged-owner".into();
+            assert!(inventory.save(&invalid).is_err());
+            assert_eq!(std::fs::read(&state_path).unwrap(), persisted);
+        }
+
+        #[tokio::test]
+        async fn model_startup_binding_keeps_whole_package_identity_when_weights_match() {
+            let mut ids = Vec::new();
+            let mut weights = Vec::new();
+            for (index, provenance) in [
+                b"publisher conversion A".as_slice(),
+                b"publisher conversion B",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (mut payload, files) =
+                    package_fixture_with_provenance(b"GGUF\x03\0\0\0fixture".to_vec(), provenance);
+                // The existing backend fixture stands in for native CID hashing;
+                // distinct notice bytes belong to distinct package identities.
+                let hash =
+                    cid::multihash::Multihash::<64>::wrap(0x12, &Sha256::digest([index as u8]))
+                        .unwrap();
+                payload["entries"][0]["cid"] =
+                    serde_json::json!(cid::Cid::new_v1(0x70, hash).to_string());
+                let (root, record, _, registry) =
+                    staged_package_fixture(now().unwrap(), true, payload, files).await;
+                admit(root.path(), &record);
+                let _engine = install_engine(root.path());
+                let mut actual = config(root.path());
+                append_admitted_model_startup_offers(root.path(), &registry, &mut actual)
+                    .await
+                    .unwrap();
+                ids.push(actual.extra["offers"][1]["id"].clone());
+                weights.push(actual.extra["offers"][1]["adapter"]["model"]["sha256"].clone());
+            }
+            assert_eq!(weights[0], weights[1]);
+            assert_ne!(
+                ids[0], ids[1],
+                "the provider execution binding includes the package-bound offer ID"
+            );
+        }
+
+        #[tokio::test]
+        async fn model_startup_binding_requires_current_catalog_trust() {
+            let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            let _engine = install_engine(root.path());
+            change_config(root.path(), |config| {
+                config["model_catalog"]["local_use"] = serde_json::Value::Null
+            });
+            let mut actual = config(root.path());
+            let before = actual.extra.clone();
+            assert!(
+                append_admitted_model_startup_offers(root.path(), &registry, &mut actual)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(actual.extra, before);
+            assert!(backend.calls.lock().unwrap().is_empty());
+
+            change_config(root.path(), |config| {
+                config["model_catalog"] = serde_json::Value::Null
+            });
+            append_admitted_model_startup_offers(root.path(), &registry, &mut actual)
+                .await
+                .unwrap();
+            assert_eq!(
+                actual.extra, before,
+                "removed catalog cannot admit a persisted offer"
+            );
+            assert!(backend.calls.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn model_startup_binding_rejects_tampering_and_unavailable_verifier_without_config_effects(
+        ) {
+            for fault in [
+                "weights",
+                "notice",
+                "index",
+                "engine",
+                "receipt",
+                "platform",
+                "alias",
+                "native_cid",
+                "backend",
+            ] {
+                let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+                admit(root.path(), &record);
+                let engine = install_engine(root.path());
+                let admitted = root
+                    .path()
+                    .join("model-preparation")
+                    .join(format!("admitted-{}", record.operation_id));
+                match fault {
+                    "weights" => {
+                        std::fs::write(admitted.join("weights.gguf"), b"GGUF\x03\0\0\0corrupt")
+                            .unwrap()
+                    }
+                    "notice" => {
+                        std::fs::write(admitted.join("LICENSE"), b"changed license").unwrap()
+                    }
+                    "index" => {
+                        std::fs::write(admitted.join("_elastos_object.json"), b"{}").unwrap()
+                    }
+                    "engine" | "receipt" => {
+                        let path = engine.0.join(if fault == "engine" {
+                            "llama-server"
+                        } else {
+                            ".elastos-engine.json"
+                        });
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                            .unwrap();
+                        std::fs::write(&path, b"changed").unwrap();
+                        std::fs::set_permissions(
+                            path,
+                            std::fs::Permissions::from_mode(if fault == "engine" {
+                                0o500
+                            } else {
+                                0o400
+                            }),
+                        )
+                        .unwrap();
+                    }
+                    "platform" => change_config(root.path(), |config| {
+                        config["external"]["llama-server"]["platforms"] = serde_json::json!({});
+                    }),
+                    "alias" => {
+                        std::fs::remove_file(admitted.join("weights.gguf")).unwrap();
+                        std::os::unix::fs::symlink("LICENSE", admitted.join("weights.gguf"))
+                            .unwrap();
+                    }
+                    "native_cid" => {
+                        *backend.cid.lock().unwrap() =
+                            "bafybeiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()
+                    }
+                    "backend" => {}
+                    _ => unreachable!(),
+                }
+                let unavailable = elastos_runtime::provider::ProviderRegistry::new();
+                let selected = if fault == "backend" {
+                    &unavailable
+                } else {
+                    registry.as_ref()
+                };
+                let mut actual = config(root.path());
+                let before = serde_json::to_value(&actual).unwrap();
+                let persisted =
+                    std::fs::read(root.path().join("model-preparation/state.json")).unwrap();
+                assert!(
+                    append_admitted_model_startup_offers(root.path(), selected, &mut actual)
+                        .await
+                        .is_err(),
+                    "{fault}"
+                );
+                assert_eq!(serde_json::to_value(&actual).unwrap(), before, "{fault}");
+                assert_eq!(
+                    std::fs::read(root.path().join("model-preparation/state.json")).unwrap(),
+                    persisted
+                );
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires explicit ELASTOS_TEST_MODEL_PROVIDER_PATH; parent runs actual provider Init proof"]
+        async fn model_startup_binding_real_model_provider_accepts_generated_init() {
+            use elastos_runtime::provider::ProviderBridge;
+
+            let binary = std::path::PathBuf::from(
+                std::env::var_os("ELASTOS_TEST_MODEL_PROVIDER_PATH")
+                    .expect("explicit model-provider prerequisite required"),
+            );
+            assert!(binary.is_absolute() && std::fs::symlink_metadata(&binary).unwrap().is_file());
+            let (root, record, _, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            let _engine = install_engine(root.path());
+            let mut actual = config(root.path());
+            actual.extra["offers"] = serde_json::json!([]);
+            append_admitted_model_startup_offers(root.path(), &registry, &mut actual)
+                .await
+                .unwrap();
+            let id = actual.extra["offers"][0]["id"].clone();
+            let bridge = ProviderBridge::spawn(&binary, actual).await.unwrap();
+            let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let status = bridge.send_raw(&serde_json::json!({"op":"status"})).await?;
+                let offers = bridge
+                    .send_raw(&serde_json::json!({"op":"offers_list"}))
+                    .await?;
+                Ok::<_, elastos_runtime::provider::bridge::BridgeError>((status, offers))
+            })
+            .await;
+            // Reap before assertions so a schema failure cannot leak the child.
+            bridge.shutdown().await.unwrap();
+            let (status, offers) = response.unwrap().unwrap();
+            assert_eq!(status["status"], "ok");
+            assert_eq!(status["data"]["offers_ready"], 1);
+            assert_eq!(offers["status"], "ok");
+            assert_eq!(offers["data"]["offers"][0]["id"], id);
+            assert_eq!(offers["data"]["offers"].as_array().unwrap().len(), 1);
+            assert!(bridge
+                .send_raw(&serde_json::json!({"op":"status"}))
+                .await
+                .is_err());
+        }
     }
 
     impl PreparationBackend {

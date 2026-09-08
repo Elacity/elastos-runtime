@@ -102,6 +102,24 @@ fn model_provider_bridge_config(data_dir: &Path) -> anyhow::Result<provider::Bri
     })
 }
 
+async fn model_provider_startup_config(
+    data_dir: &Path,
+    registry: &provider::ProviderRegistry,
+) -> anyhow::Result<provider::BridgeProviderConfig> {
+    let config = model_provider_bridge_config(data_dir)?;
+    #[cfg(unix)]
+    {
+        let mut config = config;
+        api::append_admitted_model_startup_offers(data_dir, registry, &mut config).await?;
+        Ok(config)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = registry;
+        Ok(config)
+    }
+}
+
 use elastos_server::protected_content_runtime::derive_protected_content_runtime_issuer;
 
 fn chain_provider_bridge_config_without_protected_network(
@@ -878,36 +896,6 @@ async fn setup_server_infrastructure_impl(
         ),
     }
 
-    match binaries::resolve_verified_native_provider_binary("model-provider") {
-        Ok(Some(path)) => match model_provider_bridge_config(&data_dir) {
-            Ok(model_config) => match provider::ProviderBridge::spawn(&path, model_config).await {
-                Ok(bridge) => {
-                    let bridge = Arc::new(bridge);
-                    match start_model_provider(
-                        &provider_registry,
-                        bridge,
-                        MODEL_PROVIDER_STATUS_TIMEOUT,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            tracing::info!("model-provider capsule from {}", path.display())
-                        }
-                        Err(_) => {
-                            tracing::warn!("Skipping model-provider because startup failed")
-                        }
-                    }
-                }
-                Err(_) => tracing::warn!("Skipping model-provider because startup failed"),
-            },
-            Err(_) => {
-                tracing::warn!("Skipping model-provider due to invalid private operator config")
-            }
-        },
-        Ok(None) => {}
-        Err(e) => tracing::warn!("Skipping model-provider due to verification failure: {}", e),
-    }
-
     match binaries::resolve_verified_native_provider_binary(MEDIA_PROVIDER_ID) {
         Ok(Some(path)) => match media_provider_bridge_config(&data_dir) {
             Ok(Some(media_config)) => {
@@ -993,6 +981,43 @@ async fn setup_server_infrastructure_impl(
             );
         }
         Err(e) => tracing::warn!("Skipping ipfs-provider due to verification failure: {}", e),
+    }
+
+    // Admitted model startup reuses the registered native IPFS verifier.
+    match binaries::resolve_verified_native_provider_binary("model-provider") {
+        Ok(Some(path)) => {
+            match model_provider_startup_config(&data_dir, &provider_registry).await {
+                Ok(model_config) => {
+                    match provider::ProviderBridge::spawn(&path, model_config).await {
+                        Ok(bridge) => {
+                            let bridge = Arc::new(bridge);
+                            match start_model_provider(
+                                &provider_registry,
+                                bridge,
+                                MODEL_PROVIDER_STATUS_TIMEOUT,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    tracing::info!("model-provider capsule from {}", path.display())
+                                }
+                                Err(_) => {
+                                    tracing::warn!("Skipping model-provider because startup failed")
+                                }
+                            }
+                        }
+                        Err(_) => tracing::warn!("Skipping model-provider because startup failed"),
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Skipping model-provider due to invalid private model configuration"
+                    )
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("Skipping model-provider due to verification failure: {}", e),
     }
 
     match binaries::resolve_verified_native_provider_binary("chain-provider") {
@@ -2961,6 +2986,42 @@ mod tests {
         );
         assert_eq!(config.extra["offers"], serde_json::json!([]));
         assert!(!model_provider_config_path(tempdir.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn model_provider_startup_config_keeps_operator_offers_without_admission() {
+        let tempdir = TempDir::new().unwrap();
+        let raw = r#"{"offers":[{"id":"operator-owned","enabled":false}]}"#;
+        let path = write_model_provider_operator_config(&tempdir, raw);
+        let expected = model_provider_bridge_config(tempdir.path()).unwrap();
+        let registry = provider::ProviderRegistry::new();
+        let actual = model_provider_startup_config(tempdir.path(), &registry)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), raw);
+        assert!(!tempdir.path().join("model-preparation").exists());
+        assert!(!model_provider_journal_dir(tempdir.path()).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_provider_startup_config_consumes_inventory_validation() {
+        let tempdir = TempDir::new().unwrap();
+        assert!(model_provider_bridge_config(tempdir.path()).is_ok());
+        let inventory = tempdir.path().join("model-preparation");
+        fs::create_dir(&inventory).unwrap();
+        fs::set_permissions(&inventory, fs::Permissions::from_mode(0o700)).unwrap();
+        // An existing incomplete inventory is not the absent-inventory case.
+        let registry = provider::ProviderRegistry::new();
+        assert!(model_provider_startup_config(tempdir.path(), &registry)
+            .await
+            .is_err());
+        assert!(!inventory.join("lock").exists());
+        assert!(!model_provider_journal_dir(tempdir.path()).exists());
     }
 
     #[cfg(unix)]

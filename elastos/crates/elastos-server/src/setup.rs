@@ -1368,6 +1368,60 @@ fn local_model_engine_receipt_args<'a>(
     ))
 }
 
+#[cfg(unix)]
+#[derive(PartialEq)]
+pub(crate) struct VerifiedLocalModelEngine {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub receipt_sha256: String,
+}
+
+#[cfg(unix)]
+pub(crate) fn verified_local_model_engine(
+    data_dir: &Path,
+    manifest: &ComponentsManifest,
+) -> anyhow::Result<VerifiedLocalModelEngine> {
+    let component = manifest
+        .external
+        .get("llama-server")
+        .ok_or_else(|| anyhow::anyhow!("local model engine is unavailable"))?;
+    let platform = detect_platform();
+    let info = component
+        .platforms
+        .get(&platform)
+        .ok_or_else(|| anyhow::anyhow!("local model engine platform is unavailable"))?;
+    let install_path = resolve_install_path(component, Some(info))
+        .ok_or_else(|| anyhow::anyhow!("local model engine install path is unavailable"))?;
+    let relative = Path::new(install_path);
+    anyhow::ensure!(
+        !install_path.is_empty()
+            && install_path.len() <= 4096
+            && relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_))),
+        "local model engine install path is invalid"
+    );
+    let bundle = data_dir.canonicalize()?.join(relative);
+    anyhow::ensure!(
+        bundle.canonicalize()? == bundle,
+        "local model engine bundle is aliased"
+    );
+    let (version, archive, binary) = local_model_engine_receipt_args(component, info)?;
+    local_model_engine_receipt::verify(&bundle, version, &platform, archive, binary)?;
+    let path = bundle.join(binary);
+    anyhow::ensure!(
+        path.canonicalize()? == path,
+        "local model engine executable is aliased"
+    );
+    let sha256 = compute_sha256_checksum(&path)?;
+    let receipt_sha256 = compute_sha256_checksum(&bundle.join(".elastos-engine.json"))?;
+    Ok(VerifiedLocalModelEngine {
+        path,
+        sha256,
+        receipt_sha256,
+    })
+}
+
 fn extracted_bundle_cache_stale_reason(
     install_root: &Path,
     platform_info: &PlatformInfo,

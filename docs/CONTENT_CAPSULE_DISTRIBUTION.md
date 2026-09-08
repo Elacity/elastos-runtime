@@ -290,10 +290,11 @@ policy slices:
    bounded peak buffers, slow/oversized/ignored-range failures, mid-read cancel,
    retry, concurrent duplicate selection, low disk, crash/restart and exact
    partial cleanup. Include proof that provider work stops, not just UI progress.
-3. **Admission-to-offer binding.** Reuse the installed engine receipt, private
-   artifact verification, ProviderRegistry and model run journal. Derive offers
-   from admitted records; reinitialize the existing provider only when idle and
-   safe, preserving active and unknown-settlement runs. The current coordinator
+3. **Live offer refresh.** Startup derives offers from admitted records through
+   the installed engine receipt, private artifact verification and the existing
+   model provider. Live refresh must reuse that same ProviderRegistry slot and
+   run journal. Reconfigure only when idle and safe, preserving active and
+   unknown-settlement runs. The current coordinator
    rejects a second Init, so this requires a guarded change within that owner.
    Its serialized coordinator must check the run journal and adapter workers
    and apply reinitialization in the same operation. Ordinary idle counts exclude
@@ -316,6 +317,11 @@ policy slices:
    model bytes or operator offer preconfiguration. Select the real signed Qwen
    entry, prepare, receive a real reply through the existing typed run contract,
    restart, reuse without transfer, release Keep and verify busy-safe eviction.
+   The generic directory publisher currently reads whole files into a base64
+   JSON array. Large-model bootstrap must use bounded operator/provider import
+   or a separately verified publisher repair. Capacity admission covers the
+   complete proof layout, including an additional publisher backend copy when
+   used, while preserving the 10% free-space floor.
    Verify actual
    artifact/receipt parity and human behavior, then publish code/tests/docs/
    manifests only after explicit authorization. Passkey ceremonies require the

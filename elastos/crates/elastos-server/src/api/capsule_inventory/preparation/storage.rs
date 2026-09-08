@@ -489,6 +489,46 @@ impl Stage {
         Ok(bytes)
     }
 
+    pub(super) fn verify_model_file(
+        &self,
+        expected: &crate::content::ContentObjectFile,
+        entrypoint: bool,
+    ) -> anyhow::Result<()> {
+        use sha2::{Digest as _, Sha256};
+
+        let (dir, name) = self.parent(&expected.path, false)?;
+        let mut file = open_at(&dir, &name, libc::O_RDONLY)?;
+        self.check_file(&expected.path, &file, expected.size)?;
+        let before = stamp(&file.metadata()?);
+        let mut digest = Sha256::new();
+        let mut read = 0u64;
+        let mut buffer = [0u8; 65536];
+        if entrypoint {
+            file.read_exact(&mut buffer[..8])?;
+            ensure!(
+                &buffer[..4] == b"GGUF"
+                    && matches!(u32::from_le_bytes(buffer[4..8].try_into()?), 2 | 3),
+                "invalid admitted GGUF header"
+            );
+            digest.update(&buffer[..8]);
+            read = 8;
+        }
+        while read < expected.size {
+            let limit = (expected.size - read).min(buffer.len() as u64) as usize;
+            let count = file.read(&mut buffer[..limit])?;
+            ensure!(count > 0, "admitted file is truncated");
+            digest.update(&buffer[..count]);
+            read += count as u64;
+        }
+        ensure!(
+            read == expected.size
+                && hex::encode(digest.finalize()) == expected.sha256
+                && stamp(&file.metadata()?) == before,
+            "admitted file changed or has an invalid digest"
+        );
+        self.check_file(&expected.path, &file, expected.size)
+    }
+
     pub(super) fn check_file(&self, path: &str, file: &File, size: u64) -> anyhow::Result<()> {
         let (dir, name) = self.parent(path, false)?;
         let current = open_at(&dir, &name, libc::O_RDONLY)?.metadata()?;

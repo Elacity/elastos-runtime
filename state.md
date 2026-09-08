@@ -305,8 +305,30 @@ The integrated source includes these durable facts:
   Both runs used signed synthetic packages seeded in offline local cache.
   Continuous peak-capacity and scaled cold-delivery proof remain open.
   One inventory worker retains accounting through drain and
-  exact admission reconciliation. Offer binding, shared Use/Keep/selection
+  exact admission reconciliation. Live offer refresh, shared Use/Keep/selection
   UI and cold exact-Qwen acceptance follow. Installed Homes remain unchanged.
+- Runtime startup composes admitted content with configured
+  operator offers after native IPFS registration. It rechecks the current signed
+  catalog, complete stored closure, package CID and installed engine receipt.
+  The offer ID binds the package, entrypoint/weights and engine receipt; the
+  existing model provider includes that ID and its execution settings in the
+  run binding. Its Runtime-owned profile is limited to the verified
+  Darwin-arm64 engine settings. Analyser's Rust 1.91 locked/offline build with
+  warnings denied passes six startup-binding tests, two binary startup-caller
+  tests and 25 preparation regressions. The explicitly invoked real
+  model-provider process test passes in 0.68 seconds: it accepts the generated
+  Init, reports Status and the exact offer, then shuts down. That test uses a
+  synthetic admitted package and does not invoke inference. The regular startup
+  and preparation library suites each leave their explicit process prerequisite
+  ignored; the earlier real
+  preparation-process receipt remains separate. Formatting, Home/public-copy
+  entropy and diff checks pass. Live reconfiguration, shared selection/retention
+  UI and installed proof remain open.
+- Large-model publication needs a bounded operator/provider bootstrap path or a
+  separately verified publisher repair. The current generic directory publisher
+  reads whole files and builds a base64 JSON array. Cold-proof capacity must
+  cover preparation reservation and any additional publisher backend copy;
+  existing verified model files and the 10% free-space floor remain protected.
 
 ## Protected-content Contract Truth
 
