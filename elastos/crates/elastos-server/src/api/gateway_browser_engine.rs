@@ -880,3 +880,69 @@ mod tests {
             }));
     }
 }
+
+/// Approved remote services are observed through the same Runtime provider plane.
+/// Launch selection stays local until remote resource binding is implemented.
+pub(in crate::api::gateway) async fn browser_remote_engine_summary(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+) -> serde_json::Value {
+    let read_grants = || {
+        home_services_remote_engine_grants(
+            &state.data_dir,
+            context,
+            state.collaboration_discovery_service.as_ref(),
+        )
+    };
+    let Ok(grants) = read_grants() else {
+        return serde_json::json!({"state":"unavailable","offers":[]});
+    };
+    let Some(registry) = state.provider_registry.as_ref() else {
+        return serde_json::json!({"state":"unavailable","offers":[]});
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut offers = Vec::new();
+    for grant in grants {
+        let mut visible = serde_json::json!({"id":grant["id"],"state":"unavailable",
+            "launch_available":false,"launch_reason":"remote_runtime_binding_required"});
+        if grant["expires_at"]
+            .as_u64()
+            .is_none_or(|expiry| expiry <= crate::auth::now_ts())
+        {
+            visible["state"] = serde_json::json!("expired");
+            offers.push(visible);
+            continue;
+        }
+        let observation = async {
+            let status =
+                crate::carrier::probe_browser_engine(registry, &grant, "status", None).await?;
+            let data = provider_response_data(&status)
+                .ok_or_else(|| anyhow::anyhow!("Engine status missing"))?;
+            let adapters = data["adapters"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("Engine inventory missing"))?;
+            let adapter = adapters
+                .iter()
+                .find(|adapter| adapter["default"] == true)
+                .or_else(|| adapters.first())
+                .and_then(|adapter| adapter["id"].as_str())
+                .ok_or_else(|| anyhow::anyhow!("Engine adapter missing"))?;
+            let ready =
+                crate::carrier::probe_browser_engine(registry, &grant, "readiness", Some(adapter))
+                    .await?;
+            let ready = provider_response_data(&ready)
+                .ok_or_else(|| anyhow::anyhow!("Engine readiness missing"))?;
+            Ok::<_, anyhow::Error>((data, ready))
+        };
+        if let Ok(Ok((data, readiness))) = tokio::time::timeout_at(deadline, observation).await {
+            if read_grants().is_ok_and(|current| current.contains(&grant)) {
+                visible["state"] = serde_json::json!("approved");
+                visible["adapters"] = data["adapters"].clone();
+                visible["capacity_available"] = data["capacity_available"].clone();
+                visible["readiness"] = readiness["readiness"].clone();
+            }
+        }
+        offers.push(visible);
+    }
+    serde_json::json!({"state":"available","offers":offers})
+}

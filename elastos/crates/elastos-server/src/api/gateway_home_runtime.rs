@@ -1124,6 +1124,21 @@ pub(super) fn home_service_offers_for_people_contact(
         capsule_hint: Some("browser".to_string()),
         route: None,
     });
+    offers.push(HomeServiceOfferSummary {
+        schema: "elastos.service.offer/v1".to_string(),
+        offer_id: format!("offer:{}:browser-engine", contact.contact_id),
+        service_uri: crate::carrier::ENGINE_SERVICE_URI.to_string(),
+        service_kind: crate::carrier::ENGINE_SERVICE_KIND.to_string(),
+        display_name: format!("{}'s Browser Engine", contact.display_name),
+        provider_uri: Some("elastos://browser-engine/*".to_string()),
+        provider_label: "Remote Engine".to_string(),
+        policy_summary: "Ask this person to check Browser Engine availability and capacity. This grant permits checks only; opening remote pages is not available yet.".to_string(),
+        status: "requestable".to_string(), enabled: false, grant_required: true,
+        grant_scope: "principal_scoped_browser_engine_probe_grant".to_string(),
+        capsule_contract: "browser -> Runtime service grant -> Engine status/readiness".to_string(),
+        source: "people_contact".to_string(), runtime_contract: None,
+        contact_id: Some(contact.contact_id.clone()), capsule_hint: Some("browser".to_string()), route: None,
+    });
     offers
 }
 

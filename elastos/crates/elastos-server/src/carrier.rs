@@ -73,6 +73,12 @@ mod browser_exit;
 pub(crate) use browser_exit::{
     sign_service_message, verify_service_message, BrowserExitGrant, EXIT_GRANT_TTL_SECS,
 };
+#[path = "carrier_engine.rs"]
+mod browser_engine;
+pub(crate) use browser_engine::{
+    grant_id as engine_grant_id, probe as probe_browser_engine, BrowserEngineGrant,
+    ENGINE_GRANT_TTL_SECS, ENGINE_LOCAL_OFFER, ENGINE_SERVICE_KIND, ENGINE_SERVICE_URI,
+};
 const BROWSER_CARRIER_STREAM_SCHEMA: &str = "elastos.browser.carrier-stream/v1";
 const BROWSER_CARRIER_STREAM_ACK_MAX_BYTES: usize = 16 * 1024;
 const CHAT_DISCOVERY_TOPIC_GENERAL: &str = "__elastos_internal/chat-presence-v1/#general";
@@ -400,6 +406,7 @@ pub struct GossipState {
     did: Option<String>,
     browser_exit_network: Option<crate::collaboration_network::VerifiedCollaborationNetworkProfile>,
     browser_exit_reservations: browser_exit::BrowserExitReservations,
+    browser_engine_probe_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl GossipState {
@@ -413,6 +420,7 @@ impl GossipState {
         Self {
             browser_exit_network: None,
             browser_exit_reservations: browser_exit::BrowserExitReservations::default(),
+            browser_engine_probe_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             endpoint,
             gossip,
             memory_lookup,
@@ -1299,8 +1307,26 @@ async fn handle_file_stream(
                 .await?;
                 return Ok(());
             };
-            let response =
-                carrier_provider_invoke_registry(&registry, &msg.data, &source_endpoint_id).await?;
+            let response = if msg.data["target"] == "browser-engine" {
+                let (network, slots) = {
+                    let state = gossip_state.lock().await;
+                    (
+                        state.browser_exit_network.clone(),
+                        state.browser_engine_probe_slots.clone(),
+                    )
+                };
+                browser_engine::invoke(
+                    &registry,
+                    data_dir,
+                    network,
+                    slots,
+                    source_endpoint_id,
+                    &msg.data,
+                )
+                .await
+            } else {
+                carrier_provider_invoke_registry(&registry, &msg.data, &source_endpoint_id).await?
+            };
             send_json(send, &response).await?;
         }
         "browser_exit_stream" => {

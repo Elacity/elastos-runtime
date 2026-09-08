@@ -221,6 +221,7 @@ pub(super) async fn browser_app_summary(
     };
     let mut engine_adapter =
         browser_engine_summary(state.provider_registry.as_ref(), &context.principal_id).await;
+    engine_adapter["remote_services"] = browser_remote_engine_summary(&state, &context).await;
     // This flag describes Runtime's request parser, never a guest capability.
     engine_adapter["display_attach_supported"] = serde_json::json!(true);
     let net = browser_net_summary(state.provider_registry.as_ref(), &context.principal_id).await;

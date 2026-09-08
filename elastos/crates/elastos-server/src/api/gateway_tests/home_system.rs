@@ -3236,7 +3236,7 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
     assert!(payload["message"]
         .as_str()
         .unwrap_or_default()
-        .contains("private remote Exit grant was sent"));
+        .contains("private scoped grant was sent"));
 
     let inbox_after = right_app
         .oneshot(
@@ -8442,6 +8442,364 @@ async fn test_home_appearance_preferences_fail_closed_and_signed_out_defaults_st
     );
 }
 
+fn services_engine_offer(fixture: &ServicesContactFixture) -> String {
+    format!(
+        "offer:{}:browser-engine",
+        home_people_contact_id(&fixture.profile.document().profile_did)
+    )
+}
+
+async fn services_contact_pending_engine_request(
+    left: &std::path::Path,
+    right: &std::path::Path,
+    alice: &ServicesContactFixture,
+    bob: &ServicesContactFixture,
+) -> String {
+    std::fs::create_dir_all(right.join("config")).unwrap();
+    std::fs::write(right.join("config/browser-engine-adapter.json"), "{}").unwrap();
+    let token = app_token_for_authority(right, SERVICES_CAPSULE_ID, &bob.authority);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":"local:provider:browser-engine","section":"mine","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let token = app_token_for_authority(left, SERVICES_CAPSULE_ID, &alice.authority);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_engine_offer(bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = home_test_post_json(
+        &bob.app,
+        "/api/apps/home/launch",
+        &bob.authority.home_token,
+        "http://localhost:61180",
+        json!({"target":INBOX_CAPSULE_ID}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = app_token_for_authority(right, INBOX_CAPSULE_ID, &bob.authority);
+    let (_, inbox) = home_test_get_json(&bob.app, "/api/apps/inbox/summary", &token, "null").await;
+    inbox["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "service_access_request")
+        .unwrap()["action_ref"]["action_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[derive(Default)]
+struct ServicesEngineProbeProvider {
+    calls: TokioMutex<Vec<Value>>,
+    hold: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[async_trait::async_trait]
+impl Provider for ServicesEngineProbeProvider {
+    fn schemes(&self) -> Vec<&'static str> {
+        vec![]
+    }
+    fn name(&self) -> &'static str {
+        "services-engine-probe-test"
+    }
+    async fn handle(&self, _: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider("raw only".into()))
+    }
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        self.calls.lock().await.push(request.clone());
+        self.entered.notify_one();
+        if self.hold.load(std::sync::atomic::Ordering::SeqCst) {
+            self.release.notified().await;
+        }
+        let mut response = MockBrowserEngineProvider.send_raw(request).await?;
+        if request["op"] == "status" {
+            response["data"]["capacity_available"] = json!(true);
+            response["data"]["max_active_sessions"] = json!(4);
+        }
+        response["data"]["private_control_path"] = json!("/private/never-publish");
+        response["data"]["credential"] = json!("never-publish-secret");
+        Ok(response)
+    }
+}
+
+#[tokio::test]
+async fn test_services_remote_engine_signed_approval_retains_scoped_probe_grant() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network.clone()).await;
+    accept_services_contact_pair(&alice, &bob);
+    let action =
+        services_contact_pending_engine_request(left.path(), right.path(), &alice, &bob).await;
+    let token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/inbox/actions",
+        json!({"action_id":action}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    use iroh::Watcher as _;
+    let provider = Arc::new(ServicesEngineProbeProvider::default());
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register_sub_provider("browser-engine", provider.clone())
+        .await
+        .unwrap();
+    let (_, alice_did) = elastos_identity::load_or_create_did(left.path()).unwrap();
+    let (_, bob_did) = elastos_identity::load_or_create_did(right.path()).unwrap();
+    let local_node = crate::carrier::start_isolated_carrier_node_with_registry(
+        &alice.device_key,
+        &alice_did,
+        left.path().to_path_buf(),
+        None,
+    )
+    .await
+    .unwrap();
+    let remote_node = crate::carrier::start_isolated_carrier_node_with_registry(
+        &bob.device_key,
+        &bob_did,
+        right.path().to_path_buf(),
+        Some(Arc::downgrade(&provider_registry)),
+    )
+    .await
+    .unwrap();
+    let ticket = data_encoding::BASE32_NOPAD
+        .encode(
+            &serde_json::to_vec(
+                &json!({"topic":null,"endpoints":[remote_node.endpoint.watch_addr().get()]}),
+            )
+            .unwrap(),
+        )
+        .to_lowercase();
+    let mut local = crate::carrier::CarrierRuntimeService::new(local_node);
+    let mut remote = crate::carrier::CarrierRuntimeService::new(remote_node);
+    remote.configure_browser_exit_network(network.clone()).await;
+    let endpoint = local.endpoint().unwrap();
+    let consumer_registry = Arc::new(ProviderRegistry::new());
+    consumer_registry
+        .set_carrier_invoker(Arc::new(
+            crate::carrier::CarrierProviderInvoker::with_carrier_endpoint(endpoint.clone()),
+        ))
+        .await;
+    // The fake gossip bus retains the actual serving endpoint in its signed decision.
+    // The consumer still validates that first decision through normal Services.
+    {
+        let mut mailbox = bus.lock().await;
+        for message in mailbox.topic_messages.values_mut().flatten() {
+            let mut payload: Value =
+                serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+            if payload["kind"] == "service_access_decision" && payload["decision"] == "approved" {
+                payload["remote_engine_grant"]["connect_ticket"] = json!(ticket);
+                crate::carrier::sign_service_message(right.path(), &mut payload).unwrap();
+                message["content"] = json!(payload.to_string());
+            }
+        }
+    }
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let (_, summary) =
+        home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+    let offer = summary["remote_offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|offer| offer["offer_id"] == services_engine_offer(&bob))
+        .unwrap();
+    assert_eq!(offer["status"], "approved");
+    assert_eq!(
+        offer["enabled"], false,
+        "launch awaits serving Runtime resource binding"
+    );
+    let saved = services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+    let grant = &saved["remote_offer_requests"][services_engine_offer(&bob)]["remote_engine_grant"];
+    assert_eq!(grant["schema"], "elastos.service.remote-engine-grant/v1");
+    assert_eq!(grant["peer_did"], bob.peer_id);
+    assert_eq!(grant["principal_id"], alice.authority.principal_id);
+    assert_eq!(grant["operations"], json!(["status", "readiness"]));
+    assert!(!left.path().join("config/exit-provider.json").exists());
+    assert!(alice.exit_provider.requests.lock().await.is_empty());
+    let grant = grant.clone();
+    let status = crate::carrier::probe_browser_engine(&consumer_registry, &grant, "status", None)
+        .await
+        .unwrap();
+    assert_eq!(status["data"]["launch_available"], false);
+    assert!(!status.to_string().contains("never-publish"));
+    let adapter = status["data"]["adapters"][0]["id"].as_str().unwrap();
+    let ready = crate::carrier::probe_browser_engine(
+        &consumer_registry,
+        &grant,
+        "readiness",
+        Some(adapter),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ready["data"]["readiness"]["state"], "ready");
+    let calls = provider.calls.lock().await.clone();
+    assert_eq!(calls.len(), 2);
+    assert!(calls
+        .iter()
+        .all(|call| call["principal_id"] == bob.authority.principal_id
+            && call.get("_runtime_invocation").is_none()
+            && call.get("grant_id").is_none()));
+    for field in ["principal_id", "grant_id"] {
+        let mut forged = grant.clone();
+        forged[field] = json!("foreign");
+        assert!(
+            crate::carrier::probe_browser_engine(&consumer_registry, &forged, "status", None)
+                .await
+                .is_err()
+        );
+    }
+    let anonymous_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .bind()
+        .await
+        .unwrap();
+    let anonymous_registry = ProviderRegistry::new();
+    anonymous_registry
+        .set_carrier_invoker(Arc::new(
+            crate::carrier::CarrierProviderInvoker::with_carrier_endpoint(
+                anonymous_endpoint.clone(),
+            ),
+        ))
+        .await;
+    assert!(
+        crate::carrier::probe_browser_engine(&anonymous_registry, &grant, "status", None)
+            .await
+            .is_err()
+    );
+    anonymous_endpoint.close().await;
+    assert_eq!(
+        provider.calls.lock().await.len(),
+        2,
+        "foreign requests never reach Engine"
+    );
+    let authority_request = json!({"op":"status","principal_id":alice.authority.principal_id,"grant_id":grant["grant_id"]});
+    assert!(crate::api::gateway::authorize_home_service_engine(
+        right.path(),
+        &network,
+        &endpoint.id(),
+        &authority_request,
+        grant["expires_at"].as_u64().unwrap()
+    )
+    .is_err());
+    // Exercise the actual Browser summary caller with a consumer that has no local Engine.
+    let mut consumer_state = test_state(left.path());
+    consumer_state.provider_registry = Some(consumer_registry.clone());
+    consumer_state.carrier_endpoint = Some(endpoint.clone());
+    consumer_state.collaboration_discovery_service = Some(
+        crate::collaboration_discovery_runtime::CollaborationDiscoveryService::new(
+            SigningKey::from_bytes(&alice.device_key.to_bytes()),
+            network.clone(),
+            Arc::new(ProviderRegistry::new()),
+        )
+        .await
+        .unwrap(),
+    );
+    let browser_app = gateway_router(consumer_state);
+    let browser_token = app_token_for_authority(left.path(), BROWSER_CAPSULE_ID, &alice.authority);
+    let (code, browser_summary) = home_test_get_json(
+        &browser_app,
+        "/api/apps/browser/summary",
+        &browser_token,
+        "null",
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let remote_offer = &browser_summary["engine_adapter"]["remote_services"]["offers"][0];
+    assert_eq!(remote_offer["state"], "approved", "{browser_summary}");
+    assert_eq!(remote_offer["readiness"]["state"], "ready");
+    assert_eq!(remote_offer["launch_available"], false);
+    for private in [
+        ticket.as_str(),
+        grant["grant_id"].as_str().unwrap(),
+        "never-publish",
+        "_runtime_invocation",
+    ] {
+        assert!(!browser_summary.to_string().contains(private));
+    }
+    assert_eq!(provider.calls.lock().await.len(), 4);
+    // Mutating operations fail at the actual receiver even through a raw invocation.
+    use elastos_runtime::provider::{
+        ProviderCarrierRoute, ProviderInvocation, ProviderInvocationTransport, ProviderTransfer,
+    };
+    let invocation = ProviderInvocation {
+        source: "browser".into(),
+        target: "browser-engine".into(),
+        op: "launch".into(),
+        request: json!({"op":"launch","grant_id":grant["grant_id"],"principal_id":alice.authority.principal_id}),
+        transfer: ProviderTransfer::Json,
+        range: None,
+        progress: None,
+        transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::ConnectTicket {
+            connect_ticket: ticket,
+            peer_did: Some(bob_did),
+            timeout_ms: Some(2000),
+        }),
+    };
+    assert!(consumer_registry.invoke_provider(invocation).await.is_err());
+    assert_eq!(provider.calls.lock().await.len(), 4);
+    // An approval cannot publish late readiness after the provider owner denies it.
+    provider
+        .hold
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let pending_registry = consumer_registry.clone();
+    let pending_grant = grant.clone();
+    let pending = tokio::spawn(async move {
+        crate::carrier::probe_browser_engine(&pending_registry, &pending_grant, "status", None)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if provider.calls.lock().await.len() == 5 {
+                break;
+            }
+            provider.entered.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    let token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+    let deny = action.replacen("service-approve-request:", "service-deny-request:", 1);
+    let (code, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/inbox/actions",
+        json!({"action_id":deny}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    provider.release.notify_one();
+    assert!(pending.await.unwrap().is_err());
+    assert!(
+        crate::carrier::probe_browser_engine(&consumer_registry, &grant, "status", None)
+            .await
+            .is_err()
+    );
+    assert_eq!(provider.calls.lock().await.len(), 5);
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+    let saved = services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+    let record = &saved["remote_offer_requests"][services_engine_offer(&bob)];
+    assert_eq!(record["status"], "denied");
+    assert!(record.get("remote_engine_grant").is_none());
+    assert!(alice.exit_provider.requests.lock().await.is_empty());
+    local.shutdown().await.unwrap();
+    remote.shutdown().await.unwrap();
+}
 // Regression for a configured Gateway whose Carrier is already in process.
 fn configured_services_runtime_remove_attached_runtime(
     data_dir: &std::path::Path,
