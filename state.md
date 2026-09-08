@@ -292,6 +292,12 @@ The integrated source includes these durable facts:
   The real-Kubo process proof passes with repo mode `0755`, 264 calls and
   16,777,382 transferred bytes, with cleanup, child reap and EOF confirmed.
   This observation does not reserve capacity or establish peak usage.
+- Preparation progress credits delivered bytes once against each remaining
+  staging and backend charge, which avoids charging stored bytes again.
+  Full quota, fixed overhead allowances and the 10% free-space floor remain
+  unchanged. Focused progress, separate-volume, overflow and provider-request
+  tests pass, as does the repeated seeded-warm 8 MiB process proof. Measured
+  cold-backend allocation remains open.
 - Separately invoked 1 MiB and 8 MiB process tests passed through the production preparation
   owner, real Content, Registry, native provider bridge and isolated offline
   Kubo. Fresh Use admitted 1,049,332 payload bytes plus a 717-byte index in

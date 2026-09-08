@@ -65,14 +65,16 @@ acceptance. Browser implementation belongs to its separate owner.
 
 1. [ ] Complete scaled resource proof for the existing Runtime preparation and
    admission path before a large-model transfer. Source verification passes
-   25 preparation tests plus explicit 1 MiB and 8 MiB signed synthetic-package
+   focused preparation tests plus explicit 1 MiB and 8 MiB signed synthetic-package
    process tests through real Content, Registry and native IPFS. These prove
    fresh Use, bounded index/file reads, exact package CID admission, reopened
    owner reuse without Content reads, and fixture cleanup. Full-charge and
    aggregate-budget preflight, cancellation and restart reconciliation pass.
-   The 8 MiB preparation took 2.066 seconds; allocation measurements are
-   samples, not continuous peaks. Prove bounded peak memory/disk and cold
-   delivery at the intended scale while retaining the 10% free-space floor.
+   Progress checks credit delivered bytes once against each remaining staging
+   and backend charge; full quota and the 10% free-space floor stay unchanged.
+   Allocation measurements are samples, not continuous peaks. Prove bounded
+   peak memory/disk and cold delivery at the intended scale while retaining
+   the 10% free-space floor.
    Exact Qwen and installed acceptance remain in the gates below.
 2. [ ] Expose the same Runtime model facts through Marketplace Models, System,
    Assistant and Home Agent for Use, progress, cancel, retry, Keep and selection.

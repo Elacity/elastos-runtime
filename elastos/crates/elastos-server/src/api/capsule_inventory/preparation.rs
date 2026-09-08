@@ -813,21 +813,46 @@ fn require_active(
     Ok(record)
 }
 
+fn remaining_capacity_charges(
+    total_bytes: u64,
+    completed_bytes: u64,
+    index_bytes: u64,
+) -> anyhow::Result<(u64, u64)> {
+    ensure!(
+        (1..=MAX_PACKAGE_BYTES).contains(&total_bytes)
+            && completed_bytes <= total_bytes
+            && index_bytes <= 65536,
+        "invalid preparation capacity progress"
+    );
+    let delivered = completed_bytes
+        .checked_add(index_bytes)
+        .context("delivered byte accounting overflow")?;
+    let staging = staging_charge(total_bytes)?;
+    let backend = preparation_charge(total_bytes)?
+        .checked_sub(staging)
+        // Credit one delivered payload copy. Keep the existing second-payload
+        // and fixed overhead allowance; this is not allocated-byte attribution.
+        .and_then(|charge| charge.checked_sub(delivered))
+        .context("capacity charge overflow")?;
+    let outstanding_stage = staging
+        .checked_sub(delivered)
+        .context("staging accounting overflow")?;
+    Ok((outstanding_stage, backend))
+}
+
 async fn require_capacity(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
     record: &PreparationRecord,
 ) -> anyhow::Result<()> {
-    let staging = staging_charge(record.total_bytes)?;
-    let backend = preparation_charge(record.total_bytes)?
-        .checked_sub(staging)
-        .context("capacity charge overflow")?;
+    let (outstanding_stage, backend) = remaining_capacity_charges(
+        record.total_bytes,
+        record.completed_bytes,
+        record.index_bytes,
+    )?;
     let observed = registry.check_local_ipfs_capacity(backend).await?;
     let inventory = Inventory::open(data_dir, false)?;
     require_cache_budget(data_dir, &inventory.load()?)?;
-    let outstanding_stage = staging
-        .checked_sub(record.completed_bytes + record.index_bytes)
-        .context("staging accounting overflow")?;
     let required = if inventory.volume()? == observed.volume_id {
         outstanding_stage
             .checked_add(backend)
@@ -1284,6 +1309,7 @@ mod tests {
         files: std::collections::BTreeMap<String, Vec<u8>>,
         cid: Mutex<String>,
         calls: Mutex<Vec<String>>,
+        capacity_requests: Mutex<Vec<u64>>,
         hold_drain: AtomicBool,
         fail_drain: AtomicBool,
         hold_read: AtomicBool,
@@ -1373,9 +1399,15 @@ mod tests {
                         serde_json::json!(base64::engine::general_purpose::STANDARD.encode(bytes));
                     Ok(serde_json::json!({"status":"ok","data":response}))
                 }
-                "runtime_check_capacity" => Ok(serde_json::json!({"status":"ok","data":{
-                    "volume_id":7,"capacity_bytes":1_u64 << 40,"available_bytes":1_u64 << 39,"required_bytes":request["required_bytes"]
-                }})),
+                "runtime_check_capacity" => {
+                    self.capacity_requests
+                        .lock()
+                        .unwrap()
+                        .push(request["required_bytes"].as_u64().unwrap());
+                    Ok(serde_json::json!({"status":"ok","data":{
+                        "volume_id":7,"capacity_bytes":1_u64 << 40,"available_bytes":1_u64 << 39,"required_bytes":request["required_bytes"]
+                    }}))
+                }
                 "runtime_prepare_backend" => {
                     if self.hold_drain.swap(false, Ordering::AcqRel) {
                         self.entered.notify_one();
@@ -2125,6 +2157,7 @@ mod tests {
                 files,
                 cid: Mutex::new(cid),
                 calls: Mutex::new(vec![]),
+                capacity_requests: Mutex::new(vec![]),
                 hold_drain: AtomicBool::new(false),
                 fail_drain: AtomicBool::new(false),
                 hold_read: AtomicBool::new(false),
@@ -3517,6 +3550,113 @@ mod tests {
         assert!(storage::require_space_floor(0, 0, 0).is_err());
         assert!(storage::require_space_floor(1000, 1001, 0).is_err());
         assert!(storage::require_space_floor(u128::MAX, u128::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn model_preparation_capacity_cold_growth_stays_within_initial_charge() {
+        let payload = 64 * 1024 * 1024;
+        let capacity = 1_u128 << 30;
+        let floor = capacity.div_ceil(10);
+        let margin = 1024 * 1024;
+        let charge = preparation_charge(payload).unwrap();
+        let initial_free = floor + u128::from(charge) + margin;
+        assert!(storage::require_space_floor(capacity, initial_free, charge.into()).is_ok());
+        for completed in [0, payload / 4, payload / 2, payload] {
+            let index = if completed == 0 { 0 } else { 717 };
+            let delivered = u128::from(completed + index);
+            let (stage, backend) = remaining_capacity_charges(payload, completed, index).unwrap();
+            // Model one cold backend payload copy plus the staged copy. These
+            // are deterministic logical-growth facts, not Kubo allocation proof.
+            let free = initial_free - 2 * delivered;
+            assert!(
+                storage::require_space_floor(
+                    capacity,
+                    free,
+                    u128::from(stage) + u128::from(backend)
+                )
+                .is_ok(),
+                "double charged stored backend bytes at completed={completed}"
+            );
+        }
+        assert_eq!(
+            preparation_charge(payload).unwrap(),
+            charge,
+            "quota remains the full charge"
+        );
+    }
+
+    #[test]
+    fn model_preparation_capacity_separate_cold_volume_and_warm_backend() {
+        let payload = 64 * 1024 * 1024;
+        let capacity = 1_u128 << 30;
+        let floor = capacity.div_ceil(10);
+        let margin = 1024 * 1024;
+        let stage_budget = staging_charge(payload).unwrap();
+        let backend_budget = preparation_charge(payload).unwrap() - stage_budget;
+        let completed = payload / 4;
+        let index = 717;
+        let delivered = u128::from(completed + index);
+        let (stage, backend) = remaining_capacity_charges(payload, completed, index).unwrap();
+        let stage_free = floor + u128::from(stage_budget) + margin - delivered;
+        assert!(storage::require_space_floor(capacity, stage_free, stage.into()).is_ok());
+        let backend_free = floor + u128::from(backend_budget) + margin - delivered;
+        assert!(storage::require_space_floor(capacity, backend_free, backend.into()).is_ok());
+        // A warm backend stores nothing new. Logical credit stays conservative.
+        let warm_free =
+            floor + u128::from(preparation_charge(payload).unwrap()) + margin - delivered;
+        assert!(storage::require_space_floor(
+            capacity,
+            warm_free,
+            u128::from(stage) + u128::from(backend)
+        )
+        .is_ok());
+        for required in [
+            u128::from(stage),
+            u128::from(backend),
+            u128::from(stage) + u128::from(backend),
+        ] {
+            assert!(storage::require_space_floor(capacity, floor + required, required).is_ok());
+            assert!(
+                storage::require_space_floor(capacity, floor + required - 1, required).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn model_preparation_capacity_invalid_progress_fails_without_overflow() {
+        for (total, completed, index) in [
+            (u64::MAX, 0, 0),
+            (64, u64::MAX, 1),
+            (64, 65, 0),
+            (64, 0, 65537),
+        ] {
+            let result =
+                std::panic::catch_unwind(|| remaining_capacity_charges(total, completed, index));
+            assert!(result.is_ok(), "invalid accounting panicked");
+            assert!(result.unwrap().is_err(), "invalid progress was accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn model_preparation_capacity_provider_receives_only_remaining_growth() {
+        let (root, mut record, backend, registry) = staged_fixture(now().unwrap(), false).await;
+        record.completed_bytes = record.total_bytes / 4;
+        let delivered = record.completed_bytes + record.index_bytes;
+        let full_backend = preparation_charge(record.total_bytes).unwrap()
+            - staging_charge(record.total_bytes).unwrap();
+        require_capacity(root.path(), &registry, &record)
+            .await
+            .unwrap();
+        assert_eq!(
+            *backend.capacity_requests.lock().unwrap(),
+            vec![full_backend - delivered]
+        );
+        assert_eq!(
+            load_operation(root.path(), &record.operation_id)
+                .unwrap()
+                .reserved_bytes,
+            record.reserved_bytes
+        );
     }
 
     #[test]
