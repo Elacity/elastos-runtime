@@ -134,15 +134,25 @@ export function createRuntimeApi({ launchToken }) {
 
   async function fetchJson(path, options = {}) {
     const body = options.body == null ? undefined : JSON.stringify(options.body);
-    const response = await fetch(path, {
-      ...options,
-      body,
-      headers: {
-        ...homeHeaders(Boolean(body)),
-        ...(options.headers || {}),
-      },
-    });
-    const text = await response.text();
+    let response, text;
+    try {
+      response = await fetch(path, {
+        ...options,
+        body,
+        headers: {
+          ...homeHeaders(Boolean(body)),
+          ...(options.headers || {}),
+        },
+      });
+      text = await response.text();
+    } catch (cause) {
+      const error = new Error("Browser connection interrupted.", { cause });
+      // Received HTTP failures retain their authority/policy meaning even if
+      // the connection drops before their response body is complete.
+      if (response && !response.ok) error.status = response.status;
+      else error.runtimeTransportFailure = true;
+      throw error;
+    }
     let payload = null;
     if (text) {
       try {

@@ -1030,11 +1030,13 @@ async function fetchPageStatus({
   if (!currentPage?.page_id) {
     return null;
   }
+  const owner = currentRuntimePageOwner();
   const query = fast ? "?fast=1" : "";
   const status = await fetchJson(
     `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/status${query}`,
     { method: "GET" },
   );
+  if (!sameRuntimePageOwner(currentRuntimePageOwner(), owner)) return null;
   if (
     status?.schema !== "elastos.browser.page-status/v1" ||
     status.page_id !== currentPage.page_id
@@ -1163,6 +1165,20 @@ async function handleLibraryFilePickerSelection(payload) {
   return true;
 }
 
+async function handlePageObservationFailure(error, owner) {
+  if (!sameRuntimePageOwner(currentRuntimePageOwner(), owner)) return false;
+  if (requestFreshRuntimeAuthority(error)) return false;
+  if (error.runtimeTransportFailure === true) {
+    showStatus("Connection interrupted. Browser is reconnecting.");
+    return true;
+  }
+  await failRuntimeOwnedPage(
+    error.runtimeOwnedFailureKind || "display_status",
+    friendlyOpenError(error),
+  );
+  return false;
+}
+
 function schedulePageStatusRefresh({
   history = "replace",
   delay = PAGE_STATUS_AFTER_INPUT_DELAY_MS,
@@ -1187,15 +1203,11 @@ function schedulePageStatusRefresh({
       ) {
         return;
       }
+      const owner = currentRuntimePageOwner();
       try {
         await fetchPageStatus({ history, forceAddress });
       } catch (error) {
-        if (!requestFreshRuntimeAuthority(error)) {
-          await failRuntimeOwnedPage(
-            error.runtimeOwnedFailureKind || "display_status",
-            friendlyOpenError(error),
-          );
-        }
+        await handlePageObservationFailure(error, owner);
       }
     }, nextDelay);
     return timer;
@@ -1216,18 +1228,14 @@ function startPageStatusPolling() {
       pageStatusTimer = window.setTimeout(poll, PAGE_STATUS_INTERVAL_MS);
       return;
     }
+    const owner = currentRuntimePageOwner();
     try {
       await fetchPageStatus({ fast: true });
     } catch (error) {
-      if (!requestFreshRuntimeAuthority(error)) {
-        await failRuntimeOwnedPage(
-          error.runtimeOwnedFailureKind || "display_status",
-          friendlyOpenError(error),
-        );
-      }
+      await handlePageObservationFailure(error, owner);
     } finally {
       if (
-        currentPage &&
+        sameRuntimePageOwner(currentRuntimePageOwner(), owner) &&
         !relaunchRequested &&
         !runtimePageCleanup.status(currentRuntimePageOwner())?.failure
       ) {
@@ -1244,25 +1252,22 @@ function startPageHeartbeat() {
     if (!currentPage?.page_id) {
       return;
     }
+    const owner = currentRuntimePageOwner();
+    let nextDelay = PAGE_HEARTBEAT_INTERVAL_MS;
     try {
       await fetchJson(
         `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/heartbeat`,
         { method: "POST" },
       );
     } catch (error) {
-      if (!requestFreshRuntimeAuthority(error)) {
-        await failRuntimeOwnedPage(
-          error.runtimeOwnedFailureKind || "display_status",
-          friendlyOpenError(error),
-        );
-      }
+      if (await handlePageObservationFailure(error, owner)) nextDelay = PAGE_STATUS_INTERVAL_MS;
     } finally {
       if (
-        currentPage &&
+        sameRuntimePageOwner(currentRuntimePageOwner(), owner) &&
         !relaunchRequested &&
         !runtimePageCleanup.status(currentRuntimePageOwner())?.failure
       ) {
-        pageHeartbeatTimer = window.setTimeout(beat, PAGE_HEARTBEAT_INTERVAL_MS);
+        pageHeartbeatTimer = window.setTimeout(beat, nextDelay);
       }
     }
   };

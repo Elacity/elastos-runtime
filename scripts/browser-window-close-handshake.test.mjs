@@ -6,6 +6,7 @@ import test from "node:test";
 import vm from "node:vm";
 import { requireBrowserViewer } from "../capsules/browser/browser/browser-runtime-api.js";
 import { friendlyOpenError, isAuthoritySessionError } from "../capsules/browser/browser/browser-status.js";
+import { sameRuntimePageOwner } from "../capsules/browser/browser/browser-page-cleanup.js";
 
 const browserSource = fs.readFileSync(
   new URL("../capsules/browser/browser/browser.js", import.meta.url),
@@ -108,6 +109,7 @@ const authorityRenewalSource = [
   "handleHomeBrowserAuthorityRenewalResult",
   "requestHomeRelaunch",
   "requestFreshRuntimeAuthority",
+  "handlePageObservationFailure",
   "startPageStatusPolling",
   "startPageHeartbeat",
 ]
@@ -210,6 +212,7 @@ function createActiveAuthorityExpiryHarness(surface) {
     },
     runtimePageCleanup: { status: () => null },
     currentRuntimePageOwner: () => owner,
+    sameRuntimePageOwner,
   });
   vm.runInContext(
     `${authorityRenewalSource}\nthis.authority = { handleHomeBrowserAuthorityRenewalResult, requestHomeRelaunch, startPageStatusPolling, startPageHeartbeat };`,
