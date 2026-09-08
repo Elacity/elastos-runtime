@@ -52,7 +52,7 @@ projections with narrower jobs:
 | --- | --- |
 | Signed catalog entry | Points to an exact capsule CID and presents publisher, version, compatibility, size, and license metadata. |
 | Availability receipt | States where and under which policy the CID is retained or replicated. |
-| Installed inventory | Records admission, cached bytes, explicit Keep retention and provider readiness as distinct facts. |
+| Installed inventory | Records admission, cached bytes and explicit Keep retention. Runtime derives current dispatch readiness from admission and the provider offer. |
 | Install or removal receipt | Records the principal, exact CID, operation, result, and time. |
 | Service offer | Advertises a running provider capability after installation; it is not package identity or install authority. |
 
@@ -190,12 +190,15 @@ fixed local `model-catalog.json` snapshot with a 128 KiB bound, verifies that
 head and signature independently from entry claims, and accepts one current
 signed entry. The entry names a canonical DAG-PB/SHA-256 package closure CID.
 The existing authenticated catalog exposes verified publisher identity,
-declared CID/size and model metadata as `unprepared`, with installed and
-launchable both false. A same-name local directory does not establish admission.
+declared CID/size and model metadata, with installed and launchable both false.
+The caller's admission and exact-offer dispatch readiness determine whether the
+model state is unprepared, admitted or ready. A same-name local directory does
+not establish admission.
 Absent model configuration preserves ordinary installed inventory; invalid
 model configuration marks only the model catalog unavailable. Snapshot
-verification provides publisher metadata, while transfer, atomic admission,
-provider readiness and deployed availability require their own proof.
+verification provides publisher metadata. Transfer, atomic admission and
+dispatch readiness have separate source checks; inference and deployed
+availability require target proof.
 
 ## Implemented bounded local reads
 
@@ -242,6 +245,19 @@ packages are seeded in local cache. Current proof and measurements are in
 [state.md](../state.md); scaled cold delivery, continuous peak usage, exact
 Qwen, inference and installed acceptance remain open.
 
+Catalog GET, typed catalog list and preparation status share one caller-scoped
+projection of admission, Keep, progress and `dispatch_ready`. Runtime derives
+readiness from the current signed entry and admission, safe artifact metadata,
+engine receipt identity and exactly one matching offer from the ready local
+model provider. The startup composer supplies the same offer identity and
+public policy. The offer read has byte, count and time bounds; Runtime
+revalidates the caller after it completes. Inventory snapshots preserve pending
+recovery data and store no readiness result. Polling uses metadata observations
+without reading model or engine payloads. Activation still verifies full
+hashes, and the provider verifies payloads before each new engine start.
+Dispatch readiness describes the current binding; an actual run proves
+inference.
+
 ## Source prerequisites and bounded implementation plan
 
 The following separates implemented primitives from remaining package work:
@@ -249,7 +265,7 @@ The following separates implemented primitives from remaining package work:
 | Existing surface | Current state and required extension |
 | --- | --- |
 | `elastos/crates/elastos-common/src/manifest.rs` | The bounded passive metadata profile above is implemented. Preparation must verify its declared facts against the complete fetched package before admission. |
-| `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | The catalog projects installed inventory plus verified, unprepared model metadata. The preparation inventory now owns reservations and admission receipts. Shared admission/offer projections remain to be connected. |
+| `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | The catalog projects installed inventory plus signed model metadata and caller-scoped admission, Keep and dispatch readiness. The preparation inventory owns reservations and admission receipts. Shared UI remains open. |
 | `elastos/crates/elastos-server/src/content.rs` | Preparation uses the explicit bounded local-fetch loop. Ordinary `fetch_bytes_via_provider` and `materialize_data_capsule` still drain whole files. `import_exact` and aggregate `import_object` remain capped at 64 MiB and 512 files; these are separate paths. |
 | `elastos/crates/elastos-runtime/src/provider/registry.rs` | Bounded reads validate and consume the native range once for Bytes and Stream. Ordinary `open_provider_stream` still decodes the full response into `ProviderStreamSession.bytes`; consumer chunking alone does not bound producer memory or cancel network work. |
 | `capsules/ipfs-provider/src/main.rs` | Explicit bounded Cat enforces finite bytes/time and uses the existing backend lifecycle. Ordinary `cat` and `cat_to_path` still read the entire file before encoding or writing. |

@@ -82,12 +82,12 @@ acceptance. Browser implementation belongs to its separate owner.
 2. [ ] Expose the same Runtime model facts through Marketplace Models, System,
    Assistant and Home Agent for Use, progress, cancel, retry, Keep and selection.
    Use the existing catalog, inventory and pickers. Preserve drafts and runs.
-   Runtime Keep/release and caller-scoped retention status pass source tests;
-   connect these facts to the shared views.
+   Runtime Keep/release, caller-scoped retention and exact-offer dispatch
+   readiness pass source tests; connect these facts to the shared views.
    Selection may prepare the chosen model; inference requires that exact
    admitted model and a ready provider. Prove offline/error states,
-   incompatibility, busy-safe eviction and shared-view idempotence. Keep public
-   readiness unavailable until atomic admission and offer binding are complete.
+   incompatibility, busy-safe eviction and shared-view idempotence. Use Runtime's
+   dispatch-readiness projection; actual inference needs its own run evidence.
 3. [ ] Package the exact existing Qwen model and verified engine for isolated
    setup with a real pinned signed catalog and complete closure, publisher trust
    and honest availability evidence. Distinguish verified upstream references

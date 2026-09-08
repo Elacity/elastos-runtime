@@ -1206,6 +1206,45 @@ impl ProviderRegistry {
         Ok(())
     }
 
+    /// Observe offers from the exact current local model registration. Holding
+    /// this read guard binds the reply to that slot, not a replacement or route.
+    pub async fn local_model_offers(&self) -> Result<Vec<serde_json::Value>, ProviderError> {
+        let unavailable = || ProviderError::Provider("model offers unavailable".into());
+        let read = async {
+            let slots = self.sub_providers.read().await;
+            let provider = slots
+                .get("model")
+                .and_then(SubProviderRegistration::ready_provider)
+                .ok_or_else(unavailable)?;
+            let response = provider
+                .send_raw(&serde_json::json!({"op":"offers_list"}))
+                .await
+                .map_err(|error| {
+                    tracing::debug!(?error, "private model offers read failed");
+                    unavailable()
+                })?;
+            let data = &response["data"];
+            let offers = data["offers"].as_array().ok_or_else(unavailable)?;
+            if response.as_object().is_none_or(|object| object.len() != 2)
+                || response["status"] != "ok"
+                || data.as_object().is_none_or(|object| object.len() != 3)
+                || data["schema"] != "elastos.model.offers-list/v1"
+                || data["provider"] != "model-provider"
+                || offers.len() > 64
+            {
+                return Err(unavailable());
+            }
+            // Serialization into a fixed slice checks the bound without allocating
+            // another unbounded copy of the provider's parsed response.
+            let mut bound = vec![0u8; 256 * 1024];
+            serde_json::to_writer(bound.as_mut_slice(), &response).map_err(|_| unavailable())?;
+            Ok(offers.clone())
+        };
+        tokio::time::timeout(super::bridge::REQUEST_TIMEOUT, read)
+            .await
+            .map_err(|_| unavailable())?
+    }
+
     /// Runtime-owned readiness for local preparation, through the existing Kubo lifecycle.
     /// Capsule resource dispatch and provider-plane envelopes cannot call this operation.
     pub async fn prepare_local_ipfs_backend(&self) -> Result<(), ProviderError> {
@@ -2596,6 +2635,9 @@ mod tests {
     struct PrivateIpfsMock {
         requests: Mutex<Vec<serde_json::Value>>,
         response: Mutex<Option<serde_json::Value>>,
+        hold: std::sync::atomic::AtomicBool,
+        entered: Notify,
+        release: Notify,
     }
 
     #[async_trait::async_trait]
@@ -2614,6 +2656,10 @@ mod tests {
             request: &serde_json::Value,
         ) -> Result<serde_json::Value, ProviderError> {
             self.requests.lock().await.push(request.clone());
+            if self.hold.load(Ordering::Acquire) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
             if let Some(response) = self.response.lock().await.clone() {
                 return Ok(response);
             }
@@ -2636,6 +2682,71 @@ mod tests {
             ("_elastos_object.json".into(), 2),
             ("weights.gguf".into(), 4),
         ]
+    }
+
+    #[tokio::test]
+    async fn model_offers_local_read_bounds_and_unavailable_slot() {
+        let registry = ProviderRegistry::new();
+        assert!(registry.local_model_offers().await.is_err());
+        let provider = Arc::new(PrivateIpfsMock::default());
+        registry
+            .register_sub_provider("model", provider.clone())
+            .await
+            .unwrap();
+        let valid = serde_json::json!({"status":"ok", "data":{
+            "schema":"elastos.model.offers-list/v1", "provider":"model-provider", "offers":[]
+        }});
+        *provider.response.lock().await = Some(valid.clone());
+        assert_eq!(
+            registry.local_model_offers().await.unwrap(),
+            Vec::<serde_json::Value>::new()
+        );
+        for (field, value) in [
+            ("schema", serde_json::json!("unknown")),
+            ("provider", serde_json::json!("other")),
+            (
+                "offers",
+                serde_json::json!(vec![serde_json::Value::Null; 65]),
+            ),
+            ("offers", serde_json::json!(["x".repeat(256 * 1024)])),
+        ] {
+            let mut response = valid.clone();
+            response["data"][field] = value;
+            *provider.response.lock().await = Some(response);
+            assert!(registry.local_model_offers().await.is_err(), "{field}");
+        }
+        *provider.response.lock().await =
+            Some(serde_json::json!({"status":"error", "error":"/private/model"}));
+        let error = registry.local_model_offers().await.unwrap_err().to_string();
+        assert!(!error.contains("/private/model"));
+        assert!(provider
+            .requests
+            .lock()
+            .await
+            .iter()
+            .all(|request| request == &serde_json::json!({"op":"offers_list"})));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_offers_local_read_timeout_retains_exact_slot_until_settlement() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = Arc::new(PrivateIpfsMock::default());
+        provider.hold.store(true, Ordering::Release);
+        registry
+            .register_sub_provider("model", provider.clone())
+            .await
+            .unwrap();
+        let reading = registry.clone();
+        let read = tokio::spawn(async move { reading.local_model_offers().await });
+        provider.entered.notified().await;
+        assert!(registry.sub_providers.try_write().is_err());
+        tokio::time::advance(super::super::bridge::REQUEST_TIMEOUT).await;
+        assert!(read.await.unwrap().is_err());
+        assert!(registry.sub_providers.try_write().is_ok());
+        assert!(Arc::ptr_eq(
+            &registry.get_sub_provider("model").await.unwrap(),
+            &(provider.clone() as Arc<dyn Provider>)
+        ));
     }
 
     #[tokio::test]

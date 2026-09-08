@@ -220,8 +220,9 @@ The integrated source includes these durable facts:
   `components.json` config supplies a raw CIDv1/SHA-256 head and a nonempty
   trusted publisher set independently from the entry. The authenticated catalog
   projects the verified publisher DID, declared package CID, exact declared
-  size and bounded model facts as `unprepared`, with installed and launchable
-  both false. Same-name local files do not establish admission or readiness;
+  size and bounded model facts, with installed and launchable both false.
+  Caller-scoped admission and dispatch readiness determine the model state.
+  Same-name local files do not establish admission or readiness;
   malformed model trust leaves ordinary installed inventory available.
 - The first-Qwen metadata profile and limits are in
   [Content capsule distribution](docs/CONTENT_CAPSULE_DISTRIBUTION.md#implemented-catalog-metadata-profile).
@@ -230,8 +231,8 @@ The integrated source includes these durable facts:
   Workspace/Chain formatting, Home/public-copy entropy and diff checks pass.
   These prove metadata consistency and publisher verification,
   including rejection paths; the composed preparation proof is recorded below.
-  Installed Homes remain unchanged. Model-provider still consumes
-  static private artifact/offer configuration, and Marketplace/System model
+  Installed Homes remain unchanged. Model-provider consumes Runtime-owned
+  private artifact/offer configuration, and Marketplace/System model
   selection remains future work. Model and Assistant Truth below records the
   existing Qwen operator bootstrap.
 - The signed, complete-closure CID model path is required in the current
@@ -350,7 +351,23 @@ The integrated source includes these durable facts:
   Keep changes leave admission, bytes, quota, offers and readiness unchanged and
   do not interrupt startup verification. Source checks pass 60 server model tests
   (four explicit process prerequisites ignored) and the capsule binding test.
-  Shared UI, exact-offer readiness and safe eviction remain open.
+  Shared UI and safe eviction remain open.
+- Runtime derives one caller-scoped `model_runtime` projection for catalog GET,
+  typed catalog list and preparation status. It reports admission, Keep,
+  preparation progress and `dispatch_ready` for the single signed model profile.
+  Readiness requires current admission and trust, safe artifact metadata, the
+  current engine receipt identity and exactly one matching local provider offer.
+  Startup and readiness share the same offer identity and public policy.
+  Reads are bounded, revalidate the current caller after provider I/O and use a
+  read-only inventory snapshot that preserves pending recovery data. Polls
+  neither hash payloads nor persist readiness; full activation hashing and
+  provider hashing before each new engine start remain unchanged.
+  This proves dispatch configuration, while engine warmth and inference need
+  run evidence. Source checks pass 3 Runtime and 67 server model tests, with
+  four explicit process tests excluded from that server run. Separate native
+  Init and same-process refresh tests pass with the existing pinned provider.
+  Strict Runtime/server all-target Clippy, formatting and entropy checks pass.
+  Shared UI and installed acceptance remain open; installed Homes are unchanged.
 - Large-model publication needs a bounded operator/provider bootstrap path or a
   separately verified publisher repair. The current generic directory publisher
   reads whole files and builds a base64 JSON array. Cold-proof capacity must

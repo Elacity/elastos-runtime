@@ -505,7 +505,7 @@ fn set_retention(
         revalidate()?;
         inventory.save(&state)?;
     }
-    Ok(serde_json::json!({"cid":cid,"kept":keep,"admitted":true,"inference_ready":false}))
+    Ok(serde_json::json!({"cid":cid,"kept":keep,"admitted":true}))
 }
 
 fn status(
@@ -582,8 +582,7 @@ impl PreparationRecord {
             "state":self.state, "total_bytes":self.total_bytes,
             "completed_bytes":self.completed_bytes, "cancel_requested":self.cancel_requested,
             "admitted":self.state == PreparationState::Admitted,
-            "activation_pending":self.state == PreparationState::Admitted && self.activation_pending,
-            "inference_ready":false})
+            "activation_pending":self.state == PreparationState::Admitted && self.activation_pending})
     }
 }
 
@@ -1199,6 +1198,151 @@ fn local_model_startup_profile(platform: &str) -> anyhow::Result<serde_json::Val
     }))
 }
 
+fn admitted_model_offer(
+    entry: &super::VerifiedModelCatalogEntry,
+    weights: &crate::content::ContentObjectFile,
+    engine: &crate::setup::LocalModelEngineIdentity,
+) -> anyhow::Result<serde_json::Value> {
+    let identity = serde_json::json!({
+        "schema":"elastos.model.admitted-offer/v1",
+        "cid":entry.cid, "entrypoint":weights.path, "weights_sha256":weights.sha256,
+        "engine_receipt_sha256":engine.receipt_sha256, "engine_sha256":engine.sha256,
+    });
+    let id = format!(
+        "model:{}",
+        hex::encode(Sha256::digest(serde_json::to_vec(&identity)?))
+    );
+    Ok(serde_json::json!({
+        "id":id, "title":entry.manifest.name, "operation":"text.generate",
+        "input_modalities":["text/plain"], "output_modalities":["text/plain"],
+        "stream_output":true,
+        "policy":{
+            "schema":"elastos.model.policy/v1",
+            "concurrency_limit":1, "input_bytes_limit":32768,
+            "inline_output_bytes_limit":65536, "event_bytes_limit":4096,
+            "runtime_ms_limit":120000, "retention_secs":3600,
+            "cancel_settlement_timeout_ms":15000
+        }
+    }))
+}
+
+/// Caller-scoped dispatch facts, not engine warmth or inference evidence. The
+/// inventory and signed catalog remain the owners; this projection stores nothing.
+pub(in crate::api) fn unavailable_model_runtime_projection() -> serde_json::Value {
+    serde_json::json!({"admitted":false,"kept":false,
+        "dispatch_ready":false,"offer_id":null,"preparation":null})
+}
+
+#[derive(PartialEq)]
+struct ExpectedModelOffer {
+    offer: serde_json::Value,
+    files: Vec<storage::Stamp>,
+}
+
+pub(in crate::api) async fn model_runtime_projection(
+    data_dir: &Path,
+    registry: Option<&elastos_runtime::provider::ProviderRegistry>,
+    context: &HomeLaunchTokenContext,
+    cid: &str,
+    operation: Option<&str>,
+) -> serde_json::Value {
+    let unavailable = unavailable_model_runtime_projection;
+    let snapshot = || -> anyhow::Result<(serde_json::Value, Option<ExpectedModelOffer>)> {
+        ensure!(
+            context_is_bounded(context) && canonical_cid(cid, 0x70),
+            "model selection unavailable"
+        );
+        let inventory = Inventory::open(data_dir, false)?;
+        let state = inventory.snapshot()?;
+        let record = state
+            .records
+            .iter()
+            .filter(|r| {
+                r.request_binding.principal == context.principal_id
+                    && r.package_cid == cid
+                    && operation.is_none_or(|id| r.operation_id == id)
+            })
+            .max_by_key(|r| {
+                (
+                    r.state == PreparationState::Admitted,
+                    r.created_at,
+                    &r.operation_id,
+                )
+            });
+        let Some(record) = record else {
+            return Ok((unavailable(), None));
+        };
+        let mut projection = unavailable();
+        projection["kept"] = serde_json::json!(state.kept(&context.principal_id, cid));
+        projection["preparation"] = record.projection();
+        if record.state != PreparationState::Admitted {
+            return Ok((projection, None));
+        }
+        let stage = inventory.admitted(&record.admission_id)?;
+        stage.check()?;
+        projection["admitted"] = serde_json::json!(true);
+        let expected = (|| -> anyhow::Result<ExpectedModelOffer> {
+            let entry = current_entry(data_dir, record)?;
+            local_model_startup_profile(&crate::setup::detect_platform())?;
+            let manifest = serde_json::from_slice(&super::read_model_catalog_file(
+                data_dir,
+                "components.json",
+                4 * 1024 * 1024,
+            )?)?;
+            let engine = crate::setup::local_model_engine_receipt_identity(data_dir, &manifest)?;
+            let closure = crate::content::parse_content_object_manifest(
+                &entry.cid,
+                &serde_json::to_vec(&entry.object_manifest)?,
+            )?;
+            let weights = closure
+                .files
+                .iter()
+                .find(|file| file.path == entry.manifest.entrypoint)
+                .context("model entrypoint unavailable")?;
+            Ok(ExpectedModelOffer {
+                offer: admitted_model_offer(&entry, weights, &engine)?,
+                files: closure
+                    .files
+                    .iter()
+                    .map(|file| stage.file_stamp(file))
+                    .collect::<anyhow::Result<_>>()?,
+            })
+        })()
+        .ok();
+        Ok((projection, expected))
+    };
+    let (projection, expected) = match snapshot() {
+        Ok(value) => value,
+        Err(_) => return unavailable(),
+    };
+    let Some(expected) = expected else {
+        return projection;
+    };
+    let Some(registry) = registry else {
+        return projection;
+    };
+    // All inventory guards are dropped before I/O. Re-read current trust and
+    // admission afterward, including independent Keep changes during the read.
+    let offers = registry.local_model_offers().await;
+    let (mut projection, current) = match snapshot() {
+        Ok(value) => value,
+        Err(_) => return unavailable(),
+    };
+    if current.as_ref() == Some(&expected) {
+        if let Ok(offers) = offers {
+            let matching: Vec<_> = offers
+                .iter()
+                .filter(|offer| offer["id"] == expected.offer["id"])
+                .collect();
+            if matching.len() == 1 && matching[0] == &expected.offer {
+                projection["dispatch_ready"] = serde_json::json!(true);
+                projection["offer_id"] = expected.offer["id"].clone();
+            }
+        }
+    }
+    projection
+}
+
 /// Compose admitted offers for Runtime-owned model-provider Init. This function
 /// has no capsule route; public inference still uses the existing model grant.
 pub async fn append_admitted_model_startup_offers(
@@ -1274,41 +1418,23 @@ pub async fn append_admitted_model_startup_offers(
             .iter()
             .find(|f| f.path == entry.manifest.entrypoint)
             .context("model entrypoint is unavailable")?;
-        let identity = serde_json::json!({
-            "schema":"elastos.model.admitted-offer/v1",
-            "cid":entry.cid, "entrypoint":weights.path, "weights_sha256":weights.sha256,
-            "engine_receipt_sha256":engine.receipt_sha256, "engine_sha256":engine.sha256,
-        });
-        let id = format!(
-            "model:{}",
-            hex::encode(Sha256::digest(serde_json::to_vec(&identity)?))
-        );
+        let mut offer = admitted_model_offer(&entry, weights, &engine)?;
         ensure!(
-            offers.len() < 64
-                && !offers
-                    .iter()
-                    .any(|offer| offer["id"].as_str() == Some(id.as_str())),
+            offers.len() < 64 && !offers.iter().any(|existing| existing["id"] == offer["id"]),
             "admitted model offer conflicts with operator configuration"
         );
         // The provider's execution binding includes this CID-bound offer ID,
         // artifact digests and policy. Paths and request aliases are not identity.
-        offers.push(serde_json::json!({
-            "id":id, "title":entry.manifest.name, "operation":"text.generate",
-            "input_modalities":["text/plain"], "output_modalities":["text/plain"],
-            "enabled":true,
-            "policy":{
-                "concurrency_limit":1, "input_bytes_limit":32768,
-                "inline_output_bytes_limit":65536, "event_bytes_limit":4096,
-                "runtime_ms_limit":120000, "retention_secs":3600,
-                "cancel_settlement_timeout_ms":15000
-            },
-            "adapter":{
+        offer.as_object_mut().unwrap().remove("stream_output");
+        offer["policy"].as_object_mut().unwrap().remove("schema");
+        offer["enabled"] = serde_json::json!(true);
+        offer["adapter"] = serde_json::json!({
                 "kind":"local_llama_cpp_text",
                 "engine":{"path":engine.path, "sha256":engine.sha256},
                 "model":{"path":stage.path.join(&weights.path), "sha256":format!("sha256:{}",weights.sha256)},
                 "settings":settings
-            }
-        }));
+        });
+        offers.push(offer);
     }
     let mut extra = config.extra.clone();
     extra["offers"] = serde_json::Value::Array(offers);
@@ -1756,6 +1882,783 @@ mod tests {
         }
 
         #[derive(Default)]
+        struct ReadinessOffersFixture {
+            response: Mutex<serde_json::Value>,
+            calls: Mutex<Vec<serde_json::Value>>,
+            hold: AtomicBool,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+
+        #[async_trait::async_trait]
+        impl elastos_runtime::provider::Provider for ReadinessOffersFixture {
+            fn name(&self) -> &'static str {
+                "catalog-model-fixture"
+            }
+            fn schemes(&self) -> Vec<&'static str> {
+                vec![]
+            }
+            async fn handle(
+                &self,
+                _: elastos_runtime::provider::ResourceRequest,
+            ) -> Result<
+                elastos_runtime::provider::ResourceResponse,
+                elastos_runtime::provider::ProviderError,
+            > {
+                panic!("catalog reads must not dispatch model runs or content effects")
+            }
+            async fn send_raw(
+                &self,
+                request: &serde_json::Value,
+            ) -> Result<serde_json::Value, elastos_runtime::provider::ProviderError> {
+                assert_eq!(request, &serde_json::json!({"op":"offers_list"}));
+                self.calls.lock().unwrap().push(request.clone());
+                if self.hold.load(Ordering::Acquire) {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                Ok(self.response.lock().unwrap().clone())
+            }
+        }
+
+        #[tokio::test]
+        async fn model_catalog_readiness_matches_admitted_offer_without_mutating_preparation() {
+            use axum::body::{to_bytes, Body};
+            use axum::http::{Request, StatusCode};
+            use elastos_runtime::auth::AuthSessionGrantV1;
+            use std::os::unix::fs::MetadataExt as _;
+            use tower::ServiceExt as _;
+
+            let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            let _engine = install_engine(root.path());
+            let mut configured = config(root.path());
+            // Derive the expected ID/policy once through the actual composer.
+            // A catalog poll must not repeat its payload verification or Init.
+            append_admitted_model_startup_offers(root.path(), &registry, &mut configured)
+                .await
+                .unwrap();
+            let mut offer = configured.extra["offers"][1].clone();
+            offer.as_object_mut().unwrap().remove("adapter");
+            offer.as_object_mut().unwrap().remove("enabled");
+            offer["stream_output"] = serde_json::json!(true);
+            offer["policy"]["schema"] = serde_json::json!("elastos.model.policy/v1");
+            let provider = Arc::new(ReadinessOffersFixture {
+                response: Mutex::new(serde_json::json!({"status":"ok", "data":{
+                    "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
+                    "offers":[offer.clone()]
+                }})),
+                calls: Mutex::new(Vec::new()),
+                ..Default::default()
+            });
+            registry
+                .register_sub_provider("model", provider.clone())
+                .await
+                .unwrap();
+            retention_intent(root.path(), &context(), &record.package_cid, true).unwrap();
+
+            let context = context();
+            let timestamp = now().unwrap();
+            crate::auth::store_session_grant(
+                root.path(),
+                AuthSessionGrantV1 {
+                    schema: AuthSessionGrantV1::SCHEMA.into(),
+                    grant_id: context.grant_id.clone(),
+                    session_id: context.session_id.clone(),
+                    principal_id: context.principal_id.clone(),
+                    proof_binding_id: context.proof_binding_id.clone().unwrap(),
+                    issued_at: timestamp,
+                    expires_at: timestamp + 3600,
+                    apps: vec!["marketplace".into()],
+                },
+            )
+            .unwrap();
+            let token = crate::api::gateway::issue_home_launch_token_with_context(
+                root.path(),
+                "marketplace",
+                &context,
+            )
+            .unwrap();
+            let app = crate::api::gateway::gateway_router(crate::api::gateway::GatewayState {
+                provider_registry: Some(registry),
+                collaboration_chat_product_port: None,
+                collaboration_presence_product_port: None,
+                collaboration_discovery_service: None,
+                identity_manager: Arc::new(std::sync::OnceLock::new()),
+                cache_dir: root.path().to_path_buf(),
+                data_dir: root.path().to_path_buf(),
+            });
+            let inventory_path = root.path().join("model-preparation/state.json");
+            let before = std::fs::read(&inventory_path).unwrap();
+            let stage = Inventory::open(root.path(), false)
+                .unwrap()
+                .admitted(&record.admission_id)
+                .unwrap();
+            let weights = stage.path.join("weights.gguf");
+            let bytes = std::fs::read(&weights).unwrap();
+            let inode = std::fs::metadata(&weights).unwrap().ino();
+            let calls = backend.calls.lock().unwrap().clone();
+            let orphan = root.path().join("model-preparation/state.next");
+            std::fs::write(&orphan, &before).unwrap();
+            std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let orphan_inode = std::fs::metadata(&orphan).unwrap().ino();
+
+            for _ in 0..2 {
+                let request = Request::builder()
+                    .uri("/api/capsules/catalog")
+                    .header("host", "localhost:61180")
+                    .header("origin", "null")
+                    .header("x-elastos-home-token", &token)
+                    .body(Body::empty())
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                let status = response.status();
+                let catalog: serde_json::Value = serde_json::from_slice(
+                    &to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
+                )
+                .unwrap();
+                assert_eq!(status, StatusCode::OK, "{catalog}");
+                assert_eq!(catalog["model_catalog_state"], "verified");
+                let model = catalog["capsules"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["cid"] == record.package_cid)
+                    .unwrap();
+                let readiness = &model["model_runtime"];
+                assert_eq!(readiness["dispatch_ready"], true, "{model}");
+                assert_eq!(readiness["admitted"], true);
+                assert_eq!(readiness["kept"], true);
+                assert_eq!(readiness["offer_id"], offer["id"]);
+                assert_eq!(
+                    readiness["preparation"]["operation_id"],
+                    record.operation_id
+                );
+                assert_eq!(
+                    readiness["preparation"]["completed_bytes"],
+                    record.total_bytes
+                );
+                assert_eq!(model["launchable"], false);
+                assert_eq!(
+                    model["installed"], false,
+                    "content admission does not change app install counts"
+                );
+                assert_eq!(model["state"], "ready");
+                assert_eq!(model["cid_state"], "admission-verified");
+                assert_eq!(model["trust_state"], "publisher-verified-admitted");
+                assert_eq!(
+                    model["projection"]["audit_mirror"]["note"],
+                    "Content admitted; a matching current model offer is available for dispatch."
+                );
+                let public = serde_json::to_string(readiness).unwrap();
+                for private in [
+                    root.path().to_str().unwrap(),
+                    &context.principal_id,
+                    "adapter",
+                    "inference_ready",
+                    "engine_warm",
+                ] {
+                    assert!(!public.contains(private), "{private}: {public}");
+                }
+            }
+            assert_eq!(provider.calls.lock().unwrap().len(), 2);
+            assert_eq!(
+                *backend.calls.lock().unwrap(),
+                calls,
+                "poll must not rehash or fetch model bytes"
+            );
+            assert_eq!(std::fs::read(inventory_path).unwrap(), before);
+            assert_eq!(std::fs::read(&weights).unwrap(), bytes);
+            assert_eq!(std::fs::metadata(weights).unwrap().ino(), inode);
+            assert_eq!(
+                std::fs::read(&orphan).unwrap(),
+                before,
+                "catalog must not perform owner recovery cleanup"
+            );
+            assert_eq!(std::fs::metadata(orphan).unwrap().ino(), orphan_inode);
+        }
+
+        async fn readiness_provider(
+            root: &Path,
+            registry: &elastos_runtime::provider::ProviderRegistry,
+        ) -> (serde_json::Value, Arc<ReadinessOffersFixture>) {
+            let mut configured = config(root);
+            append_admitted_model_startup_offers(root, registry, &mut configured)
+                .await
+                .unwrap();
+            let mut offer = configured.extra["offers"][1].clone();
+            offer.as_object_mut().unwrap().remove("adapter");
+            offer.as_object_mut().unwrap().remove("enabled");
+            offer["stream_output"] = serde_json::json!(true);
+            offer["policy"]["schema"] = serde_json::json!("elastos.model.policy/v1");
+            let response = serde_json::json!({"status":"ok", "data":{
+                "schema":"elastos.model.offers-list/v1", "provider":"model-provider", "offers":[offer]
+            }});
+            let provider = Arc::new(ReadinessOffersFixture {
+                response: Mutex::new(response.clone()),
+                ..Default::default()
+            });
+            registry
+                .register_sub_provider("model", provider.clone())
+                .await
+                .unwrap();
+            (response, provider)
+        }
+
+        fn readiness_catalog_app(
+            root: &Path,
+            registry: Arc<elastos_runtime::provider::ProviderRegistry>,
+            context: &HomeLaunchTokenContext,
+        ) -> (axum::Router, String) {
+            let dir = root.join("capsules/marketplace");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut manifest: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../capsules/marketplace/capsule.json"
+            )))
+            .unwrap();
+            // Bind the existing typed catalog/status seams for this route fixture.
+            for (id, op) in [("catalog.list", "list"), ("content.status", "status")] {
+                manifest["interfaces"][0]["methods"].as_array_mut().unwrap().push(serde_json::json!({
+                    "id":id, "operation":op, "resource":RESOURCE, "risk":"read", "approval":"runtime_policy", "audit":"summary"
+                }));
+            }
+            std::fs::write(
+                dir.join("capsule.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            change_config(
+                root,
+                |config| {
+                    config["external"]["marketplace"] =
+                        serde_json::json!({"install_path":"capsules/marketplace","platforms":{}})
+                },
+            );
+            let timestamp = now().unwrap();
+            crate::auth::store_session_grant(
+                root,
+                elastos_runtime::auth::AuthSessionGrantV1 {
+                    schema: elastos_runtime::auth::AuthSessionGrantV1::SCHEMA.into(),
+                    grant_id: context.grant_id.clone(),
+                    session_id: context.session_id.clone(),
+                    principal_id: context.principal_id.clone(),
+                    proof_binding_id: context.proof_binding_id.clone().unwrap(),
+                    issued_at: timestamp,
+                    expires_at: timestamp + 3600,
+                    apps: vec!["marketplace".into()],
+                },
+            )
+            .unwrap();
+            let token = crate::api::gateway::issue_home_launch_token_with_context(
+                root,
+                "marketplace",
+                context,
+            )
+            .unwrap();
+            (
+                crate::api::gateway::gateway_router(crate::api::gateway::GatewayState {
+                    provider_registry: Some(registry),
+                    collaboration_chat_product_port: None,
+                    collaboration_presence_product_port: None,
+                    collaboration_discovery_service: None,
+                    identity_manager: Arc::new(std::sync::OnceLock::new()),
+                    cache_dir: root.to_path_buf(),
+                    data_dir: root.to_path_buf(),
+                }),
+                token,
+            )
+        }
+
+        async fn readiness_catalog_request(
+            app: &axum::Router,
+            token: &str,
+            input: Option<serde_json::Value>,
+        ) -> (axum::http::StatusCode, serde_json::Value) {
+            use tower::ServiceExt as _;
+            let request = axum::http::Request::builder()
+                .header("host", "localhost:61180")
+                .header("origin", "null")
+                .header("x-elastos-home-token", token)
+                .header("content-type", "application/json");
+            let request = if let Some(input) = input {
+                request
+                    .method("POST")
+                    .uri("/api/capsules/interfaces/invoke")
+                    .body(axum::body::Body::from(serde_json::to_vec(&input).unwrap()))
+            } else {
+                request
+                    .uri("/api/capsules/catalog")
+                    .body(axum::body::Body::empty())
+            }
+            .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            (
+                status,
+                serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap(),
+            )
+        }
+
+        #[tokio::test]
+        async fn model_catalog_readiness_rejects_missing_duplicate_wrong_and_malformed_offers() {
+            let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            let _engine = install_engine(root.path());
+            let (valid, provider) = readiness_provider(root.path(), &registry).await;
+            let (app, token) = readiness_catalog_app(root.path(), registry, &context());
+            let ordinary = readiness_catalog_request(&app, &token, None).await.1["capsules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["name"] == "marketplace")
+                .unwrap()
+                .clone();
+            let offer = &valid["data"]["offers"][0];
+            let mut cases = Vec::new();
+            for (pointer, value) in [
+                ("/data/offers", serde_json::json!([])),
+                ("/data/offers", serde_json::json!([offer, offer])),
+                (
+                    "/data/offers/0/id",
+                    serde_json::json!("model:same-name-other-cid"),
+                ),
+                (
+                    "/data/offers/0/operation",
+                    serde_json::json!("image.generate"),
+                ),
+                (
+                    "/data/offers/0/input_modalities",
+                    serde_json::json!(["image/png"]),
+                ),
+                (
+                    "/data/offers/0/output_modalities",
+                    serde_json::json!(["image/png"]),
+                ),
+                ("/data/offers/0/stream_output", serde_json::json!(false)),
+                (
+                    "/data/offers/0/policy/input_bytes_limit",
+                    serde_json::json!(1),
+                ),
+                ("/data/offers/0/policy/schema", serde_json::json!("unknown")),
+                ("/data/schema", serde_json::json!("unknown")),
+            ] {
+                let mut response = valid.clone();
+                *response.pointer_mut(pointer).unwrap() = value;
+                cases.push(response);
+            }
+            cases.push(serde_json::json!({"status":"ok","data":{"provider":"model-provider","protocol_version":"elastos.model-provider/v1","offers_ready":1}}));
+            cases.push(serde_json::json!({"status":"error","error":"private /engine/path"}));
+            let mut extra = valid.clone();
+            extra["data"]["offers"][0]["adapter"] = serde_json::json!("private /engine/path");
+            cases.push(extra);
+            let before = std::fs::read(root.path().join("model-preparation/state.json")).unwrap();
+            let calls = backend.calls.lock().unwrap().clone();
+            for response in cases {
+                *provider.response.lock().unwrap() = response;
+                let (status, catalog) = readiness_catalog_request(&app, &token, None).await;
+                assert_eq!(status, axum::http::StatusCode::OK);
+                let model = catalog["capsules"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r["cid"] == record.package_cid)
+                    .unwrap();
+                assert_eq!(model["model_runtime"]["admitted"], true);
+                assert_eq!(model["model_runtime"]["dispatch_ready"], false);
+                assert!(model["model_runtime"]["offer_id"].is_null());
+                assert_eq!(model["state"], "admitted");
+                assert_eq!(
+                    catalog["capsules"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|r| r["name"] == "marketplace")
+                        .unwrap(),
+                    &ordinary
+                );
+                assert!(!catalog.to_string().contains("private /engine/path"));
+            }
+            assert_eq!(
+                std::fs::read(root.path().join("model-preparation/state.json")).unwrap(),
+                before
+            );
+            assert_eq!(*backend.calls.lock().unwrap(), calls);
+        }
+
+        #[tokio::test]
+        async fn model_catalog_readiness_is_principal_scoped_and_shared_with_typed_status() {
+            let (root, record, _, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            let _engine = install_engine(root.path());
+            let (_, provider) = readiness_provider(root.path(), &registry).await;
+            retention_intent(root.path(), &context(), &record.package_cid, true).unwrap();
+            let (app, token) = readiness_catalog_app(root.path(), registry.clone(), &context());
+            for (method, input) in [
+                ("catalog.list", serde_json::json!({})),
+                (
+                    "content.status",
+                    serde_json::json!({"operation_id":record.operation_id}),
+                ),
+            ] {
+                let (status, response) = readiness_catalog_request(&app, &token, Some(serde_json::json!({
+                    "request_id":"readiness-status", "capsule":"marketplace", "interface":"elastos.marketplace.catalog", "method":method, "input":input
+                }))).await;
+                assert_eq!(status, axum::http::StatusCode::OK, "{response}");
+                let value = if method == "catalog.list" {
+                    response["output"]["catalog"]["capsules"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|r| r["cid"] == record.package_cid)
+                        .unwrap()["model_runtime"]
+                        .clone()
+                } else {
+                    response["output"].clone()
+                };
+                assert_eq!(value["dispatch_ready"], true, "{response}");
+                assert_eq!(value["kept"], true);
+                assert!(!value.to_string().contains("inference_ready"));
+            }
+            assert_eq!(provider.calls.lock().unwrap().len(), 2);
+            let mut other = context();
+            other.principal_id = "person:other-reader".into();
+            other.session_id = "session-other".into();
+            other.grant_id = "grant-other".into();
+            let (other_app, other_token) =
+                readiness_catalog_app(root.path(), registry.clone(), &other);
+            let local = root.path().join("capsules/model-fixture");
+            std::fs::create_dir_all(&local).unwrap();
+            std::fs::write(
+                local.join("capsule.json"),
+                serde_json::to_vec(&current_entry(root.path(), &record).unwrap().manifest).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(local.join("weights.gguf"), b"unverified same-name content").unwrap();
+            let (_, catalog) = readiness_catalog_request(&other_app, &other_token, None).await;
+            let model = catalog["capsules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["cid"] == record.package_cid)
+                .unwrap();
+            assert_eq!(
+                model["model_runtime"],
+                unavailable_model_runtime_projection()
+            );
+            assert!(!catalog.to_string().contains(&record.operation_id));
+            assert!(!catalog.to_string().contains(&context().principal_id));
+            assert_eq!(
+                provider.calls.lock().unwrap().len(),
+                2,
+                "unadmitted caller must not read offers"
+            );
+            let alias = reserve_at(
+                root.path(),
+                &caller(&other, &method("use")),
+                "other-use",
+                &record.package_cid,
+                now().unwrap(),
+            )
+            .unwrap();
+            let pending = model_runtime_projection(
+                root.path(),
+                Some(&registry),
+                &other,
+                &record.package_cid,
+                None,
+            )
+            .await;
+            assert_eq!(pending["dispatch_ready"], false);
+            assert_eq!(pending["preparation"]["operation_id"], alias.operation_id);
+            update_operation(root.path(), &alias.operation_id, |alias| {
+                alias.state = PreparationState::Admitted;
+                alias.index_bytes = record.index_bytes;
+                alias.completed_bytes = record.total_bytes;
+            })
+            .unwrap();
+            let value = model_runtime_projection(
+                root.path(),
+                Some(&registry),
+                &other,
+                &record.package_cid,
+                None,
+            )
+            .await;
+            assert_eq!(value["dispatch_ready"], true);
+            assert_eq!(value["kept"], false);
+            assert_eq!(value["preparation"]["operation_id"], alias.operation_id);
+            let unavailable =
+                model_runtime_projection(root.path(), None, &other, &record.package_cid, None)
+                    .await;
+            assert_eq!(unavailable["dispatch_ready"], false);
+        }
+
+        #[tokio::test]
+        async fn model_catalog_readiness_revalidates_authority_and_catalog_after_offer_read() {
+            let (root, record, _, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            let _engine = install_engine(root.path());
+            let (_, provider) = readiness_provider(root.path(), &registry).await;
+            let (app, token) = readiness_catalog_app(root.path(), registry.clone(), &context());
+            provider.hold.store(true, Ordering::Release);
+            let request_app = app.clone();
+            let request_token = token.clone();
+            let request = tokio::spawn(async move {
+                readiness_catalog_request(&request_app, &request_token, None).await
+            });
+            provider.entered.notified().await;
+            // This succeeds while the read is held: no inventory/worker lock spans provider I/O.
+            retention_intent(root.path(), &context(), &record.package_cid, true).unwrap();
+            let config_path = root.path().join("components.json");
+            let original = std::fs::read(&config_path).unwrap();
+            change_config(root.path(), |config| {
+                config["model_catalog"]["publisher_dids"] = serde_json::json!([])
+            });
+            provider.release.notify_one();
+            let (status, catalog) = request.await.unwrap();
+            assert_eq!(status, axum::http::StatusCode::OK);
+            assert_eq!(catalog["model_catalog_state"], "unavailable");
+            assert!(catalog["capsules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["name"] == "marketplace"));
+            assert!(!catalog["capsules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["cid"] == record.package_cid));
+            std::fs::write(config_path, original).unwrap();
+            let request =
+                tokio::spawn(async move { readiness_catalog_request(&app, &token, None).await });
+            provider.entered.notified().await;
+            crate::auth::revoke_session_grant(root.path(), &context().session_id, now().unwrap())
+                .unwrap();
+            provider.release.notify_one();
+            assert_eq!(request.await.unwrap().0, axum::http::StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn model_catalog_readiness_rejects_changed_cid_and_oversized_catalog_membership() {
+            let (root, record, _, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            let _engine = install_engine(root.path());
+            let (_, provider) = readiness_provider(root.path(), &registry).await;
+            let (mut payload, files) = package_fixture(b"GGUF\x03\0\0\0different".to_vec());
+            // Synthetic catalog identity follows this fixture's changed closure
+            // metadata; real DAG-PB package hashing has separate provider proof.
+            let digest = Sha256::digest(&files["_elastos_object.json"]);
+            let hash = cid::multihash::Multihash::<64>::wrap(0x12, &digest).unwrap();
+            payload["entries"][0]["cid"] =
+                serde_json::json!(cid::Cid::new_v1(0x70, hash).to_string());
+            write_preparation_catalog(root.path(), &payload);
+            let (app, token) = readiness_catalog_app(root.path(), registry.clone(), &context());
+            let (_, catalog) = readiness_catalog_request(&app, &token, None).await;
+            let model = catalog["capsules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["model_content"].is_object())
+                .unwrap();
+            assert_ne!(model["cid"], record.package_cid);
+            assert_eq!(
+                model["model_runtime"],
+                unavailable_model_runtime_projection()
+            );
+            let second = payload["entries"][0].clone();
+            payload["entries"].as_array_mut().unwrap().push(second);
+            write_preparation_catalog(root.path(), &payload);
+            let (app, token) = readiness_catalog_app(root.path(), registry, &context());
+            let (_, catalog) = readiness_catalog_request(&app, &token, None).await;
+            assert_eq!(catalog["model_catalog_state"], "unavailable");
+            assert!(catalog["capsules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["name"] == "marketplace"));
+            assert!(provider.calls.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn model_catalog_readiness_receipt_identity_rejects_replacement_and_unsafe_metadata()
+        {
+            let (root, record, _, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            let engine = install_engine(root.path());
+            let (response, _) = readiness_provider(root.path(), &registry).await;
+            let receipt = engine.0.join(".elastos-engine.json");
+            let bytes = std::fs::read(&receipt).unwrap();
+            let original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let expected_id = &response["data"]["offers"][0]["id"];
+            let projection = model_runtime_projection(
+                root.path(),
+                Some(&registry),
+                &context(),
+                &record.package_cid,
+                None,
+            )
+            .await;
+            assert_eq!(
+                &projection["offer_id"], expected_id,
+                "receipt-derived ID must equal full startup composer ID"
+            );
+            for (field, replacement) in [
+                ("version", serde_json::json!("changed")),
+                ("schema", serde_json::json!("unknown")),
+                ("entries", serde_json::json!([])),
+            ] {
+                let mut changed = original.clone();
+                changed[field] = replacement;
+                std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(0o600)).unwrap();
+                std::fs::write(&receipt, serde_json::to_vec(&changed).unwrap()).unwrap();
+                std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(0o400)).unwrap();
+                assert_eq!(
+                    model_runtime_projection(
+                        root.path(),
+                        Some(&registry),
+                        &context(),
+                        &record.package_cid,
+                        None
+                    )
+                    .await["dispatch_ready"],
+                    false
+                );
+            }
+            let mut changed = original.clone();
+            changed["entries"][0]["sha256"] =
+                serde_json::json!(format!("sha256:{}", "b".repeat(64)));
+            // Replace the receipt inode as well as its validly shaped digest.
+            std::fs::set_permissions(&engine.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let replacement = engine.0.join("replacement");
+            std::fs::write(&replacement, serde_json::to_vec(&changed).unwrap()).unwrap();
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o400)).unwrap();
+            std::fs::rename(&replacement, &receipt).unwrap();
+            std::fs::set_permissions(&engine.0, std::fs::Permissions::from_mode(0o500)).unwrap();
+            assert_eq!(
+                model_runtime_projection(
+                    root.path(),
+                    Some(&registry),
+                    &context(),
+                    &record.package_cid,
+                    None
+                )
+                .await["dispatch_ready"],
+                false
+            );
+            let manifest = serde_json::from_slice(
+                &std::fs::read(root.path().join("components.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                crate::setup::verified_local_model_engine(root.path(), &manifest).is_err(),
+                "Init retains full payload verification"
+            );
+            std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::write(&receipt, &bytes).unwrap();
+            assert_eq!(
+                model_runtime_projection(
+                    root.path(),
+                    Some(&registry),
+                    &context(),
+                    &record.package_cid,
+                    None
+                )
+                .await["dispatch_ready"],
+                false
+            );
+            std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(0o400)).unwrap();
+            assert_eq!(
+                model_runtime_projection(
+                    root.path(),
+                    Some(&registry),
+                    &context(),
+                    &record.package_cid,
+                    None
+                )
+                .await["dispatch_ready"],
+                true
+            );
+        }
+
+        #[tokio::test]
+        async fn model_catalog_readiness_checks_declared_artifact_metadata_without_rehash() {
+            let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            let _engine = install_engine(root.path());
+            let (_, provider) = readiness_provider(root.path(), &registry).await;
+            let stage = Inventory::open(root.path(), false)
+                .unwrap()
+                .admitted(&record.admission_id)
+                .unwrap();
+            let weights = stage.path.join("weights.gguf");
+            let original = std::fs::read(&weights).unwrap();
+            let saved = root.path().join("fixture-weights");
+            std::fs::rename(&weights, &saved).unwrap();
+            assert_eq!(
+                model_runtime_projection(
+                    root.path(),
+                    Some(&registry),
+                    &context(),
+                    &record.package_cid,
+                    None
+                )
+                .await["dispatch_ready"],
+                false
+            );
+            std::os::unix::fs::symlink(&saved, &weights).unwrap();
+            assert_eq!(
+                model_runtime_projection(
+                    root.path(),
+                    Some(&registry),
+                    &context(),
+                    &record.package_cid,
+                    None
+                )
+                .await["dispatch_ready"],
+                false
+            );
+            std::fs::remove_file(&weights).unwrap();
+            std::fs::rename(&saved, &weights).unwrap();
+            std::fs::write(&weights, b"GGUF").unwrap();
+            assert_eq!(
+                model_runtime_projection(
+                    root.path(),
+                    Some(&registry),
+                    &context(),
+                    &record.package_cid,
+                    None
+                )
+                .await["dispatch_ready"],
+                false
+            );
+            std::fs::write(&weights, &original).unwrap();
+            let calls = backend.calls.lock().unwrap().clone();
+            provider.hold.store(true, Ordering::Release);
+            let read_root = root.path().to_path_buf();
+            let read_registry = registry.clone();
+            let cid = record.package_cid.clone();
+            let pending = tokio::spawn(async move {
+                model_runtime_projection(&read_root, Some(&read_registry), &context(), &cid, None)
+                    .await
+            });
+            provider.entered.notified().await;
+            // Same-size replacement during observation is detected by metadata,
+            // without persisting stamps or claiming detection of all byte tampering.
+            std::fs::write(&saved, &original).unwrap();
+            std::fs::set_permissions(&saved, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::rename(&saved, &weights).unwrap();
+            provider.release.notify_one();
+            assert_eq!(pending.await.unwrap()["dispatch_ready"], false);
+            assert_eq!(*backend.calls.lock().unwrap(), calls);
+        }
+
+        #[derive(Default)]
         struct ModelActivationFixture {
             busy: AtomicBool,
             calls: Mutex<Vec<serde_json::Value>>,
@@ -1845,7 +2748,7 @@ mod tests {
                 let admitted = load_operation(root.path(), &record.operation_id).unwrap();
                 assert_eq!(admitted.state, PreparationState::Admitted);
                 assert_eq!(admitted.projection()["activation_pending"], false);
-                assert_eq!(admitted.projection()["inference_ready"], false);
+                assert!(admitted.projection().get("inference_ready").is_none());
                 assert_eq!(
                     std::fs::read(stage.path.join("weights.gguf")).unwrap(),
                     original
@@ -3317,7 +4220,7 @@ mod tests {
                         .count(),
                     reads
                 );
-                assert!(!reused.projection()["inference_ready"].as_bool().unwrap());
+                assert!(reused.projection().get("inference_ready").is_none());
                 assert!(
                     logs.iter()
                         .all(|log| log.metadata().unwrap().len() <= 65536),
@@ -3334,7 +4237,7 @@ mod tests {
                     "index_bytes":record.index_bytes,"reserved_bytes":record.reserved_bytes,
                     "seed_disk":seed_disk,"backend_before":backend_before,"backend_sampled_peak":backend_peak,
                     "staging_sampled_peak":staged_peak,"admitted_disk":admitted_disk,"backend_after":backend_after,
-                    "reuse_content_reads":0,"inference_ready":false})
+                    "reuse_content_reads":0,"inference_executed":false})
             });
             let outcome =
                 tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut work).await;
@@ -3661,7 +4564,7 @@ mod tests {
             assert_eq!(
                 reply,
                 serde_json::json!({"cid":record.package_cid,"kept":keep,
-                "admitted":true,"inference_ready":false})
+                "admitted":true})
             );
             let saved = std::fs::read(root.path().join("model-preparation/state.json")).unwrap();
             assert_eq!(
@@ -3683,7 +4586,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(status["kept"], keep);
-            assert_eq!(status["inference_ready"], false);
+            assert!(status.get("inference_ready").is_none());
             assert_eq!(
                 Inventory::open(root.path(), false)
                     .unwrap()
@@ -4016,7 +4919,7 @@ mod tests {
             .unwrap();
         assert_eq!(replay["operation_id"], id);
         assert_eq!(replay["admitted"], true);
-        assert_eq!(replay["inference_ready"], false);
+        assert!(replay.get("inference_ready").is_none());
         assert_eq!(backend.calls.lock().unwrap().len(), prior);
         assert_eq!(
             backend

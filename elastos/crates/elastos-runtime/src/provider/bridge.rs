@@ -17,7 +17,7 @@ use super::registry::{
 };
 
 /// Timeout for provider requests (30 seconds)
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(super) const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Timeout for provider init (10 seconds)
 const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);

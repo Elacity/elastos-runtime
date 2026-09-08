@@ -17,7 +17,7 @@ const NEXT: &CStr = c"state.next";
 const MAX_STATE_BYTES: u64 = 256 * 1024;
 
 #[derive(PartialEq)]
-struct Stamp(u64, u64, u64, i64, i64, i64, i64);
+pub(super) struct Stamp(u64, u64, u64, i64, i64, i64, i64);
 
 fn stamp(meta: &Metadata) -> Stamp {
     Stamp(
@@ -181,7 +181,7 @@ impl Inventory {
         Ok(())
     }
 
-    pub(super) fn load(&self) -> anyhow::Result<PreparationInventory> {
+    pub(super) fn snapshot(&self) -> anyhow::Result<PreparationInventory> {
         self.revalidate()?;
         let file = optional_file(&self.dir, STATE)?;
         let (state, original) = if let Some(mut file) = file {
@@ -224,6 +224,12 @@ impl Inventory {
         }
         *self.loaded.borrow_mut() = Some(original);
         self.check_loaded()?;
+        let _ = optional_file(&self.dir, NEXT)?;
+        Ok(state)
+    }
+
+    pub(super) fn load(&self) -> anyhow::Result<PreparationInventory> {
+        let state = self.snapshot()?;
         // A complete or partial uncommitted snapshot never supersedes state.json.
         // There can be only this one bounded temporary file; invalid shape is refused.
         if let Some(file) = optional_file(&self.dir, NEXT)? {
@@ -527,6 +533,16 @@ impl Stage {
             "admitted file changed or has an invalid digest"
         );
         self.check_file(&expected.path, &file, expected.size)
+    }
+
+    pub(super) fn file_stamp(
+        &self,
+        expected: &crate::content::ContentObjectFile,
+    ) -> anyhow::Result<Stamp> {
+        let (dir, name) = self.parent(&expected.path, false)?;
+        let file = open_at(&dir, &name, libc::O_RDONLY)?;
+        self.check_file(&expected.path, &file, expected.size)?;
+        Ok(stamp(&file.metadata()?))
     }
 
     pub(super) fn check_file(&self, path: &str, file: &File, size: u64) -> anyhow::Result<()> {

@@ -144,6 +144,112 @@ pub(super) fn verify(
     validate_protection(bundle, &inventory)
 }
 
+/// Read bounded identity facts for dispatch projection. Full payload verification
+/// remains required for Init and new engine starts, not for catalog polling.
+pub(super) fn identity(
+    bundle: &Path,
+    version: &str,
+    platform: &str,
+    archive_sha256: &str,
+    binary_path: &str,
+) -> anyhow::Result<(String, String)> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    anyhow::ensure!(
+        !binary_path.is_empty()
+            && binary_path.len() <= 4096
+            && Path::new(binary_path)
+                .components()
+                .all(|part| matches!(part, Component::Normal(_))),
+        "invalid engine path"
+    );
+    let binary = bundle.join(binary_path);
+    let mut parent = binary.parent();
+    while let Some(directory) = parent {
+        anyhow::ensure!(
+            directory.starts_with(bundle)
+                && fs::symlink_metadata(directory)?.is_dir()
+                && protected(directory, &[0o500], false),
+            "engine parent protection is invalid"
+        );
+        if directory == bundle {
+            break;
+        }
+        parent = directory.parent();
+    }
+    anyhow::ensure!(
+        binary.canonicalize()? == binary
+            && fs::symlink_metadata(&binary)?.is_file()
+            && protected(bundle, &[0o500], false)
+            && protected(&binary, &[0o500], true),
+        "engine identity protection is invalid"
+    );
+    let receipt = bundle.join(FILE);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&receipt)?;
+    let before = file.metadata()?;
+    anyhow::ensure!(
+        before.is_file()
+            && before.len() <= 256 * 1024
+            && before.uid() == unsafe { libc::geteuid() }
+            && before.nlink() == 1
+            && before.mode() & 0o7777 == 0o400,
+        "engine receipt is unavailable"
+    );
+    let mut bytes = Vec::new();
+    (&file).take(256 * 1024 + 1).read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    anyhow::ensure!(
+        bytes.len() <= 256 * 1024
+            && before.len() == after.len()
+            && before.mtime() == after.mtime()
+            && before.mtime_nsec() == after.mtime_nsec()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
+            && fs::symlink_metadata(&receipt)?.ino() == after.ino(),
+        "engine receipt changed"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        value.as_object().is_some_and(|o| o.len() == 5)
+            && value["schema"] == SCHEMA
+            && value["version"] == version
+            && value["platform"] == platform
+            && value["archive_sha256"] == archive_sha256,
+        "engine receipt identity mismatch"
+    );
+    let entries = value["entries"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("engine inventory unavailable"))?;
+    anyhow::ensure!(entries.len() <= 1024, "engine inventory exceeds bound");
+    let matching: Vec<_> = entries
+        .iter()
+        .filter(|e| e["path"] == binary_path)
+        .collect();
+    anyhow::ensure!(
+        matching.len() == 1
+            && matching[0]["type"] == "file"
+            && matching[0].as_object().is_some_and(|o| o.len() == 3),
+        "engine receipt entry unavailable"
+    );
+    let digest = matching[0]["sha256"].as_str().unwrap_or("");
+    anyhow::ensure!(
+        digest.len() == 71
+            && digest.starts_with("sha256:")
+            && digest[7..]
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "engine receipt digest invalid"
+    );
+    Ok((
+        digest.into(),
+        format!("sha256:{:x}", Sha256::digest(&bytes)),
+    ))
+}
+
 pub(super) fn write(
     bundle: &Path,
     version: &str,

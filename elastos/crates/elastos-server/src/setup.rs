@@ -1370,17 +1370,18 @@ fn local_model_engine_receipt_args<'a>(
 
 #[cfg(unix)]
 #[derive(PartialEq)]
-pub(crate) struct VerifiedLocalModelEngine {
+pub(crate) struct LocalModelEngineIdentity {
     pub path: PathBuf,
     pub sha256: String,
     pub receipt_sha256: String,
 }
 
 #[cfg(unix)]
-pub(crate) fn verified_local_model_engine(
+pub(crate) fn local_model_engine_receipt_identity(
     data_dir: &Path,
     manifest: &ComponentsManifest,
-) -> anyhow::Result<VerifiedLocalModelEngine> {
+) -> anyhow::Result<LocalModelEngineIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
     let component = manifest
         .external
         .get("llama-server")
@@ -1401,25 +1402,56 @@ pub(crate) fn verified_local_model_engine(
                 .all(|part| matches!(part, std::path::Component::Normal(_))),
         "local model engine install path is invalid"
     );
-    let bundle = data_dir.canonicalize()?.join(relative);
+    let mut bundle = data_dir.canonicalize()?;
+    for part in relative.components() {
+        bundle.push(part.as_os_str());
+        let metadata = fs::symlink_metadata(&bundle)?;
+        anyhow::ensure!(
+            metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o022 == 0,
+            "model engine parent is not protected"
+        );
+    }
     anyhow::ensure!(
         bundle.canonicalize()? == bundle,
         "local model engine bundle is aliased"
     );
     let (version, archive, binary) = local_model_engine_receipt_args(component, info)?;
-    local_model_engine_receipt::verify(&bundle, version, &platform, archive, binary)?;
+    let (sha256, receipt_sha256) =
+        local_model_engine_receipt::identity(&bundle, version, &platform, archive, binary)?;
     let path = bundle.join(binary);
     anyhow::ensure!(
         path.canonicalize()? == path,
         "local model engine executable is aliased"
     );
-    let sha256 = compute_sha256_checksum(&path)?;
-    let receipt_sha256 = compute_sha256_checksum(&bundle.join(".elastos-engine.json"))?;
-    Ok(VerifiedLocalModelEngine {
+    Ok(LocalModelEngineIdentity {
         path,
         sha256,
         receipt_sha256,
     })
+}
+
+#[cfg(unix)]
+pub(crate) fn verified_local_model_engine(
+    data_dir: &Path,
+    manifest: &ComponentsManifest,
+) -> anyhow::Result<LocalModelEngineIdentity> {
+    let identity = local_model_engine_receipt_identity(data_dir, manifest)?;
+    let component = manifest.external.get("llama-server").unwrap();
+    let platform = detect_platform();
+    let info = component.platforms.get(&platform).unwrap();
+    let (version, archive, binary) = local_model_engine_receipt_args(component, info)?;
+    let bundle = data_dir
+        .canonicalize()?
+        .join(resolve_install_path(component, Some(info)).unwrap());
+    local_model_engine_receipt::verify(&bundle, version, &platform, archive, binary)?;
+    anyhow::ensure!(
+        local_model_engine_receipt_identity(data_dir, manifest)? == identity
+            && compute_sha256_checksum(&identity.path)? == identity.sha256,
+        "model engine changed during verification"
+    );
+    Ok(identity)
 }
 
 fn extracted_bundle_cache_stale_reason(
