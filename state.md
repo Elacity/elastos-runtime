@@ -190,7 +190,21 @@ installed review. Full adapter and human qualification remain open.
 Run 68 fails viewer reload before operator admission. Its original evidence lacks
 the failed binding predicate. Source `649132fc` retains named, redacted predicate
 results with 135 passing recovery/reload tests and preserves the original checks.
-The combined reload/operator repeat is next; B06 remains open.
+Run 73 passes reload and native operator handoff together: decoded video resumes
+in 1600 ms and close clears all effects in 741 ms. Run 74 passes the five-second
+HTTP/TURN interruption and native operator handoff, recovering in 1167 ms and
+closing in 771 ms. Both end with zero Runtime/control obligations; controlled
+audio is outside these diagnostic runs. Independent review and the full combined
+media/recovery qualification remain open, including the unexplained run 68 failure.
+
+Run 72 fails the controlled audio check when the received tone fades near the
+end of its 2.5-second sample. The receiver stays live and unmuted; before/after
+packet counters report zero loss. These observations do not identify the cause.
+The next audio experiment records bounded receiver statistics alongside PCM.
+Its exact close clears all effects in 919 ms. Run 71 separately fails during
+Home sign-out before Browser allocation. Source `35bf30ea` bounds auth fetches
+and offers explicit signed-Home reuse for focused Browser journeys, with five
+source tests. Default Home sign-in/sign-out qualification stays unchanged.
 Source `54df379a` adds signed remote Engine availability probes; full remote page,
 stream and media binding is still being implemented. The combined source
 candidate is installed; combined recovery and remote Engine journeys are next. B01-B16 retain all media,

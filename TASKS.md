@@ -88,6 +88,12 @@ alongside the local, operator and remote journeys.
   producer/receiver evidence; concurrent compilation is a hypothesis only.
   The same audio threshold applies to every repeat. Full sustained-use and
   human listening acceptance remain open.
+  Run 72 adds a second failure: the received tone fades late in the probe while
+  the track stays live/unmuted and before/after packet counters show zero loss.
+  Record bounded audio RTP counters alongside PCM to distinguish producer silence
+  from concealed or delayed receiver audio. Preserve the current thresholds.
+  Independent runs 73/74 cover reload/interruption plus native operator handoff
+  with audio explicitly outside those runs; the combined media gate stays open.
 - **B04.operator-admission / active / delegated source owner.**
   Prerequisite: the accepted owner/page contract and existing Engine CDP access.
   Deliver a bounded, capability-negotiated snapshot of the actual Engine page
