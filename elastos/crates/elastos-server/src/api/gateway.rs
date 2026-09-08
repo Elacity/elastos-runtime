@@ -117,7 +117,9 @@ pub(in crate::api) use gateway_home_runtime::capsule_icon_variants;
 pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_object_shell_title};
 pub(in crate::api) use gateway_home_system::profile_readiness_for_principal;
 use gateway_home_system::*;
-pub(crate) use gateway_home_system::{authorize_home_service_engine, authorize_home_service_exit};
+pub(crate) use gateway_home_system::{
+    authorize_home_service_engine, authorize_home_service_exit, sync_runtime_services_mailboxes,
+};
 use gateway_home_terminal::*;
 pub(crate) use gateway_home_token::home_launch_auth_data_dir;
 pub(super) use gateway_home_token::HomeLaunchTokenContext;

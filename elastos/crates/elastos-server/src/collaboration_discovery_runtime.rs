@@ -358,6 +358,26 @@ impl CollaborationDiscoveryService {
         })
     }
 
+    /// The configured Runtime owns Services receive progress, independently of
+    /// whether any Home or Inbox document is open. One principal per pass keeps
+    /// work bounded; each pass reloads current protected authority and selection.
+    pub(crate) async fn sync_services_mailboxes_once(&self, data_dir: &Path, round: usize) {
+        let service = self.clone();
+        let data_dir = data_dir.to_path_buf();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::api::gateway::sync_runtime_services_mailboxes(
+                &data_dir,
+                &service,
+                service.registry.as_ref(),
+                round,
+            )
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            tracing::debug!("Runtime Services mailbox pass unavailable");
+        }
+    }
+
     pub(crate) fn direct_message_service(&self) -> CollaborationDirectMessageService {
         self.direct_messages.clone()
     }

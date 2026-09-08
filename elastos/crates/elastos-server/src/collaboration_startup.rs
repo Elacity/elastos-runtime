@@ -244,6 +244,7 @@ pub async fn start_collaboration_runtime_service(
         shutdown_rx,
     ));
     let discovery_task = tokio::spawn(run_collaboration_discovery_sync_worker(
+        data_root.to_path_buf(),
         discovery_service.clone(),
         discovery_shutdown_rx,
     ));
@@ -428,10 +429,12 @@ async fn run_collaboration_worker(
 /// Discovery sync has the same Runtime lifecycle and shutdown signal as the
 /// collaboration worker, while remaining isolated from Chat/presence Carrier
 /// progress when a relay is slow or unavailable.
-async fn run_collaboration_discovery_sync_worker(
+pub(crate) async fn run_collaboration_discovery_sync_worker(
+    data_root: PathBuf,
     discovery_service: CollaborationDiscoveryService,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let mut mailbox_round = 0usize;
     loop {
         if *shutdown.borrow() {
             return;
@@ -443,7 +446,14 @@ async fn run_collaboration_discovery_sync_worker(
                     return;
                 }
             }
-            _ = discovery_service.sync_registered_contexts_once(now_secs()) => {}
+            _ = async {
+                tokio::join!(
+                    discovery_service.sync_registered_contexts_once(now_secs()),
+                    discovery_service.sync_services_mailboxes_once(&data_root, mailbox_round),
+                );
+            } => {
+                mailbox_round = mailbox_round.wrapping_add(1);
+            }
         }
         tokio::select! {
             biased;

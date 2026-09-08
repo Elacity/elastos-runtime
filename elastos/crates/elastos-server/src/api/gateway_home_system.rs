@@ -3366,6 +3366,47 @@ pub(in crate::api::gateway) fn home_services_remote_engine_grants(
     Ok(grants)
 }
 
+/// Runtime receive authority comes from the current durable principal and
+/// verified Profile/contact store. An app launch token is not a background lease.
+/// Use the same request and decision validators as the foreground Services path.
+pub(crate) fn sync_runtime_services_mailboxes(
+    data_dir: &std::path::Path,
+    discovery_service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    provider_registry: &elastos_runtime::provider::ProviderRegistry,
+    round: usize,
+) -> anyhow::Result<()> {
+    let principals = crate::auth::active_passkey_principals(data_dir)?;
+    anyhow::ensure!(
+        principals.len() <= 64,
+        "Services principal scope is unavailable"
+    );
+    if principals.is_empty() {
+        return Ok(());
+    }
+    let principal = &principals[round % principals.len()];
+    let context = HomeLaunchTokenContext {
+        principal_id: principal.principal_id.clone(),
+        proof_binding_id: Some(principal.proof_binding_id.clone()),
+        session_id: String::new(),
+        grant_id: String::new(),
+    };
+    if load_configured_contact_authority_for_context(data_dir, &context, Some(discovery_service))?
+        .is_none()
+    {
+        return Ok(());
+    }
+    // Keep requests and decisions independent: an unavailable incoming request
+    // path must not prevent a previously issued decision from being applied.
+    let requests = home_services_sync_access_requests(data_dir, &context, Some(discovery_service));
+    let decisions = home_services_sync_access_decisions(
+        data_dir,
+        &context,
+        Some(discovery_service),
+        Some(provider_registry),
+    );
+    requests.and(decisions)
+}
+
 pub(super) fn home_services_sync_access_requests(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,

@@ -1758,6 +1758,7 @@ impl Provider for ServicesPeerProvider {
 }
 
 struct ServicesContactFixture {
+    discovery_service: crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     peer_provider: ServicesPeerProvider,
     registry: Arc<ProviderRegistry>,
     exit_provider: ServicesExitProvider,
@@ -1826,7 +1827,7 @@ async fn services_contact_fixture(
     .await
     .unwrap();
     let mut state = test_state(data_dir);
-    state.collaboration_discovery_service = Some(service);
+    state.collaboration_discovery_service = Some(service.clone());
     let exit_provider = ServicesExitProvider::default();
     registry
         .register_sub_provider("exit", Arc::new(exit_provider.clone()))
@@ -1835,6 +1836,7 @@ async fn services_contact_fixture(
     state.provider_registry = Some(registry.clone());
 
     ServicesContactFixture {
+        discovery_service: service,
         peer_provider,
         registry,
         exit_provider,
@@ -8982,4 +8984,316 @@ async fn test_configured_services_runtime_errors_preserve_state_without_starting
     assert_eq!(services_messages(&bus).await.len(), 1);
     configured_services_runtime_assert_preserved(left.path(), &alice).await;
     configured_services_runtime_assert_preserved(right.path(), &bob).await;
+}
+
+fn services_mailbox_saved_state(
+    data_dir: &std::path::Path,
+    authority: &TestPasskeyAuthority,
+    name: &str,
+) -> Value {
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/.AppData/ElastOS/Home/{name}");
+    let path = elastos_common::localhost::rooted_localhost_fs_path(data_dir, &uri).unwrap();
+    if !path.exists() {
+        return json!({"requests":{},"remote_offer_requests":{}});
+    }
+    services_contact_saved_state(data_dir, authority, name)
+}
+
+fn services_background_worker(
+    data_dir: &std::path::Path,
+    fixture: &ServicesContactFixture,
+) -> (
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(
+        crate::collaboration_startup::run_collaboration_discovery_sync_worker(
+            data_dir.to_path_buf(),
+            fixture.discovery_service.clone(),
+            stopped,
+        ),
+    );
+    (stop, worker)
+}
+
+async fn services_wait_for_background(mut ready: impl FnMut() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(12), async {
+        while !ready() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Runtime Services receive progress must not require an Inbox launch");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_services_runtime_mailbox_receives_and_activates_without_inbox_or_services_refresh() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network.clone()).await;
+    accept_services_contact_pair(&alice, &bob);
+    std::fs::create_dir_all(right.path().join("config")).unwrap();
+    std::fs::write(right.path().join("config/exit-provider.json"), "{}").unwrap();
+    configured_services_runtime_remove_attached_runtime(left.path(), &alice);
+    configured_services_runtime_remove_attached_runtime(right.path(), &bob);
+    let token = app_token_for_authority(right.path(), SERVICES_CAPSULE_ID, &bob.authority);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":"local:provider:browser-exit","section":"mine","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (stop_bob, worker_bob) = services_background_worker(right.path(), &bob);
+    // Startup subscription happens before any incoming request and before Inbox.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if bob
+                .peer_provider
+                .state
+                .provider_requests
+                .lock()
+                .await
+                .iter()
+                .any(|call| call["op"] == "gossip_recv")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_contact_offer(&bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    services_wait_for_background(|| {
+        !services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json")
+            ["requests"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    })
+    .await;
+    let requests =
+        services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json");
+    assert_eq!(requests["requests"].as_object().unwrap().len(), 1);
+    let request = requests["requests"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(request["authenticated_request"], true);
+    assert_eq!(request["status"], "pending");
+    assert_eq!(
+        request["requester_principal_id"].as_str(),
+        Some(alice.authority.principal_id.as_str())
+    );
+    assert!(alice.exit_provider.requests.lock().await.is_empty());
+    assert!(bob.exit_provider.requests.lock().await.is_empty());
+    // The first summary sees the already durable pending request, without any
+    // additional peer operation or Home launch caused by the read.
+    stop_bob.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), worker_bob)
+        .await
+        .unwrap()
+        .unwrap();
+    let before = bob.peer_provider.state.provider_requests.lock().await.len();
+    let inbox_token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+    let (_, inbox) =
+        home_test_get_json(&bob.app, "/api/apps/inbox/summary", &inbox_token, "null").await;
+    let notification = inbox["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "service_access_request")
+        .unwrap();
+    assert_eq!(
+        before,
+        bob.peer_provider.state.provider_requests.lock().await.len()
+    );
+    assert!(bob.runtime.launch_requests.lock().await.is_empty());
+    // Only the provider's explicit Inbox approval grants use. The consumer's
+    // Runtime applies that decision with the real refresh acknowledgement path.
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &inbox_token,
+        "/api/apps/inbox/actions",
+        json!({"action_id":notification["action_ref"]["action_id"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (stop_alice, worker_alice) = services_background_worker(left.path(), &alice);
+    services_wait_for_background(|| {
+        services_mailbox_saved_state(left.path(), &alice.authority, "services-state.json")
+            ["remote_offer_requests"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|request| request["status"] == "approved")
+    })
+    .await;
+    stop_alice.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), worker_alice)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alice.exit_provider.requests.lock().await.len(), 1);
+    assert!(alice.runtime.launch_requests.lock().await.is_empty());
+    let state = services_mailbox_saved_state(left.path(), &alice.authority, "services-state.json");
+    assert!(state["remote_offer_requests"]
+        .as_object()
+        .unwrap()
+        .values()
+        .all(|r| r["installed_remote_exit_id"].as_str().is_some()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_services_runtime_mailbox_requires_current_sharing_contact_and_signed_message() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network.clone()).await;
+    accept_services_contact_pair(&alice, &bob);
+    std::fs::create_dir_all(right.path().join("config")).unwrap();
+    std::fs::write(right.path().join("config/exit-provider.json"), "{}").unwrap();
+    let service = bob.discovery_service.clone();
+    service.sync_services_mailboxes_once(right.path(), 0).await;
+    assert!(bob
+        .peer_provider
+        .state
+        .provider_requests
+        .lock()
+        .await
+        .is_empty());
+    assert!(
+        services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json")
+            ["requests"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_contact_offer(&bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Valid contact, invalid signature: background ingestion uses the same
+    // authenticated validator and cannot convert it into a pending approval.
+    {
+        let mut bus = bus.lock().await;
+        let message = &mut bus
+            .topic_messages
+            .get_mut("__elastos_internal/service-requests-v1")
+            .unwrap()[0];
+        let mut payload: Value =
+            serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+        payload["requester_principal_id"] = json!("tampered-principal");
+        message["content"] = json!(payload.to_string());
+    }
+    let token = app_token_for_authority(right.path(), SERVICES_CAPSULE_ID, &bob.authority);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":"local:provider:browser-exit","section":"mine","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    service.sync_services_mailboxes_once(right.path(), 0).await;
+    assert!(
+        services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json")
+            ["requests"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(bob.exit_provider.requests.lock().await.is_empty());
+    // Signed request from an unaccepted sender also remains outside authority.
+    let foreign = tempfile::tempdir().unwrap();
+    let (_, foreign_did) = elastos_identity::load_or_create_did(foreign.path()).unwrap();
+    let foreign_peer = crate::carrier::did_to_public_key(&foreign_did)
+        .unwrap()
+        .to_string();
+    {
+        let mut bus = bus.lock().await;
+        let message = &mut bus
+            .topic_messages
+            .get_mut("__elastos_internal/service-requests-v1")
+            .unwrap()[0];
+        let mut payload: Value =
+            serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+        payload["request_id"] = json!("00000000000000000000000000000000ab");
+        payload["requester_peer_id"] = json!(foreign_peer);
+        payload["requester_did"] = json!(foreign_did);
+        crate::carrier::sign_service_message(foreign.path(), &mut payload).unwrap();
+        message["sender_id"] = json!(foreign_peer);
+        message["content"] = json!(payload.to_string());
+        let repeated = message.clone();
+        bus.topic_messages
+            .get_mut("__elastos_internal/service-requests-v1")
+            .unwrap()
+            .push(repeated);
+    }
+    service.sync_services_mailboxes_once(right.path(), 0).await;
+    assert!(
+        services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json")
+            ["requests"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    // Authority is loaded on each pass; a previously usable context is not a
+    // retained background capability after the owner binding is revoked.
+    crate::auth::revoke_passkey_binding(
+        right.path(),
+        &bob.authority.proof_binding_id,
+        crate::auth::now_ts(),
+    )
+    .unwrap();
+    let before = bob.peer_provider.state.provider_requests.lock().await.len();
+    service.sync_services_mailboxes_once(right.path(), 0).await;
+    assert_eq!(
+        before,
+        bob.peer_provider.state.provider_requests.lock().await.len()
+    );
+    let empty = tempfile::tempdir().unwrap();
+    service.sync_services_mailboxes_once(empty.path(), 0).await;
+    assert_eq!(
+        before,
+        bob.peer_provider.state.provider_requests.lock().await.len()
+    );
+    let (stop, stopped) = tokio::sync::watch::channel(true);
+    crate::collaboration_startup::run_collaboration_discovery_sync_worker(
+        right.path().to_path_buf(),
+        service,
+        stopped,
+    )
+    .await;
+    assert!(*stop.borrow());
+    assert_eq!(
+        before,
+        bob.peer_provider.state.provider_requests.lock().await.len()
+    );
 }
