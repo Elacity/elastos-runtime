@@ -1708,7 +1708,58 @@ impl Provider for ServicesExitProvider {
     }
 }
 
+// Use the same peer operations and bus as the attached Runtime fixture, through
+// the configured Gateway's existing registry. App launch tests still use HTTP.
+#[derive(Clone)]
+struct ServicesPeerProvider {
+    state: FakeRuntimeState,
+    send_failure: Arc<TokioMutex<String>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for ServicesPeerProvider {
+    async fn handle(&self, _: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider("raw peer requests only".into()))
+    }
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["peer"]
+    }
+    fn name(&self) -> &'static str {
+        "services-configured-peer-test"
+    }
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        let op = request["op"].as_str().unwrap();
+        if op == "gossip_send" {
+            let failure = self.send_failure.lock().await.clone();
+            match failure.as_str() {
+                "unavailable" => {
+                    return Err(ProviderError::Unavailable(
+                        "configured peer unavailable".into(),
+                    ));
+                }
+                "error" => {
+                    return Ok(json!({"status":"error","message":"configured peer rejected send"}));
+                }
+                "deadline" => return std::future::pending().await,
+                _ => {}
+            }
+        }
+        let response = fake_runtime_provider(
+            AxumPath(("peer".into(), op.into())),
+            AxumState(self.state.clone()),
+            AxumJson(request.clone()),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        Ok(serde_json::from_slice(&bytes).unwrap())
+    }
+}
+
 struct ServicesContactFixture {
+    peer_provider: ServicesPeerProvider,
+    registry: Arc<ProviderRegistry>,
     exit_provider: ServicesExitProvider,
     app: Router,
     authority: TestPasskeyAuthority,
@@ -1729,7 +1780,27 @@ async fn services_contact_fixture(
     let (device_key, did) = elastos_identity::load_or_create_did(data_dir).unwrap();
     let device_key = SigningKey::from_bytes(&device_key.to_bytes());
     let peer_id = crate::carrier::did_to_public_key(&did).unwrap().to_string();
-    let runtime = start_fake_runtime(data_dir, bus, &peer_id).await;
+    let runtime = start_fake_runtime(data_dir, bus.clone(), &peer_id).await;
+    let peer_provider = ServicesPeerProvider {
+        state: FakeRuntimeState {
+            did: did.clone(),
+            signing_key: device_key.clone(),
+            attach_secret: String::new(),
+            peer_id: peer_id.clone(),
+            bus,
+            audit_events: Arc::new(TokioMutex::new(Vec::new())),
+            launch_requests: runtime.launch_requests.clone(),
+            provider_requests: Arc::new(TokioMutex::new(Vec::new())),
+            pending_capabilities: Arc::new(TokioMutex::new(HashMap::new())),
+            capabilities_start_pending: false,
+        },
+        send_failure: Arc::new(TokioMutex::new(String::new())),
+    };
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("peer", Arc::new(peer_provider.clone()))
+        .await
+        .unwrap();
     let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
     let profile = crate::collaboration_profile_authority::load_profile_authority(
         data_dir,
@@ -1750,21 +1821,22 @@ async fn services_contact_fixture(
     let service = crate::collaboration_discovery_runtime::CollaborationDiscoveryService::new(
         SigningKey::from_bytes(&device_key.to_bytes()),
         network,
-        Arc::new(elastos_runtime::provider::ProviderRegistry::new()),
+        registry.clone(),
     )
     .await
     .unwrap();
     let mut state = test_state(data_dir);
     state.collaboration_discovery_service = Some(service);
     let exit_provider = ServicesExitProvider::default();
-    let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
     registry
         .register_sub_provider("exit", Arc::new(exit_provider.clone()))
         .await
         .unwrap();
-    state.provider_registry = Some(registry);
+    state.provider_registry = Some(registry.clone());
 
     ServicesContactFixture {
+        peer_provider,
+        registry,
         exit_provider,
         app: gateway_router(state),
         authority,
@@ -8368,4 +8440,188 @@ async fn test_home_appearance_preferences_fail_closed_and_signed_out_defaults_st
         non_regular_write.status(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
+}
+
+// Regression for a configured Gateway whose Carrier is already in process.
+fn configured_services_runtime_remove_attached_runtime(
+    data_dir: &std::path::Path,
+    fixture: &ServicesContactFixture,
+) {
+    fixture.runtime._task.abort();
+    for path in [
+        data_dir.join("runtime-coords.json"),
+        crate::runtime_control::home_runtime_coord_path(data_dir),
+    ] {
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+async fn configured_services_runtime_assert_preserved(
+    data_dir: &std::path::Path,
+    fixture: &ServicesContactFixture,
+) {
+    assert!(!data_dir.join("runtime-coords.json").exists());
+    assert!(!crate::runtime_control::home_runtime_coord_path(data_dir).exists());
+    assert!(fixture.runtime.launch_requests.lock().await.is_empty());
+    let (key, did) =
+        crate::collaboration_profile_authority::load_existing_device_signing_key(data_dir)
+            .unwrap()
+            .unwrap();
+    assert_eq!(key.to_bytes(), fixture.device_key.to_bytes());
+    assert_eq!(did, fixture.peer_provider.state.did);
+}
+
+#[tokio::test]
+async fn test_configured_services_runtime_request_uses_existing_peer_without_coords() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+    accept_services_contact_pair(&alice, &bob);
+    configured_services_runtime_remove_attached_runtime(left.path(), &alice);
+    configured_services_runtime_remove_attached_runtime(right.path(), &bob);
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_contact_offer(&bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let messages = bus
+        .lock()
+        .await
+        .topic_messages
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 1);
+    let request =
+        crate::carrier::verify_service_message(&messages[0], "requester_peer_id").unwrap();
+    assert_eq!(request["kind"], "service_access_request");
+    assert_eq!(request["requester_peer_id"], alice.peer_id);
+    assert_eq!(request["requester_did"], alice.peer_provider.state.did);
+    assert_eq!(
+        request["requester_principal_id"],
+        alice.authority.principal_id
+    );
+    assert_eq!(request["target_peer_id"], bob.peer_id);
+    let calls = alice
+        .peer_provider
+        .state
+        .provider_requests
+        .lock()
+        .await
+        .clone();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["op"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "get_ticket",
+            "gossip_join",
+            "gossip_join_peers",
+            "gossip_send"
+        ]
+    );
+    assert_eq!(calls[3]["body"]["sender_id"], alice.peer_id);
+    let (_, summary) =
+        home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+    let offer = summary["remote_offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|offer| offer["offer_id"] == services_contact_offer(&bob))
+        .unwrap();
+    assert_eq!(offer["status"], "requested");
+    assert_eq!(offer["enabled"], false);
+    configured_services_runtime_assert_preserved(left.path(), &alice).await;
+    configured_services_runtime_assert_preserved(right.path(), &bob).await;
+}
+
+#[tokio::test]
+async fn test_configured_services_runtime_errors_preserve_state_without_starting_runtime() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+    accept_services_contact_pair(&alice, &bob);
+    configured_services_runtime_remove_attached_runtime(left.path(), &alice);
+    configured_services_runtime_remove_attached_runtime(right.path(), &bob);
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let offer_id = services_contact_offer(&bob);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":offer_id,"section":"others","selected":false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let before = services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+    for failure in ["missing", "unavailable", "error", "deadline"] {
+        if failure == "missing" {
+            alice
+                .registry
+                .unregister_sub_provider("peer")
+                .await
+                .unwrap();
+        } else {
+            *alice.peer_provider.send_failure.lock().await = failure.into();
+        }
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            services_contact_post(
+                &alice.app,
+                &token,
+                "/api/apps/services/offers",
+                json!({"offer_id":offer_id,"section":"others","selected":true}),
+            ),
+        )
+        .await
+        .expect("Services must finish at the peer operation deadline");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{failure}: {body}");
+        let expected = match failure {
+            "missing" => "no provider for scheme: peer",
+            "unavailable" => "configured peer unavailable",
+            "error" => "configured peer rejected send",
+            _ => "Services peer operation deadline",
+        };
+        assert!(body.contains(expected), "{failure}: {body}");
+        assert_eq!(
+            services_contact_saved_state(left.path(), &alice.authority, "services-state.json"),
+            before
+        );
+        assert!(services_messages(&bus).await.is_empty());
+        configured_services_runtime_assert_preserved(left.path(), &alice).await;
+        if failure == "missing" {
+            alice
+                .registry
+                .register_sub_provider("peer", Arc::new(alice.peer_provider.clone()))
+                .await
+                .unwrap();
+        }
+    }
+    // A failed send leaves the same live registry usable for an explicit retry.
+    alice.peer_provider.send_failure.lock().await.clear();
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":offer_id,"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(services_messages(&bus).await.len(), 1);
+    configured_services_runtime_assert_preserved(left.path(), &alice).await;
+    configured_services_runtime_assert_preserved(right.path(), &bob).await;
 }

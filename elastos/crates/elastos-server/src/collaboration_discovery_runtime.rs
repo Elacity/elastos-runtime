@@ -328,6 +328,36 @@ impl CollaborationDiscoveryService {
         self.authority.profile.clone()
     }
 
+    /// Services runs in a blocking Home projection after owner/contact checks.
+    /// Use this Runtime's existing Carrier instead of attaching a second shell.
+    pub(crate) fn request_services_peer_blocking(
+        &self,
+        op: &str,
+        mut request: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            matches!(
+                op,
+                "get_ticket" | "gossip_join" | "gossip_join_peers" | "gossip_send" | "gossip_recv"
+            ),
+            "unsupported Services peer operation"
+        );
+        let object = request
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Services peer request must be an object"))?;
+        object.insert("op".to_string(), serde_json::Value::String(op.to_string()));
+        let executor = tokio::runtime::Handle::try_current()?;
+        executor.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                self.registry.send_raw("peer", &request),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Services peer operation deadline"))?
+            .map_err(anyhow::Error::from)
+        })
+    }
+
     pub(crate) fn direct_message_service(&self) -> CollaborationDirectMessageService {
         self.direct_messages.clone()
     }

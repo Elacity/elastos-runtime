@@ -292,11 +292,18 @@ pub(super) struct ServicesOfferUpdateRequest {
     selected: bool,
 }
 
+enum ServicesPeerTransportBlocking {
+    Runtime(crate::collaboration_discovery_runtime::CollaborationDiscoveryService),
+    Attached {
+        client: reqwest::blocking::Client,
+        api_url: String,
+        client_token: String,
+        peer_cap: String,
+    },
+}
+
 struct ServicesPeerRuntimeBlocking {
-    client: reqwest::blocking::Client,
-    api_url: String,
-    client_token: String,
-    peer_cap: String,
+    transport: ServicesPeerTransportBlocking,
     peer_id: String,
     connect_ticket: String,
 }
@@ -2427,7 +2434,7 @@ fn home_services_send_access_request(
     if target_peer_id.is_empty() {
         anyhow::bail!("service offer person has no Carrier peer route");
     }
-    let runtime = services_attach_peer_runtime_blocking(data_dir)?;
+    let runtime = services_attach_peer_runtime_blocking(data_dir, discovery_service)?;
     services_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
     services_gossip_join_known_peers_blocking(
         &runtime,
@@ -2463,10 +2470,7 @@ fn home_services_send_access_request(
     });
     crate::carrier::sign_service_message(data_dir, &mut payload)?;
     let delivery = services_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
+        &runtime.transport,
         "gossip_send",
         serde_json::json!({
             "topic": HOME_SERVICES_REQUESTS_TOPIC,
@@ -2507,7 +2511,7 @@ fn home_services_require_remote_request_delivery(
 fn home_services_send_access_decision(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
-    _discovery_service: Option<
+    discovery_service: Option<
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
     request: &HomeServiceAccessRequestRecord,
@@ -2521,7 +2525,7 @@ fn home_services_send_access_decision(
     if target_peer_id.is_empty() {
         anyhow::bail!("service access request has no requester peer route");
     }
-    let runtime = services_attach_peer_runtime_blocking(data_dir)?;
+    let runtime = services_attach_peer_runtime_blocking(data_dir, discovery_service)?;
     services_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
     services_gossip_join_known_peers_blocking(
         &runtime,
@@ -2566,10 +2570,7 @@ fn home_services_send_access_decision(
     }
     crate::carrier::sign_service_message(data_dir, &mut payload)?;
     let delivery = services_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
+        &runtime.transport,
         "gossip_send",
         serde_json::json!({
             "topic": HOME_SERVICES_REQUESTS_TOPIC,
@@ -2622,7 +2623,7 @@ fn home_services_sync_access_decisions(
     if known_peers.is_empty() {
         return Ok(());
     }
-    let runtime = services_attach_peer_runtime_blocking(data_dir)?;
+    let runtime = services_attach_peer_runtime_blocking(data_dir, discovery_service)?;
     services_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
     services_gossip_join_known_peers_blocking(
         &runtime,
@@ -2630,10 +2631,7 @@ fn home_services_sync_access_decisions(
         &known_peers.iter().cloned().collect::<Vec<_>>(),
     )?;
     let recv = services_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
+        &runtime.transport,
         "gossip_recv",
         serde_json::json!({
             "topic": HOME_SERVICES_REQUESTS_TOPIC,
@@ -3174,7 +3172,7 @@ pub(super) fn home_services_sync_access_requests(
     if known_peers.is_empty() {
         return Ok(());
     }
-    let runtime = services_attach_peer_runtime_blocking(data_dir)?;
+    let runtime = services_attach_peer_runtime_blocking(data_dir, discovery_service)?;
     services_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
     services_gossip_join_known_peers_blocking(
         &runtime,
@@ -3182,10 +3180,7 @@ pub(super) fn home_services_sync_access_requests(
         &known_peers.iter().cloned().collect::<Vec<_>>(),
     )?;
     let recv = services_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
+        &runtime.transport,
         "gossip_recv",
         serde_json::json!({
             "topic": HOME_SERVICES_REQUESTS_TOPIC,
@@ -5079,30 +5074,37 @@ fn home_services_local_device_did(data_dir: &std::path::Path) -> anyhow::Result<
 
 fn services_attach_peer_runtime_blocking(
     data_dir: &std::path::Path,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
 ) -> anyhow::Result<ServicesPeerRuntimeBlocking> {
-    let coords = load_home_runtime_coords(data_dir)
-        .ok_or_else(|| anyhow::anyhow!("local ElastOS service is not running"))?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()?;
-    let token = services_attach_client_token_blocking(&client, &coords)
-        .ok_or_else(|| anyhow::anyhow!("failed to attach to local ElastOS service"))?;
-    let cap = services_request_attached_capability_blocking(
-        &client,
-        &coords.api_url,
-        &token,
-        "elastos://peer/*",
-        "message",
-    )
-    .ok_or_else(|| anyhow::anyhow!("failed to acquire Carrier peer capability"))?;
-    let response = services_peer_provider_request_blocking(
-        &client,
-        &coords.api_url,
-        &token,
-        &cap,
-        "get_ticket",
-        serde_json::json!({}),
-    )?;
+    let transport = if let Some(service) = discovery_service {
+        ServicesPeerTransportBlocking::Runtime(service.clone())
+    } else {
+        let coords = load_home_runtime_coords(data_dir)
+            .ok_or_else(|| anyhow::anyhow!("local ElastOS service is not running"))?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()?;
+        let token = services_attach_client_token_blocking(&client, &coords)
+            .ok_or_else(|| anyhow::anyhow!("failed to attach to local ElastOS service"))?;
+        let cap = services_request_attached_capability_blocking(
+            &client,
+            &coords.api_url,
+            &token,
+            "elastos://peer/*",
+            "message",
+        )
+        .ok_or_else(|| anyhow::anyhow!("failed to acquire Carrier peer capability"))?;
+        ServicesPeerTransportBlocking::Attached {
+            client,
+            api_url: coords.api_url,
+            client_token: token,
+            peer_cap: cap,
+        }
+    };
+    let response =
+        services_peer_provider_request_blocking(&transport, "get_ticket", serde_json::json!({}))?;
     let peer_id = response
         .get("data")
         .and_then(|data| data.get("node_id"))
@@ -5119,10 +5121,7 @@ fn services_attach_peer_runtime_blocking(
         .filter(|value| value.len() <= HOME_SERVICES_REMOTE_EXIT_TICKET_MAX_BYTES)
         .ok_or_else(|| anyhow::anyhow!("Carrier peer provider did not return a bounded ticket"))?;
     Ok(ServicesPeerRuntimeBlocking {
-        client,
-        api_url: coords.api_url,
-        client_token: token,
-        peer_cap: cap,
+        transport,
         peer_id,
         connect_ticket,
     })
@@ -5134,10 +5133,7 @@ fn services_peer_gossip_join_blocking(
     mode: &str,
 ) -> anyhow::Result<()> {
     match services_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
+        &runtime.transport,
         "gossip_join",
         serde_json::json!({ "topic": topic, "mode": mode }),
     ) {
@@ -5156,10 +5152,7 @@ fn services_gossip_join_known_peers_blocking(
         return Ok(());
     }
     services_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
+        &runtime.transport,
         "gossip_join_peers",
         serde_json::json!({ "topic": topic, "peers": peers }),
     )
@@ -5230,20 +5223,27 @@ fn services_request_attached_capability_blocking(
 }
 
 fn services_peer_provider_request_blocking(
-    client: &reqwest::blocking::Client,
-    api: &str,
-    client_token: &str,
-    peer_cap: &str,
+    transport: &ServicesPeerTransportBlocking,
     op: &str,
     body: serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
-    let response = client
-        .post(format!("{api}/api/provider/peer/{op}"))
-        .header(AUTHORIZATION, format!("Bearer {client_token}"))
-        .header("X-Capability-Token", peer_cap)
-        .json(&body)
-        .send()?;
-    let body: serde_json::Value = response.json()?;
+    let body: serde_json::Value = match transport {
+        ServicesPeerTransportBlocking::Runtime(service) => {
+            service.request_services_peer_blocking(op, body)?
+        }
+        ServicesPeerTransportBlocking::Attached {
+            client,
+            api_url: api,
+            client_token,
+            peer_cap,
+        } => client
+            .post(format!("{api}/api/provider/peer/{op}"))
+            .header(AUTHORIZATION, format!("Bearer {client_token}"))
+            .header("X-Capability-Token", peer_cap)
+            .json(&body)
+            .send()?
+            .json()?,
+    };
     if body.get("status").and_then(|status| status.as_str()) == Some("error") {
         anyhow::bail!(
             "{}",
