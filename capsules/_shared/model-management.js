@@ -3,6 +3,16 @@
   const CID = /^bafybei[a-z2-7]{52}$/;
   const STATES = new Set(["capacity_pending", "reserved", "preparing", "verifying", "admission_pending", "admitted", "reclaimed", "failed", "uncertain", "cancelled", "expired"]);
   const active = p => p && ["capacity_pending", "reserved", "preparing", "verifying", "admission_pending", "uncertain"].includes(p.state);
+  const FAILURE_TEXT = Object.freeze({
+    authorization_unavailable: "Preparation stopped. Open Models again to check access.",
+    policy_unavailable: "Preparation stopped. Model policy is unavailable.",
+    capacity_unavailable: "Preparation stopped. Storage capacity is unavailable.",
+    content_unavailable: "Preparation failed. Model content could not be read.",
+    local_storage_unavailable: "Preparation failed. Local storage could not be written.",
+    verification_failed: "Preparation failed. Model verification did not pass.",
+    preparation_unavailable: "Preparation failed.",
+  });
+  const failureText = p => FAILURE_TEXT[p.failure_class] || "Preparation failed.";
   const text = (v, max = 256) => typeof v === "string" && v.length > 0 && v.length <= max && !/[\u0000-\u001f]/.test(v);
   function check(ok) { if (!ok) throw new Error("Invalid model response"); }
   function parseRuntime(r, cid) {
@@ -14,6 +24,7 @@
       check([p.total_bytes, p.completed_bytes].every(n => Number.isSafeInteger(n) && n >= 0) && p.completed_bytes <= p.total_bytes);
       check(typeof p.cancel_requested === "boolean" && typeof p.activation_pending === "boolean" && typeof p.admitted === "boolean");
       check(p.admitted === (p.state === "admitted") && r.admitted === p.admitted);
+      check(p.failure_class == null || (typeof p.failure_class === "string" && Object.hasOwn(FAILURE_TEXT, p.failure_class)));
     } else check(!r.admitted && !r.kept && !r.dispatch_ready);
     return r;
   }
@@ -26,7 +37,7 @@
   // Typed operation outputs are flat. Only catalog rows nest model_runtime.
   function operationRuntime(output, cid, retainedPreparation) {
     const preparation = retainedPreparation || Object.fromEntries([
-      "operation_id", "cid", "state", "total_bytes", "completed_bytes", "cancel_requested", "admitted", "activation_pending",
+      "operation_id", "cid", "state", "total_bytes", "completed_bytes", "cancel_requested", "admitted", "activation_pending", "failure_class",
     ].map(key => [key, output[key]]));
     return parseRuntime({ admitted: output.admitted, kept: output.kept,
       dispatch_ready: output.dispatch_ready, offer_id: output.offer_id, preparation }, cid);
@@ -204,7 +215,7 @@
           element("p", `Content ID: ${model.cid}`, "model-identity"), element("p", `${model.content_size_bytes.toLocaleString()} bytes`));
         const label = message ? "Current status unavailable" : r.dispatch_ready ? "Ready to use" : r.admitted ? "Prepared. The model offer is unavailable."
           : active(p) ? (p.cancel_requested ? "Cancelling preparation…" : p.state === "capacity_pending" ? "Waiting for local capacity…" : p.state === "uncertain" ? "Waiting for preparation to settle…" : "Preparing…")
-            : p ? ({ reclaimed: "Model removed from local cache.", cancelled: "Preparation cancelled.", failed: "Preparation failed.", expired: "Preparation expired." }[p.state] || "Waiting to prepare…") : "Not prepared";
+            : p ? ({ reclaimed: "Model removed from local cache.", cancelled: "Preparation cancelled.", failed: failureText(p), expired: "Preparation expired." }[p.state] || "Waiting to prepare…") : "Not prepared";
         row.append(element("p", label));
         if (active(p)) {
           const progress = element("progress"); progress.max = p.total_bytes || 1; progress.value = p.completed_bytes;

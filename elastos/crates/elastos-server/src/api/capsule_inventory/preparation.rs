@@ -25,6 +25,52 @@ const RESERVATION_SECONDS: u64 = 3600;
 const MAX_PACKAGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const CAPACITY_WINDOW_BYTES: u64 = 1024 * 1024;
 
+// Static checkpoints retain a useful cause after cleanup without retaining
+// provider text, host paths, credentials or media bytes in the inventory.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum PreparationFailurePhase {
+    Preparation,
+    Authority,
+    Policy,
+    Capacity,
+    MetadataRead,
+    MetadataWrite,
+    MetadataSync,
+    MetadataIntegrity,
+    WeightsRead,
+    WeightsHeader,
+    WeightsWrite,
+    WeightsSync,
+    WeightsIntegrity,
+}
+
+impl std::fmt::Display for PreparationFailurePhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for PreparationFailurePhase {}
+
+impl PreparationFailurePhase {
+    fn public_class(self) -> &'static str {
+        match self {
+            Self::Authority => "authorization_unavailable",
+            Self::Policy => "policy_unavailable",
+            Self::Capacity => "capacity_unavailable",
+            Self::MetadataRead | Self::WeightsRead => "content_unavailable",
+            Self::MetadataWrite | Self::MetadataSync | Self::WeightsWrite | Self::WeightsSync => {
+                "local_storage_unavailable"
+            }
+            Self::MetadataIntegrity | Self::WeightsHeader | Self::WeightsIntegrity => {
+                "verification_failed"
+            }
+            Self::Preparation => "preparation_unavailable",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum PreparationState {
@@ -58,6 +104,8 @@ struct PreparationRecord {
     admission_id: String,
     #[serde(default)]
     activation: Option<ModelActivation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_phase: Option<PreparationFailurePhase>,
     created_at: u64,
     expires_at: u64,
 }
@@ -588,6 +636,7 @@ fn reserve_at(
         cancel_requested: false,
         admission_id: String::new(),
         activation: None,
+        failure_phase: None,
         created_at: now,
         expires_at: now
             .checked_add(RESERVATION_SECONDS)
@@ -741,7 +790,8 @@ impl PreparationRecord {
             "state":self.state, "total_bytes":self.total_bytes,
             "completed_bytes":self.completed_bytes, "cancel_requested":self.cancel_requested,
             "admitted":self.state == PreparationState::Admitted,
-            "activation_pending":self.state == PreparationState::Admitted && self.activation_pending})
+            "activation_pending":self.state == PreparationState::Admitted && self.activation_pending,
+            "failure_class":self.failure_phase.map(PreparationFailurePhase::public_class)})
     }
 }
 
@@ -969,13 +1019,34 @@ impl PreparationOwner {
                 reconcile(&data, &registry, &operation, &stopping, &revalidate).await
             };
             if let Err(error) = result {
-                tracing::debug!(error = ?error, "private model preparation stopped");
+                let phase = error
+                    .downcast_ref::<PreparationFailurePhase>()
+                    .copied()
+                    .unwrap_or(PreparationFailurePhase::Preparation);
+                let recorded = update_operation(&data, &operation, |record| {
+                    record.failure_phase.get_or_insert(phase);
+                })
+                .is_ok();
                 // The serialized local barrier is required even after transport
                 // failure. Failed drain preserves all staged bytes and charges.
                 let drained = registry.prepare_local_ipfs_backend().await.is_ok();
-                if let Err(error) = settle_failure(&data, &operation, drained) {
-                    tracing::debug!(error = ?error, "private model preparation settlement uncertain");
-                }
+                let settled = settle_failure(&data, &operation, drained).is_ok();
+                use elastos_runtime::provider::ProviderError;
+                let provider_error_kind =
+                    error
+                        .downcast_ref::<ProviderError>()
+                        .map(|error| match error {
+                            ProviderError::NotFound(_) => "NotFound",
+                            ProviderError::PermissionDenied(_) => "PermissionDenied",
+                            ProviderError::InvalidUri(_) => "InvalidUri",
+                            ProviderError::Provider(_) => "Provider",
+                            ProviderError::NoProvider(_) => "NoProvider",
+                            ProviderError::Unavailable(_) => "Unavailable",
+                            ProviderError::Io(_) => "Io",
+                        });
+                tracing::warn!(operation_id = %operation, ?phase, ?provider_error_kind,
+                    io_error_kind = ?error.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+                    recorded, drained, settled, "private model preparation stopped");
             }
             // Admission and activation share this exact inventory worker guard.
             // Short snapshot locks remain available during provider I/O.
@@ -1487,7 +1558,7 @@ fn require_active(
     stop: &AtomicBool,
     revalidate: &Revalidate,
 ) -> anyhow::Result<PreparationRecord> {
-    revalidate()?;
+    revalidate().context(PreparationFailurePhase::Authority)?;
     let record = load_operation(data_dir, id)?;
     ensure!(
         record.active()
@@ -1496,7 +1567,7 @@ fn require_active(
             && now()? < record.expires_at,
         "preparation stopped"
     );
-    current_entry(data_dir, &record)?;
+    current_entry(data_dir, &record).context(PreparationFailurePhase::Policy)?;
     Ok(record)
 }
 
@@ -1576,7 +1647,10 @@ async fn prepare(
     revalidate: &Revalidate,
 ) -> anyhow::Result<()> {
     let record = require_active(data_dir, id, stop, revalidate)?;
-    registry.prepare_local_ipfs_backend().await?;
+    registry
+        .prepare_local_ipfs_backend()
+        .await
+        .context(PreparationFailurePhase::MetadataRead)?;
     require_active(data_dir, id, stop, revalidate)?;
     let entry = current_entry(data_dir, &record)?;
     let closure = crate::content::parse_content_object_manifest(
@@ -1589,21 +1663,32 @@ async fn prepare(
     if record.index_bytes > 0 || record.completed_bytes > 0 {
         anyhow::bail!("interrupted partial preparation requires settled cleanup");
     }
-    let mut backend_volume = require_capacity(data_dir, registry, &record).await?;
+    let mut backend_volume = require_capacity(data_dir, registry, &record)
+        .await
+        .context(PreparationFailurePhase::Capacity)?;
     require_active(data_dir, id, stop, revalidate)?;
     let index =
         crate::content::fetch_model_part(registry, &entry.cid, "_elastos_object.json", None)
-            .await?;
+            .await
+            .context(PreparationFailurePhase::MetadataRead)?;
     require_active(data_dir, id, stop, revalidate)?;
-    let object: serde_json::Value = serde_json::from_slice(&index)?;
+    let object: serde_json::Value =
+        serde_json::from_slice(&index).context(PreparationFailurePhase::MetadataIntegrity)?;
     ensure!(
         object == entry.object_manifest,
-        "fetched index differs from signed catalog"
+        anyhow::anyhow!("fetched index differs from signed catalog")
+            .context(PreparationFailurePhase::MetadataIntegrity)
     );
-    let stage = Inventory::open(data_dir, false)?.stage(true)?;
-    let mut file = stage.create_file("_elastos_object.json")?;
-    file.write_all(&index)?;
-    file.sync_all()?;
+    let stage = Inventory::open(data_dir, false)?
+        .stage(true)
+        .context(PreparationFailurePhase::MetadataWrite)?;
+    let mut file = stage
+        .create_file("_elastos_object.json")
+        .context(PreparationFailurePhase::MetadataWrite)?;
+    file.write_all(&index)
+        .context(PreparationFailurePhase::MetadataWrite)?;
+    file.sync_all()
+        .context(PreparationFailurePhase::MetadataSync)?;
     update_operation(data_dir, id, |record| {
         record.index_bytes = index.len() as u64
     })?;
@@ -1611,17 +1696,26 @@ async fn prepare(
     // authority remain per read; the outstanding charge is not an OS reservation.
     let mut window_bytes = index.len() as u64;
     for expected in &closure.files {
-        let mut file = stage.create_file(&expected.path)?;
+        let weights = expected.path == entry.manifest.entrypoint;
+        let write_phase = if weights {
+            PreparationFailurePhase::WeightsWrite
+        } else {
+            PreparationFailurePhase::MetadataWrite
+        };
+        let mut file = stage.create_file(&expected.path).context(write_phase)?;
         let mut digest = Sha256::new();
         let mut offset = 0u64;
         while offset < expected.size {
             let record = require_active(data_dir, id, stop, revalidate)?;
             let length = (expected.size - offset).min(65536);
             if window_bytes + length > CAPACITY_WINDOW_BYTES {
-                backend_volume = require_capacity(data_dir, registry, &record).await?;
+                backend_volume = require_capacity(data_dir, registry, &record)
+                    .await
+                    .context(PreparationFailurePhase::Capacity)?;
                 window_bytes = 0;
             } else {
-                require_runtime_capacity(data_dir, &record, backend_volume)?;
+                require_runtime_capacity(data_dir, &record, backend_volume)
+                    .context(PreparationFailurePhase::Capacity)?;
             }
             require_active(data_dir, id, stop, revalidate)?;
             let bytes = crate::content::fetch_model_part(
@@ -1630,27 +1724,43 @@ async fn prepare(
                 &expected.path,
                 Some((offset, length)),
             )
-            .await?;
+            .await
+            .context(if weights {
+                PreparationFailurePhase::WeightsRead
+            } else {
+                PreparationFailurePhase::MetadataRead
+            })?;
             require_active(data_dir, id, stop, revalidate)?;
-            if expected.path == entry.manifest.entrypoint && offset == 0 {
+            if weights && offset == 0 {
                 ensure!(
                     bytes.len() >= 8
                         && &bytes[..4] == b"GGUF"
                         && matches!(u32::from_le_bytes(bytes[4..8].try_into()?), 2 | 3),
-                    "invalid GGUF header"
+                    anyhow::anyhow!("invalid GGUF header")
+                        .context(PreparationFailurePhase::WeightsHeader)
                 );
             }
-            stage.check_file(&expected.path, &file, offset)?;
-            file.write_all(&bytes)?;
+            stage
+                .check_file(&expected.path, &file, offset)
+                .context(write_phase)?;
+            file.write_all(&bytes).context(write_phase)?;
             digest.update(&bytes);
             offset += length;
             update_operation(data_dir, id, |record| record.completed_bytes += length)?;
             window_bytes += length;
         }
-        file.sync_all()?;
+        file.sync_all().context(if weights {
+            PreparationFailurePhase::WeightsSync
+        } else {
+            PreparationFailurePhase::MetadataSync
+        })?;
         ensure!(
             hex::encode(digest.finalize()) == expected.sha256,
-            "model file hash mismatch"
+            anyhow::anyhow!("model file hash mismatch").context(if weights {
+                PreparationFailurePhase::WeightsIntegrity
+            } else {
+                PreparationFailurePhase::MetadataIntegrity
+            })
         );
     }
     update_operation(data_dir, id, |record| {
@@ -2521,6 +2631,22 @@ mod tests {
                     };
                     let fault = *self.read_fault.lock().unwrap();
                     match (path, fault) {
+                        (
+                            "weights.gguf",
+                            Some("file_unavailable" | "file_unavailable_undrained"),
+                        ) => {
+                            self.fail_drain.store(
+                                fault == Some("file_unavailable_undrained"),
+                                Ordering::Release,
+                            );
+                            return Err(elastos_runtime::provider::ProviderError::Provider(
+                                "private fixture cause /secret/provider?credential=hidden".into(),
+                            ));
+                        }
+                        ("weights.gguf", Some("header")) => bytes[..4].copy_from_slice(b"FAIL"),
+                        ("capsule.json", Some("metadata_tamper")) => {
+                            *bytes.last_mut().unwrap() ^= 1;
+                        }
                         ("weights.gguf", Some("file_tamper"))
                         | ("_elastos_object.json", Some("index_tamper")) => {
                             *bytes.last_mut().unwrap() ^= 1;
@@ -5636,6 +5762,155 @@ server.serve_forever()
         assert_eq!(expired.reserved_bytes, 0);
         assert_eq!(std::fs::read(&weights_path).unwrap(), original_weights);
         assert!(backend.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_preparation_failure_phase_survives_cleanup_with_real_home_revalidation() {
+        use crate::api::gateway::{
+            issue_home_launch_token_for_auth_grant, require_home_launch_token_for_any_app_context,
+        };
+        use elastos_runtime::auth::AuthSessionGrantV1;
+
+        for (fault, phase) in [
+            (
+                "metadata_tamper",
+                PreparationFailurePhase::MetadataIntegrity,
+            ),
+            ("file_unavailable", PreparationFailurePhase::WeightsRead),
+            (
+                "file_unavailable_undrained",
+                PreparationFailurePhase::WeightsRead,
+            ),
+            ("header", PreparationFailurePhase::WeightsHeader),
+            ("authority_revoked", PreparationFailurePhase::Authority),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (payload, files) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+            let metadata_bytes: u64 = files
+                .iter()
+                .filter(|(path, _)| {
+                    !["_elastos_object.json", "weights.gguf"].contains(&path.as_str())
+                })
+                .map(|(_, bytes)| bytes.len() as u64)
+                .sum();
+            write_preparation_catalog(root.path(), &payload);
+            let cid = payload["entries"][0]["cid"].as_str().unwrap().to_owned();
+            let backend = Arc::new(PreparationBackend::new(files, cid.clone()));
+            *backend.read_fault.lock().unwrap() = Some(fault);
+            let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+            registry
+                .register_sub_provider("ipfs", backend.clone())
+                .await
+                .unwrap();
+            register_content(&registry, root.path()).await;
+
+            let context = context();
+            let grant = AuthSessionGrantV1 {
+                schema: AuthSessionGrantV1::SCHEMA.into(),
+                principal_id: context.principal_id.clone(),
+                session_id: context.session_id.clone(),
+                proof_binding_id: context.proof_binding_id.clone().unwrap(),
+                grant_id: context.grant_id.clone(),
+                issued_at: now().unwrap(),
+                expires_at: now().unwrap() + 3600,
+                apps: vec!["marketplace".into()],
+            };
+            crate::auth::store_session_grant(root.path(), grant.clone()).unwrap();
+            let token =
+                issue_home_launch_token_for_auth_grant(root.path(), "marketplace", &grant).unwrap();
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("host", "localhost:61180".parse().unwrap());
+            headers.insert("origin", "null".parse().unwrap());
+            headers.insert("x-elastos-home-token", token.parse().unwrap());
+            let (_, admitted) = require_home_launch_token_for_any_app_context(
+                root.path(),
+                &headers,
+                &["marketplace"],
+            )
+            .unwrap();
+            assert_eq!(admitted, context);
+            let path = root.path().to_path_buf();
+            let revalidate: Revalidate = Arc::new(move || {
+                if fault == "authority_revoked"
+                    && Inventory::open(&path, false)
+                        .and_then(|inventory| inventory.load())
+                        .is_ok_and(|state| {
+                            state
+                                .records
+                                .iter()
+                                .any(|r| r.completed_bytes == metadata_bytes)
+                        })
+                {
+                    crate::auth::revoke_session_grant(&path, &grant.session_id, now()?)?;
+                }
+                let (_, current) = require_home_launch_token_for_any_app_context(
+                    &path,
+                    &headers,
+                    &["marketplace"],
+                )?;
+                ensure!(current == admitted, "preparation authority changed");
+                Ok(())
+            });
+            let owner = PreparationOwner::default();
+            let output = owner
+                .invoke(
+                    root.path(),
+                    Some(registry),
+                    caller(&context, &method("use")),
+                    "failure-phase",
+                    &serde_json::json!({"cid":cid}),
+                    revalidate,
+                )
+                .unwrap();
+            join_worker(&owner).await;
+            let record =
+                load_operation(root.path(), output["operation_id"].as_str().unwrap()).unwrap();
+            let undrained = fault == "file_unavailable_undrained";
+            assert_eq!(
+                record.state,
+                if undrained {
+                    PreparationState::Uncertain
+                } else {
+                    PreparationState::Failed
+                },
+                "{fault}"
+            );
+            assert_eq!(record.failure_phase, Some(phase), "{fault}");
+            assert_eq!(record.completed_bytes, metadata_bytes, "{fault}");
+            assert_eq!(
+                record.reserved_bytes,
+                if undrained {
+                    preparation_charge(record.total_bytes).unwrap()
+                } else {
+                    0
+                }
+            );
+            assert_eq!(
+                root.path().join("model-preparation/stage").exists(),
+                undrained
+            );
+            assert_eq!(record.projection()["failure_class"], phase.public_class());
+            assert_eq!(
+                backend.calls.lock().unwrap().last().unwrap(),
+                "runtime_prepare_backend"
+            );
+            assert!(!backend
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|op| op == "runtime_hash_staged_directory"));
+            let durable = serde_json::to_string(&record).unwrap();
+            for private in ["/secret", "credential", "hidden", "provider?"] {
+                assert!(!durable.contains(private));
+                assert!(!record.projection().to_string().contains(private));
+            }
+            // Old failed receipts retain unknown cause; reading adds no invented phase.
+            let mut old = serde_json::to_value(&record).unwrap();
+            old.as_object_mut().unwrap().remove("failure_phase");
+            let old: PreparationRecord = serde_json::from_value(old).unwrap();
+            assert_eq!(old.projection()["failure_class"], serde_json::Value::Null);
+        }
     }
 
     #[tokio::test]
