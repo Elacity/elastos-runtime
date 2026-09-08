@@ -2509,6 +2509,136 @@ async function runControlledBrowserViewerReload(page, appFrame, token, readRecei
   }
 }
 
+async function observeControlledBrowserInput(page, appFrame, token, pageId) {
+  const started = performance.now();
+  const origin = new URL(appFrame.url()).origin;
+  const instance = new URL(appFrame.url()).searchParams.get("browser_instance");
+  const inputPath = `/api/apps/browser/pages/${encodeURIComponent(pageId)}/input`;
+  const evidence = { schema: "elastos.browser.journey-input-observation/v1", requests: [],
+    dropped_requests: 0, observer: { stopped: false } };
+  const requests = new WeakMap(), pending = new Set();
+  let sequence = 0, handle, stopped = false, finished, collecting = true;
+  const bounded = async (promise, fallback, timeoutMs = 2000) => {
+    let timer;
+    try { return await Promise.race([promise, new Promise(resolve => {
+      timer = setTimeout(() => resolve(fallback), Math.max(0, timeoutMs));
+    })]); } finally { clearTimeout(timer); }
+  };
+  const record = value => {
+    if (evidence.requests.length < 32) evidence.requests.push({ at_ms: Math.round(performance.now() - started), ...value });
+    else evidence.dropped_requests++;
+  };
+  const request = req => {
+    if (!collecting) return;
+    try {
+      const url = new URL(req.url()), headers = req.headers();
+      if (req.frame() !== appFrame || url.origin !== origin || url.pathname !== inputPath ||
+          req.method() !== "POST" || headers.origin !== "null" || headers["x-elastos-home-token"] !== token) return;
+      if (sequence >= 16) { evidence.dropped_requests++; return; }
+      let event;
+      try { event = req.postDataJSON()?.event; } catch {}
+      const metadata = { request_id: ++sequence,
+        event_type: ["click", "paste_text", "key", "wheel"].includes(event?.type) ? event.type : "other",
+        ...(event?.type === "paste_text" && typeof event.text === "string" ? { text_length: event.text.length } : {}) };
+      let settle;
+      const complete = new Promise(resolve => { settle = resolve; });
+      pending.add(complete);
+      requests.set(req, { metadata, settle: () => { pending.delete(complete); settle(); } });
+      record({ ...metadata, phase: "request" });
+    } catch { /* Detached or unrelated requests carry no input evidence. */ }
+  };
+  const failed = req => {
+    const entry = requests.get(req);
+    if (entry && !stopped) {
+      record({ ...entry.metadata, phase: "failed" });
+      requests.delete(req);
+      entry.settle();
+    }
+  };
+  const response = res => {
+    const entry = requests.get(res.request());
+    if (!entry || stopped) return;
+    requests.delete(res.request());
+    const at_ms = Math.round(performance.now() - started), status = res.status();
+    void bounded(Promise.resolve().then(() => res.json()).then(body => ({
+      schema_matches: body?.schema === "elastos.browser.input-result/v1",
+      page_matches: body?.page_id === pageId,
+      ...(typeof body?.accepted === "boolean" ? { accepted: body.accepted } : {}),
+    }), () => ({ body_unavailable: true })), { body_unavailable: true })
+      .then(details => { if (!stopped) record({ ...entry.metadata, phase: "response", at_ms, status, ...details }); })
+      .finally(entry.settle);
+  };
+  page.on("request", request);
+  page.on("requestfailed", failed);
+  page.on("response", response);
+  const setup = appFrame.evaluateHandle(({ pageId, origin, instance }) => {
+    const events = [];
+    let dropped = 0, expired = false;
+    const target = node => ["browser-keyboard-capture", "browser-render-panel", "browser-remote-display", "browser-url"]
+      .includes(node?.id) ? node.id : "other";
+    const ownerMatches = () => window.__elastosBrowserCurrentPageId === pageId &&
+      new URL(location.href).origin === origin && new URL(location.href).searchParams.get("browser_instance") === instance;
+    const listener = event => {
+      if (!ownerMatches()) return;
+      if (events.length >= 8) { dropped++; return; }
+      events.push({ viewer_at_ms: Math.round(performance.now() - started), target: target(event.target),
+        active_target: target(document.activeElement), default_prevented: event.defaultPrevented,
+        printable: typeof event.key === "string" && [...event.key].length === 1,
+        control: event.ctrlKey, meta: event.metaKey, alt: event.altKey, shift: event.shiftKey });
+    };
+    const started = performance.now();
+    document.addEventListener("keydown", listener);
+    const stop = failure => {
+      document.removeEventListener("keydown", listener);
+      clearTimeout(timer);
+      if (!failure) return null;
+      if (!ownerMatches()) return { owner_matches: false };
+      const status = document.querySelector("#browser-status")?.textContent || "";
+      // Fixed categories keep backend errors, website text and authority out of receipts.
+      const category = /input channel is not open/i.test(status) ? "input_channel_unavailable"
+        : /input is busy/i.test(status) ? "input_busy"
+        : /input was canceled/i.test(status) ? "input_canceled"
+        : /could not send that input/i.test(status) ? "input_rejected"
+        : /temporarily unavailable/i.test(status) ? "browser_unavailable"
+        : /Remote display ready/i.test(status) ? "display_ready"
+        : status ? "other" : "empty";
+      return { owner_matches: true, expired, has_focus: document.hasFocus(), active_target: target(document.activeElement),
+        loading: document.body?.dataset?.loading === "true", address_disabled: document.querySelector("#browser-url")?.disabled === true,
+        status: category, keys: events, dropped_keys: dropped };
+    };
+    const timer = setTimeout(() => { expired = true; stop(false); }, 40_000);
+    return { stop };
+  }, { pageId, origin, instance }).then(async value => {
+    if (!collecting) {
+      try { await value.evaluate(observer => observer.stop(false)); } finally { await value.dispose(); }
+      return null;
+    }
+    handle = value;
+    return value;
+  }).catch(() => { evidence.observer.setup_failed = true; return null; });
+  if (!await bounded(setup, null)) evidence.observer.setup_failed = true;
+  const stop = failure => finished ||= (async () => {
+    collecting = false;
+    page.off("request", request);
+    const deadline = performance.now() + 2000;
+    const value = handle;
+    handle = null;
+    const collected = value ? bounded(value.evaluate((observer, failure) => observer.stop(failure), failure)
+      .then(viewer => ({ viewer, stopped: true }), () => ({ stopped: false }))
+      .finally(() => value.dispose().catch(() => {})), { stopped: false }) : Promise.resolve({ stopped: false });
+    const [snapshot, drained] = await Promise.all([collected,
+      bounded(Promise.allSettled([...pending]).then(() => true), false, deadline - performance.now())]);
+    stopped = true;
+    page.off("requestfailed", failed);
+    page.off("response", response);
+    evidence.observer.drained = drained;
+    if (failure) evidence.viewer = snapshot.viewer || { unavailable: true };
+    evidence.observer.stopped = snapshot.stopped;
+    return evidence;
+  })();
+  return { evidence, stop };
+}
+
 async function runControlledBrowserJourney(page, appFrame, windowLocator, token, baseline, failures) {
   const fixture = new URL(BROWSER_JOURNEY_FIXTURE_ORIGIN);
   const run = randomUUID();
@@ -2524,7 +2654,13 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
       "Controlled fixture receipt failed", body);
     return body;
   };
-  let failure = null;
+  let failure = null, inputObserver = null;
+  const stopInputObservation = async failed => {
+    try { await inputObserver?.stop(failed); }
+    catch {
+      result.input_observation.observer = { ...result.input_observation.observer, stopped: false, stop_failed: true };
+    }
+  };
   try {
     // Ordinary address entry is available after Browser settles its current open.
     // This source disables the field while opening; the harness preserves that UI rule.
@@ -2568,6 +2704,8 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
         timing: { status_ready_ms: statusReadyMs, decoded_progress_ms: Math.round(performance.now() - navigationStarted) } });
     }
     const current = result.pages.at(-1);
+    inputObserver = await observeControlledBrowserInput(page, appFrame, token, current.page_id);
+    result.input_observation = inputObserver.evidence;
     const rect = current.load.input_rect;
     const point = await remoteVideoClickPositionForPagePoint(appFrame,
       { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 });
@@ -2582,6 +2720,7 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
       await waitForJourneyEvidence(readReceipt,
         value => value.events.some(event => event.page === "nav" && event.type === "input" && event.value === typed),
         "Engine page receives typed text");
+      if (typed.length === 1) await stopInputObservation(false);
     }
     markStage("browser:scroll");
     await appFrame.locator("#browser-remote-display").hover();
@@ -2598,6 +2737,7 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
     error.details = { stage: smokeStage, ...error.details };
     failure = error;
   } finally {
+    await stopInputObservation(Boolean(failure));
     try {
       result.close = await closeControlledBrowserWindow(page, appFrame, windowLocator, token, baseline,
         { expectedPageId: failure ? null : result.pages.at(-1)?.page_id });

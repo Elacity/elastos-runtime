@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import { createBrowserJourneyFixture } from "./browser-journey-fixture.mjs";
+import { readBrowserViewerReloadDocument } from "./browser-journey-viewer-reload.mjs";
 
 const source = readFileSync(new URL("../home-passkey-virtual-auth-smoke.mjs", import.meta.url), "utf8");
 function harnessFunction(name, globals = {}) {
@@ -197,11 +198,12 @@ test("a successful journey cannot use no-page startup cleanup as fresh-close pro
   surface.assertClean();
 });
 
-test("journey success pins close to its last page while earlier failure retains cleanup fallback", async () => {
-  for (const inputFails of [false, true]) {
+test("journey preserves click/key timing and exact close even when diagnostic stop rejects or throws", async () => {
+  for (const variant of ["success", "input-failure", "stop-reject", "stop-throw", "input-failure-stop-throw"]) {
+    const inputFails = variant.includes("input-failure");
     const runId = "journey-test-run";
     const events = [];
-    const closes = [];
+    const closes = [], inputActions = [];
     const inputError = new Error("input delivery failed");
     let url = "";
     let pageName = "";
@@ -211,10 +213,10 @@ test("journey success pins close to its last page while earlier failure retains 
       input_rect: { x: 32, y: 150, width: 480, height: 60 } });
     const appFrame = {
       waitForFunction: async () => {},
-      locator: () => ({ waitFor: async () => {}, hover: async () => {}, click: async () => {},
+      locator: () => ({ waitFor: async () => {}, hover: async () => {}, click: async () => { inputActions.push("click"); },
         fill: async target => { url = target; pageName = new URL(target).pathname.slice(1); },
         press: async key => { assert.equal(key, "Enter"); report("load"); },
-        pressSequentially: async character => { if (inputFails) throw inputError; value += character; report("input"); },
+        pressSequentially: async character => { inputActions.push("key"); if (inputFails) throw inputError; value += character; report("input"); },
       }),
     };
     const page = { mouse: { wheel: async () => report("scroll") } };
@@ -236,13 +238,33 @@ test("journey success pins close to its last page while earlier failure retains 
       waitForJourneyEvidence: async (read, predicate) => { const result = await read(); assert.ok(predicate(result)); return result; },
       waitForBrowserRemoteVideo: async () => ({ decoded_frames: frames }),
       browserRemoteVideoMetrics: async () => ({ decoded_frames: ++frames }),
-      remoteVideoClickPositionForPagePoint: async () => ({ x: 50, y: 50 }),
+      remoteVideoClickPositionForPagePoint: async () => { inputActions.push("geometry"); return { x: 50, y: 50 }; },
+      observeControlledBrowserInput: async (actualPage, actualFrame, token, pageId) => {
+        assert.equal(actualPage, page); assert.equal(actualFrame, appFrame);
+        assert.equal(token, "browser-token"); assert.equal(pageId, "page-nav");
+        inputActions.push("observe");
+        return { evidence: { observer: {} }, stop: failure => {
+          inputActions.push(failure ? "failure-stop" : "stop");
+          if (variant.includes("stop-throw")) throw new Error("private diagnostic failure");
+          if (variant === "stop-reject") return Promise.reject(new Error("private diagnostic failure"));
+        } };
+      },
       closeControlledBrowserWindow: async (...args) => { closes.push(args); return { receipt: { closed: true } }; },
     });
-    if (inputFails) await assert.rejects(journey(page, appFrame, window, "browser-token", baseline, []),
-      error => error === inputError);
-    else assert.equal((await journey(page, appFrame, window, "browser-token", baseline, [])).page_id, "page-nav");
+    if (inputFails) await assert.rejects(journey(page, appFrame, window, "browser-token", baseline, []), error => {
+      assert.equal(error, inputError);
+      if (variant.includes("stop-throw")) assert.equal(error.details.controlled_journey.input_observation.observer.stop_failed, true);
+      return true;
+    });
+    else {
+      const result = await journey(page, appFrame, window, "browser-token", baseline, []);
+      assert.equal(result.page_id, "page-nav");
+      if (variant.startsWith("stop-")) assert.equal(result.controlled_journey.input_observation.observer.stop_failed, true);
+      assert.ok(!JSON.stringify(result).includes("private diagnostic failure"));
+    }
     assert.equal(closes.length, 1);
+    assert.deepEqual(inputActions.slice(0, 4), ["observe", "geometry", "click", "key"]);
+    assert.equal(inputActions[4], inputFails ? "failure-stop" : "stop");
     assert.deepEqual(closes[0].slice(0, 5), [page, appFrame, window, "browser-token", baseline]);
     assert.equal(closes[0][5]?.expectedPageId, inputFails ? null : "page-nav");
   }
@@ -550,6 +572,7 @@ for (const observation of ["ready", "document-transition", "unexpected-viewer-er
     const sessions = { recoverable_page: { page_id: "runtime-owner" } };
     const signal = new AbortController().signal;
     const wrapper = harnessFunction("runControlledBrowserViewerReload", {
+      readBrowserViewerReloadDocument,
       markStage: () => {}, assert: (value, message) => assert.ok(value, message),
       fetch: async (url, options) => {
         requests.push({ url: String(url), options });
