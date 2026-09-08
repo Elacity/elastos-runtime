@@ -612,6 +612,10 @@ async fn execute_browser_open(
         exit_id: browser_lifecycle_exit_id(remote_exit_id.as_deref()),
         engine_route_provider: engine_registration.provider.clone(),
         selected_engine_adapter: Some(adapter_id.clone()),
+        service_selection: Some(BrowserServiceSelection::from_request(
+            requested_adapter_id,
+            remote_exit_id.clone(),
+        )),
         profile_key_hash: browser_lifecycle_hash(profile_key),
         vm_key_hash: browser_lifecycle_vm_key_hash(&[
             profile_key,

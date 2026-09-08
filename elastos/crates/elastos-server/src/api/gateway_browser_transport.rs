@@ -1246,6 +1246,7 @@ mod tests {
                 exit_id: "local-runtime".to_string(),
                 engine_route_provider: "browser-engine".to_string(),
                 selected_engine_adapter: Some("browser-vm-product".to_string()),
+                service_selection: None,
                 profile_key_hash: None,
                 vm_key_hash: None,
             },

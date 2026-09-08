@@ -144,6 +144,7 @@ async fn browser_profile_reset_refuses_live_principal_session() {
             exit_id: "local-runtime".to_string(),
             engine_route_provider: "mock-browser-engine".to_string(),
             selected_engine_adapter: Some("mock-adapter".to_string()),
+            service_selection: None,
             profile_key_hash: browser_lifecycle_hash("profile-test"),
             vm_key_hash: browser_lifecycle_hash("vm-test"),
         },

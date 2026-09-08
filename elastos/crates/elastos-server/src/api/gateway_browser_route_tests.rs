@@ -2014,6 +2014,91 @@ async fn test_browser_open_job_and_page_routes_require_exact_verified_launch_own
 }
 
 #[tokio::test]
+async fn test_browser_service_selection_uses_fresh_request_choices() {
+    for explicit in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let authority = passkey_authority(dir.path());
+        let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+        let state = if explicit {
+            browser_engine_remote_carrier_exit_test_state(dir.path()).await
+        } else {
+            browser_engine_attached_test_state(dir.path()).await
+        };
+        let app = gateway_router(state);
+        let mut request = json!({"url": "https://example.com/", "display_mode": "webrtc_remote_display",
+            "guarantee_level": "operator_rbi"});
+        if explicit {
+            request["adapter_id"] = json!("mock-jetson-engine");
+            request["remote_exit_id"] = json!("mock-remote-carrier-exit");
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/browser/open")
+                    .header("x-elastos-home-token", token.clone())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let opened: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .uri("/api/apps/browser/summary")
+                    .header("x-elastos-home-token", token.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            summary["sessions"]["recoverable_page"]["service_selection"],
+            json!({
+                "schema": "elastos.browser.service-selection/v1",
+                "engine_id": if explicit { "mock-jetson-engine" } else { "" },
+                "exit_id": if explicit { "mock-remote-carrier-exit" } else { "" },
+            })
+        );
+        assert_eq!(
+            opened["engine_page"]["adapter"],
+            if explicit {
+                "mock-jetson-engine"
+            } else {
+                "mock-browser-engine"
+            }
+        );
+        let page_id = opened["engine_page"]["page_id"].as_str().unwrap();
+        let response = app
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri(format!("/api/apps/browser/pages/{page_id}/close"))
+                    .header("x-elastos-home-token", token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(browser_close_body(browser_cleanup_id(&opened)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
 async fn test_browser_open_launches_selected_engine_adapter() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
@@ -6563,6 +6648,7 @@ async fn test_browser_close_provider_unavailable_keeps_bounded_engine_cleanup_ob
             exit_id: "local-runtime".to_string(),
             engine_route_provider: "mock-browser-engine".to_string(),
             selected_engine_adapter: Some("mock-adapter".to_string()),
+            service_selection: None,
             profile_key_hash: browser_lifecycle_hash("provider-unavailable-profile"),
             vm_key_hash: browser_lifecycle_hash("provider-unavailable-vm"),
         },

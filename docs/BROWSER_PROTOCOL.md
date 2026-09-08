@@ -159,6 +159,22 @@ cleanup IDs are scoped by the verified launch owner, not globally usable bearer
 authority. Existing progress is a status projection; a subscription/event API
 and semantic operator waits require B04/B06 implementation and tests.
 
+Runtime summary carries the requested Engine and Exit choices on a recoverable
+page as `service_selection` (`elastos.browser.service-selection/v1`). The
+`engine_id` and `exit_id` fields identify the original choices; empty values mean
+Automatic Engine and local Exit. Runtime keeps these values separate from the
+resolved adapter and redacted routing labels, through launch, durable ownership,
+reconciliation and cleanup transfer. Legacy ownership can omit this field; the
+viewer preserves cleanup authority while recovery of those choices is unavailable.
+
+The session summary's `fresh_start_allowed` result describes the verified
+principal and Browser window scope. Runtime checks pending open jobs, launching
+and active sessions, reconciliation, cleanup and capacity. A null recoverable
+page alone is insufficient to start another page. Unavailable or missing scope
+evidence keeps startup pending. Fresh open still passes the existing Runtime
+admission checks. Viewer reload adopts an active page and connects its display;
+viewer unload ends that document's observations while Runtime retains ownership.
+
 Provider timeouts bound individual calls. The current implementation has a
 five-minute stale-heartbeat threshold, a fifteen-minute retained open-job TTL,
 and bounded launch reconciliation calls. These are implementation limits in
