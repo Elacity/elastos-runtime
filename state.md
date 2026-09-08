@@ -343,6 +343,14 @@ The integrated source includes these durable facts:
   process receipts remain distinct. Formatting, Home/public-copy entropy and
   diff checks pass. Shared UI, retention eviction, scaled resource proof and
   cold exact-Qwen/installed acceptance remain open.
+- Runtime accepts `content.retention` with `{cid, keep}` through the existing
+  preparation owner and first-party manifests. The same inventory stores one
+  claim per principal and admitted CID; aliases share it and release preserves
+  other principals' claims. Status exposes only the caller's `kept` fact.
+  Keep changes leave admission, bytes, quota, offers and readiness unchanged and
+  do not interrupt startup verification. Source checks pass 60 server model tests
+  (four explicit process prerequisites ignored) and the capsule binding test.
+  Shared UI, exact-offer readiness and safe eviction remain open.
 - Large-model publication needs a bounded operator/provider bootstrap path or a
   separately verified publisher repair. The current generic directory publisher
   reads whole files and builds a base64 JSON array. Cold-proof capacity must

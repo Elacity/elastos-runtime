@@ -45,6 +45,15 @@
           "audit": "full",
           "resource": "elastos://marketplace/install",
           "operation": "install"
+        },
+        {
+          "id": "content.retention",
+          "description": "Keep or release a model on this device",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://capsules/*",
+          "operation": "retention"
         }
       ]
     }

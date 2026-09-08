@@ -277,7 +277,10 @@ Proposed local commit order, after the separate onboarding/recovery and window
 policy slices:
 
 1. **Package admission contract.** The typed preparation, status/cancel and
-   inventory path is implemented; shared retention intents remain open.
+   inventory path is implemented. `content.retention` accepts `{cid, keep}` for
+   an admitted CID owned by the current principal. The same inventory holds one
+   retention claim per principal/CID, shared across aliases; status shows only
+   the caller's claim. Keep/release leaves admission and accounting unchanged.
    Content fetch alone does not authorize installation.
    Inputs identify the exact catalog entry/CID or owned operation;
    Runtime derives principal, trust, provider and paths. Keep one inventory and
@@ -297,7 +300,8 @@ policy slices:
    Identical Init is idempotent; unresolved bindings survive expiry and restart.
    Busy activation retains admitted files for retry without transfer. Actual
    eviction still requires a proved closure receipt for every retained engine
-   and run. Shared Keep/release intents and installed retention proof remain open.
+   and run. Keep/release intents are implemented independently of activation;
+   shared UI and installed retention proof remain open.
 4. **Shared model experience.** Add Models within existing Marketplace and model
    management within System; extend Assistant/Home Agent selectors. Test the
    same records across

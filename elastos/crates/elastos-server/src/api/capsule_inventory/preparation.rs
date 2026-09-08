@@ -59,9 +59,17 @@ struct PreparationRecord {
 
 #[derive(Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+struct RetentionClaim {
+    principal: String,
+    cid: String,
+}
+
+#[derive(Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 struct PreparationInventory {
     schema: String,
     records: Vec<PreparationRecord>,
+    retention_claims: Vec<RetentionClaim>,
 }
 
 impl Default for PreparationInventory {
@@ -69,6 +77,7 @@ impl Default for PreparationInventory {
         Self {
             schema: SCHEMA.into(),
             records: Vec::new(),
+            retention_claims: Vec::new(),
         }
     }
 }
@@ -167,7 +176,9 @@ fn canonical_cid(value: &str, codec: u64) -> bool {
 impl PreparationInventory {
     fn validate(&self) -> anyhow::Result<()> {
         ensure!(
-            self.schema == SCHEMA && self.records.len() <= MAX_RECORDS,
+            self.schema == SCHEMA
+                && self.records.len() <= MAX_RECORDS
+                && self.retention_claims.len() <= MAX_RECORDS,
             "invalid preparation inventory bounds"
         );
         let mut identities = BTreeSet::new();
@@ -254,7 +265,28 @@ impl PreparationInventory {
             );
         }
         ensure!(active <= 1, "multiple active preparations");
+        let mut claims = BTreeSet::new();
+        for claim in &self.retention_claims {
+            ensure!(
+                bounded_id(&claim.principal, 160)
+                    && canonical_cid(&claim.cid, 0x70)
+                    && claims.insert((&claim.principal, &claim.cid))
+                    && self
+                        .records
+                        .iter()
+                        .any(|record| record.state == PreparationState::Admitted
+                            && record.request_binding.principal == claim.principal
+                            && record.package_cid == claim.cid),
+                "invalid retention claim"
+            );
+        }
         Ok(())
+    }
+
+    fn kept(&self, principal: &str, cid: &str) -> bool {
+        self.retention_claims
+            .iter()
+            .any(|claim| claim.principal == principal && claim.cid == cid)
     }
 
     fn expire(&mut self, now: u64) -> bool {
@@ -427,6 +459,55 @@ fn reserve_at(
     Ok(record)
 }
 
+fn set_retention(
+    data_dir: &Path,
+    caller: &PreparationCaller<'_>,
+    request_id: &str,
+    cid: &str,
+    keep: bool,
+    revalidate: &Revalidate,
+) -> anyhow::Result<serde_json::Value> {
+    authorize(caller, "retention")?;
+    ensure!(
+        bounded_id(request_id, 160) && canonical_cid(cid, 0x70),
+        "invalid retention input"
+    );
+    let inventory = Inventory::open(data_dir, false)?;
+    let mut state = inventory.load()?;
+    let principal = &caller.context.principal_id;
+    let admitted = state
+        .records
+        .iter()
+        .find(|record| {
+            record.state == PreparationState::Admitted
+                && record.request_binding.principal == *principal
+                && record.package_cid == cid
+        })
+        .context("retention admission unavailable")?;
+    inventory.admitted(&admitted.admission_id)?.check()?;
+    // Desired local retention is independent of model-use permission. Aliases
+    // share one principal/CID claim; releasing it does not evict bytes or offers.
+    if state.kept(principal, cid) != keep {
+        if keep {
+            ensure!(
+                state.retention_claims.len() < MAX_RECORDS,
+                "retention claims full"
+            );
+            state.retention_claims.push(RetentionClaim {
+                principal: principal.clone(),
+                cid: cid.into(),
+            });
+        } else {
+            state
+                .retention_claims
+                .retain(|claim| claim.principal != *principal || claim.cid != cid);
+        }
+        revalidate()?;
+        inventory.save(&state)?;
+    }
+    Ok(serde_json::json!({"cid":cid,"kept":keep,"admitted":true,"inference_ready":false}))
+}
+
 fn status(
     data_dir: &Path,
     caller: &PreparationCaller<'_>,
@@ -559,8 +640,25 @@ impl PreparationOwner {
         struct Manage {
             operation_id: String,
         }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Retention {
+            cid: String,
+            keep: bool,
+        }
         revalidate()?;
         let record = match caller.method.operation.as_deref() {
+            Some("retention") => {
+                let input: Retention = serde_json::from_value(input.clone())?;
+                return set_retention(
+                    data_dir,
+                    &caller,
+                    request_id,
+                    &input.cid,
+                    input.keep,
+                    &revalidate,
+                );
+            }
             Some("status") => {
                 let input: Manage = serde_json::from_value(input.clone())?;
                 status(data_dir, &caller, &input.operation_id)?
@@ -578,19 +676,27 @@ impl PreparationOwner {
             }
             _ => anyhow::bail!("preparation method unavailable"),
         };
+        let kept = Inventory::open(data_dir, false)?
+            .load()?
+            .kept(&caller.context.principal_id, &record.package_cid);
+        let project = |record: &PreparationRecord| {
+            let mut value = record.projection();
+            value["kept"] = serde_json::json!(kept);
+            value
+        };
         let starting = record.state == PreparationState::Reserved
             && caller.method.operation.as_deref() == Some("use");
         let activation_retry = record.state == PreparationState::Admitted
             && caller.method.operation.as_deref() == Some("use");
         if !record.active() && !starting && !activation_retry {
-            return Ok(record.projection());
+            return Ok(project(&record));
         }
         let mut worker = self
             .worker
             .lock()
             .map_err(|_| anyhow::anyhow!("preparation owner unavailable"))?;
         if worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
-            return Ok(record.projection());
+            return Ok(project(&record));
         }
         let registry = registry.context("preparation backend unavailable")?;
         let inventory = Inventory::open(data_dir, false)?;
@@ -613,7 +719,7 @@ impl PreparationOwner {
             .context("preparation disappeared")?;
         let starting = starting && current.state == PreparationState::Reserved;
         if !starting && !current.active() && !activation_retry {
-            return Ok(current.projection());
+            return Ok(project(current));
         }
         if starting {
             current.state = PreparationState::Preparing;
@@ -662,7 +768,7 @@ impl PreparationOwner {
                 tracing::debug!(?error, "private model activation pending");
             }
         }));
-        Ok(current.projection())
+        Ok(project(&current))
     }
 }
 
@@ -1160,7 +1266,7 @@ pub async fn append_admitted_model_startup_offers(
         );
         let current = Inventory::open(data_dir, false)?.load()?;
         ensure!(
-            current == snapshot,
+            current.records == snapshot.records,
             "model admission changed during startup"
         );
         let weights = closure
@@ -1313,6 +1419,7 @@ mod tests {
         hold_drain: AtomicBool,
         fail_drain: AtomicBool,
         hold_read: AtomicBool,
+        hold_hash: AtomicBool,
         read_fault: Mutex<Option<&'static str>>,
         native: Option<Arc<dyn elastos_runtime::provider::Provider>>,
         entered: tokio::sync::Notify,
@@ -1421,6 +1528,10 @@ mod tests {
                     Ok(serde_json::json!({"status":"ok"}))
                 }
                 "runtime_hash_staged_directory" => {
+                    if self.hold_hash.swap(false, Ordering::AcqRel) {
+                        self.entered.notify_one();
+                        self.release.notified().await;
+                    }
                     let directory = &request["directory"];
                     let root = Path::new(directory["root"].as_str().unwrap());
                     assert_eq!(
@@ -1950,6 +2061,50 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn model_retention_change_during_startup_verification_preserves_offer_binding() {
+            let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            let _engine = install_engine(root.path());
+            let mut expected = config(root.path());
+            append_admitted_model_startup_offers(root.path(), &registry, &mut expected)
+                .await
+                .unwrap();
+            let records = Inventory::open(root.path(), false)
+                .unwrap()
+                .load()
+                .unwrap()
+                .records;
+            let mut actual = config(root.path());
+            backend.hold_hash.store(true, Ordering::Release);
+            let verify = append_admitted_model_startup_offers(root.path(), &registry, &mut actual);
+            let keep = async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    backend.entered.notified(),
+                )
+                .await
+                .unwrap();
+                let reply =
+                    retention_intent(root.path(), &context(), &record.package_cid, true).unwrap();
+                assert_eq!(reply["kept"], true);
+                backend.release.notify_one();
+            };
+            let (result, ()) = tokio::join!(verify, keep);
+            result.expect("independent Keep must not invalidate unchanged startup admission");
+            assert_eq!(actual.extra, expected.extra);
+            let current = Inventory::open(root.path(), false).unwrap().load().unwrap();
+            assert_eq!(current.records, records);
+            assert!(current.kept(&context().principal_id, &record.package_cid));
+            assert_eq!(
+                backend.calls.lock().unwrap().as_slice(),
+                [
+                    "runtime_hash_staged_directory",
+                    "runtime_hash_staged_directory"
+                ]
+            );
+        }
+
+        #[tokio::test]
         async fn model_startup_binding_keeps_whole_package_identity_when_weights_match() {
             let mut ids = Vec::new();
             let mut weights = Vec::new();
@@ -2161,6 +2316,7 @@ mod tests {
                 hold_drain: AtomicBool::new(false),
                 fail_drain: AtomicBool::new(false),
                 hold_read: AtomicBool::new(false),
+                hold_hash: AtomicBool::new(false),
                 read_fault: Mutex::new(None),
                 native: None,
                 entered: tokio::sync::Notify::new(),
@@ -3444,6 +3600,353 @@ mod tests {
             .is_ok());
     }
 
+    fn retention_intent(
+        root: &Path,
+        principal: &HomeLaunchTokenContext,
+        cid: &str,
+        keep: bool,
+    ) -> anyhow::Result<serde_json::Value> {
+        PreparationOwner::default().invoke(
+            root,
+            None,
+            caller(principal, &method("retention")),
+            "retention-choice",
+            &serde_json::json!({"cid":cid,"keep":keep}),
+            Arc::new(|| Ok(())),
+        )
+    }
+
+    async fn finish_retention_fixture(
+        root: &Path,
+        record: &PreparationRecord,
+        registry: Arc<elastos_runtime::provider::ProviderRegistry>,
+    ) {
+        let owner = PreparationOwner::default();
+        owner
+            .invoke(
+                root,
+                Some(registry),
+                caller(&context(), &method("status")),
+                "settle",
+                &serde_json::json!({"operation_id":record.operation_id}),
+                Arc::new(|| Ok(())),
+            )
+            .unwrap();
+        join_worker(&owner).await;
+        assert_eq!(
+            load_operation(root, &record.operation_id).unwrap().state,
+            PreparationState::Admitted
+        );
+    }
+
+    #[tokio::test]
+    async fn model_retention_desired_state_replay_restart_preserves_admission_and_bytes() {
+        use std::os::unix::fs::MetadataExt as _;
+        let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+        finish_retention_fixture(root.path(), &record, registry).await;
+        let before = Inventory::open(root.path(), false)
+            .unwrap()
+            .load()
+            .unwrap()
+            .records;
+        let artifact = Inventory::open(root.path(), false)
+            .unwrap()
+            .admitted(&record.admission_id)
+            .unwrap();
+        let inode = std::fs::metadata(&artifact.path).unwrap().ino();
+        let calls = backend.calls.lock().unwrap().clone();
+        for keep in [true, true, false, false, true] {
+            let reply =
+                retention_intent(root.path(), &context(), &record.package_cid, keep).unwrap();
+            assert_eq!(
+                reply,
+                serde_json::json!({"cid":record.package_cid,"kept":keep,
+                "admitted":true,"inference_ready":false})
+            );
+            let saved = std::fs::read(root.path().join("model-preparation/state.json")).unwrap();
+            assert_eq!(
+                retention_intent(root.path(), &context(), &record.package_cid, keep).unwrap(),
+                reply
+            );
+            assert_eq!(
+                std::fs::read(root.path().join("model-preparation/state.json")).unwrap(),
+                saved
+            );
+            let status = PreparationOwner::default()
+                .invoke(
+                    root.path(),
+                    None,
+                    caller(&context(), &method("status")),
+                    "read-after-restart",
+                    &serde_json::json!({"operation_id":record.operation_id}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            assert_eq!(status["kept"], keep);
+            assert_eq!(status["inference_ready"], false);
+            assert_eq!(
+                Inventory::open(root.path(), false)
+                    .unwrap()
+                    .load()
+                    .unwrap()
+                    .records,
+                before
+            );
+            assert_eq!(std::fs::metadata(&artifact.path).unwrap().ino(), inode);
+            for (path, bytes) in &backend.files {
+                assert_eq!(std::fs::read(artifact.path.join(path)).unwrap(), *bytes);
+            }
+        }
+        // Retention release is local management, independent of model-use permission.
+        change_config(root.path(), |config| {
+            config["model_catalog"]["local_use"] = serde_json::Value::Null
+        });
+        assert_eq!(
+            retention_intent(root.path(), &context(), &record.package_cid, false).unwrap()["kept"],
+            false
+        );
+        assert_eq!(*backend.calls.lock().unwrap(), calls);
+    }
+
+    #[tokio::test]
+    async fn model_retention_aliases_share_only_the_current_principal_claim() {
+        let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+        finish_retention_fixture(root.path(), &record, registry.clone()).await;
+        let first = context();
+        let mut second = context();
+        second.principal_id = "person:second-retention".into();
+        assert!(retention_intent(root.path(), &second, &record.package_cid, true).is_err());
+        assert!(retention_intent(root.path(), &second, &record.package_cid, false).is_err());
+        retention_intent(root.path(), &first, &record.package_cid, true).unwrap();
+        let mut aliases = Vec::new();
+        for (principal, request) in [
+            (&first, "same-principal-alias"),
+            (&second, "second-principal-alias"),
+        ] {
+            let owner = PreparationOwner::default();
+            let reply = owner
+                .invoke(
+                    root.path(),
+                    Some(registry.clone()),
+                    caller(principal, &method("use")),
+                    request,
+                    &serde_json::json!({"cid":record.package_cid}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            join_worker(&owner).await;
+            assert_eq!(reply["kept"], principal.principal_id == first.principal_id);
+            aliases.push(reply["operation_id"].as_str().unwrap().to_owned());
+        }
+        let before = Inventory::open(root.path(), false)
+            .unwrap()
+            .load()
+            .unwrap()
+            .records;
+        let calls = backend.calls.lock().unwrap().clone();
+        for principal in [&first, &second] {
+            assert_eq!(
+                retention_intent(root.path(), principal, &record.package_cid, true).unwrap()
+                    ["kept"],
+                true
+            );
+        }
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("model-preparation/state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["retention_claims"].as_array().unwrap().len(), 2);
+        for (principal, id) in [
+            (&first, &record.operation_id),
+            (&first, &aliases[0]),
+            (&second, &aliases[1]),
+        ] {
+            let reply = PreparationOwner::default()
+                .invoke(
+                    root.path(),
+                    None,
+                    caller(principal, &method("status")),
+                    "alias-status",
+                    &serde_json::json!({"operation_id":id}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            assert_eq!(reply["kept"], true);
+        }
+        retention_intent(root.path(), &first, &record.package_cid, false).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("model-preparation/state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            saved["retention_claims"],
+            serde_json::json!([{"principal":second.principal_id,"cid":record.package_cid}])
+        );
+        assert_eq!(
+            Inventory::open(root.path(), false)
+                .unwrap()
+                .load()
+                .unwrap()
+                .records,
+            before
+        );
+        assert_eq!(*backend.calls.lock().unwrap(), calls);
+    }
+
+    #[tokio::test]
+    async fn model_retention_invalid_input_and_authority_preserve_inventory() {
+        let (root, record, _, registry) = staged_fixture(now().unwrap(), true).await;
+        assert!(
+            retention_intent(root.path(), &context(), &record.package_cid, true).is_err(),
+            "pending admission cannot be kept"
+        );
+        finish_retention_fixture(root.path(), &record, registry).await;
+        retention_intent(root.path(), &context(), &record.package_cid, true).unwrap();
+        let path = root.path().join("model-preparation/state.json");
+        let saved = std::fs::read(&path).unwrap();
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"cid":record.package_cid}),
+            serde_json::json!({"cid":record.package_cid,"keep":"false"}),
+            serde_json::json!({"cid":record.package_cid,"keep":false,"principal_id":"person:other"}),
+            serde_json::json!({"cid":"x".repeat(129),"keep":false}),
+            serde_json::json!({"cid":record.package_cid.to_uppercase(),"keep":false}),
+        ] {
+            assert!(PreparationOwner::default()
+                .invoke(
+                    root.path(),
+                    None,
+                    caller(&context(), &method("retention")),
+                    "bad",
+                    &input,
+                    Arc::new(|| Ok(()))
+                )
+                .is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+        }
+        let input = serde_json::json!({"cid":record.package_cid,"keep":false});
+        for mismatch in ["risk", "approval", "resource", "id", "operation"] {
+            let mut denied = method("retention");
+            match mismatch {
+                "risk" => denied.risk = AffordanceRisk::Read,
+                "approval" => denied.approval = AffordanceApprovalMode::User,
+                "resource" => denied.resource = Some("elastos://model/*".into()),
+                "id" => denied.id = "content.use".into(),
+                _ => denied.operation = Some("keep".into()),
+            }
+            assert!(PreparationOwner::default()
+                .invoke(
+                    root.path(),
+                    None,
+                    caller(&context(), &denied),
+                    "bad-policy",
+                    &input,
+                    Arc::new(|| Ok(()))
+                )
+                .is_err());
+        }
+        let mut invalid = context();
+        invalid.principal_id.clear();
+        assert!(retention_intent(root.path(), &invalid, &record.package_cid, false).is_err());
+        assert!(PreparationOwner::default()
+            .invoke(
+                root.path(),
+                None,
+                caller(&context(), &method("retention")),
+                "revoked",
+                &input,
+                Arc::new(|| anyhow::bail!("launch revoked"))
+            )
+            .is_err());
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = checks.clone();
+        assert!(PreparationOwner::default()
+            .invoke(
+                root.path(),
+                None,
+                caller(&context(), &method("retention")),
+                "revoked-before-save",
+                &input,
+                Arc::new(move || {
+                    anyhow::ensure!(
+                        checks.fetch_add(1, Ordering::SeqCst) == 0,
+                        "launch revoked before save"
+                    );
+                    Ok(())
+                })
+            )
+            .is_err());
+        assert_eq!(observed.load(Ordering::SeqCst), 2);
+        assert_eq!(std::fs::read(path).unwrap(), saved);
+    }
+
+    #[tokio::test]
+    async fn model_retention_stored_claims_fail_closed_without_matching_admission() {
+        let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+        finish_retention_fixture(root.path(), &record, registry).await;
+        retention_intent(root.path(), &context(), &record.package_cid, true).unwrap();
+        let path = root.path().join("model-preparation/state.json");
+        let valid: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let claim = valid["retention_claims"][0].clone();
+        let foreign_cid = cid::Cid::new_v1(
+            0x70,
+            cid::multihash::Multihash::<64>::wrap(0x12, &[7; 32]).unwrap(),
+        )
+        .to_string();
+        let corruptions = vec![
+            serde_json::json!([claim, claim]),
+            serde_json::json!(vec![claim.clone(); MAX_RECORDS + 1]),
+            serde_json::json!([{"principal":"person:foreign","cid":record.package_cid}]),
+            serde_json::json!([{"principal":context().principal_id,"cid":foreign_cid}]),
+            serde_json::json!([{"principal":context().principal_id,"cid":record.package_cid,"keep":true}]),
+            serde_json::Value::Null,
+        ];
+        let calls = backend.calls.lock().unwrap().clone();
+        for claims in corruptions {
+            let mut changed = valid.clone();
+            changed["retention_claims"] = claims;
+            assert!(
+                serde_json::from_value::<PreparationInventory>(changed.clone())
+                    .map(|state| state.validate().is_err())
+                    .unwrap_or(true)
+            );
+            let bytes = serde_json::to_vec(&changed).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(retention_intent(root.path(), &context(), &record.package_cid, false).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        let mut missing = valid;
+        missing.as_object_mut().unwrap().remove("retention_claims");
+        assert!(
+            serde_json::from_value::<PreparationInventory>(missing).is_err(),
+            "old shape needs no compatibility decoder"
+        );
+        assert_eq!(*backend.calls.lock().unwrap(), calls);
+    }
+
+    #[test]
+    fn model_retention_first_party_manifests_declare_local_management() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        for name in ["marketplace", "system", "assistant", "home-agent"] {
+            let value: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(root.join("capsules").join(name).join("capsule.json")).unwrap(),
+            )
+            .unwrap();
+            let methods: Vec<_> = value["interfaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|interface| interface["methods"].as_array().unwrap())
+                .filter(|method| method["id"] == "content.retention")
+                .collect();
+            assert_eq!(methods.len(), 1, "{name} must declare one retention intent");
+            let descriptor: CapsuleAffordanceDescriptor =
+                serde_json::from_value(methods[0].clone()).unwrap();
+            authorize(&caller(&context(), &descriptor), "retention").unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn model_preparation_exact_cid_reuse_preserves_actor_request_isolation() {
         let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
@@ -4030,6 +4533,7 @@ mod tests {
         let rewritten = PreparationInventory {
             schema: SCHEMA.into(),
             records: vec![rewritten],
+            retention_claims: Vec::new(),
         };
         rewritten.validate().unwrap();
         std::fs::write(&path, serde_json::to_vec(&rewritten).unwrap()).unwrap();
