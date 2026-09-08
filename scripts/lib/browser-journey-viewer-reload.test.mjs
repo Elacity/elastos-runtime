@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import test from "node:test";
+import vm from "node:vm";
 import { diagnoseBrowserViewerReload } from "./browser-journey-viewer-reload.mjs";
 
 const hash = value => `sha256:${createHash("sha256").update(value).digest("hex").slice(0, 16)}`;
@@ -326,4 +328,64 @@ test("pending media evidence distinguishes retained viewer, absent media and mis
     if (noMedia) assert.equal(sample.video_ready_state, undefined);
     else { assert.equal(sample.video_ready_state, 4); assert.ok(sample.video_decoded_frames > 0); }
   }
+});
+
+test("published retained page before status updates the address fails with the exact viewer predicate", async () => {
+  // Use the real startup continuation. The viewer publishes its retained page
+  // before the pending status read updates the initial document address.
+  const source = readFileSync(new URL("../../capsules/browser/browser/browser.js", import.meta.url), "utf8");
+  const start = source.indexOf("async function restoreRuntimePageViewer(");
+  const end = source.indexOf("\n}\n", start);
+  assert.ok(start >= 0 && end > start);
+  const viewer = { ...original.viewer, page_id: "", actual_url: "https://ela.city/home" };
+  let release;
+  const status = new Promise(resolve => { release = resolve; });
+  const context = vm.createContext({
+    unloadCleanupStarted: false, homeWindowCloseInFlight: false, homeWindowTerminalCloseConfirmed: false,
+    currentPage: null, nextPageGeneration: 1, currentPageGeneration: 0,
+    runtimeOwnershipTerminallyAbsent: false, restoredViewerOwner: null,
+    selectedBrowserEngineId: "", currentBrowserEngineId: "", selectedRemoteExitId: "", currentRemoteExitId: "",
+    recoverableRuntimePage: () => ({ schema: "elastos.browser.engine.page/v1", recovery_state: "active",
+      page_id: original.viewer.page_id }),
+    runtimePageOwner: page => ({ page_id: page.page_id }),
+    publishRuntimePageForHost: page => { viewer.page_id = page.page_id; },
+    syncEngineSelect() {}, syncExitSelect() {}, showStatus() {}, startPageHeartbeat() {},
+    async fetchPageStatus() { await status; viewer.actual_url = fixtureUrl; },
+    // End the test continuation after status settles; this test owns no display.
+    runtimeViewerOwnerActive: () => false,
+  });
+  vm.runInContext(source.slice(start, end + 2), context);
+  const sessions = structuredClone(original.sessions);
+  sessions.recoverable_page.service_selection = { schema: "elastos.browser.service-selection/v1",
+    engine_id: original.viewer.engine_id, exit_id: original.viewer.exit_id };
+  const restore = context.restoreRuntimePageViewer({ sessions });
+  try {
+    assert.equal(viewer.page_id, original.viewer.page_id);
+    assert.notEqual(viewer.actual_url, fixtureUrl);
+    const { evidence, calls } = await fails({ changeViewer: value => {
+      value.page_id = viewer.page_id; value.actual_url = viewer.actual_url;
+    } }, "binding_unavailable_or_cleanup");
+    assert.equal(evidence.binding_failure.source, "viewer");
+    assert.equal(evidence.binding_failure.phase, "reload");
+    assert.deepEqual(evidence.binding_failure.failed_checks, ["page_status_url_matches"]);
+    assert.equal(evidence.binding_failure.owner_state, "active");
+    assert.equal(evidence.binding_failure.counts.engine_cleanup_obligations, 0);
+    assert.equal(evidence.samples.length, 1, "only the completed baseline is a passing sample");
+    assert.equal(calls.filter(call => call.method === "state" && call.reloaded).length, 1, "failed owner check is not retried");
+    assert.equal(calls.some(call => call.method === "input"), false);
+  } finally { release(); await restore; }
+});
+
+test("failed Runtime predicate is retained before any pending viewer check", async () => {
+  const { evidence } = await fails({ pendingReads: 3, changeRuntime(raw) {
+    raw.sessions.recoverable_page.state = "cleanup_pending";
+    raw.sessions.engine_cleanup_obligations = 1;
+    raw.page_status = null;
+  } }, "binding_unavailable_or_cleanup");
+  assert.equal(evidence.binding_failure.source, "runtime");
+  assert.equal(evidence.binding_failure.owner_state, "cleanup_pending");
+  assert.equal(evidence.binding_failure.counts.engine_cleanup_obligations, 1);
+  for (const check of ["owner_active", "no_engine_cleanup", "page_status_schema", "page_status_page_matches"])
+    assert.ok(evidence.binding_failure.failed_checks.includes(check));
+  assert.ok(evidence.binding_failure.at_ms >= evidence.reload_started_ms);
 });

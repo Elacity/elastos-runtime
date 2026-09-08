@@ -220,6 +220,35 @@ test("fresh page status accepts a navigated page with a stale launch snapshot", 
   assert.equal((await fixture().run()).ok, true);
 });
 
+test("failed binding diagnostics survive transport restoration without retaining private values", async () => {
+  const { evidence } = await fails({ changeBinding(value) {
+    value.actual_url = secret;
+    value.sessions.recoverable_page.state = "cleanup_pending";
+    value.sessions.engine_cleanup_obligations = 1;
+  } }, "binding_unavailable_or_cleanup");
+  assert.equal(evidence.binding_failure.phase, "recovery");
+  assert.equal(evidence.binding_failure.owner_state, "cleanup_pending");
+  assert.deepEqual(evidence.binding_failure.failed_checks, ["owner_active", "page_status_url_matches", "no_engine_cleanup"]);
+  assert.equal(evidence.binding_failure.counts.engine_cleanup_obligations, 1);
+  assert.equal(evidence.restore.ok, true);
+  assert.equal(evidence.detach.ok, true);
+});
+
+test("malformed baseline binding reports named checks and still restores and detaches", async () => {
+  const f = fixture();
+  f.args.readBinding = async () => ({ sessions: { schema: secret, lifecycle: { sessions: secret } } });
+  await assert.rejects(f.run(), error => {
+    assert.equal(error.evidence.failure, "binding_unavailable_or_cleanup");
+    assert.equal(error.evidence.binding_failure.phase, "baseline");
+    assert.ok(error.evidence.binding_failure.failed_checks.includes("sessions_schema"));
+    assert.ok(error.evidence.binding_failure.failed_checks.includes("lifecycle_unique"));
+    assert.ok(!JSON.stringify(error.evidence).includes(secret));
+    assert.ok(JSON.stringify(error.evidence.binding_failure).length < 2000);
+    return true;
+  });
+  assertRestoredAndDetached(f);
+});
+
 for (const option of ["noRequestFailure", "probeHttpError", "foreignFailure"]) {
   test(`${option} cannot substitute for an actual viewer network request failure`, () =>
     fails({ [option]: true }, "viewer_request_failure_unproven"));

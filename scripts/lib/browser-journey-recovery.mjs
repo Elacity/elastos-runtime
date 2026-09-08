@@ -23,23 +23,53 @@ function requireEvidence(ok, code) {
 function binding(value) {
   const sessions = value?.sessions;
   const owner = sessions?.recoverable_page;
-  const lifecycle = sessions?.lifecycle?.sessions?.filter(row => row.page_id === hash(value.page_id || ""));
-  requireEvidence(sessions?.schema === "elastos.browser.session-capacity/v1" &&
-    owner?.state === "active" && text(owner.page_id) && owner.page_id === value.page_id &&
-    owner.cleanup?.schema === "elastos.browser.cleanup-handle/v1" && text(owner.cleanup.id) &&
-    lifecycle?.length === 1 && text(lifecycle[0].profile_key_hash) && text(lifecycle[0].exit_id) &&
-    ["ACTIVE_SESSION", "NAVIGATING"].includes(lifecycle[0].phase) &&
-    owner.engine_page?.page_id === owner.page_id && text(owner.engine_page.adapter) &&
-    text(owner.engine_page.engine) && typeof value.engine_id === "string" &&
-    typeof value.exit_id === "string" && value.engine_id.length <= 512 && value.exit_id.length <= 512 &&
-    text(value.browser_instance) && text(value.actual_url) &&
-    value.page_status?.schema === "elastos.browser.page-status/v1" &&
-    value.page_status.page_id === owner.page_id && value.page_status.actual_url === value.actual_url &&
-    [sessions.active_sessions, sessions.total_sessions, sessions.principal_sessions].every(count) &&
-    sessions.active_sessions > 0 && sessions.principal_sessions > 0 &&
-    sessions.total_sessions === sessions.active_sessions && sessions.principal_sessions <= sessions.total_sessions &&
-    sessions.launching_sessions === 0 && sessions.engine_cleanup_obligations === 0 &&
-    sessions.launch_reconciliation_obligations === 0, "binding_unavailable_or_cleanup");
+  const rows = sessions?.lifecycle?.sessions;
+  const pageHash = text(value?.page_id) ? hash(value.page_id) : null;
+  const lifecycle = Array.isArray(rows) ? rows.filter(row => pageHash && row?.page_id === pageHash) : [];
+  // These named predicates are both the acceptance check and its failure evidence.
+  // Retain fixed names, allowlisted states and counts only, never response values.
+  const checks = {
+    sessions_schema: sessions?.schema === "elastos.browser.session-capacity/v1",
+    owner_active: owner?.state === "active",
+    owner_page_valid: text(owner?.page_id),
+    viewer_page_matches: text(owner?.page_id) && owner.page_id === value?.page_id,
+    cleanup_schema: owner?.cleanup?.schema === "elastos.browser.cleanup-handle/v1",
+    cleanup_id_valid: text(owner?.cleanup?.id),
+    lifecycle_unique: lifecycle.length === 1,
+    lifecycle_profile_valid: text(lifecycle[0]?.profile_key_hash),
+    lifecycle_exit_valid: text(lifecycle[0]?.exit_id),
+    lifecycle_phase_active: ["ACTIVE_SESSION", "NAVIGATING"].includes(lifecycle[0]?.phase),
+    engine_page_matches: text(owner?.page_id) && owner?.engine_page?.page_id === owner.page_id,
+    engine_adapter_valid: text(owner?.engine_page?.adapter),
+    engine_kind_valid: text(owner?.engine_page?.engine),
+    engine_selection_valid: typeof value?.engine_id === "string" && value.engine_id.length <= 512,
+    exit_selection_valid: typeof value?.exit_id === "string" && value.exit_id.length <= 512,
+    browser_instance_valid: text(value?.browser_instance),
+    viewer_url_valid: text(value?.actual_url),
+    page_status_schema: value?.page_status?.schema === "elastos.browser.page-status/v1",
+    page_status_page_matches: text(owner?.page_id) && value?.page_status?.page_id === owner.page_id,
+    page_status_url_matches: text(value?.actual_url) && value?.page_status?.actual_url === value.actual_url,
+    session_counts_valid: [sessions?.active_sessions, sessions?.total_sessions, sessions?.principal_sessions].every(count),
+    active_sessions_positive: count(sessions?.active_sessions) && sessions.active_sessions > 0,
+    principal_sessions_positive: count(sessions?.principal_sessions) && sessions.principal_sessions > 0,
+    total_matches_active: count(sessions?.total_sessions) && sessions.total_sessions === sessions.active_sessions,
+    principal_within_total: count(sessions?.principal_sessions) && count(sessions?.total_sessions) &&
+      sessions.principal_sessions <= sessions.total_sessions,
+    no_launching_sessions: sessions?.launching_sessions === 0,
+    no_engine_cleanup: sessions?.engine_cleanup_obligations === 0,
+    no_launch_reconciliation: sessions?.launch_reconciliation_obligations === 0,
+  };
+  const failed = Object.keys(checks).filter(key => !checks[key]);
+  if (failed.length) {
+    throw Object.assign(new RecoveryFailure("binding_unavailable_or_cleanup"), { binding_diagnostic: {
+      failed_checks: failed,
+      owner_state: ["active", "cleanup_pending"].includes(owner?.state) ? owner.state : "absent_or_unknown",
+      lifecycle_matches: lifecycle.length,
+      counts: Object.fromEntries(["active_sessions", "total_sessions", "principal_sessions", "launching_sessions",
+        "engine_cleanup_obligations", "launch_reconciliation_obligations"].filter(key => count(sessions?.[key]))
+        .map(key => [key, sessions[key]])),
+    } });
+  }
   // Keep handles private. Equality uses the exact strings; evidence uses hashes.
   return [owner.page_id, owner.cleanup.schema, owner.cleanup.id, lifecycle[0].profile_key_hash,
     lifecycle[0].exit_id, owner.engine_page.adapter, owner.engine_page.engine, value.engine_id, value.exit_id,
@@ -96,6 +126,14 @@ export async function diagnoseBrowserJourneyRecovery({
   const pending = new Set();
   const elapsed = () => Math.round(clock.now() - started);
   const pause = ms => new Promise(resolve => clock.setTimeout(resolve, ms));
+  function checkedBinding(raw) {
+    try { return binding(raw); }
+    catch (error) {
+      if (error instanceof RecoveryFailure && error.binding_diagnostic)
+        evidence.binding_failure = { at_ms: elapsed(), phase, ...error.binding_diagnostic };
+      throw error;
+    }
+  }
   async function within(deadlineMs, code, action) {
     const timeoutMs = deadlineMs - clock.now();
     requireEvidence(timeoutMs > 0, code);
@@ -146,7 +184,7 @@ export async function diagnoseBrowserJourneyRecovery({
         "launch_reconciliation_obligations"].filter(key => count(raw?.sessions?.[key]))
         .map(key => [key, raw.sessions[key]])),
     };
-    const value = binding(raw);
+    const value = checkedBinding(raw);
     evidence.changed_binding_fields = BINDING_FIELDS.filter((_, i) => value[i] !== original[i]);
     requireEvidence(evidence.changed_binding_fields.length === 0, "binding_changed");
     const media = video(await within(deadline, "video_deadline", readVideo), bytesRequired);
@@ -169,7 +207,7 @@ export async function diagnoseBrowserJourneyRecovery({
       const deadline = clock.now() + WINDOW_MS;
       stop = await within(deadline, "observer_deadline", budget => observeRequests(record, budget));
       requireEvidence(typeof stop === "function", "observer_missing");
-      original = binding(await within(deadline, "binding_deadline", readBinding));
+      original = checkedBinding(await within(deadline, "binding_deadline", readBinding));
       evidence.binding_hashes = Object.fromEntries(BINDING_FIELDS.map((key, i) => [key, hash(String(original[i]))]));
       initialReceipt = validReceipt(await within(deadline, "receipt_deadline", readReceipt));
       input = initialReceipt.events.findLast(event => event.type === "input");

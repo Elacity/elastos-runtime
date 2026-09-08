@@ -8,10 +8,6 @@ const count = value => Number.isSafeInteger(value) && value >= 0;
 const documentId = value => Number.isFinite(value) && value > 0;
 class ReloadFailure extends Error {}
 function requireEvidence(ok, code) { if (!ok) throw new ReloadFailure(code); }
-function binding(raw) {
-  try { return browserJourneyBinding(raw); }
-  catch { throw new ReloadFailure("binding_unavailable_or_cleanup"); }
-}
 function video(raw, bytesRequired) {
   try { return browserJourneyVideo(raw, bytesRequired); }
   catch { throw new ReloadFailure("video_metrics_unavailable"); }
@@ -47,6 +43,14 @@ export async function diagnoseBrowserViewerReload({ expectedUrl, readReceipt, re
   let newDocument, newVideo, bytesRequired, initialReceipt, input, receiptSequence;
   const interruptions = new Set();
   const elapsed = () => Math.round(clock.now() - started);
+  function binding(raw, source) {
+    try { return browserJourneyBinding(raw); }
+    catch (error) {
+      if (error.binding_diagnostic)
+        evidence.binding_failure = { at_ms: elapsed(), phase, source, ...error.binding_diagnostic };
+      throw new ReloadFailure("binding_unavailable_or_cleanup");
+    }
+  }
   async function within(deadlineMs, code, action, finishing = false) {
     if (!finishing) requireEvidence(!forbidden, "page_open_or_close_observed");
     const timeoutMs = deadlineMs - clock.now();
@@ -102,7 +106,7 @@ export async function diagnoseBrowserViewerReload({ expectedUrl, readReceipt, re
     const raw = await within(deadline, "state_deadline", readState);
     // The launch snapshot URL can be stale; the fresh status URL must stay exact.
     matches(binding({ ...initialViewer, sessions: raw?.sessions, page_status: raw?.page_status,
-      page_id: raw?.sessions?.recoverable_page?.page_id, actual_url: raw?.page_status?.actual_url }));
+      page_id: raw?.sessions?.recoverable_page?.page_id, actual_url: raw?.page_status?.actual_url }, "runtime"));
     const viewer = raw?.viewer;
     let media = null;
     if (viewer) {
@@ -113,7 +117,7 @@ export async function diagnoseBrowserViewerReload({ expectedUrl, readReceipt, re
         requireEvidence(newDocument === viewer.document_id, "viewer_document_changed_again");
       } else requireEvidence(newDocument === undefined, "viewer_document_reverted");
       if (viewer.page_id) {
-        matches(binding({ ...viewer, sessions: raw.sessions, page_status: raw.page_status }));
+        matches(binding({ ...viewer, sessions: raw.sessions, page_status: raw.page_status }, "viewer"));
         if (raw.video && (phase === "baseline" || viewer.document_id === newDocument)) {
           media = video(raw.video, phase === "baseline" && bytesRequired);
           // A new peer can expose its video element before its first getStats result.
@@ -153,7 +157,7 @@ export async function diagnoseBrowserViewerReload({ expectedUrl, readReceipt, re
     const raw = await within(baselineDeadline, "state_deadline", readState);
     initialViewer = raw?.viewer;
     requireEvidence(initialViewer && documentId(initialViewer.document_id), "baseline_viewer_missing");
-    original = binding({ ...initialViewer, sessions: raw.sessions, page_status: raw.page_status });
+    original = binding({ ...initialViewer, sessions: raw.sessions, page_status: raw.page_status }, "baseline");
     evidence.binding_hashes = original.map(hash);
     evidence.initial_document_hash = hash(initialViewer.document_id);
     requireEvidence(text(expectedUrl) && initialViewer.actual_url === expectedUrl, "fixture_url_mismatch");
