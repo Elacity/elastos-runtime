@@ -42,6 +42,7 @@ const EGRESS_COPY_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_CONTROL_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONTROL_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONTROL_HTTP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_GUEST_CONTROL_ERROR_CHARS: usize = 512;
 const MAX_SETTLEMENT_MESSAGE_CHARS: usize = 2 * 1024;
 const DEFAULT_CONTROL_PROXY_REQUEST_TIMEOUT_MS: u32 = 120_000;
 const BROWSER_VM_TARGET_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
@@ -2668,9 +2669,10 @@ fn sdp_has_media_kind(sdp: &str, kind: &str) -> bool {
 }
 
 fn is_retryable_guest_control_open_error(error: &str) -> bool {
-    error.contains("Browser VM guest control HTTP 503")
-        || error.contains("Connection reset")
-        || error.contains("Broken pipe")
+    // Only raw connection failures can mean the control service is still starting.
+    // A completed HTTP response is a page-open outcome, including HTTP 503.
+    let error = error.to_ascii_lowercase();
+    error.starts_with("connection reset") || error.starts_with("broken pipe")
 }
 
 fn is_guest_control_response_timeout(error: &str) -> bool {
@@ -2996,13 +2998,7 @@ fn parse_http_json_response(response: &[u8]) -> Result<Value, String> {
     let split = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| {
-            format!(
-                "Browser VM guest control returned an invalid HTTP response: len={} preview={}",
-                response.len(),
-                response_preview(response)
-            )
-        })?;
+        .ok_or_else(|| "Browser VM guest control returned an invalid HTTP response".to_string())?;
     let (head, body) = response.split_at(split + 4);
     let head_text =
         std::str::from_utf8(head).map_err(|_| "Browser VM guest HTTP head is not UTF-8")?;
@@ -3012,39 +3008,60 @@ fn parse_http_json_response(response: &[u8]) -> Result<Value, String> {
         .nth(1)
         .and_then(|value| value.parse::<u16>().ok())
         .ok_or_else(|| "Browser VM guest HTTP status is invalid".to_string())?;
-    let parsed: Value = serde_json::from_slice(body)
-        .map_err(|err| format!("Browser VM guest control response is not JSON: {err}"))?;
+    let parsed = serde_json::from_slice::<Value>(body);
     if !(200..300).contains(&status) {
         let error = parsed
-            .get("error")
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("error"))
             .and_then(Value::as_str)
-            .unwrap_or("Browser VM guest control returned an error")
-            .to_string();
-        let mut message = format!("Browser VM guest control HTTP {status}: {error}");
-        if let Some(logs) = parsed.get("logs") {
-            let logs_text = serde_json::to_string(logs)
-                .unwrap_or_else(|_| "<failed to encode guest logs>".to_string());
-            let mut bounded = logs_text.chars().take(20_000).collect::<String>();
-            if logs_text.len() > bounded.len() {
-                bounded.push_str("...");
-            }
-            message.push_str(" logs=");
-            message.push_str(&bounded);
-        }
-        return Err(message);
+            .unwrap_or("Browser VM guest control returned an error");
+        // Guest log tails and call logs stay behind the private control /logs endpoint.
+        return Err(format!(
+            "Browser VM guest control HTTP {status}: {}",
+            brief_guest_control_error(error)
+        ));
     }
-    Ok(parsed)
+    parsed.map_err(|err| format!("Browser VM guest control response is not JSON: {err}"))
 }
 
-fn response_preview(response: &[u8]) -> String {
-    let mut preview = String::new();
-    for byte in response.iter().take(160) {
-        let _ = write!(preview, "{byte:02x}");
+fn brief_guest_control_error(error: &str) -> String {
+    let first_line: String = error
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(MAX_GUEST_CONTROL_ERROR_CHARS)
+        .filter(|character| !character.is_control())
+        .collect();
+    let brief = first_line
+        .split_whitespace()
+        .map(|word| {
+            if word.contains("://") || word.starts_with("turn:") || word.starts_with("turns:") {
+                "[redacted URL]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lower = brief.to_ascii_lowercase();
+    if brief.is_empty()
+        || [
+            "credential",
+            "secret",
+            "password",
+            "authorization",
+            "bearer ",
+            "home_token",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return "Browser VM guest control returned an error (details in private guest logs)"
+            .to_string();
     }
-    if response.len() > 160 {
-        preview.push_str("...");
-    }
-    preview
+    brief.chars().take(MAX_GUEST_CONTROL_ERROR_CHARS).collect()
 }
 
 fn spawn_control_proxy(
@@ -4553,6 +4570,119 @@ mod tests {
         let (guest_to_runtime, runtime_to_guest) = bridge.join().unwrap().unwrap();
         assert_eq!(guest_to_runtime, 0);
         assert_eq!(runtime_to_guest, 4);
+    }
+
+    #[test]
+    fn guest_control_completed_http_errors_are_terminal_and_keep_brief_cause() {
+        for status in [503, 400, 403, 500] {
+            for cause in [
+                "Chromium did not accept the Runtime online-state projection",
+                "page.goto: net::ERR_NAME_NOT_RESOLVED",
+                "Connection reset while opening the page",
+                "Broken pipe while opening the page",
+            ] {
+                let body = json!({
+                    "schema": "elastos.browser.selkies-control.error/v1",
+                    "error": cause,
+                    "logs": {
+                        "browser-vm-control.log": { "tail": "Connection reset; Broken pipe" },
+                        "browser-vm-chromium.log": { "tail": "DevTools listening on ws://127.0.0.1:9222/private-control-id" },
+                        "turn": { "credential": "private-turn-credential", "auth_secret": "private-turn-secret" },
+                    },
+                });
+                let response = format!("HTTP/1.1 {status} Error\r\n\r\n{body}");
+                let error = parse_http_json_response(response.as_bytes()).unwrap_err();
+
+                assert!(!is_retryable_guest_control_open_error(&error), "{error}");
+                assert_eq!(
+                    error,
+                    format!("Browser VM guest control HTTP {status}: {cause}")
+                );
+                assert!(!error.contains("logs="));
+                assert!(!error.contains("private-"));
+                assert!(!error.contains("ws://"));
+            }
+        }
+    }
+
+    #[test]
+    fn guest_control_non_json_http_error_keeps_status_and_discards_private_body() {
+        assert_eq!(
+            parse_http_json_response(b"credential=private-value").unwrap_err(),
+            "Browser VM guest control returned an invalid HTTP response"
+        );
+        for body in ["Broken pipe; credential=private-value", "{\"error\":", ""] {
+            let response = format!("HTTP/1.1 503 Service Unavailable\r\n\r\n{body}");
+            let error = parse_http_json_response(response.as_bytes()).unwrap_err();
+
+            assert!(
+                error.starts_with("Browser VM guest control HTTP 503:"),
+                "{error}"
+            );
+            assert!(!is_retryable_guest_control_open_error(&error));
+            assert!(!error.contains("private-value"));
+        }
+    }
+
+    #[test]
+    fn guest_control_brief_error_omits_urls_secrets_and_call_logs() {
+        for cause in [
+            "page.goto: net::ERR_NAME_NOT_RESOLVED at http://user:private-password@localhost/main?home_token=private-token\nCall log:\ncredential=private-credential",
+            "page.goto: net::ERR_NAME_NOT_RESOLVED\r\nDevTools listening on ws://127.0.0.1:9222/private-control-id",
+        ] {
+            let response = format!("HTTP/1.1 503 Error\r\n\r\n{}", json!({ "error": cause }));
+            let error = parse_http_json_response(response.as_bytes()).unwrap_err();
+
+            assert!(error.contains("net::ERR_NAME_NOT_RESOLVED"), "{error}");
+            assert!(!error.contains("private-"));
+            assert!(!error.contains("://"));
+            assert!(!error.contains('\n'));
+            assert!(!is_retryable_guest_control_open_error(&error));
+        }
+        for cause in [
+            "TURN credential=private-value",
+            "auth_secret=private-value",
+            "transport_secret=private-value",
+        ] {
+            let response = format!("HTTP/1.1 503 Error\r\n\r\n{}", json!({ "error": cause }));
+            let error = parse_http_json_response(response.as_bytes()).unwrap_err();
+            assert!(!error.contains("private-value"));
+            assert!(error.contains("private guest logs"));
+        }
+        let response = format!(
+            "HTTP/1.1 503 Error\r\n\r\n{}",
+            json!({ "error": "é".repeat(4096) })
+        );
+        let error = parse_http_json_response(response.as_bytes()).unwrap_err();
+        assert!(error.chars().count() <= 550);
+    }
+
+    #[test]
+    fn guest_control_retry_is_limited_to_connection_startup_errors() {
+        for error in [
+            std::io::Error::from(ErrorKind::ConnectionReset).to_string(),
+            std::io::Error::from(ErrorKind::BrokenPipe).to_string(),
+            std::io::Error::from_raw_os_error(libc::ECONNRESET).to_string(),
+            std::io::Error::from_raw_os_error(libc::EPIPE).to_string(),
+        ] {
+            assert!(is_retryable_guest_control_open_error(&error), "{error}");
+        }
+        for error in [
+            "Browser VM guest control HTTP 503: Connection reset; Broken pipe",
+            "Browser VM guest control HTTP 500: failure logs=Broken pipe",
+            "Browser VM guest control returned an invalid HTTP response",
+            "Browser VM guest control response is not JSON: Broken pipe",
+            "Browser VM control HTTP response timed out",
+        ] {
+            assert!(!is_retryable_guest_control_open_error(error), "{error}");
+        }
+    }
+
+    #[test]
+    fn guest_control_private_log_response_remains_available() {
+        let logs = json!({ "schema": "elastos.browser.selkies-control.logs/v1", "logs": { "control": "private-log-fixture" } });
+        let response = format!("HTTP/1.1 200 OK\r\n\r\n{logs}");
+        assert_eq!(parse_http_json_response(response.as_bytes()).unwrap(), logs);
     }
 
     #[test]
