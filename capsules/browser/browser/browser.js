@@ -1540,6 +1540,10 @@ remoteDisplay = createBrowserRemoteDisplay({
   getCurrentDisplayMode: () => currentDisplayMode,
   getLastPageStatus: () => lastPageStatus,
   supportsDisplayGeneration: () => browserSummary?.engine_adapter?.display_attach_supported === true,
+  captureViewerOwnerGuard: () => {
+    const owner = currentRuntimePageOwner();
+    return () => runtimeViewerOwnerActive(owner);
+  },
   handleRemoteInputChannelMessage,
   handleRemoteInputChannelTeardown: teardownRemoteClipboard,
   onRecoveryRequired: settleRemoteDisplayFailure,
