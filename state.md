@@ -216,9 +216,18 @@ not contribute formal latency distributions. Fresh attachment source now has
 independent acceptance for Engine `88717e13`, VM proxy `f0d4a8bb`, and viewer
 ownership guards. Source tests preserve typed errors, exact owner state and
 close priority across delayed responses. The guest image build passes with the
-reviewed control overlay on the verified `56ce99e4` input archive. Runtime and
-peer signaling review, artifact installation and the same reload journey remain
-pending; these source results do not establish installed reload recovery.
+reviewed control overlay on the verified `56ce99e4` input archive. Independent review accepts Runtime and
+peer signaling before installation and run 30. Full recovery qualification
+remains open.
+Installed run 30 now receives decoded video in the new document at the first
+observed 2494 ms, retains all 15 binding samples, and receives exact reload text.
+The ordinary journey and 13-effect cleanup pass, with terminal close in 564 ms
+and zero Runtime obligations. The aggregate reload probe still fails its
+five-second deadline: after input, decoded frames advance from 57 to 76 while
+the cached byte counter remains 13208 until its next one-second refresh. Fresh
+on-demand viewer diagnostics are the next measurement repair; the original
+recovery thresholds remain unchanged. Runtime, adapter, image and native helper
+artifacts remain reusable for this UI/diagnostic slice.
 Guest Node also starts about five seconds after its shell launch;
 initial entropy is 1 and no hardware RNG is selected. That secondary cause needs
 its own experiment. Run 16 includes diagnostic overhead and is excluded from

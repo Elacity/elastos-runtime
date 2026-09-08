@@ -131,12 +131,21 @@ Independent source repair and regression work can proceed in separate file scope
   viewer owner guards at their reviewed source hashes. Engine tests cover real
   socket cancellation and stale continuation; proxy tests traverse HTTP and Unix
   sockets; viewer tests cover success and failure during retained pending close.
-  Runtime retirement and absolute control deadlines remain under repair and
-  review, together with viewer peer-scoped signaling. The changed guest image
+  Independent review also accepts persistent Runtime retirement, absolute
+  control deadlines, and viewer signaling bound to exact peers and owners. The changed guest image
   builds from the verified `56ce99e4` inputs plus the reviewed Engine control
-  overlay; unrelated RNG work remains excluded. Installed run 30 will repeat the
+  overlay; unrelated RNG work remains excluded. Installed run 30 repeats the
   same journey and reload gate. The coordinator owns the shared Mac instance;
-  independent source work and review use separate file scopes.
+  independent source work and review use separate file scopes. Installed run 30
+  passes the ordinary journey and confirms all 13 cleanup effects in 564 ms,
+  with zero Runtime obligations. Reload now receives fresh decoded video at
+  the first observed 2494 ms; all 15 binding samples match. The controlled page
+  receives the exact reload text, but the aggregate five-second probe fails
+  while the once-per-second cached byte counter stays unchanged after input.
+  Source and artifact review accept the fresh attachment repair. B03 now adds
+  an on-demand query of the current viewer peer's counters, with owner and peer
+  fences. The next run preserves the same five-second, frame, byte, exact-input
+  and cleanup criteria and reuses the installed Runtime, adapter and image set.
   Full B05 mixed-transport ordering and motion behavior remain separate gates.
   The probe must observe request failure and
   stopped media, then restore the same page, profile, service selection and

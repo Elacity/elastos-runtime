@@ -189,8 +189,8 @@ a 32-digit lowercase hexadecimal `request_id`, and the expected
 `elastos.browser.display-attach-request/v1`. Attachment carries no channel, SDP
 or candidate. The existing page grant authorizes it. Runtime and the adapter
 retain one attempt; matching retries join or replay that request before checking
-the current generation. A different request stays pending while the outcome of
-the first is uncertain.
+the current generation. A different request receives `display_attach_busy`
+while the original request remains pending with an uncertain outcome.
 
 A successful `elastos.browser.display-attach-result/v1` has exactly seven fields:
 `schema`, `page_id`, `request_id`, `previous_display_generation`, a fresh
@@ -218,8 +218,9 @@ The typed errors `display_attach_busy`, `display_generation_mismatch` and
 `display_attach_failed` and `display_attach_uncertain` use 503. Guest control,
 VM proxy and Engine adapter preserve this allowlisted code across the existing
 route. The Engine bounds paired offer preparation to four seconds; the adapter
-bounds the control exchange to five seconds. Timeout retains the same uncertain
-request for reconciliation. These operation limits are separate from the B06
+bounds the control exchange to five seconds. Adapter timeout retains the same
+uncertain request for reconciliation. Engine preparation timeout caches terminal
+`display_attach_failed` for that request. These operation limits are separate from the B06
 five-second user recovery gate and its installed evidence.
 
 Provider timeouts bound individual calls. The current implementation has a
