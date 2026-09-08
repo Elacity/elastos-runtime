@@ -63,11 +63,6 @@ impl SecureTimestamp {
     }
 
     /// Create a timestamp in the future (for expiry)
-    pub fn after_mins(mins: u64) -> Self {
-        Self::after_secs(mins * 60)
-    }
-
-    /// Create a timestamp in the future (for expiry)
     pub fn after_hours(hours: u64) -> Self {
         Self::after_secs(hours * 3600)
     }

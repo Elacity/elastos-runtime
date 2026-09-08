@@ -32,13 +32,6 @@ impl LocalMutableStorage {
         Ok(Self { base_path })
     }
 
-    /// Create without ensuring the directory exists (for testing)
-    pub fn new_unchecked(base_path: impl Into<PathBuf>) -> Self {
-        Self {
-            base_path: base_path.into(),
-        }
-    }
-
     /// Get the base path
     pub fn base_path(&self) -> &Path {
         &self.base_path

@@ -61,12 +61,6 @@ impl NamespaceStore {
         }
     }
 
-    /// Set the cache size limit
-    pub fn with_cache_limit(mut self, limit: u64) -> Self {
-        self.cache_limit = limit;
-        self
-    }
-
     /// Get the storage path for a namespace
     fn namespace_path(&self, owner: &str) -> PathBuf {
         self.storage_path.join(format!("{}.namespace.json", owner))

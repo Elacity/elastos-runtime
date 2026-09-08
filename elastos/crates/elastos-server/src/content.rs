@@ -2403,16 +2403,6 @@ fn external_repair_fleet_dispatch_failed(reason: String) -> Value {
     })
 }
 
-pub async fn publish_directory_via_provider(
-    registry: &ProviderRegistry,
-    dir: &Path,
-    object_did: Option<&str>,
-    publisher_did: Option<&str>,
-) -> anyhow::Result<String> {
-    publish_directory_via_provider_with_kind(registry, dir, "directory", object_did, publisher_did)
-        .await
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContentPublishRequirements {
     min_replicas: u32,

@@ -165,11 +165,6 @@ impl RuntimeResponse {
     pub fn ok() -> Self {
         Self::Ok { data: None }
     }
-
-    /// Create an OK response with data
-    pub fn ok_with_data(data: serde_json::Value) -> Self {
-        Self::Ok { data: Some(data) }
-    }
 }
 
 /// Configuration for launching a capsule

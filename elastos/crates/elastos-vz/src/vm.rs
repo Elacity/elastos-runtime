@@ -166,52 +166,6 @@ impl RunningVm {
         }
     }
 
-    /// Test-only injection point for [`Self::last_exit_reason`].
-    ///
-    /// Synthetic supervisor tests in `elastos-server` need to
-    /// drive `capsule_status` / `stop_capsule` through every
-    /// `VzExitReason` variant without having to spin up a real
-    /// Vz VM and provoke each terminal state (impossible in CI
-    /// without an Apple runner). This
-    /// hook is `#[doc(hidden)]` so it does not appear in the
-    /// public API surface; it is not part of any contract and
-    /// production code MUST NOT call it.
-    #[doc(hidden)]
-    #[cfg(target_os = "macos")]
-    pub fn set_last_exit_reason_for_testing(&mut self, reason: VzExitReason) {
-        self.last_exit_reason = Some(reason);
-    }
-
-    /// Test-only injection point for [`Self::last_vz_error`].
-    ///
-    /// Supervisor tests need to drive the new `CapsuleVzError`
-    /// RPC through every [`VzError`] variant without provoking
-    /// real Apple NSErrors (impossible to provoke in CI without
-    /// an Apple runner). `#[doc(hidden)]` so production code MUST NOT
-    /// call it.
-    #[doc(hidden)]
-    #[cfg(target_os = "macos")]
-    pub fn set_last_vz_error_for_testing(&mut self, err: VzError) {
-        self.last_vz_error = Some(err);
-    }
-
-    /// Test-only setter for the cached lifecycle [`status`][CapsuleStatus]
-    /// field.
-    ///
-    /// Synthetic Vz capsules constructed via [`Self::new`] have
-    /// no Vz handle attached so [`Self::is_running`] defers to
-    /// the cached `status`. Supervisor tests need to mark such
-    /// records as `Running` to keep
-    /// [`crate::Supervisor::reap_dead_capsules`][reap] from
-    /// pruning them mid-test. `#[doc(hidden)]` because this is
-    /// a test fixture, not a real API.
-    ///
-    /// [reap]: # "elastos-server/src/supervisor.rs::Supervisor::reap_dead_capsules"
-    #[doc(hidden)]
-    pub fn set_status_for_testing(&mut self, status: CapsuleStatus) {
-        self.status = status;
-    }
-
     /// Take the host-side carrier console fd, leaving `None` in
     /// its place. The supervisor calls this
     /// exactly once per VM, immediately after

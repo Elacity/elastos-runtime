@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::capsule::{CapsuleId, CapsuleManager};
 use crate::content::ContentFetcher;
-use crate::handler::{CapsuleIoBridge, RequestHandler};
+use crate::handler::RequestHandler;
 use crate::messaging::MessageChannel;
 use crate::primitives::audit::TrustLevel;
 
@@ -197,16 +197,6 @@ impl ShellManager {
         }
 
         Ok(())
-    }
-
-    /// Create an I/O bridge for the shell
-    pub fn create_io_bridge(
-        &self,
-        request_handler: Arc<RequestHandler>,
-    ) -> Option<CapsuleIoBridge> {
-        self.shell_id
-            .as_ref()
-            .map(|id| CapsuleIoBridge::new(id.clone(), request_handler))
     }
 }
 

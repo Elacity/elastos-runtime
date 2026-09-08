@@ -2119,23 +2119,6 @@ pub(crate) fn leave_configured_collaboration_principal_session(
     })
 }
 
-pub fn start_local_principal_runtime_session_with_transport(
-    data_dir: &Path,
-    member_did: &str,
-    principal_id: &str,
-    display_name: &str,
-    device_label: &str,
-) -> anyhow::Result<LocalRuntimeSessionWithTransportOutput> {
-    let actor_id = local_principal_room_actor_id(principal_id)?;
-    start_local_runtime_session_for_actor(
-        data_dir,
-        member_did,
-        Some(actor_id),
-        display_name,
-        device_label,
-    )
-}
-
 fn start_local_runtime_session_for_actor(
     data_dir: &Path,
     member_did: &str,
