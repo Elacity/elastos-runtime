@@ -15,7 +15,6 @@ export function isAuthoritySessionError(error) {
   const text = String(error?.message || "");
   return (
     error?.status === 401 ||
-    error?.status === 403 ||
     /auth session not found|auth session is not active|home launch token auth session is not active|home launch token expired/i.test(text)
   );
 }
@@ -96,6 +95,9 @@ export function friendlyOpenError(error) {
     }
   }
   if (outcome?.state === "terminal_pre_effect_failure") {
+    if (error.status === 403) {
+      return "This page was blocked by your Exit Node settings.";
+    }
     return "Browser Engine failed to start cleanly. No Browser page or VM was acquired.";
   }
   if (outcome?.state === "terminal_post_effect_cleanup") {

@@ -4,8 +4,33 @@ import test from "node:test";
 import {
   collectWebrtcStats,
   friendlyOpenError,
+  isAuthoritySessionError,
   runtimeOpenOutcome,
 } from "./browser-status.js";
+
+test("destination policy denial preserves Browser authority and close ownership", () => {
+  const error = openError("terminal_pre_effect_failure");
+  error.status = 403;
+  error.message = "private host blocked: localhost";
+  assert.equal(isAuthoritySessionError(error), false);
+  assert.equal(friendlyOpenError(error), "This page was blocked by your Exit Node settings.");
+
+  error.payload.outcome.state = "cleanup_pending";
+  error.payload.outcome.effects.vm_acquired = true;
+  assert.match(friendlyOpenError(error), /cleanup is pending/);
+  assert.equal(isAuthoritySessionError({ status: 403, message: "permission denied" }), false);
+});
+
+test("authentication failures still request Home authority renewal", () => {
+  for (const error of [
+    { status: 401, message: "unauthorized" },
+    { status: 403, message: "Home launch token expired" },
+    { status: 403, message: "auth session is not active" },
+  ]) {
+    assert.equal(isAuthoritySessionError(error), true);
+    assert.match(friendlyOpenError(error), /session expired/);
+  }
+});
 
 function openError(state, effects) {
   const error = new Error("browser-vz-engine-supervisor exited");
