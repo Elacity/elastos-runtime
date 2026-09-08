@@ -28,6 +28,14 @@ try:
 finally:gate.close()
 `;
 
+function effectTarget(action, message) {
+  const { method, params } = message;
+  if (action === "fill_prepare") return method === "Runtime.callFunctionOn" && !params.arguments;
+  if (action === "fill_clear") return method === "Input.dispatchKeyEvent" && params.type === "keyDown";
+  if (action === "click") return method === "Input.dispatchMouseEvent" && params.type === "mousePressed";
+  return method === "Input.insertText";
+}
+
 async function harness(action, lostConnection, testContext) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "browser-cdp-gate-"));
   const socketPath = path.join(directory, "writer.sock");
@@ -63,8 +71,11 @@ async function harness(action, lostConnection, testContext) {
       if(method==="DOM.getNodeForLocation")result={backendNodeId:7};
       if(method==="DOM.getDocument")result={root:{nodeId:1}};
       if(method==="DOM.querySelector")result={nodeId:7};
-      if(method==="Input.insertText" || method==="Input.dispatchMouseEvent")applied.push(message);
-      const target=action==="type" ? method==="Input.insertText" : method==="Input.dispatchMouseEvent"&&params.type==="mousePressed";
+      if(method==="Page.createIsolatedWorld")result={executionContextId:42};
+      if(method==="DOM.resolveNode")result={object:{objectId:"field"}};
+      if(method==="Runtime.callFunctionOn")result={result:{value:true}};
+      if(["Input.insertText","Input.dispatchMouseEvent","Input.dispatchKeyEvent"].includes(method) || (method==="Runtime.callFunctionOn" && !params.arguments))applied.push(message);
+      const target=effectTarget(action,message);
       if(target){
         // Apply the simulated native effect first; transport ACK comes later or
         // is lost. Actual CdpClient pending/timeout/close handling remains active.
@@ -89,16 +100,16 @@ async function harness(action, lostConnection, testContext) {
   const snapshot={id:"b".repeat(32),expires:30010,backendNodes:[{backendDOMNodeId:7,frameId:"frame"}]};
   const page={pageId:"page:owned",closed:false,browserPage:{debugger_url:"ws://private-cdp/page",_cdp:client,
     _inspection:{generation:"a".repeat(32),snapshot,binding:"frame:loader:https://controlled.test/form"}}};
-  const lease={command:"acquire",admission_id:"c".repeat(32),document_generation:"a".repeat(32),actions:["click","type"],duration_ms:30000};
+  const lease={command:"acquire",admission_id:"c".repeat(32),document_generation:"a".repeat(32),actions:action.startsWith("fill")?["click","fill"]:["click","type"],duration_ms:30000};
   await context.browserOperatorLease(page,lease,()=>true);
   const request=client.request.bind(client);
   client.request=(method,params,timeout)=>{
     // Use the actual public deadline with only 10ms remaining at first effect.
-    if(method==="DOM.getNodeForLocation" || method==="DOM.querySelector")now=1500;
+    if(method==="DOM.getNodeForLocation" || method==="DOM.querySelector" || method==="DOM.resolveNode")now=1500;
     return request(method,params,timeout);
   };
   const event={schema:"elastos.browser.ref-input/v1",request_id:"d".repeat(32),admission_id:lease.admission_id,
-    document_generation:lease.document_generation,ref:`${snapshot.id}:0`,action,...(action==="type"?{text:"once"}:{})};
+    document_generation:lease.document_generation,ref:`${snapshot.id}:0`,action:action.startsWith("fill")?"fill":action,...(action!=="click"?{text:action==="fill_clear"?"":"once"}:{})};
   return {context,page,applied,replies,native,event,lease,client,expire:()=>expiry(),
     run:()=>context.browserRefInput(page,event,()=>true),
     release:()=>context.browserOperatorLease(page,{command:"release",admission_id:lease.admission_id},()=>true),
@@ -106,13 +117,13 @@ async function harness(action, lostConnection, testContext) {
     async close(){page.closed=true;clearTimeout(page.operatorLease?.timer);await cleanup();}};
 }
 
-for(const action of ["type","click"]){
+for(const action of ["type","click","fill","fill_prepare","fill_clear"]){
   test(`real CDP + Unix native gate: ${action} late ACK keeps human blocked across expiry and release`,async(t)=>{
     const h=await harness(action,false,t);
     try{
       await assert.rejects(h.run());
       assert.equal(h.replies.length,1);
-      const applied=h.applied.filter(m=>action==="type"?m.method==="Input.insertText":m.params.type==="mousePressed");
+      const applied=h.applied.filter(m=>effectTarget(action,m));
       assert.equal(applied.length,1);
       if(action==="click")assert.deepEqual(h.applied.map(m=>m.params.type),["mouseMoved","mousePressed","mouseReleased"]);
       await h.native({time:32});h.expire();
@@ -125,7 +136,7 @@ for(const action of ["type","click"]){
       assert.deepEqual((await h.native({message:"kd,100"})).events,["kd,100"]);
       assert.equal(h.connections(),1);
       await assert.rejects(h.run(),"uncertain request must never replay after late ACK");
-      assert.equal(h.applied.filter(m=>action==="type"?m.method==="Input.insertText":m.params.type==="mousePressed").length,1);
+      assert.equal(h.applied.filter(m=>effectTarget(action,m)).length,1);
     }finally{await h.close();}
   });
   test(`real CDP + Unix native gate: ${action} lost ACK never reconnects/replays or releases pending effect`,async(t)=>{
@@ -136,7 +147,7 @@ for(const action of ["type","click"]){
       await assert.rejects(h.release());
       assert.deepEqual((await h.native({message:"kd,99"})).events,[]);
       assert.equal(h.connections(),1);
-      assert.equal(h.applied.filter(m=>action==="type"?m.method==="Input.insertText":m.params.type==="mousePressed").length,1);
+      assert.equal(h.applied.filter(m=>effectTarget(action,m)).length,1);
     }finally{await h.close();}
   });
 }

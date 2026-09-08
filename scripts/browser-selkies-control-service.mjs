@@ -4912,7 +4912,7 @@ async function browserOperatorLease(page, event, isCurrent) {
         inspection.generation !== event.document_generation || performance.now() >= inspection.snapshot.expires ||
         !Number.isInteger(event.duration_ms) || event.duration_ms < 2000 || event.duration_ms > 30000 ||
         !Array.isArray(event.actions) || event.actions.length < 1 || event.actions.length > 2 ||
-        event.actions.some(action => !["click", "type"].includes(action)) || new Set(event.actions).size !== event.actions.length) throw browserOperatorError("stale_inspection");
+        event.actions.some(action => !["click", "type", "fill"].includes(action)) || new Set(event.actions).size !== event.actions.length) throw browserOperatorError("stale_inspection");
     if (page.operatorLease?.active) throw browserOperatorError("operator_writer_busy");
     const lease = { id, active: true, generation: event.document_generation, actions: event.actions,
       deadline: performance.now() + event.duration_ms, receipts: new Map(), timer: null };
@@ -4938,13 +4938,30 @@ async function browserOperatorLease(page, event, isCurrent) {
     admission_id: id, writer_acquired: event.command === "acquire" };
 }
 
+// Evaluated only in the Engine's isolated world on the exact resolved ref.
+function browserFillPrepare() {
+  const input = this instanceof HTMLInputElement;
+  if ((!input && !(this instanceof HTMLTextAreaElement)) || !this.isConnected || this.matches(":disabled") || this.readOnly ||
+    (input && !["text", "search", "tel", "url", "password"].includes(this.type)) || this.closest("[inert]")) return false;
+  const style = getComputedStyle(this), rect = this.getBoundingClientRect();
+  if (style.visibility !== "visible" || style.display === "none" || rect.width <= 0 || rect.height <= 0) return false;
+  this.focus({ preventScroll: true });
+  this.select();
+  return this.isConnected && this.getRootNode().activeElement === this && !this.matches(":disabled") && !this.readOnly &&
+    this.selectionStart === 0 && this.selectionEnd === this.value.length;
+}
+
+function browserFillMatches(expected) {
+  return this.isConnected && this.value === expected;
+}
+
 async function browserRefInput(page, event, isCurrent) {
   const lease = page.operatorLease, browserPage = page.browserPage;
   const inspection = browserPage?._inspection, snapshot = inspection?.snapshot;
   const match = /^([a-f0-9]{32}):(0|[1-9][0-9]{0,2})$/.exec(event.ref || "");
   if (event.schema !== "elastos.browser.ref-input/v1" || !/^[a-f0-9]{32}$/.test(event.request_id || "") ||
-      !match || !["click", "type"].includes(event.action) ||
-      (event.action === "click" ? event.text != null : typeof event.text !== "string" || !event.text ||
+      !match || !["click", "type", "fill"].includes(event.action) ||
+      (event.action === "click" ? event.text != null : typeof event.text !== "string" || (event.action !== "fill" && !event.text) ||
         Buffer.byteLength(event.text) > 1024 || /[\u0000-\u001f\u007f-\u009f]/u.test(event.text))) throw browserOperatorError();
   const binding = snapshot?.backendNodes[Number(match[2])];
   const current = () => {
@@ -4982,18 +4999,19 @@ async function browserRefInput(page, event, isCurrent) {
         observed.finally(() => settleBrowserOperatorEffect(lease).catch(() => {})).catch(() => {});
         return withTimeout("Browser operator effect", waitMs, observed);
       };
-      const call = async (method, params = {}) => {
+      const call = async (method, params = {}, effectful = false) => {
+        const mutates = method.startsWith("Input.") || effectful;
         current();
         if (performance.now() >= deadline || browserPage._cdp !== cdp || cdp.closed) throw browserOperatorError("operator_outcome_uncertain");
         if (effect.uncertain) throw browserOperatorError("operator_outcome_uncertain");
-        if (method.startsWith("Input.") && !effect.held) {
+        if (mutates && !effect.held) {
           effect.held = true;
           await browserInputWriterGate("begin", lease.id, undefined, effect.id);
           current();
           if (performance.now() >= deadline) throw browserOperatorError("operator_outcome_uncertain");
         }
         const remaining = Math.max(1, Math.floor(deadline - performance.now()));
-        const value = await (method.startsWith("Input.")
+        const value = await (mutates
           ? effectRequest(method, params, remaining) : cdp.request(method, params, remaining));
         current();
         if (performance.now() >= deadline) throw browserOperatorError("operator_outcome_uncertain");
@@ -5023,6 +5041,37 @@ async function browserRefInput(page, event, isCurrent) {
           // It finishes before a waiting owner handoff can acquire the writer.
           releasePointer: (method, params) => effectRequest(method, params, 250),
         });
+      } else if (event.action === "fill") {
+        let world = browserPage._operatorFillWorld;
+        if (!world || world.generation !== event.document_generation || world.cdp !== cdp) {
+          const created = await call("Page.createIsolatedWorld", { frameId: binding.frameId,
+            worldName: "elastos-reference-fill-v1", grantUniveralAccess: false });
+          if (!Number.isInteger(created.executionContextId)) throw browserOperatorError("operator_target_unavailable");
+          world = { generation: event.document_generation, context: created.executionContextId, cdp };
+          browserPage._operatorFillWorld = world;
+        }
+        const resolved = await call("DOM.resolveNode", { backendNodeId: binding.backendDOMNodeId,
+          executionContextId: world.context });
+        const objectId = resolved.object?.objectId;
+        if (!objectId) throw browserOperatorError("stale_inspection");
+        try {
+          // This fixed internal action has no caller-supplied script. Focus and
+          // selection are effects: retain the native hold before either starts.
+          const prepared = await call("Runtime.callFunctionOn", { objectId, returnByValue: true,
+            functionDeclaration: browserFillPrepare.toString() }, true);
+          if (prepared.exceptionDetails || prepared.result?.value !== true) throw browserOperatorError("operator_target_unavailable");
+          if (event.text) await call("Input.insertText", { text: event.text });
+          else {
+            try { await call("Input.dispatchKeyEvent", { type: "keyDown", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 }); }
+            finally { await effectRequest("Input.dispatchKeyEvent", { type: "keyUp", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 }, 250); }
+          }
+          const verified = await call("Runtime.callFunctionOn", { objectId, returnByValue: true,
+            functionDeclaration: browserFillMatches.toString(), arguments: [{ value: event.text }] });
+          if (verified.exceptionDetails || verified.result?.value !== true) throw browserOperatorError("operator_outcome_uncertain");
+        } finally {
+          // Release this one remote object even if the action deadline expired.
+          await cdp.request("Runtime.releaseObject", { objectId }, 250).catch(() => {});
+        }
       } else {
         const attributes = Object.fromEntries(Array.from({ length: Math.floor((dom.attributes?.length || 0) / 2) }, (_, i) => [dom.attributes[2*i], dom.attributes[2*i+1]]));
         if (!["INPUT", "TEXTAREA"].includes(dom.nodeName) || attributes.disabled !== undefined || attributes.readonly !== undefined ||

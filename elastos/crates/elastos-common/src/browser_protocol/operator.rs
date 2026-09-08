@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum BrowserRefAction {
     Click,
     Type,
+    Fill,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -17,6 +18,9 @@ pub struct BrowserOperatorRequest {
     pub duration_ms: u32,
     pub max_actions: u8,
     pub reason: String,
+    /// Owner approval explicitly includes bounded semantic inspection.
+    #[serde(default)]
+    pub inspect: bool,
 }
 
 pub fn browser_operator_id_valid(value: &str) -> bool {
@@ -74,6 +78,10 @@ impl BrowserRefInput {
                 })
             && match self.action {
                 BrowserRefAction::Click => self.text.is_none(),
+                BrowserRefAction::Fill => self
+                    .text
+                    .as_ref()
+                    .is_some_and(|s| s.len() <= 1024 && !s.chars().any(char::is_control)),
                 BrowserRefAction::Type => self.text.as_ref().is_some_and(|s| {
                     !s.is_empty() && s.len() <= 1024 && !s.chars().any(char::is_control)
                 }),
@@ -110,6 +118,55 @@ mod tests {
         let mut changed = value;
         changed["principal_id"] = json!("claimed-owner");
         assert!(serde_json::from_value::<BrowserOperatorRequest>(changed).is_err());
+    }
+
+    #[test]
+    fn operator_fill_clear_and_explicit_inspection_preserve_action_bounds() {
+        let request = json!({"schema":"elastos.browser.operator-request/v1", "document_generation":"a".repeat(32),
+            "actions":["click","fill"],"duration_ms":30000,"max_actions":3,"reason":"Replace then clear"});
+        let legacy: BrowserOperatorRequest = serde_json::from_value(request.clone()).unwrap();
+        assert!(legacy.valid());
+        assert!(!legacy.inspect);
+        let mut explicit = request;
+        explicit["inspect"] = json!(true);
+        assert!(
+            serde_json::from_value::<BrowserOperatorRequest>(explicit)
+                .unwrap()
+                .inspect
+        );
+        let mut input = json!({"schema":"elastos.browser.ref-input/v1", "request_id":"c".repeat(32),
+            "admission_id":"d".repeat(32), "document_generation":"a".repeat(32),
+            "ref":format!("{}:0","b".repeat(32)),"action":"fill","text":""});
+        for text in ["".to_owned(), "é🦊".to_owned(), "é".repeat(512)] {
+            input["text"] = json!(text);
+            assert!(serde_json::from_value::<BrowserRefInput>(input.clone())
+                .unwrap()
+                .valid());
+            let mut native = input.clone();
+            native["type"] = json!("operator_ref");
+            assert!(browser_operator_event_valid(&native));
+        }
+        for text in [
+            json!(null),
+            json!("é".repeat(513)),
+            json!("\n"),
+            json!("\u{0085}"),
+        ] {
+            input["text"] = text;
+            assert!(!serde_json::from_value::<BrowserRefInput>(input.clone())
+                .unwrap()
+                .valid());
+        }
+        input["action"] = json!("type");
+        input["text"] = json!("");
+        assert!(!serde_json::from_value::<BrowserRefInput>(input)
+            .unwrap()
+            .valid());
+        let mut lease = json!({"type":"operator_lease", "command":"acquire", "admission_id":"d".repeat(32),
+            "document_generation":"a".repeat(32), "actions":["click","fill"],"duration_ms":30000});
+        assert!(browser_operator_event_valid(&lease));
+        lease["owner"] = json!("forged");
+        assert!(!browser_operator_event_valid(&lease));
     }
 
     #[test]
@@ -181,7 +238,7 @@ pub fn browser_operator_event_valid(value: &serde_json::Value) -> bool {
                                 (1..=2).contains(&actions.len())
                                     && (actions.len() != 2 || actions[0] != actions[1])
                                     && actions.iter().all(|action| {
-                                        matches!(action.as_str(), Some("click" | "type"))
+                                        matches!(action.as_str(), Some("click" | "type" | "fill"))
                                     })
                             })
                 }

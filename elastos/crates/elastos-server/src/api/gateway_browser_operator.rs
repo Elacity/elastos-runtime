@@ -1,6 +1,9 @@
 //! Browser admission uses existing Runtime sessions, pending approvals and
 //! capability signatures. Home tokens authorize decisions and remain private.
 use super::*;
+#[path = "gateway_browser_operator_client.rs"]
+mod client;
+pub(in crate::api::gateway) use client::{detach_operator, operator_inspect};
 use elastos_common::browser_protocol::{BrowserOperatorRequest, BrowserRefInput};
 use elastos_runtime::capability::pending::PendingRequestStore;
 use elastos_runtime::capability::{
@@ -42,8 +45,10 @@ struct Admission {
     created: Instant,
     owner: Option<BrowserInspectionOwner>,
     owner_token: String,
+    owner_host: String,
     snapshot: Option<OperatorSnapshot>,
     token: Option<CapabilityToken>,
+    inspection_token: Option<CapabilityToken>,
     expires: Instant,
     phase: &'static str,
     busy: bool,
@@ -339,8 +344,10 @@ pub(in crate::api::gateway) async fn request_admission(
             created: now,
             owner: None,
             owner_token: String::new(),
+            owner_host: String::new(),
             snapshot: None,
             token: None,
+            inspection_token: None,
             expires: now,
             phase: "pending",
             busy: false,
@@ -381,6 +388,7 @@ pub(in crate::api::gateway) async fn admission_status(
     Json(serde_json::json!({"schema":"elastos.browser.operator-admission/v1","request_id":id,
         "status":if live {"active"} else if record.phase == "active" {"expired"} else {record.phase},
         "capability":if live {record.token.as_ref().and_then(|t|t.to_base64().ok())} else {None},
+        "inspection_capability":if live {record.inspection_token.as_ref().and_then(|t|t.to_base64().ok())} else {None},
         "writer_acquired":live,"receipts":record.receipts.values().collect::<Vec<_>>() })).into_response()
 }
 
@@ -482,6 +490,12 @@ pub(in crate::api::gateway) async fn approve_admission(
         record.release_pending = true;
         record.owner = Some(owner.clone());
         record.owner_token = owner_token.clone();
+        // Preserve the host already validated with the owner's opaque origin.
+        record.owner_host = headers
+            .get(axum::http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
         record.expires =
             Instant::now() + std::time::Duration::from_millis(record.request.duration_ms.into());
         (
@@ -544,6 +558,7 @@ pub(in crate::api::gateway) async fn approve_admission(
         .await;
         return failure(StatusCode::CONFLICT, "operator_request_expired");
     }
+    record.inspection_token = client::grant_inspection(&service, record, &id);
     record.token = Some(token);
     record.phase = "active";
     Json(serde_json::json!({"schema":"elastos.browser.operator-admission/v1","request_id":id,"status":"active","writer_acquired":true})).into_response()

@@ -8168,6 +8168,7 @@ async fn display_attach_route_concurrent_request_is_bounded_and_close_wins_late_
 
 #[derive(Default)]
 struct OperatorTestProvider {
+    inspection: InspectionTestProvider,
     inputs: tokio::sync::Mutex<Vec<serde_json::Value>>,
     delay: std::sync::atomic::AtomicBool,
     entered: tokio::sync::Notify,
@@ -8189,7 +8190,7 @@ impl Provider for OperatorTestProvider {
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
         if request["op"] == "inspect" {
-            return InspectionTestProvider::default().send_raw(request).await;
+            return self.inspection.send_raw(request).await;
         }
         if request["op"] != "input" {
             return MockBrowserEngineProvider.send_raw(request).await;
@@ -8689,4 +8690,319 @@ async fn test_browser_operator_late_input_cannot_publish_after_owner_close() {
     assert_eq!(result.1["accepted"], false);
     assert_eq!(result.1["outcome"], "uncertain");
     assert_eq!(browser_page_session_count(dir.path()).await, 0);
+}
+
+#[tokio::test]
+async fn test_browser_operator_inspection_fill_bootstrap_and_detach_scope() {
+    use elastos_runtime::{
+        primitives::audit::AuditLog,
+        session::{SessionRegistry, SessionType},
+    };
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("operator-fill-owner"));
+    let owner = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let sessions = Arc::new(SessionRegistry::new(Arc::new(AuditLog::new())));
+    let _service = register_browser_operator_sessions(dir.path(), sessions.clone());
+    let operator = sessions.create_session(SessionType::Capsule, None).await;
+    let foreign = sessions.create_session(SessionType::Capsule, None).await;
+    let state = browser_engine_attached_test_state(dir.path()).await;
+    let provider = Arc::new(OperatorTestProvider::default());
+    state
+        .provider_registry
+        .as_ref()
+        .unwrap()
+        .unregister_sub_provider("browser-engine")
+        .await
+        .unwrap();
+    state
+        .provider_registry
+        .as_ref()
+        .unwrap()
+        .register_sub_provider("browser-engine", provider.clone())
+        .await
+        .unwrap();
+    let app = gateway_router(state);
+    let opened =
+        open_mock_browser_page_result(app.clone(), &owner, "operator reference fill").await;
+    let page = opened["engine_page"]["page_id"].as_str().unwrap();
+    let uri = format!("/api/apps/browser/pages/{page}/operator-requests");
+    // The visible owner's invitation obtains exact generation; the operator has
+    // a separate Runtime session and creates its own request, not a supplied ID.
+    let invitation_response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(format!("/api/apps/browser/pages/{page}/inspect"))
+                .header("x-elastos-home-token", &owner)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"schema":"elastos.browser.inspect-request/v1","limit":1}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invitation_response.status(), StatusCode::OK);
+    let invitation: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(invitation_response.into_body(), 32768)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    for inspect in [false, true] {
+        let mut request = json!({"schema":"elastos.browser.operator-request/v1", "document_generation":invitation["document_generation"],
+            "actions":["click","fill"],"duration_ms":30000,"max_actions":3,"reason":"Replace then clear the invited field"});
+        if inspect {
+            request["inspect"] = json!(true);
+        }
+        let pending =
+            operator_request(app.clone(), "POST", &uri, &operator.token, None, request).await;
+        assert_eq!(pending.0, StatusCode::OK);
+        let id = pending.1["request_id"].as_str().unwrap();
+        let decision = format!("{uri}/{id}");
+        let read_uri = format!("{decision}/inspect");
+        let read_body = json!({"schema":"elastos.browser.inspect-request/v1"});
+        let before = provider.inspection.calls.load(Ordering::SeqCst);
+        assert_ne!(
+            operator_request(
+                app.clone(),
+                "POST",
+                &read_uri,
+                &operator.token,
+                Some("forged"),
+                read_body.clone()
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(provider.inspection.calls.load(Ordering::SeqCst), before);
+        assert_eq!(
+            owner_operator_request(app.clone(), "POST", &decision, &owner).await,
+            StatusCode::OK
+        );
+        let grant = operator_request(
+            app.clone(),
+            "GET",
+            &decision,
+            &operator.token,
+            None,
+            json!({}),
+        )
+        .await
+        .1;
+        let writer = grant["capability"].as_str().unwrap();
+        assert_eq!(
+            operator_request(
+                app.clone(),
+                "POST",
+                &read_uri,
+                &operator.token,
+                Some(writer),
+                read_body.clone()
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(provider.inspection.calls.load(Ordering::SeqCst), before);
+        if !inspect {
+            assert!(
+                grant["inspection_capability"].is_null(),
+                "old approval does not silently grant reads"
+            );
+        } else {
+            let reader = grant["inspection_capability"].as_str().unwrap();
+            assert_ne!(reader, writer);
+            assert_eq!(
+                operator_request(
+                    app.clone(),
+                    "POST",
+                    &read_uri,
+                    &foreign.token,
+                    Some(reader),
+                    read_body.clone()
+                )
+                .await
+                .0,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(provider.inspection.calls.load(Ordering::SeqCst), before);
+            let inspected = operator_request(
+                app.clone(),
+                "POST",
+                &read_uri,
+                &operator.token,
+                Some(reader),
+                read_body.clone(),
+            )
+            .await;
+            assert_eq!(inspected.0, StatusCode::OK, "{:?}", inspected.1);
+            assert_eq!(
+                inspected.1["nodes"][0]["name"],
+                "Actual Engine page content"
+            );
+            let input_uri = format!("/api/apps/browser/pages/{page}/input");
+            let mut event = json!({"schema":"elastos.browser.ref-input/v1","request_id":"d".repeat(32),
+                "admission_id":id,"document_generation":inspected.1["document_generation"],
+                "ref":inspected.1["nodes"][0]["ref"],"action":"fill","text":"Replaced 🦊"});
+            assert_ne!(
+                operator_request(
+                    app.clone(),
+                    "POST",
+                    &input_uri,
+                    &operator.token,
+                    Some(reader),
+                    json!({"event":event})
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+            for (request_id, text) in [("d", "Replaced 🦊"), ("e", "")] {
+                event["request_id"] = json!(request_id.repeat(32));
+                event["text"] = json!(text);
+                let result = operator_request(
+                    app.clone(),
+                    "POST",
+                    &input_uri,
+                    &operator.token,
+                    Some(writer),
+                    json!({"event":event}),
+                )
+                .await;
+                assert_eq!(result.0, StatusCode::OK, "{:?}", result.1);
+                let count = provider.inputs.lock().await.len();
+                assert_eq!(
+                    operator_request(
+                        app.clone(),
+                        "POST",
+                        &input_uri,
+                        &operator.token,
+                        Some(writer),
+                        json!({"event":event})
+                    )
+                    .await
+                    .0,
+                    StatusCode::OK
+                );
+                assert_eq!(
+                    provider.inputs.lock().await.len(),
+                    count,
+                    "receipt replay has one provider dispatch"
+                );
+            }
+            let inputs = provider.inputs.lock().await;
+            let fills: Vec<_> = inputs
+                .iter()
+                .filter(|e| e["type"] == "operator_ref")
+                .collect();
+            assert_eq!(fills.len(), 2);
+            assert_eq!(fills[0]["action"], "fill");
+            assert_eq!(fills[1]["text"], "");
+            drop(inputs);
+            // A late provider read loses disclosure authority when detached.
+            provider.inspection.delay.store(true, Ordering::SeqCst);
+            let late_app = app.clone();
+            let late_uri = read_uri.clone();
+            let late_session = operator.token.clone();
+            let late_cap = reader.to_owned();
+            let delayed = tokio::spawn(async move {
+                operator_request(
+                    late_app,
+                    "POST",
+                    &late_uri,
+                    &late_session,
+                    Some(&late_cap),
+                    json!({"schema":"elastos.browser.inspect-request/v1"}),
+                )
+                .await
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                provider.inspection.entered.notified(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                operator_request(
+                    app.clone(),
+                    "POST",
+                    &format!("{decision}/detach"),
+                    &foreign.token,
+                    None,
+                    json!({})
+                )
+                .await
+                .0,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                operator_request(
+                    app.clone(),
+                    "POST",
+                    &format!("{decision}/detach"),
+                    &operator.token,
+                    None,
+                    json!({})
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+            provider.inspection.release.notify_one();
+            let late = delayed.await.unwrap();
+            assert_eq!(late.0, StatusCode::FORBIDDEN);
+            assert!(late.1.get("nodes").is_none());
+            let count = provider.inputs.lock().await.len();
+            event["request_id"] = json!("f".repeat(32));
+            assert_ne!(
+                operator_request(
+                    app.clone(),
+                    "POST",
+                    &input_uri,
+                    &operator.token,
+                    Some(writer),
+                    json!({"event":event})
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+            assert_eq!(provider.inputs.lock().await.len(), count);
+            assert_eq!(
+                operator_request(
+                    app.clone(),
+                    "POST",
+                    &read_uri,
+                    &operator.token,
+                    Some(reader),
+                    read_body
+                )
+                .await
+                .0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            operator_request(
+                app.clone(),
+                "POST",
+                &format!("{decision}/detach"),
+                &operator.token,
+                None,
+                json!({})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            browser_page_session_count(dir.path()).await,
+            1,
+            "operator detach preserves the owner's page"
+        );
+    }
 }

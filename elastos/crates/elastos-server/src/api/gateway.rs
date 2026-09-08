@@ -843,6 +843,15 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
                 .delete(gateway_browser::gateway_browser_operator::revoke_admission),
         )
         .route(
+            "/api/apps/browser/pages/:page_id/operator-requests/:id/inspect",
+            post(gateway_browser::gateway_browser_operator::operator_inspect)
+                .layer(DefaultBodyLimit::max(8192)),
+        )
+        .route(
+            "/api/apps/browser/pages/:page_id/operator-requests/:id/detach",
+            post(gateway_browser::gateway_browser_operator::detach_operator),
+        )
+        .route(
             "/api/apps/browser/pages/:page_id/heartbeat",
             post(gateway_browser::browser_app_page_heartbeat),
         )

@@ -29,6 +29,7 @@ import {
 } from "./browser-status.js?v=browser-20260907c";
 import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260907c";
 import { renderServiceSelection } from "./browser-service-selection.js?v=browser-20260907c";
+import { createOperatorApprovalController, mountOperatorApproval } from "./browser-operator-approval.js";
 
 const STATUS_TTL_MS = 4200;
 const PAGE_STATUS_INTERVAL_MS = 2_500;
@@ -2451,6 +2452,17 @@ window.addEventListener("beforeunload", () => {
 });
 
 window.addEventListener("pagehide", releaseRuntimePageForUnload);
+
+mountOperatorApproval({
+  container: settingsPanel,
+  controller: createOperatorApprovalController({
+    fetchJson,
+    runtimeOrigin: new URL(window.location.href).origin,
+    getOwner: () => unloadCleanupStarted || homeWindowCloseInFlight
+      ? null : runtimePageOwner(currentPage, currentPageGeneration),
+    sameOwner: sameRuntimePageOwner,
+  }),
+});
 
 const initialUrl = params.get("url") || DEFAULT_URL;
 addressInput.value = initialUrl;
