@@ -167,9 +167,18 @@ preserving the same page and media through five failed status requests during
 a 5001 ms HTTP cut. Fresh close again proves all 13 effects and zero obligations.
 Full B06 remains open because media continued during the cut: Chromium's P2P
 packet-loss interceptor applies to UDP, while this VZ path uses TCP TURN.
-The next bounded experiment also interrupts the task-owned relay and retains
-the original observed-stall and five-second recovery requirements.
-Guest and native artifacts remain those accepted in run 17.
+The reviewed probe at `5f6aaafc` also interrupts the task-owned relay. Independent
+review accepts run 24 for a 5000 ms HTTP/media cut, a 4302 ms media stall, retained
+page/profile/service bindings, resumed video, and exact cleanup of all 13 effects
+with zero Runtime obligations. The relay resumes with matching process identity
+and its safeguard exits. Full recovery fails exact input acceptance: rapid
+`-recovered` typing produces `-recoveedr`. All characters arrive within 280 ms;
+the second `r` arrives last. Source diagnosis finds independent printable-key
+Runtime HTTP requests, which can overtake one another. B05 input dispatch
+ordering is the next repair, followed by this same B06 journey. The evidence
+does not establish that the interruption causes the input defect.
+Guest and native artifacts remain those accepted in run 17; this input repair
+can reuse them.
 Guest Node also starts about five seconds after its shell launch;
 initial entropy is 1 and no hardware RNG is selected. That secondary cause needs
 its own experiment. Run 16 includes diagnostic overhead and is excluded from

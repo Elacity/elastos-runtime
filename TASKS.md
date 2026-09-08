@@ -86,7 +86,16 @@ Independent source repair and regression work can proceed in separate file scope
   requests during a 5001 ms HTTP cut, retaining the same owner and media, then
   exact cleanup. Full recovery remains open: TCP TURN media kept flowing, so
   the probe correctly rejects the cut. The next test interrupts the task-owned
-  relay as well as HTTP, with an independent resume safeguard.
+  relay as well as HTTP, with an independent resume safeguard. Independent
+  review accepts run 24 for a 5000 ms HTTP/media cut, 4302 ms media stall,
+  preserved page/profile/service bindings and resumed decoded video. Its exact
+  close confirms all 13 effects and zero Runtime obligations; the relay resumes
+  with matching process identity and the safeguard exits. Rapid recovery input
+  fails: `-recovered` arrives as `-recoveedr`. Browser sends printable keys as
+  overlapping Runtime HTTP requests. B05 now repairs input dispatch ordering
+  and stale-owner handling before repeating this same B06 test. The harness
+  keeps rapid typing and exact text acceptance. Guest/native artifacts stay
+  unchanged for this UI repair.
   The probe must observe request failure and
   stopped media, then restore the same page, profile, service selection and
   input within five seconds.
