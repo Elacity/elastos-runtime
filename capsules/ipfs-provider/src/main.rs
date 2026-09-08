@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// Only Runtime's typed local Registry methods dispatch the private operations.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod directory_hash;
+
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const KUBO_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const IDLE_TIMEOUT_SECS: u64 = 600; // 10 minutes
@@ -22,6 +26,13 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const LARGE_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 const BOUNDED_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BOUNDED_READ_BYTES: u64 = 64 * 1024;
+const MAX_CAPACITY_REQUIRED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+fn deserialize_metadata_max<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
+}
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
@@ -33,6 +44,13 @@ const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
+    RuntimePrepareBackend {},
+    RuntimeCheckCapacity {
+        required_bytes: u64,
+    },
+    RuntimeHashStagedDirectory {
+        directory: StagedDirectory,
+    },
     Init {
         #[serde(default)]
         config: serde_json::Value,
@@ -64,6 +82,8 @@ enum Request {
         path: Option<String>,
         #[serde(default)]
         bounded_read: bool,
+        #[serde(default, deserialize_with = "deserialize_metadata_max")]
+        max_bytes: Option<u64>,
         #[serde(default, rename = "_runtime_invocation")]
         _runtime_invocation: Option<serde_json::Value>,
     },
@@ -104,6 +124,107 @@ enum Request {
 struct DirFile {
     path: String,
     data: String, // base64
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedFile {
+    path: String,
+    size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedDirectory {
+    root: PathBuf,
+    files: Vec<StagedFile>,
+    total_bytes: u64,
+}
+
+impl StagedDirectory {
+    fn valid_shape(&self) -> bool {
+        let Some(root) = self.root.to_str() else {
+            return false;
+        };
+        if !root.starts_with('/')
+            || root.len() > 4096
+            || root.contains('\0')
+            || root[1..].split('/').count() > 64
+            || root[1..].split('/').any(|p| matches!(p, "" | "." | ".."))
+            || self.files.is_empty()
+            || self.files.len() > 33
+            || self.total_bytes == 0
+            || self.total_bytes > 16 * 1024 * 1024 * 1024
+        {
+            return false;
+        }
+        let mut paths = std::collections::BTreeSet::new();
+        let mut total = 0u64;
+        for file in &self.files {
+            if file.path.is_empty()
+                || file.path.len() > 256
+                || file.path.split('/').count() > 8
+                || file.path.split('/').any(|p| {
+                    matches!(p, "" | "." | "..")
+                        || !p
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                })
+                || !paths.insert(file.path.as_str())
+            {
+                return false;
+            }
+            let Some(sum) = total.checked_add(file.size) else {
+                return false;
+            };
+            total = sum;
+        }
+        total == self.total_bytes
+            && ["capsule.json", "_elastos_object.json"]
+                .iter()
+                .all(|required| {
+                    self.files
+                        .iter()
+                        .any(|f| f.path == *required && (1..=65536).contains(&f.size))
+                })
+            && !self.files.iter().any(|f| {
+                f.path
+                    .match_indices('/')
+                    .any(|(i, _)| paths.contains(&f.path[..i]))
+            })
+    }
+}
+
+fn private_preparation_error() -> Response {
+    Response::error(
+        "preparation_unavailable",
+        "Local content preparation unavailable",
+    )
+}
+
+fn parse_request(line: &str) -> Result<Request, Response> {
+    serde_json::from_str(line).map_err(|error| {
+        // Private parse failures can contain descriptor values in serde's error.
+        // Keep those values out of the provider-facing response.
+        let private = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| {
+                v.get("op").and_then(|op| op.as_str()).map(|op| {
+                    matches!(
+                        op,
+                        "runtime_prepare_backend"
+                            | "runtime_hash_staged_directory"
+                            | "runtime_check_capacity"
+                    )
+                })
+            })
+            .unwrap_or(false);
+        if private {
+            private_preparation_error()
+        } else {
+            Response::error("parse_error", &error.to_string())
+        }
+    })
 }
 
 fn default_filename() -> String {
@@ -259,6 +380,76 @@ impl IpfsProvider {
 
     fn handle(&mut self, req: Request) -> Response {
         match req {
+            Request::RuntimePrepareBackend {} => {
+                if !cfg!(any(target_os = "linux", target_os = "macos")) {
+                    return private_preparation_error();
+                }
+                match self.ensure_kubo() {
+                    Ok(()) => {
+                        #[cfg(any(target_os = "linux", target_os = "macos"))]
+                        {
+                            match directory_hash::verify_backend(self) {
+                                Ok(()) => Response::ok_empty(),
+                                Err(error) => {
+                                    eprintln!(
+                                        "ipfs-provider: private readiness probe failed: {error}"
+                                    );
+                                    self.state = KuboState::Error;
+                                    private_preparation_error()
+                                }
+                            }
+                        }
+                        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                        {
+                            private_preparation_error()
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("ipfs-provider: private readiness failed: {error}");
+                        private_preparation_error()
+                    }
+                }
+            }
+            Request::RuntimeCheckCapacity { required_bytes } => {
+                if !(1..=MAX_CAPACITY_REQUIRED_BYTES).contains(&required_bytes) {
+                    return private_preparation_error();
+                }
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    match directory_hash::check_capacity(self, required_bytes) {
+                        Ok(observation) => Response::ok(serde_json::json!(observation)),
+                        Err(error) => {
+                            eprintln!(
+                                "ipfs-provider: private capacity observation failed: {error}"
+                            );
+                            private_preparation_error()
+                        }
+                    }
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    private_preparation_error()
+                }
+            }
+            Request::RuntimeHashStagedDirectory { directory } => {
+                if !directory.valid_shape() {
+                    return private_preparation_error();
+                }
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    match directory_hash::hash_directory(self, &directory) {
+                        Ok(cid) => Response::ok(serde_json::json!({"cid":cid})),
+                        Err(error) => {
+                            eprintln!("ipfs-provider: private directory hash failed: {error}");
+                            private_preparation_error()
+                        }
+                    }
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    private_preparation_error()
+                }
+            }
             Request::Init { config } => self.init(config),
             Request::AddBytes {
                 data,
@@ -272,10 +463,18 @@ impl IpfsProvider {
                 cid,
                 path,
                 bounded_read,
+                max_bytes,
                 _runtime_invocation,
             } => {
                 if bounded_read {
-                    self.cat_bounded(&cid, path.as_deref(), _runtime_invocation.as_ref())
+                    self.cat_bounded(
+                        &cid,
+                        path.as_deref(),
+                        _runtime_invocation.as_ref(),
+                        max_bytes,
+                    )
+                } else if max_bytes.is_some() {
+                    Response::error("bounded_read_failed", "Bounded content read failed")
                 } else {
                     self.cat(&cid, path.as_deref())
                 }
@@ -633,6 +832,7 @@ impl IpfsProvider {
         cid: &str,
         path: Option<&str>,
         invocation: Option<&serde_json::Value>,
+        max_bytes: Option<u64>,
     ) -> Response {
         let result = (|| -> Result<serde_json::Value, String> {
             let invocation = invocation.ok_or("bounded read requires Runtime invocation")?;
@@ -650,14 +850,33 @@ impl IpfsProvider {
                 start: u64,
                 end: u64,
             }
-            let range: Range = serde_json::from_value(invocation["range"].clone())
-                .map_err(|_| "bounded read requires a closed range")?;
-            let length = range
-                .end
-                .checked_sub(range.start)
-                .and_then(|n| n.checked_add(1))
-                .filter(|n| *n <= MAX_BOUNDED_READ_BYTES)
-                .ok_or("bounded read range exceeds limit")?;
+            let range: Option<Range> = if let Some(max) = max_bytes {
+                if !(1..=MAX_BOUNDED_READ_BYTES).contains(&max)
+                    || path != Some("_elastos_object.json")
+                    || invocation.get("range").is_some_and(|v| !v.is_null())
+                    || invocation
+                        .pointer("/progress/expected_bytes")
+                        .is_some_and(|v| !v.is_null())
+                {
+                    return Err("invalid complete metadata request".into());
+                }
+                None
+            } else {
+                Some(
+                    serde_json::from_value(invocation["range"].clone())
+                        .map_err(|_| "bounded read requires a closed range")?,
+                )
+            };
+            let length = if let Some(range) = &range {
+                range
+                    .end
+                    .checked_sub(range.start)
+                    .and_then(|n| n.checked_add(1))
+                    .filter(|n| *n <= MAX_BOUNDED_READ_BYTES)
+                    .ok_or("bounded read range exceeds limit")?
+            } else {
+                max_bytes.ok_or("missing metadata bound")?
+            };
             if let Some(expected) = invocation
                 .pointer("/progress/expected_bytes")
                 .filter(|v| !v.is_null())
@@ -697,22 +916,38 @@ impl IpfsProvider {
                 .redirects(0)
                 .try_proxy_from_env(false)
                 .build();
-            let response = agent
+            let mut request = agent
                 .post(&format!("{}/api/v0/cat", self.api_url()))
                 .query("arg", &arg)
-                .query("offset", &range.start.to_string())
-                .query("length", &length.to_string())
                 .set("Accept-Encoding", "identity")
-                .timeout(BOUNDED_READ_TIMEOUT)
-                .call()
-                .map_err(|e| e.to_string())?;
+                .timeout(BOUNDED_READ_TIMEOUT);
+            if let Some(range) = &range {
+                request = request
+                    .query("offset", &range.start.to_string())
+                    .query("length", &length.to_string());
+            } else {
+                request = request.query("length", &(length + 1).to_string());
+            }
+            let response = request.call().map_err(|e| e.to_string())?;
+            let declared_length = response
+                .header("Content-Length")
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "invalid bounded response length")
+                })
+                .transpose()?;
             if response.status() != 200
                 || response
                     .header("Content-Encoding")
                     .is_some_and(|v| v != "identity")
-                || response
-                    .header("Content-Length")
-                    .is_some_and(|v| v.parse::<u64>().ok() != Some(length))
+                || declared_length.is_some_and(|n| {
+                    if range.is_some() {
+                        n != length
+                    } else {
+                        n > length
+                    }
+                })
             {
                 return Err("invalid bounded read response".into());
             }
@@ -722,10 +957,19 @@ impl IpfsProvider {
                 .take(length + 1)
                 .read_to_end(&mut bytes)
                 .map_err(|e| e.to_string())?;
-            if bytes.len() as u64 != length {
+            if (range.is_some() && bytes.len() as u64 != length)
+                || declared_length.is_some_and(|n| bytes.len() as u64 != n)
+                || (range.is_none() && (bytes.is_empty() || bytes.len() as u64 > length))
+            {
                 return Err("bounded read response length mismatch".into());
             }
             update_coord_last_used(&self.data_dir);
+            if range.is_none() {
+                return Ok(serde_json::json!({"data":BASE64.encode(&bytes),
+                    "_runtime_complete_metadata":{"schema":"elastos.provider.complete-metadata/v1",
+                        "cid":cid,"path":path,"max_bytes":length,"actual_bytes":bytes.len(),"completed":true}}));
+            }
+            let range = range.ok_or("missing applied range")?;
             Ok(serde_json::json!({
                 "data": BASE64.encode(&bytes),
                 "_runtime_applied_range": {
@@ -1606,10 +1850,9 @@ fn main() {
             continue;
         }
 
-        let request: Request = match serde_json::from_str(&line) {
+        let request: Request = match parse_request(&line) {
             Ok(req) => req,
-            Err(e) => {
-                let response = Response::error("parse_error", &e.to_string());
+            Err(response) => {
                 writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
                 stdout.flush().unwrap();
                 continue;
@@ -1636,6 +1879,205 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn private_hash_fixture_request() -> serde_json::Value {
+        serde_json::json!({"op":"runtime_hash_staged_directory","directory":{
+            "root":"/private/fixture",
+            "files":[{"path":"capsule.json","size":2},{"path":"_elastos_object.json","size":2},{"path":"weights.gguf","size":4}],
+            "total_bytes":8,
+        }})
+    }
+
+    #[test]
+    fn private_ipfs_capacity_request_is_strict_and_cold_is_unavailable() {
+        for wire in [
+            serde_json::json!({"op":"runtime_check_capacity"}),
+            serde_json::json!({"op":"runtime_check_capacity","required_bytes":null}),
+            serde_json::json!({"op":"runtime_check_capacity","required_bytes":-1}),
+            serde_json::json!({"op":"runtime_check_capacity","required_bytes":"private-value"}),
+            serde_json::json!({"op":"runtime_check_capacity","required_bytes":1,"path":"private-value"}),
+        ] {
+            let error = parse_request(&wire.to_string()).unwrap_err();
+            assert_eq!(
+                serde_json::to_value(error).unwrap(),
+                serde_json::to_value(private_preparation_error()).unwrap()
+            );
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut provider = bounded_cat_fixture_provider(root.path(), 0);
+        provider.state = KuboState::Cold;
+        for required_bytes in [0, 1, MAX_CAPACITY_REQUIRED_BYTES + 1, u64::MAX] {
+            let wire =
+                serde_json::json!({"op":"runtime_check_capacity","required_bytes":required_bytes});
+            assert!(wire.to_string().len() < 128);
+            let response = provider.handle(parse_request(&wire.to_string()).unwrap());
+            assert_eq!(
+                serde_json::to_value(response).unwrap(),
+                serde_json::to_value(private_preparation_error()).unwrap()
+            );
+        }
+        assert_eq!(provider.state, KuboState::Cold);
+        assert!(provider.kubo_child.is_none());
+        assert!(!provider.repo_dir.exists());
+    }
+
+    #[test]
+    fn private_ipfs_descriptor_is_strict_and_failure_is_sanitized() {
+        for (pointer, value) in [
+            ("/directory/root", serde_json::json!(42)),
+            (
+                "/directory/files/0/size",
+                serde_json::json!("private-value"),
+            ),
+            ("/directory/total_bytes", serde_json::json!(-1)),
+        ] {
+            let mut wire = private_hash_fixture_request();
+            *wire.pointer_mut(pointer).unwrap() = value;
+            let err = parse_request(&wire.to_string()).unwrap_err();
+            assert_eq!(
+                serde_json::to_value(err).unwrap(),
+                serde_json::to_value(private_preparation_error()).unwrap()
+            );
+        }
+        for pointer in ["", "/directory", "/directory/files/0"] {
+            let mut wire = private_hash_fixture_request();
+            wire.pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("expected_cid".into(), serde_json::json!("private-value"));
+            assert!(parse_request(&wire.to_string()).is_err());
+        }
+        assert!(
+            parse_request(r#"{"op":"runtime_prepare_backend","path":"private-value"}"#).is_err()
+        );
+        let root = tempfile::tempdir().unwrap();
+        let mut provider = IpfsProvider {
+            state: KuboState::Cold,
+            api_port: 0,
+            gateway_port: 0,
+            kubo_binary: None,
+            kubo_child: None,
+            data_dir: root.path().join("absent"),
+            repo_dir: root.path().join("absent-repo"),
+        };
+        for (pointer, value) in [
+            ("/directory/root", serde_json::json!("relative")),
+            ("/directory/files/0/path", serde_json::json!("../secret")),
+            ("/directory/files", serde_json::json!([])),
+            ("/directory/files/0/size", serde_json::json!(u64::MAX)),
+            ("/directory/total_bytes", serde_json::json!(9)),
+        ] {
+            let mut wire = private_hash_fixture_request();
+            *wire.pointer_mut(pointer).unwrap() = value;
+            let response = provider.handle(parse_request(&wire.to_string()).unwrap());
+            assert_eq!(
+                serde_json::to_value(response).unwrap(),
+                serde_json::to_value(private_preparation_error()).unwrap()
+            );
+        }
+        let response =
+            provider.handle(parse_request(r#"{"op":"runtime_prepare_backend"}"#).unwrap());
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::to_value(private_preparation_error()).unwrap()
+        );
+        assert!(!provider.data_dir.exists());
+        assert!(!provider.repo_dir.exists());
+        assert_eq!(provider.state, KuboState::Cold);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn private_ipfs_cold_readiness_precedes_bounded_read_without_prefetch() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut provider = bounded_cat_fixture_provider(root.path(), port);
+        provider.state = KuboState::Cold;
+        provider.api_port = 0;
+        // Existing live coordination makes this binary unnecessary to execute.
+        provider.kubo_binary = Some(root.path().join("must-not-execute"));
+        assert!(matches!(
+            provider.handle(serde_json::from_value(bounded_cat_fixture_request()).unwrap()),
+            Response::Error { .. }
+        ));
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+        let backend = std::thread::spawn(move || {
+            let mut version_socket = accept_bounded_fixture(&listener);
+            let version_headers = read_bounded_fixture_headers(&mut version_socket);
+            version_socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"Version\":\"0.40.1\"}").unwrap();
+            drop(version_socket);
+            let mut socket = accept_bounded_fixture(&listener);
+            let headers = read_bounded_fixture_headers(&mut socket);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n89ab")
+                .unwrap();
+            (version_headers, headers)
+        });
+        let ready = provider.handle(parse_request(r#"{"op":"runtime_prepare_backend"}"#).unwrap());
+        let result =
+            provider.handle(serde_json::from_value(bounded_cat_fixture_request()).unwrap());
+        let (version_headers, headers) = backend.join().unwrap();
+        assert_eq!(
+            serde_json::to_value(ready).unwrap(),
+            serde_json::json!({"status":"ok"})
+        );
+        assert_eq!(provider.state, KuboState::Ready);
+        assert!(version_headers.starts_with("POST /api/v0/version"));
+        assert!(headers.starts_with("POST /api/v0/cat?"));
+        assert!(headers.contains("offset=8") && headers.contains("length=4"));
+        let Response::Ok { data: Some(data) } = result else {
+            panic!("bounded read failed");
+        };
+        assert_eq!(
+            BASE64.decode(data["data"].as_str().unwrap()).unwrap(),
+            b"89ab"
+        );
+        assert!(!provider.repo_dir.exists());
+        assert!(provider.kubo_child.is_none());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn private_ipfs_readiness_rejects_live_pid_with_dead_api() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut provider = bounded_cat_fixture_provider(root.path(), port);
+        provider.state = KuboState::Cold;
+        provider.kubo_binary = Some(root.path().join("must-not-execute"));
+        let response =
+            provider.handle(parse_request(r#"{"op":"runtime_prepare_backend"}"#).unwrap());
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::to_value(private_preparation_error()).unwrap()
+        );
+        assert_eq!(provider.state, KuboState::Error);
+        assert!(provider.kubo_child.is_none());
+        assert!(!provider.repo_dir.exists());
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn private_ipfs_unsupported_platform_fails_without_startup() {
+        let mut provider = IpfsProvider::new();
+        for request in [
+            private_hash_fixture_request(),
+            serde_json::json!({"op":"runtime_prepare_backend"}),
+            serde_json::json!({"op":"runtime_check_capacity","required_bytes":1}),
+        ] {
+            let response = provider.handle(parse_request(&request.to_string()).unwrap());
+            assert_eq!(
+                serde_json::to_value(response).unwrap(),
+                serde_json::to_value(private_preparation_error()).unwrap()
+            );
+        }
+        assert_eq!(provider.state, KuboState::Cold);
+        assert!(provider.kubo_child.is_none());
+    }
 
     fn bounded_cat_fixture_request() -> serde_json::Value {
         serde_json::json!({
@@ -1671,6 +2113,177 @@ mod tests {
             data_dir: root.to_path_buf(),
             repo_dir: root.join("unused-repo"),
         }
+    }
+
+    fn complete_metadata_request(max: u64) -> serde_json::Value {
+        let mut request = bounded_cat_fixture_request();
+        request["path"] = serde_json::json!("_elastos_object.json");
+        request["max_bytes"] = serde_json::json!(max);
+        let envelope = request["_runtime_invocation"].as_object_mut().unwrap();
+        envelope.remove("range");
+        envelope.remove("progress");
+        request
+    }
+
+    #[test]
+    fn complete_metadata_http_preserves_whitespace_and_enforces_eof_and_cap() {
+        let whitespace = b" \n{ \"files\": [] }\t\n".to_vec();
+        let cap = vec![b' '; MAX_BOUNDED_READ_BYTES as usize];
+        let oversized = vec![b' '; MAX_BOUNDED_READ_BYTES as usize + 1];
+        let mut cases = Vec::new();
+        cases.push((b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\n{}\r\n0\r\n\r\n".to_vec(), Some(b"{}".to_vec())));
+        for bytes in [whitespace, cap] {
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&bytes);
+            cases.push((response, Some(bytes)));
+        }
+        // A chunked body has no advertised size; cap+1 must still fail.
+        let mut chunked = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+            oversized.len()
+        )
+        .into_bytes();
+        chunked.extend_from_slice(&oversized);
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+        cases.push((chunked, None));
+        for response in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: invalid\r\nConnection: close\r\n\r\n{}"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n{}"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\n{}\r\n"[..],
+            &b"HTTP/1.1 500 Error\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"[..],
+            &b"HTTP/1.1 302 Found\r\nLocation: /other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+        ] { cases.push((response.to_vec(), None)); }
+        for (response, expected) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut provider =
+                bounded_cat_fixture_provider(root.path(), listener.local_addr().unwrap().port());
+            let backend = std::thread::spawn(move || {
+                let mut socket = accept_bounded_fixture(&listener);
+                let headers = read_bounded_fixture_headers(&mut socket);
+                socket.write_all(&response).unwrap();
+                headers
+            });
+            let request = complete_metadata_request(MAX_BOUNDED_READ_BYTES);
+            let result = provider.handle(serde_json::from_value(request.clone()).unwrap());
+            let headers = backend.join().unwrap();
+            assert!(headers.contains("_elastos_object.json"));
+            assert!(!headers.contains("offset="));
+            assert!(headers.contains(&format!("length={}", MAX_BOUNDED_READ_BYTES + 1)));
+            if let Some(bytes) = expected {
+                let Response::Ok { data: Some(data) } = result else {
+                    panic!("metadata read failed: {result:?}")
+                };
+                assert_eq!(
+                    BASE64.decode(data["data"].as_str().unwrap()).unwrap(),
+                    bytes
+                );
+                assert_eq!(
+                    data["_runtime_complete_metadata"],
+                    serde_json::json!({
+                        "schema":"elastos.provider.complete-metadata/v1", "cid":request["cid"],
+                        "path":"_elastos_object.json", "max_bytes":MAX_BOUNDED_READ_BYTES,
+                        "actual_bytes":bytes.len(), "completed":true
+                    })
+                );
+                assert!(data.get("_runtime_applied_range").is_none());
+            } else {
+                assert!(matches!(result, Response::Error { .. }));
+            }
+            assert!(!root.path().join("unused-repo").exists());
+        }
+    }
+
+    #[test]
+    fn complete_metadata_rejects_ambiguous_inputs_before_backend_effect() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut provider =
+            bounded_cat_fixture_provider(root.path(), listener.local_addr().unwrap().port());
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("64"),
+            serde_json::json!(-1),
+        ] {
+            let mut request = complete_metadata_request(64);
+            request["max_bytes"] = value;
+            assert!(serde_json::from_value::<Request>(request).is_err());
+        }
+        for (field, value) in [
+            ("max_bytes", serde_json::json!(0)),
+            ("max_bytes", serde_json::json!(65537)),
+            ("path", serde_json::json!("weights.gguf")),
+            ("cid", serde_json::json!("cid?arg=other")),
+            ("bounded_read", serde_json::json!(false)),
+        ] {
+            let mut request = complete_metadata_request(64);
+            request[field] = value;
+            assert!(matches!(
+                provider.handle(serde_json::from_value(request).unwrap()),
+                Response::Error { .. }
+            ));
+        }
+        for (field, value) in [
+            ("range", serde_json::json!({"start":0,"end":3})),
+            (
+                "progress",
+                serde_json::json!({"request_id":"metadata","expected_bytes":4}),
+            ),
+            ("transfer", serde_json::json!("json")),
+            ("transport", serde_json::json!("carrier")),
+        ] {
+            let mut request = complete_metadata_request(64);
+            request["_runtime_invocation"][field] = value;
+            assert!(matches!(
+                provider.handle(serde_json::from_value(request).unwrap()),
+                Response::Error { .. }
+            ));
+        }
+        assert!(matches!(listener.accept(), Err(err) if err.kind() == io::ErrorKind::WouldBlock));
+        assert_eq!(read_coord_file(root.path()).unwrap().last_used, 1);
+        assert!(!root.path().join("unused-repo").exists());
+    }
+
+    #[test]
+    fn complete_metadata_timeout_closes_http_without_returning_partial_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut provider =
+            bounded_cat_fixture_provider(root.path(), listener.local_addr().unwrap().port());
+        let backend = std::thread::spawn(move || {
+            let mut socket = accept_bounded_fixture(&listener);
+            read_bounded_fixture_headers(&mut socket);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n{")
+                .unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(8)))
+                .unwrap();
+            let mut byte = [0];
+            match socket.read(&mut byte) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                    ) => {}
+                other => panic!("metadata timeout left HTTP active: {other:?}"),
+            }
+        });
+        let started = Instant::now();
+        let result =
+            provider.handle(serde_json::from_value(complete_metadata_request(64)).unwrap());
+        assert!(matches!(result, Response::Error { .. }));
+        assert!(started.elapsed() >= BOUNDED_READ_TIMEOUT - Duration::from_millis(100));
+        backend.join().unwrap();
     }
 
     fn accept_bounded_fixture(listener: &std::net::TcpListener) -> std::net::TcpStream {
