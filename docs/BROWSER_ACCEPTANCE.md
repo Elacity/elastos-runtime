@@ -66,12 +66,17 @@ not media or usability acceptance evidence.
 
 ## Execution order
 
-First define B01, instrument B03, and repair B02, B05, and B06. Define the B04
-operator contract at the same time so the repairs serve people and agents.
-Then complete B07 through B10 and the B04 adapters. Complete performance and
-daily-use work in B11 through B13, with B14 controls applied to every slice.
-B15 and B16 close the release gate. Each implementation slice includes its
-relevant tests; testing and security are continuous work.
+B01-B16 define release acceptance areas. Current execution slices, owners and
+deadline checkpoints live in [TASKS.md](../TASKS.md#browser-maturity-workstream).
+The accepted B01 contract and bounded B04 ownership prerequisites unblock their
+consumers while device and operator qualification remain open. Run local
+installation/usability, operator capability
+and independent Engine/Exit placement work in parallel where their contracts
+and resources allow it. B03 diagnostics and B14 authority checks apply to each
+slice; B12 profiles, B13 workflows and B15 update/repair stay in the delivery
+queue. Reserve time for B11 sustained-use proof before B16 final review.
+Every repair returns to the nearest installed product journey. Full acceptance
+below remains unchanged when an execution slice passes.
 
 The numbers below are proposed engineering targets. Record a baseline on named
 devices before changing them. Any target change needs an explicit rationale in

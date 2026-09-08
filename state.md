@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-09-07 UTC
+Last updated: 2026-09-08 UTC
 
 This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
@@ -70,42 +70,39 @@ volatile proof logs remain outside the repository.
 
 ## Browser contract and device qualification
 
-The task Mac currently uses the image with ICE lifetime source `77983efd`, rootfs
-`395a8c78fb1b888de69c9f0782990b974a039bd5909e6427ec2f2064f677f153`,
-and guest control source `6f5d48ae`, helper hash
+The task Mac now uses dependency repair `cbb1e099`, rootfs
+`d03ec02910defddfda432f0897b6f21b178eff52817df2e7b709bec7e1afa5aa`.
+Guest control remains source `6f5d48ae`, helper hash
 `eb963971286e8b82d95896c4ba8a849c9938d24dee8dc2a5936784a4564cb489`.
 Runtime, adapter, VZ helper, kernel and Browser UI were reused and verified.
-Runs 45–49 fail before page acquisition when the guest signaling connection
-closes while waiting for its legacy SDP offer. Each failed launch releases its
-acquired effects; Runtime and control report zero remaining sessions. The
-terminal producer log stops during video setup after the ICE hook, without a
-Python exception. This image is not accepted.
+The installed startup helper and gst-python override match the exported image.
 
-The preceding rootfs
-`a811e66ba443dd3b9dc43dbbad8c7f230eb6ddaf36a8150a861a2b11d09a0841`
-passes the requested Home-to-close journey in runs 41 and 42. Run 42 also passes
-viewer reload in 1066 ms and exact cleanup in 600 ms. Run 41 instead crashes the
-Selkies producer while recreating its video pipeline: GObject assertions precede
-a fatal allocation failure. A matching-library reproduction confirms a dangling
-ICE wrapper. Source `77983efd` passes two reference-ownership cases over 100
-cycles each, releasing all 400 agents. Those tests use bins in NULL state and
-leave real Selkies startup uncovered; its installed regression remains open.
-The real module produces an offer in isolation, but its data-channel structure
-constructor reproduces native heap corruption in a smaller matching-library
-test. The guest omits gst-python, whose override supplies that constructor.
-Installing only `python3-gst-1.0` makes the unchanged call pass. Reviewed source `cbb1e099` supplies that dependency and removes the legacy
-fraction workarounds. The new build gate and ten real video offer/stop cycles
-pass. The corrected image still needs installed journey and reload proof.
-Independent agent review accepts both core journeys and the single bounded
-reload in run 42. Repeated recovery qualification remains open.
-Run 43 confirms accepted Runtime click/text responses and normal browsing, then
-restores both interrupted transports and cleans up all 13 effects in 649 ms.
-Its cut-boundary observation fails. Two source regressions reproduce an early
-fractional timer; the monotonic expiration correction passes 254 related tests.
-Run 44 passes with that probe change: a 5001 ms HTTP/TURN cut, 1911 ms
-same-owner media/input recovery and exact cleanup in 624 ms. Independent agent review accepts this bounded interruption result.
-These are local development receipts; publication and full B01–B16 acceptance
-remain open.
+Runs 50–52 pass Home launch, controlled navigation, advancing decoded WebRTC
+frames, exact text, scrolling and fresh Home close. Each close confirms all 13
+cleanup effects and zero remaining Runtime/control obligations. Runs 50/52 also
+pass viewer reload in 1515/3236 ms. Run 51 passes a 5001 ms HTTP/TURN cut,
+4315 ms media stall, same-owner recovery in 1774 ms and exact cleanup in 686 ms.
+Independent agent review accepts all three raw receipt sets. Launcher readiness
+samples remain 14230/15403 ms; these samples already exceed the proposed
+five-second cold-launch budget, and a formal distribution remains pending.
+The delivery queue in TASKS runs startup/fresh-install, operator and remote
+work through their accepted contracts while B01 qualification stays open.
+
+The earlier image `395a8c78` failed cold startup in runs 45–49 after its ICE hook.
+A matching-library test reproduces native heap corruption in the unchanged
+Selkies data-channel Structure constructor. The image omitted gst-python, which
+provides that Python constructor. Installing `python3-gst-1.0` makes the same
+call pass. Source `cbb1e099` supplies the dependency, removes the old fraction
+workarounds and checks override identity, real values and Selkies initialization
+before image creation. Ten isolated real video offer/stop cycles pass without
+the recorded heap, GObject or mutable-structure errors. The separate guarded
+ICE ownership repair remains covered by its reference-balance tests.
+
+Earlier independently accepted core, reload and interruption receipts remain
+historical evidence for their exact images. The source-only RNG change remains
+outside the current image. All results are local development evidence;
+publication and full B01–B16 media, endurance, lease, remote placement, device,
+operator-adapter and human acceptance remain open.
 
 Browser B01 is in progress. The contract is in
 [docs/BROWSER_PROTOCOL.md](docs/BROWSER_PROTOCOL.md), and the role-specific
