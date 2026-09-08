@@ -3,9 +3,9 @@ use crate::config::{
     MAX_BACKEND_COST_BYTES, MAX_BACKEND_COST_UNIT_BYTES, MAX_MODEL_BYTES,
 };
 use crate::contract::{
-    BackendCost, BackendFact, BackendReport, BackendTokenUsage, ErrorClass, RunError, RunStatus,
-    RuntimeCreateBinding, BACKEND_REPORT_SCHEMA, RUN_OUTPUT_CONTENT_SCHEMA,
-    RUN_OUTPUT_OBJECT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
+    BackendCost, BackendFact, BackendReport, BackendTokenUsage, ErrorClass, RunError, RunEvent,
+    RunStatus, RuntimeCreateBinding, BACKEND_REPORT_SCHEMA, MAX_EVENT_SEQUENCE, RUN_EVENT_SCHEMA,
+    RUN_OUTPUT_CONTENT_SCHEMA, RUN_OUTPUT_OBJECT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
 };
 use crate::journal::{deterministic_run_id, now_ms};
 use crate::local_llama::{LocalLlamaEngines, LocalLlamaFault};
@@ -32,6 +32,10 @@ pub(crate) const LOCAL_TEXT_BACKEND_STATE_SCHEMA: &str =
     "elastos.model.provider-local-text-state/v1";
 const BACKEND_CONNECT_TIMEOUT_MS: u64 = 500;
 const LOCAL_TEXT_DELTA_FLUSH_BYTES: usize = 8 * 1024;
+const LOCAL_TEXT_DELTA_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+// Leave at least half the journal event count for size flushes and lifecycle
+// events. The state owner still enforces exact count/aggregate/terminal bounds.
+const LOCAL_TEXT_TIMED_FLUSH_LIMIT: usize = crate::config::MAX_RUN_EVENT_COUNT_LIMIT / 2;
 const MAX_LOCAL_TEXT_SSE_LINE_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_TEXT_SSE_EVENT_BYTES: usize = 128 * 1024;
 
@@ -1529,11 +1533,24 @@ async fn run_local_text_worker_inner(
     let mut event_data = Vec::new();
     let mut stream_state = LocalTextStreamState::new();
     let mut done = false;
+    let mut flush_timer = tokio::time::interval_at(
+        tokio::time::Instant::now() + LOCAL_TEXT_DELTA_FLUSH_INTERVAL,
+        LOCAL_TEXT_DELTA_FLUSH_INTERVAL,
+    );
+    flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut timed_flushes = 0;
 
     while !done {
         let next = tokio::select! {
             _ = task.cancel_rx.changed() => {
                 return Ok(worker_settlement_unknown_result());
+            }
+            _ = flush_timer.tick(), if timed_flushes < LOCAL_TEXT_TIMED_FLUSH_LIMIT
+                && !stream_state.delta_buffer.is_empty() => {
+                flush_local_text_delta(&task.offer, &task.run_id, task.generation,
+                    &task.updates, &mut stream_state.delta_buffer).await?;
+                timed_flushes += 1;
+                continue;
             }
             chunk = response.chunk() => chunk.map_err(|err| map_text_reqwest_failure(err, private_endpoint))?
         };
@@ -1584,7 +1601,10 @@ async fn run_local_text_worker_inner(
                 match parsed {
                     ParsedTextStreamEvent::Delta(delta) if !delta.is_empty() => {
                         append_local_text_delta(&mut stream_state, &task.offer, &delta)?;
-                        if stream_state.delta_buffer.len() >= LOCAL_TEXT_DELTA_FLUSH_BYTES {
+                        if stream_state.delta_buffer.len() >= LOCAL_TEXT_DELTA_FLUSH_BYTES
+                            || local_text_event_bytes(&stream_state.delta_buffer)?
+                                >= task.offer.policy.event_bytes_limit
+                        {
                             flush_local_text_delta(
                                 &task.offer,
                                 &task.run_id,
@@ -1716,6 +1736,51 @@ fn map_text_reqwest_failure(err: reqwest::Error, private_endpoint: bool) -> Adap
     map_reqwest_failure(err)
 }
 
+fn local_text_event_bytes(text: &str) -> std::result::Result<u64, AdapterFault> {
+    // Match the complete local delta envelope stored by the coordinator. The
+    // largest allowed sequence bounds its overhead without predicting a cursor.
+    serde_json::to_vec(&RunEvent {
+        schema: RUN_EVENT_SCHEMA.into(),
+        sequence: MAX_EVENT_SEQUENCE,
+        kind: "text_delta".into(),
+        data: json!({"text": text}),
+        backend_report: None,
+        terminal: false,
+    })
+    .map(|bytes| bytes.len() as u64)
+    .map_err(|err| {
+        AdapterFault::malformed(
+            "model backend returned invalid data",
+            format!("failed to encode text stream event: {err}"),
+        )
+    })
+}
+
+fn local_text_chunk_end(text: &str, limit: u64) -> std::result::Result<usize, AdapterFault> {
+    let (mut low, mut high) = (0, text.len());
+    while low < high {
+        let mut middle = low + (high - low).div_ceil(2);
+        while !text.is_char_boundary(middle) {
+            middle -= 1;
+        }
+        if middle == low {
+            middle += text[low..].chars().next().unwrap().len_utf8();
+        }
+        if local_text_event_bytes(&text[..middle])? <= limit {
+            low = middle;
+        } else {
+            high = text[..middle].char_indices().next_back().unwrap().0;
+        }
+    }
+    if low == 0 {
+        return Err(AdapterFault::malformed(
+            "model backend returned invalid data",
+            "text stream event exceeds configured limits",
+        ));
+    }
+    Ok(low)
+}
+
 async fn flush_local_text_delta(
     offer: &ConfiguredOffer,
     run_id: &str,
@@ -1727,34 +1792,29 @@ async fn flush_local_text_delta(
         return Ok(());
     }
     let delta = std::mem::take(delta_buffer);
-    let delta_event = json!({ "text": delta });
-    let encoded = serde_json::to_vec(&delta_event).map_err(|err| {
-        AdapterFault::malformed(
-            "model backend returned invalid data",
-            format!("failed to encode text stream event: {err}"),
+    let mut remaining = delta.as_str();
+    while !remaining.is_empty() {
+        let end = local_text_chunk_end(remaining, offer.policy.event_bytes_limit)?;
+        let delta_event = json!({ "text": &remaining[..end] });
+        send_worker_apply_update(
+            run_id,
+            generation,
+            WorkerApplyGuard::None,
+            ReconcileResult::StillRunning {
+                events: vec![EventSeed {
+                    kind: "text_delta",
+                    data: delta_event,
+                }],
+                backend_state: serialize_local_text_backend_state(false)?,
+                status: RunStatus::Running,
+            },
+            updates,
         )
-    })?;
-    if encoded.len() as u64 > offer.policy.event_bytes_limit {
-        return Err(AdapterFault::malformed(
-            "model backend returned invalid data",
-            "text stream event exceeds configured limits",
-        ));
+        .await?;
+        // Only an applied acknowledgement permits the next chunk.
+        remaining = &remaining[end..];
     }
-    send_worker_apply_update(
-        run_id,
-        generation,
-        WorkerApplyGuard::None,
-        ReconcileResult::StillRunning {
-            events: vec![EventSeed {
-                kind: "text_delta",
-                data: delta_event,
-            }],
-            backend_state: serialize_local_text_backend_state(false)?,
-            status: RunStatus::Running,
-        },
-        updates,
-    )
-    .await
+    Ok(())
 }
 
 fn append_local_text_delta(
@@ -2804,7 +2864,10 @@ mod tests {
             self.shutdown.store(true, Ordering::Relaxed);
             let _ = TcpStream::connect(self.base_url.strip_prefix("http://").unwrap_or(""));
             if let Some(join) = self.join.take() {
-                let _ = join.join();
+                let result = join.join();
+                if !thread::panicking() {
+                    result.expect("HTTP fixture thread failed");
+                }
             }
         }
     }
@@ -2824,7 +2887,9 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let requests_clone = Arc::clone(&requests);
         let shutdown_clone = Arc::clone(&shutdown);
-        let join = thread::spawn(move || {
+        let join = thread::Builder::new()
+            .name(format!("http-fixture:{}", thread::current().name().unwrap_or("unnamed-test")))
+            .spawn(move || {
             for spec in responses {
                 let (mut stream, _) = loop {
                     match listener.accept() {
@@ -2838,6 +2903,10 @@ mod tests {
                         Err(err) => panic!("test server accept failed: {err}"),
                     }
                 };
+                // Drop's connection wakes accept; it is not a client request.
+                if shutdown_clone.load(Ordering::Relaxed) {
+                    return;
+                }
                 stream.set_nonblocking(false).unwrap();
                 let request = read_request(&mut stream);
                 requests_clone.lock().unwrap().push(request);
@@ -2858,7 +2927,7 @@ mod tests {
                 stream.write_all(&spec.body).unwrap();
                 stream.flush().unwrap();
             }
-        });
+        }).unwrap();
         TestServer {
             base_url,
             requests,
@@ -3449,6 +3518,264 @@ mod tests {
         assert!(update_rx.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn local_text_small_delta_is_visible_before_stream_completion() {
+        check_small_live_delta(false).await;
+    }
+
+    #[tokio::test]
+    async fn local_text_small_delta_can_cancel_before_stream_completion() {
+        check_small_live_delta(true).await;
+    }
+
+    async fn check_small_live_delta(cancel: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/chat", listener.local_addr().unwrap());
+        let prefix = sse_body(
+            &[r#"{"choices":[{"delta":{"content":"small live delta"}}]}"#],
+            false,
+        );
+        let suffix = sse_body(&[], true);
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let server = tokio::task::spawn_blocking(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            read_request(&mut stream);
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n", prefix.len() + suffix.len()).unwrap();
+            stream.write_all(&prefix).unwrap();
+            stream.flush().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let result = stream.write_all(&suffix).and_then(|_| stream.flush());
+            if !cancel {
+                result.unwrap();
+            }
+        });
+        let mut offer = openai_offer(&url);
+        offer.policy.runtime_ms_limit = 120_000;
+        offer.policy.event_bytes_limit = 65536 + 1024;
+        offer.policy.inline_output_bytes_limit = 65536;
+        let (update_tx, mut update_rx) = mpsc::channel(8);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let worker = tokio::spawn(async move {
+            let mut task = LocalTextWorkerTask {
+                run_id: "small-live-delta".into(),
+                generation: 1,
+                backend: LocalTextBackend::OpenAiCompatible {
+                    api_url: url,
+                    api_key: None,
+                    model: "fixture".into(),
+                },
+                offer,
+                deadline_ms: now_ms() + 120_000,
+                prompt: "hello".into(),
+                cancel_rx,
+                updates: update_tx,
+            };
+            run_local_text_worker_inner(&mut task).await
+        });
+        // The server cannot complete until this observation has settled. Even
+        // the RED path releases it and drains Applied acknowledgements first.
+        let early = tokio::time::timeout(Duration::from_secs(2), update_rx.recv()).await;
+        let visible_while_active = matches!(&early, Ok(Some(_)));
+        if cancel {
+            cancel_tx.send(true).unwrap();
+        } else {
+            release_tx.send(()).unwrap();
+        }
+        let mut delivered = String::new();
+        let mut next = early.ok().flatten();
+        loop {
+            let update = if let Some(update) = next.take() {
+                Some(update)
+            } else {
+                update_rx.recv().await
+            };
+            let Some(update) = update else { break };
+            match update {
+                WorkerUpdate::Apply {
+                    result: ReconcileResult::StillRunning { events, status, .. },
+                    acknowledge,
+                    ..
+                } => {
+                    assert_eq!(status, RunStatus::Running);
+                    assert!(
+                        !worker.is_finished(),
+                        "worker must await Applied acknowledgement"
+                    );
+                    assert!(
+                        update_rx.try_recv().is_err(),
+                        "unacknowledged update must apply backpressure"
+                    );
+                    for event in events {
+                        delivered.push_str(event.data["text"].as_str().unwrap());
+                    }
+                    acknowledge.send(WorkerApplyAck::Applied).unwrap();
+                }
+                other => panic!("unexpected streaming update: {other:?}"),
+            }
+        }
+        let result = worker.await.unwrap().unwrap();
+        if cancel {
+            release_tx.send(()).unwrap();
+        }
+        server.await.unwrap();
+        assert_eq!(delivered, "small live delta");
+        if cancel {
+            assert!(matches!(
+                result,
+                ReconcileResult::Terminal {
+                    status: RunStatus::SettlementUnknown,
+                    ..
+                }
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                ReconcileResult::Terminal {
+                    status: RunStatus::Completed,
+                    ..
+                }
+            ));
+        }
+        assert!(
+            visible_while_active,
+            "small delta stayed buffered until completion"
+        );
+    }
+
+    #[test]
+    fn local_text_timed_flushes_leave_qwen_journal_headroom() {
+        // Runtime's current Qwen output profile. Size flushes consume at least
+        // 8 KiB each; timed flushes have their own hard cap. Allow a final delta
+        // and four lifecycle events in addition to the reserved terminal event.
+        let output_limit = 65536usize;
+        let deltas =
+            LOCAL_TEXT_TIMED_FLUSH_LIMIT + output_limit.div_ceil(LOCAL_TEXT_DELTA_FLUSH_BYTES) + 1;
+        assert!(deltas + 4 < crate::config::MAX_RUN_EVENT_COUNT_LIMIT);
+        let encoded_overhead = local_text_event_bytes("").unwrap();
+        let aggregate = output_limit as u64 + deltas as u64 * encoded_overhead;
+        assert!(
+            aggregate + crate::config::MAX_EVENT_BYTES_LIMIT
+                < crate::config::MAX_RUN_EVENT_AGGREGATE_BYTES_LIMIT
+        );
+    }
+
+    #[tokio::test]
+    async fn local_text_small_event_budget_splits_one_large_escaped_delta() {
+        use crate::contract::{RunEvent, MAX_EVENT_SEQUENCE, RUN_EVENT_SCHEMA};
+
+        // Same streaming worker as LocalLlama, with deterministic SSE bytes.
+        let text = "🌿\"\\\n".repeat(1600);
+        let delta = json!({"choices":[{"delta":{"content":text}}]}).to_string();
+        let server = start_server(vec![HttpResponseSpec {
+            status_line: "200 OK",
+            body: sse_body(&[&delta], true),
+            headers: vec![("Content-Type".into(), "text/event-stream".into())],
+        }]);
+        let mut offer = openai_offer(&format!("{}/chat", server.base_url));
+        offer.policy.event_bytes_limit = 4096;
+        offer.policy.inline_output_bytes_limit = 65536;
+        offer.policy.runtime_ms_limit = 120000;
+        let (update_tx, mut update_rx) = mpsc::channel(8);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut task = LocalTextWorkerTask {
+            run_id: "run-admitted-budget".into(),
+            generation: 1,
+            backend: LocalTextBackend::OpenAiCompatible {
+                api_url: format!("{}/chat", server.base_url),
+                api_key: None,
+                model: "fixture".into(),
+            },
+            offer,
+            deadline_ms: now_ms().saturating_add(120000),
+            prompt: "fixture".into(),
+            cancel_rx,
+            updates: update_tx,
+        };
+        let worker = tokio::spawn(async move { run_local_text_worker_inner(&mut task).await });
+        let mut reconstructed = String::new();
+        let mut event_count = 0usize;
+        let mut aggregate = 0usize;
+        let mut full_events_bounded = true;
+        while let Some(update) = tokio::time::timeout(Duration::from_secs(10), update_rx.recv())
+            .await
+            .expect("bounded delta acknowledgement wait")
+        {
+            match update {
+                WorkerUpdate::Apply {
+                    result: ReconcileResult::StillRunning { events, status, .. },
+                    acknowledge,
+                    ..
+                } => {
+                    assert_eq!(status, RunStatus::Running);
+                    assert!(
+                        !worker.is_finished(),
+                        "worker must wait for apply acknowledgement"
+                    );
+                    for seed in events {
+                        assert_eq!(seed.kind, "text_delta");
+                        let part = seed.data["text"].as_str().unwrap();
+                        assert!(!part.is_empty());
+                        reconstructed.push_str(part);
+                        let event = RunEvent {
+                            schema: RUN_EVENT_SCHEMA.into(),
+                            sequence: MAX_EVENT_SEQUENCE,
+                            kind: seed.kind.into(),
+                            data: seed.data,
+                            backend_report: None, // Actual text_delta envelope has no report.
+                            terminal: false,
+                        };
+                        let bytes = serde_json::to_vec(&event).unwrap().len();
+                        full_events_bounded &= bytes <= 4096;
+                        aggregate += bytes;
+                        event_count += 1;
+                    }
+                    acknowledge
+                        .send(if full_events_bounded {
+                            WorkerApplyAck::Applied
+                        } else {
+                            WorkerApplyAck::Rejected
+                        })
+                        .unwrap();
+                }
+                other => panic!("unexpected streaming update: {other:?}"),
+            }
+        }
+        let result = worker.await.unwrap();
+        assert!(
+            full_events_bounded,
+            "complete serialized RunEvent exceeds configured budget"
+        );
+        assert!(
+            event_count > 1,
+            "one oversized SSE delta must yield bounded active events; result={result:?}"
+        );
+        assert_eq!(reconstructed, text);
+        assert!(event_count < crate::config::MAX_RUN_EVENT_COUNT_LIMIT);
+        assert!(
+            aggregate as u64
+                <= crate::config::MAX_RUN_EVENT_AGGREGATE_BYTES_LIMIT
+                    - crate::config::MAX_EVENT_BYTES_LIMIT
+        );
+        let ReconcileResult::Terminal {
+            status,
+            output,
+            error,
+            ..
+        } = result.unwrap()
+        else {
+            panic!("worker did not complete");
+        };
+        assert_eq!(status, RunStatus::Completed);
+        assert!(error.is_none());
+        assert_eq!(output.unwrap()["text"], text);
+        // This adapter result is not proof that a large terminal output event
+        // passes the coordinator's separate complete-event budget.
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn local_text_apply_rejection_fails_closed_before_completion() {
         let mut offer = openai_offer("http://example.invalid/chat");
@@ -3880,7 +4207,8 @@ mod tests {
             )],
         }]);
         let runtime = RunningRuntime::start();
-        let executor = LiveAdapterExecutor::new(runtime.handle.clone(), mpsc::channel(4).0);
+        let (update_tx, mut update_rx) = mpsc::channel(4);
+        let executor = LiveAdapterExecutor::new(runtime.handle.clone(), update_tx);
         let openai_offer = openai_offer(&format!("{}/chat", redirect.base_url));
 
         let fault = dispatch_text(
@@ -3898,7 +4226,56 @@ mod tests {
         .unwrap();
 
         assert!(matches!(fault, DispatchResult::Running { .. }));
+        let mut saw_rejection = false;
+        loop {
+            let update = runtime
+                .handle
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), update_rx.recv()).await
+                })
+                .unwrap()
+                .unwrap();
+            match update {
+                WorkerUpdate::Apply {
+                    result:
+                        ReconcileResult::Terminal {
+                            status,
+                            error,
+                            output,
+                            ..
+                        },
+                    acknowledge,
+                    ..
+                } => {
+                    assert_eq!(status, RunStatus::Failed);
+                    assert_eq!(error.unwrap().class, ErrorClass::BackendFailed);
+                    assert!(output.is_none());
+                    acknowledge.send(WorkerApplyAck::Applied).unwrap();
+                    saw_rejection = true;
+                }
+                WorkerUpdate::Exited { .. } => break,
+                other => panic!("unexpected redirect update: {other:?}"),
+            }
+        }
+        runtime.handle.block_on(executor.shutdown_workers());
+        assert!(
+            saw_rejection,
+            "redirect dispatch must actually fail before teardown"
+        );
+        assert_eq!(redirect.requests.lock().unwrap().len(), 1);
         assert_eq!(target.requests.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn http_fixture_wake_only_teardown_records_no_request() {
+        let server = start_server(vec![HttpResponseSpec {
+            status_line: "200 OK",
+            body: b"unused".to_vec(),
+            headers: Vec::new(),
+        }]);
+        let requests = server.requests.clone();
+        drop(server);
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     #[test]

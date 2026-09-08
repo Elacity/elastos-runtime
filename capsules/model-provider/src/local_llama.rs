@@ -487,7 +487,7 @@ async fn terminate_child(
     }
     if let Some(group) = guard_group {
         if group <= 1 || child.id().is_some_and(|pid| pid != group as u32) {
-            return Err(LocalLlamaFault::Failed);
+            return Err(guard_close_failed("guard_identity", None));
         }
         liveness.take();
         return finish_guard_shutdown(child, group, timeout).await;
@@ -524,36 +524,50 @@ async fn finish_guard_shutdown(
     timeout: Duration,
 ) -> Result<(), LocalLlamaFault> {
     if guard_group == unsafe { libc::getpgrp() } {
-        return Err(LocalLlamaFault::Failed);
+        return Err(guard_close_failed("guard_own_group", None));
     }
     if child.id().is_some() {
         let deadline = Instant::now()
             .checked_add(timeout.saturating_add(GUARD_EXIT_GRACE))
             .ok_or(LocalLlamaFault::Timeout)?;
-        while !child_exited_without_reaping(guard_group).map_err(|_| LocalLlamaFault::Failed)? {
+        let guard_exited = loop {
+            if child_exited_without_reaping(guard_group)
+                .map_err(|error| guard_close_failed("guard_waitid", error.raw_os_error()))?
+            {
+                break true;
+            }
             if Instant::now() >= deadline {
-                break;
+                break false;
             }
             sleep(
                 Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
             )
             .await;
-        }
+        };
         // Keep the guard PID unreaped while signalling its group. A retry after
         // reaping only observes absence; it must not signal a recycled group ID.
-        signal_process_group(guard_group, libc::SIGKILL).map_err(|_| LocalLlamaFault::Failed)?;
+        if let Err(error) = signal_process_group(guard_group, libc::SIGKILL) {
+            if !exited_guard_signal_can_settle(guard_exited, error.raw_os_error()) {
+                return Err(guard_close_failed("guard_signal", error.raw_os_error()));
+            }
+            // Darwin excludes zombies from killpg recipients and can return
+            // EPERM for a zombie-only group (XNU bsd/kern/kern_sig.c, killpg1).
+            // This permits only the owned reap below, not successful closure:
+            // the post-reap group probe must still establish ESRCH.
+        }
     }
     let deadline = tokio::time::Instant::now() + GUARD_EXIT_GRACE;
     tokio::time::timeout_at(deadline, child.wait())
         .await
         .map_err(|_| LocalLlamaFault::Timeout)?
-        .map_err(|_| LocalLlamaFault::Failed)?;
+        .map_err(|error| guard_close_failed("guard_wait", error.raw_os_error()))?;
     loop {
         if unsafe { libc::kill(-guard_group, 0) } != 0 {
-            return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            return if errno == Some(libc::ESRCH) {
                 Ok(())
             } else {
-                Err(LocalLlamaFault::Failed)
+                Err(guard_close_failed("guard_absence", errno))
             };
         }
         if tokio::time::Instant::now() >= deadline {
@@ -574,6 +588,18 @@ async fn finish_guard_shutdown(
     _timeout: Duration,
 ) -> Result<(), LocalLlamaFault> {
     Err(LocalLlamaFault::Failed)
+}
+
+#[cfg(unix)]
+fn exited_guard_signal_can_settle(guard_exited: bool, errno: Option<i32>) -> bool {
+    cfg!(target_os = "macos") && guard_exited && errno == Some(libc::EPERM)
+}
+
+fn guard_close_failed(stage: &'static str, errno: Option<i32>) -> LocalLlamaFault {
+    // Private diagnostics carry only a fixed stage and OS error number, never
+    // artifact paths, model text, or caller identity. Failure semantics stay exact.
+    eprintln!("[model-provider] local engine closure stage={stage} errno={errno:?}");
+    LocalLlamaFault::Failed
 }
 
 #[cfg(unix)]
@@ -1008,6 +1034,74 @@ mod tests {
         }
         assert!(process_exists(pid));
         engines.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn exited_guard_signal_exception_is_platform_and_state_scoped() {
+        for guard_exited in [false, true] {
+            for errno in [
+                None,
+                Some(libc::EPERM),
+                Some(libc::EACCES),
+                Some(libc::ESRCH),
+            ] {
+                assert_eq!(
+                    exited_guard_signal_can_settle(guard_exited, errno),
+                    cfg!(target_os = "macos") && guard_exited && errno == Some(libc::EPERM),
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reaped_guard_does_not_signal_or_accept_surviving_group_member() {
+        use std::os::unix::process::CommandExt as _;
+
+        // Both fixture descendants are direct children of the test, so it can
+        // reap each exactly. Group membership is the shutdown ownership boundary.
+        let mut guard_command = Command::new("/bin/cat");
+        guard_command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        guard_command.as_std_mut().process_group(0);
+        let mut guard = guard_command.spawn().unwrap();
+        let group = guard.id().unwrap() as libc::pid_t;
+        let mut member_command = Command::new("/bin/cat");
+        member_command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        member_command.as_std_mut().process_group(group);
+        let mut member = member_command.spawn().unwrap();
+        let member_pid = member.id().unwrap() as libc::pid_t;
+
+        let guard_exit = guard.kill().await; // Owned wait leaves child.id() == None.
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            finish_guard_shutdown(&mut guard, group, Duration::from_millis(100)),
+        )
+        .await;
+        let member_survived = process_exists(member_pid);
+        // Clean up before checking outcomes, including the failure path. The
+        // test owns these exact Child handles; it never signals an unowned group.
+        let member_exit = member.kill().await;
+        let guard_cleanup = if guard.id().is_some() {
+            guard.kill().await
+        } else {
+            Ok(())
+        };
+        guard_exit.unwrap();
+        member_exit.unwrap();
+        guard_cleanup.unwrap();
+        assert_eq!(result.unwrap(), Err(LocalLlamaFault::Timeout));
+        assert!(
+            member_survived,
+            "post-reap shutdown signalled the surviving member"
+        );
+        assert!(!process_exists(member_pid));
     }
 
     #[tokio::test(flavor = "current_thread")]

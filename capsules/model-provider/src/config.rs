@@ -795,6 +795,35 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{symlink, PermissionsExt as _};
 
+    #[test]
+    #[ignore = "requires exact read-only Qwen weights; measures the production verifier"]
+    fn qwen_artifact_verification_within_runtime_profile() {
+        let path = fs::canonicalize(
+            std::env::var_os("ELASTOS_TEST_QWEN_PATH").expect("explicit Qwen weights prerequisite"),
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 6_169_341_984);
+        let artifact = LocalArtifactConfig {
+            path: path.to_string_lossy().into_owned(),
+            sha256: "sha256:d784ce9eda1a5a7b51e8f705a9e6310844bf4f173654d115823c775fdea56d43"
+                .into(),
+        };
+        let started = std::time::Instant::now();
+        // The Runtime's current first profile shares 120 s across verification,
+        // startup and generation. This diagnostic isolates verification only.
+        let result = revalidate_local_artifact(
+            &artifact,
+            false,
+            started + std::time::Duration::from_millis(120_000),
+        );
+        eprintln!(
+            "Qwen artifact verification elapsed_ms={} result={:?}",
+            started.elapsed().as_millis(),
+            result
+        );
+        result.expect("exact Qwen verification within unchanged Runtime profile");
+    }
+
     fn base_offer() -> ConfiguredOffer {
         ConfiguredOffer {
             id: "offer".to_string(),

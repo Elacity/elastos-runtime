@@ -5,7 +5,7 @@ mod test_support;
 
 use elastos_model_contract::{model_input_hash, RUNTIME_CREATE_BINDING_SCHEMA};
 use serde_json::{json, Value};
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -14,11 +14,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const PROCESS_DEADLINE: Duration = Duration::from_secs(5);
+const MAX_STDERR_BYTES: usize = 64 * 1024;
 
 struct ProviderProcess {
     child: Child,
     stdin: Option<ChildStdin>,
     responses: Receiver<Value>,
+    stderr: Receiver<std::io::Result<(Vec<u8>, bool)>>,
 }
 
 impl ProviderProcess {
@@ -26,10 +28,30 @@ impl ProviderProcess {
         let mut child = Command::new(env!("CARGO_BIN_EXE_model-provider"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let result = (|| -> std::io::Result<_> {
+                let mut captured = Vec::new();
+                let mut overflow = false;
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let count = stderr.read(&mut buffer)?;
+                    if count == 0 {
+                        return Ok((captured, overflow));
+                    }
+                    let retained = count.min(MAX_STDERR_BYTES - captured.len());
+                    captured.extend_from_slice(&buffer[..retained]);
+                    overflow |= retained < count;
+                    // Drain after the cap too, so diagnostics cannot block the child.
+                }
+            })();
+            let _ = stderr_tx.send(result);
+        });
         let (response_tx, responses) = mpsc::channel();
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
@@ -48,6 +70,7 @@ impl ProviderProcess {
             stdin: child.stdin.take(),
             child,
             responses,
+            stderr: stderr_rx,
         }
     }
 
@@ -280,6 +303,17 @@ fn normal_provider_shutdown_reaps_local_llama_engine() {
             .filter(|line| line.as_str() == "term")
             .count(),
         1
+    );
+    let (stderr, overflow) = provider
+        .stderr
+        .recv_timeout(PROCESS_DEADLINE)
+        .unwrap()
+        .unwrap();
+    assert!(!overflow, "provider stderr exceeded fixture limit");
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(
+        !stderr.contains("local engine closure"),
+        "normal shutdown did not confirm engine closure: {stderr}"
     );
 }
 
