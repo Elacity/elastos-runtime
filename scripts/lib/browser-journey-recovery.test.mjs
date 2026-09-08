@@ -164,6 +164,52 @@ test("five-second cut proves request failure and media stall, then same-owner vi
   assert.ok(!JSON.stringify(evidence).includes("current-text"));
 });
 
+test("a separate media interruption has five seconds after both cut acknowledgements", async () => {
+  const f = fixture();
+  let cutAt, restoreAt;
+  f.args.mediaInterruption = {
+    async cut() {
+      assert.ok(f.calls.some(call => call.params?.offline === true));
+      await new Promise(resolve => f.args.clock.setTimeout(resolve, 200));
+      cutAt = f.args.clock.now();
+    },
+    async restore() { restoreAt = f.args.clock.now(); },
+  };
+  const evidence = await f.run();
+  assert.equal(restoreAt - cutAt, 5000);
+  assert.equal(evidence.media_cut_acknowledged, true);
+  assert.equal(evidence.restore.http_ok, true);
+  assert.equal(evidence.restore.media_ok, true);
+  assert.equal(evidence.ok, true);
+  assertRestoredAndDetached(f);
+});
+
+for (const failing of ["mediaCut", "mediaRestore", "httpRestore", "baseline", "mediaCutTimeout"]) {
+  test(`${failing} failure still restores both transports and detaches`, async () => {
+    const f = fixture({ restoreError: failing === "httpRestore", bindingError: failing === "baseline" });
+    let mediaRestored = 0;
+    f.args.mediaInterruption = {
+      async cut() {
+        if (failing === "mediaCut") throw new Error(secret);
+        if (failing === "mediaCutTimeout") await new Promise(() => {});
+      },
+      async restore() {
+        mediaRestored++;
+        if (failing === "mediaRestore") throw new Error(secret);
+      },
+    };
+    await assert.rejects(f.run(), error => {
+      assert.equal(error.evidence.ok, false);
+      assert.equal(error.evidence.restore.http_ok, failing !== "httpRestore");
+      assert.equal(error.evidence.restore.media_ok, failing !== "mediaRestore");
+      assert.ok(!JSON.stringify(error.evidence).includes(secret));
+      return true;
+    });
+    assert.equal(mediaRestored, 1);
+    assertRestoredAndDetached(f);
+  });
+}
+
 test("decoded frames remain sufficient when byte metrics are absent", async () => {
   assert.equal((await fixture({ noBytes: true }).run()).ok, true);
 });

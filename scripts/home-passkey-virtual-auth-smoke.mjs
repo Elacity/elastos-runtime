@@ -148,6 +148,7 @@ const CHECK_BROWSER_EMBEDDED_UI_INPUT =
 const CHECK_BROWSER_CONTROLLED_JOURNEY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_JOURNEY === "1";
 const CHECK_BROWSER_CONTROLLED_RECOVERY = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_RECOVERY === "1";
+const BROWSER_CONTROLLED_TURN_TEST_HOME = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_TURN_TEST_HOME || "";
 const REQUIRE_BROWSER_VZ_TRANSPORT = process.env.HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VZ_TRANSPORT === "1";
 const BROWSER_JOURNEY_FIXTURE_ORIGIN = process.env.HOME_VIRTUAL_AUTH_BROWSER_FIXTURE_ORIGIN ||
   "http://localhost:61511";
@@ -2289,11 +2290,22 @@ async function runControlledBrowserRecovery(page, appFrame, token, readReceipt, 
     assert(index >= 0, "Recovery observer could not identify the Browser frame");
     sourceChain.unshift(index);
   }
+  const mediaInterruption = BROWSER_CONTROLLED_TURN_TEST_HOME
+    ? await (await import("./lib/browser-journey-turn-interruption.mjs")).createBrowserTurnInterruption({
+      testHome: BROWSER_CONTROLLED_TURN_TEST_HOME,
+      runtimeOrigin,
+      pageId: await appFrame.evaluate(() => window.__elastosBrowserCurrentPageId),
+    }).catch(error => {
+      error.details = { recovery: { ok: false, failure: "media_driver_binding_failed",
+        media_driver: error.evidence } };
+      throw error;
+    }) : null;
   const { session: cdp, ancestorDepth } = await browserRecoveryCdpSession(page, appFrame);
   try {
     const evidence = await diagnoseBrowserJourneyRecovery({
       cdp,
       expectedUrl,
+      mediaInterruption,
       readBinding: async ({ signal }) => {
         // This observer uses the same scoped authority outside the cut viewer.
         const response = await fetch(summaryUrl, { headers: { Origin: "null", "x-elastos-home-token": token }, signal });
@@ -2385,10 +2397,12 @@ async function runControlledBrowserRecovery(page, appFrame, token, readReceipt, 
         };
       },
     });
-    return { ...evidence, cdp_ancestor_depth: ancestorDepth };
+    return { ...evidence, cdp_ancestor_depth: ancestorDepth,
+      ...(mediaInterruption ? { media_driver: mediaInterruption.evidence } : {}) };
   } catch (error) {
     error.details = { ...error.details, recovery: { ...error.evidence,
-      failure: error.evidence?.failure || "probe_setup_or_observation_failed", cdp_ancestor_depth: ancestorDepth } };
+      failure: error.evidence?.failure || "probe_setup_or_observation_failed", cdp_ancestor_depth: ancestorDepth,
+      ...(mediaInterruption ? { media_driver: mediaInterruption.evidence } : {}) } };
     throw error;
   }
 }
@@ -4189,6 +4203,8 @@ async function revokeCurrentPasskey(page, proofBindingId, homeToken) {
 }
 
 async function main() {
+  assert(!BROWSER_CONTROLLED_TURN_TEST_HOME || CHECK_BROWSER_CONTROLLED_RECOVERY,
+    "The task TURN interruption requires controlled Browser recovery");
   assert(!CHECK_BROWSER_CONTROLLED_RECOVERY || CHECK_BROWSER_CONTROLLED_JOURNEY,
     "Controlled Browser recovery requires the controlled journey");
   assert(!CHECK_BROWSER_CONTROLLED_JOURNEY || (INCLUDE_BROWSER && CHECK_BROWSER_EMBEDDED_UI_INPUT &&

@@ -80,7 +80,7 @@ function video(value, bytesRequired = false) {
  */
 export async function diagnoseBrowserJourneyRecovery({
   cdp, readBinding, readVideo, readReceipt, extendInput, probeViewerRequest, observeRequests,
-  expectedUrl,
+  expectedUrl, mediaInterruption,
   inputSuffix = "-recovered",
   clock = { now: () => performance.now(), setTimeout, clearTimeout },
 }) {
@@ -188,6 +188,10 @@ export async function diagnoseBrowserJourneyRecovery({
       await within(deadline, "network_cut_deadline", () => cdp.send("Network.emulateNetworkConditions", {
         offline: true, latency: 0, downloadThroughput: -1, uploadThroughput: -1, packetLoss: 100,
       }));
+      if (mediaInterruption) {
+        await within(deadline, "media_cut_deadline", budget => mediaInterruption.cut(budget));
+        evidence.media_cut_acknowledged = true;
+      }
       phase = "cut";
       const cutStarted = clock.now(), cutDeadline = cutStarted + WINDOW_MS;
       let unchangedSince = cutStarted;
@@ -222,9 +226,21 @@ export async function diagnoseBrowserJourneyRecovery({
       phase = "restoring";
       evidence.restore.attempted = true;
       try {
-        await within(clock.now() + WINDOW_MS, "network_restore_deadline", () => cdp.send("Network.emulateNetworkConditions", {
-          offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1, packetLoss: 0,
-        }));
+        const restoreDeadline = clock.now() + WINDOW_MS;
+        // These independent restores both run even if either transport fails.
+        const [http, media] = await Promise.allSettled([
+          within(restoreDeadline, "network_restore_deadline", () => cdp.send("Network.emulateNetworkConditions", {
+            offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1, packetLoss: 0,
+          })),
+          mediaInterruption
+            ? within(restoreDeadline, "media_restore_deadline", budget => mediaInterruption.restore(budget))
+            : Promise.resolve(),
+        ]);
+        if (mediaInterruption) {
+          evidence.restore.http_ok = http.status === "fulfilled";
+          evidence.restore.media_ok = media.status === "fulfilled";
+        }
+        requireEvidence(http.status === "fulfilled" && media.status === "fulfilled", "network_restore_failed");
         evidence.restore.ok = true;
       } catch {
         evidence.restore.error = "network_restore_failed";
