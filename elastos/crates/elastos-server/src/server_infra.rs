@@ -1,9 +1,6 @@
-use anyhow::Context as _;
-use serde::Deserialize;
-use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Read as _};
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::fs;
+#[cfg(all(unix, test))]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -57,7 +54,9 @@ const BROWSER_ENGINE_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const MODEL_PROVIDER_ID: &str = "model-provider";
 const MODEL_PROVIDER_PROTOCOL_VERSION: &str = "elastos.model-provider/v1";
 const MODEL_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
 const MODEL_PROVIDER_CONFIG_FILE_NAME: &str = "config.json";
+#[cfg(test)]
 const MODEL_PROVIDER_CONFIG_MAX_BYTES: usize = 256 * 1024;
 const MEDIA_PROVIDER_ID: &str = "media-provider";
 const MEDIA_PROVIDER_ROUTE: &str = "media";
@@ -71,53 +70,22 @@ const MEDIA_PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION"
 const MEDIA_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const WALLET_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ModelProviderOperatorConfigFile {
-    offers: Vec<serde_json::Value>,
-}
-
+#[cfg(test)]
+use api::model_provider_bridge_config;
+use api::model_provider_config as model_provider_startup_config;
+#[cfg(test)]
 fn model_provider_root_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("providers").join(MODEL_PROVIDER_ID)
 }
 
+#[cfg(test)]
 fn model_provider_config_path(data_dir: &Path) -> PathBuf {
     model_provider_root_dir(data_dir).join(MODEL_PROVIDER_CONFIG_FILE_NAME)
 }
 
+#[cfg(test)]
 fn model_provider_journal_dir(data_dir: &Path) -> PathBuf {
     model_provider_root_dir(data_dir).join("journal")
-}
-
-fn model_provider_bridge_config(data_dir: &Path) -> anyhow::Result<provider::BridgeProviderConfig> {
-    let offers = load_model_provider_operator_offers(data_dir)?;
-    Ok(provider::BridgeProviderConfig {
-        base_path: data_dir.to_string_lossy().into_owned(),
-        extra: serde_json::json!({
-            "provider_id": MODEL_PROVIDER_ID,
-            "journal_dir": model_provider_journal_dir(data_dir).to_string_lossy().into_owned(),
-            "offers": offers,
-        }),
-        ..Default::default()
-    })
-}
-
-async fn model_provider_startup_config(
-    data_dir: &Path,
-    registry: &provider::ProviderRegistry,
-) -> anyhow::Result<provider::BridgeProviderConfig> {
-    let config = model_provider_bridge_config(data_dir)?;
-    #[cfg(unix)]
-    {
-        let mut config = config;
-        api::append_admitted_model_startup_offers(data_dir, registry, &mut config).await?;
-        Ok(config)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = registry;
-        Ok(config)
-    }
 }
 
 use elastos_server::protected_content_runtime::derive_protected_content_runtime_issuer;
@@ -167,110 +135,6 @@ fn chain_provider_protected_startup_config(
             None
         }
     }
-}
-
-fn load_model_provider_operator_offers(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
-    let config_path = model_provider_config_path(data_dir);
-    let metadata = match fs::symlink_metadata(&config_path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to inspect model-provider operator config {}",
-                    config_path.display()
-                )
-            })
-        }
-    };
-    let config_root = model_provider_root_dir(data_dir);
-    validate_model_provider_private_directory(
-        &data_dir.join("providers"),
-        "model-provider config parent",
-    )?;
-    validate_model_provider_private_directory(&config_root, "model-provider config root")?;
-    let bytes = read_model_provider_private_file(
-        &config_path,
-        &metadata,
-        MODEL_PROVIDER_CONFIG_MAX_BYTES,
-        "model-provider operator config",
-    )?;
-    let raw = String::from_utf8(bytes)
-        .context("model-provider operator config must be valid UTF-8 JSON")?;
-    let config: ModelProviderOperatorConfigFile = serde_json::from_str(&raw)
-        .context("model-provider operator config must contain only the top-level offers key")?;
-    Ok(config.offers)
-}
-
-fn validate_model_provider_private_directory(path: &Path, label: &str) -> anyhow::Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        anyhow::bail!("{label} must be a real directory");
-    }
-    #[cfg(unix)]
-    {
-        let mode = metadata.permissions().mode() & 0o777;
-        if metadata.uid() != unsafe { libc::geteuid() } || mode != 0o700 {
-            anyhow::bail!("{label} must be owned by the current user with mode 0700");
-        }
-    }
-    Ok(())
-}
-
-fn validate_model_provider_private_file(
-    path: &Path,
-    metadata: &fs::Metadata,
-    label: &str,
-) -> anyhow::Result<()> {
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        anyhow::bail!("{label} must be a regular non-symlink file");
-    }
-    #[cfg(unix)]
-    {
-        let mode = metadata.permissions().mode() & 0o777;
-        if metadata.uid() != unsafe { libc::geteuid() } || mode != 0o600 {
-            anyhow::bail!("{label} must be owned by the current user with mode 0600");
-        }
-    }
-    let _ = path;
-    Ok(())
-}
-
-fn read_model_provider_private_file(
-    path: &Path,
-    metadata: &fs::Metadata,
-    max_bytes: usize,
-    label: &str,
-) -> anyhow::Result<Vec<u8>> {
-    validate_model_provider_private_file(path, metadata, label)?;
-    let metadata_len = usize::try_from(metadata.len())
-        .context("model-provider operator config length does not fit memory bounds")?;
-    if metadata_len > max_bytes {
-        anyhow::bail!("{label} exceeds its byte limit");
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options
-        .open(path)
-        .with_context(|| format!("failed to open {label} {}", path.display()))?;
-    let opened_metadata = file
-        .metadata()
-        .with_context(|| format!("failed to inspect opened {label} {}", path.display()))?;
-    validate_model_provider_private_file(path, &opened_metadata, label)?;
-    let mut bytes = Vec::with_capacity(metadata_len);
-    let read_limit = u64::try_from(max_bytes)?
-        .checked_add(1)
-        .context("model-provider operator config read bound overflow")?;
-    file.take(read_limit).read_to_end(&mut bytes)?;
-    if bytes.len() > max_bytes {
-        anyhow::bail!("{label} exceeds its byte limit");
-    }
-    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -2976,11 +2840,12 @@ mod tests {
 
         let config = model_provider_bridge_config(tempdir.path()).unwrap();
 
-        assert_eq!(config.base_path, tempdir.path().to_string_lossy());
+        let canonical_root = tempdir.path().canonicalize().unwrap();
+        assert_eq!(config.base_path, canonical_root.to_string_lossy());
         assert_eq!(config.extra["provider_id"], MODEL_PROVIDER_ID);
         assert_eq!(
             config.extra["journal_dir"],
-            model_provider_journal_dir(tempdir.path())
+            model_provider_journal_dir(&canonical_root)
                 .to_string_lossy()
                 .into_owned()
         );
@@ -3004,6 +2869,34 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(path).unwrap(), raw);
         assert!(!tempdir.path().join("model-preparation").exists());
+        assert!(!model_provider_journal_dir(tempdir.path()).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_provider_startup_config_resolves_root_alias_to_same_init_identity() {
+        let tempdir = TempDir::new().unwrap();
+        let raw = r#"{"offers":[{"id":"operator-owned","enabled":false}]}"#;
+        let operator_path = write_model_provider_operator_config(&tempdir, raw);
+        let links = TempDir::new().unwrap();
+        let alias = links.path().join("runtime-root");
+        std::os::unix::fs::symlink(tempdir.path(), &alias).unwrap();
+        let registry = provider::ProviderRegistry::new();
+        let initial = model_provider_bridge_config(&alias).unwrap();
+        let refreshed = model_provider_startup_config(&alias, &registry)
+            .await
+            .unwrap();
+        let canonical =
+            model_provider_bridge_config(&tempdir.path().canonicalize().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(initial).unwrap(),
+            serde_json::to_value(&canonical).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(refreshed).unwrap(),
+            serde_json::to_value(canonical).unwrap()
+        );
+        assert_eq!(fs::read_to_string(operator_path).unwrap(), raw);
         assert!(!model_provider_journal_dir(tempdir.path()).exists());
     }
 

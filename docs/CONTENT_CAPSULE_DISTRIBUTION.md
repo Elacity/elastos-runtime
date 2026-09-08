@@ -254,7 +254,7 @@ The following separates implemented primitives from remaining package work:
 | `elastos/crates/elastos-runtime/src/provider/registry.rs` | Bounded reads validate and consume the native range once for Bytes and Stream. Ordinary `open_provider_stream` still decodes the full response into `ProviderStreamSession.bytes`; consumer chunking alone does not bound producer memory or cancel network work. |
 | `capsules/ipfs-provider/src/main.rs` | Explicit bounded Cat enforces finite bytes/time and uses the existing backend lifecycle. Ordinary `cat` and `cat_to_path` still read the entire file before encoding or writing. |
 | `elastos/crates/elastos-server/src/api/gateway_site.rs` | Gateway CID reads buffer content before enforcing the 100 MiB file limit. Ordinary browser file responses are not a model-transfer route. |
-| `server_infra.rs` and `capsules/model-provider/src/config.rs` | Offers come from private startup config; local descriptors contain path and SHA-256. Bind admitted content to those verified descriptors and the existing ProviderRegistry lifecycle, rather than giving Settings write access to config. |
+| `api/model_provider_config.rs` and `capsules/model-provider/src/config.rs` | Startup and admission share the private config composer. Verified descriptors bind admitted content to the existing model-provider lifecycle. Runtime alone can refresh that configuration. |
 
 Preparation must confirm the selected backend through Runtime and use bounded
 reads for the exact CID, manifest-approved relative path, offset and length.
@@ -290,21 +290,14 @@ policy slices:
    bounded peak buffers, slow/oversized/ignored-range failures, mid-read cancel,
    retry, concurrent duplicate selection, low disk, crash/restart and exact
    partial cleanup. Include proof that provider work stops, not just UI progress.
-3. **Live offer refresh.** Startup derives offers from admitted records through
-   the installed engine receipt, private artifact verification and the existing
-   model provider. Live refresh must reuse that same ProviderRegistry slot and
-   run journal. Reconfigure only when idle and safe, preserving active and
-   unknown-settlement runs. The current coordinator
-   rejects a second Init, so this requires a guarded change within that owner.
-   Its serialized coordinator must check the run journal and adapter workers
-   and apply reinitialization in the same operation. Ordinary idle counts exclude
-   terminal unknown-settlement runs; preserve those records and their artifact
-   bindings until settlement is proved. Registry shutdown alone is not an idle
-   admission gate. Keep one provider slot
-   and the same journal across restart. Test absent/incompatible
-   engine, tampered artifacts, duplicate admission, restart without transfer,
-   busy retention release and exact CID-to-offer/run binding. This is not a new
-   inference provider or a capsule-facing config operation.
+3. **Retention closure.** Additive activation is implemented through the existing
+   Init boundary. Its serialized coordinator keeps one process, Registry slot
+   and journal, preserves exact existing offers, and blocks additions while
+   workers, cached engines or unresolved runs retain execution ownership.
+   Identical Init is idempotent; unresolved bindings survive expiry and restart.
+   Busy activation retains admitted files for retry without transfer. Actual
+   eviction still requires a proved closure receipt for every retained engine
+   and run. Shared Keep/release intents and installed retention proof remain open.
 4. **Shared model experience.** Add Models within existing Marketplace and model
    management within System; extend Assistant/Home Agent selectors. Test the
    same records across

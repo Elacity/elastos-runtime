@@ -60,6 +60,12 @@ struct GuardConfig {
 }
 
 impl LocalLlamaEngines {
+    pub(crate) async fn retains_artifacts(&self) -> bool {
+        // Idle engines can still map model bytes. Only the existing lifecycle
+        // owner can prove closure; refresh does not attempt eviction.
+        !self.engines.lock().await.is_empty()
+    }
+
     #[cfg(test)]
     pub(crate) async fn endpoint(
         &self,

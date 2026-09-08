@@ -51,6 +51,7 @@ struct PreparationRecord {
     index_bytes: u64,
     completed_bytes: u64,
     cancel_requested: bool,
+    activation_pending: bool,
     admission_id: String,
     created_at: u64,
     expires_at: u64,
@@ -402,6 +403,7 @@ fn reserve_at(
     // again against observed free space, while quota above counts every artifact.
     inventory.require_space(initial_charge)?;
     let mut record = PreparationRecord {
+        activation_pending: true,
         operation_id: String::new(),
         request_binding,
         catalog_head_cid: trust.head_cid,
@@ -498,7 +500,9 @@ impl PreparationRecord {
         serde_json::json!({"operation_id":self.operation_id, "cid":self.package_cid,
             "state":self.state, "total_bytes":self.total_bytes,
             "completed_bytes":self.completed_bytes, "cancel_requested":self.cancel_requested,
-            "admitted":self.state == PreparationState::Admitted, "inference_ready":false})
+            "admitted":self.state == PreparationState::Admitted,
+            "activation_pending":self.state == PreparationState::Admitted && self.activation_pending,
+            "inference_ready":false})
     }
 }
 
@@ -576,7 +580,9 @@ impl PreparationOwner {
         };
         let starting = record.state == PreparationState::Reserved
             && caller.method.operation.as_deref() == Some("use");
-        if !record.active() && !starting {
+        let activation_retry = record.state == PreparationState::Admitted
+            && caller.method.operation.as_deref() == Some("use");
+        if !record.active() && !starting && !activation_retry {
             return Ok(record.projection());
         }
         let mut worker = self
@@ -606,7 +612,7 @@ impl PreparationOwner {
             .find(|r| r.operation_id == record.operation_id)
             .context("preparation disappeared")?;
         let starting = starting && current.state == PreparationState::Reserved;
-        if !starting && !current.active() {
+        if !starting && !current.active() && !activation_retry {
             return Ok(current.projection());
         }
         if starting {
@@ -631,8 +637,9 @@ impl PreparationOwner {
         let stopping = self.stopping.clone();
         let operation = current.operation_id.clone();
         *worker = Some(tokio::spawn(async move {
-            let _worker_lock = worker_lock;
-            let result = if starting {
+            let result = if activation_retry {
+                Ok(())
+            } else if starting {
                 prepare(&data, &registry, &operation, &stopping, &revalidate).await
             } else {
                 reconcile(&data, &registry, &operation, &stopping, &revalidate).await
@@ -646,9 +653,62 @@ impl PreparationOwner {
                     tracing::debug!(error = ?error, "private model preparation settlement uncertain");
                 }
             }
+            // The composer acquires this same inventory worker lock. Admission
+            // is already durable; activation failure retains that exact artifact.
+            drop(worker_lock);
+            if let Err(error) =
+                activate_admitted_model(&data, &registry, &operation, &stopping, &revalidate).await
+            {
+                tracing::debug!(?error, "private model activation pending");
+            }
         }));
         Ok(current.projection())
     }
+}
+
+async fn activate_admitted_model(
+    data_dir: &Path,
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    operation: &str,
+    stopping: &AtomicBool,
+    revalidate: &Revalidate,
+) -> anyhow::Result<()> {
+    let record = load_operation(data_dir, operation)?;
+    if record.state != PreparationState::Admitted {
+        return Ok(());
+    }
+    // This flag is an activation attempt receipt, never inference authority.
+    set_activation_pending(data_dir, operation, true)?;
+    revalidate()?;
+    ensure!(
+        !stopping.load(Ordering::Acquire),
+        "model activation stopped"
+    );
+    current_entry(data_dir, &record)?;
+    let config = crate::api::model_provider_config(data_dir, registry).await?;
+    revalidate()?;
+    ensure!(
+        !stopping.load(Ordering::Acquire),
+        "model activation stopped"
+    );
+    registry.refresh_local_model_configuration(&config).await?;
+    set_activation_pending(data_dir, operation, false)
+}
+
+fn set_activation_pending(data_dir: &Path, operation: &str, pending: bool) -> anyhow::Result<()> {
+    let inventory = Inventory::open(data_dir, false)?;
+    let mut snapshot = inventory.load()?;
+    let record = snapshot
+        .records
+        .iter_mut()
+        .find(|r| r.operation_id == operation)
+        .context("model admission unavailable")?;
+    ensure!(
+        record.state == PreparationState::Admitted,
+        "model admission unavailable"
+    );
+    record.activation_pending = pending;
+    inventory.save(&snapshot)
 }
 
 fn require_cache_budget(data_dir: &Path, state: &PreparationInventory) -> anyhow::Result<()> {
@@ -1008,7 +1068,7 @@ fn local_model_startup_profile(platform: &str) -> anyhow::Result<serde_json::Val
     }))
 }
 
-/// Compose the existing model-provider Init at Runtime startup. This function
+/// Compose admitted offers for Runtime-owned model-provider Init. This function
 /// has no capsule route; public inference still uses the existing model grant.
 pub async fn append_admitted_model_startup_offers(
     data_dir: &Path,
@@ -1550,6 +1610,189 @@ mod tests {
                 r.state = PreparationState::Admitted
             })
             .unwrap();
+        }
+
+        #[derive(Default)]
+        struct ModelActivationFixture {
+            busy: AtomicBool,
+            calls: Mutex<Vec<serde_json::Value>>,
+        }
+
+        #[async_trait::async_trait]
+        impl elastos_runtime::provider::Provider for ModelActivationFixture {
+            fn name(&self) -> &'static str {
+                "model-activation-fixture"
+            }
+            fn schemes(&self) -> Vec<&'static str> {
+                vec![]
+            }
+            async fn handle(
+                &self,
+                _: elastos_runtime::provider::ResourceRequest,
+            ) -> Result<
+                elastos_runtime::provider::ResourceResponse,
+                elastos_runtime::provider::ProviderError,
+            > {
+                panic!("configuration uses the private Init boundary")
+            }
+            async fn send_raw(
+                &self,
+                request: &serde_json::Value,
+            ) -> Result<serde_json::Value, elastos_runtime::provider::ProviderError> {
+                assert_eq!(request["op"], "init");
+                self.calls.lock().unwrap().push(request.clone());
+                Ok(if self.busy.load(Ordering::Acquire) {
+                    serde_json::json!({"status":"error", "code":"selection_unavailable"})
+                } else {
+                    serde_json::json!({"status":"ok", "data":{"provider":"model-provider",
+                        "protocol_version":"elastos.model-provider/v1", "offers_ready":1}})
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn model_refresh_admission_pending_retry_reuses_exact_artifact_and_slot() {
+            let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+            let _engine = install_engine(root.path());
+            let model = Arc::new(ModelActivationFixture::default());
+            model.busy.store(true, Ordering::Release);
+            registry
+                .register_sub_provider("model", model.clone())
+                .await
+                .unwrap();
+            let slot = registry
+                .registration_for_uri("elastos://model/")
+                .await
+                .unwrap();
+            let owner = PreparationOwner::default();
+            owner
+                .invoke(
+                    root.path(),
+                    Some(registry.clone()),
+                    caller(&context(), &method("status")),
+                    "status",
+                    &serde_json::json!({"operation_id":record.operation_id}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            join_worker(&owner).await;
+            let pending = load_operation(root.path(), &record.operation_id).unwrap();
+            assert_eq!(pending.state, PreparationState::Admitted);
+            assert_eq!(pending.projection()["activation_pending"], true);
+            assert_eq!(pending.reserved_bytes, record.reserved_bytes);
+            let stage = Inventory::open(root.path(), false)
+                .unwrap()
+                .admitted(&record.admission_id)
+                .unwrap();
+            let original = std::fs::read(stage.path.join("weights.gguf")).unwrap();
+            let first = model.calls.lock().unwrap()[0].clone();
+            model.busy.store(false, Ordering::Release);
+            for _ in 0..2 {
+                owner
+                    .invoke(
+                        root.path(),
+                        Some(registry.clone()),
+                        caller(&context(), &method("use")),
+                        &record.request_binding.request_id,
+                        &serde_json::json!({"cid":record.package_cid}),
+                        Arc::new(|| Ok(())),
+                    )
+                    .unwrap();
+                join_worker(&owner).await;
+                let admitted = load_operation(root.path(), &record.operation_id).unwrap();
+                assert_eq!(admitted.state, PreparationState::Admitted);
+                assert_eq!(admitted.projection()["activation_pending"], false);
+                assert_eq!(admitted.projection()["inference_ready"], false);
+                assert_eq!(
+                    std::fs::read(stage.path.join("weights.gguf")).unwrap(),
+                    original
+                );
+                assert_eq!(
+                    slot,
+                    registry
+                        .registration_for_uri("elastos://model/")
+                        .await
+                        .unwrap()
+                );
+            }
+            assert!(backend.calls.lock().unwrap().iter().all(|op| op != "cat"));
+            assert_eq!(
+                *model.calls.lock().unwrap(),
+                vec![first.clone(), first.clone(), first]
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires explicit ELASTOS_TEST_MODEL_PROVIDER_PATH; actual same-process Init refresh proof"]
+        async fn model_refresh_real_provider_admission_uses_existing_init_and_slot() {
+            use elastos_runtime::provider::{CapsuleProvider, ProviderBridge};
+            let binary = std::path::PathBuf::from(
+                std::env::var_os("ELASTOS_TEST_MODEL_PROVIDER_PATH")
+                    .expect("explicit provider binary"),
+            );
+            assert!(binary.is_absolute());
+            let (root, record, _, registry) = staged_fixture(now().unwrap(), true).await;
+            let _engine = install_engine(root.path());
+            let initial = crate::api::model_provider_bridge_config(root.path()).unwrap();
+            assert_eq!(
+                std::path::Path::new(&initial.base_path),
+                root.path().canonicalize().unwrap()
+            );
+            let bridge = Arc::new(ProviderBridge::spawn(&binary, initial).await.unwrap());
+            registry
+                .register_sub_provider(
+                    "model",
+                    Arc::new(CapsuleProvider::with_scheme(bridge.clone(), "model")),
+                )
+                .await
+                .unwrap();
+            let slot = registry
+                .registration_for_uri("elastos://model/")
+                .await
+                .unwrap();
+            let owner = PreparationOwner::default();
+            owner
+                .invoke(
+                    root.path(),
+                    Some(registry.clone()),
+                    caller(&context(), &method("status")),
+                    "status",
+                    &serde_json::json!({"operation_id":record.operation_id}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            join_worker(&owner).await;
+            let admitted = load_operation(root.path(), &record.operation_id).unwrap();
+            let first = bridge
+                .send_raw(&serde_json::json!({"op":"offers_list"}))
+                .await;
+            owner
+                .invoke(
+                    root.path(),
+                    Some(registry.clone()),
+                    caller(&context(), &method("use")),
+                    &record.request_binding.request_id,
+                    &serde_json::json!({"cid":record.package_cid}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            join_worker(&owner).await;
+            let second = bridge
+                .send_raw(&serde_json::json!({"op":"offers_list"}))
+                .await;
+            bridge.shutdown().await.unwrap();
+            assert_eq!(admitted.state, PreparationState::Admitted);
+            assert!(!admitted.activation_pending);
+            assert_eq!(
+                slot,
+                registry
+                    .registration_for_uri("elastos://model/")
+                    .await
+                    .unwrap()
+            );
+            let first = first.unwrap();
+            assert_eq!(first["data"]["offers"].as_array().unwrap().len(), 1);
+            assert_eq!(first, second.unwrap());
         }
 
         #[tokio::test]

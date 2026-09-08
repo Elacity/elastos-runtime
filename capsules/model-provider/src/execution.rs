@@ -133,15 +133,15 @@ impl ProviderCoordinator {
     async fn route_request(&mut self, request: ProviderEnvelope) -> Result<Value, ProviderFault> {
         match request.operation {
             ProviderOperation::Init => {
-                if self.provider.is_some() {
-                    return Err(ProviderFault::invalid_request(
-                        "model provider is already initialized",
-                    ));
-                }
                 let init = serde_json::from_value::<InitRequest>(request.value)
                     .map_err(|_| ProviderFault::invalid_request("invalid init request body"))?;
                 if init.op != "init" {
                     return Err(ProviderFault::invalid_request("invalid init request op"));
+                }
+                if let Some(provider) = self.provider.as_mut() {
+                    let execution_owned = provider.adapters().retains_execution().await;
+                    provider.refresh_config(init.config, execution_owned)?;
+                    return self.status_response();
                 }
                 let adapter = LiveAdapterExecutor::new(self.handle.clone(), self.update_tx.clone());
                 let mut provider = ModelProviderState::from_init(init.config, adapter)?;
@@ -836,6 +836,132 @@ mod tests {
     ) {
         let response = provider.request(init_request(root, offers)).unwrap();
         assert_eq!(response["status"], "ok");
+    }
+
+    #[test]
+    fn model_refresh_init_reuses_coordinator_and_rejects_identity_or_offer_changes() {
+        let root = temp_root("refresh");
+        let operator = local_text_offer("https://example.invalid");
+        let mut added = operator.clone();
+        added.id = "admitted".into();
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![operator.clone()]);
+        let wrong_root = temp_root("refresh-wrong-root");
+        for (field, value) in [
+            ("base_path", json!(wrong_root)),
+            ("allowed_paths", json!(["different"])),
+            ("read_only", json!(true)),
+            ("encryption_key", json!("different")),
+        ] {
+            let mut request = init_request(&root, vec![operator.clone(), added.clone()]);
+            request.value["config"][field] = value;
+            assert_eq!(provider.request(request).unwrap()["status"], "error");
+        }
+        let mut wrong_journal = init_request(&root, vec![operator.clone(), added.clone()]);
+        wrong_journal.value["config"]["extra"]["journal_dir"] =
+            json!(format!("{wrong_root}/journal"));
+        assert_eq!(provider.request(wrong_journal).unwrap()["status"], "error");
+        assert!(!Path::new(&wrong_root).join("journal").exists());
+        let mut tampered = operator.clone();
+        tampered.enabled = false;
+        assert_eq!(
+            provider
+                .request(init_request(&root, vec![tampered]))
+                .unwrap()["status"],
+            "error"
+        );
+        let mut invalid = added.clone();
+        invalid.policy.concurrency_limit = 0;
+        assert_eq!(
+            provider
+                .request(init_request(&root, vec![operator.clone(), invalid]))
+                .unwrap()["status"],
+            "error"
+        );
+        let offers = vec![operator, added];
+        for _ in 0..2 {
+            assert_eq!(
+                provider
+                    .request(init_request(&root, offers.clone()))
+                    .unwrap()["data"]["offers_ready"],
+                2
+            );
+        }
+        let actual = send_request(
+            &provider,
+            ProviderOperation::OffersList,
+            json!({"op":"offers_list"}),
+        );
+        assert_eq!(actual["data"]["offers"].as_array().unwrap().len(), 2);
+        provider.shutdown_on_eof();
+    }
+
+    #[test]
+    fn model_refresh_is_serialized_with_create_and_preserves_active_run() {
+        let (stalled, release, started) = stalled_sse_action();
+        let server = start_server(vec![stalled]);
+        let offer = local_text_offer(&server.base_url);
+        let mut added = offer.clone();
+        added.id = "admitted".into();
+        let root = temp_root("refresh-create-race");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+        let input = text_input("active");
+        let binding = create_binding("request:refresh-active", &offer, &input);
+        // Both requests enter the real serialized command channel without a
+        // separate Status check. Either ordering preserves the active binding.
+        let create = spawn_request(
+            &provider,
+            ProviderEnvelope {
+                operation: ProviderOperation::RunsCreate,
+                value: json!({"op":"runs_create", "offer_id":offer.id,
+                "operation":offer.operation, "input":input, "runtime_binding":binding}),
+            },
+        );
+        let refresh = spawn_request(
+            &provider,
+            init_request(&root, vec![offer.clone(), added.clone()]),
+        );
+        let created = create.recv_timeout(FIXTURE_EVENT_TIMEOUT).unwrap().unwrap();
+        assert_eq!(created["status"], "ok");
+        let refreshed = refresh
+            .recv_timeout(FIXTURE_EVENT_TIMEOUT)
+            .unwrap()
+            .unwrap();
+        assert!(refreshed["status"] == "ok" || refreshed["code"] == "selection_unavailable");
+        wait_for_flag(&started);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let before = load_run(&root, run_id);
+        assert_eq!(
+            before.execution_binding_hash,
+            offer.execution_binding_hash().unwrap()
+        );
+        if refreshed["status"] == "error" {
+            assert_eq!(
+                provider
+                    .request(init_request(&root, vec![offer.clone(), added]))
+                    .unwrap()["code"],
+                "selection_unavailable"
+            );
+        }
+        // Identical Init is safe even with an active worker.
+        let same = if refreshed["status"] == "ok" {
+            let mut second = offer.clone();
+            second.id = "admitted".into();
+            vec![offer, second]
+        } else {
+            vec![offer]
+        };
+        assert_eq!(
+            provider.request(init_request(&root, same)).unwrap()["status"],
+            "ok"
+        );
+        assert_eq!(
+            load_run(&root, run_id).execution_binding_hash,
+            before.execution_binding_hash
+        );
+        release.store(true, Ordering::Relaxed);
+        provider.shutdown_on_eof();
     }
 
     fn create_run(
@@ -2648,7 +2774,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn local_llama_streams_concurrent_runs_reuses_child_and_rejects_reinit() {
+    fn local_llama_streams_concurrent_runs_reuses_child_and_guards_refresh() {
         let root = temp_root("local-llama-stream");
         let (offer, events, root) = local_llama_offer(&root, "healthy");
         let mut provider = ProviderCoordinatorHandle::start();
@@ -2691,8 +2817,27 @@ mod tests {
         let repeated_init = provider
             .request(init_request(&root, vec![offer.clone()]))
             .unwrap();
-        assert_eq!(repeated_init["status"], "error");
-        assert_eq!(repeated_init["code"], "invalid_request");
+        assert_eq!(repeated_init["status"], "ok");
+        let mut added = offer.clone();
+        added.id = "additional-local".into();
+        let changed = provider
+            .request(init_request(&root, vec![offer.clone(), added]))
+            .unwrap();
+        assert_eq!(
+            changed["status"], "error",
+            "idle cached engine still owns model bytes"
+        );
+        assert_eq!(changed["code"], "selection_unavailable");
+        let mut tampered = offer.clone();
+        if let AdapterConfig::LocalLlamaCppText { model, .. } = &mut tampered.adapter {
+            model.sha256 = format!("sha256:{}", "0".repeat(64));
+        }
+        assert_eq!(
+            provider
+                .request(init_request(&root, vec![tampered]))
+                .unwrap()["status"],
+            "error"
+        );
 
         let offers = send_request(
             &provider,

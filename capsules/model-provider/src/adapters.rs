@@ -473,6 +473,11 @@ pub struct LiveAdapterExecutor {
 }
 
 impl LiveAdapterExecutor {
+    pub(crate) async fn retains_execution(&self) -> bool {
+        let workers = !self.workers.lock().unwrap().is_empty();
+        workers || self.local_llama.retains_artifacts().await
+    }
+
     pub fn new(runtime: Handle, updates: mpsc::Sender<WorkerUpdate>) -> Self {
         Self {
             runtime,

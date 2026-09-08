@@ -26,6 +26,10 @@ fn private_ipfs_unavailable() -> ProviderError {
     ProviderError::Provider("local content preparation unavailable".into())
 }
 
+fn private_model_configuration(target: &str, op: &str) -> bool {
+    target.eq_ignore_ascii_case("model") && op == "init"
+}
+
 // Internal wire types. Only the typed local methods below can dispatch them.
 #[derive(serde::Serialize)]
 struct LocalStagedFile<'a> {
@@ -1165,6 +1169,43 @@ impl ProviderRegistry {
             .await
     }
 
+    /// Runtime-only Init refresh of the existing local model slot. The provider
+    /// coordinator owns the atomic run/engine check and in-place configuration.
+    pub async fn refresh_local_model_configuration(
+        &self,
+        config: &super::BridgeProviderConfig,
+    ) -> Result<(), ProviderError> {
+        let unavailable = || ProviderError::Provider("model activation pending".into());
+        // Retain registration ownership through dispatch; unregister cannot
+        // replace this slot while its configuration request is in flight.
+        let slots = self.sub_providers.read().await;
+        let provider = slots
+            .get("model")
+            .and_then(SubProviderRegistration::ready_provider)
+            .ok_or_else(unavailable)?;
+        let request = serde_json::json!({"op":"init", "config":config});
+        if serde_json::to_vec(&request)
+            .map_err(|_| unavailable())?
+            .len()
+            > 272 * 1024
+        {
+            return Err(unavailable());
+        }
+        let response = provider.send_raw(&request).await.map_err(|error| {
+            tracing::debug!(?error, "private model activation failed");
+            unavailable()
+        })?;
+        let data = &response["data"];
+        if response["status"] != "ok"
+            || data["provider"] != "model-provider"
+            || data["protocol_version"] != "elastos.model-provider/v1"
+            || data["offers_ready"].as_u64().is_none_or(|n| n > 64)
+        {
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+
     /// Runtime-owned readiness for local preparation, through the existing Kubo lifecycle.
     /// Capsule resource dispatch and provider-plane envelopes cannot call this operation.
     pub async fn prepare_local_ipfs_backend(&self) -> Result<(), ProviderError> {
@@ -1268,6 +1309,11 @@ impl ProviderRegistry {
         target: &str,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
+        if private_model_configuration(target, request["op"].as_str().unwrap_or_default()) {
+            return Err(ProviderError::Provider(
+                "model configuration is Runtime-owned".into(),
+            ));
+        }
         if request
             .get("op")
             .and_then(|v| v.as_str())
@@ -1305,6 +1351,11 @@ impl ProviderRegistry {
         request: &serde_json::Value,
         include_runtime_only: bool,
     ) -> Result<serde_json::Value, ProviderError> {
+        if private_model_configuration(scheme, request["op"].as_str().unwrap_or_default()) {
+            return Err(ProviderError::Provider(
+                "model configuration is Runtime-owned".into(),
+            ));
+        }
         if request
             .get("op")
             .and_then(|v| v.as_str())
@@ -1361,6 +1412,16 @@ impl ProviderRegistry {
         &self,
         invocation: ProviderInvocation,
     ) -> Result<serde_json::Value, ProviderError> {
+        if private_model_configuration(&invocation.target, &invocation.op)
+            || private_model_configuration(
+                &invocation.target,
+                invocation.request["op"].as_str().unwrap_or_default(),
+            )
+        {
+            return Err(ProviderError::Provider(
+                "model configuration is Runtime-owned".into(),
+            ));
+        }
         if private_ipfs_operation(&invocation.op)
             || invocation
                 .request
@@ -2575,6 +2636,69 @@ mod tests {
             ("_elastos_object.json".into(), 2),
             ("weights.gguf".into(), 4),
         ]
+    }
+
+    #[tokio::test]
+    async fn model_refresh_private_init_same_slot_and_mapping_denial() {
+        let registry = ProviderRegistry::new();
+        let provider = Arc::new(PrivateIpfsMock::default());
+        *provider.response.lock().await = Some(serde_json::json!({"status":"ok", "data":{
+            "provider":"model-provider", "protocol_version":"elastos.model-provider/v1", "offers_ready":0
+        }}));
+        registry
+            .register_sub_provider("model", provider.clone())
+            .await
+            .unwrap();
+        let before = registry.get_sub_provider("model").await.unwrap();
+        let carrier = Arc::new(MockCarrierInvoker::default());
+        registry.set_carrier_invoker(carrier.clone()).await;
+        let config = super::super::BridgeProviderConfig::default();
+        let request = serde_json::json!({"op":"init", "config":config});
+        assert!(registry.send_raw("model", &request).await.is_err());
+        assert!(registry
+            .send_runtime_provider_target_raw("model", &request)
+            .await
+            .is_err());
+        for transport in [
+            ProviderInvocationTransport::Local,
+            ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                peer_did: "did:key:zFixture".into(),
+                timeout_ms: Some(5000),
+            }),
+        ] {
+            let (mut invocation, _) = bounded_read_fixture(ProviderTransfer::Bytes);
+            invocation.target = "model".into();
+            invocation.op = "init".into();
+            invocation.request = request.clone();
+            invocation.transport = transport;
+            assert!(registry.invoke_provider(invocation).await.is_err());
+        }
+        assert!(provider.requests.lock().await.is_empty());
+        assert!(carrier.requests.lock().await.is_empty());
+        for _ in 0..2 {
+            registry
+                .refresh_local_model_configuration(&config)
+                .await
+                .unwrap();
+        }
+        assert!(Arc::ptr_eq(
+            &before,
+            &registry.get_sub_provider("model").await.unwrap()
+        ));
+        assert_eq!(
+            *provider.requests.lock().await,
+            vec![request.clone(), request]
+        );
+        *provider.response.lock().await =
+            Some(serde_json::json!({"status":"error", "message":"private failure"}));
+        assert_eq!(
+            registry
+                .refresh_local_model_configuration(&config)
+                .await
+                .unwrap_err()
+                .to_string(),
+            ProviderError::Provider("model activation pending".into()).to_string()
+        );
     }
 
     #[tokio::test]

@@ -206,12 +206,18 @@ async fn assistant_cannot_invoke_unsupported_model_operation() {
     let app = gateway_router(model_test_state(dir.path(), provider.clone()).await);
     let token = issue_home_launch_token(dir.path(), "assistant").unwrap();
 
-    let response = app
-        .oneshot(post_model(token, "offer_get", json!({})))
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    for operation in ["offer_get", "init"] {
+        let response = app
+            .clone()
+            .oneshot(post_model(
+                token.clone(),
+                operation,
+                json!({"config":{"extra":{"offers":[]}}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
     assert!(provider.requests.lock().await.is_empty());
 }
 

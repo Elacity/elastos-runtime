@@ -931,6 +931,9 @@ fn validate_stored_output(
 
 fn is_expired_terminal_run(run: &StoredRun, now_ms: u64) -> bool {
     run.status.is_terminal()
+        // An unresolved effect retains its execution binding across expiry and
+        // restart. A retention deadline is not a settlement receipt.
+        && run.status != RunStatus::SettlementUnknown
         && run
             .retention_until_ms
             .is_some_and(|retention_until_ms| now_ms > retention_until_ms)

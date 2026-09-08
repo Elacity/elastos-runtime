@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 pub struct ModelProviderState<A: AdapterExecutor> {
+    config: BridgeProviderConfig,
     journal: RunJournal,
     offers: BTreeMap<String, ConfiguredOffer>,
     adapters: A,
@@ -58,7 +59,9 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
                 ));
             }
         }
+        require_retained_run_bindings(&journal, &offers)?;
         Ok(Self {
+            config,
             journal,
             offers,
             adapters,
@@ -67,6 +70,78 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
 
     pub fn ready_offer_count(&self) -> usize {
         self.offers.values().filter(|offer| offer.enabled).count()
+    }
+
+    /// Called only by the serialized coordinator. Retain the same journal and
+    /// adapter owner; this boundary adds offers, it does not evict artifacts.
+    pub(crate) fn refresh_config(
+        &mut self,
+        config: BridgeProviderConfig,
+        execution_owned: bool,
+    ) -> Result<(), ProviderFault> {
+        if self.config.base_path != config.base_path
+            || self.config.allowed_paths != config.allowed_paths
+            || self.config.read_only != config.read_only
+            || self.config.encryption_key != config.encryption_key
+        {
+            return Err(ProviderFault::invalid_request(
+                "model configuration identity changed",
+            ));
+        }
+        let mut old_identity = self.config.extra.clone();
+        let mut new_identity = config.extra.clone();
+        if let Some(value) = old_identity.as_object_mut() {
+            let _ = value.remove("offers");
+        }
+        if let Some(value) = new_identity.as_object_mut() {
+            let _ = value.remove("offers");
+        }
+        if old_identity != new_identity {
+            return Err(ProviderFault::invalid_request(
+                "model configuration identity changed",
+            ));
+        }
+        config
+            .validate()
+            .map_err(|_| ProviderFault::invalid_request("invalid model configuration"))?;
+        let extra: ProviderInitExtra = serde_json::from_value(config.extra.clone())
+            .map_err(|_| ProviderFault::invalid_request("invalid model configuration"))?;
+        extra
+            .validate(&config)
+            .map_err(|_| ProviderFault::invalid_request("invalid model configuration"))?;
+        let offers: BTreeMap<_, _> = extra
+            .offers
+            .into_iter()
+            .map(|o| (o.id.clone(), o))
+            .collect();
+        // This includes every authoritative operator offer. Even an idle refresh
+        // cannot remove or change an existing offer, including its private adapter.
+        if self
+            .offers
+            .iter()
+            .any(|(id, offer)| offers.get(id) != Some(offer))
+        {
+            return Err(ProviderFault::invalid_request(
+                "existing model offers changed",
+            ));
+        }
+        if self.offers == offers {
+            return Ok(());
+        }
+        if execution_owned
+            || self
+                .journal
+                .scan_runs()?
+                .iter()
+                .any(|(_, r)| !r.status.is_terminal() || r.status == RunStatus::SettlementUnknown)
+        {
+            return Err(ProviderFault::selection_unavailable(
+                "model activation pending",
+            ));
+        }
+        self.offers = offers;
+        self.config = config;
+        Ok(())
     }
 
     pub(crate) fn adapters(&self) -> &A {
@@ -607,6 +682,29 @@ fn normalize_worker_result(
 
 fn reject_untrusted_binding_fields(input: &Value) -> Result<(), ProviderFault> {
     reject_untrusted_binding_fields_at(input)
+}
+
+fn require_retained_run_bindings(
+    journal: &RunJournal,
+    offers: &BTreeMap<String, ConfiguredOffer>,
+) -> Result<(), ProviderFault> {
+    for (_, run) in journal.scan_runs()? {
+        if !run.status.is_terminal() || run.status == RunStatus::SettlementUnknown {
+            let offer = offers.get(&run.offer.id).ok_or_else(|| {
+                ProviderFault::selection_unavailable("retained model binding unavailable")
+            })?;
+            if offer
+                .execution_binding_hash()
+                .map_err(|_| ProviderFault::invalid_request("invalid model binding"))?
+                != run.execution_binding_hash
+            {
+                return Err(ProviderFault::selection_unavailable(
+                    "retained model binding changed",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn assert_run_owner(binding: &RuntimeAccessBinding, run: &StoredRun) -> Result<(), ProviderFault> {
@@ -1496,6 +1594,60 @@ mod tests {
             adapters,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn model_refresh_unknown_retains_binding_across_expiry_and_restart() {
+        let root = temp_root("refresh-unknown");
+        let original = offer("operator");
+        let adapters = FakeAdapters::default();
+        let mut state = init_state(&root, vec![original.clone()], adapters.clone());
+        let binding = create_binding(
+            "request:unknown-refresh",
+            &original.id,
+            &json!({"prompt":"x"}),
+        );
+        let mut run =
+            run_with_id_for_offer(deterministic_run_id(&binding), binding, &original, now_ms());
+        transition_terminal(
+            &original,
+            &mut run,
+            RunStatus::SettlementUnknown,
+            None,
+            Some(RunError {
+                class: ErrorClass::SettlementUnknown,
+                code: "settlement_unknown".into(),
+                message: "model settlement is unknown".into(),
+            }),
+        )
+        .unwrap();
+        expire_terminal_run(&mut run);
+        state.journal.store_run(&run).unwrap();
+        let path = run_path(&root, &run.run_id);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!state.journal.prune_expired_loaded_run(&run).unwrap());
+        state.journal.prune_expired_terminal_runs().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let same = state.config.clone();
+        state.refresh_config(same.clone(), true).unwrap();
+        let mut addition = same.clone();
+        addition.extra["offers"] = json!([original.clone(), offer("admitted")]);
+        assert_eq!(
+            state.refresh_config(addition, false).unwrap_err().code(),
+            "selection_unavailable"
+        );
+        drop(state);
+        let mut restarted = ModelProviderState::from_init(same.clone(), adapters.clone()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let mut drift = same.clone();
+        drift.extra["offers"][0]["adapter"]["model"] = json!("changed-selector");
+        assert!(ModelProviderState::from_init(drift, adapters.clone()).is_err());
+        let mut missing = same.clone();
+        missing.extra["offers"] = json!([]);
+        assert!(ModelProviderState::from_init(missing, adapters.clone()).is_err());
+        restarted.refresh_config(same, false).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 0);
     }
 
     fn run_with_id_for_offer(

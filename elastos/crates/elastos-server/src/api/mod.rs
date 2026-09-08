@@ -17,6 +17,8 @@ pub mod gateway;
 pub(crate) mod gateway_local_control;
 pub mod handlers;
 pub mod middleware;
+mod model_provider_config;
+pub use model_provider_config::{model_provider_bridge_config, model_provider_config};
 pub mod routes;
 pub mod server;
 pub mod viewer_gateway;
