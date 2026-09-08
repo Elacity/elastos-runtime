@@ -2218,7 +2218,8 @@ function requestJsonOverUnix(
             }
           }
           if (res.statusCode < 200 || res.statusCode >= 300) {
-            reject(new Error(parsed.error || `Browser VM guest control ${method} ${requestPath} failed: HTTP ${res.statusCode}`));
+            reject(browserDisplayControlError(parsed) ||
+              new Error((typeof parsed?.error === "string" && parsed.error) || `Browser VM guest control ${method} ${requestPath} failed: HTTP ${res.statusCode}`));
             return;
           }
           resolve(parsed);
@@ -2235,6 +2236,21 @@ function requestJsonOverUnix(
     signal?.addEventListener?.("abort", abortRequest, { once: true });
     req.end(bytes);
     if (signal?.aborted) abortRequest();
+  });
+}
+
+function browserDisplayControlError(payload) {
+  const status = {
+    display_attach_busy: 409,
+    display_generation_mismatch: 409,
+    display_owner_changed: 409,
+    display_attach_unsupported: 501,
+    display_attach_failed: 503,
+    display_attach_uncertain: 503,
+  };
+  if (typeof payload?.code !== "string" || !Object.hasOwn(status, payload.code)) return null;
+  return Object.assign(new Error("Browser display operation failed."), {
+    code: payload.code, displayHttpStatus: status[payload.code],
   });
 }
 
@@ -3641,7 +3657,11 @@ function main() {
             ),
           );
         } catch (error) {
-          sendJson(404, { error: error instanceof Error ? error.message : String(error) });
+          const displayError = browserDisplayControlError(error);
+          sendJson(displayError?.displayHttpStatus || 404, {
+            error: displayError?.message || (error instanceof Error ? error.message : String(error)),
+            ...(displayError ? { code: displayError.code } : {}),
+          });
         }
         return;
       }
@@ -3743,7 +3763,8 @@ function main() {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       sendJson(
-        error?.code === "resources_in_use" ? 409 : 400,
+        browserDisplayControlError(error)?.displayHttpStatus ||
+          (error?.code === "resources_in_use" ? 409 : 400),
         {
           ...(typeof error?.code === "string"
             ? { code: error.code, message }
