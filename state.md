@@ -178,7 +178,21 @@ Runtime HTTP requests, which can overtake one another. B05 input dispatch
 ordering is the next repair, followed by this same B06 journey. The evidence
 does not establish that the interruption causes the input defect.
 Guest and native artifacts remain those accepted in run 17; this input repair
-can reuse them.
+can reuse them. Installed `23a42fb4` uses an owner-bound input queue, caps pending
+operations at 128, rejects canceled dependencies, and ignores old-owner results.
+The 20 focused tests cover rapid text, following keys/pointers, page changes,
+uncertain failure and the real clipboard bridge; 113 combined checks pass.
+Independent review accepts run 25 with matching served UI and reused guest,
+native and Runtime artifacts. Home launch, controlled navigation, decoded video,
+typing and scrolling pass. The 5001 ms HTTP/media cut causes a 4387 ms media
+stall; same-page recovery with exact rapid text and new decoded frames completes
+in 1404 ms. All 29 observations preserve bindings. Fresh UI close confirms all
+13 effects and zero Runtime sessions/cleanup obligations, and the relay safeguard
+exits. This is accepted evidence for the bounded interruption case. Full
+B01/B05/B06, mixed-transport input ordering, media/device, percentile and human
+qualification remain open. Viewer-document reload is the next local experiment:
+source startup currently closes a recoverable page before replacing it, which
+needs installed reproduction and a separate attach/recovery repair.
 Guest Node also starts about five seconds after its shell launch;
 initial entropy is 1 and no hardware RNG is selected. That secondary cause needs
 its own experiment. Run 16 includes diagnostic overhead and is excluded from
