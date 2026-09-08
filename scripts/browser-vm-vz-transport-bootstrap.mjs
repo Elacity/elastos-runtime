@@ -422,7 +422,9 @@ function readDescriptor(socketPath) {
           const line = payload
             .subarray(0, payload.indexOf(0x0a))
             .toString("utf8");
-          resolve({ socket, request: JSON.parse(line) });
+          const request = JSON.parse(line);
+          clearTimeout(timeout);
+          resolve({ socket, request });
         } catch (error) {
           socket.destroy();
           reject(error);
@@ -473,7 +475,9 @@ async function main() {
       direct_network_probe_failed: true,
     },
   };
-  socket.end(`${JSON.stringify(receipt)}\n`);
+  // The descriptor reader is paused. Release both directions after the receipt
+  // flushes so the one-session relay and guest init can finish bootstrap.
+  socket.end(`${JSON.stringify(receipt)}\n`, () => socket.destroy());
 }
 
 export {
