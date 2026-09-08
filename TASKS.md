@@ -136,12 +136,19 @@ alongside the local, operator and remote journeys.
   implementation requirement is actual framework adapter conformance; repeat
   native admission only when changed inputs or a diagnosed defect require it.
 - **B08/B09.first-remote / active / independent delegated source owner.**
-  Current integration milestone: `caa5d90f` is independently accepted after
-  45 focused tests and installed on both task Runtimes. The coordinator now
-  owns the Linux Home → Mac Engine → Linux Exit journey, including normal
-  service approval, decoded media, controlled input and exact cleanup. The
-  verified helpers and image are reused. Full remote placements and recovery
-  remain open; the following paragraphs retain earlier evidence.
+  `caa5d90f` is independently accepted after 45 focused tests. Normal Engine
+  sharing, request, approval and selection pass. The first Linux Home → Mac
+  Engine → Linux Exit attempt fails at Carrier connection before allocation.
+  Consumer-only diagnostic `70dccb34` is installed with the Mac artifacts
+  reused. The latest repeat reaches the controlled fixture's Exit port-policy
+  refusal and closes its exact window with zero Runtime/VM obligations.
+  Admit that fixture through the existing exact-destination test policy, then
+  repeat the same journey. The original Carrier failure remains unexplained;
+  remote page execution, media, all placements and recovery require proof.
+  Source `1a47ddc6` binds canonical journey Engine/window receipts; `30fa0a68`
+  corrects its introduced inventory-read deadline. Restored-window foreground
+  selection/close remains a separate test defect. Preserve both failed runs.
+  The following paragraphs retain earlier evidence.
   Prerequisite: accepted Engine/Exit identity and Runtime service contracts.
   Identify the first missing product operation for A/B/A and A/A/B against
   available peers, then repair that component with a bounded regression.

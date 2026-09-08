@@ -70,7 +70,37 @@ volatile proof logs remain outside the repository.
 
 ## Browser contract and device qualification
 
-The task Mac runs Runtime source `0244cc0c`, hash
+The current task Mac runs Runtime `caa5d90f`, SHA-256
+`2d3603f65aa418244a321ef6766ae14349cbf9a9e08b0b3ede64b6f549a5324b`.
+The Linux consumer/Exit runs the operation diagnostic `70dccb34`, SHA-256
+`1701fad008811fd3dffd4d4c75d7ec6657fea9f598bf2bfcc4420369eb2d63ae`.
+Both installed and served artifact checks pass. The Mac retains the `cb03a719`
+Engine helper and the bounded audio-observer image from `6896fee5`; its rootfs
+is `ef1c0efcbdbb5d0c5d3ad195705385b76aed66933335d6a50e4ab2ec46bd6280`
+and initrd is `05afae8f72394956f1eed1c20cd25774bde323fde75043b7b7882d9768cb3d1f`.
+This diagnostic image and the debug Runtime builds supply bounded functional
+evidence; release performance and device qualification remain open.
+
+Local installed journeys pass decoded media, navigation, input, native operator
+handoff and exact cleanup. The first A/B/A attempt fails at Carrier connection
+before page allocation. A later attempt reaches an Exit policy refusal because
+the controlled fixture uses a port outside the configured local Exit policy;
+its exact window close leaves zero Runtime and VM obligations. Remote selection
+and readiness precede that refusal in the source path. Remote page execution,
+decoded frames and the complete placement suite still require proof.
+
+Source `2cdc9535` adds explicit owner invitation, separately authenticated
+operator inspection, reference replacement/clear and detach. Independent review
+accepts 103 Node and 27 Rust checks. Matching Runtime, adapter, Browser UI and
+guest-helper installation and the actual Camofox workflow are next. Full
+Playwright/Camoufox, profiles, daily workflows, update, authority, media,
+endurance, device and human acceptance retain their original requirements.
+A bounded idle sample also finds roughly one CPU core used by the task Runtime
+with zero Browser pages/VMs; collaboration verification/projection appears in
+the active stacks. Its cause and the intermittent audio failures remain open.
+
+The following paragraphs retain earlier bounded evidence. The earlier operator
+checkpoint used Runtime source `0244cc0c`, hash
 `91457075a95661b70242b9ce379f2054868e95f2d643a80c766218bc28ab78f8`.
 The `92f04e0e` Engine adapter is
 `3c9a7d4816f0cfb4d7c1f511a93a3d33279aea5101c14d8ba71e1ed5082ac651`.
