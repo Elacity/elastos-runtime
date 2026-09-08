@@ -16,6 +16,7 @@ import { randomUUID } from "node:crypto";
 import { installBrowserJourneyAudioProbe, controlledTonePresent } from "./lib/browser-journey-audio.mjs";
 import { diagnoseBrowserJourneyRecovery } from "./lib/browser-journey-recovery.mjs";
 import { diagnoseBrowserViewerReload, readBrowserViewerReloadDocument, browserViewerSignalMetadata } from "./lib/browser-journey-viewer-reload.mjs";
+import { runBrowserOperatorJourney } from "./lib/browser-journey-operator.mjs";
 
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
@@ -151,6 +152,8 @@ const CHECK_BROWSER_CONTROLLED_JOURNEY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_JOURNEY === "1";
 const CHECK_BROWSER_CONTROLLED_MEDIA = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_MEDIA === "1";
 const CHECK_BROWSER_CONTROLLED_INSPECTION = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_INSPECTION === "1";
+const CHECK_BROWSER_CONTROLLED_OPERATOR = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_OPERATOR === "1";
+const BROWSER_OPERATOR_COORDS_PATH = process.env.HOME_VIRTUAL_AUTH_BROWSER_OPERATOR_COORDS || "";
 const CHECK_BROWSER_CONTROLLED_RECOVERY = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_RECOVERY === "1";
 const CHECK_BROWSER_VIEWER_RELOAD = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_VIEWER_RELOAD === "1";
 const BROWSER_CONTROLLED_TURN_TEST_HOME = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_TURN_TEST_HOME || "";
@@ -2041,7 +2044,15 @@ async function waitForJourneyEvidence(read, predicate, label, timeoutMs = 30_000
   throw Object.assign(new Error(`Controlled Browser journey timed out: ${label}`), { details: { last } });
 }
 
-async function closeControlledBrowserWindow(page, appFrame, windowLocator, token, baseline, { expectedPageId = null } = {}) {
+function browserJourneyRuntimeEmpty(sessions) {
+  return sessions?.schema === "elastos.browser.session-capacity/v1" && sessions.status === "configured" &&
+    sessions.recoverable_page === null && Array.isArray(sessions.lifecycle?.sessions) && sessions.lifecycle.sessions.length === 0 &&
+    ["active_sessions", "principal_sessions", "total_sessions", "launching_sessions",
+      "engine_cleanup_obligations", "launch_reconciliation_obligations"].every(key => sessions[key] === 0);
+}
+
+async function closeControlledBrowserWindow(page, appFrame, windowLocator, token, baseline,
+  { expectedPageId = null, requireEmptyRuntime = CHECK_BROWSER_CONTROLLED_JOURNEY } = {}) {
   markStage("browser:ui-close");
   // The opaque Home GUI survives Browser frame removal and supplies Origin: null.
   const apiFrame = appFrame.parentFrame();
@@ -2058,6 +2069,13 @@ async function closeControlledBrowserWindow(page, appFrame, windowLocator, token
   assert(before.ok, "Browser close summary failed", before);
   const started = performance.now();
   const evidence = { messages: [], frames: [], close_responses: [], dropped_messages: 0, dropped_frames: 0, dropped_responses: 0 };
+  // Signed Home can restore Browser before the harness reads its entry summary.
+  // That observation is useful evidence, but a controlled task must end empty.
+  const counts = sessions => Object.fromEntries(["active_sessions", "principal_sessions", "total_sessions",
+    "launching_sessions", "engine_cleanup_obligations", "launch_reconciliation_obligations"]
+    .map(key => [key, Number.isSafeInteger(sessions?.[key]) ? sessions[key] : null]));
+  evidence.runtime_counts = { entry: counts(baseline), before_close: counts(before.body?.sessions),
+    terminal_requirement: requireEmptyRuntime ? "configured_empty_runtime" : "entry_baseline" };
   const safeText = value => redactSensitiveString(typeof value === "string" ? value : "")
     .split(token || "\0").join("[redacted]").slice(0, 256);
   const append = (list, dropped, value) => {
@@ -2194,12 +2212,13 @@ async function closeControlledBrowserWindow(page, appFrame, windowLocator, token
       }
       await windowLocator.waitFor({ state: "detached", timeout: 15_000 });
       const after = await browserApi(apiFrame, token, summaryPath);
-      assert(after.ok && after.body?.sessions?.recoverable_page === null &&
+      assert(after.ok && (requireEmptyRuntime ? browserJourneyRuntimeEmpty(after.body?.sessions) :
+        after.body?.sessions?.recoverable_page === null &&
         after.body.sessions.principal_sessions <= baseline.principal_sessions &&
         after.body.sessions.total_sessions <= baseline.total_sessions &&
         after.body.sessions.launching_sessions <= baseline.launching_sessions &&
         after.body.sessions.engine_cleanup_obligations <= baseline.engine_cleanup_obligations &&
-        after.body.sessions.launch_reconciliation_obligations <= baseline.launch_reconciliation_obligations,
+        after.body.sessions.launch_reconciliation_obligations <= baseline.launch_reconciliation_obligations),
       "Browser startup close retained Runtime ownership", after);
       return { startup_close: message, receipt, window_detached: true, sessions_after_close: after.body.sessions, close_evidence: evidence };
     }
@@ -2241,14 +2260,16 @@ async function closeControlledBrowserWindow(page, appFrame, windowLocator, token
     await windowLocator.waitFor({ state: "detached", timeout: 15_000 });
     const after = await waitForJourneyEvidence(
       () => browserApi(apiFrame, token, summaryPath),
-      value => value.ok && value.body?.sessions?.schema === "elastos.browser.session-capacity/v1" &&
+      value => value.ok && (requireEmptyRuntime ? browserJourneyRuntimeEmpty(value.body?.sessions) :
+        value.body?.sessions?.schema === "elastos.browser.session-capacity/v1" &&
         value.body.sessions.principal_sessions === baseline.principal_sessions &&
         value.body.sessions.total_sessions === baseline.total_sessions &&
         value.body.sessions.launching_sessions === baseline.launching_sessions &&
         value.body.sessions.engine_cleanup_obligations <= baseline.engine_cleanup_obligations &&
         value.body.sessions.launch_reconciliation_obligations <= baseline.launch_reconciliation_obligations &&
-        value.body.sessions.recoverable_page === null,
-      "Runtime sessions and cleanup obligations return to baseline");
+        value.body.sessions.recoverable_page === null),
+      requireEmptyRuntime ? "Controlled Runtime sessions and cleanup obligations are empty" :
+        "Runtime sessions and cleanup obligations return to baseline");
     markStage("browser:cleanup-confirmed");
     return { receipt, window_detached: true, sessions_before_launch: baseline, sessions_after_close: after.body.sessions, close_evidence: evidence };
   } catch (error) {
@@ -2650,6 +2671,37 @@ async function observeControlledBrowserInput(page, appFrame, token, pageId) {
   return { evidence, stop };
 }
 
+async function runControlledBrowserOperator(appFrame, token, pageId, expectedUrl, readReceipt, closeWindow) {
+  const runtimeOrigin = new URL(appFrame.url()).origin;
+  const instance = new URL(appFrame.url()).searchParams.get("browser_instance");
+  assert(instance, "Operator journey requires the current Browser instance");
+  let runtimeCoords;
+  try {
+    const text = readFileSync(BROWSER_OPERATOR_COORDS_PATH, "utf8");
+    assert(text.length <= 32768, "Operator Runtime coordinates exceed their bound");
+    runtimeCoords = JSON.parse(text);
+  } catch { throw new Error("Operator Runtime coordinates are unavailable or invalid"); }
+  return runBrowserOperatorJourney({
+    runtimeOrigin, runtimeCoords, homeToken: token, pageId, expectedUrl,
+    readReceipt, markStage, requireVzTransport: REQUIRE_BROWSER_VZ_TRANSPORT,
+    readState: async ({ signal }) => {
+      const headers = { Origin: "null", "x-elastos-home-token": token };
+      const response = await fetch(new URL(`/api/apps/browser/summary?browser_instance=${encodeURIComponent(instance)}`, runtimeOrigin),
+        { headers, signal });
+      assert(response.ok, "Operator Runtime summary failed");
+      const { sessions } = await response.json();
+      const status = await fetch(new URL(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/status`, runtimeOrigin), { headers, signal });
+      assert(status.ok, "Operator Runtime page status failed");
+      const page_status = await status.json();
+      const visible = await appFrame.evaluate(readBrowserViewerReloadDocument);
+      return { sessions, page_status, ...visible };
+    },
+    humanInput: (text, { timeoutMs }) => appFrame.locator("#browser-keyboard-capture")
+      .pressSequentially(text, { timeout: Math.ceil(timeoutMs) }),
+    closeWindow,
+  });
+}
+
 async function runControlledBrowserJourney(page, appFrame, windowLocator, token, baseline, failures) {
   const fixture = new URL(BROWSER_JOURNEY_FIXTURE_ORIGIN);
   const run = randomUUID();
@@ -2677,7 +2729,7 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
       "Controlled fixture receipt failed", body);
     return body;
   };
-  let failure = null, inputObserver = null;
+  let failure = null, inputObserver = null, operatorClosePromise = null;
   const stopInputObservation = async failed => {
     try { await inputObserver?.stop(failed); }
     catch {
@@ -2822,7 +2874,8 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
     }
     if (CHECK_BROWSER_CONTROLLED_INSPECTION) {
       markStage("browser:operator-stale-reference");
-      const url = `${fixture.origin}/main?run=${run}`;
+      const resetSequence = (await readReceipt()).events.at(-1)?.sequence || 0;
+      const url = `${fixture.origin}/main?run=${run}${CHECK_BROWSER_CONTROLLED_MEDIA ? "&media=1" : ""}`;
       await appFrame.locator("#browser-url").fill(url);
       await appFrame.locator("#browser-url").press("Enter");
       await waitForJourneyEvidence(() => browserApi(appFrame, token,
@@ -2833,8 +2886,28 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
         { method: "POST", body: { schema: "elastos.browser.inspect-request/v1", limit: 8,
           cursor: result.inspection.pages[0].body.next_cursor } });
       result.inspection.after_navigation = response;
+      result.inspection.after_navigation_url = url;
       assert(response.status === 409 && response.body?.code === "stale_inspection",
         "The old inspection cursor survived UI navigation", result.inspection);
+      const resetReceipt = await waitForJourneyEvidence(readReceipt, value => value.events.some(event =>
+        event.type === "load" && event.page === "main" && event.sequence > resetSequence), "controlled main document reload");
+      result.inspection.after_navigation_load = resetReceipt.events.find(event =>
+        event.type === "load" && event.page === "main" && event.sequence > resetSequence);
+    }
+    if (CHECK_BROWSER_CONTROLLED_OPERATOR) {
+      try {
+        result.operator = await runControlledBrowserOperator(appFrame, token, current.page_id,
+          result.inspection.after_navigation_url, readReceipt, () => {
+            // Share the original close attempt with the outer finally even if
+            // the operator probe times out while Home is still settling close.
+            operatorClosePromise ||= closeControlledBrowserWindow(page, appFrame, windowLocator, token, baseline,
+              { expectedPageId: current.page_id });
+            return operatorClosePromise;
+          });
+      } catch (error) {
+        result.operator = error.evidence || { ok: false, failure: "operator_setup_failed" };
+        throw error;
+      }
     }
   } catch (error) {
     error.details = { stage: smokeStage, ...error.details };
@@ -2843,8 +2916,8 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
     page.off("response", captureRoute);
     await stopInputObservation(Boolean(failure));
     try {
-      result.close = await closeControlledBrowserWindow(page, appFrame, windowLocator, token, baseline,
-        { expectedPageId: failure ? null : result.pages.at(-1)?.page_id });
+      result.close = await (operatorClosePromise || closeControlledBrowserWindow(page, appFrame, windowLocator, token, baseline,
+        { expectedPageId: failure ? null : result.pages.at(-1)?.page_id }));
     } catch (error) {
       if (failure) failure.details = { ...failure.details, cleanup_error: error.message, cleanup_details: error.details };
       else failure = error;
@@ -2860,6 +2933,8 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
 async function checkBrowserEmbeddedUiInput(page, baselineToken) {
   let baseline = null;
   if (baselineToken) {
+    // Home restoration is already permitted here. This is an entry observation,
+    // not an empty pre-launch state; controlled cleanup independently requires 0.
     const apiFrame = await homeGuiFrameForPage(page);
     const summary = await browserApi(apiFrame, baselineToken, "/api/apps/browser/summary");
     assert(summary.ok && summary.body?.sessions?.schema === "elastos.browser.session-capacity/v1",
@@ -4556,6 +4631,9 @@ async function main() {
     "Controlled audio proof requires the controlled Browser journey");
   assert(!CHECK_BROWSER_CONTROLLED_INSPECTION || CHECK_BROWSER_CONTROLLED_JOURNEY,
     "Controlled inspection requires the controlled Browser journey");
+  assert(!CHECK_BROWSER_CONTROLLED_OPERATOR || (CHECK_BROWSER_CONTROLLED_JOURNEY && CHECK_BROWSER_CONTROLLED_INSPECTION &&
+    BROWSER_OPERATOR_COORDS_PATH && existsSync(BROWSER_OPERATOR_COORDS_PATH)),
+  "Controlled operator proof requires the controlled inspection journey and explicit Runtime coordinates");
   assert(!CHECK_BROWSER_VIEWER_RELOAD || CHECK_BROWSER_CONTROLLED_JOURNEY,
     "Browser viewer reload requires the controlled journey");
   assert(!CHECK_BROWSER_CONTROLLED_RECOVERY || CHECK_BROWSER_CONTROLLED_JOURNEY,

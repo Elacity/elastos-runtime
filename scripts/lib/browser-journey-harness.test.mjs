@@ -12,7 +12,9 @@ function harnessFunction(name, globals = {}) {
   const next = source.slice(start + 1).search(/\n(?:async )?function /);
   const declaration = source.slice(start, start + 1 + next);
   return vm.runInNewContext(`(${declaration})`, { URL, Date, performance,
-    CHECK_BROWSER_CONTROLLED_MEDIA: false, CHECK_BROWSER_CONTROLLED_INSPECTION: false, ...globals });
+    CHECK_BROWSER_CONTROLLED_MEDIA: false, CHECK_BROWSER_CONTROLLED_INSPECTION: false,
+    CHECK_BROWSER_CONTROLLED_OPERATOR: false, CHECK_BROWSER_CONTROLLED_JOURNEY: false,
+    BROWSER_REMOTE_EXIT_ID: "", ...globals });
 }
 
 test("controlled fixture isolates runs, records bounded events and rejects malformed requests", async () => {
@@ -165,6 +167,7 @@ function closeHarnessFunction(globals = {}) {
     REQUIRE_BROWSER_VZ_TRANSPORT: false,
     markStage: () => {}, assert: (condition, message) => assert.ok(condition, message),
     redactSensitiveString: harnessFunction("redactSensitiveString"),
+    browserJourneyRuntimeEmpty: harnessFunction("browserJourneyRuntimeEmpty"),
     waitForJourneyEvidence: async (read, predicate) => { const value = await read(); assert.ok(predicate(value)); return value; },
     ...globals,
   });
@@ -200,32 +203,44 @@ test("a successful journey cannot use no-page startup cleanup as fresh-close pro
 });
 
 test("journey preserves click/key timing and exact close even when diagnostic stop rejects or throws", async () => {
-  for (const variant of ["success", "input-failure", "stop-reject", "stop-throw", "input-failure-stop-throw"]) {
+  for (const variant of ["success", "input-failure", "stop-reject", "stop-throw", "input-failure-stop-throw",
+    "operator-success", "operator-media-success", "operator-before-close-failure", "operator-after-close-failure",
+    "operator-pending-close-failure"]) {
     const inputFails = variant.includes("input-failure");
+    const operatorEnabled = variant.startsWith("operator-");
+    const operatorFails = operatorEnabled && variant.endsWith("failure");
+    const media = variant === "operator-media-success";
     const runId = "journey-test-run";
     const events = [];
     const closes = [], inputActions = [];
     const inputError = new Error("input delivery failed");
+    const operatorError = Object.assign(new Error("operator probe failed"), { evidence: { ok: false, failure: "typed-fixture-error" } });
     let url = "";
     let pageName = "";
     let value = "";
-    let frames = 0;
-    const report = type => events.push({ type, page: pageName, value, scroll_y: type === "scroll" ? 640 : 0,
+    let frames = 0, inspectReads = 0, operatorCalls = 0, finishClose;
+    const pendingClose = new Promise(resolve => { finishClose = resolve; });
+    const report = type => events.push({ sequence: events.length + 1, type, page: pageName, value, scroll_y: type === "scroll" ? 640 : 0,
+      ...(type === "audio" ? { audio_state: "running", frequency_hz: 440 } : {}),
       input_rect: { x: 32, y: 150, width: 480, height: 60 } });
     const appFrame = {
       waitForFunction: async () => {},
-      locator: () => ({ waitFor: async () => {}, hover: async () => {}, click: async () => { inputActions.push("click"); },
-        fill: async target => { url = target; pageName = new URL(target).pathname.slice(1); },
+      evaluate: async () => ({}),
+      locator: () => ({ waitFor: async () => {}, hover: async () => {}, click: async () => { inputActions.push("click"); if (media) report("audio"); },
+        fill: async target => { url = target; pageName = new URL(target).pathname.slice(1); value = ""; },
         press: async key => { assert.equal(key, "Enter"); report("load"); },
         pressSequentially: async character => { inputActions.push("key"); if (inputFails) throw inputError; value += character; report("input"); },
       }),
     };
-    const page = { mouse: { wheel: async () => report("scroll") } };
+    const page = { on: () => {}, off: () => {}, mouse: { wheel: async () => report("scroll") } };
     const baseline = {};
     const window = {};
     const journey = harnessFunction("runControlledBrowserJourney", {
       CHECK_BROWSER_CONTROLLED_RECOVERY: false,
       CHECK_BROWSER_VIEWER_RELOAD: false,
+      CHECK_BROWSER_CONTROLLED_INSPECTION: operatorEnabled,
+      CHECK_BROWSER_CONTROLLED_OPERATOR: operatorEnabled,
+      CHECK_BROWSER_CONTROLLED_MEDIA: media, controlledTonePresent: () => true,
       BROWSER_JOURNEY_FIXTURE_ORIGIN: "http://localhost:61511", BROWSER_OPEN_DISPLAY_MODE: "webrtc_remote_display",
       BROWSER_UI_PAGE_ID_TIMEOUT_MS: 180_000, BROWSER_REMOTE_VIDEO_TIMEOUT_MS: 30_000,
       randomUUID: () => runId, AbortSignal, smokeStage: "input", markStage: () => {},
@@ -233,8 +248,18 @@ test("journey preserves click/key timing and exact close even when diagnostic st
       fetch: async () => ({ ok: true, status: 200,
         json: async () => ({ schema: "elastos.browser.journey-receipt/v1", run: runId, events }) }),
       waitForEmbeddedBrowserPage: async () => `page-${pageName}`,
-      browserApi: async () => ({ ok: true, body: { schema: "elastos.browser.page-status/v1", actual_url: url,
-        direct_network: false, display_session: { media_transport: "runtime_relay" } } }),
+      browserApi: async (_frame, _token, path, options) => {
+        if (path.endsWith("/inspect")) {
+          if (!options) return { ok: true, body: { formats: ["accessibility_tree"] } };
+          if (inspectReads++ >= 2) return { status: 409, body: { code: "stale_inspection" } };
+          return { ok: true, body: { schema: "elastos.browser.inspect-result/v1", page_id: "page-nav",
+            document_generation: "b".repeat(32), snapshot_id: "a".repeat(32),
+            next_cursor: inspectReads === 1 ? "a".repeat(32) + ":1" : null,
+            nodes: inspectReads === 1 ? [{ role: "textbox", name: "Test text", value }] : [] } };
+        }
+        return { ok: true, body: { schema: "elastos.browser.page-status/v1", actual_url: url,
+          direct_network: false, display_session: { media_transport: "runtime_relay" } } };
+      },
       runtimeRelayIceContractOk: () => true,
       waitForJourneyEvidence: async (read, predicate) => { const result = await read(); assert.ok(predicate(result)); return result; },
       waitForBrowserRemoteVideo: async () => ({ decoded_frames: frames }),
@@ -250,10 +275,31 @@ test("journey preserves click/key timing and exact close even when diagnostic st
           if (variant === "stop-reject") return Promise.reject(new Error("private diagnostic failure"));
         } };
       },
-      closeControlledBrowserWindow: async (...args) => { closes.push(args); return { receipt: { closed: true } }; },
+      closeControlledBrowserWindow: async (...args) => {
+        closes.push(args);
+        return variant === "operator-pending-close-failure" ? pendingClose : { receipt: { closed: true } };
+      },
+      runControlledBrowserOperator: async (frame, token, pageId, expectedUrl, readReceipt, close) => {
+        operatorCalls++;
+        assert.equal(frame, appFrame); assert.equal(token, "browser-token"); assert.equal(pageId, "page-nav");
+        assert.equal(expectedUrl, `http://localhost:61511/main?run=${runId}${media ? "&media=1" : ""}`);
+        assert.equal(url, expectedUrl);
+        assert.equal(inspectReads, 3, "ordinary inspection and stale-cursor checks finish first");
+        assert.equal((await readReceipt()).events.at(-1).value, "");
+        if (variant === "operator-before-close-failure") throw operatorError;
+        if (variant === "operator-pending-close-failure") {
+          void close();
+          setImmediate(() => finishClose({ receipt: { closed: true } }));
+          throw operatorError;
+        }
+        await close(); await close(); // The wrapper and outer finally share one UI attempt.
+        if (operatorFails) throw operatorError;
+        return { ok: true };
+      },
     });
-    if (inputFails) await assert.rejects(journey(page, appFrame, window, "browser-token", baseline, []), error => {
-      assert.equal(error, inputError);
+    if (inputFails || operatorFails) await assert.rejects(journey(page, appFrame, window, "browser-token", baseline, []), error => {
+      assert.equal(error, inputFails ? inputError : operatorError);
+      if (operatorFails) assert.equal(error.details.controlled_journey.operator.failure, "typed-fixture-error");
       if (variant.includes("stop-throw")) assert.equal(error.details.controlled_journey.input_observation.observer.stop_failed, true);
       return true;
     });
@@ -264,10 +310,11 @@ test("journey preserves click/key timing and exact close even when diagnostic st
       assert.ok(!JSON.stringify(result).includes("private diagnostic failure"));
     }
     assert.equal(closes.length, 1);
+    assert.equal(operatorCalls, operatorEnabled ? 1 : 0);
     assert.deepEqual(inputActions.slice(0, 4), ["observe", "geometry", "click", "key"]);
     assert.equal(inputActions[4], inputFails ? "failure-stop" : "stop");
     assert.deepEqual(closes[0].slice(0, 5), [page, appFrame, window, "browser-token", baseline]);
-    assert.equal(closes[0][5]?.expectedPageId, inputFails ? null : "page-nav");
+    assert.equal(closes[0][5]?.expectedPageId, inputFails || variant === "operator-before-close-failure" ? null : "page-nav");
   }
 });
 
@@ -284,7 +331,14 @@ test("UI close requires exact ownership, terminal Engine effects and Runtime bas
     "wrong-response-token", "wrong-receipt-instance", "missing-receipt-instance", "wrong-receipt-page",
     "wrong-request-handle", "wrong-request-instance", "missing-response", "missing-pending", "missing-terminal",
     "wrong-message-source", "wrong-message-origin", "wrong-message-token", "wrong-request-id", "wrong-generation",
-    "wrong-message-page", "wrong-message-cleanup", "wrong-terminal-kind"]) {
+    "wrong-message-page", "wrong-message-cleanup", "wrong-terminal-kind",
+    "controlled-restored-entry", "controlled-retained-session", "controlled-retained-launch",
+    "controlled-retained-cleanup", "controlled-retained-reconciliation", "controlled-unavailable", "controlled-lifecycle-residue"]) {
+    const controlled = variant.startsWith("controlled-");
+    // Home restoration already acquired one session/open before the entry read.
+    // A blanket <= baseline would hide each residual variant below.
+    const entry = controlled ? { ...baseline, active_sessions: 1, principal_sessions: 1, total_sessions: 1,
+      launching_sessions: 1, engine_cleanup_obligations: 1, launch_reconciliation_obligations: 1 } : baseline;
     const receipt = structuredClone(good);
     if (variant === "already-closed") { receipt.closed = false; receipt.already_closed = true; }
     if (variant === "wrong-owner") receipt.cleanup_id = "foreign-cleanup";
@@ -316,10 +370,17 @@ test("UI close requires exact ownership, terminal Engine effects and Runtime bas
     // negative assertions instead of failing because a mock API is absent.
     page.waitForResponse = async predicate => { assert.equal(await predicate(response), true); return response; };
     const close = closeHarnessFunction({
+      CHECK_BROWSER_CONTROLLED_JOURNEY: controlled,
       REQUIRE_BROWSER_VZ_TRANSPORT: ["valid-vz", "missing-vz-proof"].includes(variant),
       browserApi: async frame => { assert.equal(frame, opaqueGui); return { ok: true, body: { sessions: reads++ === 0 ? { recoverable_page: owner } : {
-        schema: "elastos.browser.session-capacity/v1", ...baseline,
-        principal_sessions: variant === "session-retained" ? 1 : 0, recoverable_page: null,
+        schema: "elastos.browser.session-capacity/v1", status: variant === "controlled-unavailable" ? "unavailable" : "configured",
+        ...baseline, active_sessions: variant === "controlled-retained-session" ? 1 : 0,
+        principal_sessions: ["session-retained", "controlled-retained-session"].includes(variant) ? 1 : 0,
+        total_sessions: variant === "controlled-retained-session" ? 1 : 0,
+        launching_sessions: variant === "controlled-retained-launch" ? 1 : 0,
+        engine_cleanup_obligations: variant === "controlled-retained-cleanup" ? 1 : 0,
+        launch_reconciliation_obligations: variant === "controlled-retained-reconciliation" ? 1 : 0,
+        lifecycle: { sessions: variant === "controlled-lifecycle-residue" ? [{ page_id: "foreign-page" }] : [] }, recoverable_page: null,
       } } }; },
       waitForJourneyEvidence: async (read, predicate) => { const value = await read(); assert.ok(predicate(value)); return value; },
     });
@@ -339,15 +400,20 @@ test("UI close requires exact ownership, terminal Engine effects and Runtime bas
       surface.expire();
     };
     const options = { expectedPageId: variant === "wrong-expected-page" ? "last-exercised-page" : owner.page_id };
-    if (["valid", "valid-vz"].includes(variant)) {
-      const result = await close(page, surface.frame, surface.window, "browser-token", baseline, options);
+    if (["valid", "valid-vz", "controlled-restored-entry"].includes(variant)) {
+      const result = await close(page, surface.frame, surface.window, "browser-token", entry, options);
       assert.equal(result.receipt.cleanup_id, owner.cleanup.id);
       assert.equal(result.receipt.page_id, options.expectedPageId);
       assert.equal(result.close_evidence.close_responses[0].authority_matches, true);
       assert.equal(result.close_evidence.messages.at(-1).terminalKind, "closed");
       assert.deepEqual(actions, ["ui-close", "detached", "disposed"]);
+      if (controlled) {
+        assert.equal(result.close_evidence.runtime_counts.entry.launching_sessions, 1);
+        assert.equal(result.close_evidence.runtime_counts.terminal_requirement, "configured_empty_runtime");
+        assert.equal(result.sessions_after_close.total_sessions, 0);
+      }
     } else {
-      await assert.rejects(close(page, surface.frame, surface.window, "browser-token", baseline, options),
+      await assert.rejects(close(page, surface.frame, surface.window, "browser-token", entry, options),
         error => error?.name !== "TypeError", variant);
     }
     surface.assertClean();
@@ -606,6 +672,72 @@ for (const observation of ["ready", "document-transition", "unexpected-viewer-er
       assert.equal((await run).ok, true);
       assert.deepEqual(actions, ["wait-commit", "reload-frame", "input"]);
       assert.match(requests[1].url, /\/pages\/runtime-owner\/status$/);
+    }
+  });
+}
+
+for (const variant of ["ready", "summary-rejected", "status-rejected", "viewer-rejected", "invalid-coordinates"]) {
+  test(`operator wrapper binds existing owner, separate attach coordinates and UI callbacks: ${variant}`, async () => {
+    const requests = [], actions = [];
+    const sessions = { recoverable_page: { page_id: "page-one" } };
+    const visible = { viewer: { page_id: "page-one" }, video: { decoded_frames: 10 } };
+    const frame = {
+      url: () => "http://localhost:61510/apps/browser/?browser_instance=instance-one#home_token=browser-token",
+      evaluate: async fn => {
+        assert.equal(fn, readBrowserViewerReloadDocument);
+        if (variant === "viewer-rejected") throw new Error("viewer unavailable");
+        return visible;
+      },
+      locator: selector => ({ pressSequentially: async (text, options) => {
+        assert.equal(selector, "#browser-keyboard-capture"); assert.equal(text, "-human");
+        assert.equal(options.timeout, 3000); actions.push("human-ui");
+      } }),
+    };
+    const coords = { runtime_kind: "gateway", api_url: "http://127.0.0.1:61999", attach_secret: "private-attach-secret" };
+    const receipt = async () => ({}), close = async () => { actions.push("ui-close"); return { closed: true }; };
+    const signal = new AbortController().signal;
+    const expectedUrl = "http://localhost:61511/main?run=fixture-run&media=1";
+    const wrapper = harnessFunction("runControlledBrowserOperator", {
+      BROWSER_OPERATOR_COORDS_PATH: "/explicit/task/runtime-coords.json", REQUIRE_BROWSER_VZ_TRANSPORT: true,
+      readBrowserViewerReloadDocument, markStage: () => {}, assert: (value, message) => assert.ok(value, message),
+      readFileSync: (path, encoding) => {
+        assert.equal(path, "/explicit/task/runtime-coords.json"); assert.equal(encoding, "utf8");
+        return variant === "invalid-coordinates" ? '{"private-attach-secret"' : JSON.stringify(coords);
+      },
+      fetch: async (url, options) => {
+        const target = new URL(url); requests.push(target);
+        assert.equal(target.origin, "http://localhost:61510");
+        assert.equal(options.headers.Origin, "null");
+        assert.equal(options.headers["x-elastos-home-token"], "browser-token");
+        assert.equal(options.headers.Authorization, undefined); assert.equal(options.signal, signal);
+        if (target.pathname.endsWith("summary")) {
+          assert.equal(target.searchParams.get("browser_instance"), "instance-one");
+          return { ok: variant !== "summary-rejected", json: async () => ({ sessions }) };
+        }
+        assert.equal(target.pathname, "/api/apps/browser/pages/page-one/status");
+        return { ok: variant !== "status-rejected", json: async () => ({ page_id: "page-one" }) };
+      },
+      runBrowserOperatorJourney: async callbacks => {
+        assert.equal(callbacks.runtimeCoords.api_url, coords.api_url);
+        assert.equal(callbacks.runtimeCoords.attach_secret, coords.attach_secret);
+        assert.equal(callbacks.runtimeOrigin, "http://localhost:61510");
+        assert.equal(callbacks.homeToken, "browser-token"); assert.equal(callbacks.pageId, "page-one");
+        assert.equal(callbacks.expectedUrl, expectedUrl); assert.equal(callbacks.requireVzTransport, true);
+        assert.equal(callbacks.readReceipt, receipt); assert.equal(callbacks.closeWindow, close);
+        const result = await callbacks.readState({ signal });
+        assert.equal(result.sessions, sessions); assert.equal(result.page_status.page_id, "page-one");
+        assert.equal(result.viewer, visible.viewer); assert.equal(result.video, visible.video);
+        await callbacks.humanInput("-human", { timeoutMs: 2999.5 });
+        await callbacks.closeWindow(); return { ok: true };
+      },
+    });
+    const run = wrapper(frame, "browser-token", "page-one", expectedUrl, receipt, close);
+    if (variant === "ready") {
+      assert.equal((await run).ok, true); assert.deepEqual(actions, ["human-ui", "ui-close"]);
+    } else {
+      await assert.rejects(run, error => { assert.ok(!error.message.includes("private-attach-secret")); return true; });
+      assert.deepEqual(actions, []);
+      if (variant === "invalid-coordinates") assert.equal(requests.length, 0);
     }
   });
 }
