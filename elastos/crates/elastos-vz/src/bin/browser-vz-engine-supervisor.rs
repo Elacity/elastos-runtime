@@ -2746,10 +2746,17 @@ async fn bootstrap_vz_transport(
         .write_all(&bytes)
         .and_then(|_| stream.flush())
         .map_err(|err| format!("Browser VZ transport bootstrap write failed: {err}"))?;
+    let receipt = read_vz_transport_bootstrap_receipt(&mut stream)?;
+    validate_vz_transport_bootstrap_receipt(&receipt, &transport.authority)?;
+    Ok(receipt)
+}
+
+fn read_vz_transport_bootstrap_receipt(stream: &mut impl Read) -> Result<Value, String> {
     let mut response = Vec::new();
-    stream
-        .take(64 * 1024 + 1)
-        .read_to_end(&mut response)
+    // Bootstrap is one bounded JSON line. The peer may keep its write side
+    // open until we release the connection after validating that receipt.
+    BufReader::new(stream.take(64 * 1024 + 1))
+        .read_until(b'\n', &mut response)
         .map_err(|err| format!("Browser VZ transport bootstrap read failed: {err}"))?;
     if response.len() > 64 * 1024 {
         return Err("Browser VZ transport bootstrap receipt is too large".to_string());
@@ -2761,7 +2768,6 @@ async fn bootstrap_vz_transport(
             .ok_or_else(|| "Browser VZ transport bootstrap receipt is empty".to_string())?,
     )
     .map_err(|err| format!("Browser VZ transport bootstrap receipt is invalid JSON: {err}"))?;
-    validate_vz_transport_bootstrap_receipt(&receipt, &transport.authority)?;
     Ok(receipt)
 }
 
@@ -4570,6 +4576,33 @@ mod tests {
         let (guest_to_runtime, runtime_to_guest) = bridge.join().unwrap().unwrap();
         assert_eq!(guest_to_runtime, 0);
         assert_eq!(runtime_to_guest, 4);
+    }
+
+    #[test]
+    fn bootstrap_receipt_completes_while_the_peer_write_side_stays_open() {
+        let (mut client, mut peer) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let receipt = json!({"schema": "elastos.browser.vz-transport-bootstrap-receipt/v1"});
+        writeln!(peer, "{receipt}").unwrap();
+        assert_eq!(
+            read_vz_transport_bootstrap_receipt(&mut client).unwrap(),
+            receipt
+        );
+    }
+
+    #[test]
+    fn bootstrap_receipt_read_rejects_empty_malformed_and_oversized_frames() {
+        for bytes in [b"".as_slice(), b"\n", b"{broken}\n"] {
+            assert!(read_vz_transport_bootstrap_receipt(&mut std::io::Cursor::new(bytes)).is_err());
+        }
+        let oversized = vec![b'x'; 64 * 1024 + 1];
+        assert!(
+            read_vz_transport_bootstrap_receipt(&mut std::io::Cursor::new(oversized))
+                .unwrap_err()
+                .contains("too large")
+        );
     }
 
     #[test]
