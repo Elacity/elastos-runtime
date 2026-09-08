@@ -106,6 +106,12 @@ alongside the local, operator and remote journeys.
   adapter conformance stay open while the coordinator integrates installation
   and remote service work.
   Reviewed source `9e6693d6` adds the bounded owner-approved click/type writer.
+  The installed journey exposes an unset viewport check in run 69. Repair
+  `cb03a719` passes 67 focused tests and run 70: separate operator attach, explicit
+  owner approval, click/type, human takeover, revoked-input rejection and exact
+  13-effect close. Independent installed review and the combined viewer-reload
+  repeat are next. Playwright, Camofox/Camoufox, remote operator identity and the
+  full action/profile/file conformance requirements remain open.
   The corrected real CDP wrapper dispatches each action once; a native pending
   marker keeps human handoff behind uncertain effects. Its 74 JavaScript and
   12 Python checks plus Runtime/common/adapter regressions pass. The changed guest scripts and adapter are installed. Prove actual ref actions, handoff,

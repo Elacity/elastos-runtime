@@ -168,18 +168,32 @@ hash checks. Run 57's audio silence remains unexplained.
 
 Run 65 exercises the combined operator image: decoded media, navigation, typing,
 scrolling, native inspection and reload pass. Its exact close clears all 13
-effects in 675 ms and ends with zero Runtime/control counts. The harness fails
-its final baseline equality check; its full verdict stays failed pending review
-and correction of that condition.
+effects in 675 ms and ends with zero Runtime/control counts. Its original verdict
+stays failed. Source `137a95ab` corrects the harness to require the configured
+empty Runtime and retain entry counts. Subsequent runs confirm exact cleanup.
 
 Reviewed source `92f04e0e` adds Runtime background request/decision receive with
 23 combined regressions. Source `9e6693d6` adds a short owner-approved operator
 writer and native reference click/type. Tests cover the real CDP retry wrapper
 and late-effect handoff: 74 JavaScript and 12 Python cases, plus the common,
-adapter and Runtime authority tests. Its installed native handoff remains pending.
+adapter and Runtime authority tests. Run 69 reaches owner approval but its first
+click fails: the Engine checks viewport fields absent from the actual page object.
+Source `cb03a719` reads the live CDP viewport; independent review accepts its 67
+focused tests. The installed repair changes one Engine script in the existing
+rootfs and initrd, while reusing Runtime `0244cc0c` and matching native helpers.
+Run 70 passes local controlled browsing, decoded media, inspection, separate
+operator attach, owner approval, native reference click/type, human handoff and
+revoked-input rejection. Close takes 747 ms, clears all 13 effects and leaves zero
+Runtime/control obligations. This bounded operator proof awaits independent
+installed review. Full adapter and human qualification remain open.
+
+Run 68 fails viewer reload before operator admission. Its original evidence lacks
+the failed binding predicate. Source `649132fc` retains named, redacted predicate
+results with 135 passing recovery/reload tests and preserves the original checks.
+The combined reload/operator repeat is next; B06 remains open.
 Source `54df379a` adds signed remote Engine availability probes; full remote page,
 stream and media binding is still being implemented. The combined source
-candidate is installed; the representative operator journey is next. B01-B16 retain all media,
+candidate is installed; combined recovery and remote Engine journeys are next. B01-B16 retain all media,
 performance, recovery, device, human and release gates. Public live is unchanged.
 
 The preceding image used dependency repair `cbb1e099`, rootfs
