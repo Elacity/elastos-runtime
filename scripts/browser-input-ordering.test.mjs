@@ -101,7 +101,6 @@ test("rapid r/e/d waits for each Runtime ack and preserves the observed recovere
 for (const [name, event, messages] of [
   ["Backspace", { type: "key", key: "Backspace" }, ["kd,65288", "ku,65288"]],
   ["Enter", { type: "key", key: "Enter" }, ["kd,65293", "ku,65293"]],
-  ["pointer click", { type: "click", x: 15, y: 20 }, ["m,15,20,0,0", "m,15,20,1,0", "m,15,20,0,0"]],
 ]) test(`${name} dispatch waits behind unresolved Runtime text`, async () => {
   const h = harness(), first = h.submit(text("r")), second = h.submit(event);
   await nextTurn();
@@ -111,6 +110,30 @@ for (const [name, event, messages] of [
   const results = await Promise.all([first, second]);
   assert.ok(results.every(result => result.status === "fulfilled"));
   assert.deepEqual(h.sends, messages);
+});
+
+for (const events of [
+  [{ type: "click", x: 15, y: 20 }, text("B")],
+  [text("B"), { type: "click", x: 15, y: 20 }],
+]) test(`${events[0].type} completion precedes ${events[1].type} at the Engine`, async () => {
+  const h = harness(), results = events.map(event => h.submit(event));
+  await nextTurn();
+  assert.deepEqual(h.requests.map(request => request.event), [events[0]]);
+  assert.deepEqual(h.sends, [], "a local data-channel send cannot acknowledge remote focus");
+  h.requests[0].ack(); await nextTurn();
+  assert.deepEqual(h.requests.map(request => request.event), events);
+  h.requests[1].ack();
+  assert.ok((await Promise.all(results)).every(result => result.status === "fulfilled"));
+  assert.deepEqual(h.effects, events.map(event => event.text ?? event.type));
+});
+
+test("uncertain click delivery cancels queued text instead of inserting into an unknown focus", async () => {
+  const h = harness(), click = h.submit({ type: "click", x: 15, y: 20 }), typed = h.submit(text("B"));
+  await nextTurn();
+  assert.equal(h.requests.length, 1); assert.equal(h.requests[0].event.type, "click");
+  h.requests[0].reject(new TypeError("click acknowledgment unavailable"));
+  assert.equal((await click).status, "rejected"); assertCanceled([await typed]);
+  assert.equal(h.requests.length, 1); assert.deepEqual(h.sends, []); assert.deepEqual(h.effects, []);
 });
 
 test("multiple Runtime text and paste operations each await their predecessor", async () => {

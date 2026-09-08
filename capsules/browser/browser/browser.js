@@ -1423,6 +1423,9 @@ async function dispatchBrowserInput(
   }
   const requiresRuntimeRoute =
     event?.type === "browser_command" ||
+    // A following text insertion needs the Engine's completed click/focus,
+    // rather than only a successful send on a different transport.
+    event?.type === "click" ||
     event?.type === "paste_text" ||
     event?.type === "file_upload" ||
     event?.type === "clipboard_write";
