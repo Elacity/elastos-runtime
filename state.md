@@ -9,15 +9,17 @@ volatile proof logs remain outside the repository.
 ## Release Posture
 
 - A fresh fetch records `origin/main` at `8ac18bec` as the released `v0.7.0`
-  source and `origin/upstream/0.7.1-dev` at `c511b133` as the active
+  source and `origin/upstream/0.7.1-dev` at `6c61c990` as the active
   integration line.
 - Released `v0.7.0` already carries the coordinated workspace version,
   changelog, manifest bumps, and lock refresh. Installed artifacts report
   `0.7.0` only after the checked publish flow stamps
   `ELASTOS_RELEASE_VERSION`; unstamped source builds report `0.7.0-dev`.
-- Published integration is `origin/feat/0.7.1-integration@5ba1faa0`.
-  Its setup guard is equivalent to the local guard; ancestry reconciliation
-  remains a publication prerequisite.
+- Cached historical tracking is `origin/feat/0.7.1-integration@5ba1faa0`.
+  PR58 merged it into `origin/upstream/0.7.1-dev@6c61c990`, then the integration
+  branch was deleted. The setup guard is equivalent to the local guard.
+  The reviewed local history and model preparation work await explicit
+  publication after local reconciliation and installed acceptance.
   Local merge `91209988`, tree `16f8f020`, preserves the five reviewed groups:
   artifact verification `c95cf4c9`, local-engine lifecycle `7c4fc929`, hosted
   evidence `fcb8fc5e`, Responses and honest cancellation `0d768415`, and delivery
@@ -86,6 +88,11 @@ volatile proof logs remain outside the repository.
 
 ## Installed candidate proof
 
+- Browser remains a separately owned acceptance dependency. Its owner reports
+  newer local checks and open startup/refresh issues, but those updates lack a
+  matching source/installed receipt for this integration. Historical Browser
+  results below retain their original scope; no external branch is imported
+  or accepted here on that basis.
 - The isolated localhost installation at `localhost:61380` has source commit
   `900d7e5c` and tree `c9a9effe`. This is installed acceptance for that local
   candidate. It is not seed, third-node, or cutover proof.
@@ -264,127 +271,59 @@ The integrated source includes these durable facts:
 - The candidate preserves reviewed onboarding, window/selection and
   conditional-save source checks alongside signed catalog metadata and bounded
   reads. Combined installed acceptance remains open.
-- Runtime preparation connects the inventory to Content and typed catalog
-  invocation, with native package identity and capacity verification. Source
-  receipts cover the accepted final composite; intermediate whole-server trees
-  were not tested separately. Analyser's latest
-  regular run passes 25 tests, with the explicit process prerequisite ignored
-  in that run and exercised separately. Registry, full-charge and aggregate-budget
-  preflight pass; `Reserved` carries the full charge and exact-CID aliases remain
-  single-charged. The seeded-cache 16 MiB
-  lower-layer real-Kubo/native process test transfers the complete object index and ranged files, checks
-  exact source bytes and digests, and reproduces the full package CID. Normal
-  CLI import and streamed hashing agree, with unchanged backend allocation and
-  successful fixture cleanup. Memory and disk observations are qualified
-  samples and high-water marks; cold-network and Qwen proof remain open.
-- Typed local Registry readiness/hash/capacity methods reject generic raw, provider-plane
-  and Carrier calls before transmission. Readiness probes the bounded pinned
-  version after the existing Kubo lifecycle runs. Descriptors are checked before
-  effects and responses are sanitized. The hash helper is production code on
-  supported platforms; ordinary operations retain their behavior. Current
-  parent verification passes native 43 tests (one explicit prerequisite test
-  ignored), the separately invoked real-Kubo process test and Registry 46/46.
-  Earlier Content metadata 2/2, bounded reads 2/2 and content-fetch 11/11
-  remain verified. Workspace/Chain/native formatting, Home/public-copy entropy
-  and diff checks pass. The parent's final strict native Clippy all-targets
-  rerun also passes.
-- Private capacity observation checks the ready backend's actual repository
-  and same-volume datastores, validates bounded numeric facts and preserves
-  the 10% free-space floor. Backend directories allow current-owner `0755`
-  while rejecting special or group/world write bits; staging remains `0700`.
-  The real-Kubo process proof passes with repo mode `0755`, 264 calls and
-  16,777,382 transferred bytes, with cleanup, child reap and EOF confirmed.
-  This observation does not reserve capacity or establish peak usage.
-- Preparation progress credits delivered bytes once against each remaining
-  staging and backend charge, which avoids charging stored bytes again.
-  Full quota, fixed overhead allowances and the 10% free-space floor remain
-  unchanged. Focused progress, separate-volume, overflow and provider-request
-  tests pass, as does the repeated seeded-warm 8 MiB process proof.
-- Separately invoked 1 MiB and 8 MiB process tests passed through the production preparation
-  owner, real Content, Registry, native provider bridge and isolated offline
-  Kubo. Fresh Use admitted 1,049,332 payload bytes plus a 717-byte index in
-  426 ms, with 22 Content reads and 48 provider requests. Reopened-owner CID
-  reuse made zero Content reads. Fixture cleanup and both child reaps passed.
-  The 8 MiB run admitted 8,389,356 payload bytes plus a 717-byte index in
-  2.066 seconds, with 133 Content reads and 270 provider requests. Reuse again
-  made zero Content reads. Backend allocated bytes rose from 8,470,528 to
-  8,474,624; sampled staging/admitted allocation was 8,605,696 bytes and the
-  full reservation was 33,753,284 bytes. Cleanup and both child reaps passed.
-  Both runs used signed synthetic packages seeded in offline local cache.
-  Continuous peak-capacity and exact-model-scale delivery proof remain open.
-  One inventory worker retains accounting through drain and
-  exact admission reconciliation. Shared Use/Keep/selection
-  UI and cold exact-Qwen acceptance follow. Installed Homes remain unchanged.
-- A separate 64 MiB-capped signed synthetic process test passes cold loopback
-  delivery through Content, Registry and the native provider. The consumer
-  starts with only Kubo's verified initialization block; the selected package
-  is absent before connection. Consumer backend growth, exact byte/CID admission,
-  zero-read reuse and both-peer/native cleanup pass. Disk observations include
-  sampled backend/stage allocations and free space. Whole-buffer fixture memory
-  belongs to the test harness. Real Qwen, inference and full-scale memory/disk
-  proof remain open.
-- Runtime startup composes admitted content with configured
-  operator offers after native IPFS registration. It rechecks the current signed
-  catalog, complete stored closure, package CID and installed engine receipt.
-  The offer ID binds the package, entrypoint/weights and engine receipt; the
-  existing model provider includes that ID and its execution settings in the
-  run binding. Its Runtime-owned profile is limited to the verified
-  Darwin-arm64 engine settings. Startup and admission share one private config
-  composer with canonical base and journal paths. Runtime retains the inventory
-  worker lock through startup Init/registration and refresh Init/result handling;
-  short inventory transactions remain available for status and Keep. The composer
-  projects private admitted-offer IDs only after verification and preserves
-  operator configuration. Focused source and native-provider Init/refresh tests
-  pass; they do not establish full-Qwen inference or installed acceptance.
-  Additive Init refresh keeps
-  the same provider process, Registry slot and journal, with exact existing
-  operator offers. The serialized coordinator checks and applies the config;
-  active workers, cached engines and unresolved runs block additions. Exact
-  replay is idempotent. Unknown outcomes retain their bindings through expiry
-  and restart. Busy activation keeps the admitted artifact for retry without
-  another transfer; admission and activation do not grant inference authority.
-  Analyser's Rust 1.91 locked/offline checks with warnings denied pass 186 native
-  library tests, 49 server model tests, 18 binary model-provider tests and 47
-  Registry tests. The explicit same-process Init/refresh test passes in 0.17
-  seconds with synthetic content and a fake engine; it does not run inference.
-  The native suite leaves one real-Qwen prerequisite ignored, and the server
-  suite leaves three explicit process prerequisites ignored. Earlier separate
-  process receipts remain distinct. Formatting, Home/public-copy entropy and
-  diff checks pass. Retention eviction, scaled resource proof and
-  cold exact-Qwen/installed acceptance remain open.
-- Runtime accepts `content.retention` with `{cid, keep}` through the existing
-  preparation owner and first-party manifests. The same inventory stores one
-  claim per principal and admitted CID; aliases share it and release preserves
-  other principals' claims. Status exposes only the caller's `kept` fact.
-  Keep changes leave admission, bytes, quota, offers and readiness unchanged and
-  do not interrupt startup verification. Source checks pass 60 server model tests
-  (four explicit process prerequisites ignored) and the capsule binding test.
-  The model provider retains each engine handle until bounded close confirms
-  reaping and, for production guards, process-group absence. Uncertain closure
-  blocks replacement. Provider-source tests verify exact admitted-offer retirement
-  through private Init provenance and immutable offer configuration, retained
-  ownership on uncertain close, operator offers
-  and historical results, including lost replies and racing creates. The native
-  library suite and five process tests pass; the real-model prerequisite remains
-  ignored. Runtime/Registry/inventory retirement, run/Keep/reference checks,
-  byte eviction and
-  installed full-Qwen proof remain open.
-- Runtime derives one caller-scoped `model_runtime` projection for catalog GET,
-  typed catalog list and preparation status. It reports admission, Keep,
-  preparation progress and `dispatch_ready` for the single signed model profile.
-  Readiness requires current admission and trust, safe artifact metadata, the
-  current engine receipt identity and exactly one matching local provider offer.
-  Startup and readiness share the same offer identity and public policy.
-  Reads are bounded, revalidate the current caller after provider I/O and use a
-  read-only inventory snapshot that preserves pending recovery data. Polls
-  neither hash payloads nor persist readiness; full activation hashing and
-  provider hashing before each new engine start remain unchanged.
-  This proves dispatch configuration, while engine warmth and inference need
-  run evidence. Source checks pass 3 Runtime and 67 server model tests, with
-  four explicit process tests excluded from that server run. Separate native
-  Init and same-process refresh tests pass with the existing pinned provider.
-  Strict Runtime/server all-target Clippy, formatting and entropy checks pass.
-  Installed acceptance remains open; installed Homes are unchanged.
+- Runtime preparation connects signed inventory to bounded local Content reads,
+  native package hashing and observed backend capacity. One inventory worker
+  retains ownership through transfer drain, atomic admission, activation and
+  retirement. It checks caller authority, full outstanding charges, aggregate
+  quota and the 10% free-space floor. Backend capacity observations use at most
+  1 MiB byte windows; delivered bytes are credited once. Exact-CID aliases share
+  admitted files and one charge.
+- Runtime startup and admission use one private model config composer. It
+  verifies the current signed catalog, complete closure, package CID and engine
+  receipt, and binds the generated offer to its owning admission before Init.
+  Additive refresh retains the same provider process, Registry slot and journal.
+  Operator offers stay unchanged; active workers, cached engines and unresolved
+  outcomes retain execution ownership. Exact refresh is idempotent.
+- Runtime stores caller Keep claims and retirement in the same inventory.
+  CapacityPending preserves the exact pending Use with zero reservation.
+  Retirement withdraws the exact admitted offer before removing its files;
+  withdrawal uncertainty retains bytes and accounting. Startup reconciles a
+  pending withdrawal before provider registration. Runtime selects only eligible
+  unkept admissions and preserves all principals' Keep claims and operator
+  artifacts. Removal updates local admission accounting; Kubo storage remains
+  subject to observed filesystem headroom. Release makes bytes eligible rather
+  than deleting them immediately.
+- Catalog GET, typed catalog list and preparation status share one caller-scoped
+  model_runtime projection for admission, Keep, progress and dispatch readiness.
+  Readiness requires current trust and admission, safe artifact metadata, the
+  exact engine receipt and one matching local provider offer. Registry validates
+  the exact offers envelope and protocol. Bounded reads revalidate the caller
+  after provider I/O; polling neither hashes payloads nor persists readiness.
+  Activation and each new engine start retain full artifact verification.
+- The provider splits text using the complete serialized event envelope and
+  waits for Applied acknowledgement per chunk. A capped one-second flush makes
+  small active deltas visible without changing output, journal or runtime limits.
+  Exact engine ownership remains until bounded reap and process-group checks
+  confirm closure. On macOS, only an already-observed exited guard can proceed
+  through the zombie-only signal exception to the required absence check.
+- The combined exact-Qwen source/process proof passes cold loopback delivery,
+  full CID/byte admission, zero-read same-file reuse, a ready reply, active text
+  followed by honest settlement_unknown cancellation, exact terminal/event
+  replay across restart and persisted Keep. The publisher used an isolated
+  operator-attested signed catalog. Both Kubo children, the native providers
+  and the temporary root were cleaned up. This does not establish upstream
+  publisher identity, per-run backend stop or installed behavior.
+  Process-tree memory and disk observations are samples, not continuous peaks;
+  complete idle/busy retention and eviction acceptance remains open.
+- Focused source gates pass: 204 model-provider library tests, five provider
+  process tests, 80 server model tests, strict Runtime/server/provider Clippy,
+  formatting and Home/public-copy entropy. Explicit prerequisite tests excluded
+  from ordinary runs have separate receipts, including the full Qwen proof.
+  An untouched redirect fixture failed one request-capture assertion, then
+  passed alone and in the full rerun. Its intermittent cause remains unresolved.
+  Detailed timings, artifact hashes and cleanup receipts stay in the operator
+  record. Release artifacts are required for the measured Qwen profile because
+  debug verification exhausted the unchanged 120-second run deadline.
 - Marketplace Models and System model management use one vendored helper with
   their existing catalog/interface reads and typed content operations. They
   display verified publisher/CID metadata, preparation progress, cancel/retry,
@@ -397,7 +336,7 @@ The integrated source includes these durable facts:
   release preserves bytes. Browser fixture tests cover both actual pages and
   manifests, lost replies, visibility, correlation, malformed data, focus,
   errors and desktop/narrow layouts. Existing app/media and System behavior
-  checks pass. Safe eviction and installed model acceptance remain open.
+  checks pass. Installed model acceptance remains open.
 - Assistant and Home Agent preserve an exact offer ID and optional content CID
   in their existing workspaces. Content selection requires a unique current
   ready catalog-to-offer match; ordinary service choices remain valid. Each
@@ -406,8 +345,8 @@ The integrated source includes these durable facts:
   deliberate Send; accepted runs retain their existing resume and cancel path.
   Only an empty initial choice uses the existing first-offer default. Open Models
   uses the registered Home frame and token to open System Models. Source unit,
-  actual-page browser and workspace roundtrip tests pass. Real-model and
-  installed acceptance remain open; installed Homes and user data are unchanged.
+  actual-page browser and workspace roundtrip tests pass. Combined installed
+  composer acceptance remains open; installed Homes and user data are unchanged.
 - Large-model publication needs a bounded operator/provider bootstrap path or a
   separately verified publisher repair. The current generic directory publisher
   reads whole files and builds a base64 JSON array. Cold-proof capacity must

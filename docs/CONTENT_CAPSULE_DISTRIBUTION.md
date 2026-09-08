@@ -12,8 +12,10 @@ operator-pinned signed model catalog snapshot. Its typed preparation path can
 admit that exact package through bounded local Content reads. Marketplace and
 System source views expose preparation and Keep controls. Assistant and Home
 Agent select current ready offers and preserve optional content CID intent.
-Real-model packaging, installed acceptance and network catalog updates remain
-planned work.
+The isolated cold Qwen source/process proof covers admission, reply, active
+cancellation, exact restart replay and Keep persistence. Operator-signed
+packaging for an installed Home, combined GUI/retention acceptance and network
+catalog updates remain open.
 
 The implemented content plane already provides `elastos://content` publish,
 fetch, status, ensure, repair, and unpublish operations. It records signed local
@@ -240,12 +242,15 @@ repository and same-volume datastores. It returns bounded facts and enforces the
 free-space floor. Current-owner backend directories may use `0755` with no
 special or group/world write bits; staging remains owner-only `0700`.
 This filesystem observation is separate from the inventory reservation.
-Explicit isolated process tests exercise fresh Use through real Content,
-Registry, the native bridge and offline Kubo, including atomic admission,
-reopened-owner reuse without Content reads and cleanup. The signed synthetic
-packages are seeded in local cache. Current proof and measurements are in
-[state.md](../state.md); scaled cold delivery, continuous peak usage, exact
-Qwen, inference and installed acceptance remain open.
+Isolated process tests exercise fresh Use through real Content, Registry,
+the native bridge and Kubo, including cold exact-Qwen admission, reuse without
+Content reads, a real reply, active cancellation and exact restart replay.
+Keep persists and owned processes/staging are cleaned up. Cancellation records
+unknown settlement when backend stop is unconfirmed. The catalog signer is an
+isolated test publisher; installed acceptance needs its own operator-signed
+catalog and receipt. Current evidence and limits are in [state.md](../state.md).
+Resource samples do not establish continuous peaks or complete idle/busy
+retention and eviction acceptance.
 
 Catalog GET, typed catalog list and preparation status share one caller-scoped
 projection of admission, Keep, progress and `dispatch_ready`. Runtime derives
@@ -291,8 +296,7 @@ verified closure; restart reconciles the same record and removes only its owned
 partial staging. Retry neither duplicates admission nor repeats a completed
 transfer. Cancellation and cleanup leave other packages and user data intact.
 
-Proposed local commit order, after the separate onboarding/recovery and window
-policy slices:
+Implemented source boundaries and remaining acceptance:
 
 1. **Package admission contract.** The typed preparation, status/cancel and
    inventory path is implemented. `content.retention` accepts `{cid, keep}` for
@@ -305,12 +309,12 @@ policy slices:
    its admission receipts, not an independent Store registry or second journal.
    Test canonical closure identity, signature/trust/revocation, size/license/
    provenance/compatibility rejection, caller isolation and bounded projections.
-2. **Scaled transfer proof.** Extend the verified small-package production
-   preparation proof to the intended model scale and cold delivery.
-   Test a deterministic streamed fixture larger than old whole-file limits with
-   bounded peak buffers, slow/oversized/ignored-range failures, mid-read cancel,
-   retry, concurrent duplicate selection, low disk, crash/restart and exact
-   partial cleanup. Include proof that provider work stops, not just UI progress.
+2. **Bounded transfer.** Runtime checks current authority and outstanding charges
+   before each read and observes backend capacity in bounded byte windows.
+   Source tests cover slow/oversized/ignored-range failures, cancellation,
+   duplicate selection, low disk and exact restart cleanup. The cold Qwen
+   process proof exercises the full closure. Installed memory/disk observations
+   and complete lifecycle acceptance remain separate from these fixtures.
 3. **Retention closure.** Additive activation is implemented through the existing
    Init boundary. Runtime holds the existing inventory worker lock through startup
    Init/registration and refresh Init/result handling. The shared composer emits
@@ -324,11 +328,14 @@ policy slices:
    close retains exact engine ownership until bounded reaping and process-group
    closure succeed; uncertainty blocks replacement. Provider-source tests verify
    retirement by exact offer ID and immutable configuration through private Init,
-   preserving operator offers and historical results. Actual byte eviction still
-   requires Runtime/Registry/inventory retirement and run/Keep/reference checks.
-   Keep/release
-   intents are implemented independently of activation; installed full-Qwen
-   retention and safe eviction proof remain open.
+   preserving operator offers and historical results. Runtime stores the exact
+   activation descriptor and pending retirement in the same inventory. It
+   withdraws the offer before removing eligible unkept admission files, and
+   reconciles withdrawal before startup registration. CapacityPending keeps
+   pending Use identity with zero reservation; uncertain closure preserves
+   files, ownership and accounting. Current run/Keep/reference checks protect
+   busy or retained content. Installed full-Qwen idle/busy retention and safe
+   eviction acceptance remain open.
 4. **Shared model experience.** Marketplace Models and System management use one
    vendored presentation/intent helper and the existing typed content methods.
    Catalog rows carry nested readiness; operation replies carry flat readiness.
@@ -342,7 +349,7 @@ policy slices:
    Source fixtures cover these boundaries. Verify the combined installed views,
    offline/incompatible states and busy-safe eviction with the exact model.
    Keep ordinary app catalog behavior and hosted configuration unchanged.
-5. **Cold proof and publication review.** After source review, use the existing
+5. **Installed proof and publication review.** After source review, use the existing
    authorized isolated proof scope with a compatible fresh install and no
    model bytes or operator offer preconfiguration. Select the real signed Qwen
    entry, prepare, receive a real reply through the existing typed run contract,

@@ -20,8 +20,8 @@ their acceptance evidence remains visible and separate.
 
 Active priority index:
 
-- current priority: finish the one model preparation/admission path, exact
-  provider/offer and UI binding, then cold-model and combined isolated acceptance
+- current priority: operator-signed catalog setup and combined isolated Home
+  acceptance of the reviewed source
   using the [installed provenance in state.md](state.md).
   Reviewed onboarding/window/save source work remains part of this closeout.
   Complete artifact parity, source review and final human Brave checks before
@@ -30,9 +30,10 @@ Active priority index:
 - released line: `origin/main@8ac18bec` is `v0.7.0`. Keep follow-up work on
   `origin/upstream/0.7.1-dev` until the reviewed 0.7.1 line is ready. The
   checked publish flow still owns release stamping
-- published integration is `origin/feat/0.7.1-integration@5ba1faa0`.
-  Reconcile its equivalent setup guard change with the local history before
-  publication; preserve the published commit.
+- cached historical tracking is `origin/feat/0.7.1-integration@5ba1faa0`.
+  That branch was merged through PR58 into `origin/upstream/0.7.1-dev@6c61c990`
+  and deleted. The reviewed local history and model preparation work await
+  explicit publication after local reconciliation and installed acceptance.
   Local merge `91209988` preserves the five reviewed model/delivery groups
   through `ed275ba0` and the three reviewed auth commits through `43b8f830`.
   Earlier candidate `900d7e5c` remains the broad installed UIUX and
@@ -65,35 +66,12 @@ protected-content prerequisites. It did not change the pending Wallet approval.
 Open gates, in order. Source integration comes before combined isolated
 acceptance. Browser implementation belongs to its separate owner.
 
-1. [ ] Complete scaled resource proof for the existing Runtime preparation and
-   admission path before a large-model transfer. Source verification passes
-   focused preparation tests plus signed synthetic-package process tests through
-   real Content, Registry and native IPFS: 1 MiB and 8 MiB warm-cache cases and
-   a 64 MiB-capped cold loopback case. These prove
-   fresh Use, bounded index/file reads, exact package CID admission, reopened
-   owner reuse without Content reads, and fixture cleanup. Full-charge and
-   aggregate-budget preflight, cancellation and restart reconciliation pass.
-   Progress checks credit delivered bytes once against each remaining staging
-   and backend charge; full quota and the 10% free-space floor stay unchanged.
-   Cold consumer block absence, backend growth, exact admission, zero-read reuse
-   and both-peer cleanup pass. Allocation measurements are samples, not
-   continuous peaks. Prove bounded
-   peak memory/disk and cold delivery at the intended scale while retaining
-   the 10% free-space floor.
-   Exact Qwen and installed acceptance remain in the gates below.
-2. [ ] Verify the combined Marketplace, System, Assistant and Home Agent model
-   views in the isolated Home. Source fixtures cover preparation controls,
-   exact offer/CID selection, failed and overlapping refreshes, preserved drafts
-   and accepted runs, and the Home handoff to System Models. Prove installed
-   offline/error and incompatible states, busy-safe eviction and shared-view
-   idempotence. Preparation belongs to Models; composers require the chosen
-   offer's current readiness before a new dispatch. Actual inference needs its
-   own run evidence. Provider-source tests verify immutable admitted-offer retirement
-   and retained ownership on uncertain close. Runtime holds the inventory worker
-   lock through startup and refresh Init, and projects verified admitted-offer
-   provenance while preserving operator configuration. Complete Runtime/Registry/inventory
-   retirement and run/Keep/reference checks before model-byte eviction.
-3. [ ] Package the exact existing Qwen model and verified engine for isolated
+1. [ ] Prepare one real operator-signed pinned catalog and exact-source setup
+   for the authorized isolated Home. Cold delivery, admission, ready reply,
+   active unknown cancellation, exact restart replay and Keep persistence
+   passed in the combined source/process proof. Complete installed idle/busy
+   retention and reclamation acceptance.
+   Package the exact existing Qwen model and verified engine for isolated
    setup with a real pinned signed catalog and complete closure, publisher trust
    and honest availability evidence. Distinguish verified upstream references
    from conversion facts that the publisher attests. Git carries code, tests,
@@ -106,8 +84,8 @@ acceptance. Browser implementation belongs to its separate owner.
    or separately fix and prove that publisher before sending a large model
    through it. Reserve the complete proof layout, including any separate
    publisher backend copy, above the 10% free-space floor.
-4. [ ] Install the combined reviewed source on the authorized isolated Homes
-   and verify exact artifact parity before guided Brave acceptance. Preserve
+2. [ ] Complete combined installed Home acceptance and the manual Brave
+   checklist with exact installed artifact parity. Preserve
    current accounts, Wallets, passkeys, profiles and content; use disposable
    fresh profiles for first-run checks.
    Complete owner and enabled-guest Create/Recover, verified-kit import,
@@ -131,12 +109,15 @@ acceptance. Browser implementation belongs to its separate owner.
    stored winner and losing draft, pause autosave on conflict, and require
    deliberate recovery after an uncertain create or body-before-metadata write.
    Complete installed model draft/run preservation, uncertain outcome,
+   Marketplace/System/Assistant/Home Agent shared views, offline/error and
+   incompatible states, busy-safe eviction and shared-view idempotence,
    cancellation, restart and exact terminal-result checks. Backend stop or
    honest unknown settlement remains the cancellation rule; stream closure
    alone does not prove backend stop.
    Include isolated first-owner origin/RP admission and typed denials.
    Windows enrollment and same-principal linking remain separate follow-up.
-5. [ ] Reconcile source and installed proof, docs and reviewable commit groups.
+3. [ ] Reconcile source and installed proof, docs, remote divergence and
+   reviewable commit groups for publication preparation.
    Preserve reviewed history; compare changed upstream patches before adding
    them. Finish the relevant source gates, exact artifact receipts and a concise
    manual Brave checklist for Anders covering onboarding, recovery, windows,
@@ -144,11 +125,13 @@ acceptance. Browser implementation belongs to its separate owner.
    after his review and explicit approval. Keep release and deployment decisions
    separate from source or isolated acceptance.
 
-External Browser evidence remains open: the hosted service smoke fails at
+External Browser evidence remains a separately owned acceptance dependency.
+The earlier hosted service smoke failed at
 `engine_close_indeterminate` because its v1 close result does not meet the
-generation-bound v2 terminal-receipt contract. The Browser owner supplies the
-repair and matching acceptance evidence. Preserve that failure and its limits;
-passing source checks here do not establish whole-Browser readiness.
+generation-bound v2 terminal-receipt contract. Keep that historical receipt
+separate from the owner's newer work. Require matching source and installed
+receipts before adopting a repair or claiming this integration's Browser
+journey passes; changing external status alone is not proof here.
 
 Funded protected-content rollout remains later, under the
 [protected-content acceptance contract](docs/PROTECTED_CONTENT.md). Its owner
@@ -157,7 +140,9 @@ three-replica repair, funded mint/buy/read/restart proof, stable target receipts
 and explicit atomic-cutover authorization gates. Hosted services, Jetson and
 standing mandates also remain later.
 
-Window coverage for gate 4. The 41 manifests include ten single, six hybrid and
+### Capsule window acceptance
+
+The 41 manifests include ten single, six hybrid and
 one multiple policy. Complete installed People/Inbox/Wallet deep-link and draft
 proof and current-navigation restore acceptance. Source receipts are in
 [state.md](state.md).
