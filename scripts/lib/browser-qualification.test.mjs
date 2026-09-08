@@ -683,6 +683,7 @@ test("raw thirty-minute media and interaction trace drives its summary and retai
       const duration = i === 0 ? 100 : i * 5000;
       const value = { schema: "elastos.browser.qualification-sample/v1", page_id: a.journey.page_id,
         run: a.journey.controlled_journey.run, initial_cursor: 0, events: [],
+        clock_origin: { started_ms: 0, ready_ms: 0 }, snapshot_window: { started_ms: duration - 50, observed_ms: duration },
         action_window: { started_ms: i === 0 ? 0 : i === 1 ? 100 : (i - 1) * 5000, observed_ms: duration }, snapshot: {
           page_id: a.journey.page_id, document_id: 1, engine_id: "local", exit_id: "runtime-default",
           receiver_unchanged: true, phase: "active", phase_started_ms: 0, duration_ms: duration, active_ms: duration, interaction_ms: duration,
@@ -762,6 +763,71 @@ test("raw thirty-minute media and interaction trace drives its summary and retai
     const stalled = structuredClone(trace);
     stalled[100].value.snapshot.active_ms = stalled[100].value.snapshot.interaction_ms = stalled[99].value.snapshot.active_ms;
     save(stalled); assert.throws(() => auditQualification(path), /media_phase_coverage/);
+    const compressed = structuredClone(trace);
+    for (const [i, { value }] of compressed.entries()) {
+      const end = 100 + i * 10;
+      value.action_window = { started_ms: i ? end - 10 : 0, observed_ms: end };
+      value.snapshot_window = { started_ms: end - 4, observed_ms: end };
+      if (value.interaction) {
+        Object.assign(value.interaction.input, { started_ms: end - 9, receipt_ms: end - 8 });
+        Object.assign(value.interaction.scroll, { started_ms: end - 8, receipt_ms: end - 7 });
+      }
+    }
+    assert.equal(compressed.at(-1).value.action_window.observed_ms, 3700);
+    save(compressed); assert.throws(() => auditQualification(path), /media_observation_clock/);
+    const compressedParent = structuredClone(trace);
+    compressedParent.forEach((row, i) => { row.at_ms = 100 + i * 10; });
+    save(compressedParent); assert.throws(() => auditQualification(path), /media_parent_clock/);
+    const distributed = targets => {
+      const out = structuredClone(trace), witnesses = trace.filter(r => r.value.interaction); let cursor = 0;
+      for (const [i, { value }] of out.entries()) {
+        delete value.interaction; value.events = [];
+        const actionIndex = targets.indexOf(i);
+        if (actionIndex !== -1) {
+          const witness = structuredClone(witnesses[actionIndex].value), end = value.action_window.observed_ms;
+          value.events = witness.events; value.interaction = witness.interaction;
+          Object.assign(value.interaction.input, { started_ms: end - 100, receipt_ms: end - 99 });
+          Object.assign(value.interaction.scroll, { started_ms: end - 99, receipt_ms: end - 98 });
+          cursor += 2;
+        }
+        value.fixture_cursor = cursor;
+      }
+      return out;
+    };
+    const regular = Array.from({ length: 30 }, (_, i) => i * 12);
+    for (const targets of [Array.from({ length: 30 }, (_, i) => i), // All 30 actions in the first 145 seconds.
+      regular.map((v, i) => i === 0 ? 3 : v), // Missed first active interval.
+      regular.map((v, i) => i === 10 ? 126 : v), // A 90-second middle gap.
+      regular.map((v, i) => i === 29 ? 337 : v)]) { // Last action leaves 115 seconds uncovered.
+      const changed = distributed(targets); save(changed);
+      assert.throws(() => auditQualification(path), /sustained_interaction_cadence/);
+    }
+    const frozenFrames = structuredClone(trace);
+    for (const { value } of frozenFrames) {
+      const s = value.snapshot, t = s.duration_ms;
+      if (t >= 900_000 && t <= 960_000) s.video.frames = s.video.total = 27_000;
+      else if (t > 960_000 && t <= 1_020_000) s.video.frames = s.video.total = 27_000 + (t - 960_000) * 0.06;
+    }
+    assert.equal(frozenFrames.at(-1).value.snapshot.video.frames / 1800, 30);
+    save(frozenFrames); assert.throws(() => auditQualification(path), /media_frame_progress_gap/);
+    const sparseFrames = structuredClone(trace);
+    sparseFrames[181].value.snapshot.video.frames = sparseFrames[180].value.snapshot.video.frames + 1;
+    save(sparseFrames); assert.throws(() => auditQualification(path), /media_frame_progress_gap/);
+    // Different host origin and bounded RPC/IPC delay still describe the same media timeline.
+    const overhead = structuredClone(trace);
+    for (const [i, row] of overhead.entries()) {
+      const v = row.value;
+      v.clock_origin = { started_ms: 970, ready_ms: 1000 };
+      v.action_window.started_ms += 1000; v.action_window.observed_ms += 1000;
+      v.snapshot_window.started_ms += 1000; v.snapshot_window.observed_ms += 1000;
+      for (const action of v.interaction ? [v.interaction.input, v.interaction.scroll] : []) {
+        action.started_ms += 1000; action.receipt_ms += 1000;
+      }
+      row.at_ms += i % 2 ? 2000 : 0;
+    }
+    save(overhead); assert.equal(auditQualification(path).completed_execution, true);
+    const wrongOrigin = structuredClone(trace); wrongOrigin[100].value.clock_origin.ready_ms = 1;
+    save(wrongOrigin); assert.throws(() => auditQualification(path), /media_observation_clock/);
     // A complete mixed cycle derives 270 seconds of media and 240 of interaction.
     const mixed = structuredClone(trace.slice(0, 61)).map(r => r.value);
     for (const row of mixed) {
@@ -785,13 +851,49 @@ test("raw thirty-minute media and interaction trace drives its summary and retai
       const s = row.snapshot;
       if (s.phase === "idle") {
         s.phase_started_ms += 200; s.duration_ms += 250;
+        row.snapshot_window.started_ms += 250; row.snapshot_window.observed_ms += 250;
+        row.action_window.observed_ms += 250;
         s.active_ms = s.audio.observed_ms = s.duration_ms; s.interaction_ms = 240_200;
         s.video.frames = s.video.total = s.active_ms * 0.03;
       }
       if (s.phase === "hidden") s.interaction_ms = 240_200;
     }
+    shifted.forEach((row, i) => { if (i) row.action_window.started_ms = shifted[i - 1].action_window.observed_ms; });
     assert.equal(deriveMedia(shifted, { ...binding, mode: "mixed" }).interaction_ms, 240_200);
     shifted[49].snapshot.active_ms -= 100;
     assert.throws(() => deriveMedia(shifted, { ...binding, mode: "mixed" }), /media_phase_coverage/);
+    const resumed = structuredClone(trace.slice(0, 79)).map(r => r.value); let cursor = 0, actionIndex = 0;
+    for (const [i, row] of resumed.entries()) {
+      const s = row.snapshot;
+      if (i === 60) {
+        s.duration_ms += 250; row.snapshot_window.started_ms += 250; row.snapshot_window.observed_ms += 250;
+        row.action_window.observed_ms += 250;
+        for (const action of [row.interaction.input, row.interaction.scroll]) { action.started_ms += 250; action.receipt_ms += 250; }
+      }
+      const t = s.duration_ms;
+      s.phase = t >= 300_000 ? "active" : t >= 270_000 ? "hidden" : t >= 240_000 ? "idle" : "active";
+      s.phase_started_ms = t >= 300_000 ? 300_000 : t >= 270_000 ? 270_000 : t >= 240_000 ? 240_000 : 0;
+      s.hidden = s.phase === "hidden";
+      s.active_ms = s.audio.observed_ms = t >= 300_000 ? t - 30_000 : Math.min(t, 270_000);
+      s.interaction_ms = t >= 300_000 ? t - 60_000 : Math.min(t, 240_000);
+      s.video.frames = s.video.total = s.active_ms * 0.03;
+      if (s.phase !== "active") { delete row.interaction; row.events = []; }
+      if (row.interaction) {
+        row.interaction.index = actionIndex++;
+        row.interaction.input.sequence = row.events[0].sequence = ++cursor;
+        row.interaction.scroll.sequence = row.events[1].sequence = ++cursor;
+      }
+      row.fixture_cursor = cursor;
+      if (i) row.action_window.started_ms = resumed[i - 1].action_window.observed_ms;
+    }
+    assert.equal(deriveMedia(resumed, { ...binding, mode: "mixed" }).interactions, 6);
+    const lateResume = structuredClone(resumed), moved = lateResume[60].interaction;
+    const movedEvents = lateResume[60].events;
+    delete lateResume[60].interaction;
+    for (let i = 60; i < 64; i++) { lateResume[i].events = []; lateResume[i].fixture_cursor = 8; }
+    lateResume[64].interaction = moved; lateResume[64].events = movedEvents;
+    Object.assign(moved.input, { started_ms: 319900, receipt_ms: 319901 });
+    Object.assign(moved.scroll, { started_ms: 319901, receipt_ms: 319902 });
+    assert.throws(() => deriveMedia(lateResume, { ...binding, mode: "mixed" }), /sustained_interaction_cadence/);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

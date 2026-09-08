@@ -420,14 +420,18 @@ export async function createQualificationHarness(context, page, options, now = (
       requireEvidence(initialReceipt.observation === "bounded-v1", "qualification_fixture_contract_required");
       cursor = initialReceipt.events.at(-1)?.sequence || 0;
       try {
+        const originStarted = performance.now();
         const result = await call(() => appFrame.evaluate(() => window.__browserQualification.start()));
         requireEvidence(result.page_id === pageId, "qualification_page_changed");
         const started = performance.now(); let nextSample = started, priorCapture = started;
+        const clockOrigin = { started_ms: originStarted, ready_ms: started };
         let documentId;
         const { engine_id: engineId, exit_id: exitId } = evidence.services;
         const initialCursor = cursor;
         const capture = async interaction => {
+          const snapshotStarted = performance.now();
           snapshot = await call(() => appFrame.evaluate(() => window.__browserQualification.read()));
+          const snapshotWindow = { started_ms: snapshotStarted, observed_ms: performance.now() };
           documentId ??= snapshot.document_id;
           requireEvidence(snapshot.page_id === pageId && snapshot.document_id === documentId &&
             snapshot.engine_id === engineId && snapshot.exit_id === exitId && snapshot.receiver_unchanged &&
@@ -442,6 +446,7 @@ export async function createQualificationHarness(context, page, options, now = (
           if (events.length) cursor = events.at(-1).sequence;
           const row = { schema: "elastos.browser.qualification-sample/v1", page_id: pageId, run: initialReceipt.run,
             snapshot, events, fixture_cursor: cursor, initial_cursor: initialCursor,
+            clock_origin: clockOrigin, snapshot_window: snapshotWindow,
             action_window: { started_ms: priorCapture, observed_ms: performance.now() }, ...(interaction ? { interaction } : {}) };
           priorCapture = row.action_window.observed_ms;
           requireEvidence(trace.length < 6000, "media_trace_bound"); trace.push(row);

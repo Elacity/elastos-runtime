@@ -61,14 +61,20 @@ export function percentile(values, fraction = 0.95) {
   requireEvidence(values.length > 0 && values.every(value => finite(value) && value >= 0), "latency_samples_invalid");
   return [...values].sort((a, b) => a - b)[Math.ceil(values.length * fraction) - 1];
 }
-export function deriveMedia(rows, { page_id, run, engine_id, exit_id, mode = "media" }) {
+export function deriveMedia(rows, { page_id, run, engine_id, exit_id, mode = "media", parent_times }) {
   requireEvidence(rows.length >= 2 && rows.length <= 6000, "media_trace_required");
   requireEvidence(["media", "mixed"].includes(mode), "media_mode_required");
   let prior, priorWindow, cursor = rows[0].initial_cursor, gap = 0, hidden = 0, idle = 0;
   let active = 0, interaction = 0, lastWitness = cursor;
-  const actions = [], phaseLengths = { active: 240_000, idle: 30_000, hidden: 30_000 };
+  const actions = [], activePhases = [], phaseLengths = { active: 240_000, idle: 30_000, hidden: 30_000 };
+  // Measured start/read bounds account for RPC overhead. Allow at most 100 ms
+  // additional monotonic clock error, and 3 s variation in parent IPC delivery.
+  const clockError = 100, origin = rows[0].clock_origin;
+  requireEvidence(origin && finite(origin.started_ms) && finite(origin.ready_ms) && origin.started_ms >= 0 &&
+    origin.ready_ms >= origin.started_ms && origin.ready_ms - origin.started_ms <= 3000, "media_clock_origin");
+  if (parent_times) requireEvidence(parent_times.length === rows.length && parent_times.every(finite), "media_parent_clock");
   requireEvidence(Number.isSafeInteger(cursor) && cursor >= 0, "fixture_initial_cursor_required");
-  for (const row of rows) {
+  for (const [sampleIndex, row] of rows.entries()) {
     const s = row.snapshot;
     requireEvidence(row.schema === "elastos.browser.qualification-sample/v1" && row.page_id === page_id && row.run === run &&
       s?.page_id === page_id && s.engine_id === engine_id && s.exit_id === exit_id &&
@@ -106,6 +112,10 @@ export function deriveMedia(rows, { page_id, run, engine_id, exit_id, mode = "me
     // Compare cumulative coverage, so per-sample tolerance cannot hide a long gap.
     requireEvidence(Math.abs(s.active_ms - active) <= 1 && Math.abs(s.interaction_ms - interaction) <= 1,
       "media_phase_coverage");
+    const visibleDelta = active - (prior?.active_ms || 0);
+    const delivered = s.video.frames - (prior?.video.frames || 0), total = s.video.total - (prior?.video.total || 0);
+    requireEvidence(visibleDelta <= (Math.min(delivered, total) + 1) * Math.max(1, s.video.max_frame_gap_ms) + 0.001,
+      "media_frame_progress_gap");
     if (prior) {
       requireEvidence(s.document_id === prior.document_id && s.active_ms >= prior.active_ms &&
         s.active_ms - prior.active_ms <= delta + 1 && s.interaction_ms >= prior.interaction_ms &&
@@ -120,19 +130,35 @@ export function deriveMedia(rows, { page_id, run, engine_id, exit_id, mode = "me
     requireEvidence(window && finite(window.started_ms) && finite(window.observed_ms) && window.started_ms >= 0 &&
       window.observed_ms >= window.started_ms && window.observed_ms - window.started_ms <= 10_000 &&
       (!priorWindow || window.started_ms === priorWindow.observed_ms), "interaction_sample_window");
+    const read = row.snapshot_window;
+    requireEvidence(isDeepStrictEqual(row.clock_origin, origin) && (!prior || window.started_ms >= origin.ready_ms) &&
+      (prior || window.started_ms === origin.ready_ms) && read && finite(read.started_ms) && finite(read.observed_ms) &&
+      read.started_ms >= window.started_ms && read.observed_ms >= read.started_ms &&
+      read.observed_ms - read.started_ms <= 3000 && read.observed_ms <= window.observed_ms &&
+      window.observed_ms - read.observed_ms <= 6000 &&
+      s.duration_ms >= read.started_ms - origin.ready_ms - clockError &&
+      s.duration_ms <= read.observed_ms - origin.started_ms + clockError, "media_observation_clock");
+    if (parent_times) requireEvidence(Math.abs((parent_times[sampleIndex] - parent_times[0]) -
+      (window.observed_ms - rows[0].action_window.observed_ms)) <= 3000 + clockError, "media_parent_clock");
     requireEvidence(Array.isArray(row.events), "fixture_events_required");
     for (const e of row.events) {
       requireEvidence(e.sequence === ++cursor && e.page === "nav" && ["input", "scroll"].includes(e.type),
         "fixture_event_gap_or_page");
     }
     requireEvidence(row.fixture_cursor === cursor, "fixture_cursor_mismatch");
+    if (!prior || (s.phase === "active" && prior.phase !== "active")) {
+      activePhases.push({ start: s.phase_started_ms, end: s.duration_ms, actions: [] });
+    }
+    if (s.phase === "active") activePhases.at(-1).end = s.duration_ms;
+    else if (prior?.phase === "active") activePhases.at(-1).end = s.phase_started_ms;
     if (row.interaction) {
       requireEvidence(s.phase === "active", "interaction_phase_invalid");
-      actions.push({ action: row.interaction, events: row.events, window });
+      actions.push({ action: row.interaction, events: row.events, window, read });
+      activePhases.at(-1).actions.push(row.interaction);
     }
     prior = s; priorWindow = window;
   }
-  for (const [i, { action, events, window }] of actions.entries()) {
+  for (const [i, { action, events, window, read }] of actions.entries()) {
     const input = events.find(e => e.sequence === action.input?.sequence), scroll = events.find(e => e.sequence === action.scroll?.sequence);
     requireEvidence(action.index === i && action.page_id === page_id && action.run === run &&
       input?.type === "input" && input.value === action.expected && scroll?.type === "scroll" &&
@@ -142,10 +168,22 @@ export function deriveMedia(rows, { page_id, run, engine_id, exit_id, mode = "me
       [action.input, action.scroll].every(a => finite(a.started_ms) && finite(a.receipt_ms) &&
         a.receipt_ms >= a.started_ms && a.receipt_ms - a.started_ms <= 5000) &&
       action.input.started_ms >= window.started_ms && action.scroll.started_ms >= action.input.receipt_ms &&
-      action.scroll.receipt_ms <= window.observed_ms, "sustained_interaction_unconfirmed");
+      action.scroll.receipt_ms <= read.started_ms, "sustained_interaction_unconfirmed");
     lastWitness = scroll.sequence;
   }
   requireEvidence(actions.length >= Math.floor(prior.interaction_ms / 60_000), "sustained_interaction_missing");
+  for (const phase of activePhases) {
+    const first = phase.actions[0], last = phase.actions.at(-1);
+    if (!first) { requireEvidence(phase.end - phase.start <= 10_000, "sustained_interaction_cadence"); continue; }
+    requireEvidence(first.input.started_ms - origin.ready_ms - phase.start <= 10_000 + clockError &&
+      first.input.started_ms - origin.started_ms >= phase.start - clockError &&
+      phase.end - (last.input.started_ms - origin.started_ms) <= 70_000 + clockError,
+    "sustained_interaction_cadence");
+    // The 60 s schedule allows one 5 s sampling interval and one bounded 5 s action.
+    for (let i = 1; i < phase.actions.length; i++) requireEvidence(
+      phase.actions[i].input.started_ms - phase.actions[i - 1].input.started_ms <= 70_000,
+      "sustained_interaction_cadence");
+  }
   const video = { frames: prior.video.frames, total: prior.video.total, dropped: prior.video.dropped,
     fps: prior.active_ms > 0 ? prior.video.frames * 1000 / prior.active_ms : 0,
     drop_ratio: prior.video.total > 0 ? prior.video.dropped / prior.video.total : 0,
@@ -328,13 +366,13 @@ export function auditQualification(receiptPath) {
       Number.isInteger(row.attempt) && row.attempt >= 1 && row.attempt <= 100 &&
       ["resources", "media"].includes(row.kind), "sample_sequence_or_kind");
     lastAt = row.at_ms;
-    const rows = observed.get(row.attempt) || { resources: 0, media: [] };
+    const rows = observed.get(row.attempt) || { resources: 0, media: [], parent_times: [] };
     if (row.kind === "resources") {
       requireEvidence(row.value?.identity_verified === true && finite(row.value.rss_bytes) &&
         row.value.rss_bytes <= plan.limits.rss_bytes && finite(row.value.cpu_percent) &&
         row.value.cpu_percent <= plan.limits.cpu_percent, "resource_sample_invalid");
       rows.resources++;
-    } else rows.media.push(row.value);
+    } else { rows.media.push(row.value); rows.parent_times.push(row.at_ms); }
     observed.set(row.attempt, rows);
   }
   const expected = ["media", "mixed"].includes(plan.mode) ? 1 : 100;
@@ -358,7 +396,7 @@ export function auditQualification(receiptPath) {
       "journey_log_hash_mismatch");
     if (["media", "mixed"].includes(plan.mode)) {
       const derived = deriveMedia(rows.media, { page_id: a.journey.page_id, run: j.run,
-        engine_id: plan.runtime.engine_id, exit_id: plan.runtime.exit_id, mode: plan.mode });
+        engine_id: plan.runtime.engine_id, exit_id: plan.runtime.exit_id, mode: plan.mode, parent_times: rows.parent_times });
       const reported = Object.fromEntries(Object.keys(derived).map(k => [k, j.qualification.observation[k]]));
       requireEvidence(isDeepStrictEqual(derived, reported), "media_summary_trace_mismatch");
       if (plan.mode === "mixed") requireEvidence(derived.duration_ms - derived.active_ms >= plan.duration_ms / 15 &&
