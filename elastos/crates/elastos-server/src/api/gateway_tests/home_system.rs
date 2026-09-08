@@ -1649,98 +1649,571 @@ async fn test_home_summary_ignores_invalid_protected_services_state() {
     assert_eq!(payload["services"]["local_offer_count"], 0);
 }
 
+// Services must consume the same signed acceptance as People, without a legacy
+// services-peer-contacts.json file or a caller-supplied delivery endpoint.
+struct ServicesContactFixture {
+    app: Router,
+    authority: TestPasskeyAuthority,
+    runtime: FakeRuntimeHandle,
+    store: crate::collaboration_contact_store::CollaborationContactStore,
+    profile: crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+    device_key: SigningKey,
+    peer_id: String,
+}
+
+async fn services_contact_fixture(
+    data_dir: &std::path::Path,
+    name: &str,
+    bus: Arc<TokioMutex<FakePeerBus>>,
+    network: crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+) -> ServicesContactFixture {
+    let authority = passkey_authority_with_profile(data_dir, name);
+    let (device_key, did) = elastos_identity::load_or_create_did(data_dir).unwrap();
+    let device_key = SigningKey::from_bytes(&device_key.to_bytes());
+    let peer_id = crate::carrier::did_to_public_key(&did).unwrap().to_string();
+    let runtime = start_fake_runtime(data_dir, bus, &peer_id).await;
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let profile = crate::collaboration_profile_authority::load_profile_authority(
+        data_dir,
+        &authority.principal_id,
+        &localhost_root,
+    )
+    .unwrap()
+    .unwrap();
+    let store = crate::collaboration_contact_store::CollaborationContactStore::new(
+        data_dir,
+        &authority.principal_id,
+        &localhost_root,
+        network.clone(),
+        &profile,
+        &did,
+    )
+    .unwrap();
+    let service = crate::collaboration_discovery_runtime::CollaborationDiscoveryService::new(
+        SigningKey::from_bytes(&device_key.to_bytes()),
+        network,
+        Arc::new(elastos_runtime::provider::ProviderRegistry::new()),
+    )
+    .await
+    .unwrap();
+    let mut state = test_state(data_dir);
+    state.collaboration_discovery_service = Some(service);
+    ServicesContactFixture {
+        app: gateway_router(state),
+        authority,
+        runtime,
+        store,
+        profile,
+        device_key,
+        peer_id,
+    }
+}
+
+fn accept_services_contact_pair(left: &ServicesContactFixture, right: &ServicesContactFixture) {
+    use crate::collaboration_discovery::*;
+    use elastos_common::collaboration_protocol::{
+        CollaborationRecipient, CollaborationRecipientKind,
+    };
+    let now = crate::auth::now_ts().saturating_sub(3);
+    let advertisement = signed_discovery_message_for_test(
+        &right.device_key,
+        &right.profile.document().profile_did,
+        TestCollaborationMessageScope {
+            network_id: "services-contacts",
+            conversation_id: COLLABORATION_DISCOVERY_DIRECTORY_ID,
+        },
+        CollaborationRecipient {
+            kind: CollaborationRecipientKind::Conversation,
+            id: COLLABORATION_DISCOVERY_DIRECTORY_ID.to_string(),
+        },
+        COLLABORATION_DISCOVERY_ADVERTISEMENT_PAYLOAD_TYPE,
+        serde_json::to_value(CollaborationDiscoveryAdvertisementPayload {
+            signed_profile: right.profile.signed_envelope().clone(),
+        })
+        .unwrap(),
+        now..now + COLLABORATION_DISCOVERY_ADVERTISEMENT_TTL_SECS,
+    );
+    right
+        .store
+        .store_local_advertisement(&advertisement, now)
+        .unwrap();
+    let request = signed_discovery_message_for_test(
+        &left.device_key,
+        &left.profile.document().profile_did,
+        TestCollaborationMessageScope {
+            network_id: "services-contacts",
+            conversation_id: COLLABORATION_DISCOVERY_CONTACT_ID,
+        },
+        CollaborationRecipient {
+            kind: CollaborationRecipientKind::Profile,
+            id: right.profile.document().profile_did.clone(),
+        },
+        COLLABORATION_DISCOVERY_CONTACT_REQUEST_PAYLOAD_TYPE,
+        serde_json::to_value(CollaborationContactRequestPayload {
+            advertisement_envelope_sha256:
+                elastos_common::collaboration_protocol::collaboration_message_envelope_sha256(
+                    &advertisement,
+                ),
+            signed_profile: left.profile.signed_envelope().clone(),
+        })
+        .unwrap(),
+        now + 1..now + 1 + COLLABORATION_DISCOVERY_CONTACT_REQUEST_TTL_SECS,
+    );
+    left.store
+        .record_outgoing_contact_request(&request, &advertisement, now + 1)
+        .unwrap();
+    right
+        .store
+        .record_incoming_contact_request(&request, now + 1)
+        .unwrap();
+    let receipt = signed_contact_decision_for_test(
+        &right.device_key,
+        "services-contacts",
+        &request,
+        &right.profile.document().profile_did,
+        now + 2,
+    );
+    left.store
+        .record_contact_decision_receipt(&receipt, now + 2)
+        .unwrap();
+    right
+        .store
+        .record_contact_decision_receipt(&receipt, now + 2)
+        .unwrap();
+    assert_eq!(left.store.snapshot().unwrap().contacts().len(), 1);
+    assert_eq!(right.store.snapshot().unwrap().contacts().len(), 1);
+}
+
+async fn services_contact_post(
+    app: &Router,
+    token: &str,
+    uri: &str,
+    payload: serde_json::Value,
+) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(uri)
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+fn services_contact_offer(fixture: &ServicesContactFixture) -> String {
+    format!(
+        "offer:{}:browser-exit",
+        home_people_contact_id(&fixture.profile.document().profile_did,)
+    )
+}
+
+async fn services_messages(bus: &Arc<TokioMutex<FakePeerBus>>) -> Vec<serde_json::Value> {
+    bus.lock()
+        .await
+        .topic_messages
+        .values()
+        .flatten()
+        .filter_map(|message| serde_json::from_str(message.get("content")?.as_str()?).ok())
+        .collect()
+}
+
+#[tokio::test]
+async fn test_services_contact_authority_rejects_other_principal_and_removed_contact() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+    accept_services_contact_pair(&alice, &bob);
+    let offer_id = services_contact_offer(&bob);
+    let other = passkey_authority_with_profile_role_credential(
+        left.path(),
+        "Other",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "other-services-principal",
+    );
+    let other_token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &other);
+    let (_, summary) = home_test_get_json(
+        &alice.app,
+        "/api/apps/services/summary",
+        &other_token,
+        "null",
+    )
+    .await;
+    assert!(summary["available_remote_offers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let before = services_messages(&bus).await;
+    let (status, _) = services_contact_post(
+        &alice.app,
+        &other_token,
+        "/api/apps/services/offers",
+        json!({"offer_id":offer_id,"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(services_messages(&bus).await, before);
+
+    let contact_id = alice.store.snapshot().unwrap().contacts()[0]
+        .remote_profile_did()
+        .to_string();
+    let (status, _) = services_contact_post(
+        &alice.app,
+        &alice.authority.people_token,
+        "/api/apps/people/contacts/remove",
+        json!({"contact_id":home_people_contact_id(&contact_id)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let before = services_messages(&bus).await;
+    let (status, _) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":offer_id,"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(services_messages(&bus).await, before);
+    let (_, summary) =
+        home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+    assert!(summary["available_remote_offers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(!left.path().join("config/exit-provider.json").exists());
+}
+
+#[tokio::test]
+async fn test_services_contact_authority_ignores_substituted_legacy_endpoint() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+    accept_services_contact_pair(&alice, &bob);
+    let contact_id = home_people_contact_id(&bob.profile.document().profile_did);
+    write_home_principal_object_json_for_authority(
+        left.path(),
+        &alice.authority,
+        "services-peer-contacts.json",
+        json!({
+            "schema":"elastos.services.peer-contacts-state/v1", "principal_id":alice.authority.principal_id,
+            "localhost_root":crate::auth::principal_localhost_root(&alice.authority.principal_id), "updated_at":10,
+            "contacts":{contact_id.clone():{"contact_id":contact_id,"peer_id":"substituted-endpoint","did":"did:key:substituted",
+                "display_name":"Substituted","added_at":10,"updated_at":10,"source":"people_discovery"}}
+        }),
+    );
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let legacy_only_app = gateway_router(test_state(left.path()));
+    let (_, summary) = home_test_get_json(
+        &legacy_only_app,
+        "/api/apps/services/summary",
+        &token,
+        "null",
+    )
+    .await;
+    assert!(summary["available_remote_offers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let before = services_messages(&bus).await;
+    let (status, _) = services_contact_post(
+        &legacy_only_app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_contact_offer(&bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(services_messages(&bus).await, before);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_contact_offer(&bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let messages = services_messages(&bus).await;
+    let requests = messages
+        .iter()
+        .filter(|message| message["kind"] == "service_access_request")
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["target_peer_id"], bob.peer_id);
+    assert!(!messages
+        .iter()
+        .any(|message| message["target_peer_id"] == "substituted-endpoint"));
+    // Acceptance/request delivery does not install a grant or enable the offer.
+    assert!(!left.path().join("config/exit-provider.json").exists());
+    let (_, summary) =
+        home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+    let offer = summary["remote_offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|offer| offer["offer_id"] == services_contact_offer(&bob))
+        .unwrap();
+    assert_eq!(offer["status"], "requested");
+    assert_eq!(offer["enabled"], false);
+    assert_eq!(offer["grant_required"], true);
+}
+
+async fn services_contact_pending_request(
+    left: &std::path::Path,
+    right: &std::path::Path,
+    alice: &ServicesContactFixture,
+    bob: &ServicesContactFixture,
+) -> String {
+    std::fs::create_dir_all(right.join("config")).unwrap();
+    std::fs::write(right.join("config/exit-provider.json"), "{}").unwrap();
+    let token = app_token_for_authority(right, SERVICES_CAPSULE_ID, &bob.authority);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":"local:provider:browser-exit","section":"mine","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let token = app_token_for_authority(left, SERVICES_CAPSULE_ID, &alice.authority);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_contact_offer(bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = home_test_post_json(
+        &bob.app,
+        "/api/apps/home/launch",
+        &bob.authority.home_token,
+        "http://localhost:61180",
+        json!({"target":INBOX_CAPSULE_ID}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = app_token_for_authority(right, INBOX_CAPSULE_ID, &bob.authority);
+    let (_, inbox) = home_test_get_json(&bob.app, "/api/apps/inbox/summary", &token, "null").await;
+    inbox["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "service_access_request")
+        .unwrap()["action_ref"]["action_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn services_contact_saved_state(
+    data_dir: &std::path::Path,
+    authority: &TestPasskeyAuthority,
+    name: &str,
+) -> serde_json::Value {
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/.AppData/ElastOS/Home/{name}");
+    let path = elastos_common::localhost::rooted_localhost_fs_path(data_dir, &uri).unwrap();
+    serde_json::from_slice(
+        &crate::auth::read_principal_root_object(
+            data_dir,
+            &authority.principal_id,
+            &root,
+            &uri,
+            &path,
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_services_contact_authority_rechecks_pending_approval_before_delivery() {
+    for substituted in [false, true] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+        let (trusted_key, _) = generate_keypair();
+        let network =
+            configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+        let alice =
+            services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+        accept_services_contact_pair(&alice, &bob);
+        let action =
+            services_contact_pending_request(left.path(), right.path(), &alice, &bob).await;
+        if substituted {
+            let mut saved = services_contact_saved_state(
+                right.path(),
+                &bob.authority,
+                "services-requests.json",
+            );
+            for request in saved["requests"].as_object_mut().unwrap().values_mut() {
+                request["requester_peer_id"] = json!("substituted-endpoint");
+            }
+            write_home_principal_object_json_for_authority(
+                right.path(),
+                &bob.authority,
+                "services-requests.json",
+                saved,
+            );
+        } else {
+            let (status, body) = services_contact_post(
+                &bob.app,
+                &bob.authority.people_token,
+                "/api/apps/people/contacts/remove",
+                json!({"contact_id":home_people_contact_id(&alice.profile.document().profile_did)}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let before = services_messages(&bus).await;
+        let token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+        let (status, body) = services_contact_post(
+            &bob.app,
+            &token,
+            "/api/apps/inbox/actions",
+            json!({"action_id":action}),
+        )
+        .await;
+        assert!(!status.is_success(), "{body}");
+        assert_eq!(services_messages(&bus).await, before);
+        assert!(!left.path().join("config/exit-provider.json").exists());
+    }
+}
+
+#[tokio::test]
+async fn test_services_contact_authority_rechecks_pending_decision_before_install() {
+    for case in ["removed", "saved_endpoint", "grant_endpoint"] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+        let (trusted_key, _) = generate_keypair();
+        let network =
+            configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+        let alice =
+            services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+        accept_services_contact_pair(&alice, &bob);
+        let action =
+            services_contact_pending_request(left.path(), right.path(), &alice, &bob).await;
+        let token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+        let (status, body) = services_contact_post(
+            &bob.app,
+            &token,
+            "/api/apps/inbox/actions",
+            json!({"action_id":action}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if case == "saved_endpoint" {
+            let mut saved =
+                services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+            for request in saved["remote_offer_requests"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+            {
+                request["target_peer_id"] = json!("substituted-endpoint");
+            }
+            write_home_principal_object_json_for_authority(
+                left.path(),
+                &alice.authority,
+                "services-state.json",
+                saved,
+            );
+            // A matching forged decision cannot turn the saved route into authority.
+            for message in bus.lock().await.topic_messages.values_mut().flatten() {
+                let Some(content) = message["content"].as_str() else {
+                    continue;
+                };
+                let mut payload: serde_json::Value = serde_json::from_str(content).unwrap();
+                if payload["kind"] == "service_access_decision" {
+                    payload["provider_peer_id"] = json!("substituted-endpoint");
+                    payload["remote_exit_grant"]["peer_did"] = json!("substituted-endpoint");
+                    message["content"] = json!(payload.to_string());
+                }
+            }
+        } else if case == "grant_endpoint" {
+            for message in bus.lock().await.topic_messages.values_mut().flatten() {
+                let Some(content) = message["content"].as_str() else {
+                    continue;
+                };
+                let mut payload: serde_json::Value = serde_json::from_str(content).unwrap();
+                if payload["kind"] == "service_access_decision" {
+                    payload["remote_exit_grant"]["peer_did"] = json!("substituted-endpoint");
+                    message["content"] = json!(payload.to_string());
+                }
+            }
+        } else {
+            let (status, body) = services_contact_post(
+                &alice.app,
+                &alice.authority.people_token,
+                "/api/apps/people/contacts/remove",
+                json!({"contact_id":home_people_contact_id(&bob.profile.document().profile_did)}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+        let (status, _) =
+            home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!left.path().join("config/exit-provider.json").exists());
+        let saved =
+            services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+        assert!(saved["remote_offer_requests"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|request| request["status"] == "requested"));
+    }
+}
+
 #[tokio::test]
 async fn test_services_remote_exit_request_delivers_provider_inbox_notification() {
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _left_runtime = start_fake_runtime(left.path(), bus.clone(), "services-left").await;
-    let _right_runtime = start_fake_runtime(right.path(), bus, "services-right").await;
-    let left_app = gateway_router(test_state(left.path()));
-    let right_app = gateway_router(test_state(right.path()));
-    let left_authority = passkey_authority_with_name(left.path(), Some("Alice"));
-    let right_authority = passkey_authority_with_name(right.path(), Some("Bob"));
-    crate::auth::store_test_principal_root_protection(left.path(), &left_authority.principal_id);
-    crate::auth::store_test_principal_root_protection(right.path(), &right_authority.principal_id);
-    let (_, left_did) = elastos_identity::load_or_create_did(left.path()).unwrap();
-    let (_, right_did) = elastos_identity::load_or_create_did(right.path()).unwrap();
-
-    for (app, token, body) in [
-        (
-            left_app.clone(),
-            left_authority.people_token.as_str(),
-            r#"{"display_name":"Alice"}"#,
-        ),
-        (
-            right_app.clone(),
-            right_authority.people_token.as_str(),
-            r#"{"display_name":"Bob"}"#,
-        ),
-    ] {
-        let response = app
-            .oneshot(
-                test_browser_request("localhost:61180", "null")
-                    .method("POST")
-                    .uri("/api/apps/people/profile")
-                    .header("x-elastos-home-token", token)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let left_fixture =
+        services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let right_fixture = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+    accept_services_contact_pair(&left_fixture, &right_fixture);
+    let ServicesContactFixture {
+        app: left_app,
+        authority: left_authority,
+        runtime: _left_runtime,
+        ..
+    } = left_fixture;
+    let ServicesContactFixture {
+        app: right_app,
+        authority: right_authority,
+        runtime: _right_runtime,
+        peer_id: right_peer_id,
+        ..
+    } = right_fixture;
     std::fs::create_dir_all(right.path().join("config")).unwrap();
     std::fs::write(right.path().join("config/exit-provider.json"), "{}").unwrap();
-
-    write_home_principal_object_json_for_authority(
-        left.path(),
-        &left_authority,
-        "services-peer-contacts.json",
-        json!({
-            "schema": "elastos.services.peer-contacts-state/v1",
-            "principal_id": left_authority.principal_id,
-            "localhost_root": crate::auth::principal_localhost_root(&left_authority.principal_id),
-            "updated_at": 10,
-            "contacts": {
-                "contact:right": {
-                    "contact_id": "contact:right",
-                    "peer_id": "services-right",
-                    "did": right_did,
-                    "display_name": "Bob",
-                    "handle": "Bob",
-                    "added_at": 10,
-                    "updated_at": 10,
-                    "source": "people_discovery"
-                }
-            }
-        }),
-    );
-    write_home_principal_object_json_for_authority(
-        right.path(),
-        &right_authority,
-        "services-peer-contacts.json",
-        json!({
-            "schema": "elastos.services.peer-contacts-state/v1",
-            "principal_id": right_authority.principal_id,
-            "localhost_root": crate::auth::principal_localhost_root(&right_authority.principal_id),
-            "updated_at": 10,
-            "contacts": {
-                "contact:left": {
-                    "contact_id": "contact:left",
-                    "peer_id": "services-left",
-                    "did": left_did,
-                    "display_name": "Alice",
-                    "handle": "Alice",
-                    "added_at": 10,
-                    "updated_at": 10,
-                    "source": "people_discovery"
-                }
-            }
-        }),
-    );
 
     let right_services_token =
         app_token_for_authority(right.path(), SERVICES_CAPSULE_ID, &right_authority);
@@ -1943,8 +2416,8 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
         .unwrap()
         .iter()
         .find(|exit| {
-            exit["connect_ticket"] == "fake-ticket-services-right"
-                && exit["peer_did"] == "services-right"
+            exit["connect_ticket"] == format!("fake-ticket-{right_peer_id}")
+                && exit["peer_did"] == right_peer_id
         })
         .expect("approval should install a private remote Carrier Exit grant");
     assert_eq!(
@@ -1959,68 +2432,18 @@ async fn test_services_remote_exit_request_local_only_does_not_save_requested_st
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _left_runtime = start_fake_runtime(left.path(), bus.clone(), "services-left-local").await;
-    let _right_runtime =
-        start_fake_runtime(right.path(), bus.clone(), "services-right-local").await;
-    let left_app = gateway_router(test_state(left.path()));
-    let left_authority = passkey_authority_with_name(left.path(), Some("Alice"));
-    let right_authority = passkey_authority_with_name(right.path(), Some("Bob"));
-    crate::auth::store_test_principal_root_protection(left.path(), &left_authority.principal_id);
-    crate::auth::store_test_principal_root_protection(right.path(), &right_authority.principal_id);
-    let right_did = elastos_identity::load_or_create_did(right.path())
-        .unwrap()
-        .1;
-
-    write_home_principal_object_json_for_authority(
-        left.path(),
-        &left_authority,
-        "services-peer-contacts.json",
-        json!({
-            "schema": "elastos.services.peer-contacts-state/v1",
-            "principal_id": left_authority.principal_id,
-            "localhost_root": crate::auth::principal_localhost_root(&left_authority.principal_id),
-            "updated_at": 10,
-            "contacts": {
-                "contact:right": {
-                    "contact_id": "contact:right",
-                    "peer_id": "services-right-local",
-                    "did": right_did,
-                    "display_name": "Bob",
-                    "handle": "Bob",
-                    "added_at": 10,
-                    "updated_at": 10,
-                    "source": "people_discovery"
-                }
-            }
-        }),
-    );
-    write_home_principal_object_json_for_authority(
-        right.path(),
-        &right_authority,
-        "services-peer-contacts.json",
-        json!({
-            "schema": "elastos.services.peer-contacts-state/v1",
-            "principal_id": right_authority.principal_id,
-            "localhost_root": crate::auth::principal_localhost_root(&right_authority.principal_id),
-            "updated_at": 10,
-            "contacts": {}
-        }),
-    );
-
-    let profile = left_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/profile")
-                .header("x-elastos-home-token", left_authority.people_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"display_name":"Alice"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(profile.status(), StatusCode::OK);
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let left_fixture =
+        services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let right_fixture = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+    accept_services_contact_pair(&left_fixture, &right_fixture);
+    let ServicesContactFixture {
+        app: left_app,
+        authority: left_authority,
+        runtime: _left_runtime,
+        ..
+    } = left_fixture;
 
     let left_services_token =
         app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &left_authority);

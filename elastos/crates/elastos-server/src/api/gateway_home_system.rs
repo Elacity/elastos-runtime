@@ -330,9 +330,12 @@ pub(super) async fn home_summary(
             ) {
                 return home_error_response(err);
             }
-            if let Err(err) =
-                apply_services_peer_authority(&state.data_dir, context, &mut home_state.services)
-            {
+            if let Err(err) = apply_services_peer_authority(
+                &state.data_dir,
+                context,
+                state.collaboration_discovery_service.as_ref(),
+                &mut home_state.services,
+            ) {
                 return home_error_response(err);
             }
             if let Err(err) =
@@ -1817,9 +1820,12 @@ fn apply_profile_people_authority(
 fn apply_services_peer_authority(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
     services: &mut HomeServicesSummary,
 ) -> anyhow::Result<()> {
-    let contacts = home_services_peer_contacts_state(data_dir, context)?;
+    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
     let mut remote_offers = contacts
         .contacts
         .values()
@@ -1947,15 +1953,23 @@ pub(super) async fn services_summary(
             Err(err) => return home_error_response(err),
         };
     let data_dir = state.data_dir.clone();
+    let discovery_service = state.collaboration_discovery_service.clone();
     match tokio::task::spawn_blocking(move || {
-        if let Err(err) = home_services_sync_access_decisions(&data_dir, &context) {
+        if let Err(err) =
+            home_services_sync_access_decisions(&data_dir, &context, discovery_service.as_ref())
+        {
             tracing::warn!(
                 error = %err,
                 "could not sync Services access decisions"
             );
         }
         let mut home_state = home_state(&data_dir);
-        apply_services_peer_authority(&data_dir, &context, &mut home_state.services)?;
+        apply_services_peer_authority(
+            &data_dir,
+            &context,
+            discovery_service.as_ref(),
+            &mut home_state.services,
+        )?;
         apply_home_services_selection(&data_dir, &context, &mut home_state.services)?;
         Ok::<_, anyhow::Error>(home_state.services)
     })
@@ -1978,9 +1992,15 @@ pub(super) async fn services_offer_update(
             Err(err) => return home_error_response(err),
         };
     let data_dir = state.data_dir.clone();
+    let discovery_service = state.collaboration_discovery_service.clone();
     match tokio::task::spawn_blocking(move || {
         let mut home_state = home_state(&data_dir);
-        apply_services_peer_authority(&data_dir, &context, &mut home_state.services)?;
+        apply_services_peer_authority(
+            &data_dir,
+            &context,
+            discovery_service.as_ref(),
+            &mut home_state.services,
+        )?;
         let offer_id = req.offer_id.trim();
         if offer_id.is_empty() {
             anyhow::bail!("service offer id is required");
@@ -2021,14 +2041,19 @@ pub(super) async fn services_offer_update(
                     }
                 } else if req.selected {
                     if offer.grant_required && !services_state.remote_offer_ids.contains(offer_id) {
-                        let sent = home_services_send_access_request(&data_dir, &context, offer)
-                            .map_err(|err| {
-                                if profile_required_message(&err).is_some() {
-                                    err
-                                } else {
-                                    anyhow::anyhow!("service access request delivery failed: {err}")
-                                }
-                            })?;
+                        let sent = home_services_send_access_request(
+                            &data_dir,
+                            &context,
+                            discovery_service.as_ref(),
+                            offer,
+                        )
+                        .map_err(|err| {
+                            if profile_required_message(&err).is_some() {
+                                err
+                            } else {
+                                anyhow::anyhow!("service access request delivery failed: {err}")
+                            }
+                        })?;
                         services_state.remote_offer_requests.insert(
                             offer_id.to_string(),
                             HomeServicesRemoteOfferRequestRecord {
@@ -2279,6 +2304,9 @@ fn home_save_services_requests_state(
 fn home_services_peer_contact_record_for_offer(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
     offer: &HomeServiceOfferSummary,
 ) -> anyhow::Result<HomeServicesPeerContactRecord> {
     let contact_id = offer
@@ -2287,7 +2315,7 @@ fn home_services_peer_contact_record_for_offer(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("service offer is not tied to a person"))?;
-    let contacts = home_services_peer_contacts_state(data_dir, context)?;
+    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
     contacts
         .contacts
         .get(contact_id)
@@ -2340,6 +2368,9 @@ fn home_services_local_exit_shared(
 fn home_services_send_access_request(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
     offer: &HomeServiceOfferSummary,
 ) -> anyhow::Result<HomeServiceAccessRequestSent> {
     if offer.service_kind != HOME_REMOTE_EXIT_SERVICE_KIND
@@ -2347,7 +2378,8 @@ fn home_services_send_access_request(
     {
         anyhow::bail!("only Browser Exit service requests are supported");
     }
-    let contact = home_services_peer_contact_record_for_offer(data_dir, context, offer)?;
+    let contact =
+        home_services_peer_contact_record_for_offer(data_dir, context, discovery_service, offer)?;
     let target_peer_id = contact.peer_id.trim();
     if target_peer_id.is_empty() {
         anyhow::bail!("service offer person has no Carrier peer route");
@@ -2431,6 +2463,9 @@ fn home_services_require_remote_request_delivery(
 fn home_services_send_access_decision(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
     request: &HomeServiceAccessRequestRecord,
     decision: &str,
 ) -> anyhow::Result<()> {
@@ -2440,6 +2475,19 @@ fn home_services_send_access_decision(
     let target_peer_id = request.requester_peer_id.trim();
     if target_peer_id.is_empty() {
         anyhow::bail!("service access request has no requester peer route");
+    }
+    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
+    if !contacts
+        .contacts
+        .values()
+        .any(|contact| contact.peer_id == target_peer_id && contact.did == request.requester_did)
+    {
+        anyhow::bail!(
+            "service access request person is not connected through People at this endpoint"
+        );
+    }
+    if decision == "approved" && !home_services_local_exit_shared(data_dir, context)? {
+        anyhow::bail!("service offer is no longer shared");
     }
     let runtime = services_attach_peer_runtime_blocking(data_dir)?;
     services_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
@@ -2504,14 +2552,30 @@ fn home_services_send_access_decision(
 fn home_services_sync_access_decisions(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
 ) -> anyhow::Result<()> {
     let mut state = home_services_selection_state(data_dir, context)?;
     if state.remote_offer_requests.is_empty() {
         return Ok(());
     }
+    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
+    let current_requests = state
+        .remote_offer_requests
+        .values()
+        .filter(|request| {
+            contacts.contacts.values().any(|contact| {
+                request.offer_id == format!("offer:{}:browser-exit", contact.contact_id)
+                    && request.target_peer_id == contact.peer_id
+            })
+        })
+        .map(|request| request.request_id.clone())
+        .collect::<BTreeSet<_>>();
     let known_peers = state
         .remote_offer_requests
         .values()
+        .filter(|request| current_requests.contains(&request.request_id))
         .filter_map(|request| {
             let peer_id = request.target_peer_id.trim();
             (!peer_id.is_empty()).then(|| peer_id.to_string())
@@ -2557,6 +2621,13 @@ fn home_services_sync_access_decisions(
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(content) else {
             continue;
         };
+        if !payload
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| current_requests.contains(id))
+        {
+            continue;
+        }
         match home_services_merge_access_decision(
             data_dir,
             context,
@@ -2709,6 +2780,11 @@ fn home_services_install_remote_exit_grant(
     let provider_peer_id = home_services_payload_text(grant, "peer_did", 256)
         .or_else(|| home_services_payload_text(payload, "provider_peer_id", 256))
         .ok_or_else(|| anyhow::anyhow!("approved Browser Exit grant is missing a provider peer"))?;
+    if provider_peer_id != record.target_peer_id {
+        anyhow::bail!(
+            "approved Browser Exit grant provider endpoint differs from the requested contact"
+        );
+    }
     let id = home_services_remote_exit_id(&record.service_display_name, &record.request_id);
     let grant_id = home_services_remote_exit_grant_id(&record.request_id);
     let path = home_services_exit_provider_config_path(data_dir);
@@ -2778,11 +2854,14 @@ fn home_services_remove_remote_exit_grant(
 pub(super) fn home_services_sync_access_requests(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
 ) -> anyhow::Result<()> {
     if !home_services_local_exit_shared(data_dir, context)? {
         return Ok(());
     }
-    let contacts = home_services_peer_contacts_state(data_dir, context)?;
+    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
     let known_peers = contacts
         .contacts
         .values()
@@ -2832,6 +2911,18 @@ pub(super) fn home_services_sync_access_requests(
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(content) else {
             continue;
         };
+        if !contacts.contacts.values().any(|contact| {
+            payload
+                .get("requester_peer_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(contact.peer_id.as_str())
+                && payload
+                    .get("requester_did")
+                    .and_then(serde_json::Value::as_str)
+                    == contact.did.as_deref()
+        }) {
+            continue;
+        }
         changed |= home_services_merge_access_request(
             &mut state,
             &known_peers,
@@ -3006,22 +3097,31 @@ pub(super) fn append_home_service_access_notifications(
 pub(super) fn approve_home_service_access_request(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
     request_id: &str,
 ) -> anyhow::Result<String> {
-    home_services_mark_access_request(data_dir, context, request_id, "approved")
+    home_services_mark_access_request(data_dir, context, discovery_service, request_id, "approved")
 }
 
 pub(super) fn deny_home_service_access_request(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
     request_id: &str,
 ) -> anyhow::Result<String> {
-    home_services_mark_access_request(data_dir, context, request_id, "denied")
+    home_services_mark_access_request(data_dir, context, discovery_service, request_id, "denied")
 }
 
 fn home_services_mark_access_request(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
     request_id: &str,
     status: &str,
 ) -> anyhow::Result<String> {
@@ -3033,13 +3133,14 @@ fn home_services_mark_access_request(
     let Some(request) = state.requests.get(request_id).cloned() else {
         anyhow::bail!("service request not found");
     };
-    home_services_send_access_decision(data_dir, context, &request, status).map_err(|err| {
-        if profile_required_message(&err).is_some() {
-            err
-        } else {
-            err.context("service access request delivery failed")
-        }
-    })?;
+    home_services_send_access_decision(data_dir, context, discovery_service, &request, status)
+        .map_err(|err| {
+            if profile_required_message(&err).is_some() {
+                err
+            } else {
+                err.context("service access request delivery failed")
+            }
+        })?;
     let Some(request) = state.requests.get_mut(request_id) else {
         anyhow::bail!("service request not found");
     };
@@ -3290,7 +3391,14 @@ async fn home_realtime_snapshot(
     {
         home_state.people = HomePeopleSummary::default();
     }
-    if apply_services_peer_authority(&state.data_dir, context, &mut home_state.services).is_err() {
+    if apply_services_peer_authority(
+        &state.data_dir,
+        context,
+        state.collaboration_discovery_service.as_ref(),
+        &mut home_state.services,
+    )
+    .is_err()
+    {
         home_state.services = HomeServicesSummary::default();
     }
     if apply_home_services_selection(&state.data_dir, context, &mut home_state.services).is_err() {
@@ -4539,38 +4647,40 @@ fn home_services_peer_contacts_path(
 fn home_services_peer_contacts_state(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
 ) -> anyhow::Result<HomeServicesPeerContactsState> {
-    let path = home_services_peer_contacts_path(data_dir, context)?;
-    if !path.is_file() {
-        return Ok(default_home_services_peer_contacts_state(context));
-    }
-    let principal_id = home_browser_principal_id(context);
-    let localhost_root = home_browser_localhost_root(context);
-    let bytes = match crate::auth::read_principal_root_object(
-        data_dir,
-        &principal_id,
-        &localhost_root,
-        &home_services_peer_contacts_uri(context),
-        &path,
-    ) {
-        Ok(bytes) => bytes,
-        Err(err) if is_unencrypted_principal_root_state(&err) => {
-            return Ok(default_home_services_peer_contacts_state(context));
-        }
-        Err(err) if is_missing_principal_root_state_file(&err) => {
-            return Ok(default_home_services_peer_contacts_state(context));
-        }
-        Err(err) => return Err(err),
+    let mut state = default_home_services_peer_contacts_state(context);
+    let Some(authority) =
+        load_configured_contact_authority_for_context(data_dir, context, discovery_service)?
+    else {
+        return Ok(state);
     };
-    let state: HomeServicesPeerContactsState = serde_json::from_slice(&bytes)?;
-    if state.schema != HOME_SERVICES_PEER_CONTACTS_SCHEMA {
-        anyhow::bail!("unsupported Services peer contacts schema");
-    }
-    if state.principal_id != principal_id {
-        anyhow::bail!("Services peer contacts principal mismatch");
-    }
-    if state.localhost_root != localhost_root {
-        anyhow::bail!("Services peer contacts root mismatch");
+    // A contact permits a request. The provider's separate approval grants use.
+    // Delivery follows the endpoint in the current verified Profile chain;
+    // legacy peer files remain migration evidence, never contact authority.
+    for contact in authority.store.snapshot()?.contacts() {
+        let endpoint_did = contact.remote_presence_device_did();
+        let peer_id = crate::carrier::did_to_public_key(endpoint_did)
+            .ok_or_else(|| {
+                anyhow::anyhow!("service offer contact has no verified Carrier endpoint")
+            })?
+            .to_string();
+        let contact_id = home_people_contact_id(contact.remote_profile_did());
+        state.contacts.insert(
+            contact_id.clone(),
+            HomeServicesPeerContactRecord {
+                contact_id,
+                peer_id,
+                did: Some(endpoint_did.to_string()),
+                display_name: contact.remote_display_name().to_string(),
+                handle: contact.remote_handle().map(str::to_string),
+                added_at: contact.added_at(),
+                updated_at: contact.added_at(),
+                source: "accepted_profile_contact".to_string(),
+            },
+        );
     }
     Ok(state)
 }

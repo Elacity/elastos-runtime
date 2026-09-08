@@ -2801,7 +2801,13 @@ assert(
       "Carrier service access request was not delivered to the other person's device",
     ) &&
     gatewayHomeSystemTests.includes('approved_offer["status"], "active"') &&
-    gatewayHomeSystemTests.includes("fake-ticket-services-right") &&
+    gatewayHomeSystemTests.includes('format!("fake-ticket-{right_peer_id}")') &&
+    gatewayHomeSystemTests.includes(
+      "test_services_contact_authority_rejects_other_principal_and_removed_contact",
+    ) &&
+    gatewayHomeSystemTests.includes(
+      "test_services_contact_authority_ignores_substituted_legacy_endpoint",
+    ) &&
     gatewayHomeSystemTests.includes(
       'assert_eq!(approved_offer["grant_required"], false)',
     ) &&
