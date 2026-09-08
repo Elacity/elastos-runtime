@@ -2404,9 +2404,9 @@ async function restoreRuntimePageViewer(summary) {
   if (!owner) throw new Error("Runtime could not restore Browser cleanup authority.");
   currentPage = page;
   currentPageGeneration = nextPageGeneration++;
-  publishRuntimePageForHost(currentPage);
   runtimeOwnershipTerminallyAbsent = false;
   if (page.recovery_state === "cleanup_pending") {
+    publishRuntimePageForHost(currentPage);
     showStatus("Browser session cleanup is pending. Close Browser to retry.", { sticky: true });
     setLoading(false);
     return true;
@@ -2421,6 +2421,7 @@ async function restoreRuntimePageViewer(summary) {
   try {
     await fetchPageStatus({ history: "replace", forceAddress: true });
     if (!runtimeViewerOwnerActive(owner)) return true;
+    publishRuntimePageForHost(currentPage);
     // Page status is diagnostic; attach replaces offers within retained Runtime authority.
     if (currentPage.display_session?.mode !== "webrtc_remote_display") {
       throw new Error("Runtime could not restore the Browser display.");

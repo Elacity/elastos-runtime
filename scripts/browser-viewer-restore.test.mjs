@@ -78,6 +78,23 @@ test('startup restores exact owner, fresh URL, and Runtime-selected services wit
   assert.deepEqual(h.failures, []);
 });
 
+test('restored page becomes visible to Home after its fresh address is applied', async () => {
+  const h = harness(), pending = deferred(), fetch = h.state.fetchJson;
+  h.state.fetchJson = async (path, options) => {
+    if (path.endsWith('/status')) await pending.promise;
+    return fetch(path, options);
+  };
+  const restoring = h.restore(summary());
+  try {
+    assert.equal(h.state.currentPage.runtime_cleanup.id, 'cleanup-one');
+    assert.equal(h.calls.some(row => row[0] === 'publish'), false);
+  } finally { pending.resolve(); await restoring; }
+  const url = h.calls.findIndex(row => row[0] === 'url');
+  const publish = h.calls.findIndex(row => row[0] === 'publish');
+  assert.ok(url >= 0 && publish > url);
+  assert.ok(h.calls.findIndex(row => row[0] === 'connect') > publish);
+});
+
 test('Automatic Engine and local Exit remain the Runtime-selected empty values', async () => {
   const h = harness(), value = summary(); value.sessions.recoverable_page.service_selection.engine_id = '';
   value.sessions.recoverable_page.service_selection.exit_id = '';

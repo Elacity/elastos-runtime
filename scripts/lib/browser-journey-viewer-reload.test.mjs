@@ -330,50 +330,20 @@ test("pending media evidence distinguishes retained viewer, absent media and mis
   }
 });
 
-test("published retained page before status updates the address fails with the exact viewer predicate", async () => {
-  // Use the real startup continuation. The viewer publishes its retained page
-  // before the pending status read updates the initial document address.
-  const source = readFileSync(new URL("../../capsules/browser/browser/browser.js", import.meta.url), "utf8");
-  const start = source.indexOf("async function restoreRuntimePageViewer(");
-  const end = source.indexOf("\n}\n", start);
-  assert.ok(start >= 0 && end > start);
-  const viewer = { ...original.viewer, page_id: "", actual_url: "https://ela.city/home" };
-  let release;
-  const status = new Promise(resolve => { release = resolve; });
-  const context = vm.createContext({
-    unloadCleanupStarted: false, homeWindowCloseInFlight: false, homeWindowTerminalCloseConfirmed: false,
-    currentPage: null, nextPageGeneration: 1, currentPageGeneration: 0,
-    runtimeOwnershipTerminallyAbsent: false, restoredViewerOwner: null,
-    selectedBrowserEngineId: "", currentBrowserEngineId: "", selectedRemoteExitId: "", currentRemoteExitId: "",
-    recoverableRuntimePage: () => ({ schema: "elastos.browser.engine.page/v1", recovery_state: "active",
-      page_id: original.viewer.page_id }),
-    runtimePageOwner: page => ({ page_id: page.page_id }),
-    publishRuntimePageForHost: page => { viewer.page_id = page.page_id; },
-    syncEngineSelect() {}, syncExitSelect() {}, showStatus() {}, startPageHeartbeat() {},
-    async fetchPageStatus() { await status; viewer.actual_url = fixtureUrl; },
-    // End the test continuation after status settles; this test owns no display.
-    runtimeViewerOwnerActive: () => false,
-  });
-  vm.runInContext(source.slice(start, end + 2), context);
-  const sessions = structuredClone(original.sessions);
-  sessions.recoverable_page.service_selection = { schema: "elastos.browser.service-selection/v1",
-    engine_id: original.viewer.engine_id, exit_id: original.viewer.exit_id };
-  const restore = context.restoreRuntimePageViewer({ sessions });
-  try {
-    assert.equal(viewer.page_id, original.viewer.page_id);
-    assert.notEqual(viewer.actual_url, fixtureUrl);
-    const { evidence, calls } = await fails({ changeViewer: value => {
-      value.page_id = viewer.page_id; value.actual_url = viewer.actual_url;
-    } }, "binding_unavailable_or_cleanup");
-    assert.equal(evidence.binding_failure.source, "viewer");
-    assert.equal(evidence.binding_failure.phase, "reload");
-    assert.deepEqual(evidence.binding_failure.failed_checks, ["page_status_url_matches"]);
-    assert.equal(evidence.binding_failure.owner_state, "active");
-    assert.equal(evidence.binding_failure.counts.engine_cleanup_obligations, 0);
-    assert.equal(evidence.samples.length, 1, "only the completed baseline is a passing sample");
-    assert.equal(calls.filter(call => call.method === "state" && call.reloaded).length, 1, "failed owner check is not retried");
-    assert.equal(calls.some(call => call.method === "input"), false);
-  } finally { release(); await restore; }
+test("a published page with a stale address fails with the exact viewer predicate", async () => {
+  // Keep the strict classification for the run 68/81 state after repairing
+  // the product's publication order. A stale visible owner still fails.
+  const { evidence, calls } = await fails({ changeViewer: value => {
+    value.page_id = original.viewer.page_id; value.actual_url = "https://ela.city/home";
+  } }, "binding_unavailable_or_cleanup");
+  assert.equal(evidence.binding_failure.source, "viewer");
+  assert.equal(evidence.binding_failure.phase, "reload");
+  assert.deepEqual(evidence.binding_failure.failed_checks, ["page_status_url_matches"]);
+  assert.equal(evidence.binding_failure.owner_state, "active");
+  assert.equal(evidence.binding_failure.counts.engine_cleanup_obligations, 0);
+  assert.equal(evidence.samples.length, 1, "only the completed baseline is a passing sample");
+  assert.equal(calls.filter(call => call.method === "state" && call.reloaded).length, 1, "failed owner check is not retried");
+  assert.equal(calls.some(call => call.method === "input"), false);
 });
 
 test("failed Runtime predicate is retained before any pending viewer check", async () => {
