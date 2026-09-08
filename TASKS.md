@@ -33,6 +33,30 @@ frame, navigate, type, scroll, and close through Home with confirmed session
 cleanup. One coordinating operator owns that installed Runtime, VM and viewer.
 Independent source repair and regression work can proceed in separate file scopes.
 
+Latest checkpoint: installed guest control `6f5d48ae` with the existing Runtime,
+provider, VZ helper and Browser UI. The image and helper match the installed
+receipts; source-only RNG work remains outside this image.
+
+| Delivered milestone | Current result | Next action |
+| --- | --- | --- |
+| B01 shared compatibility/ownership contract | Accepted prerequisite; full B01 stays open | Use the contract for B02/B03/B05/B06 and operator work. |
+| Requested local Home-to-close journey | Runs 41 and 42 independently accepted on the current image | Keep this bounded milestone accepted while qualifying recovery and devices. |
+| B02 Mac TURN admission | Installed valid/absent/nonexistent program cases accepted | Complete automatic artifact admission and fresh-install proof. |
+| B03 passive retained diagnostics | Installed log reads capture the reload failure without audio commands | Reproduce the ICE object lifetime defect with matching guest libraries. |
+| B05 acknowledged click then text | Installed click and first character each return accepted Runtime results in run 43 | Keep composition, motion, mixed transports and manual interaction open. |
+| B06 viewer reload | Run 42 passes in 1066 ms; run 41 crashes the media producer during video pipeline recreation | Repair the smallest proven object-lifetime defect and repeat the journey. |
+| B06 five-second interruption | Run 44 passes a 5001 ms cut, recovery in 1911 ms and cleanup in 624 ms | Independent review accepts this bounded result; retain full recovery cases and leases. |
+
+B04 can now implement owner-authorized inspection of the actual Engine page
+against the accepted contract. Its next slice needs capability negotiation,
+bounded snapshots, pagination and document generations. Writer leases, delegated
+operators and Playwright/Camofox/Camoufox adapters retain their full gates.
+
+The fractional-timer regression fails before the probe correction; 254 related
+checks pass after it. The recovery threshold remains five seconds. Source tests
+and bounded local passes leave media, repetition, lease, remote placement,
+device-role, operator-adapter and human acceptance open.
+
 - Passed prerequisites: protocol 2.1 compatibility/readiness source checks;
   matching installed Runtime, providers and guest artifacts; served Home parity.
   Repairs cover Runtime-scoped IPC, the no-NIC online-state projection, Net's

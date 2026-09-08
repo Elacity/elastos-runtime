@@ -70,6 +70,26 @@ volatile proof logs remain outside the repository.
 
 ## Browser contract and device qualification
 
+The task Mac currently uses guest Engine source `6f5d48ae`, rootfs
+`a811e66ba443dd3b9dc43dbbad8c7f230eb6ddaf36a8150a861a2b11d09a0841`,
+and matching control helper
+`eb963971286e8b82d95896c4ba8a849c9938d24dee8dc2a5936784a4564cb489`.
+Runtime, adapter, VZ helper, kernel and Browser UI were reused and verified.
+Runs 41 and 42 pass the requested Home-to-close journey. Run 42 also passes
+viewer reload in 1066 ms and exact cleanup in 600 ms. Run 41 instead crashes the
+Selkies producer while recreating its video pipeline: GObject assertions precede
+a fatal allocation failure. The ICE wrapper lifetime is under source diagnosis.
+Independent agent review accepts both core journeys and the single bounded
+reload in run 42. Repeated recovery qualification remains open.
+Run 43 confirms accepted Runtime click/text responses and normal browsing, then
+restores both interrupted transports and cleans up all 13 effects in 649 ms.
+Its cut-boundary observation fails. Two source regressions reproduce an early
+fractional timer; the monotonic expiration correction passes 254 related tests.
+Run 44 passes with that probe change: a 5001 ms HTTP/TURN cut, 1911 ms
+same-owner media/input recovery and exact cleanup in 624 ms. Independent agent review accepts this bounded interruption result.
+These are local development receipts; publication and full B01–B16 acceptance
+remain open.
+
 Browser B01 is in progress. The contract is in
 [docs/BROWSER_PROTOCOL.md](docs/BROWSER_PROTOCOL.md), and the role-specific
 qualification matrix is in [docs/BROWSER_SUPPORT.md](docs/BROWSER_SUPPORT.md).
