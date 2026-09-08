@@ -491,7 +491,7 @@ async function main() {
   // The descriptor reader is paused. Release both directions after the receipt
   // flushes so the one-session relay and guest init can finish bootstrap.
   socket.end(`${JSON.stringify(receipt)}\n`, () => {
-    markStage("receipt_flushed");
+    markStage("receipt_write_callback");
     socket.destroy();
   });
 }

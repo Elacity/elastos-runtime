@@ -272,7 +272,7 @@ test("bootstrap flushes its bound receipt and closes without waiting for the des
     assert.equal(receipt.terminal, true);
     assert.equal(deadlineTimers.size, 0, "a completed descriptor has no pending read deadline");
     assert.deepEqual(stages.map(event => event.stage), ["descriptor_wait", "descriptor_received",
-      "authority_validated", "direct_network_checked", "authority_written", "ice_written", "receipt_flushed"]);
+      "authority_validated", "direct_network_checked", "authority_written", "ice_written", "receipt_write_callback"]);
     for (const event of stages) {
       assert.deepEqual(Object.keys(event).sort(), ["at", "elapsed_ms", "schema", "stage"]);
       assert.equal(event.schema, "elastos.browser.vz-bootstrap-stage/v1");
