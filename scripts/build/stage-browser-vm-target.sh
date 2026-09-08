@@ -629,8 +629,12 @@ JSON
     echo "browser-vm-init: VZ transport bootstrap relay did not start" >&2
     exit 1
   }
+  rootfs_mark "VZ bootstrap helper starting at $(date -u +%FT%TZ)"
+  rootfs_mark "VZ bootstrap entropy_bits=$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null || true) rng=$(cat /sys/class/misc/hw_random/rng_current 2>/dev/null || true)"
   ELASTOS_BROWSER_VM_VZ_TRANSPORT_BOOTSTRAP_CONFIG='{"schema":"elastos.browser.vz-transport-bootstrap.config/v1","relay_socket_path":"/run/elastos/browser-vz-transport-bootstrap.sock","authority_path":"/run/elastos/browser-vz-transport-authority.json","ice_servers_path":"/run/elastos/browser-ice-servers.json"}' \
     /opt/elastos/bin/node /opt/elastos/bin/browser-vm-vz-transport-bootstrap.mjs
+  rootfs_mark "VZ bootstrap helper exited at $(date -u +%FT%TZ)"
+  rootfs_mark "VZ bootstrap entropy_bits=$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null || true) rng=$(cat /sys/class/misc/hw_random/rng_current 2>/dev/null || true)"
   wait "$ELASTOS_BROWSER_VM_BOOTSTRAP_RELAY_PID"
   read_vz_authority_field() {
     /opt/elastos/bin/node -e '

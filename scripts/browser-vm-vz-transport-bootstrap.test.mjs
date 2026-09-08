@@ -235,9 +235,12 @@ test("bootstrap flushes its bound receipt and closes without waiting for the des
   const source = fs.readFileSync(new URL("./browser-vm-vz-transport-bootstrap.mjs", import.meta.url), "utf8");
   const program = source.slice(source.indexOf("function readDescriptor("), source.indexOf("\nexport {"));
   const deadlineTimers = new Set();
+  const stages = [];
   const context = vm.createContext({
     Buffer,
     JSON,
+    performance,
+    console: { error: (line) => stages.push(JSON.parse(line)) },
     net: { createConnection(options) {
       const socket = net.createConnection(options);
       sockets.add(socket);
@@ -268,6 +271,14 @@ test("bootstrap flushes its bound receipt and closes without waiting for the des
     assert.equal(receipt.generation, descriptor.authority.generation);
     assert.equal(receipt.terminal, true);
     assert.equal(deadlineTimers.size, 0, "a completed descriptor has no pending read deadline");
+    assert.deepEqual(stages.map(event => event.stage), ["descriptor_wait", "descriptor_received",
+      "authority_validated", "direct_network_checked", "authority_written", "ice_written", "receipt_flushed"]);
+    for (const event of stages) {
+      assert.deepEqual(Object.keys(event).sort(), ["at", "elapsed_ms", "schema", "stage"]);
+      assert.equal(event.schema, "elastos.browser.vz-bootstrap-stage/v1");
+      assert.ok(Number.isInteger(event.elapsed_ms) && event.elapsed_ms >= 0);
+      assert.ok(Number.isFinite(Date.parse(event.at)));
+    }
   } finally {
     clearTimeout(failureTimer);
     for (const timer of deadlineTimers) clearTimeout(timer);
