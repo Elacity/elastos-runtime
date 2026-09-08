@@ -2111,11 +2111,16 @@ async function navigateAddress(value) {
   addressInput.blur();
   setLoading(true);
   showStatus(`Opening ${visibleAddressForUrl(nextUrl)}...`, { sticky: true });
+  const openingStatus = statusNode.firstChild;
   try {
-    await sendBrowserInput(
+    const response = await sendBrowserInput(
       { type: "browser_command", command: "navigate", url: nextUrl },
       { history: "push" },
     );
+    if (response?.accepted === true && statusNode.firstChild === openingStatus) {
+      window.clearTimeout(statusTimer);
+      statusNode.dataset.visible = "false";
+    }
     startPageStatusPolling();
   } catch (error) {
     if (crossStreamTarget) {

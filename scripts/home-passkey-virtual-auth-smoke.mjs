@@ -2791,7 +2791,13 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
       const decoded = await waitForJourneyEvidence(() => browserRemoteVideoMetrics(appFrame),
         value => value.decoded_frames > ready.decoded_frames && value.decoded_frames > 0,
         `${name} decoded WebRTC frame progress`, BROWSER_REMOTE_VIDEO_TIMEOUT_MS);
-      result.pages.push({ name, url, page_id: status.page_id, load, video: { ready, decoded },
+      const navigationStatus = await appFrame.locator("#browser-status").evaluate(node => ({
+        visible: node.dataset.visible === "true",
+        opening: /^Opening /.test(node.querySelector(".browser-status-message")?.textContent || ""),
+      }));
+      assert(!(navigationStatus.visible && navigationStatus.opening),
+        "Browser retained navigation progress after the controlled page loaded", { name, navigationStatus });
+      result.pages.push({ name, url, page_id: status.page_id, load, video: { ready, decoded }, navigation_status: navigationStatus,
         timing: { status_ready_ms: statusReadyMs, decoded_progress_ms: Math.round(performance.now() - navigationStarted) } });
     }
     const current = result.pages.at(-1);
