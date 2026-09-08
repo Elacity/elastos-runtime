@@ -2692,10 +2692,12 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
     await appFrame.waitForFunction(() => document.querySelector("#browser-url")?.disabled === false,
       null, { timeout: BROWSER_UI_PAGE_ID_TIMEOUT_MS });
     if (BROWSER_REMOTE_EXIT_ID) {
+      await appFrame.locator("#browser-settings").click();
       await appFrame.locator("#browser-exit").selectOption(BROWSER_REMOTE_EXIT_ID);
       assert(await appFrame.locator("#browser-exit").inputValue() === BROWSER_REMOTE_EXIT_ID,
         "Controlled Browser did not select the requested remote Exit");
       result.remote_exit_id = BROWSER_REMOTE_EXIT_ID;
+      await appFrame.locator("#browser-settings-close").click();
     }
     const settled = failures.filter(entry => {
       const outcome = entry.body?.error?.outcome || entry.body?.outcome;
