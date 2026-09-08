@@ -471,3 +471,33 @@ for (const callback of ["observeRequests", "readBinding", "readVideo", "readRece
     }
   });
 }
+
+for (const callback of ["readBinding", "readVideo"]) {
+  test(`${callback} cut timeout checks the clock when a timer fires early`, async () => {
+    const f = fixture(), schedule = f.args.clock.setTimeout, read = f.args[callback];
+    let early = false, delayed = false;
+    f.args.clock.setTimeout = (fn, delay) => {
+      const cut = f.calls.find(call => call.params?.offline === true);
+      const restored = f.calls.some(call => call.params?.offline === false);
+      if (cut && !restored && !early && f.args.clock.now() - cut.at >= 4500 && delay >= 250) {
+        return schedule(() => { early = true; fn(); }, delay - 0.25);
+      }
+      return schedule(fn, delay);
+    };
+    f.args[callback] = async budget => {
+      const cut = f.calls.find(call => call.params?.offline === true);
+      if (cut && !f.calls.some(call => call.params?.offline === false) &&
+          f.args.clock.now() - cut.at >= 4500) {
+        delayed = true;
+        await new Promise(resolve => budget.signal.addEventListener("abort", resolve, { once: true }));
+      }
+      return read(budget);
+    };
+    const evidence = await f.run();
+    assert.equal(early && delayed, true);
+    assert.equal(evidence.ok, true);
+    assert.ok(evidence.cut_ms >= 5000 && evidence.cut_ms <= 5001);
+    assert.ok(evidence.recovery_ms <= 5000);
+    assertRestoredAndDetached(f);
+  });
+}

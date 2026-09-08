@@ -105,10 +105,16 @@ export async function diagnoseBrowserJourneyRecovery({
       const result = await Promise.race([
         Promise.resolve().then(() => action({ signal: controller.signal, deadlineMs, timeoutMs })),
         new Promise((_, reject) => {
-          timer = clock.setTimeout(() => {
+          const expire = () => {
+            const remaining = deadlineMs - clock.now();
+            if (remaining > 0) {
+              timer = clock.setTimeout(expire, Math.max(1, Math.ceil(remaining)));
+              return;
+            }
             controller.abort();
             reject(new RecoveryFailure(code));
-          }, timeoutMs);
+          };
+          timer = clock.setTimeout(expire, Math.ceil(timeoutMs));
         }),
       ]);
       requireEvidence(clock.now() <= deadlineMs, code);
