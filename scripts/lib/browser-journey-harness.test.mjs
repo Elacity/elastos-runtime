@@ -101,6 +101,38 @@ test("explicit Browser inventory deadline aborts a hung response body; default A
   finally { clearInterval(keepAlive); }
 });
 
+test("Engine summary can finish after the server's five-second offer phase but a hung body stops at fifteen seconds", async () => {
+  const api = harnessFunction("browserApi");
+  let now = 0, finishBody;
+  const timers = [];
+  const page = { evaluate: async (callback, args) => vm.runInNewContext(`(${callback.toString()})(args)`, {
+    args, AbortSignal: { timeout: ms => {
+      const controller = new AbortController(); timers.push({ at: now + ms, controller }); return controller.signal;
+    } },
+    fetch: async (_path, options) => ({ ok: true, status: 200, text: () => new Promise((resolve, reject) => {
+      finishBody = resolve;
+      options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+    }) }),
+  }) };
+  const advance = ms => {
+    now += ms;
+    for (const timer of timers) if (timer.at <= now) {
+      timer.controller.abort(Object.assign(new Error("summary deadline"), { name: "TimeoutError" }));
+    }
+  };
+  const pending = api(page, "exact-token", "/summary", { timeoutMs: 15_000 });
+  await new Promise(setImmediate);
+  advance(6_000);
+  assert.equal(timers[0].controller.signal.aborted, false);
+  finishBody('{"engine_adapter":{"adapters":[]}}');
+  assert.equal((await pending).ok, true);
+  const hung = api(page, "exact-token", "/summary", { timeoutMs: 15_000 });
+  const failure = assert.rejects(hung, { name: "TimeoutError" });
+  await new Promise(setImmediate);
+  advance(14_999); assert.equal(timers[1].controller.signal.aborted, false);
+  advance(1); await failure;
+});
+
 test("error-state redaction covers frame fragments and direct token fields", () => {
   const redactString = harnessFunction("redactSensitiveString");
   const redact = harnessFunction("redactSensitive", { redactSensitiveString: redactString });
@@ -447,7 +479,7 @@ test("journey preserves click/key timing and exact close even when diagnostic st
       browserApi: async (_frame, _token, path, options) => {
         if (path.includes("/summary?")) {
           assert.equal(path, "/api/apps/browser/summary?browser_instance=instance-one");
-          assert.equal(options.timeoutMs, 5_000);
+          assert.equal(options.timeoutMs, 15_000);
           summaryReads++;
           if (setupFails) return { ok: true, body: { engine_adapter: { adapters: [] } } };
           const adapter = { id: target.engineId, direct_network: false, wallet_injection: false };

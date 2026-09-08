@@ -2791,7 +2791,8 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
       markStage("browser:controlled-engine-selection");
       result.requested_engine_id = fixture.engineId;
       const summary = await browserApi(appFrame, token,
-        `/api/apps/browser/summary?browser_instance=${encodeURIComponent(windowIdentity.instance)}`, { timeoutMs: 5_000 });
+        // Remote offers can consume 5s; allow the other sequential summary reads and transport.
+        `/api/apps/browser/summary?browser_instance=${encodeURIComponent(windowIdentity.instance)}`, { timeoutMs: 15_000 });
       assert(summary.ok, "Browser Engine selection summary is unavailable");
       engineChoice = browserJourneyEngineChoice(summary.body, fixture.engineId);
     }
@@ -2838,7 +2839,7 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
       const statusReadyMs = Math.round(performance.now() - navigationStarted);
       if (engineChoice) {
         const summary = await browserApi(appFrame, token,
-          `/api/apps/browser/summary?browser_instance=${encodeURIComponent(windowIdentity.instance)}`, { timeoutMs: 5_000 });
+          `/api/apps/browser/summary?browser_instance=${encodeURIComponent(windowIdentity.instance)}`, { timeoutMs: 15_000 });
         assert(summary.ok, "Browser Engine ownership summary is unavailable");
         result.engine_route = browserJourneyEngineRoute(summary.body, engineChoice, status.page_id);
       }
