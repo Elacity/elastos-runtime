@@ -1574,9 +1574,19 @@ async fn handle_browser_carrier_exit_stream(
         Ok::<_, anyhow::Error>((authority, grant, reservation, relay))
     };
     let admitted = tokio::time::timeout(std::time::Duration::from_secs(5), admitted).await;
-    let Ok(Ok((authority, grant, _reservation, (relay_path, relay_stream_id)))) = admitted else {
-        return send_json(send, &serde_json::json!({"ok":false,
-            "code":"browser_exit_permission_denied", "error":"Runtime Exit grant is unavailable or does not authorize this stream"})).await;
+    let (authority, grant, _reservation, (relay_path, relay_stream_id)) = match admitted {
+        Ok(Ok(admitted)) => admitted,
+        failed => {
+            match failed {
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "Browser Carrier Exit admission failed")
+                }
+                Err(_) => tracing::warn!("Browser Carrier Exit admission deadline"),
+                Ok(Ok(_)) => unreachable!(),
+            }
+            return send_json(send, &serde_json::json!({"ok":false,
+                "code":"browser_exit_permission_denied", "error":"Runtime Exit grant is unavailable or does not authorize this stream"})).await;
+        }
     };
     write_json_line(send, &serde_json::json!({"ok": true})).await?;
     let result = tokio::select! {
