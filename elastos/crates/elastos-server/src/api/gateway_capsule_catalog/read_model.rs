@@ -77,7 +77,7 @@ pub(in crate::api::gateway) fn capsule_catalog_summary(
             payment_state: "provider-rail-required".to_string(),
             payment_note: "Paid apps and services must use wallet/payment provider receipts, not embedded payment SDKs.".to_string(),
             drm_state: "provider-rail-required".to_string(),
-            drm_note: "Protected apps and content must use rights, key, and decrypt providers for dDRM enforcement.".to_string(),
+            drm_note: "Protected apps and content use the Runtime-owned protect, custody, and decrypt plane with Chain rights evidence; capsules never call those providers.".to_string(),
         },
     }
 }
@@ -309,16 +309,12 @@ fn capsule_title(name: &str) -> String {
         "browser-engine-adapter" => Some("Browser Engine"),
         "chain-provider" => Some("Chains"),
         "content-block-graph-provider" => Some("Content Index"),
-        "decrypt-provider" => Some("Decryption"),
         "did-provider" => Some("Identity"),
-        "drm-provider" => Some("Content Protection"),
         "exit-provider" => Some("Browser Exit"),
         "ipfs-provider" => Some("Content Storage"),
-        "key-provider" => Some("Key Access"),
         "net-provider" => Some("Network"),
         "object-provider" => Some("Storage"),
         "operator-drive-adapter" => Some("Drive"),
-        "rights-provider" => Some("Content Rights"),
         "tunnel-provider" => Some("Network Tunnel"),
         "wallet-metamask" => Some("MetaMask"),
         "wallet-provider" => Some("Wallet Security"),
@@ -371,15 +367,11 @@ fn capsule_payment_state(name: &str) -> &'static str {
     }
 }
 
-fn capsule_drm_state(name: &str) -> &'static str {
-    if matches!(
-        name,
-        "drm-provider" | "rights-provider" | "key-provider" | "decrypt-provider"
-    ) {
-        "provider"
-    } else {
-        "not-declared"
-    }
+/// Protected content is owned by the Runtime-only protect, custody, and
+/// decrypt targets, which are never projected into the capsule catalog, so no
+/// public capsule declares a DRM role.
+fn capsule_drm_state(_name: &str) -> &'static str {
+    "not-declared"
 }
 
 struct CapsuleProjectionInput<'a> {

@@ -1331,100 +1331,6 @@ async fn setup_server_infrastructure_impl(
         ),
     }
 
-    if let Some(path) = crate::find_installed_provider_binary("drm-provider") {
-        if let Err(e) = verify_provider_binary("drm-provider", &path) {
-            tracing::warn!("Skipping drm-provider due to verification failure: {}", e);
-        } else {
-            match provider::ProviderBridge::spawn(&path, Default::default()).await {
-                Ok(bridge) => {
-                    let drm_provider: Arc<dyn provider::Provider> = Arc::new(
-                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "drm"),
-                    );
-                    if let Err(e) = provider_registry
-                        .register_sub_provider("drm", drm_provider)
-                        .await
-                    {
-                        tracing::warn!("Failed to register elastos://drm sub-provider: {}", e);
-                    }
-                    tracing::info!("drm-provider capsule from {}", path.display());
-                }
-                Err(e) => tracing::warn!("Failed to spawn drm-provider: {}", e),
-            }
-        }
-    }
-
-    if let Some(path) = crate::find_installed_provider_binary("rights-provider") {
-        if let Err(e) = verify_provider_binary("rights-provider", &path) {
-            tracing::warn!(
-                "Skipping rights-provider due to verification failure: {}",
-                e
-            );
-        } else {
-            match provider::ProviderBridge::spawn(&path, Default::default()).await {
-                Ok(bridge) => {
-                    let rights_provider: Arc<dyn provider::Provider> = Arc::new(
-                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "rights"),
-                    );
-                    if let Err(e) = provider_registry
-                        .register_sub_provider("rights", rights_provider)
-                        .await
-                    {
-                        tracing::warn!("Failed to register elastos://rights sub-provider: {}", e);
-                    }
-                    tracing::info!("rights-provider capsule from {}", path.display());
-                }
-                Err(e) => tracing::warn!("Failed to spawn rights-provider: {}", e),
-            }
-        }
-    }
-
-    if let Some(path) = crate::find_installed_provider_binary("key-provider") {
-        if let Err(e) = verify_provider_binary("key-provider", &path) {
-            tracing::warn!("Skipping key-provider due to verification failure: {}", e);
-        } else {
-            match provider::ProviderBridge::spawn(&path, Default::default()).await {
-                Ok(bridge) => {
-                    let key_provider: Arc<dyn provider::Provider> = Arc::new(
-                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "key"),
-                    );
-                    if let Err(e) = provider_registry
-                        .register_sub_provider("key", key_provider)
-                        .await
-                    {
-                        tracing::warn!("Failed to register elastos://key sub-provider: {}", e);
-                    }
-                    tracing::info!("key-provider capsule from {}", path.display());
-                }
-                Err(e) => tracing::warn!("Failed to spawn key-provider: {}", e),
-            }
-        }
-    }
-
-    if let Some(path) = crate::find_installed_provider_binary("decrypt-provider") {
-        if let Err(e) = verify_provider_binary("decrypt-provider", &path) {
-            tracing::warn!(
-                "Skipping decrypt-provider due to verification failure: {}",
-                e
-            );
-        } else {
-            match provider::ProviderBridge::spawn(&path, Default::default()).await {
-                Ok(bridge) => {
-                    let decrypt_provider: Arc<dyn provider::Provider> = Arc::new(
-                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "decrypt"),
-                    );
-                    if let Err(e) = provider_registry
-                        .register_sub_provider("decrypt", decrypt_provider)
-                        .await
-                    {
-                        tracing::warn!("Failed to register elastos://decrypt sub-provider: {}", e);
-                    }
-                    tracing::info!("decrypt-provider capsule from {}", path.display());
-                }
-                Err(e) => tracing::warn!("Failed to spawn decrypt-provider: {}", e),
-            }
-        }
-    }
-
     if let Some(path) = crate::find_installed_provider_binary("protected-content-decrypt-provider")
     {
         if let Err(e) = verify_provider_binary("protected-content-decrypt-provider", &path) {
@@ -1446,7 +1352,7 @@ async fn setup_server_infrastructure_impl(
             );
         } else {
             tracing::info!(
-                "protected-content-decrypt-provider registered on Runtime-only target protected-content-decrypt; provisional decrypt-provider remains on elastos://decrypt"
+                "protected-content-decrypt-provider registered on Runtime-only target protected-content-decrypt"
             );
             elastos_server::protected_content_runtime::reconcile_runtime_custody_viewers_after_decrypt_boot(
                 &data_dir,
@@ -1492,22 +1398,19 @@ async fn setup_server_infrastructure_impl(
                 "Skipping custody-provider due to verification failure: {}",
                 e
             );
-        } else if let Err(e) =
-            elastos_server::protected_content_runtime::register_inactive_custody_provider(
-                &provider_registry,
-                &path,
-                &data_dir,
-            )
-            .await
+        } else if let Err(e) = elastos_server::protected_content_runtime::register_custody_provider(
+            &provider_registry,
+            &path,
+            &data_dir,
+        )
+        .await
         {
             tracing::warn!(
                 "Failed to register inactive Runtime-only custody provider: {}",
                 e
             );
         } else {
-            tracing::info!(
-                "custody-provider registered as inactive Runtime custody route; provisional key-provider remains the product path"
-            );
+            tracing::info!("custody-provider registered on the Runtime-only custody target");
         }
     } else {
         tracing::warn!(

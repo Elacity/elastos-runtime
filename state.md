@@ -39,9 +39,11 @@ volatile proof logs remain outside the repository.
   checks.
 - `origin/upstream/0.7.1-dev` also carries Irzhy's verified Base 8453 probe
   evidence, shared build-artifact staging, upstream collaboration work, and
-  Browser local-exit orphan cleanup. The protected-content source path remains
-  inactive. Installed proof on isolated localhost, the seed and third custody
-  node, and one atomic cutover remain open.
+  Browser local-exit orphan cleanup. The protected-content Runtime-owned path is
+  the installed product path. The atomic cutover removed the provisional `drm`,
+  `rights`, `key`, and `decrypt` authority surfaces in one slice; no second
+  authority remains. Installed proof on isolated localhost, and on the seed and
+  third custody node, remains open.
 - Commits `3026992b`, `ed7a8bfc`, and `7f6e47f9` provide portable listing
   publication and import, buyer purchase, and buyer open, read, and close
   without creator Runtime mint state. The package binds the public custody
@@ -331,7 +333,9 @@ typed-viewer scope. External cryptographic review remains open before public
 dKMS or production confidentiality claims. Global listing discovery and public
 custody governance remain later work. The shared listing link, portable import,
 buyer Runtime rights admission, and exact two-Runtime 2-of-3 source journey are
-complete. Installed proof and the atomic authority cutover remain open.
+complete. The atomic authority cutover is complete. The remaining installed
+gates are distinct operator hardware and failure domains, the real Base
+deployment, and the Brave UIUX walkthrough on the seed.
 
 ## Capsule Execution Truth
 
@@ -418,9 +422,6 @@ complete. Installed proof and the atomic authority cutover remain open.
   `local-identity-profile-smoke.sh`, depending on target role.
 - Public Linux runtime portability proof path:
   `audit-linux-runtime-portability.sh`.
-- Provisional protected-content provider retirement guard:
-  `protected-content-provider-contract-smoke.sh`. It does not verify the
-  canonical v1 custody or Runtime path.
 
 ## Browser Truth
 

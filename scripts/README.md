@@ -74,9 +74,6 @@ Common branch gates include:
 - `wallet-product-safety-smoke.sh` for product Wallet release safety
 - `wallet-connector-transaction-smoke.mjs` for fake-DOM, fake-provider
   connector handoff source proof, not hosted Browser acceptance
-- `protected-content-provider-contract-smoke.sh` as the fail-closed retirement
-  guard for the provisional rights, key, decrypt, and DRM providers; it does not
-  verify the canonical v1 custody path
 - `protected-content-installed-e2e-proof.sh` drives the installed two-Runtime
   protected-content journey phase by phase (provision, preflight,
   chain-config-real, wallet-setup, mint, availability, buy, open,

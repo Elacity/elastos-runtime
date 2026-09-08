@@ -70,8 +70,9 @@ each effect.
 | Provider packages | `capsules/*-provider` and provider entries in `components.json` |
 
 Provider packages include typed boundaries for AI, chain, wallet, objects,
-Browser Net/Exit/Engine, content availability, rights, key release, decrypt,
-DRM, IPFS, and tunnels. `components.json` is authoritative for the selected
+Browser Net/Exit/Engine, content availability, IPFS, and tunnels; the
+Runtime-only protect, media, custody, and decrypt providers are listed under
+`components.json` profiles. `components.json` is authoritative for the selected
 install set; directory presence alone is not a support claim.
 
 ## Collaboration and Profile

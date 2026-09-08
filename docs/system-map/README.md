@@ -38,6 +38,15 @@ states what the capsule or projection must not see, such as a host path, peer,
 backend, credential, socket, or transport. `Done-check` is one command a new
 contributor can run to prove the change.
 
+Most recent record, for the protected-content open view:
+
+```text
+Layer: Runtime coordinator -> Runtime-only providers (custody, protected-content-decrypt) -> Chain provider
+Capability: protected-content open for one mint (signed Runtime release operation; chain/protected_content_rights_evidence; custody/release_contribution; protected-content-decrypt/open_session)
+Hidden detail: custody endpoints and Carrier routes, node share bytes, the CEK and its contributions, evidence RPC sources, decrypt process handles
+Done-check: node scripts/system-map-check.mjs && (cd elastos && cargo test -p elastos-server protected_content_runtime)
+```
+
 For this map, the minimum check is `node scripts/system-map-check.mjs` from the
 repository root. A code or contract change also needs the narrow test for its
 own surface. If those four lines cannot be stated, the proposed edit is not

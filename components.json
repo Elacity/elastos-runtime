@@ -130,42 +130,6 @@
         "aarch64-linux"
       ]
     },
-    "drm-provider": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "x86_64-linux",
-        "aarch64-linux"
-      ]
-    },
-    "rights-provider": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "x86_64-linux",
-        "aarch64-linux"
-      ]
-    },
-    "key-provider": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "x86_64-linux",
-        "aarch64-linux"
-      ]
-    },
-    "decrypt-provider": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "x86_64-linux",
-        "aarch64-linux"
-      ]
-    },
     "ipfs-provider": {
       "cid": "",
       "sha256": "",
@@ -612,86 +576,6 @@
           "size": 0,
           "release_path": "content-block-graph-provider-darwin-arm64",
           "install_path": "bin/content-block-graph-provider"
-        }
-      }
-    },
-    "drm-provider": {
-      "install_path": "bin/drm-provider",
-      "description": "Host DRM provider binary for Runtime-mediated protected content requests",
-      "platforms": {
-        "linux-amd64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "drm-provider-linux-amd64",
-          "install_path": "bin/drm-provider"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "drm-provider-linux-arm64",
-          "install_path": "bin/drm-provider"
-        }
-      }
-    },
-    "rights-provider": {
-      "install_path": "bin/rights-provider",
-      "description": "Host rights provider binary for typed protected-content access checks",
-      "platforms": {
-        "linux-amd64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "rights-provider-linux-amd64",
-          "install_path": "bin/rights-provider"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "rights-provider-linux-arm64",
-          "install_path": "bin/rights-provider"
-        }
-      }
-    },
-    "key-provider": {
-      "install_path": "bin/key-provider",
-      "description": "Host key provider binary for fail-closed protected-content key release",
-      "platforms": {
-        "linux-amd64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "key-provider-linux-amd64",
-          "install_path": "bin/key-provider"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "key-provider-linux-arm64",
-          "install_path": "bin/key-provider"
-        }
-      }
-    },
-    "decrypt-provider": {
-      "install_path": "bin/decrypt-provider",
-      "description": "Host decrypt/render provider binary for fail-closed protected-content sessions",
-      "platforms": {
-        "linux-amd64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "decrypt-provider-linux-amd64",
-          "install_path": "bin/decrypt-provider"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "decrypt-provider-linux-arm64",
-          "install_path": "bin/decrypt-provider"
         }
       }
     },
@@ -1313,7 +1197,7 @@
     },
     "gba-nonogram": {
       "install_path": "capsules/gba-nonogram",
-      "description": "Nonogram Advance — MIT homebrew cartridge for the browser GBA viewer",
+      "description": "Nonogram Advance \u2014 MIT homebrew cartridge for the browser GBA viewer",
       "platforms": {
         "*": {
           "cid": "",
@@ -1426,7 +1310,7 @@
     },
     "model-qwen3.5-0.8b": {
       "size_mb": 507,
-      "description": "Qwen3.5 0.8B Q4_K_M — small default for fast local startup",
+      "description": "Qwen3.5 0.8B Q4_K_M \u2014 small default for fast local startup",
       "platforms": {
         "*": {
           "url": "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf",
@@ -1437,7 +1321,7 @@
     },
     "model-qwen3.5-4b": {
       "size_mb": 2740,
-      "description": "Qwen3.5 4B Q4_K_M — default for Orin Nano reliability",
+      "description": "Qwen3.5 4B Q4_K_M \u2014 default for Orin Nano reliability",
       "platforms": {
         "*": {
           "url": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
@@ -1448,7 +1332,7 @@
     },
     "model-qwen3.5-9b": {
       "size_mb": 5680,
-      "description": "Qwen3.5 9B Q4_K_M — higher quality, needs more memory",
+      "description": "Qwen3.5 9B Q4_K_M \u2014 higher quality, needs more memory",
       "platforms": {
         "*": {
           "url": "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
@@ -1572,17 +1456,13 @@
       ]
     },
     "blockchain": {
-      "description": "Runtime plus typed chain, wallet, DRM, rights, key, and decrypt providers for blockchain/auth/protected-content development",
+      "description": "Runtime plus typed chain, wallet, and Runtime-only protected-content providers for blockchain/auth/protected-content development",
       "components": [
         "shell",
         "localhost-provider",
         "did-provider",
         "chain-provider",
         "wallet-provider",
-        "drm-provider",
-        "rights-provider",
-        "key-provider",
-        "decrypt-provider",
         "protected-content-protect-provider",
         "media-provider",
         "custody-provider",
@@ -1704,10 +1584,6 @@
         "wallet-provider",
         "object-provider",
         "content-block-graph-provider",
-        "drm-provider",
-        "rights-provider",
-        "key-provider",
-        "decrypt-provider",
         "protected-content-protect-provider",
         "media-provider",
         "custody-provider",

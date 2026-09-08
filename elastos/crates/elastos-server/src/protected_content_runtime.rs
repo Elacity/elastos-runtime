@@ -1,10 +1,11 @@
 //! Protected-content Runtime provider plane.
 //!
-//! This module registers Runtime-owned `protect` and `custody` routes, scans
-//! the durable Runtime release journal on startup, and evaluates policy through
-//! the existing `chain` registry route. Library mint and buy use these seams.
-//! It does not replace the provisional `key`/`rights`/`drm`/`decrypt`
-//! open/share path or expose provider topology to capsules.
+//! This module registers the Runtime-owned `protect`, `media`, `custody`, and
+//! `protected-content-decrypt` targets, scans the durable Runtime release
+//! journal on startup, and evaluates policy through the `chain` registry
+//! route. Library mint, buy, open, read, and close use these seams. It is the
+//! only protected-content authority, and it exposes no provider topology to
+//! capsules.
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -281,6 +282,9 @@ const PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS: &[&str] = &[
     "shutdown",
 ];
 const WALLET_PROVIDER_ID: &str = "wallet";
+/// Historical directory name. The path is frozen because provisioned custody
+/// hosts already hold state there; `inactive` says nothing about whether the
+/// custody plane is active.
 const INACTIVE_CUSTODY_ROOT: &str = "protected-content/custody-provider/inactive";
 const PROVIDER_INVOCATION_SCHEMA_V1: &str = "elastos.provider.invocation/v1";
 const CHAIN_PROTECTED_CONTENT_POLICY_OP: &str = "resolve_protected_content_policy";
@@ -1165,17 +1169,17 @@ pub fn unresolved_release_audit_records(
         .collect()
 }
 
-pub async fn register_inactive_custody_provider(
+pub async fn register_custody_provider(
     registry: &Arc<ProviderRegistry>,
     binary_path: &Path,
     data_dir: &Path,
 ) -> anyhow::Result<()> {
     let state_root = inactive_custody_state_root(data_dir);
-    validate_inactive_custody_state_root(&state_root)?;
+    validate_custody_state_root(&state_root)?;
     let base_path = state_root
         .to_str()
         .ok_or_else(|| {
-            invalid_inactive_custody_config("inactive custody provider root must be valid UTF-8")
+            invalid_custody_config("inactive custody provider root must be valid UTF-8")
         })?
         .to_owned();
     let bridge_config = ProviderConfig {
@@ -1192,12 +1196,12 @@ pub async fn register_inactive_custody_provider(
     let startup = async {
         let status =
             request_protected_provider_startup_status(&bridge, "inactive custody provider").await?;
-        require_inactive_custody_provider_status(&status)?;
+        require_custody_provider_status(&status)?;
         let provider: Arc<dyn Provider> = Arc::new(InactiveCustodyProvider::new(
             bridge.clone(),
             Arc::downgrade(registry),
         ));
-        register_inactive_custody_runtime_provider_target(registry, provider)
+        register_custody_runtime_provider_target(registry, provider)
             .await
             .map_err(|error| anyhow::anyhow!("failed to register inactive custody route: {error}"))
     }
@@ -1372,7 +1376,7 @@ pub fn require_media_provider_status(status: &Value) -> anyhow::Result<()> {
     require_exact_provider_operations(data, MEDIA_PROVIDER_OPERATIONS, "media-provider")
 }
 
-fn require_inactive_custody_provider_status(status: &Value) -> anyhow::Result<()> {
+fn require_custody_provider_status(status: &Value) -> anyhow::Result<()> {
     let data = require_exact_provider_status_data(
         status,
         "inactive custody provider",
@@ -1495,7 +1499,7 @@ fn require_exact_provider_operations(
     Ok(())
 }
 
-async fn register_inactive_custody_runtime_provider_target(
+async fn register_custody_runtime_provider_target(
     registry: &ProviderRegistry,
     provider: Arc<dyn Provider>,
 ) -> Result<(), ProviderError> {
@@ -1530,31 +1534,26 @@ pub(crate) fn runtime_custody_composition_config_path(data_dir: &Path) -> PathBu
     data_dir.join(CUSTODY_COMPOSITION_CONFIG_FILE)
 }
 
-fn validate_inactive_custody_state_root(root: &Path) -> anyhow::Result<()> {
+fn validate_custody_state_root(root: &Path) -> anyhow::Result<()> {
     validate_owner_only_directory(root, "inactive custody provider root")
 }
 
-fn invalid_inactive_custody_config(reason: impl std::fmt::Display) -> anyhow::Error {
+fn invalid_custody_config(reason: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("inactive custody provider configuration is missing or unsafe: {reason}")
 }
 
 pub(crate) fn validate_owner_only_directory(path: &Path, label: &str) -> anyhow::Result<()> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         let _ = error;
-        invalid_inactive_custody_config(format!("{label} is unavailable"))
+        invalid_custody_config(format!("{label} is unavailable"))
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         anyhow::bail!(
             "{}",
-            invalid_inactive_custody_config(format!("{label} must be an owner-only directory"))
+            invalid_custody_config(format!("{label} must be an owner-only directory"))
         );
     }
-    validate_owner_only_metadata_with_error(
-        label,
-        &metadata,
-        false,
-        invalid_inactive_custody_config,
-    )
+    validate_owner_only_metadata_with_error(label, &metadata, false, invalid_custody_config)
 }
 
 fn validate_owner_only_directory_with_error(

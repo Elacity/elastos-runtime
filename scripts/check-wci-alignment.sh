@@ -343,16 +343,13 @@ check_required 'site promote' docs/SITES.md 'site docs must teach site promotion
 check_required 'public-install-operator-smoke\.sh' docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md 'runtime repo checklist must record the installed operator/update proof'
 check_required 'public-install-identity-smoke\.sh' docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md 'runtime repo checklist must record the DID/profile proof contract'
 check_required 'audit-linux-runtime-portability\.sh' docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md 'runtime repo checklist must record the public Linux runtime portability proof'
-check_required 'protected-content-provider-contract-smoke\.sh' docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md 'runtime repo checklist must record the provisional protected-content provider retirement guard'
 check_required 'just verify-release' docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md 'runtime repo checklist must record the canonical release-trust gate'
 check_required 'public-install-operator-smoke\.sh' state.md 'state ledger must record the explicit installed operator/update proof'
 check_required 'local-identity-profile-smoke\.sh|public-install-identity-smoke\.sh' state.md 'state ledger must record the DID/profile proof path'
 check_required 'audit-linux-runtime-portability\.sh' state.md 'state ledger must record the explicit public Linux runtime portability proof'
-check_required 'protected-content-provider-contract-smoke\.sh' state.md 'state ledger must record the provisional protected-content provider retirement guard'
 check_required 'public-install-operator-smoke\.sh' TASKS.md 'tasks must keep the installed operator/update proof in scope'
 check_required 'public-install-identity-smoke\.sh|DID-backed People/profile contract' TASKS.md 'tasks must keep the DID/profile public proof in scope'
 check_required 'audit-linux-runtime-portability\.sh' TASKS.md 'tasks must keep the public Linux runtime portability proof in scope'
-check_required 'protected-content-provider-contract-smoke\.sh' TASKS.md 'tasks must keep the provisional protected-content provider retirement guard in scope'
 check_required 'BindDomain' elastos/crates/elastos-server/src/main.rs 'site command surface must expose bind-domain'
 check_required 'Publish' elastos/crates/elastos-server/src/main.rs 'site command surface must expose publish'
 check_required 'Releases' elastos/crates/elastos-server/src/main.rs 'site command surface must expose releases'
@@ -372,15 +369,10 @@ check_required 'ProviderInvocation' elastos/crates/elastos-server/src/content.rs
 check_required '"availability",' elastos/crates/elastos-server/src/content.rs 'content provider must keep the internal availability provider seam'
 check_required '"availability",' elastos/crates/elastos-runtime/src/provider/registry.rs 'provider registry must reserve elastos://availability for the availability provider'
 check_required '"wallet",' elastos/crates/elastos-runtime/src/provider/registry.rs 'provider registry must reserve elastos://wallet for the wallet provider'
-check_required '"drm",' elastos/crates/elastos-runtime/src/provider/registry.rs 'provider registry must reserve elastos://drm for the protected-content provider'
-check_required '"rights",' elastos/crates/elastos-runtime/src/provider/registry.rs 'provider registry must reserve elastos://rights for the protected-content rights provider'
-check_required '"key",' elastos/crates/elastos-runtime/src/provider/registry.rs 'provider registry must reserve elastos://key for the protected-content key provider'
-check_required 'elastos://drm/open' elastos/crates/elastos-server/src/provider_resource.rs 'DRM provider requests must map to narrow protected-content capability resources'
+check_forbidden_in_path '^    "(drm|rights|key|decrypt)",$' elastos/crates/elastos-runtime/src/provider/registry.rs 'retired provisional schemes must not stay reserved for sub-provider registration'
+check_forbidden_in_path 'elastos://(drm|rights|key|decrypt)/' elastos/crates/elastos-server/src/provider_resource.rs 'retired provisional schemes must not map to any capability resource'
 check_required 'elastos://content/fetch' elastos/crates/elastos-server/src/provider_resource.rs 'Content provider requests must map to narrow content capability resources'
 check_forbidden_in_path '"content" \| "did" \| "peer" => Ok\(format!\("elastos://\{scheme\}/\*"\)\)' elastos/crates/elastos-server/src/provider_resource.rs 'content provider requests must not fall through to a broad wildcard capability resource'
-check_required 'elastos://rights/access/has_access_by_content_id' elastos/crates/elastos-server/src/provider_resource.rs 'Rights provider requests must map to narrow protected-content capability resources'
-check_required 'elastos://key/release' elastos/crates/elastos-server/src/provider_resource.rs 'Key provider requests must map to narrow protected-content capability resources'
-check_required 'elastos://decrypt/session/open' elastos/crates/elastos-server/src/provider_resource.rs 'Decrypt provider requests must map to narrow protected-content capability resources'
 check_required 'elastos-auth' capsules/wallet-provider/Cargo.toml 'wallet-provider must share proof primitives through elastos-auth'
 check_forbidden_in_path 'elastos-runtime = ' capsules/wallet-provider/Cargo.toml 'wallet-provider must not depend on the full runtime execution stack'
 check_required 'pub use elastos_auth' elastos/crates/elastos-runtime/src/auth.rs 'runtime auth module must re-export shared elastos-auth primitives'
@@ -837,7 +829,6 @@ for path in manifest_paths:
             "elastos://drm": "raw protected-content backend namespace",
             "elastos://rights": "raw protected-content rights backend namespace",
             "elastos://key": "raw protected-content key backend namespace",
-            "elastos://decrypt": "raw protected-content decrypt/render backend namespace",
             "chain-provider": "raw chain backend provider",
             "net-provider": "raw Browser/Net backend provider",
             "exit-provider": "raw Browser Exit backend provider",
@@ -849,10 +840,6 @@ for path in manifest_paths:
             "object-provider": "raw object backend provider",
             "ipfs-provider": "raw IPFS backend provider",
             "availability-provider": "raw availability backend provider",
-            "drm-provider": "raw protected-content backend provider",
-            "rights-provider": "raw protected-content rights backend provider",
-            "key-provider": "raw protected-content key backend provider",
-            "decrypt-provider": "raw protected-content decrypt/render backend provider",
             "/api/provider/chain": "direct chain provider route",
             "/api/provider/net": "direct Browser/Net provider route",
             "/api/provider/exit": "direct Browser Exit provider route",
@@ -908,10 +895,10 @@ def platform_info(component, platform):
     return platforms.get(platform) or platforms.get("*")
 
 home = components["profiles"]["home"]["components"]
-forbidden = {"availability-provider", "site-provider", "tunnel-provider", "cloudflared", "drm-provider", "rights-provider", "key-provider", "decrypt-provider"}
+forbidden = {"availability-provider", "site-provider", "tunnel-provider", "cloudflared"}
 bad = sorted(forbidden.intersection(home))
 if bad:
-    print("[alignment] home profile includes non-default public-edge or provisional protected components:", ", ".join(bad))
+    print("[alignment] home profile includes non-default public-edge components:", ", ".join(bad))
     sys.exit(1)
 wallet_browser_surfaces = {"wallet", "wallet-metamask", "wallet-unisat", "wallet-walletconnect", "browser", "inbox"}
 wallet_browser_providers = {"chain-provider", "wallet-provider"}
@@ -1070,6 +1057,20 @@ for provider in sorted(protected_runtime_providers):
     if runtime.get("runtime_only") is not True:
         print(f"[alignment] protected provider must remain Runtime-only: {provider}")
         sys.exit(1)
+retired_provisional_providers = ("drm-provider", "rights-provider", "key-provider", "decrypt-provider")
+for retired in retired_provisional_providers:
+    for root in [Path("capsules"), Path("elastos/capsules")]:
+        if (root / retired).exists():
+            print(f"[alignment] retired provisional provider still present: {root / retired}")
+            sys.exit(1)
+    if retired in components.get("capsules", {}) or retired in components.get("external", {}):
+        print(f"[alignment] retired provisional provider still in components.json: {retired}")
+        sys.exit(1)
+    for profile_name, profile in components["profiles"].items():
+        if retired in (profile.get("components") or []):
+            print(f"[alignment] retired provisional provider in profile {profile_name}: {retired}")
+            sys.exit(1)
+
 protected_home_dependencies = {
     "chain-provider",
     "wallet-provider",
@@ -1101,7 +1102,7 @@ if not blockchain:
     print("[alignment] blockchain profile is missing")
     sys.exit(1)
 blockchain_components = set(blockchain["components"])
-required_blockchain = {"shell", "localhost-provider", "did-provider", "chain-provider", "wallet-provider", "drm-provider", "rights-provider", "key-provider", "decrypt-provider", *protected_runtime_providers}
+required_blockchain = {"shell", "localhost-provider", "did-provider", "chain-provider", "wallet-provider", *protected_runtime_providers}
 missing_blockchain = sorted(required_blockchain.difference(blockchain_components))
 if missing_blockchain:
     print("[alignment] blockchain profile missing required components:", ", ".join(missing_blockchain))
@@ -1213,54 +1214,6 @@ for platform in ("linux-amd64", "linux-arm64", "darwin-arm64"):
         sys.exit(1)
     if not info.get("release_path"):
         print(f"[alignment] wallet-provider missing {platform} release_path")
-        sys.exit(1)
-drm_component = components["external"].get("drm-provider")
-if not drm_component:
-    print("[alignment] drm-provider is missing from external components")
-    sys.exit(1)
-for platform in ("linux-amd64", "linux-arm64"):
-    info = (drm_component.get("platforms") or {}).get(platform)
-    if not info:
-        print(f"[alignment] drm-provider missing {platform} release metadata")
-        sys.exit(1)
-    if not info.get("release_path"):
-        print(f"[alignment] drm-provider missing {platform} release_path")
-        sys.exit(1)
-rights_component = components["external"].get("rights-provider")
-if not rights_component:
-    print("[alignment] rights-provider is missing from external components")
-    sys.exit(1)
-for platform in ("linux-amd64", "linux-arm64"):
-    info = (rights_component.get("platforms") or {}).get(platform)
-    if not info:
-        print(f"[alignment] rights-provider missing {platform} release metadata")
-        sys.exit(1)
-    if not info.get("release_path"):
-        print(f"[alignment] rights-provider missing {platform} release_path")
-        sys.exit(1)
-key_component = components["external"].get("key-provider")
-if not key_component:
-    print("[alignment] key-provider is missing from external components")
-    sys.exit(1)
-for platform in ("linux-amd64", "linux-arm64"):
-    info = (key_component.get("platforms") or {}).get(platform)
-    if not info:
-        print(f"[alignment] key-provider missing {platform} release metadata")
-        sys.exit(1)
-    if not info.get("release_path"):
-        print(f"[alignment] key-provider missing {platform} release_path")
-        sys.exit(1)
-decrypt_component = components["external"].get("decrypt-provider")
-if not decrypt_component:
-    print("[alignment] decrypt-provider is missing from external components")
-    sys.exit(1)
-for platform in ("linux-amd64", "linux-arm64"):
-    info = (decrypt_component.get("platforms") or {}).get(platform)
-    if not info:
-        print(f"[alignment] decrypt-provider missing {platform} release metadata")
-        sys.exit(1)
-    if not info.get("release_path"):
-        print(f"[alignment] decrypt-provider missing {platform} release_path")
         sys.exit(1)
 availability_component = components["external"].get("availability-provider")
 if not availability_component:

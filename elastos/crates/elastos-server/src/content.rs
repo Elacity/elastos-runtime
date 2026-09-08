@@ -14,9 +14,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use elastos_common::protected_content::{
-    validate_protected_content_key_envelope_algorithms, SealedObjectV1, SEALED_OBJECT_SCHEMA,
-};
 use elastos_runtime::provider::{
     Provider, ProviderByteRange, ProviderError, ProviderInvocation, ProviderInvocationTransport,
     ProviderProgress, ProviderRegistry, ProviderStreamOptions, ProviderTransfer, ResourceRequest,
@@ -97,7 +94,6 @@ const IMPORT_OBJECT_MAX_FILES: usize = 512;
 const AVAILABILITY_DASHBOARD_REMOTE_ROW_LIMIT: usize = 10;
 const OBJECT_MANIFEST_SCHEMA: &str = "elastos.content.object.manifest/v1";
 const OBJECT_MANIFEST_PATH: &str = "_elastos_object.json";
-const SEALED_OBJECT_PATH: &str = "sealed.json";
 
 pub const CONTENT_OBJECT_MANIFEST_PATH: &str = OBJECT_MANIFEST_PATH;
 
@@ -8236,7 +8232,6 @@ fn directory_object_manifest(
     let links = parse_content_object_links(links)?;
     let mut seen_paths = BTreeSet::new();
     let mut object_files = Vec::with_capacity(files.len());
-    let mut sealed_object = None;
     for file in files {
         let path = file
             .get("path")
@@ -8271,15 +8266,6 @@ fn directory_object_manifest(
                     "directory publish file {path} has invalid base64 data: {err}"
                 ))
             })?;
-        if kind == "sealed" && path == SEALED_OBJECT_PATH {
-            let sealed: SealedObjectV1 = serde_json::from_slice(&bytes).map_err(|err| {
-                ProviderError::Provider(format!(
-                    "sealed content object has invalid {SEALED_OBJECT_PATH}: {err}"
-                ))
-            })?;
-            validate_sealed_object_descriptor(&sealed)?;
-            sealed_object = Some(sealed);
-        }
         object_files.push(ContentObjectFile {
             path: path.to_string(),
             sha256: format!("{:x}", sha2::Sha256::digest(&bytes)),
@@ -8287,14 +8273,6 @@ fn directory_object_manifest(
         });
     }
     object_files.sort_by(|a, b| a.path.cmp(&b.path));
-    if kind == "sealed" {
-        let sealed_object = sealed_object.ok_or_else(|| {
-            ProviderError::Provider(format!(
-                "sealed content object requires {SEALED_OBJECT_PATH}"
-            ))
-        })?;
-        validate_sealed_content_links(&sealed_object, &links)?;
-    }
 
     let mut hasher = sha2::Sha256::new();
     for file in &object_files {
@@ -8325,7 +8303,6 @@ fn validate_content_object_kind(kind: &str) -> Result<String, ProviderError> {
         | "protected-content"
         | "protected-content-listing"
         | "release"
-        | "sealed"
         | "share"
         | "site" => Ok(kind.to_string()),
         _ => Err(ProviderError::Provider(format!(
@@ -8372,73 +8349,6 @@ fn parse_content_object_links(
     }
     parsed.sort_by(|a, b| a.rel.cmp(&b.rel).then_with(|| a.cid.cmp(&b.cid)));
     Ok(parsed)
-}
-
-fn validate_sealed_object_descriptor(object: &SealedObjectV1) -> Result<(), ProviderError> {
-    if object.schema != SEALED_OBJECT_SCHEMA {
-        return Err(ProviderError::Provider(
-            "sealed content object schema is unsupported".to_string(),
-        ));
-    }
-    validate_linked_cid(&object.payload_cid, "payload_cid")?;
-    validate_linked_cid(&object.rights_policy_cid, "rights_policy_cid")?;
-    validate_linked_cid(&object.availability_receipt_cid, "availability_receipt_cid")?;
-    require_field(&object.key_envelope.scheme, "key_envelope.scheme")?;
-    require_field(&object.key_envelope.kid, "key_envelope.kid")?;
-    require_field(&object.key_envelope.wrapped_cek, "key_envelope.wrapped_cek")?;
-    require_field(&object.key_envelope.policy_hash, "key_envelope.policy_hash")?;
-    validate_protected_content_key_envelope_algorithms(&object.key_envelope.algorithms)
-        .map_err(|err| ProviderError::Provider(format!("sealed content object {err}")))?;
-    require_field(
-        &object.viewer.required_interface,
-        "viewer.required_interface",
-    )
-}
-
-fn validate_sealed_content_links(
-    object: &SealedObjectV1,
-    links: &[ContentObjectLink],
-) -> Result<(), ProviderError> {
-    require_link(links, "payload", &object.payload_cid)?;
-    require_link(links, "rights.policy", &object.rights_policy_cid)?;
-    require_link(
-        links,
-        "availability.receipt",
-        &object.availability_receipt_cid,
-    )?;
-    if !links.iter().any(|link| link.rel == "provenance") {
-        return Err(ProviderError::Provider(
-            "sealed content object requires provenance link".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn require_link(links: &[ContentObjectLink], rel: &str, cid: &str) -> Result<(), ProviderError> {
-    if links.iter().any(|link| link.rel == rel && link.cid == cid) {
-        Ok(())
-    } else {
-        Err(ProviderError::Provider(format!(
-            "sealed content object requires {rel} link to {cid}"
-        )))
-    }
-}
-
-fn validate_linked_cid(value: &str, field: &str) -> Result<(), ProviderError> {
-    require_field(value, field)?;
-    cid::Cid::try_from(value)
-        .map(|_| ())
-        .map_err(|err| ProviderError::Provider(format!("invalid sealed object {field}: {err}")))
-}
-
-fn require_field(value: &str, field: &str) -> Result<(), ProviderError> {
-    if value.trim().is_empty() {
-        Err(ProviderError::Provider(format!(
-            "sealed content object {field} is required"
-        )))
-    } else {
-        Ok(())
-    }
 }
 
 fn validate_content_object_link_rel(rel: &str) -> Result<(), ProviderError> {
@@ -10663,63 +10573,21 @@ mod tests {
         assert!(manifest.content_digest.starts_with("sha256:"));
     }
 
-    fn sealed_object_value() -> Value {
-        json!({
-            "schema": "elastos.sealed.object/v1",
-            "payload_cid": TEST_CID,
-            "rights_policy_cid": TEST_CID,
-            "availability_receipt_cid": TEST_CID,
-            "key_envelope": {
-                "scheme": "elastos-pq-hybrid-threshold-v0",
-                "kid": "kid:test",
-                "wrapped_cek": "wrapped",
-                "policy_hash": "sha256:test",
-                "algorithms": {
-                    "cipher": "aes-256-gcm",
-                    "signature": ["ed25519", "ml-dsa-65"],
-                    "kem": ["x25519", "ml-kem-768"],
-                    "share_scheme": "shamir-t-of-n"
-                }
-            },
-            "viewer": {
-                "required_interface": "elastos.viewer/document@1"
-            }
-        })
-    }
-
-    fn sealed_object_data() -> String {
-        base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_vec(&sealed_object_value()).unwrap())
-    }
-
-    fn sealed_object_data_from(value: &Value) -> String {
-        base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(value).unwrap())
-    }
-
-    fn sealed_object_links() -> Vec<Value> {
-        vec![
-            json!({"rel": "availability.receipt", "cid": TEST_CID}),
-            json!({"rel": "payload", "cid": TEST_CID}),
-            json!({"rel": "provenance", "cid": TEST_CID}),
-            json!({"rel": "rights.policy", "cid": TEST_CID}),
-        ]
-    }
-
     #[tokio::test]
-    async fn content_publish_directory_accepts_linked_release_and_sealed_manifests() {
+    async fn content_publish_directory_accepts_linked_release_manifest() {
         let (_data_dir, _registry, ipfs, content) = registry_with_content_and_ipfs().await;
-        let response = content
+        let release_response = content
             .send_raw(&json!({
                 "op": "publish",
                 "kind": "directory",
-                "object_kind": "sealed",
-                "links": sealed_object_links(),
-                "files": [{"path": "sealed.json", "data": sealed_object_data()}],
+                "object_kind": "release",
+                "links": [{"rel": "payload", "cid": TEST_CID}],
+                "files": [{"path": "release.json", "data": "e30="}],
             }))
             .await
             .unwrap();
+        assert_eq!(release_response["status"], "ok");
 
-        assert_eq!(response["status"], "ok");
         let directories = ipfs.added_directories.lock().await;
         let manifest_entry = directories[0]
             .iter()
@@ -10729,82 +10597,31 @@ mod tests {
             .decode(manifest_entry["data"].as_str().unwrap())
             .unwrap();
         let manifest: ContentObjectManifest = serde_json::from_slice(&manifest_bytes).unwrap();
-
-        assert_eq!(manifest.kind, "sealed");
-        assert_eq!(manifest.links.len(), 4);
-        assert_eq!(manifest.links[0].rel, "availability.receipt");
+        assert_eq!(manifest.kind, "release");
+        assert_eq!(manifest.links.len(), 1);
+        assert_eq!(manifest.links[0].rel, "payload");
         assert_eq!(manifest.links[0].cid, TEST_CID);
-        assert_eq!(manifest.links[1].rel, "payload");
-        assert_eq!(manifest.links[1].cid, TEST_CID);
-        assert_eq!(manifest.links[2].rel, "provenance");
-        assert_eq!(manifest.links[2].cid, TEST_CID);
-        assert_eq!(manifest.links[3].rel, "rights.policy");
-        assert_eq!(manifest.links[3].cid, TEST_CID);
-        drop(directories);
-
-        let release_response = content
-            .send_raw(&json!({
-                "op": "publish",
-                "kind": "directory",
-                "object_kind": "release",
-                "links": [{"rel": "sealed", "cid": TEST_CID}],
-                "files": [{"path": "release.json", "data": "e30="}],
-            }))
-            .await
-            .unwrap();
-        assert_eq!(release_response["status"], "ok");
     }
 
     #[tokio::test]
-    async fn content_publish_directory_rejects_incomplete_sealed_objects() {
+    async fn content_publish_directory_rejects_retired_sealed_object_kind() {
         let (_data_dir, _registry, _ipfs, content) = registry_with_content_and_ipfs().await;
-        let missing_descriptor = content
+        let error = content
             .send_raw(&json!({
                 "op": "publish",
                 "kind": "directory",
                 "object_kind": "sealed",
-                "links": sealed_object_links(),
-                "files": [{"path": "payload.bin", "data": "c2VhbGVkCg=="}],
+                "files": [{"path": "sealed.json", "data": "e30="}],
             }))
             .await
-            .unwrap_err();
-        assert!(missing_descriptor
-            .to_string()
-            .contains("sealed content object requires sealed.json"));
+            .expect_err("the retired provisional sealed object kind must fail closed");
 
-        let missing_provenance = content
-            .send_raw(&json!({
-                "op": "publish",
-                "kind": "directory",
-                "object_kind": "sealed",
-                "links": [
-                    {"rel": "availability.receipt", "cid": TEST_CID},
-                    {"rel": "payload", "cid": TEST_CID},
-                    {"rel": "rights.policy", "cid": TEST_CID}
-                ],
-                "files": [{"path": "sealed.json", "data": sealed_object_data()}],
-            }))
-            .await
-            .unwrap_err();
-        assert!(missing_provenance
-            .to_string()
-            .contains("sealed content object requires provenance link"));
-
-        let mut weak_envelope = sealed_object_value();
-        weak_envelope["key_envelope"]["algorithms"]["cipher"] = Value::String("aes-128-gcm".into());
-        let weak_cipher = content
-            .send_raw(&json!({
-                "op": "publish",
-                "kind": "directory",
-                "object_kind": "sealed",
-                "links": sealed_object_links(),
-                "files": [{"path": "sealed.json", "data": sealed_object_data_from(&weak_envelope)}],
-            }))
-            .await
-            .unwrap_err();
-        assert!(weak_cipher
-            .to_string()
-            .contains("key_envelope.algorithms.cipher uses unsupported algorithm"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported content object kind"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

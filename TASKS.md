@@ -97,10 +97,12 @@ Open gates, in order:
     Profile creation, configured model execution, collaboration, Browser
     startup diagnostics, and protected-content prerequisites. Keep the broad
     localhost journey as completed evidence rather than repeating it.
-10. [ ] Make one atomic cutover that selects the Runtime-owned
-    protected-content path and removes the provisional `drm`, `rights`, `key`,
+10. [x] Made one atomic cutover that selects the Runtime-owned
+    protected-content path and removed the provisional `drm`, `rights`, `key`,
     and `decrypt` authority surfaces from startup, registration, resources,
-    packaging, tests, and docs.
+    packaging, tests, and docs. The retired scheme names are no longer
+    reservable for sub-provider registration, and
+    `scripts/check-wci-alignment.sh` fails if any of them reappears.
 
 The operator-owned model-provider configuration remains a separate installed
 Assistant proof item. Missing configuration is an honest zero-offer state.
@@ -381,7 +383,7 @@ installed behavior and public-live behavior require separate evidence.
   completeness, run `git diff --check`, the Home and Browser entropy checks,
   WCI alignment, `just candidate-command-audit`, and touched-surface tests.
 - [ ] Treat Remote Carrier Exit as part of the Carrier slice: two-runtime evidence must cite the exact source/exit runtime DIDs and endpoint evidence; the installed artifact readiness report and route-readiness report must be hash-bound; evidence for route readiness, installed artifact readiness, discovery, policy, accounting, stream transport, Browser proof, and cleanup must cite reviewed route nouns; the local Browser machine-proof artifact must cite the reviewed route target or target host; local artifacts must stay redacted, and remote paths need an explicit digest and review trail. Compose Inspector, typed Runtime authority, installed artifact readiness, route-readiness, operator evidence, Browser handoff, manual UX, performance/zoom, and clean-worktree proof before any full-goal claim.
-- [ ] Keep the verification gate green after each slice: run Rust workspace commands from `elastos/` such as `cargo fmt --all -- --check`, the narrow Rust tests for touched crates, `cargo check` for changed capsules, `git diff --check`, `scripts/check-wci-alignment.sh`, `scripts/protected-content-provider-contract-smoke.sh` only as the provisional provider retirement guard where those old capsules are touched, `node scripts/home-entropy-check.mjs` where Home UI is touched, `scripts/auth-wallet-focus-smoke.sh` after auth/wallet/chain changes, `scripts/installed-provider-verify.sh <provider>` after installed provider binary changes, and a live `/apps/home/` proof before handing browser-visible changes back for testing.
+- [ ] Keep the verification gate green after each slice: run Rust workspace commands from `elastos/` such as `cargo fmt --all -- --check`, the narrow Rust tests for touched crates, `cargo check` for changed capsules, `git diff --check`, `scripts/check-wci-alignment.sh`, `node scripts/home-entropy-check.mjs` where Home UI is touched, `scripts/auth-wallet-focus-smoke.sh` after auth/wallet/chain changes, `scripts/installed-provider-verify.sh <provider>` after installed provider binary changes, and a live `/apps/home/` proof before handing browser-visible changes back for testing.
 - [ ] Do not add visible UI, protocol surface, provider behavior, or blockchain hooks unless the runtime capability path, fail-closed behavior, and docs contract are already explicit.
 - [ ] Keep first-party capsule projection validation covered by
   `first_party_capsules_have_complete_projection_contract`; extend the same
