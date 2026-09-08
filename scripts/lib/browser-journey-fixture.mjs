@@ -9,7 +9,7 @@ const MAX_EVENTS = 128;
 const TTL_MS = 10 * 60_000;
 const RUN_ID = /^[a-zA-Z0-9_-]{8,64}$/;
 
-function fixturePage(page, run, media = false) {
+function fixturePage(page, run, media = false, qualification = false) {
   return `<!doctype html><html lang="en"><meta charset="utf-8">
 <title>Browser journey ${page}</title>
 <style>
@@ -50,7 +50,7 @@ function fixturePage(page, run, media = false) {
   let sent = 0;
   let pending = Promise.resolve();
   function report(type) {
-    if (sent >= ${MAX_EVENTS}) return;
+    if (sent >= ${qualification ? 8192 : MAX_EVENTS}) return;
     sent++;
     const rect = input.getBoundingClientRect();
     const event = { type, page, value: input.value, scroll_x: scrollX, scroll_y: scrollY,
@@ -76,7 +76,7 @@ function fixturePage(page, run, media = false) {
 </script></html>`;
 }
 
-export function createBrowserJourneyFixture() {
+export function createBrowserJourneyFixture({ now = Date.now } = {}) {
   const runs = new Map();
   return http.createServer({ requestTimeout: 5_000, headersTimeout: 5_000 }, async (req, res) => {
     const json = (status, body) => {
@@ -86,27 +86,36 @@ export function createBrowserJourneyFixture() {
     try {
       const url = new URL(req.url, "http://localhost");
       if (req.method === "GET" && url.pathname === "/health") {
-        json(200, { schema: "elastos.browser.journey-fixture/v1", ok: true });
+        json(200, { schema: "elastos.browser.journey-fixture/v1", ok: true, qualification: "bounded-v1" });
         return;
       }
       const run = url.searchParams.get("run") || "";
       if (!RUN_ID.test(run)) { json(400, { error: "invalid run id" }); return; }
       for (const [id, record] of runs) {
-        if (Date.now() - record.created_at >= TTL_MS) runs.delete(id);
+        if (now() - (record.qualification ? record.last_seen : record.created_at) >= TTL_MS) runs.delete(id);
       }
       if (req.method === "GET" && ["/main", "/nav"].includes(url.pathname)) {
         if (!runs.has(run)) {
           if (runs.size >= MAX_RUNS) { json(429, { error: "fixture run capacity" }); return; }
-          runs.set(run, { created_at: Date.now(), events: [] });
+          runs.set(run, { created_at: now(), last_seen: now(), events: [], sequence: 0,
+            qualification: url.searchParams.get("qualification") === "1" });
         }
+        const record = runs.get(run);
+        if (record.qualification !== (url.searchParams.get("qualification") === "1")) {
+          json(409, { error: "fixture observation contract changed" }); return;
+        }
+        record.last_seen = now();
         res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-        res.end(fixturePage(url.pathname.slice(1), run, url.searchParams.get("media") === "1"));
+        res.end(fixturePage(url.pathname.slice(1), run, url.searchParams.get("media") === "1", record.qualification));
         return;
       }
       const record = runs.get(run);
       if (!record) { json(404, { error: "unknown run" }); return; }
+      record.last_seen = now();
       if (req.method === "GET" && url.pathname === "/receipt") {
-        json(200, { schema: "elastos.browser.journey-receipt/v1", run, events: record.events });
+        json(200, { schema: "elastos.browser.journey-receipt/v1", run, events: record.events,
+          ...(record.qualification ? { observation: "bounded-v1", total_events: record.sequence,
+            dropped_events: record.sequence - record.events.length } : {}) });
         return;
       }
       if (req.method !== "POST" || url.pathname !== "/events") {
@@ -131,8 +140,11 @@ export function createBrowserJourneyFixture() {
       if (event.type === "audio" && (event.audio_state !== "running" || event.frequency_hz !== 440)) {
         json(400, { error: "invalid audio event" }); return;
       }
-      if (record.events.length >= MAX_EVENTS) { json(429, { error: "fixture event capacity" }); return; }
-      record.events.push({ sequence: record.events.length + 1, received_at: Date.now(),
+      if (record.events.length >= MAX_EVENTS && !record.qualification || record.sequence >= 8192) {
+        json(429, { error: "fixture event capacity" }); return;
+      }
+      if (record.events.length >= MAX_EVENTS) record.events.shift();
+      record.events.push({ sequence: ++record.sequence, received_at: now(),
         type: event.type, page: event.page, value: event.value,
         ...(event.type === "audio" ? { audio_state: event.audio_state, frequency_hz: event.frequency_hz } : {}),
         scroll_x: event.scroll_x, scroll_y: event.scroll_y,

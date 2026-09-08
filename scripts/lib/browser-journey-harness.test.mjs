@@ -14,7 +14,7 @@ function harnessFunction(name, globals = {}) {
   return vm.runInNewContext(`(${declaration})`, { URL, Date, performance,
     CHECK_BROWSER_CONTROLLED_MEDIA: false, CHECK_BROWSER_CONTROLLED_INSPECTION: false,
     CHECK_BROWSER_CONTROLLED_OPERATOR: false, CHECK_BROWSER_CONTROLLED_JOURNEY: false,
-    BROWSER_REMOTE_EXIT_ID: "", ...globals });
+    BROWSER_REMOTE_EXIT_ID: "", browserQualification: null, qualificationCancellation: null, ...globals });
 }
 
 test("controlled fixture isolates runs, records bounded events and rejects malformed requests", async () => {
@@ -205,16 +205,19 @@ test("a successful journey cannot use no-page startup cleanup as fresh-close pro
 test("journey preserves click/key timing and exact close even when diagnostic stop rejects or throws", async () => {
   for (const variant of ["success", "input-failure", "stop-reject", "stop-throw", "input-failure-stop-throw",
     "operator-success", "operator-media-success", "operator-before-close-failure", "operator-after-close-failure",
-    "operator-pending-close-failure"]) {
+    "operator-pending-close-failure", "operator-qualification-success", "operator-qualification-failure"]) {
     const inputFails = variant.includes("input-failure");
     const operatorEnabled = variant.startsWith("operator-");
-    const operatorFails = operatorEnabled && variant.endsWith("failure");
-    const media = variant === "operator-media-success";
+    const qualification = variant.includes("qualification");
+    const qualificationFails = variant === "operator-qualification-failure";
+    const operatorFails = operatorEnabled && variant.endsWith("failure") && !qualificationFails;
+    const media = variant === "operator-media-success" || qualification;
     const runId = "journey-test-run";
     const events = [];
     const closes = [], inputActions = [];
     const inputError = new Error("input delivery failed");
     const operatorError = Object.assign(new Error("operator probe failed"), { evidence: { ok: false, failure: "typed-fixture-error" } });
+    const qualificationError = Object.assign(new Error("qualification probe failed"), { qualification: { failure: "fixture-gap" } });
     let url = "";
     let pageName = "";
     let value = "";
@@ -227,6 +230,7 @@ test("journey preserves click/key timing and exact close even when diagnostic st
       waitForFunction: async () => {},
       evaluate: async () => ({}),
       locator: () => ({ waitFor: async () => {}, hover: async () => {}, click: async () => { inputActions.push("click"); if (media) report("audio"); },
+        evaluate: async fn => fn({ dataset: { visible: "false" }, querySelector: () => ({ textContent: "" }) }),
         fill: async target => { url = target; pageName = new URL(target).pathname.slice(1); value = ""; },
         press: async key => { assert.equal(key, "Enter"); report("load"); },
         pressSequentially: async character => { inputActions.push("key"); if (inputFails) throw inputError; value += character; report("input"); },
@@ -241,6 +245,15 @@ test("journey preserves click/key timing and exact close even when diagnostic st
       CHECK_BROWSER_CONTROLLED_INSPECTION: operatorEnabled,
       CHECK_BROWSER_CONTROLLED_OPERATOR: operatorEnabled,
       CHECK_BROWSER_CONTROLLED_MEDIA: media, controlledTonePresent: () => true,
+      browserQualification: qualification ? { observe: async options => {
+        assert.equal(options.pageId, "page-nav"); assert.equal(options.appFrame, appFrame);
+        assert.equal(typeof options.interact, "function"); assert.equal((await options.readStatus()).body.direct_network, false);
+        assert.ok((await options.readReceipt()).events.some(e => e.type === "scroll"));
+        assert.equal(inspectReads, 2, "ordinary inspection and input precede long observation");
+        assert.ok(url.endsWith("&media=1&qualification=1"));
+        if (qualificationFails) throw qualificationError;
+        return { schema: "elastos.browser.qualification-observation/v1", fixture: true };
+      } } : null,
       BROWSER_JOURNEY_FIXTURE_ORIGIN: "http://localhost:61511", BROWSER_OPEN_DISPLAY_MODE: "webrtc_remote_display",
       BROWSER_UI_PAGE_ID_TIMEOUT_MS: 180_000, BROWSER_REMOTE_VIDEO_TIMEOUT_MS: 30_000,
       randomUUID: () => runId, AbortSignal, smokeStage: "input", markStage: () => {},
@@ -282,7 +295,7 @@ test("journey preserves click/key timing and exact close even when diagnostic st
       runControlledBrowserOperator: async (frame, token, pageId, expectedUrl, readReceipt, close) => {
         operatorCalls++;
         assert.equal(frame, appFrame); assert.equal(token, "browser-token"); assert.equal(pageId, "page-nav");
-        assert.equal(expectedUrl, `http://localhost:61511/main?run=${runId}${media ? "&media=1" : ""}`);
+        assert.equal(expectedUrl, `http://localhost:61511/main?run=${runId}${media ? "&media=1" : ""}${qualification ? "&qualification=1" : ""}`);
         assert.equal(url, expectedUrl);
         assert.equal(inspectReads, 3, "ordinary inspection and stale-cursor checks finish first");
         assert.equal((await readReceipt()).events.at(-1).value, "");
@@ -297,8 +310,9 @@ test("journey preserves click/key timing and exact close even when diagnostic st
         return { ok: true };
       },
     });
-    if (inputFails || operatorFails) await assert.rejects(journey(page, appFrame, window, "browser-token", baseline, []), error => {
-      assert.equal(error, inputFails ? inputError : operatorError);
+    if (inputFails || operatorFails || qualificationFails) await assert.rejects(journey(page, appFrame, window, "browser-token", baseline, []), error => {
+      assert.equal(error, inputFails ? inputError : qualificationFails ? qualificationError : operatorError);
+      if (qualificationFails) assert.equal(error.details.controlled_journey.qualification.failure, "fixture-gap");
       if (operatorFails) assert.equal(error.details.controlled_journey.operator.failure, "typed-fixture-error");
       if (variant.includes("stop-throw")) assert.equal(error.details.controlled_journey.input_observation.observer.stop_failed, true);
       return true;
@@ -306,15 +320,16 @@ test("journey preserves click/key timing and exact close even when diagnostic st
     else {
       const result = await journey(page, appFrame, window, "browser-token", baseline, []);
       assert.equal(result.page_id, "page-nav");
+      if (qualification) assert.equal(result.controlled_journey.qualification.fixture, true);
       if (variant.startsWith("stop-")) assert.equal(result.controlled_journey.input_observation.observer.stop_failed, true);
       assert.ok(!JSON.stringify(result).includes("private diagnostic failure"));
     }
     assert.equal(closes.length, 1);
-    assert.equal(operatorCalls, operatorEnabled ? 1 : 0);
+    assert.equal(operatorCalls, operatorEnabled && !qualificationFails ? 1 : 0);
     assert.deepEqual(inputActions.slice(0, 4), ["observe", "geometry", "click", "key"]);
     assert.equal(inputActions[4], inputFails ? "failure-stop" : "stop");
     assert.deepEqual(closes[0].slice(0, 5), [page, appFrame, window, "browser-token", baseline]);
-    assert.equal(closes[0][5]?.expectedPageId, inputFails || variant === "operator-before-close-failure" ? null : "page-nav");
+    assert.equal(closes[0][5]?.expectedPageId, inputFails || qualificationFails || variant === "operator-before-close-failure" ? null : "page-nav");
   }
 });
 

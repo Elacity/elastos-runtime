@@ -18,6 +18,7 @@ import { installBrowserJourneyAudioProbe, controlledTonePresent } from "./lib/br
 import { diagnoseBrowserJourneyRecovery } from "./lib/browser-journey-recovery.mjs";
 import { diagnoseBrowserViewerReload, readBrowserViewerReloadDocument, browserViewerSignalMetadata } from "./lib/browser-journey-viewer-reload.mjs";
 import { runBrowserOperatorJourney } from "./lib/browser-journey-operator.mjs";
+import { qualificationOptions, createQualificationHarness, createQualificationCancellation, qualificationInteraction } from "./lib/browser-qualification-observer.mjs";
 
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
@@ -155,6 +156,9 @@ const CHECK_BROWSER_CONTROLLED_MEDIA = process.env.HOME_VIRTUAL_AUTH_BROWSER_CON
 const CHECK_BROWSER_CONTROLLED_INSPECTION = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_INSPECTION === "1";
 const CHECK_BROWSER_CONTROLLED_OPERATOR = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_OPERATOR === "1";
 const REUSE_SIGNED_HOME = process.env.HOME_VIRTUAL_AUTH_REUSE_SIGNED_HOME === "1";
+const BROWSER_QUALIFICATION_OPTIONS = qualificationOptions(process.env);
+const qualificationCancellation = createQualificationCancellation(BROWSER_QUALIFICATION_OPTIONS);
+let browserQualification = null;
 const BROWSER_OPERATOR_COORDS_PATH = process.env.HOME_VIRTUAL_AUTH_BROWSER_OPERATOR_COORDS || "";
 const CHECK_BROWSER_CONTROLLED_RECOVERY = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_RECOVERY === "1";
 const CHECK_BROWSER_VIEWER_RELOAD = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_VIEWER_RELOAD === "1";
@@ -182,6 +186,7 @@ const VIRTUAL_AUTH_CREDENTIAL_STORE = join(
 let smokeStage = "init";
 
 function markStage(stage) {
+  if (!stage.includes("close") && !stage.includes("cleanup")) qualificationCancellation?.check();
   smokeStage = stage;
   if (CHECK_BROWSER_CONTROLLED_JOURNEY) {
     console.error(JSON.stringify({ stage, at: new Date().toISOString() }));
@@ -2686,8 +2691,10 @@ async function runControlledBrowserOperator(appFrame, token, pageId, expectedUrl
   } catch { throw new Error("Operator Runtime coordinates are unavailable or invalid"); }
   return runBrowserOperatorJourney({
     runtimeOrigin, runtimeCoords, homeToken: token, pageId, expectedUrl,
+    ...(qualificationCancellation ? { fetchImpl: qualificationCancellation.fetch } : {}),
     readReceipt, markStage, requireVzTransport: REQUIRE_BROWSER_VZ_TRANSPORT,
     readState: async ({ signal }) => {
+      if (qualificationCancellation) signal = AbortSignal.any([signal, qualificationCancellation.signal]);
       const headers = { Origin: "null", "x-elastos-home-token": token };
       const response = await fetch(new URL(`/api/apps/browser/summary?browser_instance=${encodeURIComponent(instance)}`, runtimeOrigin),
         { headers, signal });
@@ -2763,7 +2770,7 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
     result.prior_open_settlements = settled.map(({ open_id, body }) => ({ open_id, settlement: body }));
     for (const name of ["main", "nav"]) {
       markStage(`browser:controlled-${name}`);
-      const url = `${fixture.origin}/${name}?run=${run}${CHECK_BROWSER_CONTROLLED_MEDIA ? "&media=1" : ""}`;
+      const url = `${fixture.origin}/${name}?run=${run}${CHECK_BROWSER_CONTROLLED_MEDIA ? "&media=1" : ""}${browserQualification ? "&qualification=1" : ""}`;
       const navigationStarted = performance.now();
       await appFrame.locator("#browser-url").fill(url);
       await appFrame.locator("#browser-url").press("Enter");
@@ -2873,6 +2880,18 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
     const afterInput = await waitForJourneyEvidence(() => browserRemoteVideoMetrics(appFrame),
       value => value.decoded_frames > current.video.decoded.decoded_frames, "decoded frames after input");
     result.input = { text, receipt, video_after_input: afterInput };
+    if (browserQualification) {
+      result.qualification = await browserQualification.observe({ appFrame, pageId: current.page_id, readReceipt,
+        readStatus: () => browserApi(appFrame, token, `/api/apps/browser/pages/${encodeURIComponent(current.page_id)}/status`),
+        interact: (index, { signal, timeoutMs }) => qualificationInteraction({
+          index, pageId: current.page_id, run, text, readReceipt, signal, timeoutMs,
+          key: (method, value, budget) => appFrame.locator("#browser-keyboard-capture")[method](value, budget),
+          wheel: async (delta, budget) => {
+            await appFrame.locator("#browser-remote-display").hover(budget());
+            budget(); await page.mouse.wheel(0, delta);
+          },
+        }) });
+    }
     if (CHECK_BROWSER_CONTROLLED_RECOVERY) result.recovery = await runControlledBrowserRecovery(page, appFrame, token, readReceipt, result.pages.at(-1).url);
     if (CHECK_BROWSER_VIEWER_RELOAD) result.viewer_reload = await runControlledBrowserViewerReload(page, appFrame, token, readReceipt, result.pages.at(-1).url);
     if (CHECK_BROWSER_CONTROLLED_MEDIA && (CHECK_BROWSER_CONTROLLED_RECOVERY || CHECK_BROWSER_VIEWER_RELOAD)) {
@@ -2884,7 +2903,7 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
     if (CHECK_BROWSER_CONTROLLED_INSPECTION) {
       markStage("browser:operator-stale-reference");
       const resetSequence = (await readReceipt()).events.at(-1)?.sequence || 0;
-      const url = `${fixture.origin}/main?run=${run}${CHECK_BROWSER_CONTROLLED_MEDIA ? "&media=1" : ""}`;
+      const url = `${fixture.origin}/main?run=${run}${CHECK_BROWSER_CONTROLLED_MEDIA ? "&media=1" : ""}${browserQualification ? "&qualification=1" : ""}`;
       await appFrame.locator("#browser-url").fill(url);
       await appFrame.locator("#browser-url").press("Enter");
       await waitForJourneyEvidence(() => browserApi(appFrame, token,
@@ -2919,6 +2938,8 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
       }
     }
   } catch (error) {
+    if (error.qualification) result.qualification = error.qualification;
+    else if (browserQualification) result.qualification ||= browserQualification.snapshot?.(result.pages.at(-1)?.page_id);
     error.details = { stage: smokeStage, ...error.details };
     failure = error;
   } finally {
@@ -4648,6 +4669,9 @@ async function main() {
     "The task TURN interruption requires controlled Browser recovery");
   assert(!CHECK_BROWSER_CONTROLLED_MEDIA || CHECK_BROWSER_CONTROLLED_JOURNEY,
     "Controlled audio proof requires the controlled Browser journey");
+  assert(!BROWSER_QUALIFICATION_OPTIONS || (CHECK_BROWSER_CONTROLLED_JOURNEY && CHECK_BROWSER_CONTROLLED_MEDIA &&
+    CHECK_BROWSER_CONTROLLED_INSPECTION && CHECK_BROWSER_CONTROLLED_OPERATOR && CHECK_BROWSER_VIEWER_RELOAD &&
+    REQUIRE_BROWSER_VZ_TRANSPORT), "Qualification requires the full controlled Mac operator/media/reload journey");
   assert(!CHECK_BROWSER_CONTROLLED_INSPECTION || CHECK_BROWSER_CONTROLLED_JOURNEY,
     "Controlled inspection requires the controlled Browser journey");
   assert(!CHECK_BROWSER_CONTROLLED_OPERATOR || (CHECK_BROWSER_CONTROLLED_JOURNEY && CHECK_BROWSER_CONTROLLED_INSPECTION &&
@@ -4685,12 +4709,13 @@ async function main() {
   }
 
   if (CHECK_BROWSER_CONTROLLED_JOURNEY) markStage("home:viewer-launch");
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+  const contextPromise = chromium.launchPersistentContext(PROFILE_DIR, {
     headless: HEADLESS,
     executablePath: process.env.ELASTOS_BROWSER_EXECUTABLE || undefined,
     ignoreHTTPSErrors: true,
     viewport: { width: 1280, height: 900 },
   });
+  const context = qualificationCancellation ? await qualificationCancellation.ownContext(contextPromise) : await contextPromise;
   if (CHECK_BROWSER_CONTROLLED_MEDIA) await context.addInitScript(installBrowserJourneyAudioProbe);
   let page = context.pages()[0] || await context.newPage();
   let created = null;
@@ -4714,6 +4739,7 @@ async function main() {
     return cleanupResult;
   }
   try {
+    browserQualification = await createQualificationHarness(context, page, BROWSER_QUALIFICATION_OPTIONS, undefined, qualificationCancellation);
     if (CHECK_BROWSER_CONTROLLED_JOURNEY) markStage("home:virtual-authenticator");
     virtualAuthenticator = await setupVirtualAuthenticator(context, page);
     if (CHECK_BROWSER_CONTROLLED_JOURNEY) markStage("home:navigate");
@@ -4826,6 +4852,7 @@ async function main() {
     }
     process.exitCode = 1;
   } finally {
+    await browserQualification?.stop();
     await context.close().catch(() => {});
     if (!PRESERVE_PROFILE && !process.env.HOME_VIRTUAL_AUTH_PROFILE) {
       rmSync(PROFILE_DIR, { recursive: true, force: true });
@@ -4833,4 +4860,9 @@ async function main() {
   }
 }
 
-await main();
+try { await main(); }
+finally {
+  const cancellation = await qualificationCancellation?.stop();
+  if (cancellation?.cancelled) console.error(JSON.stringify({ stage: "qualification:cancelled", cancellation }));
+  if (BROWSER_QUALIFICATION_OPTIONS) console.error(JSON.stringify({ stage: "qualification:open-attempts", evidence: browserQualification?.snapshot() }));
+}
