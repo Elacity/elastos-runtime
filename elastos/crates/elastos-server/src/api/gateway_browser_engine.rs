@@ -7,11 +7,37 @@ use elastos_common::browser_protocol::{
 
 pub(in crate::api::gateway) async fn resolve_browser_engine_adapter(
     registry: &ProviderRegistry,
+    data_dir: &FsPath,
     principal_id: &str,
     requested_adapter: Option<&str>,
     display_mode: BrowserDisplayMode,
     guarantee_level: BrowserGuaranteeLevel,
 ) -> Result<String, BrowserCompatibilityError> {
+    resolve_browser_engine_adapter_with_preparation(
+        registry,
+        data_dir,
+        principal_id,
+        requested_adapter,
+        display_mode,
+        guarantee_level,
+        || crate::setup::ensure_browser_vm_image_for_local_engine(data_dir),
+    )
+    .await
+}
+
+async fn resolve_browser_engine_adapter_with_preparation<F, Fut>(
+    registry: &ProviderRegistry,
+    data_dir: &FsPath,
+    principal_id: &str,
+    requested_adapter: Option<&str>,
+    display_mode: BrowserDisplayMode,
+    guarantee_level: BrowserGuaranteeLevel,
+    mut prepare_image: F,
+) -> Result<String, BrowserCompatibilityError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     let response = registry
         .send_raw(
             "browser-engine",
@@ -37,12 +63,24 @@ pub(in crate::api::gateway) async fn resolve_browser_engine_adapter(
         .filter(|adapter| requested_adapter.is_none_or(|id| adapter.id == id))
         .collect::<Vec<_>>();
     candidates.sort_by_key(|adapter| !adapter.default);
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
+    let mut readiness_budget = std::time::Duration::from_secs(12);
     let mut unavailable_reason = BrowserEngineReadinessReason::ReadinessUnsupported;
     for adapter in candidates {
+        if browser_engine_requires_runtime_image(registry, data_dir, adapter).await {
+            if let Err(error) = prepare_image().await {
+                tracing::warn!(adapter_id = %adapter.id, error = %error,
+                    "Browser local Engine image preparation failed");
+                unavailable_reason = BrowserEngineReadinessReason::PreparationRequired;
+                continue;
+            }
+        }
         let request = serde_json::json!({
             "op": "readiness", "principal_id": principal_id, "adapter_id": adapter.id,
         });
+        // Acquisition can exceed the host probe budget. Start this probe after
+        // preparation, preserving the total twelve seconds across candidates.
+        let probe_started = tokio::time::Instant::now();
+        let deadline = probe_started + readiness_budget;
         let result =
             match tokio::time::timeout_at(deadline, registry.send_raw("browser-engine", &request))
                 .await
@@ -54,6 +92,7 @@ pub(in crate::api::gateway) async fn resolve_browser_engine_adapter(
                     })
                 }
             };
+        readiness_budget = readiness_budget.saturating_sub(probe_started.elapsed());
         let readiness = result.ok().and_then(|response| {
             if response.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
                 return None;
@@ -76,6 +115,117 @@ pub(in crate::api::gateway) async fn resolve_browser_engine_adapter(
     Err(BrowserCompatibilityError::EngineNotReady {
         reason: unavailable_reason,
     })
+}
+
+async fn browser_engine_requires_runtime_image(
+    registry: &ProviderRegistry,
+    data_dir: &FsPath,
+    adapter: &elastos_common::browser_protocol::BrowserEngineAdapterCapabilities,
+) -> bool {
+    if adapter.engine != "chromium_microvm" || adapter.backing_substrate != "local_microvm" {
+        return false;
+    }
+    // Inventory capability strings alone do not bind a provider to Runtime's
+    // image layout. Match the configured first-party host launcher as well.
+    if registry
+        .registration_for_uri("elastos://browser-engine/status")
+        .await
+        .is_none_or(|registration| registration.provider != "capsule-provider")
+    {
+        return false;
+    }
+    let raw = match std::env::var("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG") {
+        Ok(raw) => raw,
+        Err(_) => {
+            match tokio::fs::read_to_string(data_dir.join("config/browser-engine-adapter.json"))
+                .await
+            {
+                Ok(raw) => raw,
+                Err(_) => return false,
+            }
+        }
+    };
+    let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    // Supervisor commands inherit Runtime's environment. Explicit configuration
+    // wins, just as it does when the provider starts the launcher.
+    if let Some(adapters) = config["adapters"].as_array_mut() {
+        for entry in adapters {
+            if let Some(env) = entry["supervisor"]["env"].as_object_mut() {
+                for key in [
+                    "ELASTOS_BROWSER_VM_ROOTFS",
+                    "ELASTOS_BROWSER_VM_ROOTFS_MANIFEST",
+                    "ELASTOS_BROWSER_VM_KERNEL",
+                    "ELASTOS_BROWSER_VM_INITRD",
+                    "ELASTOS_BROWSER_VM_INITRAMFS",
+                ] {
+                    if !env.contains_key(key) {
+                        if let Ok(value) = std::env::var(key) {
+                            env.insert(key.into(), serde_json::Value::String(value));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    browser_engine_config_uses_runtime_image(
+        &config,
+        data_dir,
+        &adapter.id,
+        &crate::setup::detect_platform(),
+    )
+}
+
+fn browser_engine_config_uses_runtime_image(
+    config: &serde_json::Value,
+    data_dir: &FsPath,
+    adapter_id: &str,
+    platform: &str,
+) -> bool {
+    let launcher = if platform.starts_with("darwin-") {
+        "browser-vz-engine-supervisor"
+    } else if platform.starts_with("linux-") {
+        "browser-vm-local-crosvm-launcher"
+    } else {
+        return false;
+    };
+    let Some(adapter) = config["adapters"].as_array().and_then(|adapters| {
+        adapters
+            .iter()
+            .find(|adapter| adapter["id"].as_str() == Some(adapter_id))
+    }) else {
+        return false;
+    };
+    let supervisor = &adapter["supervisor"];
+    let env = &supervisor["env"];
+    let path_matches = |value: &serde_json::Value, relative: &str| {
+        value
+            .as_str()
+            .is_some_and(|value| FsPath::new(value) == data_dir.join(relative))
+    };
+    adapter["kind"] == "chromium_microvm"
+        && path_matches(&supervisor["program"], "bin/browser-vm-engine-supervisor")
+        && path_matches(
+            &env["ELASTOS_BROWSER_VM_CONTROL_LAUNCHER"],
+            &format!("bin/{launcher}"),
+        )
+        && path_matches(&env["ELASTOS_BROWSER_VM_DATA_DIR"], "")
+        && [
+            ("ELASTOS_BROWSER_VM_ROOTFS", "browser-vm/rootfs.ext4"),
+            (
+                "ELASTOS_BROWSER_VM_ROOTFS_MANIFEST",
+                "browser-vm/browser-vm-rootfs-manifest.json",
+            ),
+            ("ELASTOS_BROWSER_VM_KERNEL", "bin/vmlinux"),
+            if platform.starts_with("darwin-") {
+                ("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd")
+            } else {
+                ("ELASTOS_BROWSER_VM_INITRD", "browser-vm/initrd")
+            },
+        ]
+        .iter()
+        .all(|(key, path)| env[*key].is_null() || path_matches(&env[*key], path))
 }
 
 pub(in crate::api::gateway) async fn browser_engine_summary(
@@ -388,8 +538,316 @@ fn invalid_provider_summary(provider: &str, reason: &str) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::browser_visible_remote_carrier_exits;
+    use super::*;
+    use elastos_runtime::provider::{Provider, ProviderError, ResourceRequest, ResourceResponse};
     use serde_json::json;
+    use std::sync::Mutex;
+
+    struct ImageEngineFixture {
+        name: &'static str,
+        adapters: Vec<serde_json::Value>,
+        calls: Arc<Mutex<Vec<String>>>,
+        probe_delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ImageEngineFixture {
+        async fn handle(&self, _: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("raw Engine fixture only".into()))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            vec![]
+        }
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            let op = request["op"].as_str().unwrap();
+            self.calls.lock().unwrap().push(op.into());
+            match op {
+                "status" => Ok(json!({"status":"ok", "data":{
+                    "provider":"browser-engine-adapter", "protocol_version":BROWSER_ENGINE_PROTOCOL_VERSION,
+                    "status":"configured", "adapter_count":self.adapters.len(), "adapters":self.adapters,
+                    "direct_network":false, "wallet_injection":false}})),
+                "readiness" => {
+                    tokio::time::sleep(self.probe_delay).await;
+                    Ok(
+                        json!({"status":"ok", "data":{"schema":BROWSER_ENGINE_READINESS_SCHEMA,
+                        "adapter_id":request["adapter_id"], "readiness":{"state":"ready"}}}),
+                    )
+                }
+                _ => panic!("unexpected Engine effect: {op}"),
+            }
+        }
+    }
+
+    fn image_adapter(id: &str, substrate: &str, default: bool) -> serde_json::Value {
+        json!({"id":id, "engine":"chromium_microvm", "default":default,
+            "backing_substrate":substrate, "supported_display_modes":["webrtc_remote_display"],
+            "supported_guarantee_levels":["mechanism_microvm"], "network_mode":"runtime_net_only",
+            "direct_network":false, "wallet_injection":false})
+    }
+
+    fn image_config(data: &FsPath, platform: &str) -> serde_json::Value {
+        let launcher = if platform.starts_with("darwin-") {
+            "browser-vz-engine-supervisor"
+        } else {
+            "browser-vm-local-crosvm-launcher"
+        };
+        json!({"adapters":[{"id":"local", "kind":"chromium_microvm", "supervisor":{
+            "program":data.join("bin/browser-vm-engine-supervisor"), "env":{
+                "ELASTOS_BROWSER_VM_CONTROL_LAUNCHER":data.join("bin").join(launcher),
+                "ELASTOS_BROWSER_VM_DATA_DIR":data}}}]})
+    }
+
+    fn write_image_config(data: &FsPath) {
+        std::fs::create_dir_all(data.join("config")).unwrap();
+        std::fs::write(
+            data.join("config/browser-engine-adapter.json"),
+            serde_json::to_vec(&image_config(data, &crate::setup::detect_platform())).unwrap(),
+        )
+        .unwrap();
+    }
+
+    async fn image_registry(
+        name: &'static str,
+        adapters: Vec<serde_json::Value>,
+        probe_delay: std::time::Duration,
+    ) -> (ProviderRegistry, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = ProviderRegistry::new();
+        registry
+            .register_sub_provider(
+                "browser-engine",
+                Arc::new(ImageEngineFixture {
+                    name,
+                    adapters,
+                    calls: calls.clone(),
+                    probe_delay,
+                }),
+            )
+            .await
+            .unwrap();
+        (registry, calls)
+    }
+
+    #[test]
+    fn image_acquisition_requires_standard_local_host_paths() {
+        let data = FsPath::new("/runtime-test");
+        for platform in ["darwin-arm64", "linux-arm64", "linux-amd64"] {
+            let config = image_config(data, platform);
+            assert!(browser_engine_config_uses_runtime_image(
+                &config, data, "local", platform
+            ));
+            for (pointer, value) in [
+                ("/adapters/0/kind", "hosted_remote_browser"),
+                ("/adapters/0/supervisor/program", "/custom/supervisor"),
+                (
+                    "/adapters/0/supervisor/env/ELASTOS_BROWSER_VM_CONTROL_LAUNCHER",
+                    "/runtime-test/bin/browser-vm-remote-vz-launcher",
+                ),
+                (
+                    "/adapters/0/supervisor/env/ELASTOS_BROWSER_VM_DATA_DIR",
+                    "/other-runtime",
+                ),
+            ] {
+                let mut other = config.clone();
+                *other.pointer_mut(pointer).unwrap() = json!(value);
+                assert!(
+                    !browser_engine_config_uses_runtime_image(&other, data, "local", platform),
+                    "{pointer}"
+                );
+            }
+            let mut manual = config.clone();
+            manual["adapters"][0]["supervisor"]["env"]["ELASTOS_BROWSER_VM_ROOTFS"] =
+                json!("/manual/verified.ext4");
+            assert!(!browser_engine_config_uses_runtime_image(
+                &manual, data, "local", platform
+            ));
+            manual["adapters"][0]["supervisor"]["env"]["ELASTOS_BROWSER_VM_ROOTFS"] =
+                json!(data.join("browser-vm/rootfs.ext4"));
+            assert!(browser_engine_config_uses_runtime_image(
+                &manual, data, "local", platform
+            ));
+            let (key, path) = if platform.starts_with("darwin-") {
+                ("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd")
+            } else {
+                ("ELASTOS_BROWSER_VM_INITRD", "browser-vm/initrd")
+            };
+            manual["adapters"][0]["supervisor"]["env"][key] = json!(data.join(path));
+            assert!(browser_engine_config_uses_runtime_image(
+                &manual, data, "local", platform
+            ));
+            manual["adapters"][0]["supervisor"]["env"][key] = json!(data.join("bin/initrd.img"));
+            assert!(!browser_engine_config_uses_runtime_image(
+                &manual, data, "local", platform
+            ));
+            assert!(!browser_engine_config_uses_runtime_image(
+                &config, data, "absent", platform
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn image_acquisition_finishes_before_local_readiness_budget_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        write_image_config(dir.path());
+        let (registry, calls) = image_registry(
+            "capsule-provider",
+            vec![image_adapter("local", "local_microvm", true)],
+            std::time::Duration::from_secs(11),
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        let resolved = resolve_browser_engine_adapter_with_preparation(
+            &registry,
+            dir.path(),
+            "person:test",
+            None,
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::MechanismMicrovm,
+            || async {
+                calls.lock().unwrap().push("prepare".into());
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                calls.lock().unwrap().push("verified".into());
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, "local");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(41));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["status", "prepare", "verified", "readiness"]
+        );
+    }
+
+    #[tokio::test]
+    async fn image_acquisition_is_lazy_for_remote_selection_and_custom_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        write_image_config(dir.path());
+        for (name, adapters, requested, expected) in [
+            (
+                "capsule-provider",
+                vec![
+                    image_adapter("remote", "remote_operator_vm", true),
+                    image_adapter("local", "local_microvm", false),
+                ],
+                None,
+                "remote",
+            ),
+            (
+                "capsule-provider",
+                vec![
+                    image_adapter("local", "local_microvm", true),
+                    image_adapter("remote", "remote_operator_vm", false),
+                ],
+                Some("remote"),
+                "remote",
+            ),
+            (
+                "custom-provider",
+                vec![image_adapter("local", "local_microvm", true)],
+                None,
+                "local",
+            ),
+        ] {
+            let (registry, calls) = image_registry(name, adapters, std::time::Duration::ZERO).await;
+            let resolved = resolve_browser_engine_adapter_with_preparation(
+                &registry,
+                dir.path(),
+                "person:test",
+                requested,
+                BrowserDisplayMode::WebrtcRemoteDisplay,
+                BrowserGuaranteeLevel::MechanismMicrovm,
+                || async { panic!("unselected/local-independent Engine acquired an image") },
+            )
+            .await
+            .unwrap();
+            assert_eq!(resolved, expected);
+            assert_eq!(*calls.lock().unwrap(), ["status", "readiness"]);
+            assert!(!dir.path().join("browser-vm").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn image_acquisition_missing_release_stops_selected_local_before_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        write_image_config(dir.path());
+        let (registry, calls) = image_registry(
+            "capsule-provider",
+            vec![image_adapter("local", "local_microvm", true)],
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let error = resolve_browser_engine_adapter(
+            &registry,
+            dir.path(),
+            "person:test",
+            Some("local"),
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::MechanismMicrovm,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error,
+            BrowserCompatibilityError::EngineNotReady {
+                reason: BrowserEngineReadinessReason::PreparationRequired
+            }
+        );
+        assert_eq!(*calls.lock().unwrap(), ["status"]);
+        assert!(!dir.path().join("browser-vm").exists());
+    }
+
+    #[tokio::test]
+    async fn image_acquisition_failure_allows_only_an_unrequested_ready_alternative() {
+        let dir = tempfile::tempdir().unwrap();
+        write_image_config(dir.path());
+        for (requested, expected) in [
+            (None, Ok("remote".into())),
+            (
+                Some("local"),
+                Err(BrowserCompatibilityError::EngineNotReady {
+                    reason: BrowserEngineReadinessReason::PreparationRequired,
+                }),
+            ),
+        ] {
+            let (registry, calls) = image_registry(
+                "capsule-provider",
+                vec![
+                    image_adapter("local", "local_microvm", true),
+                    image_adapter("remote", "remote_operator_vm", false),
+                ],
+                std::time::Duration::ZERO,
+            )
+            .await;
+            let result = resolve_browser_engine_adapter_with_preparation(
+                &registry,
+                dir.path(),
+                "person:test",
+                requested,
+                BrowserDisplayMode::WebrtcRemoteDisplay,
+                BrowserGuaranteeLevel::MechanismMicrovm,
+                || async {
+                    calls.lock().unwrap().push("prepare".into());
+                    anyhow::bail!("missing published image bundle")
+                },
+            )
+            .await;
+            assert_eq!(result, expected);
+            let expected_calls = if requested.is_some() {
+                vec!["status", "prepare"]
+            } else {
+                vec!["status", "prepare", "readiness"]
+            };
+            assert_eq!(*calls.lock().unwrap(), expected_calls);
+        }
+    }
 
     #[test]
     fn browser_visible_remote_carrier_exits_redacts_transport_identity_and_authority() {

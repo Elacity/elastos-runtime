@@ -32,7 +32,8 @@ initrd_rel = "bin/initrd" if args.platform == "darwin-arm64" else "browser-vm/in
 result = {"schema": "elastos.setup-source-home.browser-artifacts/v1", "ok": True,
           "platform": args.platform, "data_dir": str(data),
           "candidate_dirs": [str(p) for p in candidates], "linked": 0,
-          "skipped_existing": 0, "missing": 0, "image_set_verified": False}
+          "skipped_existing": 0, "missing": 0, "image_set_verified": False,
+          "image_preparation": "required"}
 
 
 def finish(error=None):
@@ -51,6 +52,10 @@ else:
     rootfs = next((p / rootfs_rel for p in candidates if (p / rootfs_rel).is_file()), None)
 if rootfs is None:
     result["missing"] = 4
+    result["detail"] = ("Browser local Engine image preparation is required. Install the release's "
+                        "browser-vm-image component through Runtime setup or select an approved remote Engine.")
+    # Source Home can serve as a viewer. Command success reports completed setup
+    # work; image_preparation and image_set_verified report image readiness.
     finish("The selected Browser artifact store has no image set." if args.artifact_data_dir else None)
 source_vm = rootfs.parent
 source_data = source_vm.parent
@@ -111,6 +116,6 @@ except OSError as exc:
     for dest in reversed(created):
         dest.unlink()
     finish(f"Browser artifact links could not be installed: {exc}")
-result.update(linked=len(created), image_set_verified=True)
+result.update(linked=len(created), image_set_verified=True, image_preparation="verified")
 finish()
 PY

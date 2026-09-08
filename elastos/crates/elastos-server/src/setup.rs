@@ -12,6 +12,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod browser_vm_image;
 #[cfg(unix)]
 mod local_model_engine_receipt;
 
@@ -264,6 +265,10 @@ async fn run_with_data_dir(
     }
 
     let components = resolve_components(&manifest, selected_profile, &with, &without)?;
+
+    if components.iter().any(|name| name == browser_vm_image::NAME) {
+        browser_vm_image::component_info(&manifest, &platform)?;
+    }
 
     if components.is_empty() {
         println!("No components selected.");
@@ -750,6 +755,45 @@ pub(crate) struct CapsuleComponentEnsure {
     pub detail: Option<String>,
 }
 
+/// Prepare only the image dependency of an explicitly selected local Engine.
+/// Host helper admission and page allocation remain with the Engine adapter.
+pub async fn ensure_browser_vm_image_for_local_engine(data_dir: &Path) -> anyhow::Result<()> {
+    let check_dir = data_dir.to_path_buf();
+    let pending = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<PlatformInfo>> {
+        let platform = detect_platform();
+        let manifest_path = check_dir.join("components.json");
+        if !manifest_path.exists() {
+            browser_vm_image::verify_legacy_or_missing_release(&check_dir, &platform)?;
+            return Ok(None);
+        }
+        let manifest = load_manifest_from_path(&manifest_path)?;
+        if !manifest.external.contains_key(browser_vm_image::NAME) {
+            browser_vm_image::verify_legacy_or_missing_release(&check_dir, &platform)?;
+            return Ok(None);
+        }
+        let info = browser_vm_image::component_info(&manifest, &platform)?;
+        Ok(
+            browser_vm_image::verify_installed(&check_dir, info, &platform)
+                .is_err()
+                .then(|| info.clone()),
+        )
+    })
+    .await??;
+    let Some(info) = pending else {
+        return Ok(());
+    };
+    let dest = data_dir.join(browser_vm_image::INSTALL_PATH);
+    download_component(
+        data_dir,
+        browser_vm_image::NAME,
+        &resolve_component_download_url(&info).expect("validated Browser image release path"),
+        &info,
+        &dest,
+        &build_gateway_list(data_dir),
+    )
+    .await
+}
+
 pub(crate) async fn ensure_capsule_component_for_home_launch(
     data_dir: &Path,
     name: &str,
@@ -1055,6 +1099,17 @@ fn component_install_state_for_name(
     component: &Component,
     platform_info: Option<&PlatformInfo>,
 ) -> InstallState {
+    if name == browser_vm_image::NAME {
+        if !data_dir.join(browser_vm_image::INSTALL_PATH).exists() {
+            return InstallState::Missing;
+        }
+        return match browser_vm_image::component_info(manifest, &detect_platform())
+            .and_then(|info| browser_vm_image::verify_installed(data_dir, info, &detect_platform()))
+        {
+            Ok(()) => InstallState::Installed,
+            Err(err) => InstallState::Stale(format!("Browser image set requires repair: {err}")),
+        };
+    }
     #[cfg(unix)]
     if name == "llama-server"
         && platform_info
@@ -2189,10 +2244,22 @@ pub(crate) async fn install_first_party_component_via_carrier(
     platform_info: &PlatformInfo,
     dest: &Path,
 ) -> anyhow::Result<()> {
+    if name == browser_vm_image::NAME {
+        browser_vm_image::validate_request(data_dir, platform_info, dest, &detect_platform())?;
+    }
     let release_path = platform_info.release_path.as_deref().ok_or_else(|| {
         anyhow::anyhow!("missing release_path for first-party component '{}'", name)
     })?;
     let bytes = fetch_first_party_component_via_carrier(data_dir, release_path).await?;
+
+    if name == browser_vm_image::NAME {
+        let data_dir = data_dir.to_path_buf();
+        let platform_info = platform_info.clone();
+        return tokio::task::spawn_blocking(move || {
+            browser_vm_image::install_archive(&data_dir, &bytes, &platform_info, &detect_platform())
+        })
+        .await?;
+    }
     verify_checksum(name, &bytes, platform_info)?;
 
     let is_model = dest.extension().map(|e| e == "gguf").unwrap_or(false);
@@ -2223,6 +2290,9 @@ async fn download_component(
     dest: &Path,
     ipfs_gateways: &[ElastosFetchPath],
 ) -> anyhow::Result<()> {
+    if name == browser_vm_image::NAME {
+        browser_vm_image::validate_request(data_dir, platform_info, dest, &detect_platform())?;
+    }
     // Ensure parent dir exists
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;

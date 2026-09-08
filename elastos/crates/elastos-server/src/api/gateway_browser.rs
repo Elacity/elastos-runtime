@@ -579,6 +579,7 @@ async fn execute_browser_open(
     };
     let adapter_id = match resolve_browser_engine_adapter(
         registry.as_ref(),
+        &state.data_dir,
         &context.principal_id,
         requested_adapter_id.as_deref(),
         display_mode,

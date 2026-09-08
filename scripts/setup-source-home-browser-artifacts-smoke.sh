@@ -8,10 +8,12 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shutil
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 
 repo = Path(sys.argv[1])
 checks = []
@@ -120,6 +122,96 @@ with tempfile.TemporaryDirectory(prefix="browser-image-ownership-") as temp:
     run("missing explicit artifact store is actionable", root / "missing-explicit", root / "absent-store", ok=False)
     unavailable = run("no local image permits a viewer Runtime", root / "viewer")
     assert unavailable["missing"] == 4 and not unavailable["image_set_verified"]
+    assert unavailable["image_preparation"] == "required" and "browser-vm-image" in unavailable["detail"]
+
+    # Package only tiny fixture bytes, then inspect the release component overlay.
+    # The parent-owned production image store is outside this test's scope.
+    package = runpy.run_path(str(repo / "scripts/package-browser-vm-image.py"))["package"]
+    package_source = root / "package-source"
+    package_source.mkdir()
+    for name, rel in [("rootfs.ext4", "browser-vm/rootfs.ext4"),
+                      ("browser-vm-rootfs-manifest.json", "browser-vm/browser-vm-rootfs-manifest.json"),
+                      ("vmlinux", "bin/vmlinux"), ("initrd", "bin/initrd")]:
+        shutil.copyfile(source / rel, package_source / name)
+    archive = root / "release/image.tar.gz"
+    metadata = root / "release/components.json"
+    saved_debugfs = os.environ.get("ELASTOS_DEBUGFS_BIN")
+    os.environ["ELASTOS_DEBUGFS_BIN"] = env["ELASTOS_DEBUGFS_BIN"]
+    try:
+        overlay = package(package_source, "darwin-arm64", archive, metadata, "test/image.tar.gz")
+        before_package = archive.read_bytes(), metadata.read_bytes()
+        package(package_source, "darwin-arm64", archive, metadata, "test/image.tar.gz")
+        assert (archive.read_bytes(), metadata.read_bytes()) == before_package
+        platform_info = overlay["external"]["browser-vm-image"]["platforms"]["darwin-arm64"]
+        assert platform_info["checksum"] == "sha256:" + sha(archive)
+        assert platform_info["size"] == archive.stat().st_size
+        assert platform_info["install_path"] == "browser-vm/image-set"
+        checks.append("image release archive and manifest are reproducible and hash-bound")
+        try:
+            package(package_source, "darwin-arm64", archive, metadata, "test/another-release.tar.gz")
+            raise AssertionError("existing package pair was overwritten")
+        except ValueError as error:
+            assert "immutable" in str(error)
+        assert (archive.read_bytes(), metadata.read_bytes()) == before_package
+        checks.append("new release metadata preserves the immutable previous output pair")
+
+        next_archive, next_metadata = root / "next/image.tar.gz", root / "next/components.json"
+        original_link = os.link
+        def fail_metadata_link(source, destination, *args, **kwargs):
+            if Path(destination) == next_metadata.resolve():
+                raise OSError("injected metadata publication failure")
+            return original_link(source, destination, *args, **kwargs)
+        with mock.patch("os.link", side_effect=fail_metadata_link):
+            try:
+                package(package_source, "darwin-arm64", next_archive, next_metadata, "test/image.tar.gz")
+                raise AssertionError("metadata publication failure was ignored")
+            except OSError as error:
+                assert "injected" in str(error)
+        assert not next_archive.exists() and not next_metadata.exists()
+        assert not list(next_archive.parent.glob(".browser-image-*"))
+        assert (archive.read_bytes(), metadata.read_bytes()) == before_package
+        checks.append("failed metadata publication cleans the new archive and preserves previous outputs")
+
+        original_write = Path.write_bytes
+        def fail_metadata_stage(destination, data):
+            if destination.name == "components.json" and destination.parent.name.startswith(".browser-image-metadata-"):
+                raise OSError("injected metadata staging failure")
+            return original_write(destination, data)
+        with mock.patch.object(Path, "write_bytes", fail_metadata_stage):
+            try:
+                package(package_source, "darwin-arm64", next_archive, next_metadata, "test/image.tar.gz")
+                raise AssertionError("metadata staging failure was ignored")
+            except OSError as error:
+                assert "injected" in str(error)
+        assert not next_archive.exists() and not next_metadata.exists()
+        assert not list(next_archive.parent.glob(".browser-image-*"))
+        checks.append("metadata staging failure leaves no published or temporary output")
+        for name in ["rootfs.ext4", "vmlinux", "initrd", "browser-vm-rootfs-manifest.json"]:
+            artifact = package_source / name
+            original = artifact.read_bytes()
+            artifact.write_bytes(b"corrupt")
+            try:
+                package(package_source, "darwin-arm64", archive, metadata, "test/image.tar.gz")
+                raise AssertionError("corrupt package source was accepted: " + name)
+            except ValueError:
+                pass
+            assert (archive.read_bytes(), metadata.read_bytes()) == before_package
+            artifact.write_bytes(original)
+            checks.append("release packaging preserves existing outputs after corrupt " + name)
+        for platform, release_path in [("darwin-amd64", "test/image.tar.gz"),
+                                       ("linux-amd64", "test/image.tar.gz"),
+                                       ("darwin-arm64", "../image.tar.gz")]:
+            try:
+                package(package_source, platform, archive, metadata, release_path)
+                raise AssertionError("invalid release package was accepted")
+            except ValueError:
+                pass
+        checks.append("release packaging rejects wrong architecture and unsafe release paths")
+    finally:
+        if saved_debugfs is None:
+            os.environ.pop("ELASTOS_DEBUGFS_BIN", None)
+        else:
+            os.environ["ELASTOS_DEBUGFS_BIN"] = saved_debugfs
 
     # Exercise the actual source-home helper installation. Older setup modified
     # rootfs/initrd here, including a shared store reached through symlinks.
