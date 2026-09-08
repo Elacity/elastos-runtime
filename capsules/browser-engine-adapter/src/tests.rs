@@ -4098,3 +4098,46 @@ fn display_attach_control_error_preserves_only_fixed_code() {
         );
     }
 }
+
+#[test]
+fn operator_input_requires_principal_and_typed_payload_before_socket_dispatch() {
+    let provider = display_attach_adapter("/tmp/operator-must-not-connect.sock".into(), None);
+    let event = json!({"type":"operator_lease","command":"acquire","admission_id":"a".repeat(32),
+        "document_generation":"b".repeat(32),"duration_ms":30000,"actions":["click","type"]});
+    for principal in [None, Some("person:foreign".into())] {
+        assert_eq!(
+            error_code(provider.input("page:attach", event.clone(), principal)),
+            "page_not_found"
+        );
+    }
+    for field in ["principal_id", "provider_route", "extra"] {
+        let mut invalid = event.clone();
+        invalid[field] = json!("caller value");
+        assert_eq!(
+            error_code(provider.input("page:attach", invalid, Some("person:owner".into()))),
+            "invalid_operator_input"
+        );
+    }
+}
+
+#[test]
+fn operator_input_uses_existing_owned_control_session_and_bounds_private_failure() {
+    let reply = json!({"schema":"elastos.browser.input-result/v1","page_id":"page:attach","admission_id":"a".repeat(32),"accepted":true,"writer_acquired":false});
+    let socket = spawn_status_socket(reply.clone());
+    let provider = display_attach_adapter(socket.clone(), None);
+    let event = json!({"type":"operator_lease","command":"release","admission_id":"a".repeat(32)});
+    let result = serde_json::to_value(provider.input(
+        "page:attach",
+        event.clone(),
+        Some("person:owner".into()),
+    ))
+    .unwrap();
+    assert_eq!(result["data"], reply);
+    let _ = std::fs::remove_file(socket);
+    let provider = display_attach_adapter("/tmp/operator-private-unavailable.sock".into(), None);
+    let result =
+        serde_json::to_value(provider.input("page:attach", event, Some("person:owner".into())))
+            .unwrap();
+    assert_eq!(result["code"], "operator_outcome_uncertain");
+    assert!(!result.to_string().contains("/tmp/"));
+}

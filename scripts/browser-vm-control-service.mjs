@@ -2212,7 +2212,11 @@ function requestJsonOverUnix(
         let received = 0;
         res.on("data", (chunk) => {
           received += chunk.length;
-          if (received > maxResponseBytes) { req.destroy(new Error("Browser control response exceeded its byte limit")); return; }
+          if (received > maxResponseBytes) {
+            clearAbort();
+            reject(new Error("Browser control response exceeded its byte limit"));
+            res.destroy(); req.destroy(); return;
+          }
           chunks.push(chunk);
         });
         res.on("error", error => { clearAbort(); reject(error); });
@@ -3495,6 +3499,21 @@ async function proxyGuestPageInspect(activePages, activeVms, pageId, body) {
 
 async function proxyGuestPageInput(config, activePages, activeVms, pageId, body) {
   const { controlSocketPath } = activePageGuestControl(activePages, activeVms, pageId);
+  if (String(body?.event?.type || "").startsWith("operator_")) {
+    const owner = activePages.get(pageId);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2000);
+    try {
+      const result = await requestJsonOverUnix(controlSocketPath, "POST", `/pages/${encodeURIComponent(pageId)}/input`,
+        body, 2000, controller.signal, 4096);
+      if (controller.signal.aborted || activePages.get(pageId) !== owner ||
+          activePageGuestControl(activePages, activeVms, pageId).controlSocketPath !== controlSocketPath) {
+        throw new Error("Browser operator ownership changed");
+      }
+      return result;
+    } finally { clearTimeout(timer); }
+  }
+
   return postJsonOverUnix(
     controlSocketPath,
     `/pages/${encodeURIComponent(pageId)}/input`,

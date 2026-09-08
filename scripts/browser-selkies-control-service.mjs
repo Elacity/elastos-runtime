@@ -2856,6 +2856,11 @@ export class SelkiesPage {
       return;
     }
     this.closed = true;
+    if (this.operatorLease) {
+      this.operatorLease.active = false;
+      clearTimeout(this.operatorLease.timer);
+      browserInputWriterGate("release", this.operatorLease.id).catch(() => {});
+    }
     if (this.browserPage?._inspection) {
       const inspection = this.browserPage._inspection;
       clearTimeout(inspection.expiryTimer);
@@ -4080,17 +4085,21 @@ function validateBrowserFileUploadEvent(event) {
   };
 }
 
-async function pasteTextIntoBrowserPage(browserPage, event, timeoutMs) {
+async function pasteTextIntoBrowserPage(browserPage, event, timeoutMs, suppliedCdp = null) {
   if (!browserPage?.debugger_url) {
     throw new Error("browser page debugger URL is unavailable");
   }
   const text = validatePasteText(event?.text);
-  await withBrowserCdp(browserPage, timeoutMs, async (cdp) => {
+  const insert = async (cdp) => {
+    if (!suppliedCdp) {
     await cdp.request("Page.enable").catch(() => {});
     await cdp.request("Runtime.enable").catch(() => {});
     await ensureBrowserFileChooserInterception(cdp, browserPage);
+    }
     await cdp.request("Input.insertText", { text });
-  });
+  };
+  if (suppliedCdp) await insert(suppliedCdp);
+  else await withBrowserCdp(browserPage, timeoutMs, insert);
   return {
     url: browserPage.url || "",
     title: browserPage.title || "Selkies Browser",
@@ -4809,7 +4818,235 @@ async function inspectBrowserPage(page, request, isCurrent) {
   }
 }
 
-async function withBrowserCdp(browserPage, timeoutMs, action) {
+const OPERATOR_ID = /^[a-f0-9-]{32,36}$/;
+function browserOperatorError(code = "operator_input_rejected") {
+  return Object.assign(new Error("Browser operator input could not complete."), { code });
+}
+
+async function browserInputWriterGate(command, admissionId, durationMs, effectId) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ path: "/run/elastos/browser-input-writer.sock" });
+    let received = "", settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer); socket.destroy();
+      error ? reject(browserOperatorError("operator_writer_unavailable")) : resolve(result);
+    };
+    const timer = setTimeout(() => finish(new Error("deadline")), 1200);
+    socket.on("error", finish);
+    socket.on("end", () => finish(new Error("incomplete receipt")));
+    socket.on("connect", () => socket.write(JSON.stringify({ command, admission_id: admissionId,
+      ...(durationMs === undefined ? {} : { duration_ms: durationMs }),
+      ...(effectId === undefined ? {} : { effect_id: effectId }) }) + "\n"));
+    socket.on("data", data => {
+      received += data.toString("utf8");
+      if (received.length > 1024) return finish(new Error("oversize receipt"));
+      if (!received.includes("\n")) return;
+      try {
+        const value = JSON.parse(received);
+        if (value.schema !== "elastos.browser.input-writer/v1" || value.admission_id !== admissionId ||
+            (command === "release" ? value.held !== false :
+              command === "settle" ? value.pending_effect !== null : value.active !== true || value.held !== true) ||
+            (command === "begin" && value.pending_effect !== effectId)) throw new Error("invalid receipt");
+        finish(null, value);
+      } catch (error) { finish(error); }
+    });
+  });
+}
+
+async function withBrowserInputWriter(page, isCurrent, action, cleanup = false) {
+  const state = page.inputWriter ||= { tail: Promise.resolve(), pending: 0, failed: false };
+  if (state.pending >= 128) throw browserOperatorError("operator_writer_busy");
+  state.pending++;
+  const pending = state.tail.then(async () => {
+    if ((state.failed && !cleanup) || page.closed || !isCurrent()) throw browserOperatorError("operator_owner_changed");
+    return action();
+  });
+  state.tail = pending.catch(() => {
+    state.failed = true;
+    if (page.inputWriter === state) page.inputWriter = null;
+  });
+  try { return await pending; } finally { state.pending--; }
+}
+
+function cancelBrowserOperatorLease(page, id) {
+  if (!OPERATOR_ID.test(id || "")) throw browserOperatorError();
+  page.revokedOperatorLeases ||= new Set();
+  if (page.revokedOperatorLeases.size < 128) page.revokedOperatorLeases.add(id);
+  if (page.operatorLease?.id === id) page.operatorLease.active = false;
+}
+
+async function settleBrowserOperatorEffect(lease) {
+  const effect = lease?.effect;
+  if (!effect?.held) return true;
+  if (!effect.done || effect.pending > 0 || effect.uncertain) return false;
+  if (!effect.settling) {
+    effect.settling = browserInputWriterGate("settle", lease.id, undefined, effect.id)
+      .then(() => { if (lease.effect === effect) lease.effect = null; return true; })
+      .catch(error => { effect.settling = null; throw error; });
+  }
+  return effect.settling;
+}
+
+async function browserOperatorLease(page, event, isCurrent) {
+  if (!OPERATOR_ID.test(event.admission_id || "")) throw browserOperatorError();
+  const id = event.admission_id;
+  const current = () => {
+    if (page.closed || !isCurrent()) throw browserOperatorError("operator_owner_changed");
+  };
+  current();
+  if (event.command === "release") {
+    cancelBrowserOperatorLease(page, id);
+    if (page.operatorLease?.id === id) {
+      page.operatorLease.active = false;
+      clearTimeout(page.operatorLease.timer);
+    }
+    if (page.operatorLease?.id === id) await settleBrowserOperatorEffect(page.operatorLease);
+    await browserInputWriterGate("release", id);
+    current();
+    if (page.operatorLease?.id === id) page.operatorLease = null;
+  } else if (event.command === "acquire") {
+    if (page.revokedOperatorLeases?.has(id) || page.revokedOperatorLeases?.size >= 128) throw browserOperatorError("operator_admission_inactive");
+    const inspection = page.browserPage?._inspection;
+    if (!/^[a-f0-9]{32}$/.test(event.document_generation || "") || !inspection?.snapshot ||
+        inspection.generation !== event.document_generation || performance.now() >= inspection.snapshot.expires ||
+        !Number.isInteger(event.duration_ms) || event.duration_ms < 2000 || event.duration_ms > 30000 ||
+        !Array.isArray(event.actions) || event.actions.length < 1 || event.actions.length > 2 ||
+        event.actions.some(action => !["click", "type"].includes(action)) || new Set(event.actions).size !== event.actions.length) throw browserOperatorError("stale_inspection");
+    if (page.operatorLease?.active) throw browserOperatorError("operator_writer_busy");
+    const lease = { id, active: true, generation: event.document_generation, actions: event.actions,
+      deadline: performance.now() + event.duration_ms, receipts: new Map(), timer: null };
+    page.operatorLease = lease;
+    try {
+      await browserInputWriterGate("acquire", id, event.duration_ms);
+      current();
+      if (page.operatorLease !== lease || !lease.active || inspection.generation !== lease.generation ||
+          performance.now() >= lease.deadline) throw browserOperatorError("operator_owner_changed");
+      lease.timer = setTimeout(() => {
+        lease.active = false;
+        withBrowserInputWriter(page, isCurrent, () => browserOperatorLease(page,
+          { command: "release", admission_id: id }, isCurrent), true).catch(() => {});
+      }, Math.max(1, lease.deadline - performance.now()));
+      lease.timer.unref?.();
+    } catch (error) {
+      lease.active = false;
+      await browserInputWriterGate("release", id).catch(() => {});
+      throw error;
+    }
+  } else throw browserOperatorError();
+  return { schema: "elastos.browser.input-result/v1", page_id: page.pageId, accepted: true,
+    admission_id: id, writer_acquired: event.command === "acquire" };
+}
+
+async function browserRefInput(page, event, isCurrent) {
+  const lease = page.operatorLease, browserPage = page.browserPage;
+  const inspection = browserPage?._inspection, snapshot = inspection?.snapshot;
+  const match = /^([a-f0-9]{32}):(0|[1-9][0-9]{0,2})$/.exec(event.ref || "");
+  if (event.schema !== "elastos.browser.ref-input/v1" || !/^[a-f0-9]{32}$/.test(event.request_id || "") ||
+      !match || !["click", "type"].includes(event.action) ||
+      (event.action === "click" ? event.text != null : typeof event.text !== "string" || !event.text ||
+        Buffer.byteLength(event.text) > 1024 || /[\u0000-\u001f\u007f-\u009f]/u.test(event.text))) throw browserOperatorError();
+  const binding = snapshot?.backendNodes[Number(match[2])];
+  const current = () => {
+    if (page.closed || page.browserPage !== browserPage || !isCurrent()) throw browserOperatorError("operator_owner_changed");
+    if (!lease?.active || page.operatorLease !== lease || lease.id !== event.admission_id ||
+        lease.generation !== event.document_generation || !lease.actions.includes(event.action) || performance.now() >= lease.deadline) throw browserOperatorError("operator_admission_inactive");
+    if (!snapshot || inspection.snapshot !== snapshot || inspection.generation !== event.document_generation ||
+        snapshot.id !== match[1] || performance.now() >= snapshot.expires || !binding) throw browserOperatorError("stale_inspection");
+  };
+  current();
+  if (lease.receipts.has(event.request_id)) {
+    const previous = lease.receipts.get(event.request_id);
+    if (previous.binding !== JSON.stringify(event)) throw browserOperatorError("operator_request_conflict");
+    if (previous.error) throw browserOperatorError(previous.error);
+    return previous.result;
+  }
+  if (lease.receipts.size >= 16 || lease.deadline - performance.now() < 1500) throw browserOperatorError("operator_admission_inactive");
+  const receipt = { binding: JSON.stringify(event), error: "operator_outcome_uncertain", result: null };
+  lease.receipts.set(event.request_id, receipt);
+  const deadline = Math.min(lease.deadline, performance.now() + 1500);
+  const effect = { id: event.request_id, held: false, pending: 0, uncertain: false, done: false, settling: null };
+  lease.effect = effect;
+  try {
+    const result = await withBrowserCdp(browserPage, 1500, async cdp => {
+      const effectRequest = (method, params, waitMs) => {
+        effect.pending++;
+        // Keep the original ACK observable after the public action deadline.
+        // It may settle the native hold, but can never start another action.
+        let sent;
+        try { sent = cdp.request(method, params, 15000); }
+        catch (error) { sent = Promise.reject(error); }
+        const observed = Promise.resolve(sent).then(value => { effect.pending--; return value; }, error => {
+            effect.pending--; effect.uncertain = true; throw error;
+          });
+        observed.finally(() => settleBrowserOperatorEffect(lease).catch(() => {})).catch(() => {});
+        return withTimeout("Browser operator effect", waitMs, observed);
+      };
+      const call = async (method, params = {}) => {
+        current();
+        if (performance.now() >= deadline || browserPage._cdp !== cdp || cdp.closed) throw browserOperatorError("operator_outcome_uncertain");
+        if (effect.uncertain) throw browserOperatorError("operator_outcome_uncertain");
+        if (method.startsWith("Input.") && !effect.held) {
+          effect.held = true;
+          await browserInputWriterGate("begin", lease.id, undefined, effect.id);
+          current();
+          if (performance.now() >= deadline) throw browserOperatorError("operator_outcome_uncertain");
+        }
+        const remaining = Math.max(1, Math.floor(deadline - performance.now()));
+        const value = await (method.startsWith("Input.")
+          ? effectRequest(method, params, remaining) : cdp.request(method, params, remaining));
+        current();
+        if (performance.now() >= deadline) throw browserOperatorError("operator_outcome_uncertain");
+        return value;
+      };
+      const frame = (await call("Page.getFrameTree")).frameTree?.frame;
+      if (`${frame?.id}:${frame?.loaderId}:${frame?.url}` !== inspection.binding || frame.id !== binding.frameId) throw browserOperatorError("stale_inspection");
+      const dom = (await call("DOM.describeNode", { backendNodeId: binding.backendDOMNodeId, depth: 0 })).node;
+      if (dom?.backendNodeId !== binding.backendDOMNodeId) throw browserOperatorError("stale_inspection");
+      await browserInputWriterGate("check", lease.id);
+      current();
+      if (event.action === "click") {
+        const quad = (await call("DOM.getContentQuads", { backendNodeId: binding.backendDOMNodeId })).quads?.[0];
+        if (!Array.isArray(quad) || quad.length !== 8 || quad.some(n => !Number.isFinite(n))) throw browserOperatorError("operator_target_unavailable");
+        const x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4;
+        const y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
+        if (!Number.isFinite(browserPage.width) || !Number.isFinite(browserPage.height) || x < 0 || y < 0 || x >= browserPage.width || y >= browserPage.height) throw browserOperatorError("operator_target_unavailable");
+        const hit = await call("DOM.getNodeForLocation", { x: Math.floor(x), y: Math.floor(y), includeUserAgentShadowDOM: false });
+        if (hit.backendNodeId !== binding.backendDOMNodeId) throw browserOperatorError("operator_target_unavailable");
+        await dispatchBrowserInputEvent(browserPage, { type: "click", x, y }, 1500, {
+          request: call,
+          // This releases only the press started above, on that same CDP client.
+          // It finishes before a waiting owner handoff can acquire the writer.
+          releasePointer: (method, params) => effectRequest(method, params, 250),
+        });
+      } else {
+        const attributes = Object.fromEntries(Array.from({ length: Math.floor((dom.attributes?.length || 0) / 2) }, (_, i) => [dom.attributes[2*i], dom.attributes[2*i+1]]));
+        if (!["INPUT", "TEXTAREA"].includes(dom.nodeName) || attributes.disabled !== undefined || attributes.readonly !== undefined ||
+            (dom.nodeName === "INPUT" && !["text", "search", "email", "url", "tel", "password"].includes((attributes.type || "text").toLowerCase()))) throw browserOperatorError("operator_target_unavailable");
+        const root = (await call("DOM.getDocument", { depth: 0 })).root;
+        const focused = await call("DOM.querySelector", { nodeId: root.nodeId, selector: ":focus" });
+        if (!focused.nodeId || (await call("DOM.describeNode", { nodeId: focused.nodeId, depth: 0 })).node?.backendNodeId !== binding.backendDOMNodeId) throw browserOperatorError("operator_target_unavailable");
+        await pasteTextIntoBrowserPage(browserPage, { type: "paste_text", text: event.text }, 1500, { request: call });
+      }
+      current();
+      return { schema: "elastos.browser.ref-input-result/v1", page_id: page.pageId, request_id: event.request_id,
+        admission_id: lease.id, document_generation: lease.generation, accepted: true };
+    }, { retryAction: false });
+    effect.done = true;
+    if (!(await settleBrowserOperatorEffect(lease)) || performance.now() >= deadline) throw browserOperatorError("operator_outcome_uncertain");
+    current();
+    receipt.error = null; receipt.result = result;
+    return result;
+  } catch (error) {
+    effect.done = true;
+    await settleBrowserOperatorEffect(lease).catch(() => {});
+    receipt.error = error.code || "operator_outcome_uncertain";
+    lease.active = false;
+    throw browserOperatorError(receipt.error);
+  }
+}
+
+async function withBrowserCdp(browserPage, timeoutMs, action, { retryAction = true } = {}) {
   if (!browserPage?.debugger_url) {
     throw new Error("browser page debugger URL is unavailable");
   }
@@ -4834,7 +5071,8 @@ async function withBrowserCdp(browserPage, timeoutMs, action) {
         throw error;
       }
       cachedCdp.close();
-      browserPage._cdp = null;
+      if (browserPage._cdp === cachedCdp) browserPage._cdp = null;
+      if (!retryAction) throw error;
     }
   }
   const cdp = new CdpClient(browserPage.debugger_url, timeoutMs);
@@ -4888,11 +5126,13 @@ function keyEventDefinition(key) {
   return map[key] || null;
 }
 
-async function dispatchBrowserInputEvent(browserPage, event, timeoutMs) {
-  return withBrowserCdp(browserPage, timeoutMs, async (cdp) => {
+async function dispatchBrowserInputEvent(browserPage, event, timeoutMs, suppliedCdp = null) {
+  const dispatch = async (cdp) => {
+    if (!suppliedCdp) {
     await cdp.request("Page.enable");
     await cdp.request("Runtime.enable");
     await ensureBrowserFileChooserInterception(cdp, browserPage);
+    }
     await cdp.request("Input.setIgnoreInputEvents", { ignore: false }).catch(() => {});
     if (event?.type === "click") {
       const x = finiteCoordinate(event.x);
@@ -4905,6 +5145,7 @@ async function dispatchBrowserInputEvent(browserPage, event, timeoutMs) {
         buttons: 0,
         pointerType: "mouse",
       });
+      try {
       await cdp.request("Input.dispatchMouseEvent", {
         type: "mousePressed",
         x,
@@ -4914,7 +5155,8 @@ async function dispatchBrowserInputEvent(browserPage, event, timeoutMs) {
         clickCount: 1,
         pointerType: "mouse",
       });
-      await cdp.request("Input.dispatchMouseEvent", {
+      } finally {
+      await (cdp.releasePointer || cdp.request.bind(cdp))("Input.dispatchMouseEvent", {
         type: "mouseReleased",
         x,
         y,
@@ -4923,6 +5165,7 @@ async function dispatchBrowserInputEvent(browserPage, event, timeoutMs) {
         clickCount: 1,
         pointerType: "mouse",
       });
+      }
       return;
     }
     if (event?.type === "wheel") {
@@ -4950,7 +5193,8 @@ async function dispatchBrowserInputEvent(browserPage, event, timeoutMs) {
       return;
     }
     throw new Error("unsupported browser input event");
-  });
+  };
+  return suppliedCdp ? dispatch(suppliedCdp) : withBrowserCdp(browserPage, timeoutMs, dispatch);
 }
 
 function validateBrowserNavigationUrl(value) {
@@ -5419,6 +5663,25 @@ async function main() {
         return;
       }
       if (req.method === "POST" && op === "input") {
+        if (body?.event?.type === "operator_lease" && body.event.command === "release") cancelBrowserOperatorLease(page, body.event.admission_id);
+        const ownerHandoff = !String(body?.event?.type || "").startsWith("operator_") && page.operatorLease;
+        if (ownerHandoff) cancelBrowserOperatorLease(page, ownerHandoff.id);
+        const inputStarted = performance.now();
+        // A disconnected/timed-out caller cannot acquire or use a late writer.
+        // Release retains its cleanup obligation after its caller has gone.
+        const operatorCurrent = () => pages.get(pageId) === page &&
+          !res.destroyed && performance.now() - inputStarted < 1800;
+        await withBrowserInputWriter(page, () => pages.get(pageId) === page, async () => {
+        if (body?.event?.type === "operator_lease") {
+          httpJson(res, 200, await browserOperatorLease(page, body.event,
+            body.event.command === "release" ? () => pages.get(pageId) === page : operatorCurrent));
+          return;
+        }
+        if (body?.event?.type === "operator_ref") {
+          httpJson(res, 200, await browserRefInput(page, body.event, operatorCurrent));
+          return;
+        }
+        if (ownerHandoff) await browserOperatorLease(page, { command: "release", admission_id: ownerHandoff.id }, () => pages.get(pageId) === page);
         if (body?.event?.type === "browser_command") {
           const state = await applyBrowserCommand(
             config,
@@ -5515,6 +5778,7 @@ async function main() {
           accepted: false,
           reason: "Selkies input is carried by the WebRTC data channel",
         });
+        }, Boolean(ownerHandoff) || (body?.event?.type === "operator_lease" && body.event.command === "release"));
         return;
       }
       if (req.method === "POST" && op === "close") {

@@ -21,6 +21,8 @@ use std::sync::{Mutex as StdMutex, Weak};
 use tokio::sync::{watch, Notify};
 #[path = "gateway_browser_engine.rs"]
 mod gateway_browser_engine;
+#[path = "gateway_browser_operator.rs"]
+pub(crate) mod gateway_browser_operator;
 #[path = "gateway_browser_response.rs"]
 mod gateway_browser_response;
 #[path = "gateway_browser_sessions.rs"]
@@ -3135,6 +3137,7 @@ async fn browser_page_inspection(
             return browser_inspection_error(error);
         }
     }
+    let started = tokio::time::Instant::now();
     let outcome = async {
         let registry = state
             .provider_registry
@@ -3200,7 +3203,16 @@ async fn browser_page_inspection(
         return browser_inspection_error(BrowserInspectionError::OwnerChanged);
     }
     match outcome {
-        Ok(value) => Json(value).into_response(),
+        Ok(value) => {
+            gateway_browser_operator::remember_inspection(&state, &owner, &value, started).await;
+            if require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID])
+                .is_err()
+                || !browser_inspection_owner_current(&state.data_dir, &owner).await
+            {
+                return browser_inspection_error(BrowserInspectionError::OwnerChanged);
+            }
+            Json(value).into_response()
+        }
         Err(error) => browser_inspection_error(error),
     }
 }
@@ -3239,6 +3251,27 @@ pub(super) async fn browser_app_page_input(
     Path(page_id): Path<String>,
     Json(input): Json<BrowserInputRequest>,
 ) -> Response {
+    if headers.contains_key(AUTHORIZATION) {
+        return gateway_browser_operator::operator_input(state, headers, page_id, input.event)
+            .await;
+    }
+    if input
+        .event
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind.starts_with("operator_"))
+        || input
+            .event
+            .get("schema")
+            .and_then(serde_json::Value::as_str)
+            == Some("elastos.browser.ref-input/v1")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "operator input requires separate writer admission",
+        )
+            .into_response();
+    }
     let authority =
         match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
             Ok(authority) => authority,
@@ -3254,6 +3287,16 @@ pub(super) async fn browser_app_page_input(
         return (StatusCode::NOT_FOUND, "browser session is not active").into_response();
     }
     let event = input.event;
+    if let Err(response) = gateway_browser_operator::return_page_to_owner(
+        &state,
+        &page_id,
+        &principal_id,
+        &owner_launch_id,
+    )
+    .await
+    {
+        return response;
+    }
     let browser_command = event
         .get("type")
         .and_then(|value| value.as_str())

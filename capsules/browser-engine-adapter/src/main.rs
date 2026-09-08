@@ -2109,6 +2109,32 @@ impl BrowserEngineAdapter {
         if !page_control_session_principal_matches(session, principal_id.as_deref()) {
             return Response::error("page_not_found", "browser page not found");
         }
+        if event
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.starts_with("operator_"))
+        {
+            if !elastos_common::browser_protocol::browser_operator_event_valid(&event) {
+                return Response::error(
+                    "invalid_operator_input",
+                    "Browser operator input is invalid",
+                );
+            }
+            return match supervisor_control_json_bounded(
+                &session.socket_path,
+                "POST",
+                &format!("/pages/{page_id}/input"),
+                Some(json!({"event":event,"principal_id":principal_id})),
+                std::time::Duration::from_millis(2500),
+                8192,
+            ) {
+                Ok(data) => Response::ok(data),
+                Err(_) => Response::error(
+                    "operator_outcome_uncertain",
+                    "Browser operator input requires reconciliation",
+                ),
+            };
+        }
         match supervisor_control_json(
             &session.socket_path,
             "POST",

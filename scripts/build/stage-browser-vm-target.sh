@@ -255,6 +255,7 @@ install -m 755 "$native_proxy_bin" "$staging_dir/opt/elastos/bin/browser-native-
 install -m 755 "$runtime_relay_bin" "$staging_dir/opt/elastos/bin/browser-vm-runtime-relay"
 install -m 755 "$guest_control_bridge_bin" "$staging_dir/opt/elastos/bin/browser-vm-guest-control-bridge"
 install -m 644 "$control_service" "$staging_dir/opt/elastos/bin/browser-selkies-control-service.mjs"
+install -m 644 "$repo_root/scripts/browser-input-writer-gate.py" "$staging_dir/opt/elastos/bin/browser_input_writer_gate.py"
 install -m 755 "$vz_transport_bootstrap" "$staging_dir/opt/elastos/bin/browser-vm-vz-transport-bootstrap.mjs"
 install -m 755 "$node_bin" "$staging_dir/opt/elastos/bin/node"
 install -m 755 "$chromium_bin" "$staging_dir/opt/elastos/bin/chromium.real"
@@ -1359,7 +1360,26 @@ def patch_selkies_signaling_retries(source):
             raise SystemExit(f"browser-vm-selkies-start: Selkies {handler} retry patch target not found")
     return source
 
-main_text = patch_selkies_signaling_retries(main_path.read_text())
+def patch_selkies_input_writer(source):
+    input_marker = "    app.on_data_message = webrtc_input.on_message\n"
+    input_patch = """    from browser_input_writer_gate import InputWriterGate
+    input_writer = InputWriterGate(webrtc_input, "/run/elastos/browser-input-writer.sock")
+    app.on_data_message = input_writer.on_message
+"""
+    import_marker = "import sys\n"
+    import_patch = 'import sys\nsys.path.insert(0, "/opt/elastos/bin")\n'
+    close_marker = "        webrtc_input.disconnect()\n"
+    close_patch = "        input_writer.close()\n        webrtc_input.disconnect()\n"
+    if input_patch in source:
+        if any(source.count(value) != 1 for value in (input_patch, import_patch, close_patch)):
+            raise SystemExit("browser-vm-selkies-start: incomplete input writer patch")
+        return source
+    for marker in (input_marker, import_marker, close_marker):
+        if source.count(marker) != 1:
+            raise SystemExit("browser-vm-selkies-start: Selkies input writer patch target not found")
+    return source.replace(input_marker, input_patch, 1).replace(import_marker, import_patch, 1).replace(close_marker, close_patch, 1)
+
+main_text = patch_selkies_input_writer(patch_selkies_signaling_retries(main_path.read_text()))
 transport_helper_marker = "\ndef parse_rtc_config(data):\n"
 transport_helper_patch = '''
 def _elastos_turn_transport_query(url):

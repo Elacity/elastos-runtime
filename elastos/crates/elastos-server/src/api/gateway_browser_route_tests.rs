@@ -8165,3 +8165,528 @@ async fn display_attach_route_concurrent_request_is_bounded_and_close_wins_late_
     assert_eq!(browser_page_session_count(dir.path()).await, 0);
     assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
 }
+
+#[derive(Default)]
+struct OperatorTestProvider {
+    inputs: tokio::sync::Mutex<Vec<serde_json::Value>>,
+    delay: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[async_trait::async_trait]
+impl Provider for OperatorTestProvider {
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["browser-engine"]
+    }
+    fn name(&self) -> &'static str {
+        "mock-browser-engine"
+    }
+    async fn handle(&self, request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        MockBrowserEngineProvider.handle(request).await
+    }
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        if request["op"] == "inspect" {
+            return InspectionTestProvider::default().send_raw(request).await;
+        }
+        if request["op"] != "input" {
+            return MockBrowserEngineProvider.send_raw(request).await;
+        }
+        let event = &request["event"];
+        self.inputs.lock().await.push(event.clone());
+        if event["type"] == "operator_ref" && self.delay.load(std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        let result = if event["type"] == "operator_lease" {
+            json!({"schema":"elastos.browser.input-result/v1","page_id":request["page_id"],"admission_id":event["admission_id"],"accepted":true,"writer_acquired":event["command"]=="acquire"})
+        } else if event["type"] == "operator_ref" {
+            json!({"schema":"elastos.browser.ref-input-result/v1","page_id":request["page_id"],"request_id":event["request_id"],"admission_id":event["admission_id"],"document_generation":event["document_generation"],"accepted":true})
+        } else {
+            json!({"schema":"elastos.browser.input-result/v1","page_id":request["page_id"],"accepted":true})
+        };
+        Ok(json!({"status":"ok","data":result}))
+    }
+}
+
+async fn operator_request(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    session: &str,
+    capability: Option<&str>,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let mut request = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(AUTHORIZATION, format!("Bearer {session}"))
+        .header(CONTENT_TYPE, "application/json");
+    if let Some(capability) = capability {
+        request = request.header("x-elastos-capability", capability);
+    }
+    let response = app
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({})),
+    )
+}
+async fn owner_operator_request(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    owner: &str,
+) -> StatusCode {
+    app.oneshot(
+        test_browser_request("localhost:61180", "null")
+            .method(method)
+            .uri(uri)
+            .header("x-elastos-home-token", owner)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .status()
+}
+
+#[tokio::test]
+async fn test_browser_operator_admission_separate_session_quota_replay_and_handoff() {
+    use elastos_runtime::{
+        primitives::audit::AuditLog,
+        session::{SessionRegistry, SessionType},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("operator-owner"));
+    let owner = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let foreign_launch = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let sessions = Arc::new(SessionRegistry::new(Arc::new(AuditLog::new())));
+    let _service = register_browser_operator_sessions(dir.path(), sessions.clone());
+    // Use the actual local attach exchange; the Browser grant does not mint or
+    // impersonate this separately authenticated Runtime session.
+    let attached = crate::api::handlers::attach::attach(
+        State(crate::api::handlers::attach::AttachState {
+            session_registry: sessions.clone(),
+            secret: "private-test-attach".into(),
+        }),
+        Json(crate::api::handlers::attach::AttachRequest {
+            secret: "private-test-attach".into(),
+            scope: "client".into(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(attached.status(), StatusCode::OK);
+    let attached: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(attached.into_body(), 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let operator = sessions
+        .validate_token(attached["token"].as_str().unwrap())
+        .await
+        .unwrap();
+    let foreign = sessions.create_session(SessionType::Capsule, None).await;
+    let state = browser_engine_attached_test_state(dir.path()).await;
+    let provider = Arc::new(OperatorTestProvider::default());
+    state
+        .provider_registry
+        .as_ref()
+        .unwrap()
+        .unregister_sub_provider("browser-engine")
+        .await
+        .unwrap();
+    state
+        .provider_registry
+        .as_ref()
+        .unwrap()
+        .register_sub_provider("browser-engine", provider.clone())
+        .await
+        .unwrap();
+    let app = gateway_router(state);
+    let opened = open_mock_browser_page_result(app.clone(), &owner, "operator admission").await;
+    let page = opened["engine_page"]["page_id"].as_str().unwrap();
+    let uri = format!("/api/apps/browser/pages/{page}/operator-requests");
+    let inspected = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(format!("/api/apps/browser/pages/{page}/inspect"))
+                .header("x-elastos-home-token", &owner)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"schema":"elastos.browser.inspect-request/v1"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inspected.status(), StatusCode::OK);
+
+    let request = json!({"schema":"elastos.browser.operator-request/v1","document_generation":"a".repeat(32),"actions":["click","type"],"duration_ms":30000,"max_actions":2,"reason":"Complete the form"});
+    assert_eq!(
+        operator_request(app.clone(), "POST", &uri, &owner, None, request.clone())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let pending = operator_request(app.clone(), "POST", &uri, &operator.token, None, request).await;
+    assert_eq!(pending.0, StatusCode::OK);
+    let id = pending.1["request_id"].as_str().unwrap();
+    let decision = format!("{uri}/{id}");
+    assert_eq!(
+        owner_operator_request(app.clone(), "POST", &decision, &foreign_launch).await,
+        StatusCode::NOT_FOUND
+    );
+    assert!(provider.inputs.lock().await.is_empty());
+    assert_eq!(
+        owner_operator_request(app.clone(), "POST", &decision, &owner).await,
+        StatusCode::OK
+    );
+    let grant = operator_request(
+        app.clone(),
+        "GET",
+        &decision,
+        &operator.token,
+        None,
+        json!({}),
+    )
+    .await
+    .1;
+    let capability = grant["capability"].as_str().unwrap();
+    let mut event = json!({"schema":"elastos.browser.ref-input/v1","request_id":"b".repeat(32),"admission_id":id,"document_generation":"a".repeat(32),"ref":format!("{}:0","b".repeat(32)),"action":"click"});
+    let input_uri = format!("/api/apps/browser/pages/{page}/input");
+    assert_eq!(
+        operator_request(
+            app.clone(),
+            "POST",
+            &input_uri,
+            &foreign.token,
+            Some(capability),
+            json!({"event":event})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let mut foreign_ref = event.clone();
+    foreign_ref["ref"] = json!(format!("{}:0", "c".repeat(32)));
+    assert_eq!(
+        operator_request(
+            app.clone(),
+            "POST",
+            &input_uri,
+            &operator.token,
+            Some(capability),
+            json!({"event":foreign_ref})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        provider.inputs.lock().await.len(),
+        1,
+        "foreign ref never reaches the provider"
+    );
+    let clicked = operator_request(
+        app.clone(),
+        "POST",
+        &input_uri,
+        &operator.token,
+        Some(capability),
+        json!({"event":event}),
+    )
+    .await;
+    assert_eq!(clicked.0, StatusCode::OK);
+    assert_eq!(clicked.1["accepted"], true);
+    assert_eq!(
+        operator_request(
+            app.clone(),
+            "POST",
+            &input_uri,
+            &operator.token,
+            Some(capability),
+            json!({"event":event})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(provider.inputs.lock().await.len(), 2); // one lease + one actual input
+    event["action"] = json!("type");
+    event["text"] = json!("hello");
+    assert_eq!(
+        operator_request(
+            app.clone(),
+            "POST",
+            &input_uri,
+            &operator.token,
+            Some(capability),
+            json!({"event":event})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    event["request_id"] = json!("d".repeat(32));
+    assert_eq!(
+        operator_request(
+            app.clone(),
+            "POST",
+            &input_uri,
+            &operator.token,
+            Some(capability),
+            json!({"event":event})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    event["request_id"] = json!("e".repeat(32));
+    assert_eq!(
+        operator_request(
+            app.clone(),
+            "POST",
+            &input_uri,
+            &operator.token,
+            Some(capability),
+            json!({"event":event})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let before = provider.inputs.lock().await.len();
+    let human = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(&input_uri)
+                .header("x-elastos-home-token", &owner)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"event":{"type":"click","x":10,"y":20}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(human.status(), StatusCode::OK);
+    let inputs = provider.inputs.lock().await;
+    assert_eq!(inputs[before]["command"], "release");
+    assert_eq!(inputs[before + 1]["type"], "click");
+    drop(inputs);
+    assert_eq!(
+        operator_request(
+            app.clone(),
+            "POST",
+            &input_uri,
+            &operator.token,
+            Some(capability),
+            json!({"event":event})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    // Each lifecycle boundary rejects before another Engine input. Keep the
+    // original Runtime service alive to prove replacement, not merely drop.
+    let mut replacement = None;
+    for boundary in ["expiry", "revoke", "session", "runtime"] {
+        let candidate = sessions.create_session(SessionType::Capsule, None).await;
+        let request = json!({"schema":"elastos.browser.operator-request/v1",
+            "document_generation":"a".repeat(32),"actions":["click"],
+            "duration_ms":if boundary == "expiry" {2000} else {30000},
+            "max_actions":1,"reason":"Check writer lifetime"});
+        let pending =
+            operator_request(app.clone(), "POST", &uri, &candidate.token, None, request).await;
+        assert_eq!(pending.0, StatusCode::OK);
+        let id = pending.1["request_id"].as_str().unwrap();
+        let decision = format!("{uri}/{id}");
+        assert_eq!(
+            owner_operator_request(app.clone(), "POST", &decision, &owner).await,
+            StatusCode::OK
+        );
+        let grant = operator_request(
+            app.clone(),
+            "GET",
+            &decision,
+            &candidate.token,
+            None,
+            json!({}),
+        )
+        .await
+        .1;
+        let capability = grant["capability"].as_str().unwrap();
+        let expected = match boundary {
+            "expiry" => {
+                tokio::time::sleep(std::time::Duration::from_millis(2050)).await;
+                StatusCode::FORBIDDEN
+            }
+            "revoke" => {
+                assert_eq!(
+                    owner_operator_request(app.clone(), "DELETE", &decision, &owner).await,
+                    StatusCode::OK
+                );
+                StatusCode::FORBIDDEN
+            }
+            "session" => {
+                sessions.invalidate_session(&candidate.token).await;
+                StatusCode::UNAUTHORIZED
+            }
+            "runtime" => {
+                replacement = Some(register_browser_operator_sessions(
+                    dir.path(),
+                    sessions.clone(),
+                ));
+                StatusCode::NOT_FOUND
+            }
+            _ => unreachable!(),
+        };
+        let before = provider.inputs.lock().await.len();
+        let event = json!({"schema":"elastos.browser.ref-input/v1","request_id":"f".repeat(32),
+            "admission_id":id,"document_generation":"a".repeat(32),
+            "ref":format!("{}:0","b".repeat(32)),"action":"click"});
+        assert_eq!(
+            operator_request(
+                app.clone(),
+                "POST",
+                &input_uri,
+                &candidate.token,
+                Some(capability),
+                json!({"event":event})
+            )
+            .await
+            .0,
+            expected,
+            "{boundary}"
+        );
+        assert_eq!(
+            provider.inputs.lock().await.len(),
+            before,
+            "{boundary} dispatched input"
+        );
+        if boundary != "runtime" {
+            assert_eq!(
+                owner_operator_request(app.clone(), "DELETE", &decision, &owner).await,
+                StatusCode::OK
+            );
+        }
+    }
+    drop(replacement);
+    assert_eq!(browser_page_session_count(dir.path()).await, 1);
+}
+
+#[tokio::test]
+async fn test_browser_operator_late_input_cannot_publish_after_owner_close() {
+    use elastos_runtime::{
+        primitives::audit::AuditLog,
+        session::{SessionRegistry, SessionType},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("operator-close-owner"));
+    let owner = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let sessions = Arc::new(SessionRegistry::new(Arc::new(AuditLog::new())));
+    let _service = register_browser_operator_sessions(dir.path(), sessions.clone());
+    let operator = sessions.create_session(SessionType::Capsule, None).await;
+    let state = browser_engine_attached_test_state(dir.path()).await;
+    let provider = Arc::new(OperatorTestProvider::default());
+    state
+        .provider_registry
+        .as_ref()
+        .unwrap()
+        .unregister_sub_provider("browser-engine")
+        .await
+        .unwrap();
+    state
+        .provider_registry
+        .as_ref()
+        .unwrap()
+        .register_sub_provider("browser-engine", provider.clone())
+        .await
+        .unwrap();
+    let app = gateway_router(state);
+    let opened = open_mock_browser_page_result(app.clone(), &owner, "operator close").await;
+    let page = opened["engine_page"]["page_id"].as_str().unwrap();
+    let uri = format!("/api/apps/browser/pages/{page}/operator-requests");
+    let inspected = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(format!("/api/apps/browser/pages/{page}/inspect"))
+                .header("x-elastos-home-token", &owner)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"schema":"elastos.browser.inspect-request/v1"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inspected.status(), StatusCode::OK);
+
+    let pending=operator_request(app.clone(),"POST",&uri,&operator.token,None,json!({"schema":"elastos.browser.operator-request/v1","document_generation":"a".repeat(32),"actions":["click"],"duration_ms":30000,"max_actions":1,"reason":"Click control"})).await.1;
+    let id = pending["request_id"].as_str().unwrap();
+    let decision = format!("{uri}/{id}");
+    assert_eq!(
+        owner_operator_request(app.clone(), "POST", &decision, &owner).await,
+        StatusCode::OK
+    );
+    let grant = operator_request(
+        app.clone(),
+        "GET",
+        &decision,
+        &operator.token,
+        None,
+        json!({}),
+    )
+    .await
+    .1;
+    let capability = grant["capability"].as_str().unwrap().to_string();
+    provider
+        .delay
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let input_uri = format!("/api/apps/browser/pages/{page}/input");
+    let event = json!({"schema":"elastos.browser.ref-input/v1","request_id":"b".repeat(32),"admission_id":id,"document_generation":"a".repeat(32),"ref":format!("{}:0","b".repeat(32)),"action":"click"});
+    let input_app = app.clone();
+    let session_token = operator.token.clone();
+    let pending = tokio::spawn(async move {
+        operator_request(
+            input_app,
+            "POST",
+            &input_uri,
+            &session_token,
+            Some(&capability),
+            json!({"event":event}),
+        )
+        .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        provider.entered.notified(),
+    )
+    .await
+    .unwrap();
+    let closed=app.oneshot(test_browser_request("localhost:61180","null").method("POST").uri(format!("/api/apps/browser/pages/{page}/close")).header("x-elastos-home-token",&owner).header(CONTENT_TYPE,"application/json").body(Body::from(json!({"schema":"elastos.browser.close-request/v2","cleanup_id":browser_cleanup_id(&opened)}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(closed.status(), StatusCode::OK);
+    provider.release.notify_one();
+    let result = pending.await.unwrap();
+    assert_eq!(result.0, StatusCode::CONFLICT);
+    assert_eq!(result.1["accepted"], false);
+    assert_eq!(result.1["outcome"], "uncertain");
+    assert_eq!(browser_page_session_count(dir.path()).await, 0);
+}

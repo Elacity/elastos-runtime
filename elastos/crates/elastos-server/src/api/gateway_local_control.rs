@@ -25,6 +25,7 @@ pub(crate) struct GatewayLocalControl {
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     _coords: crate::runtime_control::GatewayRuntimeCoordsGuard,
+    _browser_operators: Arc<super::gateway::BrowserOperatorService>,
 }
 
 pub(crate) async fn start_gateway_local_control(
@@ -39,6 +40,8 @@ pub(crate) async fn start_gateway_local_control(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let session_registry = Arc::new(SessionRegistry::new(Arc::new(AuditLog::new())));
+    let browser_operators =
+        super::gateway::register_browser_operator_sessions(data_dir, session_registry.clone());
     let app = gateway_local_control_router(registry, session_registry, attach_secret.clone());
     let (shutdown, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -72,6 +75,7 @@ pub(crate) async fn start_gateway_local_control(
         shutdown: Some(shutdown),
         task: Some(task),
         _coords: coords_guard,
+        _browser_operators: browser_operators,
     })
 }
 

@@ -46,6 +46,9 @@ use url::form_urlencoded;
 mod gateway_assistant;
 #[path = "gateway_browser.rs"]
 mod gateway_browser;
+pub(crate) use gateway_browser::gateway_browser_operator::{
+    register_browser_operator_sessions, BrowserOperatorService,
+};
 #[path = "gateway_capsule_catalog.rs"]
 mod gateway_capsule_catalog;
 #[path = "gateway_collaboration_presence.rs"]
@@ -823,6 +826,17 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/apps/browser/pages/:page_id/inspect",
             get(gateway_browser::browser_app_page_inspection_capabilities)
                 .post(gateway_browser::browser_app_page_inspect),
+        )
+        .route(
+            "/api/apps/browser/pages/:page_id/operator-requests",
+            get(gateway_browser::gateway_browser_operator::pending_admissions)
+                .post(gateway_browser::gateway_browser_operator::request_admission),
+        )
+        .route(
+            "/api/apps/browser/pages/:page_id/operator-requests/:id",
+            get(gateway_browser::gateway_browser_operator::admission_status)
+                .post(gateway_browser::gateway_browser_operator::approve_admission)
+                .delete(gateway_browser::gateway_browser_operator::revoke_admission),
         )
         .route(
             "/api/apps/browser/pages/:page_id/heartbeat",

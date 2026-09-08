@@ -1790,8 +1790,22 @@ pub(in crate::api::gateway) struct BrowserInspectionOwner {
     owner_launch_id: String,
     page_id: String,
     cleanup_id: String,
+    profile_key_hash: Option<String>,
+    browser_instance: Option<String>,
     generation: String,
     pub(in crate::api::gateway) engine_route_provider: String,
+}
+
+impl BrowserInspectionOwner {
+    pub(super) fn principal_id(&self) -> &str {
+        &self.principal_id
+    }
+    pub(super) fn launch_id(&self) -> &str {
+        &self.owner_launch_id
+    }
+    pub(super) fn page_id(&self) -> &str {
+        &self.page_id
+    }
 }
 
 pub(in crate::api::gateway) async fn capture_browser_inspection_owner(
@@ -1822,6 +1836,8 @@ pub(in crate::api::gateway) async fn capture_browser_inspection_owner(
             owner_launch_id: owner_launch_id.into(),
             page_id: page_id.into(),
             cleanup_id: session.cleanup_id.clone(),
+            profile_key_hash: session.profile_key_hash.clone(),
+            browser_instance: session.browser_instance.clone(),
             generation: session.generation.clone(),
             engine_route_provider: session.engine_route_provider.clone(),
         })

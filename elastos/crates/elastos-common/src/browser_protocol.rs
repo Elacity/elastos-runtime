@@ -9,6 +9,8 @@ use std::collections::BTreeSet;
 
 mod inspection;
 pub use inspection::*;
+mod operator;
+pub use operator::*;
 
 pub const BROWSER_ENGINE_PROVIDER_ID: &str = "browser-engine-adapter";
 pub const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.1";
