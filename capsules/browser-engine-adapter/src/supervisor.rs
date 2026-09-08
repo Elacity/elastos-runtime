@@ -536,6 +536,13 @@ pub(super) fn parse_http_json_response(response: &[u8]) -> Result<Value, String>
         if let Some(error) = json
             .get("code")
             .and_then(Value::as_str)
+            .and_then(BrowserInspectionError::from_code)
+        {
+            return Err(error.code().to_string());
+        }
+        if let Some(error) = json
+            .get("code")
+            .and_then(Value::as_str)
             .and_then(BrowserDisplayError::from_code)
         {
             return Err(error.code().to_string());

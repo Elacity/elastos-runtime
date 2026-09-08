@@ -1781,6 +1781,67 @@ pub(in crate::api::gateway) async fn touch_browser_page(
     false
 }
 
+/// A read retains the exact acquired owner across provider dispatch. Capturing
+/// this value does not renew, navigate, attach a viewer, or acquire a lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::api::gateway) struct BrowserInspectionOwner {
+    scope: String,
+    principal_id: String,
+    owner_launch_id: String,
+    page_id: String,
+    cleanup_id: String,
+    generation: String,
+    pub(in crate::api::gateway) engine_route_provider: String,
+}
+
+pub(in crate::api::gateway) async fn capture_browser_inspection_owner(
+    data_dir: &Path,
+    page_id: &str,
+    principal_id: &str,
+    owner_launch_id: &str,
+) -> Option<BrowserInspectionOwner> {
+    let scope = browser_session_scope(data_dir);
+    let registry = BROWSER_SESSION_REGISTRY
+        .get_or_init(Default::default)
+        .lock()
+        .await;
+    registry
+        .sessions
+        .values()
+        .find(|session| {
+            session.scope == scope
+                && session.principal_id == principal_id
+                && session.owner_launch_id == owner_launch_id
+                && session.page_id.as_deref() == Some(page_id)
+                && session.state == BrowserSessionState::Active
+                && session.phase == BrowserLifecyclePhase::ActiveSession
+        })
+        .map(|session| BrowserInspectionOwner {
+            scope,
+            principal_id: principal_id.into(),
+            owner_launch_id: owner_launch_id.into(),
+            page_id: page_id.into(),
+            cleanup_id: session.cleanup_id.clone(),
+            generation: session.generation.clone(),
+            engine_route_provider: session.engine_route_provider.clone(),
+        })
+}
+
+pub(in crate::api::gateway) async fn browser_inspection_owner_current(
+    data_dir: &Path,
+    owner: &BrowserInspectionOwner,
+) -> bool {
+    capture_browser_inspection_owner(
+        data_dir,
+        &owner.page_id,
+        &owner.principal_id,
+        &owner.owner_launch_id,
+    )
+    .await
+    .as_ref()
+        == Some(owner)
+}
+
 pub(in crate::api::gateway) async fn touch_browser_page_transport_authority(
     data_dir: &Path,
     page_id: &str,
@@ -3527,6 +3588,67 @@ mod tests {
             last_frame_at: None,
             failure_reason: None,
         }
+    }
+
+    #[tokio::test]
+    async fn inspection_owner_fences_replacement_and_retirement_without_renewing() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = browser_session_scope(dir.path());
+        let record = test_session_record(
+            &scope,
+            Some("page:inspect-race"),
+            BrowserSessionState::Active,
+            Instant::now(),
+            Instant::now(),
+        );
+        let key = format!("{scope}:inspect-race");
+        let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+        registry
+            .lock()
+            .await
+            .sessions
+            .insert(key.clone(), record.clone());
+        let owner = capture_browser_inspection_owner(
+            dir.path(),
+            "page:inspect-race",
+            "person:local:test",
+            "launch:test",
+        )
+        .await
+        .unwrap();
+        assert!(browser_inspection_owner_current(dir.path(), &owner).await);
+        assert_eq!(
+            registry.lock().await.sessions[&key].last_seen_at,
+            record.last_seen_at
+        );
+        for change in [
+            "principal",
+            "launch",
+            "page",
+            "cleanup",
+            "generation",
+            "route",
+            "retiring",
+        ] {
+            let mut replaced = record.clone();
+            match change {
+                "principal" => replaced.principal_id.push_str("-new"),
+                "launch" => replaced.owner_launch_id.push_str("-new"),
+                "page" => replaced.page_id = Some("page:other".into()),
+                "cleanup" => replaced.cleanup_id.push_str("-new"),
+                "generation" => replaced.generation.push_str("-new"),
+                "route" => replaced.engine_route_provider.push_str("-new"),
+                "retiring" => replaced.phase = BrowserLifecyclePhase::Retiring,
+                _ => unreachable!(),
+            }
+            registry.lock().await.sessions.insert(key.clone(), replaced);
+            assert!(
+                !browser_inspection_owner_current(dir.path(), &owner).await,
+                "{change}"
+            );
+        }
+        registry.lock().await.sessions.remove(&key);
+        assert!(!browser_inspection_owner_current(dir.path(), &owner).await);
     }
 
     #[tokio::test]

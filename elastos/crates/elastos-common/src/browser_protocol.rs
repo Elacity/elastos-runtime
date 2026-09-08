@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
+mod inspection;
+pub use inspection::*;
+
 pub const BROWSER_ENGINE_PROVIDER_ID: &str = "browser-engine-adapter";
 pub const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.1";
 pub const BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA: &str = "elastos.browser.engine-cleanup-binding/v2";

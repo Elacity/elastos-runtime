@@ -818,6 +818,11 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             get(gateway_browser::browser_app_page_diagnostics),
         )
         .route(
+            "/api/apps/browser/pages/:page_id/inspect",
+            get(gateway_browser::browser_app_page_inspection_capabilities)
+                .post(gateway_browser::browser_app_page_inspect),
+        )
+        .route(
             "/api/apps/browser/pages/:page_id/heartbeat",
             post(gateway_browser::browser_app_page_heartbeat),
         )

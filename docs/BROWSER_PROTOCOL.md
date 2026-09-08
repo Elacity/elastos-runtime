@@ -67,11 +67,23 @@ Current HTTP adaptation:
 | Observe acquisition | `GET /api/apps/browser/open/:open_id` | `elastos.browser.open-status/v1`, bound to the verified launch owner |
 | Observe page | `GET /api/apps/browser/pages/:page_id/status` | `elastos.browser.page-status/v1` |
 | Observe diagnostics | `GET /api/apps/browser/pages/:page_id/diagnostics` | Bounded, authorized diagnostics for that page |
+| Discover page inspection | `GET /api/apps/browser/pages/:page_id/inspect` | Optional `elastos.browser.inspect-capabilities/v1` |
+| Inspect the Engine document | `POST /api/apps/browser/pages/:page_id/inspect` | `elastos.browser.inspect-request/v1`: schema, limit and cursor; `elastos.browser.inspect-result/v1` |
 | Renew viewer activity | `POST /api/apps/browser/pages/:page_id/heartbeat` | Exact page ownership and Runtime lease handling |
 | Input | `POST /api/apps/browser/pages/:page_id/input` | `BrowserInputRequest`; the Engine validates its typed input-event schema |
 | Signaling | `POST /api/apps/browser/pages/:page_id/webrtc` | `BrowserWebrtcSignalRequest`; Runtime validates type, bounds and page binding |
 | Close | `POST /api/apps/browser/pages/:page_id/close` | `BrowserPageCloseRequest` with `elastos.browser.close-request/v2` and the Runtime cleanup handle |
 | Reset profile | `POST /api/apps/browser/profile/reset` | Explicit principal-bound destructive operation |
+
+Page inspection projects native Engine accessibility roles, names, descriptions
+and values from the top document. Each result binds a document generation and
+snapshot ID. Opaque node references map to private Engine nodes; navigation,
+replacement, close and a 30-second expiry invalidate the snapshot. The provider
+limits collection to 512 nodes, 128 KiB and 1.5 seconds; each response contains
+at most 64 nodes and 32 KiB. Native reply size and expansion work are bounded.
+Runtime checks the exact launch owner before dispatch and before returning
+content. This read preserves the page, media and input lifetimes. Typed actions,
+delegation, child frames and operator-adapter conformance remain B04 successors.
 
 The private `BrowserProfileDescriptor` includes the host-adapter disk binding.
 Runtime sends that descriptor only to its selected Engine adapter. Public

@@ -1,4 +1,169 @@
 use super::*;
+
+#[derive(Default)]
+struct InspectionTestProvider {
+    calls: std::sync::atomic::AtomicUsize,
+    delay: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl Provider for InspectionTestProvider {
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["browser-engine"]
+    }
+    fn name(&self) -> &'static str {
+        "mock-browser-engine"
+    }
+    async fn handle(&self, request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        MockBrowserEngineProvider.handle(request).await
+    }
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        if request["op"] != "inspect" {
+            return MockBrowserEngineProvider.send_raw(request).await;
+        }
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.delay.load(std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        let data = if request["request"].is_null() {
+            json!({"schema":"elastos.browser.inspect-capabilities/v1", "page_id":request["page_id"],
+                "formats":["accessibility_tree"], "max_nodes":512,"max_page_nodes":64,"max_snapshot_bytes":131072,
+                "max_response_bytes":32768,"snapshot_ttl_ms":30000,"timeout_ms":1500})
+        } else {
+            json!({"schema":"elastos.browser.inspect-result/v1", "page_id":request["page_id"],
+                "document_generation":"a".repeat(32),"snapshot_id":"b".repeat(32),
+                "nodes":[{"ref":format!("{}:0","b".repeat(32)),"role":"button",
+                    "name":"Actual Engine page content","description":"","value":null}],"next_cursor":null,"truncated":false})
+        };
+        Ok(json!({"status":"ok", "data":data}))
+    }
+}
+
+#[tokio::test]
+async fn test_browser_inspection_authorizes_launch_before_dispatch_and_rechecks_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = passkey_authority_with_name(dir.path(), Some("inspection-owner"));
+    let foreign = passkey_authority_with_name_role(
+        dir.path(),
+        Some("inspection-foreign"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &owner);
+    let other_launch = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &owner);
+    let other_principal = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &foreign);
+    let state = browser_engine_attached_test_state(dir.path()).await;
+    let provider = Arc::new(InspectionTestProvider::default());
+    let registry = state.provider_registry.as_ref().unwrap();
+    registry
+        .unregister_sub_provider("browser-engine")
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider("browser-engine", provider.clone())
+        .await
+        .unwrap();
+    let app = gateway_router(state);
+    let opened = open_mock_browser_page_result(app.clone(), &token, "inspection authority").await;
+    let page_id = opened["engine_page"]["page_id"].as_str().unwrap();
+    let uri = format!("/api/apps/browser/pages/{page_id}/inspect");
+    for other in [&other_launch, &other_principal] {
+        for method in ["GET", "POST"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    test_browser_request("localhost:61180", "null")
+                        .method(method)
+                        .uri(&uri)
+                        .header("x-elastos-home-token", other)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"schema":"elastos.browser.inspect-request/v1"}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let discovery = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(&uri)
+                .header("x-elastos-home-token", &token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(discovery.status(), StatusCode::OK);
+    let inspected = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(&uri)
+                .header("x-elastos-home-token", &token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"schema":"elastos.browser.inspect-request/v1","limit":1}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inspected.status(), StatusCode::OK);
+    let content = axum::body::to_bytes(inspected.into_body(), 32768)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&content).contains("Actual Engine page content"));
+    assert_eq!(browser_page_session_count(dir.path()).await, 1);
+
+    provider
+        .delay
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let pending = tokio::spawn(
+        app.clone().oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(&uri)
+                .header("x-elastos-home-token", &token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"schema":"elastos.browser.inspect-request/v1"}"#,
+                ))
+                .unwrap(),
+        ),
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        provider.entered.notified(),
+    )
+    .await
+    .unwrap();
+    let closed = app.oneshot(test_browser_request("localhost:61180", "null")
+        .method("POST").uri(format!("/api/apps/browser/pages/{page_id}/close"))
+        .header("x-elastos-home-token", &token).header(CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"schema":"elastos.browser.close-request/v2","cleanup_id":browser_cleanup_id(&opened)}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(closed.status(), StatusCode::OK);
+    provider.release.notify_one();
+    let rejected = pending.await.unwrap().unwrap();
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(rejected.into_body(), 32768)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("inspection_owner_changed"));
+    assert!(!String::from_utf8_lossy(&body).contains("Actual Engine page content"));
+    assert_eq!(browser_page_session_count(dir.path()).await, 0);
+}
 use crate::api::browser_engine_protocol::{
     BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA, BROWSER_ENGINE_PROTOCOL_VERSION,
 };

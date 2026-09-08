@@ -10,11 +10,12 @@ use crate::api::browser_engine_protocol::{
 };
 pub(super) use elastos_common::browser_protocol::{
     browser_display_generation_valid, browser_display_request_id_valid,
-    validate_browser_display_attach_result, BrowserCompatibilityError, BrowserDisplayAttachment,
-    BrowserDisplayError, BrowserDisplayMode, BrowserEngineInventory, BrowserGuaranteeLevel,
-    BrowserInputRequest, BrowserOpenRequest, BrowserPageCloseRequest, BrowserProfileDescriptor,
-    BrowserViewport as BrowserViewportRequest, BrowserWebrtcSignalRequest,
-    BROWSER_DISPLAY_ATTACH_REQUEST_SCHEMA,
+    validate_browser_display_attach_result, validate_browser_inspection_result,
+    BrowserCompatibilityError, BrowserDisplayAttachment, BrowserDisplayError, BrowserDisplayMode,
+    BrowserEngineInventory, BrowserGuaranteeLevel, BrowserInputRequest, BrowserInspectionError,
+    BrowserInspectionRequest, BrowserOpenRequest, BrowserPageCloseRequest,
+    BrowserProfileDescriptor, BrowserViewport as BrowserViewportRequest,
+    BrowserWebrtcSignalRequest, BROWSER_DISPLAY_ATTACH_REQUEST_SCHEMA,
 };
 use std::sync::{Mutex as StdMutex, Weak};
 use tokio::sync::{watch, Notify};
@@ -3070,6 +3071,130 @@ pub(super) async fn browser_app_page_diagnostics(
             "browser-engine",
             anyhow::anyhow!("browser-engine provider returned an invalid diagnostics response"),
         ),
+    }
+}
+
+pub(super) async fn browser_app_page_inspection_capabilities(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Path(page_id): Path<String>,
+) -> Response {
+    browser_page_inspection(state, headers, page_id, None).await
+}
+
+pub(super) async fn browser_app_page_inspect(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Path(page_id): Path<String>,
+    Json(request): Json<BrowserInspectionRequest>,
+) -> Response {
+    browser_page_inspection(state, headers, page_id, Some(request)).await
+}
+
+fn browser_inspection_error(error: BrowserInspectionError) -> Response {
+    (
+        StatusCode::from_u16(error.http_status()).unwrap(),
+        Json(serde_json::json!({
+            "schema": "elastos.browser.inspect-error/v1", "code": error.code(),
+            "error": "Browser page inspection could not complete.",
+        })),
+    )
+        .into_response()
+}
+
+async fn browser_page_inspection(
+    state: GatewayState,
+    headers: HeaderMap,
+    page_id: String,
+    request: Option<BrowserInspectionRequest>,
+) -> Response {
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
+            Err(err) => return gateway_provider_error_response("browser", err),
+        };
+    if !is_safe_runtime_id(&page_id) {
+        return browser_inspection_error(BrowserInspectionError::Invalid);
+    }
+    let principal = authority.home_launch_context().principal_id;
+    let launch = authority.verified_context().launch_id();
+    let Some(owner) =
+        capture_browser_inspection_owner(&state.data_dir, &page_id, &principal, launch).await
+    else {
+        return (StatusCode::NOT_FOUND, "browser session is not active").into_response();
+    };
+    if let Some(request) = request.as_ref() {
+        if let Err(error) = request.validate() {
+            return browser_inspection_error(error);
+        }
+    }
+    let outcome = async {
+        let registry = state
+            .provider_registry
+            .as_ref()
+            .ok_or(BrowserInspectionError::Unsupported)?;
+        let registration = registry
+            .registration_for_uri("elastos://browser-engine/page/inspect")
+            .await
+            .ok_or(BrowserInspectionError::Unsupported)?;
+        if registration.provider != owner.engine_route_provider {
+            return Err(BrowserInspectionError::OwnerChanged);
+        }
+        if !browser_inspection_owner_current(&state.data_dir, &owner).await {
+            return Err(BrowserInspectionError::OwnerChanged);
+        }
+        let call = browser_provider_resource_call(
+            "browser-engine",
+            "inspect",
+            "elastos://browser-engine/page/inspect".into(),
+            serde_json::json!({
+                "page_id": page_id, "principal_id": principal, "request": request,
+            }),
+        )
+        .map_err(|_| BrowserInspectionError::Failed)?;
+        // The guest spends at most 1.5s collecting, the adapter at most 2.5s on
+        // its control exchange. This read timeout creates no retry or cleanup.
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            browser_provider_resource_response(&state, call),
+        )
+        .await
+        .map_err(|_| BrowserInspectionError::Failed)?
+        .map_err(|_| BrowserInspectionError::Failed)?;
+        let mut envelope = &response;
+        for _ in 0..4 {
+            match envelope.get("status").and_then(serde_json::Value::as_str) {
+                Some("error") => {
+                    return Err(envelope
+                        .get("code")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(BrowserInspectionError::from_code)
+                        .unwrap_or(BrowserInspectionError::Unsupported))
+                }
+                Some("ok") => match envelope.get("data") {
+                    Some(data) => envelope = data,
+                    None => break,
+                },
+                _ => break,
+            }
+        }
+        validate_browser_inspection_result(
+            &page_id,
+            request.as_ref(),
+            provider_response_data(&response).ok_or(BrowserInspectionError::Failed)?,
+        )
+    }
+    .await;
+    // Revalidate both the still-live grant and exact owner before publishing
+    // content. A late provider success cannot resurrect or disclose a closed page.
+    if require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]).is_err()
+        || !browser_inspection_owner_current(&state.data_dir, &owner).await
+    {
+        return browser_inspection_error(BrowserInspectionError::OwnerChanged);
+    }
+    match outcome {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => browser_inspection_error(error),
     }
 }
 

@@ -1860,10 +1860,15 @@ function summarizeIceCandidate(candidate) {
   };
 }
 
-function readJsonRequest(req) {
+function readJsonRequest(req, maxBytes = Infinity) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
+    let received = 0;
+    req.on("data", (chunk) => {
+      received += chunk.length;
+      if (received > maxBytes) { reject(browserInspectionError("invalid_inspection")); return; }
+      chunks.push(chunk);
+    });
     req.on("end", () => {
       try {
         const raw = Buffer.concat(chunks).toString("utf8");
@@ -1877,9 +1882,10 @@ function readJsonRequest(req) {
 }
 
 export class MinimalWebSocketClient {
-  constructor(url, { basicAuth } = {}) {
+  constructor(url, { basicAuth, maxIncomingBytes } = {}) {
     this.url = url;
     this.basicAuth = basicAuth;
+    this.maxIncomingBytes = maxIncomingBytes;
     this.socket = null;
     this.buffer = Buffer.alloc(0);
     this.textHandler = () => {};
@@ -1959,6 +1965,9 @@ export class MinimalWebSocketClient {
       const onError = error => { cleanup(); reject(error); };
       const onClose = () => onError(new Error("Selkies WebSocket closed during handshake"));
       const onData = chunk => {
+        if (this.maxIncomingBytes && data.length + chunk.length > this.maxIncomingBytes + 16384) {
+          onError(new Error("WebSocket handshake exceeded its byte limit")); return;
+        }
         data = Buffer.concat([data, chunk]);
         const end = data.indexOf("\r\n\r\n");
         if (end < 0) return;
@@ -2027,9 +2036,12 @@ export class MinimalWebSocketClient {
   }
 
   handleData(chunk) {
+    if (this.maxIncomingBytes && this.buffer.length + chunk.length > this.maxIncomingBytes + 65536) {
+      throw new Error("WebSocket input exceeded its byte limit");
+    }
     this.buffer = Buffer.concat([this.buffer, chunk]);
     for (;;) {
-      const frame = readFrame(this.buffer);
+      const frame = readFrame(this.buffer, this.maxIncomingBytes);
       if (!frame) {
         return;
       }
@@ -2048,7 +2060,7 @@ export class MinimalWebSocketClient {
   }
 }
 
-function readFrame(buffer) {
+function readFrame(buffer, maxBytes = MAX_WEBSOCKET_FRAME_BYTES) {
   if (buffer.length < 2) {
     return null;
   }
@@ -2064,12 +2076,12 @@ function readFrame(buffer) {
     if (buffer.length < offset + 8) return null;
     const bigLength = buffer.readBigUInt64BE(offset);
     offset += 8;
-    if (bigLength > BigInt(MAX_WEBSOCKET_FRAME_BYTES)) {
+    if (bigLength > BigInt(maxBytes)) {
       throw new Error("Selkies WebSocket frame is too large");
     }
     length = Number(bigLength);
   }
-  if (length > MAX_WEBSOCKET_FRAME_BYTES) {
+  if (length > maxBytes) {
     throw new Error("Selkies WebSocket frame is too large");
   }
   let mask;
@@ -2844,6 +2856,13 @@ export class SelkiesPage {
       return;
     }
     this.closed = true;
+    if (this.browserPage?._inspection) {
+      const inspection = this.browserPage._inspection;
+      clearTimeout(inspection.expiryTimer);
+      inspection.snapshot = null;
+      for (const remove of inspection.removeHandlers || []) remove();
+      inspection.removeHandlers = [];
+    }
     this.displayAvailable = false;
     this.onClosed(this);
     this.flushWaiters();
@@ -2865,8 +2884,9 @@ export class SelkiesPage {
 }
 
 class CdpClient {
-  constructor(webSocketUrl, defaultTimeoutMs = 15000) {
-    this.ws = new MinimalWebSocketClient(new URL(webSocketUrl));
+  constructor(webSocketUrl, defaultTimeoutMs = 15000, { maxIncomingBytes, retainEvents = true } = {}) {
+    this.ws = new MinimalWebSocketClient(new URL(webSocketUrl), { maxIncomingBytes });
+    this.retainEvents = retainEvents;
     this.defaultTimeoutMs = defaultTimeoutMs;
     this.nextId = 1;
     this.pending = new Map();
@@ -2960,7 +2980,7 @@ class CdpClient {
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
       if (message.error) {
-        pending.reject(new Error(message.error.message || "browser CDP request failed"));
+        pending.reject(Object.assign(new Error(message.error.message || "browser CDP request failed"), { cdpCode: message.error.code }));
       } else {
         pending.resolve(message.result || {});
       }
@@ -2987,7 +3007,7 @@ class CdpClient {
           }));
         });
     }
-    this.events.push(message);
+    if (this.retainEvents) this.events.push(message);
     if (this.events.length > 100) {
       this.events.splice(0, this.events.length - 100);
     }
@@ -4584,6 +4604,211 @@ async function collectBrowserDiagnostics(browserPage, timeoutMs) {
   });
 }
 
+const BROWSER_INSPECTION_LIMITS = Object.freeze({
+  max_nodes: 512, max_page_nodes: 64, max_snapshot_bytes: 131072,
+  max_response_bytes: 32768, snapshot_ttl_ms: 30000, timeout_ms: 1500,
+});
+const INSPECTION_HTTP_STATUS = Object.freeze({
+  invalid_inspection: 400, inspection_unsupported: 501, stale_inspection: 409,
+  inspection_busy: 409, inspection_owner_changed: 409, inspection_failed: 503,
+});
+
+function browserInspectionError(code) {
+  return Object.assign(new Error("Browser page inspection could not complete."), { code });
+}
+
+function browserInspectionCapabilities(page) {
+  if (page.closed || !page.browserPage?.debugger_url) throw browserInspectionError("inspection_unsupported");
+  return { schema: "elastos.browser.inspect-capabilities/v1", page_id: page.pageId,
+    formats: ["accessibility_tree"], ...BROWSER_INSPECTION_LIMITS };
+}
+
+function validateBrowserInspectionRequest(request) {
+  if (typeof request?.schema === "string" && request.schema !== "elastos.browser.inspect-request/v1") {
+    throw browserInspectionError("inspection_unsupported");
+  }
+  if (!request || typeof request !== "object" || Array.isArray(request) ||
+      Object.keys(request).some(key => !["schema", "limit", "cursor"].includes(key)) ||
+      request.schema !== "elastos.browser.inspect-request/v1" ||
+      (request.limit !== undefined && (!Number.isInteger(request.limit) || request.limit < 1 || request.limit > 64)) ||
+      (request.cursor !== undefined && request.cursor !== null &&
+        (typeof request.cursor !== "string" || !/^[a-f0-9]{32}:[0-9]{1,3}$/.test(request.cursor)))) {
+    throw browserInspectionError("invalid_inspection");
+  }
+  return { limit: request.limit ?? 64, cursor: request.cursor ?? null };
+}
+
+// AX owns role/name/visibility semantics. A short-lived connection bounds native
+// replies without disturbing the page's existing network/input CDP connection.
+async function collectBrowserAccessibilityDocument(browserPage, frameId, deadline, current) {
+  const cdp = new CdpClient(browserPage.debugger_url, 1500, { maxIncomingBytes: 262144, retainEvents: false });
+  const timer = setTimeout(() => cdp.close(), Math.max(1, deadline - performance.now()));
+  const nodes = [], backendNodes = [], seen = new Set();
+  let calls = 0, bytes = 2, truncated = false;
+  const short = value => {
+    if (!["string", "number", "boolean"].includes(typeof value)) return "";
+    const text = String(value);
+    if (text.length > 256) truncated = true;
+    return text.slice(0, 256);
+  };
+  const call = async (method, params = {}) => {
+    current();
+    if (performance.now() >= deadline) throw browserInspectionError("inspection_failed");
+    const result = await cdp.request(method, params, Math.max(1, Math.floor(deadline - performance.now())));
+    current();
+    if (performance.now() >= deadline) throw browserInspectionError("inspection_failed");
+    return result;
+  };
+  try {
+    await cdp.connect(Math.max(1, Math.floor(deadline - performance.now())));
+    current();
+    await call("Accessibility.enable");
+    const root = (await call("Accessibility.getRootAXNode", { frameId })).node;
+    if (!root || typeof root.nodeId !== "string") throw browserInspectionError("inspection_failed");
+    const pending = [root];
+    while (pending.length) {
+      if (seen.size >= 1024 || nodes.length >= 512 || calls >= 64) { truncated = true; break; }
+      const node = pending.shift();
+      if (!node || typeof node.nodeId !== "string" || node.nodeId.length > 128) throw browserInspectionError("inspection_failed");
+      if (seen.has(node.nodeId) || (node.frameId && node.frameId !== frameId)) continue;
+      seen.add(node.nodeId);
+      // Anonymous AX nodes can supply descendants, but an exposed ref always
+      // names an actual DOM node in this acquired document.
+      if (node.ignored === false && Number.isSafeInteger(node.backendDOMNodeId) && node.backendDOMNodeId > 0) {
+        let value = node.value?.value;
+        if (value !== undefined) {
+          calls++;
+          const dom = (await call("DOM.describeNode", { backendNodeId: node.backendDOMNodeId, depth: 0 })).node;
+          if (!dom || dom.backendNodeId !== node.backendDOMNodeId) throw browserInspectionError("stale_inspection");
+          const attrs = dom.attributes || [];
+          const type = attrs.findIndex((item, index) => index % 2 === 0 && item.toLowerCase() === "type");
+          if (dom.nodeName === "INPUT" && type >= 0 && ["password", "file"].includes(String(attrs[type + 1]).toLowerCase())) value = undefined;
+        }
+        const item = { role: short(node.role?.value), name: short(node.name?.value),
+          description: short(node.description?.value), value: value === undefined ? null : short(value) };
+        const binding = { backendDOMNodeId: node.backendDOMNodeId, frameId };
+        const size = Buffer.byteLength(JSON.stringify(item)) + Buffer.byteLength(JSON.stringify(binding)) + 64;
+        if (bytes + size > BROWSER_INSPECTION_LIMITS.max_snapshot_bytes) { truncated = true; break; }
+        bytes += size; nodes.push(item); backendNodes.push(binding);
+      }
+      if (Array.isArray(node.childIds) && node.childIds.length) {
+        if (calls >= 64) { truncated = true; break; }
+        calls++;
+        const children = (await call("Accessibility.getChildAXNodes", { id: node.nodeId, frameId })).nodes;
+        if (!Array.isArray(children)) throw browserInspectionError("inspection_failed");
+        const room = Math.max(0, 1024 - seen.size - pending.length);
+        if (children.length > room) truncated = true;
+        pending.push(...children.slice(0, room));
+      }
+    }
+    return { nodes, backendNodes, truncated };
+  } catch (error) {
+    if (error?.cdpCode === -32601) throw browserInspectionError("inspection_unsupported");
+    throw error;
+  } finally {
+    // Disconnect is also the terminal path for an expired read or failed disable.
+    // The page, its existing CDP client, and its media keep their own lifetimes.
+    try {
+      const remaining = Math.floor(deadline - performance.now());
+      if (!cdp.closed && remaining > 0) await cdp.request("Accessibility.disable", {}, Math.min(remaining, 100));
+    } catch {} finally { clearTimeout(timer); cdp.close(); }
+  }
+}
+
+async function inspectBrowserPage(page, request, isCurrent) {
+  const input = validateBrowserInspectionRequest(request);
+  browserInspectionCapabilities(page);
+  const browserPage = page.browserPage;
+  const deadline = performance.now() + BROWSER_INSPECTION_LIMITS.timeout_ms;
+  const state = browserPage._inspection ||= { cdp: null, generation: null, snapshot: null, busy: false };
+  const current = () => {
+    if (page.closed || page.browserPage !== browserPage || !isCurrent()) throw browserInspectionError("inspection_owner_changed");
+    if (performance.now() >= deadline) throw browserInspectionError("inspection_failed");
+  };
+  current();
+  if (state.busy) throw browserInspectionError("inspection_busy");
+  state.busy = true;
+  try {
+    return await withBrowserCdp(browserPage, BROWSER_INSPECTION_LIMITS.timeout_ms, async cdp => {
+      current();
+      const call = async (method, params = {}) => {
+        current();
+        const result = await cdp.request(method, params, Math.max(1, Math.floor(deadline - performance.now())));
+        current();
+        if (browserPage._cdp !== cdp || cdp.closed) throw browserInspectionError("stale_inspection");
+        return result;
+      };
+      if (state.cdp !== cdp) {
+        for (const remove of state.removeHandlers || []) remove();
+        state.cdp = cdp;
+        state.generation = crypto.randomBytes(16).toString("hex");
+        state.snapshot = null;
+        const invalidate = params => {
+          if (params.frame?.parentId || (state.frameId && (params.frame?.id || params.frameId) !== state.frameId)) return;
+          state.generation = crypto.randomBytes(16).toString("hex");
+          state.snapshot = null;
+        };
+        state.removeHandlers = ["Page.frameNavigated", "Page.navigatedWithinDocument", "Page.frameStartedLoading"]
+          .map(method => cdp.onEvent(method, invalidate));
+        await call("Page.enable");
+      }
+      const frame = (await call("Page.getFrameTree")).frameTree?.frame;
+      if (!frame?.id || !frame.loaderId) throw browserInspectionError("inspection_failed");
+      state.frameId = frame.id;
+      const binding = `${frame.id}:${frame.loaderId}:${frame.url}`;
+      if (state.binding !== binding) {
+        state.binding = binding;
+        state.generation = crypto.randomBytes(16).toString("hex");
+        state.snapshot = null;
+      }
+      const generation = state.generation;
+      let snapshot = state.snapshot;
+      let offset = 0;
+      if (input.cursor) {
+        const [id, index] = input.cursor.split(":");
+        offset = Number(index);
+        if (!snapshot || snapshot.id !== id || snapshot.generation !== generation ||
+            performance.now() >= snapshot.expires || offset < 1 || offset >= snapshot.nodes.length) {
+          throw browserInspectionError("stale_inspection");
+        }
+      } else {
+        const value = await collectBrowserAccessibilityDocument(browserPage, frame.id, deadline, current);
+        current();
+        const after = (await call("Page.getFrameTree")).frameTree?.frame;
+        if (state.generation !== generation || `${after?.id}:${after?.loaderId}:${after?.url}` !== binding) {
+          throw browserInspectionError("stale_inspection");
+        }
+        snapshot = { id: crypto.randomBytes(16).toString("hex"), generation, nodes: value.nodes, backendNodes: value.backendNodes,
+          truncated: value.truncated === true, expires: performance.now() + BROWSER_INSPECTION_LIMITS.snapshot_ttl_ms };
+      }
+      current();
+      if (state.generation !== generation) throw browserInspectionError("stale_inspection");
+      const result = { schema: "elastos.browser.inspect-result/v1", page_id: page.pageId,
+        document_generation: generation, snapshot_id: snapshot.id, nodes: [], next_cursor: null, truncated: snapshot.truncated };
+      let index = offset;
+      while (index < snapshot.nodes.length && result.nodes.length < input.limit) {
+        result.nodes.push({ ...snapshot.nodes[index], ref: `${snapshot.id}:${index}` });
+        if (Buffer.byteLength(JSON.stringify(result)) + 128 > BROWSER_INSPECTION_LIMITS.max_response_bytes) {
+          result.nodes.pop(); break;
+        }
+        index++;
+      }
+      if (index < snapshot.nodes.length) result.next_cursor = `${snapshot.id}:${index}`;
+      if (index === offset && snapshot.nodes.length) throw browserInspectionError("inspection_failed");
+      state.snapshot = snapshot;
+      clearTimeout(state.expiryTimer);
+      state.expiryTimer = setTimeout(() => { if (state.snapshot === snapshot) state.snapshot = null; }, Math.max(1, snapshot.expires - performance.now()));
+      state.expiryTimer.unref?.();
+      return result;
+    });
+  } catch (error) {
+    current();
+    throw Object.hasOwn(INSPECTION_HTTP_STATUS, error?.code) ? error : browserInspectionError("inspection_failed");
+  } finally {
+    state.busy = false;
+  }
+}
+
 async function withBrowserCdp(browserPage, timeoutMs, action) {
   if (!browserPage?.debugger_url) {
     throw new Error("browser page debugger URL is unavailable");
@@ -5120,7 +5345,7 @@ async function main() {
         }
         return;
       }
-      const pageMatch = url.pathname.match(/^\/pages\/([^/]+)\/(webrtc|input|close|status|diagnostics)$/);
+      const pageMatch = url.pathname.match(/^\/pages\/([^/]+)\/(webrtc|input|close|status|diagnostics|inspect)$/);
       if (!pageMatch) {
         httpJson(res, 404, { error: "not found" });
         return;
@@ -5130,6 +5355,10 @@ async function main() {
       const page = pages.get(pageId);
       if (!page) {
         httpJson(res, 404, { error: "browser page not found" });
+        return;
+      }
+      if (req.method === "GET" && op === "inspect") {
+        httpJson(res, 200, browserInspectionCapabilities(page));
         return;
       }
       if (req.method === "GET" && op === "status") {
@@ -5178,7 +5407,13 @@ async function main() {
         });
         return;
       }
-      const body = await readJsonRequest(req);
+      const body = await readJsonRequest(req, op === "inspect" ? 1024 : Infinity).catch(error => {
+        throw op === "inspect" ? browserInspectionError("invalid_inspection") : error;
+      });
+      if (req.method === "POST" && op === "inspect") {
+        httpJson(res, 200, await inspectBrowserPage(page, body, () => pages.get(pageId) === page));
+        return;
+      }
       if (req.method === "POST" && op === "webrtc") {
         httpJson(res, 200, await page.signal(body.signal, body.channel));
         return;
@@ -5297,9 +5532,10 @@ async function main() {
       });
       const displayStatus = Object.hasOwn(DISPLAY_CONTROL_HTTP_STATUS, error?.code)
         ? DISPLAY_CONTROL_HTTP_STATUS[error.code] : null;
-      httpJson(res, displayStatus || (error?.code === "invalid_request" ? 400 : 500), {
+      const inspectionStatus = Object.hasOwn(INSPECTION_HTTP_STATUS, error?.code) ? INSPECTION_HTTP_STATUS[error.code] : null;
+      httpJson(res, inspectionStatus || displayStatus || (error?.code === "invalid_request" ? 400 : 500), {
         error: error instanceof Error ? error.message : String(error),
-        ...(displayStatus ? { code: error.code } : {}),
+        ...(displayStatus || inspectionStatus ? { code: error.code } : {}),
       });
     }
   });

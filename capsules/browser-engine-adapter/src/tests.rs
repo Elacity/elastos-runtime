@@ -17,6 +17,65 @@ fn error_code(response: Response) -> String {
         .to_string()
 }
 
+#[test]
+fn inspection_adapter_requires_principal_and_valid_version_before_control_dispatch() {
+    let provider = display_attach_adapter("/tmp/inspection-must-not-connect.sock".into(), None);
+    for principal in [None, Some("person:foreign".into())] {
+        assert_eq!(
+            error_code(provider.inspect("page:attach", principal, None)),
+            "page_not_found"
+        );
+    }
+    let request = BrowserInspectionRequest {
+        schema: "future".into(),
+        limit: 64,
+        cursor: None,
+    };
+    assert_eq!(
+        error_code(provider.inspect("page:attach", Some("person:owner".into()), Some(request))),
+        "inspection_unsupported"
+    );
+}
+
+#[test]
+fn inspection_adapter_validates_exact_control_response_and_preserves_private_errors() {
+    let capability = json!({"schema":"elastos.browser.inspect-capabilities/v1", "page_id":"page:attach",
+        "formats":["accessibility_tree"],"max_nodes":512,"max_page_nodes":64,"max_snapshot_bytes":131072,
+        "max_response_bytes":32768,"snapshot_ttl_ms":30000,"timeout_ms":1500});
+    let socket = spawn_status_socket(capability.clone());
+    let provider = display_attach_adapter(socket.clone(), None);
+    let result =
+        serde_json::to_value(provider.inspect("page:attach", Some("person:owner".into()), None))
+            .unwrap();
+    assert_eq!(result["data"], capability);
+    let _ = std::fs::remove_file(socket);
+    let mut foreign = capability;
+    foreign["page_id"] = json!("page:foreign");
+    let socket = spawn_status_socket(foreign);
+    let provider = display_attach_adapter(socket.clone(), None);
+    assert_eq!(
+        error_code(provider.inspect("page:attach", Some("person:owner".into()), None)),
+        "inspection_unsupported"
+    );
+    let _ = std::fs::remove_file(socket);
+    for code in [
+        "invalid_inspection",
+        "stale_inspection",
+        "inspection_owner_changed",
+        "inspection_failed",
+        "inspection_busy",
+        "inspection_unsupported",
+    ] {
+        let body = json!({"code":code,"error":"private socket /secret"}).to_string();
+        let wire = format!(
+            "HTTP/1.1 409 Conflict\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        assert_eq!(parse_http_json_response(wire.as_bytes()), Err(code.into()));
+    }
+}
+
 fn cleanup_binding_for(provider: &BrowserEngineAdapter, page_id: &str) -> EngineCleanupBinding {
     engine_cleanup_binding(
         page_id,

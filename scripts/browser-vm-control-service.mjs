@@ -2184,6 +2184,7 @@ function requestJsonOverUnix(
   body,
   timeoutMs,
   signal,
+  maxResponseBytes = Infinity,
 ) {
   validateAbsolutePath(socketPath, "Browser VM guest control socket");
   const bytes = body == null ? Buffer.alloc(0) : Buffer.from(JSON.stringify(body));
@@ -2208,7 +2209,13 @@ function requestJsonOverUnix(
       },
       (res) => {
         const chunks = [];
-        res.on("data", (chunk) => chunks.push(chunk));
+        let received = 0;
+        res.on("data", (chunk) => {
+          received += chunk.length;
+          if (received > maxResponseBytes) { req.destroy(new Error("Browser control response exceeded its byte limit")); return; }
+          chunks.push(chunk);
+        });
+        res.on("error", error => { clearAbort(); reject(error); });
         res.on("end", () => {
           clearAbort();
           const text = Buffer.concat(chunks).toString("utf8");
@@ -2222,7 +2229,7 @@ function requestJsonOverUnix(
             }
           }
           if (res.statusCode < 200 || res.statusCode >= 300) {
-            reject(browserDisplayControlError(parsed) ||
+            reject((requestPath.endsWith("/inspect") ? browserInspectionControlError(parsed, res.statusCode) : null) || browserDisplayControlError(parsed) ||
               new Error((typeof parsed?.error === "string" && parsed.error) || `Browser VM guest control ${method} ${requestPath} failed: HTTP ${res.statusCode}`));
             return;
           }
@@ -2256,6 +2263,14 @@ function browserDisplayControlError(payload) {
   return Object.assign(new Error("Browser display operation failed."), {
     code: payload.code, displayHttpStatus: status[payload.code],
   });
+}
+
+function browserInspectionControlError(payload, statusCode) {
+  const statuses = { invalid_inspection: 400, inspection_unsupported: 501, stale_inspection: 409,
+    inspection_busy: 409, inspection_owner_changed: 409, inspection_failed: 503 };
+  const code = typeof payload?.code === "string" && Object.hasOwn(statuses, payload.code)
+    ? payload.code : statusCode === 404 ? "inspection_unsupported" : "inspection_failed";
+  return Object.assign(new Error("Browser page inspection could not complete."), { code, inspectionHttpStatus: statuses[code] });
 }
 
 function postJsonOverUnix(socketPath, requestPath, body, timeoutMs, signal) {
@@ -3454,6 +3469,30 @@ async function proxyGuestPageRead(config, activePages, activeVms, pageId, op) {
   );
 }
 
+async function proxyGuestPageInspect(activePages, activeVms, pageId, body) {
+  const { record, controlSocketPath } = activePageGuestControl(activePages, activeVms, pageId);
+  const ownerCurrent = () => {
+    try {
+      const current = activePageGuestControl(activePages, activeVms, pageId);
+      return current.record === record && current.controlSocketPath === controlSocketPath;
+    } catch { return false; }
+  };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2000);
+  try {
+    const result = await requestJsonOverUnix(controlSocketPath, body === null ? "GET" : "POST",
+      `/pages/${encodeURIComponent(pageId)}/inspect`, body, 2000, controller.signal, 32768);
+    if (!ownerCurrent()) {
+      throw browserInspectionControlError({ code: "inspection_owner_changed" });
+    }
+    if (controller.signal.aborted) throw browserInspectionControlError({ code: "inspection_failed" });
+    return result;
+  } catch (error) {
+    if (!ownerCurrent()) throw browserInspectionControlError({ code: "inspection_owner_changed" });
+    throw error;
+  } finally { clearTimeout(timer); }
+}
+
 async function proxyGuestPageInput(config, activePages, activeVms, pageId, body) {
   const { controlSocketPath } = activePageGuestControl(activePages, activeVms, pageId);
   return postJsonOverUnix(
@@ -3609,6 +3648,17 @@ function main() {
           network_mode: "runtime_net_only",
           direct_network: false,
         });
+        return;
+      }
+      const inspectionMatch = url.pathname.match(/^\/pages\/([^/]+)\/inspect$/);
+      if (inspectionMatch && ["GET", "POST"].includes(req.method)) {
+        try {
+          const body = req.method === "POST" ? await readJsonBody(req, 1024) : null;
+          sendJson(200, await proxyGuestPageInspect(activePages, activeVms, decodeURIComponent(inspectionMatch[1]), body));
+        } catch (error) {
+          const failure = browserInspectionControlError(error);
+          sendJson(failure.inspectionHttpStatus, { code: failure.code, error: failure.message });
+        }
         return;
       }
       const pageReadMatch = url.pathname.match(/^\/pages\/([^/]+)\/(status|diagnostics|logs)$/);

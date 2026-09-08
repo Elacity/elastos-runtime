@@ -115,6 +115,13 @@ verification without rebuilding. The probe links were then removed and the
 source artifacts retained. This is a bounded source-home installation check;
 automatic package acquisition and a complete fresh Home journey remain open.
 
+Installed run 59 reaches Home, both controlled pages, decoded WebRTC frames and
+exact UI text before the operator inspection route returns HTTP 404. Close
+clears all 13 effects in 684 ms, with zero remaining obligations. The bounded
+native accessibility inspection source passes 61 JavaScript and seven Rust
+checks and coordinator review. Installing that source and repeating the journey
+is the next operator milestone; source evidence alone leaves B04 open.
+
 Earlier evidence for the same rootfs with the preceding initrd follows.
 
 Runs 50–52 pass Home launch, controlled navigation, advancing decoded WebRTC

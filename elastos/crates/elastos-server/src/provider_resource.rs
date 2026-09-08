@@ -150,7 +150,7 @@ pub fn provider_operation_action(scheme: &str, op: &str) -> Option<Action> {
             _ => None,
         },
         "browser-engine" => match op {
-            "status" | "page_status" | "diagnostics" => Some(Action::Read),
+            "status" | "page_status" | "diagnostics" | "inspect" => Some(Action::Read),
             "launch" | "attach_stream" | "input" | "webrtc_signal" => Some(Action::Write),
             "close_page" => Some(Action::Delete),
             _ => None,
@@ -465,6 +465,7 @@ fn browser_engine_resource(op: &str) -> Result<String, String> {
         "close_page" => Ok("elastos://browser-engine/close_page".to_string()),
         "page_status" => Ok("elastos://browser-engine/page/status".to_string()),
         "diagnostics" => Ok("elastos://browser-engine/page/diagnostics".to_string()),
+        "inspect" => Ok("elastos://browser-engine/page/inspect".to_string()),
         "input" => Ok("elastos://browser-engine/page/input".to_string()),
         "webrtc_signal" => Ok("elastos://browser-engine/page/webrtc_signal".to_string()),
         _ => Err(format!(
@@ -641,6 +642,18 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_inspection_uses_the_existing_read_authority_resource() {
+        assert_eq!(
+            provider_operation_action("browser-engine", "inspect"),
+            Some(Action::Read)
+        );
+        assert_eq!(
+            build_capability_resource("browser-engine", "inspect", &serde_json::json!({})).unwrap(),
+            "elastos://browser-engine/page/inspect"
+        );
+    }
 
     #[test]
     fn localhost_resource_accepts_full_uri_and_bare_rooted_path() {

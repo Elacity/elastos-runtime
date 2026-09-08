@@ -15,7 +15,7 @@
       {
         "resource": "elastos://browser-engine/*",
         "actions": ["read", "write"],
-        "operations": ["status", "readiness", "launch", "attach_stream", "close_page", "page_status", "diagnostics", "input", "webrtc_signal"]
+        "operations": ["status", "readiness", "launch", "attach_stream", "close_page", "page_status", "diagnostics", "inspect", "input", "webrtc_signal"]
       }
     ],
     "audit_events": [
@@ -95,6 +95,15 @@
           "audit": "summary",
           "resource": "elastos://browser-engine/*",
           "operation": "diagnostics"
+        },
+        {
+          "id": "inspect",
+          "description": "Read bounded semantic content from an acquired Browser Engine page.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://browser-engine/*",
+          "operation": "inspect"
         },
         {
           "id": "input",

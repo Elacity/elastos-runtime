@@ -150,6 +150,7 @@ const CHECK_BROWSER_EMBEDDED_UI_INPUT =
 const CHECK_BROWSER_CONTROLLED_JOURNEY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_JOURNEY === "1";
 const CHECK_BROWSER_CONTROLLED_MEDIA = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_MEDIA === "1";
+const CHECK_BROWSER_CONTROLLED_INSPECTION = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_INSPECTION === "1";
 const CHECK_BROWSER_CONTROLLED_RECOVERY = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_RECOVERY === "1";
 const CHECK_BROWSER_VIEWER_RELOAD = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_VIEWER_RELOAD === "1";
 const BROWSER_CONTROLLED_TURN_TEST_HOME = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_TURN_TEST_HOME || "";
@@ -2732,6 +2733,35 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
         "Engine page receives typed text");
       if (typed.length === 1) await stopInputObservation(false);
     }
+    if (CHECK_BROWSER_CONTROLLED_INSPECTION) {
+      markStage("browser:operator-inspection");
+      const path = `/api/apps/browser/pages/${encodeURIComponent(current.page_id)}/inspect`;
+      const capabilities = await browserApi(appFrame, token, path);
+      result.inspection = { capabilities, pages: [] };
+      assert(capabilities.ok && capabilities.body?.formats?.includes("accessibility_tree"),
+        "The installed Browser does not provide Engine-page inspection", result.inspection);
+      let cursor = null, snapshotId = null, generation = null;
+      const nodes = [];
+      do {
+        const response = await browserApi(appFrame, token, path, { method: "POST",
+          body: { schema: "elastos.browser.inspect-request/v1", limit: 8, cursor } });
+        result.inspection.pages.push(response);
+        assert(response.ok && response.body?.schema === "elastos.browser.inspect-result/v1" &&
+          response.body.page_id === current.page_id && Array.isArray(response.body.nodes),
+          "Engine-page inspection failed", result.inspection);
+        const body = response.body;
+        snapshotId ||= body.snapshot_id; generation ||= body.document_generation;
+        assert(body.snapshot_id === snapshotId && body.document_generation === generation,
+          "Engine inspection changed document during pagination", result.inspection);
+        nodes.push(...body.nodes);
+        cursor = body.next_cursor;
+        assert(result.inspection.pages.length <= 8 && nodes.length <= 512 &&
+          (!cursor || result.inspection.pages.length < 8), "Engine inspection pagination exceeded its bounds", result.inspection);
+      } while (cursor);
+      assert(nodes.some(node => node.role === "textbox" && node.name === "Test text" && node.value === text),
+        "The operator did not inspect the text entered through Browser UI", result.inspection);
+      assert(result.inspection.pages.length > 1, "The controlled operator proof did not exercise pagination", result.inspection);
+    }
     if (CHECK_BROWSER_CONTROLLED_MEDIA) {
       markStage("browser:decoded-audio");
       const toneReceipt = await waitForJourneyEvidence(readReceipt,
@@ -2762,6 +2792,22 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
       result.audio_after_recovery = await appFrame.evaluate(() => window.__readBrowserJourneyAudio());
       assert(controlledTonePresent(result.audio_after_recovery),
         "Controlled tone did not resume at the product audio receiver", result.audio_after_recovery);
+    }
+    if (CHECK_BROWSER_CONTROLLED_INSPECTION) {
+      markStage("browser:operator-stale-reference");
+      const url = `${fixture.origin}/main?run=${run}`;
+      await appFrame.locator("#browser-url").fill(url);
+      await appFrame.locator("#browser-url").press("Enter");
+      await waitForJourneyEvidence(() => browserApi(appFrame, token,
+        `/api/apps/browser/pages/${encodeURIComponent(current.page_id)}/status`),
+      value => value.ok && value.body?.actual_url === url, "UI navigation keeps the acquired Engine page");
+      const response = await browserApi(appFrame, token,
+        `/api/apps/browser/pages/${encodeURIComponent(current.page_id)}/inspect`,
+        { method: "POST", body: { schema: "elastos.browser.inspect-request/v1", limit: 8,
+          cursor: result.inspection.pages[0].body.next_cursor } });
+      result.inspection.after_navigation = response;
+      assert(response.status === 409 && response.body?.code === "stale_inspection",
+        "The old inspection cursor survived UI navigation", result.inspection);
     }
   } catch (error) {
     error.details = { stage: smokeStage, ...error.details };
@@ -4480,6 +4526,8 @@ async function main() {
     "The task TURN interruption requires controlled Browser recovery");
   assert(!CHECK_BROWSER_CONTROLLED_MEDIA || CHECK_BROWSER_CONTROLLED_JOURNEY,
     "Controlled audio proof requires the controlled Browser journey");
+  assert(!CHECK_BROWSER_CONTROLLED_INSPECTION || CHECK_BROWSER_CONTROLLED_JOURNEY,
+    "Controlled inspection requires the controlled Browser journey");
   assert(!CHECK_BROWSER_VIEWER_RELOAD || CHECK_BROWSER_CONTROLLED_JOURNEY,
     "Browser viewer reload requires the controlled journey");
   assert(!CHECK_BROWSER_CONTROLLED_RECOVERY || CHECK_BROWSER_CONTROLLED_JOURNEY,

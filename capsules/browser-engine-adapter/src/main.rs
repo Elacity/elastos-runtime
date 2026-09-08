@@ -6,13 +6,15 @@
 //! through Runtime-owned stream and display sessions.
 
 use elastos_common::browser_protocol::{
-    browser_display_generation_valid, browser_display_request_id_valid, BrowserDisplayAttachment,
-    BrowserDisplayError, BrowserDisplayMode, BrowserEngineAdapterCapabilities,
-    BrowserEngineReadiness, BrowserEngineReadinessReason, BrowserGuaranteeLevel,
-    BrowserProfileDescriptor, BrowserViewport as ViewportRequest,
+    browser_display_generation_valid, browser_display_request_id_valid,
+    validate_browser_inspection_result, BrowserDisplayAttachment, BrowserDisplayError,
+    BrowserDisplayMode, BrowserEngineAdapterCapabilities, BrowserEngineReadiness,
+    BrowserEngineReadinessReason, BrowserGuaranteeLevel, BrowserInspectionError,
+    BrowserInspectionRequest, BrowserProfileDescriptor, BrowserViewport as ViewportRequest,
     BROWSER_DISPLAY_ATTACH_REQUEST_SCHEMA, BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA,
     BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA, BROWSER_ENGINE_PROTOCOL_VERSION,
     BROWSER_ENGINE_PROVIDER_ID, BROWSER_ENGINE_READINESS_SCHEMA,
+    BROWSER_INSPECTION_MAX_RESPONSE_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -115,6 +117,13 @@ enum Request {
         page_id: String,
         #[serde(default)]
         principal_id: Option<String>,
+    },
+    Inspect {
+        page_id: String,
+        #[serde(default)]
+        principal_id: Option<String>,
+        #[serde(default)]
+        request: Option<BrowserInspectionRequest>,
     },
     Input {
         page_id: String,
@@ -808,6 +817,11 @@ impl BrowserEngineAdapter {
                 page_id,
                 principal_id,
             } => self.diagnostics(&page_id, principal_id),
+            Request::Inspect {
+                page_id,
+                principal_id,
+                request,
+            } => self.inspect(&page_id, principal_id, request),
             Request::Input {
                 page_id,
                 event,
@@ -919,7 +933,7 @@ impl BrowserEngineAdapter {
             "adapters": self.adapter_summaries(),
             "supported_display_modes": self.supported_display_modes(),
             "supported_guarantee_levels": self.supported_guarantee_levels(),
-            "operations": ["status", "readiness", "launch", "attach_stream", "close_page", "page_status", "diagnostics", "input", "webrtc_signal"],
+            "operations": ["status", "readiness", "launch", "attach_stream", "close_page", "page_status", "diagnostics", "inspect", "input", "webrtc_signal"],
         }))
     }
 
@@ -2034,6 +2048,51 @@ impl BrowserEngineAdapter {
         ) {
             Ok(data) => Response::ok(data),
             Err(err) => Response::error("engine_process_unavailable", err),
+        }
+    }
+
+    fn inspect(
+        &self,
+        page_id: &str,
+        principal_id: Option<String>,
+        request: Option<BrowserInspectionRequest>,
+    ) -> Response {
+        let error = |error: BrowserInspectionError| {
+            Response::error(error.code(), "Browser page inspection could not complete.")
+        };
+        if !is_safe_id(page_id) {
+            return error(BrowserInspectionError::Invalid);
+        }
+        let Some(session) = self.page_control_session(page_id) else {
+            return Response::error("page_not_found", "browser page not found");
+        };
+        if !page_control_session_principal_matches(session, principal_id.as_deref()) {
+            return Response::error("page_not_found", "browser page not found");
+        }
+        if let Some(request) = request.as_ref() {
+            if let Err(reason) = request.validate() {
+                return error(reason);
+            }
+        }
+        let body = request
+            .as_ref()
+            .map(|request| serde_json::to_value(request).expect("inspection request serializes"));
+        match supervisor_control_json_bounded(
+            &session.socket_path,
+            if body.is_some() { "POST" } else { "GET" },
+            &format!("/pages/{page_id}/inspect"),
+            body,
+            std::time::Duration::from_millis(2500),
+            BROWSER_INSPECTION_MAX_RESPONSE_BYTES + 4096,
+        ) {
+            Ok(data) => match validate_browser_inspection_result(page_id, request.as_ref(), data) {
+                Ok(data) => Response::ok(data),
+                Err(reason) => error(reason),
+            },
+            Err(reason) => error(
+                BrowserInspectionError::from_code(&reason)
+                    .unwrap_or(BrowserInspectionError::Failed),
+            ),
         }
     }
 
