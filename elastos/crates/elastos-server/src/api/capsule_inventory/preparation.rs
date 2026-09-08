@@ -2537,169 +2537,74 @@ mod tests {
             visit(path, &mut 0)
         }
 
-        #[tokio::test]
-        #[ignore = "requires explicit ELASTOS_TEST_KUBO_PATH and ELASTOS_TEST_IPFS_PROVIDER_PATH; parent runs isolated process proof"]
-        async fn model_preparation_real_content_native_process_use_admit_and_reuse() {
-            use elastos_runtime::provider::{
-                BridgeProviderConfig, CapsuleProvider, ProviderBridge,
-            };
-            let prerequisite = |name| {
-                let path = PathBuf::from(
-                    std::env::var_os(name)
-                        .expect("explicit prerequisite required; skipped test is not proof"),
-                );
-                assert!(path.is_absolute() && fs::symlink_metadata(&path).unwrap().is_file());
-                path.canonicalize().unwrap()
-            };
-            let kubo = prerequisite("ELASTOS_TEST_KUBO_PATH");
-            let native = prerequisite("ELASTOS_TEST_IPFS_PROVIDER_PATH");
-            if let Some(override_path) = std::env::var_os("ELASTOS_IPFS_KUBO_PATH") {
-                assert_eq!(
-                    fs::canonicalize(override_path).unwrap(),
-                    kubo,
-                    "ambient provider override differs from pinned fixture prerequisite"
-                );
-            }
-            let root = tempfile::tempdir().unwrap();
-            let root_path = root.path().canonicalize().unwrap();
-            let dir = File::open(&root_path).unwrap();
+        fn volume_bytes(dir: &File) -> (u128, u128) {
             let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
             assert_eq!(
                 unsafe { libc::fstatvfs(dir.as_raw_fd(), stats.as_mut_ptr()) },
                 0
             );
             let stats = unsafe { stats.assume_init() };
-            storage::require_space_floor(
+            (
                 u128::from(stats.f_blocks) * u128::from(stats.f_frsize),
                 u128::from(stats.f_bavail) * u128::from(stats.f_frsize),
-                64 * 1024 * 1024,
             )
-            .unwrap();
-            let data = root_path.join("data");
-            let seed = root_path.join("seed");
-            let repo = data.join("ipfs-repo");
-            for path in [&data, &seed, &data.join("bin")] {
-                fs::create_dir(path).unwrap();
-                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-            }
-            // The native provider resolves the explicit fixture tool locally;
-            // only this isolated directory contains the test link.
-            std::os::unix::fs::symlink(&kubo, data.join("bin/kubo")).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(90);
-            assert_eq!(
-                run(
-                    command(
-                        &kubo,
-                        &root_path,
-                        &repo,
-                        &root_path,
-                        &["version", "--number"]
-                    ),
-                    &root_path,
-                    deadline
+        }
+
+        fn loopback_listener(address: &str) {
+            let port = address
+                .strip_prefix("/ip4/127.0.0.1/tcp/")
+                .and_then(|port| port.parse::<u16>().ok())
+                .unwrap();
+            assert_ne!(port, 0, "fixture listener must have a bound loopback port");
+        }
+
+        async fn require_peer(
+            kubo: &Path,
+            root: &Path,
+            repo: &Path,
+            expected: &str,
+            deadline: Instant,
+        ) {
+            loop {
+                let peers = run(
+                    command(kubo, root, repo, root, &["swarm", "peers"]),
+                    root,
+                    deadline,
                 )
-                .await,
-                "0.40.1"
-            );
-            run(
-                command(
-                    &kubo,
-                    &root_path,
-                    &repo,
-                    &root_path,
-                    &["init", "--empty-repo"],
-                ),
-                &root_path,
-                deadline,
-            )
-            .await;
-            let config_path = repo.join("config");
-            let mut config: serde_json::Value =
-                serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
-            config["Bootstrap"] = serde_json::json!([]);
-            config["Addresses"]["API"] = serde_json::json!("/ip4/127.0.0.1/tcp/0");
-            config["Addresses"]["Gateway"] = serde_json::json!("");
-            config["Addresses"]["Swarm"] = serde_json::json!([]);
-            config["Routing"]["Type"] = serde_json::json!("none");
-            config["Discovery"]["MDNS"]["Enabled"] = serde_json::json!(false);
-            config["AutoConf"]["Enabled"] = serde_json::json!(false);
-            config["Import"] = serde_json::json!({
-                "CidVersion":1,"UnixFSRawLeaves":true,"UnixFSChunker":"size-262144", "HashFunction":"sha2-256",
-                "UnixFSFileMaxLinks":174,"UnixFSDirectoryMaxLinks":0,"UnixFSHAMTDirectoryMaxFanout":256,
-                "UnixFSHAMTDirectorySizeThreshold":"256KiB","UnixFSHAMTDirectorySizeEstimation":"links",
-                "UnixFSDAGLayout":"balanced","FastProvideRoot":false,"FastProvideWait":false
-            });
-            fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
-            let mut weights = vec![0; 8 * 1024 * 1024];
-            let mut random = 0x7b16_984d_3c20_a5e1u64;
-            for bytes in weights.chunks_mut(8) {
-                random ^= random << 13;
-                random ^= random >> 7;
-                random ^= random << 17;
-                let len = bytes.len();
-                bytes.copy_from_slice(&random.to_le_bytes()[..len]);
+                .await;
+                let peers: Vec<_> = peers.lines().collect();
+                if peers.is_empty() {
+                    assert!(Instant::now() < deadline, "fixture peer readiness deadline");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+                assert_eq!(peers.len(), 1, "fixture must have only its exact peer");
+                let (address, peer) = peers[0].rsplit_once("/p2p/").unwrap();
+                loopback_listener(address);
+                assert_eq!(peer, expected);
+                return;
             }
-            weights[..8].copy_from_slice(b"GGUF\x03\0\0\0");
-            let (mut payload, files) = package_fixture(weights);
-            assert!(files.values().map(|bytes| bytes.len()).sum::<usize>() <= 16 * 1024 * 1024);
-            for (path, bytes) in &files {
-                fs::write(seed.join(path), bytes).unwrap();
+        }
+
+        async fn start_daemon(
+            kubo: &Path,
+            root: &Path,
+            repo: &Path,
+            cold: bool,
+            deadline: Instant,
+        ) -> (OwnedChild, File, File, u16) {
+            let mut args = vec!["daemon", "--routing=none", "--enable-gc=false"];
+            if !cold {
+                args.push("--offline");
             }
-            let mut args = vec![
-                "add",
-                "--recursive=true",
-                "--quieter=true",
-                "--wrap-with-directory=true",
-                "--only-hash=false",
-                "--pin=true",
-                "--cid-version=1",
-                "--hash=sha2-256",
-                "--raw-leaves=true",
-                "--chunker=size-262144",
-                "--trickle=false",
-                "--max-file-links=174",
-                "--max-directory-links=0",
-                "--max-hamt-fanout=256",
-                "--inline=false",
-                "--nocopy=false",
-                "--fscache=false",
-                "--preserve-mode=false",
-                "--preserve-mtime=false",
-                "--empty-dirs=false",
-                "--progress=false",
-                "--fast-provide-root=false",
-                "--fast-provide-wait=false",
-            ];
-            args.extend(files.keys().map(String::as_str));
-            let cid = run(
-                command(&kubo, &root_path, &repo, &seed, &args),
-                &root_path,
-                deadline,
-            )
-            .await;
-            assert!(canonical_cid(&cid, 0x70));
-            payload["entries"][0]["cid"] = serde_json::json!(cid);
-            write_preparation_catalog(&data, &payload);
-            assert!(
-                !data.join("model-preparation").exists(),
-                "Use starts with an empty preparation inventory"
-            );
-            let backend_before = disk_bytes(&repo);
-            let seed_disk = disk_bytes(&seed);
-            let stdout = tempfile::tempfile_in(&root_path).unwrap();
-            let stderr = tempfile::tempfile_in(&root_path).unwrap();
+            let stdout = tempfile::tempfile_in(root).unwrap();
+            let stderr = tempfile::tempfile_in(root).unwrap();
             let mut daemon = OwnedChild(
-                command(
-                    &kubo,
-                    &root_path,
-                    &repo,
-                    &root_path,
-                    &["daemon", "--offline", "--routing=none", "--enable-gc=false"],
-                )
-                .stdout(stdout.try_clone().unwrap())
-                .stderr(stderr.try_clone().unwrap())
-                .spawn()
-                .unwrap(),
+                command(kubo, root, repo, root, &args)
+                    .stdout(stdout.try_clone().unwrap())
+                    .stderr(stderr.try_clone().unwrap())
+                    .spawn()
+                    .unwrap(),
             );
             let client = reqwest::Client::builder()
                 .no_proxy()
@@ -2745,6 +2650,326 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             };
+            (daemon, stdout, stderr, port)
+        }
+
+        #[tokio::test]
+        #[ignore = "requires explicit ELASTOS_TEST_KUBO_PATH and ELASTOS_TEST_IPFS_PROVIDER_PATH; parent runs isolated process proof"]
+        async fn model_preparation_real_content_native_process_use_admit_and_reuse() {
+            preparation_process(false).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires explicit pinned binaries and isolated loopback peers; parent runs cold process proof"]
+        async fn model_preparation_real_content_native_process_cold_64mib() {
+            preparation_process(true).await;
+        }
+
+        async fn preparation_process(cold: bool) {
+            use elastos_runtime::provider::{
+                BridgeProviderConfig, CapsuleProvider, ProviderBridge,
+            };
+            let prerequisite = |name| {
+                let path = PathBuf::from(
+                    std::env::var_os(name)
+                        .expect("explicit prerequisite required; skipped test is not proof"),
+                );
+                assert!(path.is_absolute() && fs::symlink_metadata(&path).unwrap().is_file());
+                path.canonicalize().unwrap()
+            };
+            let kubo = prerequisite("ELASTOS_TEST_KUBO_PATH");
+            let native = prerequisite("ELASTOS_TEST_IPFS_PROVIDER_PATH");
+            if let Some(override_path) = std::env::var_os("ELASTOS_IPFS_KUBO_PATH") {
+                assert_eq!(
+                    fs::canonicalize(override_path).unwrap(),
+                    kubo,
+                    "ambient provider override differs from pinned fixture prerequisite"
+                );
+            }
+            let root = tempfile::tempdir().unwrap();
+            let root_path = root.path().canonicalize().unwrap();
+            let setup_started = Instant::now();
+            // Fixed synthetic sizes only. This whole-buffer fixture is not a
+            // large-model publisher or a product-memory measurement.
+            let weights_size = if cold {
+                64 * 1024 * 1024 - 65536
+            } else {
+                8 * 1024 * 1024
+            };
+            let package_bound = weights_size as u64 + 65536;
+            let layout_charge =
+                preparation_charge(package_bound).unwrap() + 3 * package_bound + 32 * 1024 * 1024;
+            let dir = File::open(&root_path).unwrap();
+            let (volume_capacity, initial_free) = volume_bytes(&dir);
+            storage::require_space_floor(volume_capacity, initial_free, u128::from(layout_charge))
+                .unwrap();
+            let data = root_path.join("data");
+            let seed = root_path.join("seed");
+            let repo = data.join("ipfs-repo");
+            let publisher_repo = root_path.join("publisher-repo");
+            let seed_repo = if cold { &publisher_repo } else { &repo };
+            for path in [&data, &seed, &data.join("bin")] {
+                fs::create_dir(path).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            // The native provider resolves the explicit fixture tool locally;
+            // only this isolated directory contains the test link.
+            std::os::unix::fs::symlink(&kubo, data.join("bin/kubo")).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(90);
+            assert_eq!(
+                run(
+                    command(
+                        &kubo,
+                        &root_path,
+                        &repo,
+                        &root_path,
+                        &["version", "--number"]
+                    ),
+                    &root_path,
+                    deadline
+                )
+                .await,
+                "0.40.1"
+            );
+            for fixture_repo in if cold {
+                vec![&repo, &publisher_repo]
+            } else {
+                vec![&repo]
+            } {
+                run(
+                    command(
+                        &kubo,
+                        &root_path,
+                        fixture_repo,
+                        &root_path,
+                        &["init", "--empty-repo"],
+                    ),
+                    &root_path,
+                    deadline,
+                )
+                .await;
+                if cold {
+                    for profile in ["test", "autoconf-off", "announce-off"] {
+                        run(
+                            command(
+                                &kubo,
+                                &root_path,
+                                fixture_repo,
+                                &root_path,
+                                &["config", "profile", "apply", profile],
+                            ),
+                            &root_path,
+                            deadline,
+                        )
+                        .await;
+                    }
+                }
+                let config_path = fixture_repo.join("config");
+                let mut config: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+                config["Bootstrap"] = serde_json::json!([]);
+                config["Addresses"]["API"] = serde_json::json!("/ip4/127.0.0.1/tcp/0");
+                config["Addresses"]["Gateway"] = serde_json::json!("");
+                config["Addresses"]["Swarm"] = if cold {
+                    serde_json::json!(["/ip4/127.0.0.1/tcp/0"])
+                } else {
+                    serde_json::json!([])
+                };
+                config["Routing"]["Type"] = serde_json::json!("none");
+                config["Discovery"]["MDNS"]["Enabled"] = serde_json::json!(false);
+                config["AutoConf"]["Enabled"] = serde_json::json!(false);
+                if cold {
+                    config["Swarm"]["DisableNatPortMap"] = serde_json::json!(true);
+                    config["Swarm"]["RelayClient"]["Enabled"] = serde_json::json!(false);
+                    config["Swarm"]["RelayService"]["Enabled"] = serde_json::json!(false);
+                    config["Swarm"]["EnableHolePunching"] = serde_json::json!(false);
+                    config["AutoNAT"]["ServiceMode"] = serde_json::json!("disabled");
+                    config["Swarm"]["Transports"]["Network"] = serde_json::json!({
+                        "TCP":true,"Relay":false,"QUIC":false,"Websocket":false,
+                        "WebTransport":false,"WebRTCDirect":false
+                    });
+                }
+                config["Import"] = serde_json::json!({
+                    "CidVersion":1,"UnixFSRawLeaves":true,"UnixFSChunker":"size-262144", "HashFunction":"sha2-256",
+                    "UnixFSFileMaxLinks":174,"UnixFSDirectoryMaxLinks":0,"UnixFSHAMTDirectoryMaxFanout":256,
+                    "UnixFSHAMTDirectorySizeThreshold":"256KiB","UnixFSHAMTDirectorySizeEstimation":"links",
+                    "UnixFSDAGLayout":"balanced","FastProvideRoot":false,"FastProvideWait":false
+                });
+                fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+            }
+            let consumer_baseline = if cold {
+                let blocks = run(
+                    command(&kubo, &root_path, &repo, &root_path, &["refs", "local"]),
+                    &root_path,
+                    deadline,
+                )
+                .await;
+                // Pinned Kubo creates this four-byte initialization block even
+                // with --empty-repo. It is unrelated to the selected package.
+                assert_eq!(
+                    blocks,
+                    "bafkreiczsscdsbs7ffqz55asqdf3smv6klcw3gofszvwlyarci47bgf354"
+                );
+                let stat = run(
+                    command(
+                        &kubo,
+                        &root_path,
+                        &repo,
+                        &root_path,
+                        &["block", "stat", "--enc=json", &blocks],
+                    ),
+                    &root_path,
+                    deadline,
+                )
+                .await;
+                let stat: serde_json::Value = serde_json::from_str(&stat).unwrap();
+                assert_eq!(stat["Size"], 4);
+                Some(blocks)
+            } else {
+                None
+            };
+            let mut weights = vec![0; weights_size];
+            let mut random = 0x7b16_984d_3c20_a5e1u64;
+            for bytes in weights.chunks_mut(8) {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                let len = bytes.len();
+                bytes.copy_from_slice(&random.to_le_bytes()[..len]);
+            }
+            weights[..8].copy_from_slice(b"GGUF\x03\0\0\0");
+            let (mut payload, files) = package_fixture(weights);
+            assert!(files.values().map(|bytes| bytes.len() as u64).sum::<u64>() <= package_bound);
+            for (path, bytes) in &files {
+                fs::write(seed.join(path), bytes).unwrap();
+            }
+            let mut args = vec![
+                "add",
+                "--recursive=true",
+                "--quieter=true",
+                "--wrap-with-directory=true",
+                "--only-hash=false",
+                "--pin=true",
+                "--cid-version=1",
+                "--hash=sha2-256",
+                "--raw-leaves=true",
+                "--chunker=size-262144",
+                "--trickle=false",
+                "--max-file-links=174",
+                "--max-directory-links=0",
+                "--max-hamt-fanout=256",
+                "--inline=false",
+                "--nocopy=false",
+                "--fscache=false",
+                "--preserve-mode=false",
+                "--preserve-mtime=false",
+                "--empty-dirs=false",
+                "--progress=false",
+                "--fast-provide-root=false",
+                "--fast-provide-wait=false",
+            ];
+            args.extend(files.keys().map(String::as_str));
+            let cid = run(
+                command(&kubo, &root_path, seed_repo, &seed, &args),
+                &root_path,
+                deadline,
+            )
+            .await;
+            assert!(canonical_cid(&cid, 0x70));
+            payload["entries"][0]["cid"] = serde_json::json!(cid);
+            write_preparation_catalog(&data, &payload);
+            if cold {
+                change_config(&data, |config| {
+                    config["model_catalog"]["local_use"]["max_cache_bytes"] =
+                        serde_json::json!(preparation_charge(package_bound).unwrap());
+                });
+                let baseline = consumer_baseline.as_deref().unwrap();
+                assert!(
+                    !baseline.lines().any(|block| block == cid),
+                    "selected package was already present in consumer baseline"
+                );
+                assert_eq!(
+                    run(
+                        command(&kubo, &root_path, &repo, &root_path, &["refs", "local"]),
+                        &root_path,
+                        deadline
+                    )
+                    .await,
+                    baseline,
+                    "consumer block set changed before peer connection"
+                );
+            }
+            assert!(
+                !data.join("model-preparation").exists(),
+                "Use starts with an empty preparation inventory"
+            );
+            let backend_before = disk_bytes(&repo);
+            let seed_disk = disk_bytes(&seed);
+            let (mut daemon, stdout, stderr, port) =
+                start_daemon(&kubo, &root_path, &repo, cold, deadline).await;
+            let mut publisher = if cold {
+                Some(start_daemon(&kubo, &root_path, &publisher_repo, true, deadline).await)
+            } else {
+                None
+            };
+            let mut peer_ids = Vec::new();
+            if cold {
+                let mut listeners = Vec::new();
+                for fixture_repo in [&repo, &publisher_repo] {
+                    let config: serde_json::Value =
+                        serde_json::from_slice(&fs::read(fixture_repo.join("config")).unwrap())
+                            .unwrap();
+                    peer_ids.push(config["Identity"]["PeerID"].as_str().unwrap().to_owned());
+                    let listener = run(
+                        command(
+                            &kubo,
+                            &root_path,
+                            fixture_repo,
+                            &root_path,
+                            &["swarm", "addrs", "listen"],
+                        ),
+                        &root_path,
+                        deadline,
+                    )
+                    .await;
+                    loopback_listener(&listener);
+                    listeners.push(listener);
+                    assert!(run(
+                        command(
+                            &kubo,
+                            &root_path,
+                            fixture_repo,
+                            &root_path,
+                            &["swarm", "peers"]
+                        ),
+                        &root_path,
+                        deadline
+                    )
+                    .await
+                    .is_empty());
+                }
+                let address = format!("{}/p2p/{}", listeners[1], peer_ids[1]);
+                run(
+                    command(
+                        &kubo,
+                        &root_path,
+                        &repo,
+                        &root_path,
+                        &["swarm", "connect", &address],
+                    ),
+                    &root_path,
+                    deadline,
+                )
+                .await;
+                require_peer(&kubo, &root_path, &repo, &peer_ids[1], deadline).await;
+                require_peer(&kubo, &root_path, &publisher_repo, &peer_ids[0], deadline).await;
+            }
+            let setup_ms = setup_started.elapsed().as_millis();
+            let publisher_before = if cold {
+                disk_bytes(&publisher_repo)
+            } else {
+                (0, 0)
+            };
             fs::write(data.join("ipfs-coords.json"), serde_json::to_vec(&serde_json::json!({
                 "kubo_pid":daemon.0.id(),"api_port":port,"gateway_port":0,"started_at":now().unwrap(),"last_used":now().unwrap()
             })).unwrap()).unwrap();
@@ -2777,6 +3002,12 @@ mod tests {
             let test_repo = repo.clone();
             let test_registry = registry.clone();
             let test_backend = backend.clone();
+            let test_volume = dir.try_clone().unwrap();
+            let test_publisher_repo = publisher_repo.clone();
+            let mut logs = vec![stdout.try_clone().unwrap(), stderr.try_clone().unwrap()];
+            if let Some((_, out, err, _)) = &publisher {
+                logs.extend([out.try_clone().unwrap(), err.try_clone().unwrap()]);
+            }
             let mut work = tokio::spawn(async move {
                 let started = Instant::now();
                 let input = serde_json::json!({"cid":cid});
@@ -2793,6 +3024,12 @@ mod tests {
                 let id = response["operation_id"].as_str().unwrap().to_owned();
                 let mut staged_peak = (0, 0);
                 let mut backend_peak = backend_before;
+                let mut publisher_peak = publisher_before;
+                let mut combined_allocated_peak = 0;
+                let mut minimum_free = volume_bytes(&test_volume).1;
+                let mut samples = 0;
+                let mut last_sample = Instant::now();
+                let mut max_sample_gap_ms = 0;
                 while !test_owner
                     .worker
                     .lock()
@@ -2803,8 +3040,29 @@ mod tests {
                 {
                     let stage = disk_bytes(&test_data.join("model-preparation/stage"));
                     let backend = disk_bytes(&test_repo);
+                    let publisher = if cold {
+                        disk_bytes(&test_publisher_repo)
+                    } else {
+                        (0, 0)
+                    };
                     staged_peak = (staged_peak.0.max(stage.0), staged_peak.1.max(stage.1));
                     backend_peak = (backend_peak.0.max(backend.0), backend_peak.1.max(backend.1));
+                    publisher_peak = (
+                        publisher_peak.0.max(publisher.0),
+                        publisher_peak.1.max(publisher.1),
+                    );
+                    combined_allocated_peak = combined_allocated_peak
+                        .max(stage.1 + backend.1 + publisher.1 + seed_disk.1);
+                    minimum_free = minimum_free.min(volume_bytes(&test_volume).1);
+                    storage::require_space_floor(volume_capacity, minimum_free, 0).unwrap();
+                    assert!(
+                        logs.iter()
+                            .all(|log| log.metadata().unwrap().len() <= 65536),
+                        "daemon log bound"
+                    );
+                    max_sample_gap_ms = max_sample_gap_ms.max(last_sample.elapsed().as_millis());
+                    last_sample = Instant::now();
+                    samples += 1;
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 join_worker(&test_owner).await;
@@ -2812,6 +3070,10 @@ mod tests {
                 let record = load_operation(&test_data, &id).unwrap();
                 assert_eq!(record.state, PreparationState::Admitted);
                 assert_eq!(record.completed_bytes, record.total_bytes);
+                assert_eq!(
+                    record.reserved_bytes,
+                    preparation_charge(record.total_bytes).unwrap()
+                );
                 assert_eq!(
                     record.index_bytes,
                     test_backend.files["_elastos_object.json"].len() as u64
@@ -2826,6 +3088,34 @@ mod tests {
                     assert_eq!(fs::read(admitted.path.join(path)).unwrap(), *bytes);
                 }
                 let admitted_disk = disk_bytes(&admitted.path);
+                let backend_after = disk_bytes(&test_repo);
+                let publisher_after = if cold {
+                    disk_bytes(&test_publisher_repo)
+                } else {
+                    (0, 0)
+                };
+                backend_peak = (
+                    backend_peak.0.max(backend_after.0),
+                    backend_peak.1.max(backend_after.1),
+                );
+                publisher_peak = (
+                    publisher_peak.0.max(publisher_after.0),
+                    publisher_peak.1.max(publisher_after.1),
+                );
+                if cold {
+                    assert!(
+                        backend_after.0 >= backend_before.0 + weights_size as u64,
+                        "cold transfer must grow consumer backend logical bytes"
+                    );
+                    assert!(
+                        backend_after.1 > backend_before.1,
+                        "cold transfer must allocate consumer backend blocks"
+                    );
+                }
+                combined_allocated_peak = combined_allocated_peak
+                    .max(admitted_disk.1 + backend_after.1 + publisher_after.1 + seed_disk.1);
+                minimum_free = minimum_free.min(volume_bytes(&test_volume).1);
+                storage::require_space_floor(volume_capacity, minimum_free, 0).unwrap();
                 let requests = test_backend.calls.lock().unwrap().clone();
                 let reads = requests.iter().filter(|op| *op == "cat").count();
                 let expected_reads = 1 + test_backend
@@ -2843,6 +3133,7 @@ mod tests {
                     1
                 );
                 let reopened = PreparationOwner::default();
+                let reuse_started = Instant::now();
                 let alias = reopened
                     .invoke(
                         &test_data,
@@ -2871,11 +3162,22 @@ mod tests {
                     reads
                 );
                 assert!(!reused.projection()["inference_ready"].as_bool().unwrap());
-                serde_json::json!({"elapsed_preparation_ms":elapsed_ms,"content_reads":reads,
+                assert!(
+                    logs.iter()
+                        .all(|log| log.metadata().unwrap().len() <= 65536),
+                    "daemon log bound"
+                );
+                serde_json::json!({"cold":cold,"setup_ms":setup_ms,"elapsed_preparation_ms":elapsed_ms,
+                    "reuse_ms":reuse_started.elapsed().as_millis(),"content_reads":reads,
+                    "layout_preflight_bytes":layout_charge,"minimum_sampled_free_bytes":minimum_free,
+                    "sample_interval_ms":10,"samples":samples,"max_sample_gap_ms":max_sample_gap_ms,
+                    "publisher_before":publisher_before,"publisher_sampled_peak":publisher_peak,
+                    "publisher_after":publisher_after,
+                    "combined_sampled_allocated_peak":combined_allocated_peak,
                     "provider_requests":test_backend.calls.lock().unwrap().len(),"total_bytes":record.total_bytes,
                     "index_bytes":record.index_bytes,"reserved_bytes":record.reserved_bytes,
                     "seed_disk":seed_disk,"backend_before":backend_before,"backend_sampled_peak":backend_peak,
-                    "staging_sampled_peak":staged_peak,"admitted_disk":admitted_disk,"backend_after":disk_bytes(&test_repo),
+                    "staging_sampled_peak":staged_peak,"admitted_disk":admitted_disk,"backend_after":backend_after,
                     "reuse_content_reads":0,"inference_ready":false})
             });
             let outcome =
@@ -2902,22 +3204,54 @@ mod tests {
             drop(registry);
             drop(backend);
             drop(bridge);
+            // Perform peer assertions in a task so an assertion still reaches
+            // the exact-child cleanup below.
+            let peer_check = if cold {
+                let kubo = kubo.clone();
+                let root = root_path.clone();
+                let repo = repo.clone();
+                let publisher_repo = publisher_repo.clone();
+                Some(
+                    tokio::spawn(async move {
+                        require_peer(&kubo, &root, &repo, &peer_ids[1], deadline).await;
+                        require_peer(&kubo, &root, &publisher_repo, &peer_ids[0], deadline).await;
+                    })
+                    .await,
+                )
+            } else {
+                None
+            };
             daemon.0.kill().unwrap();
             daemon.0.wait().unwrap();
             drop(daemon);
+            if let Some((child, _, _, _)) = &mut publisher {
+                child.0.kill().unwrap();
+                child.0.wait().unwrap();
+            }
+            drop(publisher);
             drop(dir);
             drop(stdout);
             drop(stderr);
             root.close().unwrap();
             assert!(!root_path.exists());
             shutdown.expect("native bridge shutdown and reap");
+            if let Some(peer_check) = peer_check {
+                peer_check.unwrap();
+            }
             let mut receipt = outcome
                 .expect("production preparation deadline")
                 .expect("production preparation task");
             receipt["fixture_cleanup"] = serde_json::json!(true);
             receipt["native_shutdown_reap"] = serde_json::json!(true);
             receipt["kubo_reaped"] = serde_json::json!(true);
-            receipt["proof_limit"] = serde_json::json!("Isolated signed synthetic package from seeded offline Kubo; actual Content/native Use/admission/reuse. Allocation observations are samples, not continuous peak; extra seed copy is fixture-only. Cold-network, exact Qwen and inference remain open.");
+            receipt["kubo_children_reaped"] = serde_json::json!(if cold { 2 } else { 1 });
+            receipt["consumer_package_absent_before_connect"] = serde_json::json!(cold);
+            receipt["consumer_init_block"] = serde_json::json!(consumer_baseline);
+            receipt["proof_limit"] = serde_json::json!(if cold {
+                "64 MiB-capped signed synthetic cold loopback delivery through Content/native Use/admission/reuse. Allocations are sampled peaks; whole-buffer fixture memory is harness-only. Public-network, exact Qwen and inference remain open."
+            } else {
+                "8 MiB signed synthetic seeded offline Kubo proof through Content/native Use/admission/reuse. Allocations are sampled peaks; whole-buffer fixture memory is harness-only. Cold-network, exact Qwen and inference remain open."
+            });
             println!("{receipt}");
         }
     }

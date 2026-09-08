@@ -296,8 +296,7 @@ The integrated source includes these durable facts:
   staging and backend charge, which avoids charging stored bytes again.
   Full quota, fixed overhead allowances and the 10% free-space floor remain
   unchanged. Focused progress, separate-volume, overflow and provider-request
-  tests pass, as does the repeated seeded-warm 8 MiB process proof. Measured
-  cold-backend allocation remains open.
+  tests pass, as does the repeated seeded-warm 8 MiB process proof.
 - Separately invoked 1 MiB and 8 MiB process tests passed through the production preparation
   owner, real Content, Registry, native provider bridge and isolated offline
   Kubo. Fresh Use admitted 1,049,332 payload bytes plus a 717-byte index in
@@ -309,10 +308,18 @@ The integrated source includes these durable facts:
   8,474,624; sampled staging/admitted allocation was 8,605,696 bytes and the
   full reservation was 33,753,284 bytes. Cleanup and both child reaps passed.
   Both runs used signed synthetic packages seeded in offline local cache.
-  Continuous peak-capacity and scaled cold-delivery proof remain open.
+  Continuous peak-capacity and exact-model-scale delivery proof remain open.
   One inventory worker retains accounting through drain and
   exact admission reconciliation. Shared Use/Keep/selection
   UI and cold exact-Qwen acceptance follow. Installed Homes remain unchanged.
+- A separate 64 MiB-capped signed synthetic process test passes cold loopback
+  delivery through Content, Registry and the native provider. The consumer
+  starts with only Kubo's verified initialization block; the selected package
+  is absent before connection. Consumer backend growth, exact byte/CID admission,
+  zero-read reuse and both-peer/native cleanup pass. Disk observations include
+  sampled backend/stage allocations and free space. Whole-buffer fixture memory
+  belongs to the test harness. Real Qwen, inference and full-scale memory/disk
+  proof remain open.
 - Runtime startup composes admitted content with configured
   operator offers after native IPFS registration. It rechecks the current signed
   catalog, complete stored closure, package CID and installed engine receipt.
