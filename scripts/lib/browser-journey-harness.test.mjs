@@ -4,6 +4,8 @@ import test from "node:test";
 import vm from "node:vm";
 import { createBrowserJourneyFixture } from "./browser-journey-fixture.mjs";
 import { readBrowserViewerReloadDocument } from "./browser-journey-viewer-reload.mjs";
+import { browserJourneyTargetConfig, readBrowserJourneyReceipt,
+  browserJourneyEngineChoice, browserJourneyEngineRoute } from "./browser-journey-target.mjs";
 
 const source = readFileSync(new URL("../home-passkey-virtual-auth-smoke.mjs", import.meta.url), "utf8");
 function harnessFunction(name, globals = {}) {
@@ -11,10 +13,13 @@ function harnessFunction(name, globals = {}) {
   assert.ok(start >= 0, name);
   const next = source.slice(start + 1).search(/\n(?:async )?function /);
   const declaration = source.slice(start, start + 1 + next);
-  return vm.runInNewContext(`(${declaration})`, { URL, Date, performance,
+  return vm.runInNewContext(`(${declaration})`, { URL, URLSearchParams, Date, performance,
     CHECK_BROWSER_CONTROLLED_MEDIA: false, CHECK_BROWSER_CONTROLLED_INSPECTION: false,
     CHECK_BROWSER_CONTROLLED_OPERATOR: false, CHECK_BROWSER_CONTROLLED_JOURNEY: false,
-    BROWSER_REMOTE_EXIT_ID: "", browserQualification: null, qualificationCancellation: null, ...globals });
+    BROWSER_REMOTE_EXIT_ID: "", browserQualification: null, qualificationCancellation: null,
+    BROWSER_JOURNEY_TARGET: browserJourneyTargetConfig(), browserJourneyEngineChoice, browserJourneyEngineRoute,
+    readBrowserJourneyReceipt: (config, run, options) => readBrowserJourneyReceipt(config, run,
+      { ...options, fetchImpl: globals.fetch || fetch }), ...globals });
 }
 
 test("controlled fixture isolates runs, records bounded events and rejects malformed requests", async () => {
@@ -73,6 +78,27 @@ test("page acquisition fails immediately on its terminal open settlement", async
   assert.equal(await wait(active, [{ frame, at: Date.now(), body: {} }]), "page-current");
   assert.equal(await wait(active, [{ frame: active, open_id: "old-open", body: {} }], new Set(["old-open"])), "page-current");
   await assert.rejects(wait(active, [{ frame: active, open_id: "new-open", body: {} }], new Set(["old-open"])));
+});
+
+test("explicit Browser inventory deadline aborts a hung response body; default API calls keep their options", async () => {
+  const api = harnessFunction("browserApi");
+  const page = { evaluate: async (callback, args) => vm.runInNewContext(`(${callback.toString()})(args)`, {
+    args, AbortSignal, fetch: async (_path, options) => {
+      assert.equal(options.headers["x-elastos-home-token"], "exact-token");
+      if (args.timeoutMs === null) {
+        assert.equal(options.signal, undefined);
+        return { ok: true, status: 200, text: async () => "{}" };
+      }
+      assert.ok(options.signal);
+      return { ok: true, status: 200, text: () => new Promise((resolve, reject) => {
+        options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+      }) };
+    },
+  }) };
+  assert.equal((await api(page, "exact-token", "/summary")).ok, true);
+  const keepAlive = setInterval(() => {}, 100);
+  try { await assert.rejects(api(page, "exact-token", "/summary", { timeoutMs: 5 }), { name: "TimeoutError" }); }
+  finally { clearInterval(keepAlive); }
 });
 
 test("error-state redaction covers frame fragments and direct token fields", () => {
@@ -134,12 +160,37 @@ function closeHarnessSurface() {
     },
   };
   const frame = { url: () => "http://localhost/apps/browser/?browser_instance=instance-one#home_token=browser-token",
-    parentFrame: () => gui, frameElement: async () => ({ contentWindow: source }), waitForFunction: async () => {} };
+    parentFrame: () => gui, frameElement: async () => iframe, waitForFunction: async () => {} };
+  const node = { isConnected: true, dataset: { windowId: "browser--2" }, querySelector: () => iframe };
+  const iframe = { contentWindow: source, isConnected: true, closest: () => node,
+    getAttribute: async () => frame.url(), evaluateHandle: async callback => ({ asElement: () => {
+      assert.equal(callback(iframe), node); return section;
+    } }) };
+  const section = { node, getAttribute: async () => node.dataset.windowId,
+    evaluate: async (callback, args) => callback(node, args),
+    $: async selector => {
+      assert.equal(selector, '[data-action="close"]');
+      return { getAttribute: async () => "Close", dispose: async () => {}, click: async () => {
+        actions.push("ui-close"); await surface.click();
+        if (surface.removeSection !== false) { node.isConnected = false; iframe.isConnected = false; }
+      } };
+    } };
+  const sections = new Map([[node.dataset.windowId, section]]);
+  gui.locator = selector => {
+    const id = selector.match(/data-window-id="([^"]+)"/)?.[1];
+    const live = () => sections.get(id)?.node.isConnected ? sections.get(id) : null;
+    return { count: async () => live() ? 1 : 0,
+      evaluate: async (callback, captured) => callback(live()?.node, captured.node) };
+  };
+  gui.waitForFunction = async (callback, captured) => {
+    assert.ok(callback(captured.node), "captured Browser section is still connected");
+    actions.push("detached"); await surface.emit("framedetached", frame);
+  };
   const page = {
     on: (event, listener) => { if (!listeners.has(event)) listeners.set(event, new Set()); listeners.get(event).add(listener); },
     off: (event, listener) => listeners.get(event)?.delete(listener),
   };
-  const surface = { gui, frame, page, actions,
+  const surface = { gui, frame, page, actions, sections, section, iframe,
     emit: async (event, value) => { for (const listener of listeners.get(event) || []) await listener(value); },
     message: (data = {}, overrides = {}) => {
       const event = { source, origin: "null", data: { type: "elastos.browser.window-close.result/v1", browserInstance: "instance-one",
@@ -155,14 +206,18 @@ function closeHarnessSurface() {
       assert.equal(actions.at(-1), "disposed");
     },
   };
-  surface.window = { getByRole: () => ({ click: async () => { actions.push("ui-close"); await surface.click(); } }),
-    waitFor: async () => { actions.push("detached"); await surface.emit("framedetached", frame); } };
+  surface.window = { appFrame: frame, section, iframe, parent: gui, windowId: node.dataset.windowId,
+    instance: "instance-one", token: "browser-token",
+    locator: gui.locator('section.window[data-target="browser"][data-window-id="browser--2"]') };
   surface.click = async () => surface.message();
   return surface;
 }
 
 function closeHarnessFunction(globals = {}) {
+  const identityGlobals = browserIdentityGlobals();
   return harnessFunction("closeControlledBrowserWindow", {
+    clickBrowserWindowClose: harnessFunction("clickBrowserWindowClose", identityGlobals),
+    waitForBrowserWindowDetached: harnessFunction("waitForBrowserWindowDetached"),
     BROWSER_UI_PAGE_ID_TIMEOUT_MS: 180_000,
     REQUIRE_BROWSER_VZ_TRANSPORT: false,
     markStage: () => {}, assert: (condition, message) => assert.ok(condition, message),
@@ -173,19 +228,131 @@ function closeHarnessFunction(globals = {}) {
   });
 }
 
+function browserIdentityGlobals() {
+  const globals = { HOME_URL: "http://localhost/apps/home/",
+    assert: (condition, message) => assert.ok(condition, message) };
+  globals.launchTokenFromRoute = harnessFunction("launchTokenFromRoute", globals);
+  globals.assertIsolatedLaunchRoute = harnessFunction("assertIsolatedLaunchRoute", globals);
+  globals.assertBrowserWindowIdentity = harnessFunction("assertBrowserWindowIdentity", globals);
+  return globals;
+}
+
+test("captured Browser B closes while A remains and newly inserted C never takes its token or chrome", async () => {
+  const surface = closeHarnessSurface();
+  const other = id => ({ node: { isConnected: true, dataset: { windowId: id } } });
+  const a = other("browser--1"), c = other("browser--3");
+  surface.sections.set("browser--1", a);
+  const selectedFrame = surface.frame;
+  surface.sections.set("browser--3", c); // A restore races after Frame B was selected.
+  const globals = browserIdentityGlobals();
+  const identity = await harnessFunction("captureBrowserWindowIdentity", globals)(selectedFrame);
+  assert.equal(identity.windowId, "browser--2");
+  assert.equal(identity.token, "browser-token");
+  await harnessFunction("clickBrowserWindowClose", globals)(identity, selectedFrame, identity.token);
+  await harnessFunction("waitForBrowserWindowDetached")(identity);
+  assert.equal(surface.section.node.isConnected, false);
+  assert.equal(a.node.isConnected, true);
+  assert.equal(c.node.isConnected, true);
+  assert.deepEqual(surface.actions, ["ui-close", "detached"]);
+});
+
+test("iframe-only replacement is not a detached Browser window; replaced section and foreign token reject", async () => {
+  const surface = closeHarnessSurface();
+  const globals = browserIdentityGlobals();
+  const capture = harnessFunction("captureBrowserWindowIdentity", globals);
+  const identity = await capture(surface.frame);
+  surface.iframe.isConnected = false;
+  await assert.rejects(harnessFunction("waitForBrowserWindowDetached")(identity), /section is still connected/);
+  await assert.rejects(globals.assertBrowserWindowIdentity(identity, surface.frame, identity.token), /no longer belongs/);
+  surface.iframe.isConnected = true;
+  await assert.rejects(globals.assertBrowserWindowIdentity(identity, surface.frame, "foreign-token"), /authority identity/);
+  surface.sections.set(identity.windowId, { node: { isConnected: true } });
+  await assert.rejects(globals.assertBrowserWindowIdentity(identity, surface.frame, identity.token), /replaced or duplicated/);
+});
+
 test("startup failure can close through Home before a page id exists", async () => {
   const baseline = { principal_sessions: 0, total_sessions: 0, launching_sessions: 0,
     engine_cleanup_obligations: 0, launch_reconciliation_obligations: 0 };
   const surface = closeHarnessSurface();
+  const otherWindow = { node: { isConnected: true } };
+  surface.sections.set("browser--1", otherWindow);
   const close = closeHarnessFunction({
     browserApi: async frame => { assert.equal(frame, surface.gui); return { ok: true,
       body: { sessions: { ...baseline, recoverable_page: null } } }; },
   });
   const result = await close(surface.page, surface.frame, surface.window, "browser-token", baseline);
+  assert.equal(otherWindow.node.isConnected, true);
   assert.equal(result.startup_close.terminal_kind, "no_page");
   assert.equal(result.close_evidence.messages[0].requestId, "close-one");
   assert.equal(result.close_evidence.frames[0].event, "detached");
   assert.deepEqual(surface.actions, ["ui-close", "detached", "disposed"]);
+  surface.assertClean();
+});
+
+test("terminal no-page and iframe detachment still fail while the captured Home section remains", async () => {
+  const surface = closeHarnessSurface();
+  surface.removeSection = false;
+  surface.click = async () => { surface.message(); surface.iframe.isConnected = false; };
+  const baseline = { principal_sessions: 0, total_sessions: 0, launching_sessions: 0,
+    engine_cleanup_obligations: 0, launch_reconciliation_obligations: 0 };
+  const close = closeHarnessFunction({ browserApi: async () => ({ ok: true,
+    body: { sessions: { ...baseline, recoverable_page: null } } }) });
+  await assert.rejects(close(surface.page, surface.frame, surface.window, "browser-token", baseline), /section is still connected/);
+  assert.equal(surface.section.node.isConnected, true);
+  surface.assertClean();
+});
+
+test("launcher visibility failure retains exact Frame B for caller cleanup while A and restored C remain", async () => {
+  const surface = closeHarnessSurface();
+  const a = { node: { isConnected: true } }, c = { node: { isConnected: true } };
+  surface.sections.set("browser--1", a);
+  surface.page.url = () => "http://localhost/apps/home/";
+  const original = new Error("selected Browser B visibility failed");
+  surface.iframe.contentFrame = async () => surface.frame;
+  surface.iframe.waitForElementState = async state => {
+    assert.equal(state, "visible");
+    surface.sections.set("browser--3", c);
+    throw original;
+  };
+  surface.gui.getByRole = () => ({ waitFor: async () => {
+    const error = new Error(); error.name = "TimeoutError"; throw error;
+  } });
+  const pinnedLocator = surface.gui.locator;
+  surface.gui.locator = selector => {
+    if (selector.includes("data-window-id=")) return pinnedLocator(selector);
+    if (selector.includes("#taskbar-targets")) return { first: () => ({ isVisible: async () => true }) };
+    if (selector.includes("iframe.window-frame")) return { last: () => ({
+      waitFor: async options => { assert.equal(options.state, "attached"); },
+      elementHandle: async () => surface.iframe,
+    }) };
+    return { last: () => ({ isVisible: async () => true,
+      evaluate: async callback => callback({ classList: { contains: () => true } }),
+    }) };
+  };
+  const globals = browserIdentityGlobals();
+  const open = harnessFunction("openDesktopAppWindow", { ...globals,
+    waitForSignedHome: async () => {}, waitForCapsuleFrame: async () => surface.gui,
+  });
+  const empty = { schema: "elastos.browser.session-capacity/v1", status: "configured", recoverable_page: null,
+    lifecycle: { sessions: [] }, active_sessions: 0, principal_sessions: 0, total_sessions: 0,
+    launching_sessions: 0, engine_cleanup_obligations: 0, launch_reconciliation_obligations: 0 };
+  const close = closeHarnessFunction({ CHECK_BROWSER_CONTROLLED_JOURNEY: true,
+    browserApi: async () => ({ ok: true, body: { sessions: empty } }) });
+  const caller = harnessFunction("checkBrowserEmbeddedUiInput", { ...globals,
+    CHECK_BROWSER_CONTROLLED_JOURNEY: true, openDesktopAppWindow: open,
+    captureBrowserWindowIdentity: harnessFunction("captureBrowserWindowIdentity", globals),
+    closeControlledBrowserWindow: close, markStage: () => {}, smokeStage: "browser:home-launch",
+    console: { error: () => {} }, redactSensitive: value => value,
+  });
+  await assert.rejects(caller(surface.page, null), error => {
+    assert.equal(error, original);
+    assert.equal(error.details.startup_cleanup.startup_close.terminal_kind, "no_page");
+    assert.equal(error.details.cleanup_error, undefined);
+    return true;
+  });
+  assert.equal(surface.section.node.isConnected, false);
+  assert.equal(a.node.isConnected, true); assert.equal(c.node.isConnected, true);
+  assert.equal(surface.actions.filter(action => action === "ui-close").length, 1);
   surface.assertClean();
 });
 
@@ -205,7 +372,17 @@ test("a successful journey cannot use no-page startup cleanup as fresh-close pro
 test("journey preserves click/key timing and exact close even when diagnostic stop rejects or throws", async () => {
   for (const variant of ["success", "input-failure", "stop-reject", "stop-throw", "input-failure-stop-throw",
     "operator-success", "operator-media-success", "operator-before-close-failure", "operator-after-close-failure",
-    "operator-pending-close-failure", "operator-qualification-success", "operator-qualification-failure"]) {
+    "operator-pending-close-failure", "operator-qualification-success", "operator-qualification-failure",
+    "remote-engine-success", "remote-engine-wrong-adapter", "remote-engine-unavailable"]) {
+    const remote = variant.startsWith("remote-engine-");
+    const routeFails = variant === "remote-engine-wrong-adapter";
+    const setupFails = variant === "remote-engine-unavailable";
+    const target = browserJourneyTargetConfig(remote ? { HOME_VIRTUAL_AUTH_BROWSER_ENGINE_ID: "remote-engine-test",
+      HOME_VIRTUAL_AUTH_BROWSER_FIXTURE_ORIGIN: "http://fixture.example:61512",
+      HOME_VIRTUAL_AUTH_BROWSER_FIXTURE_ADMIN_ORIGIN: "http://localhost:61512",
+      HOME_VIRTUAL_AUTH_BROWSER_ALLOW_REMOTE_FIXTURE: "1" } : {});
+    let selectedEngine = "", summaryReads = 0, addressWaits = 0;
+    const stages = [];
     const inputFails = variant.includes("input-failure");
     const operatorEnabled = variant.startsWith("operator-");
     const qualification = variant.includes("qualification");
@@ -227,9 +404,11 @@ test("journey preserves click/key timing and exact close even when diagnostic st
       ...(type === "audio" ? { audio_state: "running", frequency_hz: 440 } : {}),
       input_rect: { x: 32, y: 150, width: 480, height: 60 } });
     const appFrame = {
-      waitForFunction: async () => {},
+      waitForFunction: async () => { addressWaits++; },
       evaluate: async () => ({}),
-      locator: () => ({ waitFor: async () => {}, hover: async () => {}, click: async () => { inputActions.push("click"); if (media) report("audio"); },
+      locator: selector => ["#browser-settings", "#browser-settings-close", "#browser-engine"].includes(selector) ? {
+        click: async () => {}, selectOption: async id => { selectedEngine = id; }, inputValue: async () => selectedEngine,
+      } : ({ waitFor: async () => {}, hover: async () => {}, click: async () => { inputActions.push("click"); if (media) report("audio"); },
         evaluate: async fn => fn({ dataset: { visible: "false" }, querySelector: () => ({ textContent: "" }) }),
         fill: async target => { url = target; pageName = new URL(target).pathname.slice(1); value = ""; },
         press: async key => { assert.equal(key, "Enter"); report("load"); },
@@ -238,7 +417,7 @@ test("journey preserves click/key timing and exact close even when diagnostic st
     };
     const page = { on: () => {}, off: () => {}, mouse: { wheel: async () => report("scroll") } };
     const baseline = {};
-    const window = {};
+    const window = { instance: "instance-one" };
     const journey = harnessFunction("runControlledBrowserJourney", {
       CHECK_BROWSER_CONTROLLED_RECOVERY: false,
       CHECK_BROWSER_VIEWER_RELOAD: false,
@@ -254,14 +433,30 @@ test("journey preserves click/key timing and exact close even when diagnostic st
         if (qualificationFails) throw qualificationError;
         return { schema: "elastos.browser.qualification-observation/v1", fixture: true };
       } } : null,
-      BROWSER_JOURNEY_FIXTURE_ORIGIN: "http://localhost:61511", BROWSER_OPEN_DISPLAY_MODE: "webrtc_remote_display",
+      BROWSER_JOURNEY_TARGET: target, BROWSER_OPEN_DISPLAY_MODE: "webrtc_remote_display",
       BROWSER_UI_PAGE_ID_TIMEOUT_MS: 180_000, BROWSER_REMOTE_VIDEO_TIMEOUT_MS: 30_000,
-      randomUUID: () => runId, AbortSignal, smokeStage: "input", markStage: () => {},
+      randomUUID: () => runId, AbortSignal, smokeStage: "input", markStage: value => stages.push(value),
       assert: (condition, message) => assert.ok(condition, message),
-      fetch: async () => ({ ok: true, status: 200,
-        json: async () => ({ schema: "elastos.browser.journey-receipt/v1", run: runId, events }) }),
+      fetch: async (requestUrl, options) => {
+        assert.equal(requestUrl, `${target.adminOrigin}/receipt?run=${runId}`);
+        assert.equal(options.credentials, "omit");
+        return { ok: true, status: 200,
+          json: async () => ({ schema: "elastos.browser.journey-receipt/v1", run: runId, events }) };
+      },
       waitForEmbeddedBrowserPage: async () => `page-${pageName}`,
       browserApi: async (_frame, _token, path, options) => {
+        if (path.includes("/summary?")) {
+          assert.equal(path, "/api/apps/browser/summary?browser_instance=instance-one");
+          assert.equal(options.timeoutMs, 5_000);
+          summaryReads++;
+          if (setupFails) return { ok: true, body: { engine_adapter: { adapters: [] } } };
+          const adapter = { id: target.engineId, direct_network: false, wallet_injection: false };
+          return { ok: true, body: { engine_adapter: { adapters: [adapter], remote_services: { offers: [{ state: "approved",
+            launch_available: true, selectable_adapters: [adapter], adapters: [{ ...adapter, id: "browser-vm-test" }] }] } },
+            sessions: { recoverable_page: { schema: "elastos.browser.recoverable-page/v1", state: "active", page_id: `page-${pageName}`,
+              service_selection: { schema: "elastos.browser.service-selection/v1", engine_id: selectedEngine },
+              engine_page: { page_id: `page-${pageName}`, adapter: routeFails ? "wrong-adapter" : "browser-vm-test", provider: "browser-engine" } } } } };
+        }
         if (path.endsWith("/inspect")) {
           if (!options) return { ok: true, body: { formats: ["accessibility_tree"] } };
           if (inspectReads++ >= 2) return { status: 409, body: { code: "stale_inspection" } };
@@ -310,7 +505,13 @@ test("journey preserves click/key timing and exact close even when diagnostic st
         return { ok: true };
       },
     });
-    if (inputFails || operatorFails || qualificationFails) await assert.rejects(journey(page, appFrame, window, "browser-token", baseline, []), error => {
+    if (setupFails) await assert.rejects(journey(page, appFrame, window, "browser-token", baseline, []), error => {
+      assert.match(error.message, /Requested Browser Engine is absent from the Runtime inventory/);
+      assert.equal(error.details.controlled_journey.requested_engine_id, target.engineId);
+      return true;
+    });
+    else if (routeFails) await assert.rejects(journey(page, appFrame, window, "browser-token", baseline, []), /different Engine or page/);
+    else if (inputFails || operatorFails || qualificationFails) await assert.rejects(journey(page, appFrame, window, "browser-token", baseline, []), error => {
       assert.equal(error, inputFails ? inputError : qualificationFails ? qualificationError : operatorError);
       if (qualificationFails) assert.equal(error.details.controlled_journey.qualification.failure, "fixture-gap");
       if (operatorFails) assert.equal(error.details.controlled_journey.operator.failure, "typed-fixture-error");
@@ -320,16 +521,32 @@ test("journey preserves click/key timing and exact close even when diagnostic st
     else {
       const result = await journey(page, appFrame, window, "browser-token", baseline, []);
       assert.equal(result.page_id, "page-nav");
+      assert.ok(result.controlled_journey.pages.every(row => new URL(row.url).origin === target.origin));
+      if (remote) {
+        assert.equal(result.controlled_journey.requested_engine_id, target.engineId);
+        assert.equal(result.controlled_journey.engine_route.adapter_id, "browser-vm-test");
+        assert.equal(result.controlled_journey.engine_route.engine_id, selectedEngine);
+        assert.equal(result.controlled_journey.engine_route.page_id, "page-nav");
+      }
       if (qualification) assert.equal(result.controlled_journey.qualification.fixture, true);
       if (variant.startsWith("stop-")) assert.equal(result.controlled_journey.input_observation.observer.stop_failed, true);
       assert.ok(!JSON.stringify(result).includes("private diagnostic failure"));
     }
     assert.equal(closes.length, 1);
     assert.equal(operatorCalls, operatorEnabled && !qualificationFails ? 1 : 0);
-    assert.deepEqual(inputActions.slice(0, 4), ["observe", "geometry", "click", "key"]);
-    assert.equal(inputActions[4], inputFails ? "failure-stop" : "stop");
+    assert.equal(summaryReads, remote ? setupFails ? 1 : routeFails ? 2 : 3 : 0);
+    if (setupFails) {
+      assert.equal(addressWaits, 0); assert.equal(selectedEngine, "");
+      assert.equal(stages[0], "browser:controlled-engine-selection");
+      assert.ok(!stages.includes("browser:controlled-address-ready"));
+    }
+    if (routeFails || setupFails) assert.deepEqual(inputActions, []);
+    else {
+      assert.deepEqual(inputActions.slice(0, 4), ["observe", "geometry", "click", "key"]);
+      assert.equal(inputActions[4], inputFails ? "failure-stop" : "stop");
+    }
     assert.deepEqual(closes[0].slice(0, 5), [page, appFrame, window, "browser-token", baseline]);
-    assert.equal(closes[0][5]?.expectedPageId, inputFails || qualificationFails || variant === "operator-before-close-failure" ? null : "page-nav");
+    assert.equal(closes[0][5]?.expectedPageId, setupFails || routeFails || inputFails || qualificationFails || variant === "operator-before-close-failure" ? null : "page-nav");
   }
 });
 

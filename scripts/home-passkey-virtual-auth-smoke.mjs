@@ -14,6 +14,8 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { browserOpenResponseEvidence } from "./lib/browser-open-failure.mjs";
+import { browserJourneyTargetConfig, readBrowserJourneyHealth, readBrowserJourneyReceipt,
+  browserJourneyEngineChoice, browserJourneyEngineRoute } from "./lib/browser-journey-target.mjs";
 import { installBrowserJourneyAudioProbe, controlledTonePresent } from "./lib/browser-journey-audio.mjs";
 import { diagnoseBrowserJourneyRecovery } from "./lib/browser-journey-recovery.mjs";
 import { diagnoseBrowserViewerReload, readBrowserViewerReloadDocument, browserViewerSignalMetadata } from "./lib/browser-journey-viewer-reload.mjs";
@@ -164,8 +166,7 @@ const CHECK_BROWSER_CONTROLLED_RECOVERY = process.env.HOME_VIRTUAL_AUTH_BROWSER_
 const CHECK_BROWSER_VIEWER_RELOAD = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_VIEWER_RELOAD === "1";
 const BROWSER_CONTROLLED_TURN_TEST_HOME = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_TURN_TEST_HOME || "";
 const REQUIRE_BROWSER_VZ_TRANSPORT = process.env.HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VZ_TRANSPORT === "1";
-const BROWSER_JOURNEY_FIXTURE_ORIGIN = process.env.HOME_VIRTUAL_AUTH_BROWSER_FIXTURE_ORIGIN ||
-  "http://localhost:61511";
+const BROWSER_JOURNEY_TARGET = CHECK_BROWSER_CONTROLLED_JOURNEY ? browserJourneyTargetConfig(process.env) : null;
 const CHECK_BROWSER_EMBEDDED_RECOVERY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_EMBEDDED_RECOVERY === "1";
 const BROWSER_OPEN_URLS = parseBrowserOpenUrls(process.env.HOME_VIRTUAL_AUTH_BROWSER_OPEN_URLS);
@@ -763,8 +764,8 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function browserApi(page, token, path, { method = "GET", body = null } = {}) {
-  return page.evaluate(async ({ token, path, method, body }) => {
+async function browserApi(page, token, path, { method = "GET", body = null, timeoutMs = null } = {}) {
+  return page.evaluate(async ({ token, path, method, body, timeoutMs }) => {
     const headers = { "x-elastos-home-token": token };
     let requestBody;
     if (body != null) {
@@ -775,6 +776,7 @@ async function browserApi(page, token, path, { method = "GET", body = null } = {
       method,
       headers,
       body: requestBody,
+      ...(timeoutMs === null ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
     });
     const text = await response.text();
     let payload = {};
@@ -784,7 +786,7 @@ async function browserApi(page, token, path, { method = "GET", body = null } = {
       payload = { raw: text };
     }
     return { ok: response.ok, status: response.status, body: payload };
-  }, { token, path, method, body });
+  }, { token, path, method, body, timeoutMs });
 }
 
 async function waitForBrowserOpenResult(page, browserToken, initialResult, timeoutMs) {
@@ -2059,7 +2061,54 @@ function browserJourneyRuntimeEmpty(sessions) {
       "engine_cleanup_obligations", "launch_reconciliation_obligations"].every(key => sessions[key] === 0);
 }
 
-async function closeControlledBrowserWindow(page, appFrame, windowLocator, token, baseline,
+async function captureBrowserWindowIdentity(appFrame) {
+  const iframe = await appFrame.frameElement();
+  const section = (await iframe.evaluateHandle(node => node.closest('section.window[data-target="browser"]'))).asElement();
+  assert(section, "Exact Browser frame has no Home window section");
+  const windowId = await section.getAttribute("data-window-id");
+  assert(typeof windowId === "string" && /^[A-Za-z0-9:_-]{1,128}$/.test(windowId),
+    "Exact Browser window has no stable identity");
+  const route = await iframe.getAttribute("src") || "";
+  const token = assertIsolatedLaunchRoute(route, "browser");
+  const instance = new URL(route, HOME_URL).searchParams.get("browser_instance") || "";
+  const parent = appFrame.parentFrame();
+  const locator = parent.locator(`section.window[data-target="browser"][data-window-id="${windowId}"]`);
+  const identity = { appFrame, iframe, section, parent, locator, windowId, token, instance };
+  await assertBrowserWindowIdentity(identity, appFrame, token);
+  return identity;
+}
+
+async function assertBrowserWindowIdentity(identity, appFrame, token) {
+  assert(identity?.appFrame === appFrame && identity.token === token && identity.instance &&
+    new URL(appFrame.url()).searchParams.get("browser_instance") === identity.instance &&
+    assertIsolatedLaunchRoute(appFrame.url(), "browser") === token,
+  "Browser frame, window and authority identity differ");
+  assert(await identity.locator.count() === 1 &&
+    await identity.locator.evaluate((node, captured) => node === captured, identity.section),
+  "Browser window identity was replaced or duplicated");
+  assert(await identity.section.evaluate((node, { iframe, windowId }) => node.isConnected &&
+    node.dataset.windowId === windowId && iframe.isConnected &&
+    node.querySelector("iframe.window-frame") === iframe &&
+    iframe.closest('section.window[data-target="browser"]') === node,
+  { iframe: await appFrame.frameElement(), windowId: identity.windowId }),
+  "Browser frame no longer belongs to the captured Home window");
+}
+
+async function clickBrowserWindowClose(identity, appFrame, token) {
+  await assertBrowserWindowIdentity(identity, appFrame, token);
+  // ElementHandle.click cannot retarget another window during auto-wait.
+  const button = await identity.section.$('[data-action="close"]');
+  assert(button && /^(Close|Retry Browser close)$/.test(await button.getAttribute("aria-label")),
+    "Captured Browser window has no ordinary close control");
+  try { await button.click(); } finally { await button.dispose(); }
+}
+
+async function waitForBrowserWindowDetached(identity) {
+  await identity.parent.waitForFunction(node => !node.isConnected, identity.section,
+    { timeout: 15_000 });
+}
+
+async function closeControlledBrowserWindow(page, appFrame, windowIdentity, token, baseline,
   { expectedPageId = null, requireEmptyRuntime = CHECK_BROWSER_CONTROLLED_JOURNEY } = {}) {
   markStage("browser:ui-close");
   // The opaque Home GUI survives Browser frame removal and supplies Origin: null.
@@ -2186,7 +2235,7 @@ async function closeControlledBrowserWindow(page, appFrame, windowLocator, token
     if (!owner) {
       const messagePromise = messages.evaluate(observer => observer.terminal)
         .then(result => result, error => ({ error }));
-      await windowLocator.getByRole("button", { name: /^(Close|Retry Browser close)$/ }).click();
+      await clickBrowserWindowClose(windowIdentity, appFrame, token);
       const terminal = await messagePromise;
       if (terminal.error) throw terminal.error;
       assert(!terminal.timed_out, "Browser startup close remained pending");
@@ -2218,7 +2267,7 @@ async function closeControlledBrowserWindow(page, appFrame, windowLocator, token
         assert(message.terminal_kind === "no_page" && !message.page_id && !message.cleanup_id,
           "Browser startup close did not confirm absent ownership", message);
       }
-      await windowLocator.waitFor({ state: "detached", timeout: 15_000 });
+      await waitForBrowserWindowDetached(windowIdentity);
       const after = await browserApi(apiFrame, token, summaryPath);
       assert(after.ok && (requireEmptyRuntime ? browserJourneyRuntimeEmpty(after.body?.sessions) :
         after.body?.sessions?.recoverable_page === null &&
@@ -2234,7 +2283,7 @@ async function closeControlledBrowserWindow(page, appFrame, windowLocator, token
       "Controlled Browser close requires the exact Runtime page and cleanup handle", before);
     const messagePromise = messages.evaluate(observer => observer.terminal)
       .then(result => result, error => ({ error }));
-    await windowLocator.getByRole("button", { name: /^(Close|Retry Browser close)$/ }).click();
+    await clickBrowserWindowClose(windowIdentity, appFrame, token);
     const terminal = await messagePromise;
     if (terminal.error) throw terminal.error;
     assert(!terminal.timed_out, "Browser UI close remained pending");
@@ -2265,7 +2314,7 @@ async function closeControlledBrowserWindow(page, appFrame, windowLocator, token
     assert(receipt.cleanup?.schema === "elastos.browser.runtime-session-cleanup/v1" &&
       receipt.cleanup.ok === true && requiredEffects.every(key => receipt.terminal_effects?.[key] === true),
     "UI close did not confirm Runtime and Engine cleanup", receipt);
-    await windowLocator.waitFor({ state: "detached", timeout: 15_000 });
+    await waitForBrowserWindowDetached(windowIdentity);
     const after = await waitForJourneyEvidence(
       () => browserApi(apiFrame, token, summaryPath),
       value => value.ok && (requireEmptyRuntime ? browserJourneyRuntimeEmpty(value.body?.sessions) :
@@ -2712,11 +2761,11 @@ async function runControlledBrowserOperator(appFrame, token, pageId, expectedUrl
   });
 }
 
-async function runControlledBrowserJourney(page, appFrame, windowLocator, token, baseline, failures) {
-  const fixture = new URL(BROWSER_JOURNEY_FIXTURE_ORIGIN);
+async function runControlledBrowserJourney(page, appFrame, windowIdentity, token, baseline, failures) {
+  const fixture = BROWSER_JOURNEY_TARGET;
   const run = randomUUID();
-  const receiptUrl = `${fixture.origin}/receipt?run=${run}`;
   const result = { schema: "elastos.browser.controlled-journey/v1", run, pages: [] };
+  let engineChoice = null;
   const openRoutes = new Map();
   const captureRoute = async response => {
     if (!/^\/api\/apps\/browser\/open(?:\/[^/]+)?$/.test(new URL(response.url()).pathname)) return;
@@ -2729,16 +2778,7 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
     }
   };
   page.on("response", captureRoute);
-  const readReceipt = async ({ signal } = {}) => {
-    const response = await fetch(receiptUrl, { signal: signal || AbortSignal.timeout(5_000) });
-    const body = await response.json();
-    if (response.status === 404 && body.error === "unknown run") {
-      return { schema: "elastos.browser.journey-receipt/v1", run, events: [] };
-    }
-    assert(response.ok && body.schema === "elastos.browser.journey-receipt/v1" && body.run === run,
-      "Controlled fixture receipt failed", body);
-    return body;
-  };
+  const readReceipt = options => readBrowserJourneyReceipt(fixture, run, options);
   let failure = null, inputObserver = null, operatorClosePromise = null;
   const stopInputObservation = async failed => {
     try { await inputObserver?.stop(failed); }
@@ -2747,12 +2787,27 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
     }
   };
   try {
+    if (fixture.engineId) {
+      markStage("browser:controlled-engine-selection");
+      result.requested_engine_id = fixture.engineId;
+      const summary = await browserApi(appFrame, token,
+        `/api/apps/browser/summary?browser_instance=${encodeURIComponent(windowIdentity.instance)}`, { timeoutMs: 5_000 });
+      assert(summary.ok, "Browser Engine selection summary is unavailable");
+      engineChoice = browserJourneyEngineChoice(summary.body, fixture.engineId);
+    }
     // Ordinary address entry is available after Browser settles its current open.
     // This source disables the field while opening; the harness preserves that UI rule.
     markStage("browser:controlled-address-ready");
     await appFrame.locator("#browser-url").waitFor({ state: "visible", timeout: 15_000 });
     await appFrame.waitForFunction(() => document.querySelector("#browser-url")?.disabled === false,
       null, { timeout: BROWSER_UI_PAGE_ID_TIMEOUT_MS });
+    if (fixture.engineId) {
+      await appFrame.locator("#browser-settings").click();
+      await appFrame.locator("#browser-engine").selectOption(fixture.engineId);
+      assert(await appFrame.locator("#browser-engine").inputValue() === fixture.engineId,
+        "Requested Browser Engine UI selection failed");
+      await appFrame.locator("#browser-settings-close").click();
+    }
     if (BROWSER_REMOTE_EXIT_ID) {
       await appFrame.locator("#browser-settings").click();
       await appFrame.locator("#browser-exit").selectOption(BROWSER_REMOTE_EXIT_ID);
@@ -2781,6 +2836,12 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
       }, value => value.ok && value.schema === "elastos.browser.page-status/v1" && value.actual_url === url,
       `Runtime navigates to ${name}`, BROWSER_UI_PAGE_ID_TIMEOUT_MS);
       const statusReadyMs = Math.round(performance.now() - navigationStarted);
+      if (engineChoice) {
+        const summary = await browserApi(appFrame, token,
+          `/api/apps/browser/summary?browser_instance=${encodeURIComponent(windowIdentity.instance)}`, { timeoutMs: 5_000 });
+        assert(summary.ok, "Browser Engine ownership summary is unavailable");
+        result.engine_route = browserJourneyEngineRoute(summary.body, engineChoice, status.page_id);
+      }
       if (BROWSER_REMOTE_EXIT_ID) {
         const route = await waitForJourneyEvidence(async () => openRoutes.get(status.page_id),
           value => Boolean(value), "remote Exit open receipt");
@@ -2807,6 +2868,7 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
       assert(!(navigationStatus.visible && navigationStatus.opening),
         "Browser retained navigation progress after the controlled page loaded", { name, navigationStatus });
       result.pages.push({ name, url, page_id: status.page_id, load, video: { ready, decoded }, navigation_status: navigationStatus,
+        ...(engineChoice ? { engine_route: result.engine_route } : {}),
         timing: { status_ready_ms: statusReadyMs, decoded_progress_ms: Math.round(performance.now() - navigationStarted) } });
     }
     const current = result.pages.at(-1);
@@ -2928,7 +2990,7 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
           result.inspection.after_navigation_url, readReceipt, () => {
             // Share the original close attempt with the outer finally even if
             // the operator probe times out while Home is still settling close.
-            operatorClosePromise ||= closeControlledBrowserWindow(page, appFrame, windowLocator, token, baseline,
+            operatorClosePromise ||= closeControlledBrowserWindow(page, appFrame, windowIdentity, token, baseline,
               { expectedPageId: current.page_id });
             return operatorClosePromise;
           });
@@ -2946,7 +3008,7 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
     page.off("response", captureRoute);
     await stopInputObservation(Boolean(failure));
     try {
-      result.close = await (operatorClosePromise || closeControlledBrowserWindow(page, appFrame, windowLocator, token, baseline,
+      result.close = await (operatorClosePromise || closeControlledBrowserWindow(page, appFrame, windowIdentity, token, baseline,
         { expectedPageId: failure ? null : result.pages.at(-1)?.page_id }));
     } catch (error) {
       if (failure) failure.details = { ...failure.details, cleanup_error: error.message, cleanup_details: error.details };
@@ -3014,27 +3076,24 @@ async function checkBrowserEmbeddedUiInput(page, baselineToken) {
   markStage("browser:home-launch");
   let appFrame = null;
   let windowLocator = null;
+  let windowIdentity = null;
   let browserToken = "";
   let pageId = "";
   let controlledAttemptStarted = false;
   let primaryFailure = null;
   try {
-    appFrame = await openDesktopAppWindow(page, "browser");
-    const homeGuiFrame = await waitForCapsuleFrame(page, "home-gui");
-    windowLocator = homeGuiFrame.locator('section.window[data-target="browser"]').last();
+    appFrame = await openDesktopAppWindow(page, "browser", selected => { appFrame = selected; });
+    windowIdentity = await captureBrowserWindowIdentity(appFrame);
+    windowLocator = windowIdentity.locator;
+    browserToken = windowIdentity.token;
     await windowLocator.waitFor({ state: "visible", timeout: 30_000 });
-    await homeGuiFrame.waitForFunction(() => {
-      const node = [...document.querySelectorAll('section.window[data-target="browser"]')].at(-1);
-      return node?.classList.contains("window-active") &&
+    await windowIdentity.parent.waitForFunction(node => {
+      return node.isConnected && node.classList.contains("window-active") &&
         getComputedStyle(node.querySelector(".window-frame")).pointerEvents === "auto";
-    }, null, { timeout: 10_000 });
-    const frameHandle = await windowLocator.locator("iframe.window-frame").elementHandle();
-    assert(frameHandle, "Home Browser window did not contain an iframe");
-    const route = await frameHandle.getAttribute("src") || "";
-    browserToken = assertIsolatedLaunchRoute(route, "browser");
+    }, windowIdentity.section, { timeout: 10_000 });
     if (CHECK_BROWSER_CONTROLLED_JOURNEY) {
       controlledAttemptStarted = true;
-      return await runControlledBrowserJourney(page, appFrame, windowLocator, browserToken, baseline, openFailures);
+      return await runControlledBrowserJourney(page, appFrame, windowIdentity, browserToken, baseline, openFailures);
     }
     await appFrame.evaluate(() => {
       window.__elastosBrowserSmokeClicks = [];
@@ -3390,14 +3449,12 @@ async function checkBrowserEmbeddedUiInput(page, baselineToken) {
     page.off("response", captureWebrtcResponse);
     if (primaryFailure && !controlledAttemptStarted) {
       try {
-        if (!appFrame || !windowLocator || !browserToken) {
-          const gui = await homeGuiFrameForPage(page);
-          windowLocator = gui.locator('section.window[data-target="browser"]').last();
-          const frame = await windowLocator.locator("iframe.window-frame").elementHandle();
-          appFrame = frame ? await frame.contentFrame() : null;
-          browserToken = assertIsolatedLaunchRoute(appFrame?.url() || "", "browser");
+        if (!windowIdentity) {
+          assert(appFrame, "Startup cleanup requires the exact opened Browser frame");
+          windowIdentity = await captureBrowserWindowIdentity(appFrame);
+          browserToken = windowIdentity.token;
         }
-        const cleanup = await closeControlledBrowserWindow(page, appFrame, windowLocator, browserToken, baseline);
+        const cleanup = await closeControlledBrowserWindow(page, appFrame, windowIdentity, browserToken, baseline);
         primaryFailure.details = { ...primaryFailure.details, startup_cleanup: cleanup };
       } catch (error) {
         primaryFailure.details = { ...primaryFailure.details, cleanup_error: error.message, cleanup_details: error.details };
@@ -3675,7 +3732,7 @@ async function homeGuiFrameForPage(page) {
   return waitForCapsuleFrame(page, "home-gui");
 }
 
-async function openDesktopAppWindow(page, target) {
+async function openDesktopAppWindow(page, target, onFrame = null) {
   const current = new URL(page.url());
   const home = new URL(HOME_URL);
   if (current.origin !== home.origin || current.pathname !== home.pathname) {
@@ -3713,10 +3770,15 @@ async function openDesktopAppWindow(page, target) {
   const windowFrameEl = homeGuiFrame
     .locator(`section.window[data-target="${target}"] iframe.window-frame`)
     .last();
-  await windowFrameEl.waitFor({ state: "visible", timeout: 20_000 });
+  await windowFrameEl.waitFor({ state: onFrame ? "attached" : "visible", timeout: 20_000 });
   const handle = await windowFrameEl.elementHandle();
   const appFrame = handle ? await handle.contentFrame() : null;
   assert(appFrame, `desktop window for ${target} had no content frame`, { target });
+  if (onFrame) {
+    // Preserve this selected frame for exact cleanup if a later launch wait fails.
+    await onFrame(appFrame);
+    await handle.waitForElementState("visible", { timeout: 20_000 });
+  }
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline && !appFrame.url().includes(`/apps/${target}/`)) {
     await delay(100);
@@ -4685,15 +4747,8 @@ async function main() {
     !OPEN_BROWSER && !CHECK_BROWSER_UI_INPUT && !CHECK_BROWSER_UI_SETUP && !CHECK_BROWSER_VIEWER_PREFLIGHT),
   "Controlled journey requires BROWSER=1 and BROWSER_EMBEDDED_UI_INPUT=1, with other Browser runs disabled");
   if (CHECK_BROWSER_CONTROLLED_JOURNEY) {
-    const fixture = new URL(BROWSER_JOURNEY_FIXTURE_ORIGIN);
-    assert(isLoopbackUrl(fixture.href) && fixture.protocol === "http:" &&
-      !fixture.username && !fixture.password && fixture.pathname === "/" && !fixture.search && !fixture.hash,
-    "Browser fixture requires a loopback HTTP origin with its exact authorized port");
     markStage("browser:fixture-preflight");
-    const response = await fetch(`${fixture.origin}/health`, { signal: AbortSignal.timeout(5_000) });
-    const health = await response.json();
-    assert(response.ok && health.schema === "elastos.browser.journey-fixture/v1" && health.ok === true,
-      "Controlled Browser fixture is unavailable", health);
+    await readBrowserJourneyHealth(BROWSER_JOURNEY_TARGET);
   }
   if (!ALLOW_REMOTE) {
     assert(
