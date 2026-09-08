@@ -2351,6 +2351,66 @@ if (response.accepted !== true || response.direct_network !== false) throw new E
 if (inserted !== "Paste Text 123") throw new Error(`paste_text did not use CDP Input.insertText: ${inserted}`);
 ' "$paste_response" "$tmp_dir/fake-cdp-ready.json.inserted-text"
 
+# Passive log reads share the real control route with status and page close.
+# This checks page-channel closure; the adapter cleanup boundary stays below.
+"$node_bin" --input-type=module - "$control_socket" "$page_id" "$tmp_dir/control.log" <<'NODE'
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import http from "node:http";
+const [socketPath, encodedPageId, logPath] = process.argv.slice(2);
+const pageId = decodeURIComponent(encodedPageId);
+const controller = new AbortController();
+const deadline = setTimeout(() => controller.abort(), 2500);
+function request(path, method = "GET") {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ socketPath, path, method, signal: controller.signal }, res => {
+      const chunks = [];
+      res.on("data", chunk => chunks.push(chunk));
+      res.on("error", reject);
+      res.on("end", () => {
+        try {
+          assert.equal(res.statusCode, 200, `${method} ${path}`);
+          resolve(JSON.parse(Buffer.concat(chunks)));
+        } catch (error) { reject(error); }
+      });
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+function checkLogs(result) {
+  assert.equal(result.schema, "elastos.browser.selkies-control.logs/v1");
+  for (const log of Object.values(result.logs)) {
+    if (!log.present) continue;
+    assert.ok(Number.isFinite(Date.parse(log.mtime)), "retained log age must be visible");
+    assert.ok(log.tail.length <= 8192, "log tail must be bounded");
+  }
+}
+try {
+  let before;
+  for (let round = 0; round < 3; round++) {
+    const [logs, status] = await Promise.all([request("/logs"), request("/status")]);
+    checkLogs(logs);
+    assert.equal(status.schema, "elastos.browser.selkies-control.status/v1");
+    assert.ok(status.page_ids.includes(pageId), "log polling must retain the page");
+    before = status.page_ids;
+  }
+  const [firstLogs, closed, lastLogs] = await Promise.all([
+    request("/logs"), request(`/pages/${encodeURIComponent(pageId)}/close`, "POST"), request("/logs"),
+  ]);
+  checkLogs(firstLogs); checkLogs(lastLogs);
+  assert.deepEqual(closed, { schema: "elastos.browser.close-result/v1", page_id: pageId, closed: true });
+  const after = await request("/status");
+  assert.deepEqual(after.page_ids.sort(), before.filter(id => id !== pageId).sort());
+  const events = fs.readFileSync(logPath, "utf8").split("\n").filter(line => line.startsWith("{")).map(line => JSON.parse(line));
+  assert.equal(events.some(event => event.kind === "request" && event.path === "/logs"), false,
+    "log polling must not append its own request events");
+} finally {
+  clearTimeout(deadline);
+  controller.abort();
+}
+NODE
+
 if [[ "$control_only" == 1 ]]; then
   printf '%s\n' '{"schema":"elastos.browser.selkies-control-service-smoke/v1","ok":true,"scope":"control-service","adapter_cleanup_verified":false}'
   exit 0

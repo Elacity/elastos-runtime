@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import crypto from "node:crypto";
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -1795,122 +1794,7 @@ function readTail(path, maxBytes) {
   return buffer.toString("utf8");
 }
 
-function guestAudioEnv() {
-  const runtimeDir = process.env.XDG_RUNTIME_DIR || "/run/elastos/browser-runtime";
-  const pulseRuntimePath = process.env.PULSE_RUNTIME_PATH || `${runtimeDir}/pulse`;
-  return {
-    ...process.env,
-    XDG_RUNTIME_DIR: runtimeDir,
-    PIPEWIRE_RUNTIME_DIR: process.env.PIPEWIRE_RUNTIME_DIR || runtimeDir,
-    PULSE_RUNTIME_PATH: pulseRuntimePath,
-    PULSE_SERVER: process.env.PULSE_SERVER || `unix:${pulseRuntimePath}/native`,
-  };
-}
-
-function runGuestAudioCommand(command, args = [], timeoutMs = 2500) {
-  try {
-    return execFileSync(command, args, {
-      encoding: "utf8",
-      timeout: timeoutMs,
-      maxBuffer: 512 * 1024,
-      env: guestAudioEnv(),
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch (error) {
-    const stdout = error?.stdout ? String(error.stdout) : "";
-    const stderr = error?.stderr ? String(error.stderr) : "";
-    const message = error instanceof Error ? error.message : String(error);
-    return [stdout, stderr, `[${command} failed: ${message}]`].filter(Boolean).join("\n");
-  }
-}
-
-function compactPipewireDump() {
-  const raw = runGuestAudioCommand("pw-dump", [], 3000);
-  let objects = [];
-  try {
-    objects = JSON.parse(raw);
-  } catch {
-    return raw
-      .split(/\r?\n/)
-      .filter((line) => /"(type|id|node\.name|node\.description|media\.class|application\.name|client\.api|object\.path|factory\.name|pulse\.server\.type|audio\.position)"/.test(line))
-      .join("\n");
-  }
-  const interestingKeys = [
-    "node.name",
-    "node.description",
-    "media.class",
-    "application.name",
-    "client.api",
-    "object.path",
-    "factory.name",
-    "pulse.server.type",
-    "audio.position",
-    "node.target",
-    "target.object",
-    "link.output.node",
-    "link.input.node",
-  ];
-  return objects
-    .map((object) => {
-      const props = object?.info?.props || {};
-      const facts = interestingKeys
-        .filter((key) => props[key] !== undefined)
-        .map((key) => `${key}=${JSON.stringify(props[key])}`)
-        .join(" ");
-      if (!facts && !/Client|Node|Link|Metadata|Module|Factory/.test(String(object?.type || ""))) {
-        return "";
-      }
-      return `${object?.id ?? "?"} ${object?.type || "unknown"}${facts ? ` ${facts}` : ""}`;
-    })
-    .filter(Boolean)
-    .join("\n");
-}
-
-function refreshBrowserVmAudioSummary() {
-  const path = `${VM_LOG_DIR}/browser-vm-pipewire-summary.log`;
-  try {
-    const env = guestAudioEnv();
-    const runtimeDir = env.XDG_RUNTIME_DIR;
-    const pulseRuntimePath = env.PULSE_RUNTIME_PATH;
-    const lines = [
-      "=== browser audio environment ===",
-      `XDG_RUNTIME_DIR=${runtimeDir}`,
-      `PIPEWIRE_RUNTIME_DIR=${env.PIPEWIRE_RUNTIME_DIR}`,
-      `PULSE_RUNTIME_PATH=${pulseRuntimePath}`,
-      `PULSE_SERVER=${env.PULSE_SERVER}`,
-      "=== browser audio sockets ===",
-    ];
-    for (const dir of [runtimeDir, pulseRuntimePath].filter(Boolean)) {
-      try {
-        lines.push(`${dir}: ${fs.readdirSync(dir).join(" ")}`);
-      } catch (error) {
-        lines.push(`${dir}: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-    lines.push("=== pw-cli info 0 ===");
-    lines.push(runGuestAudioCommand("pw-cli", ["info", "0"]));
-    lines.push("=== pw-cli ls Node ===");
-    lines.push(runGuestAudioCommand("pw-cli", ["ls", "Node"]));
-    lines.push("=== pw-cli ls Client ===");
-    lines.push(runGuestAudioCommand("pw-cli", ["ls", "Client"]));
-    lines.push("=== pw-cli ls Port ===");
-    lines.push(runGuestAudioCommand("pw-cli", ["ls", "Port"]));
-    lines.push("=== pw-cli ls Link ===");
-    lines.push(runGuestAudioCommand("pw-cli", ["ls", "Link"]));
-    lines.push("=== pw-link outputs ===");
-    lines.push(runGuestAudioCommand("pw-link", ["-o"]));
-    lines.push("=== pw-link inputs ===");
-    lines.push(runGuestAudioCommand("pw-link", ["-i"]));
-    lines.push("=== pw-link links ===");
-    lines.push(runGuestAudioCommand("pw-link", ["-l"]));
-    lines.push("=== pw-dump compact audio facts ===");
-    lines.push(compactPipewireDump());
-    fs.writeFileSync(path, `${lines.join("\n")}\n`);
-  } catch {}
-}
-
 function readBrowserVmLogTails() {
-  refreshBrowserVmAudioSummary();
   const logs = {};
   for (const name of VM_LOG_NAMES) {
     const path = `${VM_LOG_DIR}/${name}`;
@@ -1923,6 +1807,7 @@ function readBrowserVmLogTails() {
       logs[name] = {
         present: true,
         bytes: stat.size,
+        mtime: stat.mtime.toISOString(),
         tail: readTail(path, 8192),
       };
     } catch (error) {
@@ -5167,7 +5052,6 @@ async function main() {
         return;
       }
       if (req.method === "GET" && url.pathname === "/logs") {
-        logControlEvent("request", { method: req.method, path: url.pathname });
         httpJson(res, 200, {
           schema: "elastos.browser.selkies-control.logs/v1",
           logs: readBrowserVmLogTails(),
