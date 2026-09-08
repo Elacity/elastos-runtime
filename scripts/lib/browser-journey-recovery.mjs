@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 const WINDOW_MS = 5000;
 const POLL_MS = 250;
+export { binding as browserJourneyBinding, video as browserJourneyVideo };
 const hash = value => `sha256:${createHash("sha256").update(value).digest("hex").slice(0, 16)}`;
 const text = value => typeof value === "string" && value.length > 0 && value.length <= 512;
 const count = value => Number.isSafeInteger(value) && value >= 0;

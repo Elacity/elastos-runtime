@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { diagnoseBrowserJourneyRecovery } from "./lib/browser-journey-recovery.mjs";
+import { diagnoseBrowserViewerReload } from "./lib/browser-journey-viewer-reload.mjs";
 
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
@@ -148,6 +149,7 @@ const CHECK_BROWSER_EMBEDDED_UI_INPUT =
 const CHECK_BROWSER_CONTROLLED_JOURNEY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_JOURNEY === "1";
 const CHECK_BROWSER_CONTROLLED_RECOVERY = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_RECOVERY === "1";
+const CHECK_BROWSER_VIEWER_RELOAD = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_VIEWER_RELOAD === "1";
 const BROWSER_CONTROLLED_TURN_TEST_HOME = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_TURN_TEST_HOME || "";
 const REQUIRE_BROWSER_VZ_TRANSPORT = process.env.HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VZ_TRANSPORT === "1";
 const BROWSER_JOURNEY_FIXTURE_ORIGIN = process.env.HOME_VIRTUAL_AUTH_BROWSER_FIXTURE_ORIGIN ||
@@ -2274,6 +2276,106 @@ async function browserRecoveryCdpSession(page, appFrame) {
   throw new Error("Browser viewer CDP session is unavailable");
 }
 
+async function observeControlledBrowserRequests(page, appFrame, token, record,
+  { probeId = randomUUID(), recordNavigation = false, signal } = {}) {
+  const ensureActive = () => { if (signal?.aborted) throw new Error("Browser observer setup canceled"); };
+  ensureActive();
+  const instance = new URL(appFrame.url()).searchParams.get("browser_instance");
+  const runtimeOrigin = new URL(appFrame.url()).origin;
+  const sourceChain = [];
+  for (let frame = appFrame; frame.parentFrame(); frame = frame.parentFrame()) {
+    const element = await frame.frameElement();
+    let index;
+    try {
+      ensureActive();
+      index = await frame.parentFrame().evaluate(node =>
+        Array.from(document.querySelectorAll("iframe,frame")).indexOf(node), element);
+    } finally { await element.dispose(); }
+    ensureActive();
+    assert(index >= 0, "Recovery observer could not identify the Browser frame");
+    sourceChain.unshift(index);
+  }
+  const requests = new WeakMap();
+  let sequence = 0, documentGeneration = 0;
+  const request = req => {
+    if (req.frame() !== appFrame) return;
+    const url = new URL(req.url());
+    if (url.origin !== runtimeOrigin) return;
+    const kind = url.searchParams.get("recovery_probe") === probeId ? "probe"
+      : /^\/api\/apps\/browser\/open(?:\/|$)/.test(url.pathname) && req.method() === "POST" ? "opening"
+      : /\/pages\/[^/]+\/close$/.test(url.pathname) ? "closing"
+      : /\/pages\/[^/]+\/status$/.test(url.pathname) ? "status"
+      : /\/pages\/[^/]+\/heartbeat$/.test(url.pathname) ? "heartbeat" : null;
+    if (!kind) return;
+    const event = { kind, request_id: `viewer-request-${++sequence}`, source_matches: true, document_generation: documentGeneration };
+    requests.set(req, event);
+    record({ ...event, phase: "request" });
+  };
+  const failed = req => { const event = requests.get(req); if (event) record({ ...event, phase: "failed" }); };
+  const response = res => { const event = requests.get(res.request()); if (event) record({ ...event, phase: "response", status: res.status() }); };
+  const navigation = frame => {
+    if (recordNavigation && frame === appFrame) record({ kind: "navigation", phase: "commit",
+      request_id: `viewer-navigation-${++documentGeneration}`, source_matches: true, document_generation: documentGeneration });
+  };
+  let messages = null, cleanup = Promise.resolve();
+  const stop = () => {
+    page.off("framenavigated", navigation);
+    page.off("request", request);
+    page.off("requestfailed", failed);
+    page.off("response", response);
+    signal?.removeEventListener("abort", onAbort);
+    if (messages) {
+      const handle = messages;
+      messages = null;
+      cleanup = cleanup.then(async () => {
+        try { await handle.evaluate(observer => observer.stop()); }
+        finally { await handle.dispose(); }
+      });
+    }
+    return cleanup;
+  };
+  const onAbort = () => { void stop().catch(() => {}); };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    ensureActive();
+    const bindingName = `__browserRecovery_${probeId.replaceAll("-", "")}`;
+    await page.exposeBinding(bindingName, (source, event) => {
+      if (source.frame === page.mainFrame()) record(event);
+    });
+    ensureActive();
+    messages = await page.evaluateHandle(({ sourceChain, token, instance, bindingName }) => {
+      const source = sourceChain.reduce((frame, index) => frame.frames[index], window);
+      const pending = new Set();
+      let overflow = false;
+      const listener = event => {
+        const data = event.data;
+        if (event.source !== source || event.origin !== "null" || data?.homeToken !== token ||
+          data.browserInstance !== instance || data.type !== "elastos.home.browser-authority-renew.request/v1" ||
+          typeof data.requestId !== "string" || data.requestId.length > 512) return;
+        if (pending.size >= 64) { overflow = true; return; }
+        const promise = window[bindingName]({ kind: "renewal", phase: "request", request_id: data.requestId, source_matches: true });
+        pending.add(promise);
+        promise.finally(() => pending.delete(promise)).catch(() => {});
+      };
+      window.addEventListener("message", listener);
+      return { stop: async () => {
+        window.removeEventListener("message", listener);
+        await Promise.allSettled(pending);
+        if (overflow) throw new Error("Recovery authority observer overflow");
+      } };
+    }, { sourceChain, token, instance, bindingName });
+    ensureActive();
+    page.on("framenavigated", navigation);
+    page.on("request", request);
+    page.on("requestfailed", failed);
+    page.on("response", response);
+    return stop;
+  } catch (error) {
+    await stop();
+    throw error;
+  }
+}
+
 async function runControlledBrowserRecovery(page, appFrame, token, readReceipt, expectedUrl) {
   markStage("browser:controlled-recovery");
   const instance = new URL(appFrame.url()).searchParams.get("browser_instance");
@@ -2281,15 +2383,6 @@ async function runControlledBrowserRecovery(page, appFrame, token, readReceipt, 
   const runtimeOrigin = new URL(appFrame.url()).origin;
   const summaryUrl = new URL(`/api/apps/browser/summary?browser_instance=${encodeURIComponent(instance)}`, runtimeOrigin);
   const probeId = randomUUID();
-  const sourceChain = [];
-  for (let frame = appFrame; frame.parentFrame(); frame = frame.parentFrame()) {
-    const element = await frame.frameElement();
-    const index = await frame.parentFrame().evaluate(node =>
-      Array.from(document.querySelectorAll("iframe,frame")).indexOf(node), element);
-    await element.dispose();
-    assert(index >= 0, "Recovery observer could not identify the Browser frame");
-    sourceChain.unshift(index);
-  }
   const mediaInterruption = BROWSER_CONTROLLED_TURN_TEST_HOME
     ? await (await import("./lib/browser-journey-turn-interruption.mjs")).createBrowserTurnInterruption({
       testHome: BROWSER_CONTROLLED_TURN_TEST_HOME,
@@ -2341,61 +2434,7 @@ async function runControlledBrowserRecovery(page, appFrame, token, readReceipt, 
           await response.text();
         } catch {}
       }, { probeId, timeoutMs }),
-      observeRequests: async record => {
-        const requests = new WeakMap();
-        let sequence = 0;
-        const request = req => {
-          if (req.frame() !== appFrame) return;
-          const url = new URL(req.url());
-          if (url.origin !== runtimeOrigin) return;
-          const kind = url.searchParams.get("recovery_probe") === probeId ? "probe"
-            : /^\/api\/apps\/browser\/open(?:\/|$)/.test(url.pathname) && req.method() === "POST" ? "opening"
-            : /\/pages\/[^/]+\/close$/.test(url.pathname) ? "closing"
-            : /\/pages\/[^/]+\/status$/.test(url.pathname) ? "status"
-            : /\/pages\/[^/]+\/heartbeat$/.test(url.pathname) ? "heartbeat" : null;
-          if (!kind) return;
-          const event = { kind, request_id: `viewer-request-${++sequence}`, source_matches: true };
-          requests.set(req, event);
-          record({ ...event, phase: "request" });
-        };
-        const failed = req => { const event = requests.get(req); if (event) record({ ...event, phase: "failed" }); };
-        const response = res => { const event = requests.get(res.request()); if (event) record({ ...event, phase: "response", status: res.status() }); };
-        const bindingName = `__browserRecovery_${probeId.replaceAll("-", "")}`;
-        await page.exposeBinding(bindingName, (source, event) => {
-          if (source.frame === page.mainFrame()) record(event);
-        });
-        const messages = await page.evaluateHandle(({ sourceChain, token, instance, bindingName }) => {
-          const source = sourceChain.reduce((frame, index) => frame.frames[index], window);
-          const pending = new Set();
-          let overflow = false;
-          const listener = event => {
-            const data = event.data;
-            if (event.source !== source || event.origin !== "null" || data?.homeToken !== token ||
-              data.browserInstance !== instance || data.type !== "elastos.home.browser-authority-renew.request/v1" ||
-              typeof data.requestId !== "string" || data.requestId.length > 512) return;
-            if (pending.size >= 64) { overflow = true; return; }
-            const promise = window[bindingName]({ kind: "renewal", phase: "request", request_id: data.requestId, source_matches: true });
-            pending.add(promise);
-            promise.finally(() => pending.delete(promise)).catch(() => {});
-          };
-          window.addEventListener("message", listener);
-          return { stop: async () => {
-            window.removeEventListener("message", listener);
-            await Promise.allSettled(pending);
-            if (overflow) throw new Error("Recovery authority observer overflow");
-          } };
-        }, { sourceChain, token, instance, bindingName });
-        page.on("request", request);
-        page.on("requestfailed", failed);
-        page.on("response", response);
-        return async () => {
-          page.off("request", request);
-          page.off("requestfailed", failed);
-          page.off("response", response);
-          try { await messages.evaluate(observer => observer.stop()); }
-          finally { await messages.dispose(); }
-        };
-      },
+      observeRequests: (record, { signal }) => observeControlledBrowserRequests(page, appFrame, token, record, { probeId, signal }),
     });
     return { ...evidence, cdp_ancestor_depth: ancestorDepth,
       ...(mediaInterruption ? { media_driver: mediaInterruption.evidence } : {}) };
@@ -2403,6 +2442,72 @@ async function runControlledBrowserRecovery(page, appFrame, token, readReceipt, 
     error.details = { ...error.details, recovery: { ...error.evidence,
       failure: error.evidence?.failure || "probe_setup_or_observation_failed", cdp_ancestor_depth: ancestorDepth,
       ...(mediaInterruption ? { media_driver: mediaInterruption.evidence } : {}) } };
+    throw error;
+  }
+}
+
+async function runControlledBrowserViewerReload(page, appFrame, token, readReceipt, expectedUrl) {
+  markStage("browser:controlled-viewer-reload");
+  const instance = new URL(appFrame.url()).searchParams.get("browser_instance");
+  const runtimeOrigin = new URL(appFrame.url()).origin;
+  assert(instance, "Viewer reload requires the current Browser instance");
+  try {
+    return await diagnoseBrowserViewerReload({
+      expectedUrl, readReceipt,
+      readState: async ({ signal }) => {
+        const headers = { Origin: "null", "x-elastos-home-token": token };
+        const response = await fetch(new URL(`/api/apps/browser/summary?browser_instance=${encodeURIComponent(instance)}`, runtimeOrigin),
+          { headers, signal });
+        assert(response.ok, "Viewer reload Runtime summary failed");
+        const { sessions } = await response.json();
+        const pageId = sessions?.recoverable_page?.page_id;
+        let page_status = null;
+        if (pageId) {
+          const status = await fetch(new URL(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/status`, runtimeOrigin), { headers, signal });
+          if (status.ok) page_status = await status.json();
+          else assert(status.status === 404, "Viewer reload Runtime page status failed");
+        }
+        let visible = { viewer: null, video: null };
+        try {
+          // Read the document identity and media in one execution context.
+          visible = await appFrame.evaluate(() => {
+            const element = document.querySelector("#browser-remote-display");
+            const rect = element?.getBoundingClientRect();
+            const metrics = window.__elastosBrowserRemoteDisplayMetrics;
+            const bytes = metrics?.latestVideoWebrtcStats?.video_bytes_received ?? metrics?.latestWebrtcStats?.video_bytes_received;
+            return {
+              viewer: {
+                page_id: window.__elastosBrowserCurrentPageId || "",
+                browser_instance: new URL(location.href).searchParams.get("browser_instance"),
+                actual_url: document.querySelector("#browser-url")?.value || "",
+                engine_id: document.querySelector("#browser-engine")?.value,
+                exit_id: document.querySelector("#browser-exit")?.value,
+                document_id: performance.timeOrigin,
+              },
+              video: element ? { present: true, hidden: element.hidden, paused: element.paused,
+                ready_state: element.readyState, video_width: element.videoWidth, video_height: element.videoHeight,
+                client_width: Math.round(rect.width), client_height: Math.round(rect.height),
+                decoded_frames: Number(element.webkitDecodedFrameCount || 0),
+                ...(Number.isSafeInteger(bytes) ? { video_bytes_received: bytes } : {}) } : null,
+            };
+          });
+        } catch (error) {
+          if (!/Execution context was destroyed|Cannot find context with specified id/.test(String(error.message))) throw error;
+        }
+        return { sessions, page_status, ...visible };
+      },
+      reloadViewer: async ({ timeoutMs }) => {
+        await Promise.all([
+          appFrame.waitForNavigation({ waitUntil: "commit", timeout: Math.ceil(timeoutMs) }),
+          appFrame.evaluate(() => location.reload()),
+        ]);
+      },
+      extendInput: (suffix, { timeoutMs }) => appFrame.locator("#browser-keyboard-capture")
+        .pressSequentially(suffix, { timeout: Math.ceil(timeoutMs) }),
+      observeRequests: (record, { signal }) => observeControlledBrowserRequests(page, appFrame, token, record, { recordNavigation: true, signal }),
+    });
+  } catch (error) {
+    error.details = { ...error.details, viewer_reload: error.evidence || { ok: false, failure: "probe_setup_or_observation_failed" } };
     throw error;
   }
 }
@@ -2491,6 +2596,7 @@ async function runControlledBrowserJourney(page, appFrame, windowLocator, token,
       value => value.decoded_frames > current.video.decoded.decoded_frames, "decoded frames after input");
     result.input = { text, receipt, video_after_input: afterInput };
     if (CHECK_BROWSER_CONTROLLED_RECOVERY) result.recovery = await runControlledBrowserRecovery(page, appFrame, token, readReceipt, result.pages.at(-1).url);
+    if (CHECK_BROWSER_VIEWER_RELOAD) result.viewer_reload = await runControlledBrowserViewerReload(page, appFrame, token, readReceipt, result.pages.at(-1).url);
   } catch (error) {
     error.details = { stage: smokeStage, ...error.details };
     failure = error;
@@ -4205,6 +4311,8 @@ async function revokeCurrentPasskey(page, proofBindingId, homeToken) {
 async function main() {
   assert(!BROWSER_CONTROLLED_TURN_TEST_HOME || CHECK_BROWSER_CONTROLLED_RECOVERY,
     "The task TURN interruption requires controlled Browser recovery");
+  assert(!CHECK_BROWSER_VIEWER_RELOAD || CHECK_BROWSER_CONTROLLED_JOURNEY,
+    "Browser viewer reload requires the controlled journey");
   assert(!CHECK_BROWSER_CONTROLLED_RECOVERY || CHECK_BROWSER_CONTROLLED_JOURNEY,
     "Controlled Browser recovery requires the controlled journey");
   assert(!CHECK_BROWSER_CONTROLLED_JOURNEY || (INCLUDE_BROWSER && CHECK_BROWSER_EMBEDDED_UI_INPUT &&

@@ -222,6 +222,7 @@ test("journey success pins close to its last page while earlier failure retains 
     const window = {};
     const journey = harnessFunction("runControlledBrowserJourney", {
       CHECK_BROWSER_CONTROLLED_RECOVERY: false,
+      CHECK_BROWSER_VIEWER_RELOAD: false,
       BROWSER_JOURNEY_FIXTURE_ORIGIN: "http://localhost:61511", BROWSER_OPEN_DISPLAY_MODE: "webrtc_remote_display",
       BROWSER_UI_PAGE_ID_TIMEOUT_MS: 180_000, BROWSER_REMOTE_VIDEO_TIMEOUT_MS: 30_000,
       randomUUID: () => runId, AbortSignal, smokeStage: "input", markStage: () => {},
@@ -472,4 +473,148 @@ test("recovery probe selects the owning CDP ancestor only for shared-frame sessi
   const page = { context: () => ({ newCDPSession: async () => { attempts++; throw error; } }) };
   await assert.rejects(select(page, frame), value => value === error);
   assert.equal(attempts, 1);
+});
+
+test("recovery observer binds requests to the viewer and keeps their start generation after reload", async () => {
+  const listeners = new Map(), messages = new Set(), records = [], disposed = [];
+  const frameWindow = {};
+  const rootWindow = { frames: [frameWindow], addEventListener: (_, fn) => messages.add(fn),
+    removeEventListener: (_, fn) => messages.delete(fn) };
+  const root = { parentFrame: () => null, evaluate: async () => 0 };
+  const frame = { parentFrame: () => root,
+    url: () => "http://localhost:61510/apps/browser/?browser_instance=instance-one#home_token=token-one",
+    frameElement: async () => ({ dispose: async () => {} }) };
+  const page = { mainFrame: () => root,
+    on: (kind, fn) => { if (!listeners.has(kind)) listeners.set(kind, new Set()); listeners.get(kind).add(fn); },
+    off: (kind, fn) => listeners.get(kind)?.delete(fn),
+    exposeBinding: async (name, fn) => { rootWindow[name] = value => Promise.resolve(fn({ frame: root }, value)); },
+    evaluateHandle: async (fn, args) => {
+      const value = vm.runInNewContext(`(${fn.toString()})(args)`, { args, window: rootWindow });
+      return { evaluate: async callback => callback(value), dispose: async () => disposed.push(true) };
+    },
+  };
+  const emit = (kind, value) => { for (const fn of listeners.get(kind) || []) fn(value); };
+  const request = (path, sourceFrame = frame, origin = "http://localhost:61510") => ({
+    frame: () => sourceFrame, url: () => origin + path, method: () => "POST",
+  });
+  const observe = harnessFunction("observeControlledBrowserRequests", { assert: (value, message) => assert.ok(value, message) });
+  const stop = await observe(page, frame, "token-one", value => records.push(value), { probeId: "probe-one", recordNavigation: true });
+  try {
+    emit("request", request("/api/apps/browser/open", root));
+    emit("request", request("/api/apps/browser/open", frame, "http://foreign.invalid"));
+    const old = request("/api/apps/browser/pages/page-one/status");
+    emit("request", old);
+    emit("framenavigated", root);
+    emit("framenavigated", frame);
+    emit("response", { request: () => old, status: () => 200 });
+    emit("request", request("/api/apps/browser/pages/page-one/close"));
+    assert.deepEqual(records.map(value => [value.kind, value.phase, value.document_generation]),
+      [["status", "request", 0], ["navigation", "commit", 1], ["status", "response", 0], ["closing", "request", 1]]);
+    assert.equal(records[0].request_id, records[2].request_id);
+    const event = { source: frameWindow, origin: "null", data: {
+      type: "elastos.home.browser-authority-renew.request/v1", homeToken: "token-one",
+      browserInstance: "instance-one", requestId: "renew-one" } };
+    for (const fn of messages) {
+      fn({ ...event, source: {} });
+      fn({ ...event, origin: "http://foreign.invalid" });
+      fn({ ...event, data: { ...event.data, homeToken: "foreign-token" } });
+      fn(event);
+    }
+    assert.equal(records.filter(value => value.kind === "renewal").length, 1);
+    assert.ok(records.every(value => value.source_matches));
+  } finally { await stop(); }
+  assert.equal(messages.size, 0);
+  assert.ok([...listeners.values()].every(value => value.size === 0));
+  assert.equal(disposed.length, 1);
+});
+
+for (const observation of ["ready", "document-transition", "unexpected-viewer-error", "authority-error"]) {
+  test(`viewer reload wrapper uses Runtime ownership and targets only the existing frame: ${observation}`, async () => {
+    const requests = [], actions = [];
+    const viewer = { page_id: "", browser_instance: "instance-one", actual_url: "", document_id: 100 };
+    const frame = {
+      url: () => "http://localhost:61510/apps/browser/?browser_instance=instance-one#home_token=token-one",
+      evaluate: async fn => {
+        if (fn.toString().includes("location.reload()")) { actions.push("reload-frame"); return; }
+        if (observation === "document-transition") throw new Error("Execution context was destroyed");
+        if (observation === "unexpected-viewer-error") throw new Error("unrelated viewer error");
+        return { viewer, video: null };
+      },
+      waitForNavigation: async options => { assert.equal(options.waitUntil, "commit"); actions.push("wait-commit"); },
+      locator: selector => ({ pressSequentially: async (suffix, options) => {
+        assert.equal(selector, "#browser-keyboard-capture"); assert.equal(suffix, "-reload");
+        assert.equal(options.timeout, 5000); actions.push("input");
+      } }),
+    };
+    const page = {};
+    const sessions = { recoverable_page: { page_id: "runtime-owner" } };
+    const signal = new AbortController().signal;
+    const wrapper = harnessFunction("runControlledBrowserViewerReload", {
+      markStage: () => {}, assert: (value, message) => assert.ok(value, message),
+      fetch: async (url, options) => {
+        requests.push({ url: String(url), options });
+        assert.equal(options.signal, signal);
+        assert.equal(options.headers.Origin, "null");
+        assert.equal(options.headers["x-elastos-home-token"], "token-one");
+        return { ok: observation !== "authority-error", status: observation === "authority-error" ? 401 : 200,
+          json: async () => String(url).includes("/summary") ? { sessions } : { page_id: "runtime-owner" } };
+      },
+      observeControlledBrowserRequests: async (actualPage, actualFrame, token, record, options) => {
+        assert.equal(actualPage, page); assert.equal(actualFrame, frame); assert.equal(token, "token-one");
+        assert.equal(options.recordNavigation, true); return () => {};
+      },
+      diagnoseBrowserViewerReload: async callbacks => {
+        const state = await callbacks.readState({ signal });
+        assert.equal(state.sessions, sessions);
+        assert.equal(state.page_status.page_id, "runtime-owner");
+        assert.equal(state.viewer, observation === "document-transition" ? null : viewer);
+        await callbacks.reloadViewer({ timeoutMs: 5000 });
+        await callbacks.extendInput("-reload", { timeoutMs: 5000 });
+        await callbacks.observeRequests(() => {}, { signal });
+        return { ok: true };
+      },
+    });
+    const run = wrapper(page, frame, "token-one", async () => {}, "http://localhost:61511/nav?run=fixture");
+    if (["unexpected-viewer-error", "authority-error"].includes(observation)) {
+      await assert.rejects(run, error => error.details.viewer_reload.failure === "probe_setup_or_observation_failed");
+      assert.deepEqual(actions, []);
+    } else {
+      assert.equal((await run).ok, true);
+      assert.deepEqual(actions, ["wait-commit", "reload-frame", "input"]);
+      assert.match(requests[1].url, /\/pages\/runtime-owner\/status$/);
+    }
+  });
+}
+
+test("observer cancellation disposes a listener handle returned after its setup deadline", async () => {
+  let begin, finish;
+  const entered = new Promise(resolve => { begin = resolve; });
+  const release = new Promise(resolve => { finish = resolve; });
+  const controller = new AbortController(), listeners = new Map();
+  let remoteListener = false, disposed = 0;
+  const frame = { url: () => "http://localhost:61510/apps/browser/?browser_instance=instance-one", parentFrame: () => null };
+  const page = {
+    mainFrame: () => frame,
+    on: (kind, fn) => { if (!listeners.has(kind)) listeners.set(kind, new Set()); listeners.get(kind).add(fn); },
+    off: (kind, fn) => listeners.get(kind)?.delete(fn),
+    exposeBinding: async () => {},
+    evaluateHandle: async () => {
+      remoteListener = true;
+      begin();
+      await release;
+      return { evaluate: async callback => callback({ stop: async () => { remoteListener = false; } }),
+        dispose: async () => { disposed++; } };
+    },
+  };
+  const observe = harnessFunction("observeControlledBrowserRequests");
+  const result = observe(page, frame, "token-one", () => {}, { probeId: "late-setup", signal: controller.signal })
+    .then(value => ({ value }), error => ({ error }));
+  await entered;
+  controller.abort();
+  finish();
+  const outcome = await result;
+  assert.match(outcome.error?.message || "", /observer setup canceled/);
+  assert.equal(remoteListener, false);
+  assert.equal(disposed, 1);
+  assert.ok([...listeners.values()].every(value => value.size === 0));
 });
