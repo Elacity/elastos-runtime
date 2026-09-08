@@ -882,7 +882,7 @@ mod tests {
 }
 
 /// Approved remote services are observed through the same Runtime provider plane.
-/// Launch selection stays local until remote resource binding is implemented.
+/// Execution selections retain an opaque Runtime route to their exact grant.
 pub(in crate::api::gateway) async fn browser_remote_engine_summary(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
@@ -937,6 +937,28 @@ pub(in crate::api::gateway) async fn browser_remote_engine_summary(
         if let Ok(Ok((data, readiness))) = tokio::time::timeout_at(deadline, observation).await {
             if read_grants().is_ok_and(|current| current.contains(&grant)) {
                 visible["state"] = serde_json::json!("approved");
+                if data["remote_page_binding_supported"] == true
+                    && data["launch_available"] == true
+                    && grant["operations"]
+                        == crate::carrier::browser_engine_binding::operations(Some(
+                            crate::carrier::browser_engine_binding::EXECUTION_SCOPE,
+                        ))
+                {
+                    visible["launch_available"] = serde_json::json!(true);
+                    visible["launch_reason"] = serde_json::Value::Null;
+                    let mut selectable = data["adapters"].clone();
+                    if let Some(adapters) = selectable.as_array_mut() {
+                        for adapter in adapters {
+                            if let Some(id) = adapter["id"].as_str() {
+                                adapter["id"] = serde_json::json!(
+                                    gateway_browser_remote::selection_id(&grant, id)
+                                );
+                                adapter["default"] = serde_json::json!(false);
+                            }
+                        }
+                    }
+                    visible["selectable_adapters"] = selectable;
+                }
                 visible["adapters"] = data["adapters"].clone();
                 visible["capacity_available"] = data["capacity_available"].clone();
                 visible["readiness"] = readiness["readiness"].clone();

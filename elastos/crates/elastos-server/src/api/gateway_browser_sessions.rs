@@ -58,9 +58,12 @@ static BROWSER_DURABLE_TEMP_SERIAL: AtomicU64 = AtomicU64::new(0);
 static BROWSER_DURABLE_DELETE_FAILURES: OnceLock<std::sync::Mutex<BTreeSet<PathBuf>>> =
     OnceLock::new();
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(in crate::api::gateway) struct BrowserLaunchReservation {
     id: String,
+    #[serde(default)]
+    scope: String,
     cleanup_id: String,
     generation: String,
     page_id: String,
@@ -70,6 +73,14 @@ pub(in crate::api::gateway) struct BrowserLaunchReservation {
 }
 
 impl BrowserLaunchReservation {
+    fn matches_record(&self, record: &BrowserSessionRecord) -> bool {
+        !self.scope.is_empty()
+            && self.scope == record.scope
+            && self.cleanup_id == record.cleanup_id
+            && self.generation == record.generation
+            && self.page_id == record.expected_page_id
+            && self.vm_id == record.vm_id
+    }
     pub(in crate::api::gateway) fn generation(&self) -> &str {
         &self.generation
     }
@@ -436,6 +447,36 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
     principal_id: &str,
     lifecycle: BrowserLaunchLifecycle,
 ) -> Result<BrowserLaunchReservation, (StatusCode, String)> {
+    reserve_browser_launch_with_generation(data_dir, principal_id, lifecycle, None).await
+}
+
+pub(super) async fn reserve_remote_browser_launch(
+    data_dir: &Path,
+    principal_id: &str,
+    lifecycle: BrowserLaunchLifecycle,
+    generation: &str,
+) -> Result<BrowserLaunchReservation, (StatusCode, String)> {
+    if !generation.strip_prefix("sha256:").is_some_and(|value| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Remote Browser generation invalid".into(),
+        ));
+    }
+    reserve_browser_launch_with_generation(data_dir, principal_id, lifecycle, Some(generation))
+        .await
+}
+
+async fn reserve_browser_launch_with_generation(
+    data_dir: &Path,
+    principal_id: &str,
+    lifecycle: BrowserLaunchLifecycle,
+    remote_generation: Option<&str>,
+) -> Result<BrowserLaunchReservation, (StatusCode, String)> {
     if principal_id.trim().is_empty()
         || lifecycle.owner_launch_id.trim().is_empty()
         || lifecycle.engine_route_provider.trim().is_empty()
@@ -561,15 +602,36 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
             ),
         ));
     }
+    if remote_generation.is_some_and(|generation| {
+        registry
+            .sessions
+            .values()
+            .any(|s| s.scope == scope && s.generation == generation)
+            || registry
+                .pending_engine_cleanups
+                .values()
+                .any(|s| s.scope == scope && s.cleanup.generation == generation)
+            || registry
+                .pending_launch_reconciliations
+                .values()
+                .any(|s| s.scope == scope && s.reconciliation.generation == generation)
+    }) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Browser lifecycle generation already belongs to a Runtime owner".into(),
+        ));
+    }
     let id = registry.next_reservation_id();
-    let generation = browser_launch_generation_hash_label(&format!(
-        "{scope}\n{principal_id}\n{}\n{id}\n{}",
-        lifecycle.owner_launch_id,
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let generation = remote_generation.map(str::to_owned).unwrap_or_else(|| {
+        browser_launch_generation_hash_label(&format!(
+            "{scope}\n{principal_id}\n{}\n{id}\n{}",
+            lifecycle.owner_launch_id,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    });
     let cleanup_id = format!("browser-cleanup:{}", generation.replace(':', "-"));
     let page_id = format!(
         "page:vz-{}",
@@ -586,7 +648,7 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
     registry.sessions.insert(
         id.clone(),
         BrowserSessionRecord {
-            scope,
+            scope: scope.clone(),
             principal_id: principal_id.to_string(),
             owner_launch_id: lifecycle.owner_launch_id,
             browser_instance: lifecycle.browser_instance,
@@ -624,6 +686,7 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
     );
     Ok(BrowserLaunchReservation {
         id,
+        scope,
         cleanup_id,
         generation,
         page_id,
@@ -892,14 +955,65 @@ fn reservation_transport_authority_is_bound(
     registry
         .sessions
         .get(&reservation.id)
-        .is_some_and(|record| record.transport_authority.is_some())
+        .is_some_and(|record| {
+            reservation.matches_record(record) && record.transport_authority.is_some()
+        })
 }
 
 pub(in crate::api::gateway) async fn release_browser_launch(
     reservation: &BrowserLaunchReservation,
 ) {
     let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
-    registry.lock().await.sessions.remove(&reservation.id);
+    let mut registry = registry.lock().await;
+    if registry
+        .sessions
+        .get(&reservation.id)
+        .is_some_and(|record| reservation.matches_record(record))
+    {
+        registry.sessions.remove(&reservation.id);
+    }
+}
+
+pub(super) async fn browser_remote_cleanup_pending(
+    data_dir: &Path,
+    generation: &str,
+) -> Result<bool, String> {
+    let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+    let mut registry = registry.lock().await;
+    registry.load_durable_ownerships(data_dir)?;
+    let scope = browser_session_scope(data_dir);
+    Ok(registry
+        .pending_engine_cleanups
+        .values()
+        .any(|o| o.scope == scope && o.cleanup.generation == generation)
+        || registry
+            .pending_launch_reconciliations
+            .values()
+            .any(|o| o.scope == scope && o.reconciliation.generation == generation))
+}
+
+/// Absence of an in-memory remote owner alone cannot authorize a cancellation
+/// receipt after restart. Existing native or reconciliation ownership wins.
+pub(super) async fn browser_remote_generation_absent(
+    data_dir: &Path,
+    generation: &str,
+) -> Result<bool, String> {
+    let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+    let mut registry = registry.lock().await;
+    registry.load_durable_ownerships(data_dir)?;
+    let scope = browser_session_scope(data_dir);
+    Ok(!registry
+        .sessions
+        .values()
+        .any(|s| s.scope == scope && s.generation == generation)
+        && !registry
+            .pending_engine_cleanups
+            .values()
+            .any(|o| o.scope == scope && o.cleanup.generation == generation)
+        && !registry
+            .pending_launch_reconciliations
+            .values()
+            .any(|o| o.scope == scope && o.reconciliation.generation == generation))
 }
 
 pub(in crate::api::gateway) async fn browser_launch_transport_authority(
@@ -911,6 +1025,7 @@ pub(in crate::api::gateway) async fn browser_launch_transport_authority(
         .await
         .sessions
         .get(&reservation.id)
+        .filter(|record| reservation.matches_record(record))
         .and_then(|record| record.transport_authority.clone())
 }
 
@@ -1012,6 +1127,9 @@ pub(in crate::api::gateway) async fn discard_browser_vz_transport_preparation(
     let Some(record) = registry.sessions.get(&reservation.id) else {
         return Ok(());
     };
+    if !reservation.matches_record(record) || record.scope != browser_session_scope(data_dir) {
+        return Ok(());
+    }
     if record.transport_authority.is_none() {
         return Ok(());
     }
@@ -2122,7 +2240,15 @@ pub(in crate::api::gateway) async fn browser_gateway_session_status(
                 key.starts_with(&format!("{scope}\n"))
                     && obligation.cleanup.principal_id == principal_id
             });
+    let pending_remote_preparation = super::gateway_browser_remote::unresolved_preparation(
+        data_dir,
+        principal_id,
+        owner_launch_id,
+        browser_instance,
+    )
+    .unwrap_or(true);
     let fresh_start_allowed = verified_scope
+        && !pending_remote_preparation
         && capacity_available
         && !matching_session
         && !matching_job
@@ -2609,7 +2735,7 @@ fn create_browser_temp_file(parent: &Path, target: &Path) -> Result<(PathBuf, Fi
     Err("Browser lifecycle temporary state name could not be allocated".to_string())
 }
 
-fn write_browser_json_atomic<T: Serialize>(
+pub(super) fn write_browser_json_atomic<T: Serialize>(
     data_dir: &Path,
     path: &Path,
     value: &T,
@@ -2908,7 +3034,7 @@ fn browser_reaped_page_tombstone_matches_at(
     }))
 }
 
-fn remove_browser_durable_file(data_dir: &Path, path: PathBuf) -> Result<(), String> {
+pub(super) fn remove_browser_durable_file(data_dir: &Path, path: PathBuf) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "Browser lifecycle path has no parent".to_string())?;
@@ -2944,7 +3070,7 @@ fn remove_browser_durable_file(data_dir: &Path, path: PathBuf) -> Result<(), Str
 }
 
 #[cfg(test)]
-fn set_browser_durable_delete_failure(path: &Path, fail: bool) {
+pub(in crate::api::gateway) fn set_browser_durable_delete_failure(path: &Path, fail: bool) {
     let failures = BROWSER_DURABLE_DELETE_FAILURES.get_or_init(Default::default);
     let mut failures = failures.lock().expect("Browser durable delete test lock");
     if fail {
@@ -3311,7 +3437,7 @@ impl BrowserSessionRegistry {
     }
 }
 
-fn read_bounded_browser_json_dir<T: for<'de> Deserialize<'de>>(
+pub(super) fn read_bounded_browser_json_dir<T: for<'de> Deserialize<'de>>(
     data_dir: &Path,
     dir: &Path,
     max_entries: usize,
@@ -3892,6 +4018,73 @@ mod tests {
             profile_key_hash: Some("sha256:profilehash".to_string()),
             vm_key_hash: Some("sha256:vmhash".to_string()),
         }
+    }
+
+    #[tokio::test]
+    async fn remote_engine_deserialized_reservation_cannot_release_reused_serial_owner() {
+        let old_root = tempfile::tempdir().unwrap();
+        let new_root = tempfile::tempdir().unwrap();
+        let old =
+            reserve_browser_launch(old_root.path(), "person:old", test_lifecycle("launch:old"))
+                .await
+                .unwrap();
+        let mut serialized_old = serde_json::to_value(&old).unwrap();
+        release_browser_launch(&old).await;
+        let current =
+            reserve_browser_launch(new_root.path(), "person:new", test_lifecycle("launch:new"))
+                .await
+                .unwrap();
+        // Process serials restart at zero. Reuse the new serial without changing
+        // any of the old durable owner's scope or cleanup authority.
+        serialized_old["id"] = serde_json::json!(current.id);
+        let old: BrowserLaunchReservation = serde_json::from_value(serialized_old).unwrap();
+        let transport = serde_json::json!({"generation":current.generation,"page_id":current.page_id,"marker":"new-owner"});
+        {
+            let mut registry = BROWSER_SESSION_REGISTRY.get().unwrap().lock().await;
+            registry
+                .sessions
+                .get_mut(&current.id)
+                .unwrap()
+                .transport_authority = Some(transport.clone());
+        }
+        assert!(browser_launch_transport_authority(&old).await.is_none());
+        discard_browser_vz_transport_preparation(old_root.path(), &old)
+            .await
+            .unwrap();
+        release_browser_launch(&old).await;
+        assert_eq!(
+            browser_launch_transport_authority(&current).await,
+            Some(transport.clone())
+        );
+        for field in ["scope", "generation", "cleanup_id", "page_id", "vm_id"] {
+            let mut stale = serde_json::to_value(&current).unwrap();
+            stale[field] = serde_json::json!(format!("foreign-{field}"));
+            let stale = serde_json::from_value(stale).unwrap();
+            release_browser_launch(&stale).await;
+            assert_eq!(
+                browser_launch_transport_authority(&current).await,
+                Some(transport.clone()),
+                "{field}"
+            );
+        }
+        let mut legacy = serde_json::to_value(&current).unwrap();
+        legacy.as_object_mut().unwrap().remove("scope");
+        release_browser_launch(&serde_json::from_value(legacy).unwrap()).await;
+        assert_eq!(
+            browser_launch_transport_authority(&current).await,
+            Some(transport)
+        );
+        release_browser_launch(&current).await;
+        assert!(browser_launch_transport_authority(&current).await.is_none());
+        release_browser_launch(&old).await;
+        release_browser_launch(&current).await;
+        assert!(!BROWSER_SESSION_REGISTRY
+            .get()
+            .unwrap()
+            .lock()
+            .await
+            .sessions
+            .contains_key(&current.id));
     }
 
     #[tokio::test]

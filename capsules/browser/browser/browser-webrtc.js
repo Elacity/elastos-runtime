@@ -145,6 +145,9 @@ export async function validateRuntimeLaunchTurn(
     "credential_hash",
     "turn_url",
   ];
+  if (capability && Object.hasOwn(capability, "viewer_ingress")) {
+    capabilityKeys.push("viewer_ingress");
+  }
   if (
     displaySession?.ice_connection_policy !== "runtime_launch_relay_only" ||
     displaySession?.offerer !== "engine" ||
@@ -181,8 +184,30 @@ export async function validateRuntimeLaunchTurn(
   ) {
     throw new Error("Browser Runtime TURN binding is invalid.");
   }
-  const expectedTurnUrl =
+  let expectedTurnUrl =
     `turn:${turnHost(proof.turn.advertised_host)}:${proof.turn.listen_port}?transport=tcp`;
+  if (Object.hasOwn(capability, "viewer_ingress")) {
+    // Runtime supplies this capability after it owns a Carrier-bound ingress.
+    // The Engine's native TURN receipt and ephemeral credentials stay intact.
+    const ingress = capability.viewer_ingress;
+    if (
+      !exactObjectKeys(ingress, ["schema", "page_id", "generation",
+        "engine_binding_hash", "owner_runtime_hash", "engine_runtime_hash", "turn_url"]) ||
+      ingress.schema !== "elastos.browser.viewer-ingress/v1" ||
+      ingress.page_id !== proof.page_id ||
+      ingress.generation !== proof.generation ||
+      ingress.engine_binding_hash !== proof.binding_hash ||
+      !isSha256Label(ingress.owner_runtime_hash) ||
+      !isSha256Label(ingress.engine_runtime_hash) ||
+      typeof ingress.turn_url !== "string" || ingress.turn_url.length > 320 ||
+      !/^turn:(?:[a-z0-9.-]+|\[[a-f0-9:]+\]):[0-9]{1,5}\?transport=tcp$/i.test(ingress.turn_url) ||
+      !Number(ingress.turn_url.match(/:([0-9]+)\?/)?.[1]) ||
+      Number(ingress.turn_url.match(/:([0-9]+)\?/)?.[1]) > 65535
+    ) {
+      throw new Error("Browser Runtime TURN ingress binding is invalid.");
+    }
+    expectedTurnUrl = ingress.turn_url;
+  }
   if (capability.turn_url !== expectedTurnUrl) {
     throw new Error("Browser Runtime TURN endpoint is invalid.");
   }

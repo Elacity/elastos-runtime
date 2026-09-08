@@ -187,7 +187,13 @@ async fn engine_input(
         }
         None => None,
     };
-    if registration.is_none_or(|r| r.provider != owner.engine_route_provider)
+    if (registration.is_none_or(|r| r.provider != owner.engine_route_provider)
+        && !super::gateway_browser_remote::route_matches(
+            state,
+            owner.principal_id(),
+            owner.page_id(),
+            &owner.engine_route_provider,
+        ))
         || !browser_inspection_owner_current(&state.data_dir, owner).await
     {
         return Err(failure(StatusCode::CONFLICT, "operator_owner_changed"));

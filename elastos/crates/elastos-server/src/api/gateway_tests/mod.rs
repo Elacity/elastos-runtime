@@ -597,7 +597,14 @@ async fn browser_engine_remote_carrier_exit_test_state_with_close_failures(
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
-        carrier_endpoint: None,
+        // This fixture represents an attached Runtime, which owns the endpoint
+        // required by the authenticated remote Exit stream path.
+        carrier_endpoint: Some(
+            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap(),
+        ),
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -649,7 +656,14 @@ async fn rejecting_browser_engine_remote_carrier_exit_test_state_with_close_fail
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
-        carrier_endpoint: None,
+        // This fixture represents an attached Runtime, which owns the endpoint
+        // required by the authenticated remote Exit stream path.
+        carrier_endpoint: Some(
+            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap(),
+        ),
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -843,6 +857,8 @@ mod library;
 mod marketplace;
 mod model;
 mod recovery;
+#[cfg(unix)]
+mod remote_engine;
 mod room;
 mod site_publication;
 mod wallet;

@@ -76,9 +76,14 @@ pub(crate) use browser_exit::{
 };
 #[path = "carrier_engine.rs"]
 mod browser_engine;
+#[path = "carrier_engine_binding.rs"]
+pub(crate) mod browser_engine_binding;
+#[path = "carrier_engine_media.rs"]
+pub(crate) mod browser_engine_media;
 pub(crate) use browser_engine::{
-    grant_id as engine_grant_id, probe as probe_browser_engine, BrowserEngineGrant,
-    ENGINE_GRANT_TTL_SECS, ENGINE_LOCAL_OFFER, ENGINE_SERVICE_KIND, ENGINE_SERVICE_URI,
+    call as call_browser_engine, grant_id as engine_grant_id, probe as probe_browser_engine,
+    BrowserEngineGrant, ENGINE_GRANT_TTL_SECS, ENGINE_LOCAL_OFFER, ENGINE_SERVICE_KIND,
+    ENGINE_SERVICE_URI,
 };
 const BROWSER_CARRIER_STREAM_SCHEMA: &str = "elastos.browser.carrier-stream/v1";
 const BROWSER_CARRIER_STREAM_ACK_MAX_BYTES: usize = 16 * 1024;
@@ -1309,18 +1314,20 @@ async fn handle_file_stream(
                 return Ok(());
             };
             let response = if msg.data["target"] == "browser-engine" {
-                let (network, slots) = {
+                let (network, slots, endpoint) = {
                     let state = gossip_state.lock().await;
                     (
                         state.browser_exit_network.clone(),
                         state.browser_engine_probe_slots.clone(),
+                        state.endpoint.clone(),
                     )
                 };
                 browser_engine::invoke(
-                    &registry,
+                    registry.clone(),
                     data_dir,
                     network,
                     slots,
+                    endpoint,
                     source_endpoint_id,
                     &msg.data,
                 )
@@ -1329,6 +1336,31 @@ async fn handle_file_stream(
                 carrier_provider_invoke_registry(&registry, &msg.data, &source_endpoint_id).await?
             };
             send_json(send, &response).await?;
+        }
+        "browser_engine_media" => {
+            let buffered = reader.buffer().to_vec();
+            return browser_engine_media::serve(
+                data_dir,
+                source_endpoint_id,
+                &msg.data,
+                send,
+                reader.into_inner(),
+                buffered,
+            )
+            .await;
+        }
+        #[cfg(unix)]
+        "browser_engine_egress" => {
+            let buffered = reader.buffer().to_vec();
+            return browser_engine_binding::serve_egress(
+                data_dir,
+                source_endpoint_id,
+                &msg.data,
+                send,
+                reader.into_inner(),
+                buffered,
+            )
+            .await;
         }
         "browser_exit_stream" => {
             let Some(registry) = provider_registry.and_then(|registry| registry.upgrade()) else {

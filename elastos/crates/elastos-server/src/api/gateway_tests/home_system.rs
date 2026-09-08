@@ -8505,6 +8505,7 @@ async fn services_contact_pending_engine_request(
 
 #[derive(Default)]
 struct ServicesEngineProbeProvider {
+    execution: super::remote_engine::RemoteEngineFixture,
     calls: TokioMutex<Vec<Value>>,
     hold: std::sync::atomic::AtomicBool,
     entered: tokio::sync::Notify,
@@ -8527,7 +8528,7 @@ impl Provider for ServicesEngineProbeProvider {
         if self.hold.load(std::sync::atomic::Ordering::SeqCst) {
             self.release.notified().await;
         }
-        let mut response = MockBrowserEngineProvider.send_raw(request).await?;
+        let mut response = self.execution.send_raw(request).await?;
         if request["op"] == "status" {
             response["data"]["capacity_available"] = json!(true);
             response["data"]["max_active_sessions"] = json!(4);
@@ -8539,7 +8540,7 @@ impl Provider for ServicesEngineProbeProvider {
 }
 
 #[tokio::test]
-async fn test_services_remote_engine_signed_approval_retains_scoped_probe_grant() {
+async fn test_services_remote_engine_signed_approval_retains_scoped_execution_grant() {
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
@@ -8635,14 +8636,19 @@ async fn test_services_remote_engine_signed_approval_retains_scoped_probe_grant(
     assert_eq!(grant["schema"], "elastos.service.remote-engine-grant/v1");
     assert_eq!(grant["peer_did"], bob.peer_id);
     assert_eq!(grant["principal_id"], alice.authority.principal_id);
-    assert_eq!(grant["operations"], json!(["status", "readiness"]));
+    assert_eq!(
+        grant["operations"],
+        crate::carrier::browser_engine_binding::operations(Some(
+            crate::carrier::browser_engine_binding::EXECUTION_SCOPE
+        ))
+    );
     assert!(!left.path().join("config/exit-provider.json").exists());
     assert!(alice.exit_provider.requests.lock().await.is_empty());
     let grant = grant.clone();
     let status = crate::carrier::probe_browser_engine(&consumer_registry, &grant, "status", None)
         .await
         .unwrap();
-    assert_eq!(status["data"]["launch_available"], false);
+    assert_eq!(status["data"]["launch_available"], true);
     assert!(!status.to_string().contains("never-publish"));
     let adapter = status["data"]["adapters"][0]["id"].as_str().unwrap();
     let ready = crate::carrier::probe_browser_engine(
@@ -8715,7 +8721,19 @@ async fn test_services_remote_engine_signed_approval_retains_scoped_probe_grant(
         .await
         .unwrap(),
     );
-    let browser_app = gateway_router(consumer_state);
+    consumer_registry
+        .register_sub_provider("net", Arc::new(MockNetProvider))
+        .await
+        .unwrap();
+    let consumer_exit = Arc::new(super::remote_engine::ConsumerExitFixture {
+        stream_id: mock_attached_stream_id(left.path()),
+        calls: TokioMutex::default(),
+    });
+    consumer_registry
+        .register_sub_provider("exit", consumer_exit.clone())
+        .await
+        .unwrap();
+    let browser_app = gateway_router(consumer_state.clone());
     let browser_token = app_token_for_authority(left.path(), BROWSER_CAPSULE_ID, &alice.authority);
     let (code, browser_summary) = home_test_get_json(
         &browser_app,
@@ -8728,7 +8746,7 @@ async fn test_services_remote_engine_signed_approval_retains_scoped_probe_grant(
     let remote_offer = &browser_summary["engine_adapter"]["remote_services"]["offers"][0];
     assert_eq!(remote_offer["state"], "approved", "{browser_summary}");
     assert_eq!(remote_offer["readiness"]["state"], "ready");
-    assert_eq!(remote_offer["launch_available"], false);
+    assert_eq!(remote_offer["launch_available"], true);
     for private in [
         ticket.as_str(),
         grant["grant_id"].as_str().unwrap(),
@@ -8738,7 +8756,7 @@ async fn test_services_remote_engine_signed_approval_retains_scoped_probe_grant(
         assert!(!browser_summary.to_string().contains(private));
     }
     assert_eq!(provider.calls.lock().await.len(), 4);
-    // Mutating operations fail at the actual receiver even through a raw invocation.
+    // Launch without a retained page/generation fails at the actual receiver before native effects.
     use elastos_runtime::provider::{
         ProviderCarrierRoute, ProviderInvocation, ProviderInvocationTransport, ProviderTransfer,
     };
@@ -8758,6 +8776,32 @@ async fn test_services_remote_engine_signed_approval_retains_scoped_probe_grant(
     };
     assert!(consumer_registry.invoke_provider(invocation).await.is_err());
     assert_eq!(provider.calls.lock().await.len(), 4);
+    super::remote_engine::exercise_signed_remote_engine_carrier(
+        &consumer_registry,
+        &grant,
+        right.path(),
+    )
+    .await;
+    super::remote_engine::exercise_consumer_http_remote_engine(
+        &browser_app,
+        &browser_token,
+        left.path(),
+        &remote_offer["selectable_adapters"][0]["id"],
+        &alice.authority.principal_id,
+        &consumer_exit,
+        &consumer_state,
+        &provider.calls,
+    )
+    .await;
+    super::remote_engine::exercise_revoked_remote_preparation_cleanup(
+        &consumer_state,
+        &grant,
+        &consumer_exit,
+        true,
+        right.path(),
+    )
+    .await;
+    let before_late_probe = provider.calls.lock().await.len();
     // An approval cannot publish late readiness after the provider owner denies it.
     provider
         .hold
@@ -8770,7 +8814,7 @@ async fn test_services_remote_engine_signed_approval_retains_scoped_probe_grant(
     });
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if provider.calls.lock().await.len() == 5 {
+            if provider.calls.lock().await.len() == before_late_probe + 1 {
                 break;
             }
             provider.entered.notified().await;
@@ -8795,7 +8839,40 @@ async fn test_services_remote_engine_signed_approval_retains_scoped_probe_grant(
             .await
             .is_err()
     );
-    assert_eq!(provider.calls.lock().await.len(), 5);
+    assert_eq!(provider.calls.lock().await.len(), before_late_probe + 1);
+    let cancellation =
+        json!({"principal_id":alice.authority.principal_id,"grant_id":grant["grant_id"]});
+    authorize_home_engine_preparation_cancellation(right.path(), &endpoint.id(), &cancellation)
+        .unwrap();
+    for field in ["principal_id", "grant_id"] {
+        let mut foreign = cancellation.clone();
+        foreign[field] = json!("foreign");
+        assert!(authorize_home_engine_preparation_cancellation(
+            right.path(),
+            &endpoint.id(),
+            &foreign
+        )
+        .is_err());
+    }
+    assert!(authorize_home_engine_preparation_cancellation(
+        right.path(),
+        &iroh::SecretKey::from_bytes(&[91; 32]).public(),
+        &cancellation
+    )
+    .is_err());
+    super::remote_engine::exercise_revoked_remote_preparation_cleanup(
+        &consumer_state,
+        &grant,
+        &consumer_exit,
+        false,
+        right.path(),
+    )
+    .await;
+    assert_eq!(
+        provider.calls.lock().await.len(),
+        before_late_probe + 1,
+        "revoked prepare and cancellation have no native effects"
+    );
     let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
     home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
     let saved = services_contact_saved_state(left.path(), &alice.authority, "services-state.json");

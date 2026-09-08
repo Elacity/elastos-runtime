@@ -228,6 +228,8 @@ struct HomeServicesPendingAccessDecision {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct HomeServicesRemoteOfferRequestRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grant_scope: Option<String>,
     request_id: String,
     offer_id: String,
     service_uri: String,
@@ -259,6 +261,8 @@ struct HomeServicesRequestsState {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct HomeServiceAccessRequestRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grant_scope: Option<String>,
     request_id: String,
     offer_id: String,
     service_uri: String,
@@ -2113,6 +2117,7 @@ pub(super) async fn services_offer_update(
                         services_state.remote_offer_requests.insert(
                             offer_id.to_string(),
                             HomeServicesRemoteOfferRequestRecord {
+                                grant_scope: Some(offer.grant_scope.clone()),
                                 request_id: sent.request_id,
                                 offer_id: offer_id.to_string(),
                                 service_uri: offer.service_uri.clone(),
@@ -2616,7 +2621,8 @@ fn home_services_send_access_decision(
             "schema":"elastos.service.remote-engine-grant/v1",
             "grant_id":crate::carrier::engine_grant_id(&request.request_id),
             "peer_did":runtime.peer_id, "connect_ticket":runtime.connect_ticket,
-            "operations":["status","readiness"], "expires_at":request.grant_expires_at,
+            "operations":crate::carrier::browser_engine_binding::operations(request.grant_scope.as_deref()),
+            "expires_at":request.grant_expires_at,
         });
     }
     crate::carrier::sign_service_message(data_dir, &mut payload)?;
@@ -3148,6 +3154,55 @@ pub(crate) fn authorize_home_service_exit(
     authorized.ok_or_else(|| anyhow::anyhow!("Exit grant was not issued by this Runtime"))
 }
 
+/// Cancellation can retire only the authenticated requester's generation. A
+/// denied/expired decision still identifies that requester, without restoring
+/// permission to prepare, launch or use an Engine.
+pub(crate) fn authorize_home_engine_preparation_cancellation(
+    data_dir: &std::path::Path,
+    source: &iroh::PublicKey,
+    request: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let principals = crate::auth::active_passkey_principals(data_dir)?;
+    anyhow::ensure!(
+        principals.len() <= 64,
+        "Engine cancellation authority scope unavailable"
+    );
+    let mut matched = false;
+    for principal in principals {
+        let context = HomeLaunchTokenContext {
+            principal_id: principal.principal_id,
+            proof_binding_id: Some(principal.proof_binding_id),
+            session_id: String::new(),
+            grant_id: String::new(),
+        };
+        let state = home_services_requests_state(data_dir, &context)?;
+        for record in state
+            .requests
+            .values()
+            .filter(|r| request["grant_id"] == crate::carrier::engine_grant_id(&r.request_id))
+        {
+            anyhow::ensure!(
+                !matched
+                    && record.authenticated_request
+                    && matches!(record.status.as_str(), "approved" | "denied")
+                    && record.service_uri == crate::carrier::ENGINE_SERVICE_URI
+                    && record.service_kind == crate::carrier::ENGINE_SERVICE_KIND
+                    && record.grant_scope.as_deref()
+                        == Some(crate::carrier::browser_engine_binding::EXECUTION_SCOPE)
+                    && record.requester_peer_id == source.to_string()
+                    && record.requester_principal_id.as_deref() == request["principal_id"].as_str(),
+                "Engine cancellation requester does not own the retained service decision"
+            );
+            matched = true;
+        }
+    }
+    anyhow::ensure!(
+        matched,
+        "Engine cancellation has no retained service decision"
+    );
+    Ok(())
+}
+
 pub(crate) fn authorize_home_service_engine(
     data_dir: &std::path::Path,
     network: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
@@ -3204,6 +3259,8 @@ pub(crate) fn authorize_home_service_engine(
                 "Engine requester is no longer an accepted contact"
             );
             let grant = crate::carrier::BrowserEngineGrant {
+                execution_allowed: record.grant_scope.as_deref()
+                    == Some(crate::carrier::browser_engine_binding::EXECUTION_SCOPE),
                 provider_principal_id: context.principal_id.clone(),
                 requester_principal_id: record
                     .requester_principal_id
@@ -3333,7 +3390,10 @@ fn home_services_remote_engine_grant(
             && grant["grant_id"].as_str()
                 == Some(crate::carrier::engine_grant_id(&record.request_id).as_str())
             && grant["peer_did"].as_str() == Some(&record.target_peer_id)
-            && grant["operations"] == serde_json::json!(["status", "readiness"])
+            && grant["operations"]
+                == crate::carrier::browser_engine_binding::operations(
+                    record.grant_scope.as_deref()
+                )
             && expiry > now_ts()
             && expiry > revision
             && expiry - revision <= crate::carrier::ENGINE_GRANT_TTL_SECS,
@@ -3344,7 +3404,7 @@ fn home_services_remote_engine_grant(
         serde_json::json!({"schema":"elastos.service.remote-engine-grant/v1",
         "id":format!("remote-engine-{}", hex::encode(&Sha256::digest(record.request_id.as_bytes())[..8])),
         "grant_id":grant["grant_id"],"peer_did":record.target_peer_id,"connect_ticket":ticket,
-        "principal_id":context.principal_id,"operations":["status","readiness"],"expires_at":expiry}),
+        "principal_id":context.principal_id,"operations":grant["operations"],"expires_at":expiry}),
     )
 }
 
@@ -3585,6 +3645,7 @@ fn home_services_merge_access_request(
     }
     let status = "pending".to_string();
     let record = HomeServiceAccessRequestRecord {
+        grant_scope: home_services_payload_text(payload, "grant_scope", 128),
         request_id: request_id.clone(),
         offer_id: home_services_payload_text(payload, "offer_id", 256).unwrap_or_default(),
         service_uri,

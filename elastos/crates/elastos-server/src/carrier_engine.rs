@@ -22,6 +22,7 @@ pub(crate) struct BrowserEngineGrant {
     pub grant_id: String,
     pub revision: u64,
     pub expires_at: u64,
+    pub execution_allowed: bool,
 }
 
 impl BrowserEngineGrant {
@@ -41,7 +42,13 @@ impl BrowserEngineGrant {
             "Engine grant expired or invalid"
         );
         anyhow::ensure!(
-            matches!(request["op"].as_str(), Some("status" | "readiness")),
+            request["op"]
+                .as_str()
+                .is_some_and(|op| super::browser_engine_binding::allows(
+                    self.execution_allowed
+                        .then_some(super::browser_engine_binding::EXECUTION_SCOPE),
+                    op
+                )),
             "Engine operation requires remote Runtime resource binding"
         );
         Ok(())
@@ -109,6 +116,7 @@ fn project_response(operation: &str, request: &Value, response: Value) -> Result
         .context("Engine capacity invalid")?;
     Ok(
         json!({"status":"ok","data":{"schema":"elastos.browser.remote-engine-status/v1",
+        "provider":inventory.provider,"status":inventory.status,"adapter_count":visible.len(),
         "protocol_version":inventory.protocol_version,
         "adapters":visible,"capacity_available":capacity,"max_active_sessions":maximum,
         "direct_network":false,"wallet_injection":false,"launch_available":false}}),
@@ -141,13 +149,105 @@ async fn read_authority(
 }
 
 pub(super) async fn invoke(
-    registry: &ProviderRegistry,
+    registry: Arc<ProviderRegistry>,
     data_dir: &Path,
     network: Option<crate::collaboration_network::VerifiedCollaborationNetworkProfile>,
     slots: Arc<tokio::sync::Semaphore>,
+    endpoint: iroh::Endpoint,
     source: iroh::PublicKey,
     data: &Value,
 ) -> Value {
+    let operation = data["operation"].as_str().unwrap_or_default();
+    if !matches!(operation, "status" | "readiness") || data["request"].get("page_id").is_some() {
+        let outcome = async {
+            anyhow::ensure!(
+                serde_json::to_vec(data)?.len() <= 256 * 1024
+                    && data["source"] == "browser"
+                    && data["target"] == "browser-engine"
+                    && data["transfer"] == "json"
+                    && super::browser_engine_binding::EXECUTION_OPERATIONS.contains(&operation),
+                "Engine execution envelope invalid"
+            );
+            super::validate_carrier_provider_invocation(
+                "browser",
+                "browser-engine",
+                operation,
+                "json",
+                &data["request"],
+            )
+            .map_err(anyhow::Error::msg)?;
+            if operation == "close_page" && data["request"]["cancel_preparation"] == true {
+                let root = data_dir.to_owned();
+                let request = data["request"].clone();
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    tokio::task::spawn_blocking(move || {
+                        crate::api::gateway::authorize_home_engine_preparation_cancellation(
+                            &root, &source, &request,
+                        )
+                    }),
+                )
+                .await
+                .context("Engine cancellation authority deadline")???;
+            }
+            let grant = if matches!(operation, "close_page" | "status") {
+                None
+            } else {
+                Some(
+                    read_authority(
+                        data_dir,
+                        network
+                            .as_ref()
+                            .context("Engine contact authority missing")?,
+                        source,
+                        &data["request"],
+                    )
+                    .await?,
+                )
+            };
+            let response = crate::api::gateway::invoke_remote_browser_engine(
+                data_dir,
+                registry.clone(),
+                endpoint,
+                source,
+                network
+                    .clone()
+                    .context("Engine Runtime network unavailable")?,
+                grant.clone(),
+                &data["request"],
+            )
+            .await?;
+            if let Some(grant) = grant {
+                anyhow::ensure!(
+                    read_authority(
+                        data_dir,
+                        network.as_ref().unwrap(),
+                        source,
+                        &data["request"]
+                    )
+                    .await?
+                        == grant,
+                    "Engine authority changed during operation"
+                );
+            }
+            Ok::<_, anyhow::Error>(response)
+        };
+        return match tokio::time::timeout(
+            Duration::from_secs(if matches!(operation, "prepare_launch" | "launch") {
+                55
+            } else {
+                5
+            }),
+            outcome,
+        )
+        .await
+        {
+            Ok(Ok(result)) => json!({"ok":true,"result":result}),
+            _ => {
+                json!({"ok":false,"code":"browser_engine_unavailable","error":"Runtime Engine operation is unavailable or pending settlement"})
+            }
+        };
+    }
     let outcome = async {
         let _slot = slots
             .try_acquire_owned()
@@ -211,7 +311,12 @@ pub(super) async fn invoke(
             read_authority(data_dir, &network, source, &data["request"]).await? == grant,
             "Engine grant changed during observation"
         );
-        project_response(operation, &provider_request, response)
+        let mut projected = project_response(operation, &provider_request, response)?;
+        if operation == "status" {
+            projected["data"]["remote_page_binding_supported"] = json!(true);
+            projected["data"]["launch_available"] = json!(grant.execution_allowed);
+        }
+        Ok(projected)
     };
     match tokio::time::timeout(Duration::from_secs(4), outcome).await {
         Ok(Ok(result)) => json!({"ok":true,"result":result}),
@@ -230,6 +335,25 @@ pub(crate) async fn probe(
         matches!(operation, "status" | "readiness"),
         "Engine launch resource binding unavailable"
     );
+    let mut request = json!({"op":operation});
+    if let Some(adapter) = adapter_id {
+        request["adapter_id"] = json!(adapter);
+    }
+    call(registry, grant, operation, request).await
+}
+
+pub(crate) async fn call(
+    registry: &ProviderRegistry,
+    grant: &Value,
+    operation: &str,
+    mut request: Value,
+) -> Result<Value> {
+    anyhow::ensure!(
+        grant["operations"]
+            .as_array()
+            .is_some_and(|ops| ops.iter().any(|op| op == operation)),
+        "Engine operation was not approved"
+    );
     let endpoint = grant["peer_did"]
         .as_str()
         .context("Engine peer required")?
@@ -237,11 +361,9 @@ pub(crate) async fn probe(
     let ticket = grant["connect_ticket"]
         .as_str()
         .context("Engine ticket required")?;
-    let mut request =
-        json!({"op":operation,"grant_id":grant["grant_id"],"principal_id":grant["principal_id"]});
-    if let Some(adapter) = adapter_id {
-        request["adapter_id"] = json!(adapter);
-    }
+    request["op"] = json!(operation);
+    request["grant_id"] = grant["grant_id"].clone();
+    request["principal_id"] = grant["principal_id"].clone();
     let result = registry
         .invoke_provider(ProviderInvocation {
             source: "browser".into(),
@@ -254,7 +376,11 @@ pub(crate) async fn probe(
             transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::ConnectTicket {
                 connect_ticket: ticket.into(),
                 peer_did: Some(super::public_key_to_did(&endpoint)?),
-                timeout_ms: Some(4000),
+                timeout_ms: Some(if matches!(operation, "prepare_launch" | "launch") {
+                    60_000
+                } else {
+                    5_000
+                }),
             }),
         })
         .await?;
@@ -275,6 +401,7 @@ mod tests {
             grant_id: "grant".into(),
             revision: 100,
             expires_at: 3700,
+            execution_allowed: false,
         };
         let request = json!({"op":"status","grant_id":"grant","principal_id":"consumer"});
         assert!(grant.validate(&source, &request, 100).is_ok());
@@ -324,6 +451,8 @@ mod tests {
         assert_eq!(public["data"]["capacity_available"], true);
         assert!(!public.to_string().contains("private"));
         assert_eq!(public["data"]["launch_available"], false);
+        elastos_common::browser_protocol::BrowserEngineInventory::from_status(&public["data"])
+            .expect("remote status must remain consumable by the shared Engine selector");
         for pointer in [
             "/data/direct_network",
             "/data/wallet_injection",
@@ -367,10 +496,15 @@ mod tests {
         let slots = Arc::new(tokio::sync::Semaphore::new(1));
         let _held = slots.clone().acquire_owned().await.unwrap();
         let response = invoke(
-            &ProviderRegistry::new(),
+            Arc::new(ProviderRegistry::new()),
             Path::new("unused"),
             None,
             slots.clone(),
+            iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .bind()
+                .await
+                .unwrap(),
             iroh::SecretKey::from_bytes(&[15; 32]).public(),
             &json!({}),
         )

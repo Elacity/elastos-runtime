@@ -23,6 +23,8 @@ use tokio::sync::{watch, Notify};
 mod gateway_browser_engine;
 #[path = "gateway_browser_operator.rs"]
 pub(crate) mod gateway_browser_operator;
+#[path = "gateway_browser_remote.rs"]
+pub(crate) mod gateway_browser_remote;
 #[path = "gateway_browser_response.rs"]
 mod gateway_browser_response;
 #[path = "gateway_browser_sessions.rs"]
@@ -224,6 +226,29 @@ pub(super) async fn browser_app_summary(
     let mut engine_adapter =
         browser_engine_summary(state.provider_registry.as_ref(), &context.principal_id).await;
     engine_adapter["remote_services"] = browser_remote_engine_summary(&state, &context).await;
+    let remote_adapters = engine_adapter["remote_services"]["offers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|offer| offer["launch_available"] == true)
+        .flat_map(|offer| {
+            offer["selectable_adapters"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    if !remote_adapters.is_empty() {
+        let mut adapters = engine_adapter["adapters"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        adapters.extend(remote_adapters);
+        engine_adapter["adapters"] = serde_json::json!(adapters);
+        engine_adapter["status"] = serde_json::json!("configured");
+        engine_adapter["protocol_version"] = serde_json::json!(BROWSER_ENGINE_PROTOCOL_VERSION);
+    }
     // This flag describes Runtime's request parser, never a guest capability.
     engine_adapter["display_attach_supported"] = serde_json::json!(true);
     let net = browser_net_summary(state.provider_registry.as_ref(), &context.principal_id).await;
@@ -269,6 +294,13 @@ pub(super) async fn browser_app_profile_reset(
             Ok(context) => context,
             Err(err) => return gateway_provider_error_response("browser", err),
         };
+    if let Err(error) = gateway_browser_remote::require_profile_placement(
+        &state.data_dir,
+        &context.principal_id,
+        None,
+    ) {
+        return (StatusCode::CONFLICT, error.to_string()).into_response();
+    }
     if browser_principal_has_live_sessions(&state.data_dir, &context.principal_id).await {
         return (
             StatusCode::CONFLICT,
@@ -568,28 +600,48 @@ async fn execute_browser_open(
         },
         None => None,
     };
-    let engine_registration = match registry
-        .registration_for_uri("elastos://browser-engine/launch")
-        .await
-    {
-        Some(registration) => registration,
-        None => {
-            return Err(BrowserOpenFailure::provider(
-                "browser-engine",
-                anyhow::anyhow!("Browser Engine provider route is unavailable"),
-            ))
-        }
-    };
-    let adapter_id = match resolve_browser_engine_adapter(
-        registry.as_ref(),
-        &state.data_dir,
-        &context.principal_id,
+    let remote_choice = match gateway_browser_remote::select(
+        state,
+        &context,
         requested_adapter_id.as_deref(),
         display_mode,
         guarantee_level,
     )
     .await
     {
+        Ok(choice) => choice,
+        Err(error) => return Err(BrowserOpenFailure::provider("browser-engine", error)),
+    };
+    let engine_route_provider = if let Some(choice) = &remote_choice {
+        choice.2.clone()
+    } else {
+        match registry
+            .registration_for_uri("elastos://browser-engine/launch")
+            .await
+        {
+            Some(registration) => registration.provider,
+            None => {
+                return Err(BrowserOpenFailure::provider(
+                    "browser-engine",
+                    anyhow::anyhow!("Browser Engine provider route is unavailable"),
+                ))
+            }
+        }
+    };
+    let resolved_adapter = if let Some(choice) = &remote_choice {
+        Ok(choice.1.clone())
+    } else {
+        resolve_browser_engine_adapter(
+            registry.as_ref(),
+            &state.data_dir,
+            &context.principal_id,
+            requested_adapter_id.as_deref(),
+            display_mode,
+            guarantee_level,
+        )
+        .await
+    };
+    let adapter_id = match resolved_adapter {
         Ok(adapter_id) => adapter_id,
         Err(error) => {
             let mut body =
@@ -617,10 +669,10 @@ async fn execute_browser_open(
         .unwrap_or_default();
     let lifecycle = BrowserLaunchLifecycle {
         owner_launch_id: authority.verified_context().launch_id().to_string(),
-        browser_instance,
+        browser_instance: browser_instance.clone(),
         url: url.clone(),
         exit_id: browser_lifecycle_exit_id(remote_exit_id.as_deref()),
-        engine_route_provider: engine_registration.provider.clone(),
+        engine_route_provider: engine_route_provider.clone(),
         selected_engine_adapter: Some(adapter_id.clone()),
         service_selection: Some(BrowserServiceSelection::from_request(
             requested_adapter_id,
@@ -716,21 +768,31 @@ async fn execute_browser_open(
             .with_outcome(outcome));
         }
     };
-    let vz_transport_launch = match prepare_browser_vz_transport_launch(
-        &state.data_dir,
-        BrowserVzTransportLaunchBinding {
-            generation: launch_reservation.generation(),
-            page_id: launch_reservation.page_id(),
-            vm_id: launch_reservation.vm_id(),
-            principal_id: &context.principal_id,
-            egress_stream_id: &engine_stream_id,
-            egress_target: &target,
-            egress_runtime_socket_path: stream_session
-                .pointer("/adapter_ipc/runtime_stream_path")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default(),
-        },
-    ) {
+    let mut remote_viewer = None;
+    let prepared_transport = if let Some(choice) = &remote_choice {
+        gateway_browser_remote::prepare_consumer(state, choice, &launch_reservation, &context.principal_id,
+            &profile, &stream_session, &serde_json::json!({"url":url,"viewport":viewport,"display_mode":display_mode,"guarantee_level":guarantee_level,
+                "owner_launch_id":authority.verified_context().launch_id(),"browser_instance":browser_instance})).await
+            .map(|(transport, viewer)| {remote_viewer = Some(viewer); Some(transport)})
+            .map_err(|error| error.to_string())
+    } else {
+        prepare_browser_vz_transport_launch(
+            &state.data_dir,
+            BrowserVzTransportLaunchBinding {
+                generation: launch_reservation.generation(),
+                page_id: launch_reservation.page_id(),
+                vm_id: launch_reservation.vm_id(),
+                principal_id: &context.principal_id,
+                egress_stream_id: &engine_stream_id,
+                egress_target: &target,
+                egress_runtime_socket_path: stream_session
+                    .pointer("/adapter_ipc/runtime_stream_path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            },
+        )
+    };
+    let vz_transport_launch = match prepared_transport {
         Ok(launch) => launch,
         Err(message) => {
             let outcome = release_browser_open_resources(
@@ -768,7 +830,11 @@ async fn execute_browser_open(
                     .with_outcome(outcome),
             );
         }
-        if let Err(err) = spawn_browser_vz_fixed_media_listener(&transport.authority).await {
+        if let Err(err) = if remote_choice.is_none() {
+            spawn_browser_vz_fixed_media_listener(&transport.authority).await
+        } else {
+            Ok(())
+        } {
             let outcome = release_browser_open_resources(
                 state,
                 &launch_reservation,
@@ -1196,7 +1262,9 @@ async fn execute_browser_open(
             page.insert("transport_proof".to_string(), proof);
         }
     }
-    let viewer_turn_capability = if let Some(transport) = vz_transport_launch.as_ref() {
+    let viewer_turn_capability = if let Some(viewer) = remote_viewer {
+        Some(viewer)
+    } else if let Some(transport) = vz_transport_launch.as_ref() {
         match browser_vz_viewer_turn_capability(&transport.authority, &transport.secret) {
             Ok(capability) => Some(capability),
             Err(message) => {
@@ -1833,7 +1901,9 @@ async fn reconcile_dispatched_browser_launch_failure(
             vm_acquired,
         } => {
             if let Some(authority) = transport_authority.as_ref() {
-                if let Err(err) = close_browser_vz_fixed_media_listener(authority).await {
+                if let Err(err) =
+                    gateway_browser_remote::close_transport_listener(state, authority).await
+                {
                     tracing::warn!(
                         error = %err,
                         generation = reservation.generation(),
@@ -1842,17 +1912,6 @@ async fn reconcile_dispatched_browser_launch_failure(
                     return browser_cleanup_pending_outcome(page_acquired, vm_acquired, true);
                 }
             }
-            if let Err(err) =
-                discard_browser_vz_transport_preparation(&state.data_dir, reservation).await
-            {
-                tracing::warn!(
-                    error = %err,
-                    generation = reservation.generation(),
-                    "Browser terminal reconciliation could not retire transport authority"
-                );
-                return browser_cleanup_pending_outcome(page_acquired, vm_acquired, true);
-            }
-            release_browser_launch(reservation).await;
             if let Err(err) = close_browser_stream_cleanup(state, stream_cleanup).await {
                 tracing::warn!(
                     error = %err,
@@ -1860,6 +1919,32 @@ async fn reconcile_dispatched_browser_launch_failure(
                 );
                 browser_cleanup_pending_outcome(page_acquired, vm_acquired, true)
             } else {
+                if let Err(error) = gateway_browser_remote::mark_consumer_terminal_retirement(
+                    &state.data_dir,
+                    principal_id,
+                    reservation.generation(),
+                ) {
+                    tracing::warn!(%error, "Remote Engine terminal retirement could not be retained");
+                    return browser_cleanup_pending_outcome(page_acquired, vm_acquired, true);
+                }
+                if let Err(err) =
+                    discard_browser_vz_transport_preparation(&state.data_dir, reservation).await
+                {
+                    tracing::warn!(
+                        error = %err,
+                        generation = reservation.generation(),
+                        "Browser terminal reconciliation could not retire transport authority"
+                    );
+                    return browser_cleanup_pending_outcome(page_acquired, vm_acquired, true);
+                }
+                release_browser_launch(reservation).await;
+                if let Err(error) = gateway_browser_remote::retire_consumer_generation(
+                    &state.data_dir,
+                    principal_id,
+                    reservation.generation(),
+                ) {
+                    tracing::warn!(%error, "Remote Engine terminal route retirement remains pending");
+                }
                 browser_terminal_post_dispatch_outcome(page_acquired, vm_acquired)
             }
         }
@@ -1924,17 +2009,24 @@ async fn attempt_browser_launch_reconciliation(
     let registry = state.provider_registry.as_ref().ok_or_else(|| {
         "browser-engine provider unavailable during launch reconciliation".to_string()
     })?;
-    let registration = registry
-        .registration_for_uri("elastos://browser-engine/meta/status")
-        .await
-        .ok_or_else(|| {
-            "browser-engine provider status route unavailable during launch reconciliation"
-                .to_string()
-        })?;
-    if registration.provider != engine_route_provider {
-        return Err(
-            "browser-engine provider binding changed during launch reconciliation".to_string(),
-        );
+    if !gateway_browser_remote::generation_route_matches(
+        state,
+        principal_id,
+        generation,
+        engine_route_provider,
+    ) {
+        let registration = registry
+            .registration_for_uri("elastos://browser-engine/meta/status")
+            .await
+            .ok_or_else(|| {
+                "browser-engine provider status route unavailable during launch reconciliation"
+                    .to_string()
+            })?;
+        if registration.provider != engine_route_provider {
+            return Err(
+                "browser-engine provider binding changed during launch reconciliation".to_string(),
+            );
+        }
     }
     let call = browser_provider_resource_call(
         "browser-engine",
@@ -2359,10 +2451,11 @@ pub(in crate::api::gateway) async fn cleanup_stale_browser_pages(state: &Gateway
 }
 
 async fn retry_pending_browser_lifecycle_obligations(state: &GatewayState) -> bool {
+    let preparation_settled = gateway_browser_remote::retry_consumer_preparations(state).await;
     let launch_settled = retry_pending_browser_launch_reconciliations(state).await;
     let engine_settled = retry_pending_browser_engine_cleanups(state).await;
     let stream_settled = retry_pending_browser_stream_cleanups(state).await;
-    launch_settled || engine_settled || stream_settled
+    preparation_settled || launch_settled || engine_settled || stream_settled
 }
 
 async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> bool {
@@ -2373,6 +2466,39 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
     )
     .await
     {
+        let terminal_retirement = match gateway_browser_remote::consumer_terminal_retirement(
+            &state.data_dir,
+            &reconciliation.principal_id,
+            &reconciliation.generation,
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation).await;
+                continue;
+            }
+        };
+        if terminal_retirement {
+            if forget_browser_launch_reconciliation_obligation(&state.data_dir, &reconciliation)
+                .await
+                .is_ok()
+            {
+                let _ = gateway_browser_remote::retire_consumer_generation(
+                    &state.data_dir,
+                    &reconciliation.principal_id,
+                    &reconciliation.generation,
+                );
+                release_browser_open_job_instance_for_owner(
+                    &state.data_dir,
+                    &reconciliation.principal_id,
+                    &reconciliation.owner_launch_id,
+                )
+                .await;
+                settled = true;
+            } else {
+                release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation).await;
+            }
+            continue;
+        }
         let result = if reconciliation.was_dispatched() {
             attempt_browser_launch_reconciliation_bounded(
                 state,
@@ -2394,7 +2520,9 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
             BrowserLaunchReconciliationDecision::DidNotAct
             | BrowserLaunchReconciliationDecision::TerminalPostEffectCleanup { .. } => {
                 if let Some(authority) = reconciliation.transport_authority() {
-                    if let Err(err) = close_browser_vz_fixed_media_listener(authority).await {
+                    if let Err(err) =
+                        gateway_browser_remote::close_transport_listener(state, authority).await
+                    {
                         tracing::warn!(
                             error = %err,
                             generation = %reconciliation.generation,
@@ -2425,6 +2553,16 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
                         .await;
                     continue;
                 }
+                if let Err(error) = gateway_browser_remote::mark_consumer_terminal_retirement(
+                    &state.data_dir,
+                    &reconciliation.principal_id,
+                    &reconciliation.generation,
+                ) {
+                    tracing::warn!(%error, "Remote Engine terminal retirement could not be retained");
+                    release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation)
+                        .await;
+                    continue;
+                }
                 if let Err(err) = forget_browser_launch_reconciliation_obligation(
                     &state.data_dir,
                     &reconciliation,
@@ -2439,6 +2577,13 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
                     release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation)
                         .await;
                 } else {
+                    if let Err(error) = gateway_browser_remote::retire_consumer_generation(
+                        &state.data_dir,
+                        &reconciliation.principal_id,
+                        &reconciliation.generation,
+                    ) {
+                        tracing::warn!(%error, "Remote Engine terminal route retirement remains pending");
+                    }
                     release_browser_open_job_instance_for_owner(
                         &state.data_dir,
                         &reconciliation.principal_id,
@@ -2546,6 +2691,34 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
     )
     .await
     {
+        let terminal_retirement = match gateway_browser_remote::consumer_terminal_retirement(
+            &state.data_dir,
+            &cleanup.principal_id,
+            &cleanup.generation,
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
+                continue;
+            }
+        };
+        if terminal_retirement {
+            if commit_browser_terminal_cleanup(state, &cleanup, None)
+                .await
+                .is_ok()
+            {
+                release_browser_open_job_instance_for_owner(
+                    &state.data_dir,
+                    &cleanup.principal_id,
+                    &cleanup.owner_launch_id,
+                )
+                .await;
+                settled = true;
+            } else {
+                release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
+            }
+            continue;
+        }
         let engine_result = tokio::time::timeout(
             BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
             attempt_browser_engine_cleanup(state, &cleanup),
@@ -2631,7 +2804,20 @@ async fn commit_browser_terminal_cleanup(
 ) -> Result<(), String> {
     record_browser_reaped_page_tombstone(&state.data_dir, cleanup, terminal_owner_launch_id)
         .await?;
-    forget_browser_engine_cleanup_obligation(&state.data_dir, cleanup).await
+    gateway_browser_remote::mark_consumer_terminal_retirement(
+        &state.data_dir,
+        &cleanup.principal_id,
+        &cleanup.generation,
+    )
+    .map_err(|error| error.to_string())?;
+    forget_browser_engine_cleanup_obligation(&state.data_dir, cleanup).await?;
+    gateway_browser_remote::retire_consumer(
+        &state.data_dir,
+        &cleanup.principal_id,
+        &cleanup.page_id,
+        &cleanup.generation,
+    )
+    .map_err(|error| error.to_string())
 }
 
 async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanup) {
@@ -2712,7 +2898,7 @@ async fn attempt_browser_engine_cleanup(
     })?;
     let receipt = browser_terminal_close_receipt(cleanup, data)?;
     if let Some(authority) = cleanup.transport_authority.as_ref() {
-        close_browser_vz_fixed_media_listener(authority).await?;
+        gateway_browser_remote::close_transport_listener(state, authority).await?;
     }
     Ok(receipt)
 }
@@ -2721,6 +2907,14 @@ async fn require_browser_engine_provider_binding(
     state: &GatewayState,
     cleanup: &BrowserEngineCleanup,
 ) -> Result<(), String> {
+    if gateway_browser_remote::route_matches(
+        state,
+        &cleanup.principal_id,
+        &cleanup.page_id,
+        &cleanup.engine_route_provider,
+    ) {
+        return Ok(());
+    }
     let registry = state.provider_registry.as_ref().ok_or_else(|| {
         "browser-engine provider unavailable while cleanup is pending".to_string()
     })?;
@@ -2773,8 +2967,19 @@ async fn release_browser_open_resources(
     stream_cleanup: Option<BrowserStreamCleanup>,
     provider_dispatched: bool,
 ) -> serde_json::Value {
+    if !provider_dispatched {
+        match gateway_browser_remote::cancel_consumer_preparation(state, reservation).await {
+            Ok(true) => return browser_terminal_pre_effect_outcome(),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, generation=reservation.generation(), "Remote Engine preparation cleanup remains pending");
+                return browser_cleanup_pending_outcome(false, false, true);
+            }
+        }
+    }
     if let Some(authority) = browser_launch_transport_authority(reservation).await {
-        if let Err(err) = close_browser_vz_fixed_media_listener(&authority).await {
+        if let Err(err) = gateway_browser_remote::close_transport_listener(state, &authority).await
+        {
             tracing::warn!(
                 error = %err,
                 generation = reservation.generation(),
@@ -2782,6 +2987,29 @@ async fn release_browser_open_resources(
             );
             return browser_cleanup_pending_outcome(false, false, true);
         }
+    }
+    if let Err(err) = close_browser_stream_cleanup(state, stream_cleanup).await {
+        // The existing stream queue owns local Engine cleanup after this
+        // failure. A remote Engine retains its consumer reservation separately.
+        if gateway_browser_remote::consumer_reservation_absent(&state.data_dir, reservation)
+            .unwrap_or(false)
+            && discard_browser_vz_transport_preparation(&state.data_dir, reservation)
+                .await
+                .is_ok()
+        {
+            release_browser_launch(reservation).await;
+        }
+        tracing::warn!(
+            error = %err,
+            "Browser open resource cleanup failed"
+        );
+        return browser_cleanup_pending_outcome(false, false, true);
+    }
+    if let Err(error) =
+        gateway_browser_remote::mark_consumer_reservation_terminal(&state.data_dir, reservation)
+    {
+        tracing::warn!(%error, "Remote Engine terminal retirement could not be retained");
+        return browser_cleanup_pending_outcome(false, false, true);
     }
     if let Err(err) = discard_browser_vz_transport_preparation(&state.data_dir, reservation).await {
         tracing::warn!(
@@ -2792,12 +3020,10 @@ async fn release_browser_open_resources(
         return browser_cleanup_pending_outcome(false, false, true);
     }
     release_browser_launch(reservation).await;
-    if let Err(err) = close_browser_stream_cleanup(state, stream_cleanup).await {
-        tracing::warn!(
-            error = %err,
-            "Browser open resource cleanup failed"
-        );
-        return browser_cleanup_pending_outcome(false, false, true);
+    if let Err(error) =
+        gateway_browser_remote::retire_consumer_reservation(&state.data_dir, reservation)
+    {
+        tracing::warn!(%error, "Remote Engine terminal route retirement remains pending");
     }
     if provider_dispatched {
         browser_terminal_post_dispatch_outcome(false, false)
@@ -3143,12 +3369,19 @@ async fn browser_page_inspection(
             .provider_registry
             .as_ref()
             .ok_or(BrowserInspectionError::Unsupported)?;
-        let registration = registry
-            .registration_for_uri("elastos://browser-engine/page/inspect")
-            .await
-            .ok_or(BrowserInspectionError::Unsupported)?;
-        if registration.provider != owner.engine_route_provider {
-            return Err(BrowserInspectionError::OwnerChanged);
+        if !gateway_browser_remote::route_matches(
+            &state,
+            &principal,
+            &page_id,
+            &owner.engine_route_provider,
+        ) {
+            let registration = registry
+                .registration_for_uri("elastos://browser-engine/page/inspect")
+                .await
+                .ok_or(BrowserInspectionError::Unsupported)?;
+            if registration.provider != owner.engine_route_provider {
+                return Err(BrowserInspectionError::OwnerChanged);
+            }
         }
         if !browser_inspection_owner_current(&state.data_dir, &owner).await {
             return Err(BrowserInspectionError::OwnerChanged);

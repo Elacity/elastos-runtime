@@ -783,6 +783,11 @@ struct BrowserCarrierExitRoute {
 
 #[derive(Debug, Clone)]
 enum BrowserRuntimeStreamTarget {
+    RemoteEngine {
+        owner: crate::carrier::browser_engine_binding::RemoteEngineOwner,
+        stream_id: String,
+        endpoint: iroh::Endpoint,
+    },
     LocalRelay(Option<BrowserExitRelay>),
     Carrier {
         route: BrowserCarrierExitRoute,
@@ -1240,6 +1245,35 @@ async fn bridge_browser_runtime_stream_to_carrier(
 }
 
 #[cfg(unix)]
+pub(in crate::api::gateway) async fn attach_remote_engine_stream(
+    data_dir: &FsPath,
+    owner: &crate::carrier::browser_engine_binding::RemoteEngineOwner,
+    endpoint: &iroh::Endpoint,
+    mut receipt: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let stream_id = receipt["stream_id"]
+        .as_str()
+        .context("Engine stream identity required")?
+        .to_owned();
+    let path = browser_runtime_stream_socket_path(data_dir, &stream_id)?;
+    let adapter_path = browser_adapter_ipc_socket_path(data_dir, &stream_id)?;
+    spawn_browser_runtime_stream_listener(
+        &path,
+        BrowserRuntimeStreamTarget::RemoteEngine {
+            owner: owner.clone(),
+            stream_id: stream_id.clone(),
+            endpoint: endpoint.clone(),
+        },
+    )
+    .await?;
+    receipt["adapter_ipc"] = serde_json::json!({"schema":"elastos.adapter-ipc/v1",
+        "kind":"unix_socket","path":adapter_path,"runtime_stream_path":path,"stream_id":stream_id});
+    receipt["byte_transport"] = serde_json::json!("adapter_ipc");
+    receipt["schema"] = serde_json::json!(EXIT_STREAM_SESSION_SCHEMA);
+    Ok(receipt)
+}
+
+#[cfg(unix)]
 async fn spawn_browser_runtime_stream_listener(
     path: &FsPath,
     target: BrowserRuntimeStreamTarget,
@@ -1318,6 +1352,21 @@ async fn spawn_browser_runtime_stream_listener_with_accept_timeout(
                     let session_path = cleanup_path.clone();
                     sessions.spawn(async move {
                         match target {
+                            BrowserRuntimeStreamTarget::RemoteEngine {owner, stream_id, endpoint} => {
+                                let result = async {
+                                    let mut remote = crate::carrier::browser_engine_binding::connect_egress(
+                                        &endpoint, &owner, &stream_id).await?;
+                                    let (mut read, mut write) = stream.into_split();
+                                    tokio::try_join!(
+                                        async {copy(&mut read, &mut remote.send).await?; remote.send.finish()?; Ok::<_, anyhow::Error>(())},
+                                        async {copy(&mut remote.recv, &mut write).await?; write.shutdown().await?; Ok::<_, anyhow::Error>(())},
+                                    )?;
+                                    Ok::<_, anyhow::Error>(())
+                                }.await;
+                                if let Err(error) = result {
+                                    tracing::warn!(%error, "Runtime remote Engine egress closed");
+                                }
+                            }
                             BrowserRuntimeStreamTarget::LocalRelay(relay) => {
                                 if let Err(err) = bridge_browser_runtime_stream_to_local_relay(
                                     &session_path,
