@@ -242,20 +242,26 @@ only the exact legacy UID rejection before HELLO acknowledgment, inside the
 existing four-second deadline. Its installed image passes run 34 in 3143 ms
 and run 36 in 3163 ms. Repeat run 35 reaches the four-second attachment deadline;
 normal browsing and exact cleanup pass in all three. Repeated recovery remains
-open. The next diagnosis checks video/audio registration order and producer
-retry timing. Runtime, adapter and Browser UI are unchanged.
-Run 37 then fails at initial typing, before reload; exact cleanup still passes.
-Reviewed source `a80b230a` fixes a proven click/text ordering gap by awaiting
-the existing Runtime click acknowledgment before text insertion. Its 22 ordering
-tests pass; installed proof is pending. Attribution of run 37 remains provisional.
-Guest log reads refresh synchronous audio diagnostics, so observer runs remain
-excluded from formal latency distributions.
-A separate B02 child-process check finds that the installed Mac host-readiness
-script reports ready with valid, absent and nonexistent TURN program settings.
-The installed configuration stays unchanged and the check acquires no page or
-VM. A source repair to readiness and its cache has 20 passing regressions and
-29 passing artifact smoke checks. Independent agent review accepts the source;
-installed proof remains open.
+open. Run 37 fails at initial typing before reload; exact cleanup still passes.
+Installed UI `a80b230a` awaits the Runtime click acknowledgment before text
+insertion. Run 38 passes normal browsing, reload in 3116 ms and exact cleanup
+in 872 ms; independent agent review accepts this bounded evidence. Attribution
+of run 37 remains provisional. Installed B02 readiness `3f47bfc1` passes three
+child checks: a valid TURN executable is ready, while absent and nonexistent
+programs return unavailable/preparation_required. Configuration stays unchanged
+and these checks acquire no page or VM. Run 39 fails before acquisition because
+an operator omitted control prewarm after replacing the scripts. Completing the
+configured restart resolves that setup omission. Run 40 passes normal browsing
+and exact cleanup in 648 ms, but reload again reaches the four-second attachment
+deadline. Full recovery and fresh-installer acceptance remain open.
+Source `e9950532` starts fresh video/audio attachment together, covering a
+source-proven producer-retry delay. Source `6f5d48ae` makes retained diagnostic
+log reads passive; earlier observer runs remain outside formal latency
+distributions. The aggregate source passes 38 focused tests and the full
+Selkies smoke. Its new image is built and awaiting verified export/install and
+the same installed journey. Runtime, adapter, native helpers and UI are reused.
+The bounded input observer now accepts both supported origins; its request
+frame, URL, page and authority filters remain exact and 31 harness tests pass.
 Guest Node also starts about five seconds after its shell launch;
 initial entropy is 1 and no hardware RNG is selected. That secondary cause needs
 its own experiment. Run 16 includes diagnostic overhead and is excluded from

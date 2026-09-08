@@ -167,23 +167,30 @@ Independent source repair and regression work can proceed in separate file scope
   567 ms. Repeat run 35 fails attachment at its four-second deadline; normal
   browsing and all 13 cleanup effects still pass. Run 36 passes in 3163 ms; its
   late diagnostic read finds the guest already closed. Repeated recovery remains
-  open. The next experiment captures the late attachment failure and checks
-  whether sequential video-offer/audio-registration work misses a producer retry
-  cycle. B02 readiness is source-reviewed and remains outside this installed
-  experiment until the Engine result is understood.
-  Guest log requests also refresh synchronous audio diagnostics; runs with that
-  observer remain outside formal latency distributions. Full B06 remains open.
-  In parallel, B02 has an installed readiness counterexample: valid, absent and
-  nonexistent Mac TURN program settings all report ready in fresh child checks.
-  These checks change only child environments and acquire no page or VM. The
-  readiness source now checks the executable and its cache identity, then will
-  repeat the negative checks and the same installed Browser journey.
-  Run 37 fails before reload: main/nav load, then no typed-text event reaches
-  the fixture; close settles all 13 effects in 615 ms. Source review proves a
-  separate ordering gap between data-channel clicks and Runtime text insertion.
-  Reviewed source `a80b230a` sends clicks through the existing acknowledged
-  Runtime input route. Its 22 ordering tests pass; the old source fails the three
-  new click cases. Install that UI-only repair and repeat the same journey.
+  open. Run 37 fails before reload: main/nav load, then no typed-text event
+  reaches the fixture; close settles all 13 effects in 615 ms. Source review
+  proves a separate ordering gap between data-channel clicks and Runtime text
+  insertion. Installed UI `a80b230a` awaits the existing Runtime click
+  acknowledgment. Run 38 passes the normal journey, reload in 3116 ms and exact
+  cleanup in 872 ms. Independent agent review accepts this bounded run.
+  Installed B02 readiness `3f47bfc1` now reports ready for an executable Mac TURN
+  program and unavailable/preparation_required for absent or nonexistent
+  programs. Three installed child checks pass with unchanged configuration and
+  zero acquired pages or VMs. Run 39 exposes an operator restart omission after
+  installing those scripts; configured control prewarm resolves it. Run 40 then
+  passes normal browsing and exact cleanup in 648 ms, but fresh display
+  attachment again reaches its four-second Engine deadline.
+  Reviewed source `e9950532` starts fresh video/audio registration together;
+  socket regression tests reproduce the previous sequential producer-retry delay.
+  Source `6f5d48ae` makes guest log reads passive, retaining bounded file tails
+  and timestamps. The combined source passes 38 focused tests and the full
+  Selkies smoke. A new image contains these two diagnosed changes; its baseline,
+  native helpers, Runtime and UI remain bound to their existing receipts. Verify
+  and install that image, then repeat the same journey. Earlier active diagnostic
+  reads remain excluded from formal latency distributions. A bounded input
+  observer correction accepts both supported request origins while retaining
+  exact frame, Runtime URL, page and authority filters; 31 harness tests pass.
+  B02 fresh installation and full B03 diagnosis remain open.
   Full B05 mixed-transport ordering and motion behavior remain separate gates.
   The probe must observe request failure and
   stopped media, then restore the same page, profile, service selection and
