@@ -75,7 +75,7 @@ assert.ok(turnStart.includes("startLiveTurnForPrompt(userText)"));
 assert.ok(!turnStart.includes("startMockStream"), "no mock reply when no model is live");
 assert.ok(!agentStream.includes("Preview mock"), "live failures are reported, never replaced by a mock");
 assert.ok(agentStream.includes("NO_MODEL_OFFER_STATUS"), "the no-offer state is an honest status line");
-assert.ok(agentLive.includes("models.find((m) => m.offerId === selectedLiveOfferId)"), "the model menu selects among advertised offers only");
+assert.ok(agentLive.includes("selectedModelOffer(models.map"), "the model menu resolves exact current offer and optional content identity");
 
 /* ---- workspace: a Runtime object ----------------------------------------- */
 
@@ -104,7 +104,7 @@ assert.ok(gatewayHomeAgent.includes("#[serde(deny_unknown_fields)]"));
 
 assert.equal(manifest.name, "home-agent");
 const methods = manifest.interfaces.flatMap((i) => i.methods.map((m) => m.operation)).sort();
-assert.deepEqual(methods, ["offers_list", "runs_cancel", "runs_create", "runs_events", "runs_get"]);
+assert.deepEqual(methods, ["offers_list", "retention", "runs_cancel", "runs_create", "runs_events", "runs_get"]);
 assert.ok(components.external?.["home-agent"], "components.json installs home-agent");
 assert.ok(
   localCarrierSetup.includes('HOME_AGENT_CAPSULE_DIR="${REPO_ROOT}/capsules/home-agent"') &&
@@ -124,7 +124,7 @@ assert.ok(
 );
 assert.ok(
   /export function openSelectedLauncherTarget\(\)[\s\S]{0,180}openTarget\(shellState\.selectedLauncherTargetId\)/.test(homeSurface) &&
-    /if \(action === "open-target"\)[\s\S]{0,220}openTarget\(shellState\.contextMenuTarget\.targetId\)/.test(homeSurface) &&
+    /if \(action === "open-target" \|\| action === "open-target-new-window"\)[\s\S]{0,220}openTarget\(shellState\.contextMenuTarget\.targetId,/.test(homeSurface) &&
     /function attachTargetIconInteractions\(node, targetId, source\)[\s\S]{0,2600}handleTaskbarTargetClick\(targetId\)/.test(homeSurface) &&
     /function attachTargetIconInteractions\(node, targetId, source\)[\s\S]{0,2600}openTarget\(targetId\)/.test(homeSurface),
   "desktop, launcher, taskbar, keyboard, and context-menu activation must converge on Home target activation",

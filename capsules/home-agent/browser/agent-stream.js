@@ -1459,7 +1459,6 @@ export function startTurnForPrompt(userText) {
   void probeLiveInference({ force: true }).then(() => {
     if (getLiveInferenceState().live) {
       setStreamStatus("");
-      void startLiveTurnForPrompt(userText);
     }
   });
 }

@@ -654,6 +654,57 @@ async fn assistant_workspace_round_trip_and_restart_preserve_exact_workspace() {
 }
 
 #[tokio::test]
+async fn assistant_workspace_content_selection_pair_round_trip_and_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("assistant-user"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), "assistant", &authority);
+    let app = gateway_router(test_state(dir.path()));
+    let cid = format!("bafybei{}", "a".repeat(52));
+    for invalid in [
+        "not-a-cid".to_string(),
+        cid.to_uppercase(),
+        format!("{cid} "),
+        format!("bafybei{}b", "a".repeat(51)),
+    ] {
+        let mut request = sample_workspace_put(0);
+        request["selected_model_cid"] = json!(invalid);
+        let response = app
+            .clone()
+            .oneshot(put_assistant_workspace(token.clone(), request))
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error());
+    }
+    let mut partial = sample_workspace_put(0);
+    partial["selected_model_cid"] = json!(cid);
+    partial.as_object_mut().unwrap().remove("selected_offer_id");
+    assert!(app
+        .clone()
+        .oneshot(put_assistant_workspace(token.clone(), partial))
+        .await
+        .unwrap()
+        .status()
+        .is_client_error());
+    let mut request = sample_workspace_put(0);
+    request["selected_model_cid"] = json!(cid);
+    let saved = app
+        .oneshot(put_assistant_workspace(token.clone(), request))
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved = response_json(saved).await;
+    assert_eq!(saved["selected_model_cid"], cid);
+    assert_eq!(saved["selected_offer_id"], "offer:sample-model");
+    let restarted = gateway_router(test_state(dir.path()));
+    let loaded = restarted
+        .oneshot(get_assistant_workspace(token))
+        .await
+        .unwrap();
+    assert_eq!(response_json(loaded).await, saved);
+}
+
+#[tokio::test]
 async fn assistant_workspace_wrong_capsule_is_forbidden_and_other_principals_stay_isolated() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority_with_name(dir.path(), Some("assistant-user"));

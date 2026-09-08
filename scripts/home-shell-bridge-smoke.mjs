@@ -244,6 +244,8 @@ const summary = {
     { target: "browser", title: "Browser", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "inbox", title: "Inbox", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "people", title: "People", attach_kind: "iframe", role: "app", target_kind: "app" },
+    { target: "assistant", title: "Assistant", attach_kind: "iframe", role: "app", target_kind: "app" },
+    { target: "home-agent", title: "Home Agent", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "system", title: "System", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "wallet", title: "Wallet", attach_kind: "iframe", role: "app", target_kind: "app" },
   ],
@@ -512,6 +514,10 @@ globalThis.fetch = async (url, init = {}) => {
         target: "system",
         title: "System",
       });
+    }
+    if (["assistant", "home-agent"].includes(body?.target)) {
+      return jsonResponse({ attach_kind: "iframe", target: body.target,
+        route: `/apps/${body.target}/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=${body.target}-token` });
     }
     if (body?.target === "people") {
       return jsonResponse({
@@ -1166,6 +1172,38 @@ sendChildMessage("null", walletFrameWindow, {
   type: "home:app-ready",
   homeToken: "wallet-token",
 });
+
+for (const actor of ["assistant", "home-agent"]) {
+  sendChildMessage("null", shellFrameWindow, { type: "home:launch-target", requestId: `launch-${actor}`,
+    target: actor, query: {}, homeToken: "gui-token" });
+  for (let i = 0; i < 50 && !shellMessages.some(m => m.payload?.requestId === `launch-${actor}`); i++) {
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  assert(shellMessages.some(m => m.payload?.result?.target === actor), "composer launch registered", shellMessages);
+  const source = { parent: shellFrameWindow, postMessage() {} };
+  const token = `${actor}-token`;
+  const intent = { type: "home:open-target", homeToken: token, target: "system", query: { settings: "models" } };
+  const count = () => shellMessages.filter(m => m.payload?.command === "open-target").length;
+  const before = count();
+  sendChildMessage("null", source, intent);
+  assert(count() === before, "unregistered nested source cannot request Models");
+  sendChildMessage("null", source, { type: "home:app-ready", homeToken: token });
+  for (const [origin, sender, data] of [
+    ["https://evil.invalid", source, intent], ["null", {}, intent],
+    ["null", source, { ...intent, homeToken: "wrong-token" }],
+    ["null", walletFrameWindow, { ...intent, homeToken: "wallet-token" }],
+    ["null", source, { ...intent, target: "wallet" }],
+    ["null", source, { ...intent, query: { settings: "accounts" } }],
+    ["null", source, { ...intent, query: { settings: "models", offer_id: "injected" } }],
+  ]) sendChildMessage(origin, sender, data);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert(count() === before, "Models handoff rejects wrong actor/source/token/origin/target/query", shellMessages);
+  sendChildMessage("null", source, intent);
+  for (let i = 0; i < 50 && count() === before; i++) await new Promise(resolve => setTimeout(resolve, 0));
+  assert(count() === before + 1, "registered composer opens Models exactly once", shellMessages);
+  const opened = shellMessages.filter(m => m.payload?.command === "open-target").at(-1).payload;
+  assert(opened.target === "system" && JSON.stringify(opened.query) === JSON.stringify({ settings: "models" }), "exact Models destination", opened);
+}
 
 const connectorLaunchesBeforeDeniedRequests = requests.filter(
   (request) =>

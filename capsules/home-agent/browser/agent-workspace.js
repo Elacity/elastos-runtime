@@ -15,10 +15,12 @@ import {
   normalizeAgentNotes,
   selectLiveOffer,
   liveOfferChoice,
+  liveContentChoice,
 } from "./agent-live.js";
 import { cheapTurnSnapshot } from "./agent-context.js";
 import { recoverStalePersistedTurn } from "./agent-stream-qos.js";
 import { scheduleAgentWorkspacePersist } from "./harness-host.js";
+import { validModelCid } from "./model-selection.js";
 
 export const AGENT_WORKSPACE_V = 1;
 const MAX_PERSISTED_SESSIONS = 24;
@@ -199,6 +201,7 @@ export function getAgentWorkspaceSnapshot() {
     activeSessionId: store.getActiveSessionId(),
     sessionMode: sessionMode === "build" ? "build" : "chat",
     liveOfferId: String(liveOfferChoice() || "").slice(0, 200),
+    ...(liveContentChoice() != null ? { selectedModelCid: liveContentChoice() } : {}),
     systemPrompt: normalizeLiveSystemPrompt(store.getSystemPrompt?.() || ""),
     agentNotes: normalizeAgentNotes(store.getAgentNotes?.() || ""),
     maxTokens: clampLiveMaxTokens(store.getMaxTokens?.()),
@@ -228,6 +231,12 @@ export function applyAgentWorkspaceSnapshot(raw) {
   if (!raw || typeof raw !== "object" || Number(raw.v) !== AGENT_WORKSPACE_V) {
     return false;
   }
+  if (raw.selectedModelCid != null && (!validModelCid(raw.selectedModelCid) ||
+      typeof raw.liveOfferId !== "string" || !raw.liveOfferId.trim() || raw.liveOfferId.length > 200)) {
+    selectLiveOffer("", raw.selectedModelCid);
+    store.setWorkspaceHydrated(false);
+    return false;
+  }
   if (Array.isArray(raw.projects)) {
     replaceProjects(raw.projects);
   }
@@ -243,7 +252,7 @@ export function applyAgentWorkspaceSnapshot(raw) {
   }
   store.setSessionMode(raw.sessionMode === "build" ? "build" : "chat");
   if (typeof raw.liveOfferId === "string") {
-    selectLiveOffer(raw.liveOfferId.slice(0, 200));
+    selectLiveOffer(raw.liveOfferId.slice(0, 200), raw.selectedModelCid ?? null);
   }
   if (typeof raw.systemPrompt === "string") {
     store.setSystemPrompt?.(normalizeLiveSystemPrompt(raw.systemPrompt));

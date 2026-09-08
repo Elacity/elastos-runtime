@@ -6,6 +6,7 @@
    Tip: home-20260814a */
 
 import { getHomeGuiLaunchToken } from "./harness-host.js";
+import { catalogModels, selectedModelOffer, readyModelChoices } from "./model-selection.js";
 import { yieldToBrowser, YIELD_EVENT_SLICE, YIELD_MS } from "./agent-stream-qos.js";
 import {
   eligibleTextOffers,
@@ -83,9 +84,11 @@ let liveState = {
   checkedAt: 0,
   /** Live model rows (from advertised model offers). */
   models: [],
+  catalogModels: [],
 };
 
 let probePromise = null;
+let probeEpoch = 0;
 
 export function getLiveInferenceState() {
   return { ...liveState, models: liveState.models.slice() };
@@ -97,12 +100,27 @@ function chatOfferRows(offers) {
   return textOfferRows(eligibleTextOffers(offers));
 }
 
-/* The offer a turn runs on: the one picked in the model menu when it is still
-   advertised, else the first the provider lists. */
+/* An existing choice stays exact. Only a workspace with no choice uses the
+   initial first advertised offer; later absence never substitutes another. */
 let selectedLiveOfferId = "";
+let selectedContentCid = null;
 
-export function selectLiveOffer(offerId) {
+export function selectLiveOffer(offerId, modelCid = null) {
   selectedLiveOfferId = typeof offerId === "string" ? offerId : "";
+  selectedContentCid = modelCid;
+  if (!liveState.checking) {
+    liveState.live = Boolean(currentChoice(liveState.models, liveState.catalogModels));
+  }
+}
+
+export function liveContentChoice() { return selectedContentCid; }
+export function liveContentModels() {
+  return readyModelChoices(liveState.catalogModels || [], liveState.models.map(m => ({ ...m, id: m.offerId })));
+}
+function currentChoice(models, content) {
+  // Initial empty workspace may use the first offer. An existing choice stays exact.
+  const id = selectedLiveOfferId || (selectedContentCid == null ? models[0]?.offerId : "");
+  return selectedModelOffer(models.map(m => ({ ...m, id: m.offerId })), id, selectedContentCid, content || []);
 }
 
 export function liveOfferChoice() {
@@ -110,8 +128,8 @@ export function liveOfferChoice() {
 }
 
 export function selectedLiveOffer() {
-  const models = liveState.models;
-  return models.find((m) => m.offerId === selectedLiveOfferId) || models[0] || null;
+  if (!liveState.live || liveState.checking) return null;
+  return currentChoice(liveState.models, liveState.catalogModels);
 }
 
 /** Cached offers_list — model menu + Configure panel + probe share it. */
@@ -125,37 +143,41 @@ export async function fetchModelOffers({ force = false } = {}) {
   if (!force && offersPromise) {
     return offersPromise;
   }
-  offersPromise = (async () => {
+  const request = (async () => {
     const data = await modelRunCall("offers_list");
-    offersCache = data;
+    if (offersPromise === request) offersCache = data;
     return data;
   })()
-    .catch((error) => {
-      console.warn("model offers fetch failed", error);
-      return offersCache;
-    })
     .finally(() => {
-      offersPromise = null;
+      if (offersPromise === request) offersPromise = null;
     });
-  return offersPromise;
+  offersPromise = request;
+  return request;
 }
 
 /**
- * Truth probe: live when the model-provider answers ping AND advertises at
- * least one text→text offer. Conservative on failure — preview is the honest
- * default (§AL.3).
+ * A current successful offers read must contain the exact chosen text offer.
+ * Refresh ownership applies only to readiness, never to accepted run settlement.
  */
 export async function probeLiveInference({ force = false } = {}) {
   const now = Date.now();
   if (!force && (liveState.checking || now - liveState.checkedAt < PROBE_TTL_MS)) {
     return probePromise ? probePromise.then(getLiveInferenceState) : getLiveInferenceState();
   }
+  const epoch = ++probeEpoch;
   liveState.checking = true;
+  liveState.live = false;
   probePromise = (async () => {
     try {
       /* Reachability and offers in one call: the 0.7.1 model-provider contract
          is offers_list / runs_*; it has no ping. */
-      const offers = await fetchModelOffers({ force: true });
+      const [offers, content] = await Promise.all([
+        fetchModelOffers({ force: true }),
+        fetch(new URL("/api/capsules/catalog", window.location.href).href, {
+          headers: { "x-elastos-home-token": getHomeGuiLaunchToken() },
+        }).then(async response => response.ok ? catalogModels(await response.json()) : []).catch(() => []),
+      ]);
+      if (epoch !== probeEpoch) return;
       const models = chatOfferRows(offers);
       if (!models.length) {
         liveState = {
@@ -166,19 +188,22 @@ export async function probeLiveInference({ force = false } = {}) {
           reason: "no-model-offers",
           checkedAt: Date.now(),
           models: [],
+          catalogModels: content,
         };
         return;
       }
       liveState = {
-        live: true,
+        live: Boolean(currentChoice(models, content)),
         checking: false,
-        model: models[0].label,
+        model: currentChoice(models, content)?.label || "Chosen model unavailable",
         endpointState: "model-offers",
         reason: "ready",
         checkedAt: Date.now(),
         models,
+        catalogModels: content,
       };
     } catch (error) {
+      if (epoch !== probeEpoch) return;
       liveState = {
         live: false,
         checking: false,
@@ -187,9 +212,10 @@ export async function probeLiveInference({ force = false } = {}) {
         reason: String(error?.code || error?.message || "unreachable"),
         checkedAt: Date.now(),
         models: [],
+        catalogModels: [],
       };
     } finally {
-      probePromise = null;
+      if (epoch === probeEpoch) probePromise = null;
     }
   })();
   await probePromise;

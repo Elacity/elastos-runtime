@@ -81,17 +81,14 @@ acceptance. Browser implementation belongs to its separate owner.
    peak memory/disk and cold delivery at the intended scale while retaining
    the 10% free-space floor.
    Exact Qwen and installed acceptance remain in the gates below.
-2. [ ] Connect Assistant and Home Agent selectors to the shared Runtime model
-   facts. Marketplace Models and System management pass browser fixture tests
-   for Use, progress, cancel, retry, Keep and exact dispatch readiness.
-   Preserve explicit selected identity and drafts when an offer disappears or
-   refresh fails; another offer requires deliberate selection. Cached labels
-   provide display context, not current readiness. Use the existing catalog,
-   inventory and pickers; verify the combined views in the isolated Home.
-   Selection may prepare the chosen model; inference requires that exact
-   admitted model and a ready provider. Prove offline/error states,
-   incompatibility, busy-safe eviction and shared-view idempotence. Use Runtime's
-   dispatch-readiness projection; actual inference needs its own run evidence.
+2. [ ] Verify the combined Marketplace, System, Assistant and Home Agent model
+   views in the isolated Home. Source fixtures cover preparation controls,
+   exact offer/CID selection, failed and overlapping refreshes, preserved drafts
+   and accepted runs, and the Home handoff to System Models. Prove installed
+   offline/error and incompatible states, busy-safe eviction and shared-view
+   idempotence. Preparation belongs to Models; composers require the chosen
+   offer's current readiness before a new dispatch. Actual inference needs its
+   own run evidence.
 3. [ ] Package the exact existing Qwen model and verified engine for isolated
    setup with a real pinned signed catalog and complete closure, publisher trust
    and honest availability evidence. Distinguish verified upstream references

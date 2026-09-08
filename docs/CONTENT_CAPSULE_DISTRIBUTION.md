@@ -10,8 +10,10 @@ replication policy and availability receipts remain in
 Runtime source projects installed capsules and can verify one locally supplied,
 operator-pinned signed model catalog snapshot. Its typed preparation path can
 admit that exact package through bounded local Content reads. Marketplace and
-System source views expose preparation and Keep controls. Assistant/Home Agent
-selection, real-model packaging and network catalog updates remain planned work.
+System source views expose preparation and Keep controls. Assistant and Home
+Agent select current ready offers and preserve optional content CID intent.
+Real-model packaging, installed acceptance and network catalog updates remain
+planned work.
 
 The implemented content plane already provides `elastos://content` publish,
 fetch, status, ensure, repair, and unpublish operations. It records signed local
@@ -97,9 +99,9 @@ workflow, file picker or editable model path. It uses this sequence:
 7. Marketplace Models browse/details/Use, System model management and existing
    Assistant/Home Agent pickers project the same catalog, inventory and offer
    records. They show availability, Preparing with progress, Ready, or an
-   actionable failed, offline or incompatible state. Selection can prepare the
-   exact model; inference waits for admission and provider readiness. A pin is
-   retention, not evidence of trust, license acceptance or inference readiness.
+   actionable failed, offline or incompatible state. Composer Open Models hands
+   preparation to System; inference waits for admission and provider readiness.
+   A pin is retention, not evidence of trust, license acceptance or inference readiness.
    Runtime keeps paths and backend routes private. Selection preserves drafts
    and existing runs and never silently substitutes another model.
 
@@ -265,7 +267,7 @@ The following separates implemented primitives from remaining package work:
 | Existing surface | Current state and required extension |
 | --- | --- |
 | `elastos/crates/elastos-common/src/manifest.rs` | The bounded passive metadata profile above is implemented. Preparation must verify its declared facts against the complete fetched package before admission. |
-| `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | The catalog projects installed inventory plus signed model metadata and caller-scoped admission, Keep and dispatch readiness. The preparation inventory owns reservations and admission receipts. Marketplace/System consume these facts; Assistant/Home Agent selection remains open. |
+| `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | The catalog projects installed inventory plus signed model metadata and caller-scoped admission, Keep and dispatch readiness. The preparation inventory owns reservations and admission receipts. Marketplace/System consume these facts; Assistant/Home Agent match exact ready offers and preserve optional CID intent. |
 | `elastos/crates/elastos-server/src/content.rs` | Preparation uses the explicit bounded local-fetch loop. Ordinary `fetch_bytes_via_provider` and `materialize_data_capsule` still drain whole files. `import_exact` and aggregate `import_object` remain capped at 64 MiB and 512 files; these are separate paths. |
 | `elastos/crates/elastos-runtime/src/provider/registry.rs` | Bounded reads validate and consume the native range once for Bytes and Stream. Ordinary `open_provider_stream` still decodes the full response into `ProviderStreamSession.bytes`; consumer chunking alone does not bound producer memory or cancel network work. |
 | `capsules/ipfs-provider/src/main.rs` | Explicit bounded Cat enforces finite bytes/time and uses the existing backend lifecycle. Ordinary `cat` and `cat_to_path` still read the entire file before encoding or writing. |
@@ -317,17 +319,19 @@ policy slices:
    Busy activation retains admitted files for retry without transfer. Actual
    eviction still requires a proved closure receipt for every retained engine
    and run. Keep/release intents are implemented independently of activation;
-   shared UI and installed retention proof remain open.
+   installed retention and safe eviction proof remain open.
 4. **Shared model experience.** Marketplace Models and System management use one
    vendored presentation/intent helper and the existing typed content methods.
    Catalog rows carry nested readiness; operation replies carry flat readiness.
    Visible in-flight preparation has bounded polling; request and CID ownership
    reject stale replies. An unconfirmed Use keeps its request identity until a
    successful read reconciles it. Keep is a caller retention choice, not deletion.
-   Extend Assistant/Home Agent selectors and test the same records across
-   all views; Use/Keep/release intent shapes; Preparing, progress, cancel, retry,
-   failed/offline/incompatible/ready states; selection while preparing; draft/run
-   preservation; and inference disabled until the selected model is ready.
+   Assistant/Home Agent keep exact offer/CID intent in existing workspaces and
+   use current unique ready mappings. Missing choices and failed refreshes
+   preserve drafts and accepted runs; new dispatch requires current readiness
+   and deliberate Send. Open Models uses the existing Home handoff to System.
+   Source fixtures cover these boundaries. Verify the combined installed views,
+   offline/incompatible states and busy-safe eviction with the exact model.
    Keep ordinary app catalog behavior and hosted configuration unchanged.
 5. **Cold proof and publication review.** After source review, use the existing
    authorized isolated proof scope with a compatible fresh install and no

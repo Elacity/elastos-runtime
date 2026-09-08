@@ -344,7 +344,7 @@ The integrated source includes these durable facts:
   The native suite leaves one real-Qwen prerequisite ignored, and the server
   suite leaves three explicit process prerequisites ignored. Earlier separate
   process receipts remain distinct. Formatting, Home/public-copy entropy and
-  diff checks pass. Shared UI, retention eviction, scaled resource proof and
+  diff checks pass. Retention eviction, scaled resource proof and
   cold exact-Qwen/installed acceptance remain open.
 - Runtime accepts `content.retention` with `{cid, keep}` through the existing
   preparation owner and first-party manifests. The same inventory stores one
@@ -353,7 +353,7 @@ The integrated source includes these durable facts:
   Keep changes leave admission, bytes, quota, offers and readiness unchanged and
   do not interrupt startup verification. Source checks pass 60 server model tests
   (four explicit process prerequisites ignored) and the capsule binding test.
-  Shared UI and safe eviction remain open.
+  Safe eviction and installed retention proof remain open.
 - Runtime derives one caller-scoped `model_runtime` projection for catalog GET,
   typed catalog list and preparation status. It reports admission, Keep,
   preparation progress and `dispatch_ready` for the single signed model profile.
@@ -369,8 +369,7 @@ The integrated source includes these durable facts:
   four explicit process tests excluded from that server run. Separate native
   Init and same-process refresh tests pass with the existing pinned provider.
   Strict Runtime/server all-target Clippy, formatting and entropy checks pass.
-  Assistant/Home Agent selection and installed acceptance remain open;
-  installed Homes are unchanged.
+  Installed acceptance remains open; installed Homes are unchanged.
 - Marketplace Models and System model management use one vendored helper with
   their existing catalog/interface reads and typed content operations. They
   display verified publisher/CID metadata, preparation progress, cancel/retry,
@@ -383,8 +382,17 @@ The integrated source includes these durable facts:
   release preserves bytes. Browser fixture tests cover both actual pages and
   manifests, lost replies, visibility, correlation, malformed data, focus,
   errors and desktop/narrow layouts. Existing app/media and System behavior
-  checks pass. Assistant/Home Agent selection, safe eviction and installed
-  model acceptance remain open. Installed Homes and user data are unchanged.
+  checks pass. Safe eviction and installed model acceptance remain open.
+- Assistant and Home Agent preserve an exact offer ID and optional content CID
+  in their existing workspaces. Content selection requires a unique current
+  ready catalog-to-offer match; ordinary service choices remain valid. Each
+  matched offer appears once. A missing choice or failed refresh preserves the
+  choice and draft while blocking new dispatch. A fresh ready result requires
+  deliberate Send; accepted runs retain their existing resume and cancel path.
+  Only an empty initial choice uses the existing first-offer default. Open Models
+  uses the registered Home frame and token to open System Models. Source unit,
+  actual-page browser and workspace roundtrip tests pass. Real-model and
+  installed acceptance remain open; installed Homes and user data are unchanged.
 - Large-model publication needs a bounded operator/provider bootstrap path or a
   separately verified publisher repair. The current generic directory publisher
   reads whole files and builds a base64 JSON array. Cold-proof capacity must

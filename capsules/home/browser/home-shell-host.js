@@ -70,6 +70,8 @@ const WALLET_CONNECTOR_TARGETS = new Set(
   Object.keys(WALLET_CONNECTOR_TARGET_TITLES),
 );
 const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
+  assistant: new Set(["system"]),
+  "home-agent": new Set(["system"]),
   "archive-manager": new Set(["library"]),
   browser: new Set(["library"]),
   "chat-room": new Set(["library"]),
@@ -1821,6 +1823,9 @@ window.addEventListener("message", (event) => {
     console.warn("home ignored unauthorized open-target message", context.targetId, target);
     return;
   }
+  if (["assistant", "home-agent"].includes(context.targetId) &&
+      (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"]) ||
+       !hasExactMessageKeys(data.query, ["settings"]) || data.query.settings !== "models")) return;
   if (
     context.kind === "app-frame" &&
     context.targetId === "wallet" &&

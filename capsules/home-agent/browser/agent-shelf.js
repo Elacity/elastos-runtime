@@ -7,6 +7,7 @@ import { registerEscapeHandler } from "./shell-popovers.js";
 import { sendToAgentHarness, stopAgentHarnessStream, abortAgentStreamNow } from "./agent-send.js";
 import { DICTATION_HYPOTHESIS_CAP } from "./agent-context.js";
 import { desktopStageId, setActiveStage } from "./harness-host.js";
+import { selectedLiveOffer } from "./agent-live.js";
 
 let bound = false;
 let persistComposerDraft = null;
@@ -75,7 +76,7 @@ export function syncAgentSendButton(input = composerInput()) {
   }
   const hasText = hasMeaningfulComposerContent(input);
   btn.dataset.mode = "send";
-  btn.disabled = !hasText;
+  btn.disabled = !hasText || !selectedLiveOffer();
   btn.setAttribute("aria-label", "Send");
   btn.title = hasText ? "Send" : "Enter a message to send";
 }

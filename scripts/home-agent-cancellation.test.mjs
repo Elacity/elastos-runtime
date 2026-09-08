@@ -9,8 +9,114 @@ const { recoverStalePersistedTurn } = await import("../capsules/home-agent/brows
 const controller = await import("../capsules/home-agent/browser/agent-stream.js");
 const workspace = await import("../capsules/home-agent/browser/agent-workspace.js");
 const sessions = await import("../capsules/home-agent/browser/agent-sessions.js");
-const defer = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
+const defer = () => { let resolve, reject; const promise = new Promise((r, e) => { resolve = r; reject = e; }); return { promise, resolve, reject }; };
 const terminal = (kind) => ({ events: [{ sequence: 1, kind, terminal: true, data: kind === "output" ? { schema: "elastos.model.output.text/v1", text: "Done" } : {} }], next_cursor: 1, has_more: false });
+
+test("content intent survives missing catalog and overlapping refresh; hosted replacement is deliberate", async t => {
+  t.after(() => live.selectLiveOffer(""));
+  const cid = `bafybei${"a".repeat(52)}`;
+  const chosen = { id: "chosen", title: "Chosen", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] };
+  const other = { ...chosen, id: "other", title: "Other" };
+  let offers = [chosen, other];
+  let rows = [{ source: "signed-model-catalog", role: "content", installed: false, launchable: false, cid,
+    title: "Chosen", signature_state: "catalog-signature-verified", model_runtime: { admitted: true, dispatch_ready: true, offer_id: "chosen" } }];
+  let read = async () => offers;
+  globalThis.fetch = async url => ({ ok: true, json: async () => new URL(url).pathname === "/api/capsules/catalog"
+    ? { schema: "elastos.capsules.catalog/v1", model_catalog_state: "verified", capsules: rows }
+    : { offers: await read() } });
+  live.selectLiveOffer("chosen", cid);
+  await live.probeLiveInference({ force: true });
+  assert.equal(live.selectedLiveOffer().offerId, "chosen");
+  assert.equal(live.liveContentModels().length, 1);
+  rows = [];
+  await live.probeLiveInference({ force: true });
+  assert.equal(live.selectedLiveOffer(), null);
+  assert.equal(live.liveContentChoice(), cid);
+  assert.deepEqual(live.getLiveInferenceState().models.map(m => m.offerId), ["chosen", "other"], "available replacements remain discoverable");
+  const pending = defer(), started = defer();
+  read = () => { started.resolve(); return pending.promise; };
+  const old = live.probeLiveInference({ force: true });
+  await started.promise;
+  offers = [other]; read = async () => offers;
+  await live.probeLiveInference({ force: true });
+  live.selectLiveOffer("other");
+  pending.reject(new Error("old request failed")); await old;
+  assert.equal(live.liveOfferChoice(), "other");
+  assert.equal(live.liveContentChoice(), null);
+  assert.equal(live.selectedLiveOffer().offerId, "other");
+  const newer = defer(), newerStarted = defer();
+  read = () => { newerStarted.resolve(); return newer.promise; };
+  const fresh = live.probeLiveInference({ force: true });
+  await newerStarted.promise;
+  assert.equal(live.selectedLiveOffer(), null);
+  const shared = live.probeLiveInference();
+  newer.resolve([other]);
+  await Promise.all([fresh, shared]);
+  assert.equal(live.selectedLiveOffer().offerId, "other");
+  live.selectLiveOffer("");
+});
+
+test("an unavailable chosen offer cannot become another model or cached readiness", async t => {
+  t.after(() => live.selectLiveOffer(""));
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ offers: [
+    { id: "other", title: "Other", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+  ] }) });
+  live.selectLiveOffer("chosen");
+  await live.probeLiveInference({ force: true });
+  assert.equal(live.liveOfferChoice(), "chosen");
+  assert.equal(live.selectedLiveOffer(), null, "missing choice stays unavailable while another offer exists");
+  globalThis.fetch = async () => { throw new Error("fixture unavailable"); };
+  await live.probeLiveInference({ force: true });
+  assert.equal(live.getLiveInferenceState().live, false, "failed refresh cannot reuse cached readiness");
+  assert.equal(live.liveOfferChoice(), "chosen");
+  live.selectLiveOffer("");
+});
+
+test("Agent selection pair roundtrips with drafts; invalid pair blocks hydration and new dispatch", async t => {
+  t.after(() => { workspace.bindAgentWorkspaceStore(null); live.selectLiveOffer(""); });
+  const cid = `bafybei${"a".repeat(52)}`;
+  let hydrated = true, draft = { text: "Untouched draft", parts: [] };
+  workspace.bindAgentWorkspaceStore({ getSessions: () => [], setSessions() {}, getActiveSessionId: () => null,
+    getReasoningVisible: () => false,
+    setReasoningVisible() {},
+    setActiveSessionId() {}, getSessionMode: () => "chat", setSessionMode() {},
+    getComposerDraft: () => draft, applyComposerDraft: value => { draft = value; },
+    getWorkspaceHydrated: () => hydrated, setWorkspaceHydrated: value => { hydrated = value; } });
+  live.selectLiveOffer("chosen", cid);
+  const saved = workspace.getAgentWorkspaceSnapshot();
+  live.selectLiveOffer("other");
+  assert.equal(workspace.applyAgentWorkspaceSnapshot(saved), true);
+  assert.equal(live.liveOfferChoice(), "chosen");
+  assert.equal(live.liveContentChoice(), cid);
+  assert.equal(workspace.getAgentWorkspaceSnapshot().composerDraft.text, "Untouched draft");
+  for (const invalid of [{ ...saved, selectedModelCid: "bad" }, { ...saved, liveOfferId: "" }]) {
+    assert.equal(workspace.applyAgentWorkspaceSnapshot(invalid), false);
+    assert.equal(workspace.getAgentWorkspaceSnapshot(), null);
+    assert.equal(live.selectedLiveOffer(), null);
+    assert.equal(draft.text, "Untouched draft");
+  }
+  assert.equal(workspace.applyAgentWorkspaceSnapshot(saved), true);
+  live.selectLiveOffer("other");
+  assert.equal(workspace.getAgentWorkspaceSnapshot().selectedModelCid, undefined);
+  live.selectLiveOffer("");
+});
+
+test("nested Agent Models intent registers top Home with exact origin and leaves draft alone", async () => {
+  const { openModelsFromAgent } = await import("../capsules/home-agent/browser/harness-host.js");
+  const prior = { href: window.location.href, top: window.top };
+  const messages = [];
+  window.top = { postMessage: (message, origin) => messages.push({ message, origin }) };
+  window.location.href = "https://home.example/apps/home-agent/?home_origin=https%3A%2F%2Fhome.example";
+  assert.equal(openModelsFromAgent(), true);
+  assert.deepEqual(messages, [
+    { origin: "https://home.example", message: { type: "home:app-ready", homeToken: "fixture" } },
+    { origin: "https://home.example", message: { type: "home:open-target", homeToken: "fixture", target: "system", query: { settings: "models" } } },
+  ]);
+  window.location.href = "https://home.example/apps/home-agent/?home_origin=null";
+  assert.equal(openModelsFromAgent(), false);
+  assert.equal(messages.length, 2);
+  window.location.href = prior.href; window.top = prior.top;
+});
 
 async function fixture(cancelReject = false, saved = null) {
   const events = defer();
@@ -223,6 +329,26 @@ function controllerFixture() {
   sessions.bindAgentSessions(ctx, { sessionListEl: () => null });
   return { ctx, status };
 }
+
+test("refresh after a refused new turn requires another deliberate Send", async t => {
+  t.after(() => live.selectLiveOffer(""));
+  const { ctx } = controllerFixture(); ctx.turnBusy = false;
+  let offers = [];
+  let created = 0;
+  globalThis.fetch = async url => {
+    const op = new URL(url).pathname.split("/").pop();
+    if (op === "runs_create") created += 1;
+    return { ok: true, json: async () => ({ offers }) };
+  };
+  live.selectLiveOffer("chosen");
+  await live.probeLiveInference({ force: true });
+  offers = [{ id: "chosen", title: "Chosen", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] }];
+  controller.startTurnForPrompt("Keep this draft");
+  await live.probeLiveInference();
+  assert.equal(live.selectedLiveOffer().offerId, "chosen");
+  assert.equal(created, 0);
+  assert.deepEqual(ctx.sessions[0].messages, []);
+});
 
 test("actual session selection detaches without a cancellation", async () => {
   const { ctx } = controllerFixture();

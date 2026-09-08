@@ -3,6 +3,7 @@ import {
   MAX_HOME_CLIPBOARD_TEXT_UTF8_BYTES,
 } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
 import { renderToString as renderMathToString } from "./vendor/katex/katex.mjs";
+import { catalogModels, selectedModelOffer, readyModelChoices } from "./model-selection.js";
 
 const MODEL_TEXT_INPUT_SCHEMA = "elastos.model.input.text/v1";
 const MODEL_IMAGE_INPUT_SCHEMA = "elastos.model.input.image/v1";
@@ -125,6 +126,7 @@ function normalizeWorkspace(workspace) {
       typeof workspace?.selected_offer_id === "string" && workspace.selected_offer_id.trim()
         ? workspace.selected_offer_id
         : null,
+    selected_model_cid: workspace?.selected_model_cid ?? null,
   };
 }
 
@@ -350,6 +352,7 @@ function serializeWorkspace(state) {
     })),
     draft: boundedText(state.draft, MAX_DRAFT_BYTES),
     selected_offer_id: state.selectedOfferId,
+    ...(state.selectedModelCid != null ? { selected_model_cid: state.selectedModelCid } : {}),
   };
 }
 
@@ -370,6 +373,8 @@ function initialState(homeToken) {
     studioDraft: "",
     searchQuery: "",
     selectedOfferId: null,
+    selectedModelCid: null,
+    models: [],
     selectedStudioOfferId: null,
     activeSessionId: "",
     deletingSessionId: "",
@@ -404,6 +409,7 @@ export function createAssistantApp({
   onStateChange = () => {},
 } = {}) {
   const state = initialState(homeToken);
+  let offersEpoch = 0;
   const homeClipboard = homeClipboardClientFactory({
     targetId: "assistant",
     homeOrigin,
@@ -444,6 +450,8 @@ export function createAssistantApp({
       filteredSessions,
       offersReady: offersReady.filter((offer) => offer.id && offer.operation),
       selectedOfferId,
+      selectedModelCid: currentMode === MODE_STUDIO ? null : state.selectedModelCid,
+      modelChoices: readyModelChoices(state.models, offersReady),
       draft,
       studioUnavailable: currentMode === MODE_STUDIO && offersReady.length === 0,
       starters:
@@ -473,8 +481,9 @@ export function createAssistantApp({
       sendDisabled:
         !homeToken ||
         state.offersLoading ||
+        Boolean(state.offersError) ||
         state.workspaceLoading ||
-        !selectedOfferId ||
+        !selectedOffer() ||
         !draft.trim() ||
         Boolean(state.activeRun && !state.activeRun.terminal),
     };
@@ -541,6 +550,10 @@ export function createAssistantApp({
   }
 
   async function loadOffers() {
+    const epoch = ++offersEpoch;
+    state.offersLoading = true;
+    state.offersError = "";
+    notify();
     if (!homeToken) {
       state.offersLoading = false;
       state.offersError = "Model provider unavailable.";
@@ -548,7 +561,20 @@ export function createAssistantApp({
       notify();
       return;
     }
-    const { response, payload } = await requestJson("/api/provider/model/offers_list", {});
+    let response, payload;
+    try {
+      const [offers, catalog] = await Promise.all([
+        requestJson("/api/provider/model/offers_list", {}),
+        requestJson("/api/capsules/catalog", null, "GET").catch(() => null),
+      ]);
+      if (epoch !== offersEpoch) return;
+      ({ response, payload } = offers);
+      try { state.models = catalog?.response.ok ? catalogModels(catalog.payload) : []; }
+      catch { state.models = []; }
+    } catch {
+      response = { ok: false };
+    }
+    if (epoch !== offersEpoch) return;
     if (!response.ok || payload?.status === "error") {
       state.offersLoading = false;
       state.offersError = readStatusMessage(payload, "Model provider unavailable.");
@@ -560,21 +586,17 @@ export function createAssistantApp({
     state.studioOffers = eligibleStudioOffers(payload);
     state.offersLoading = false;
     if (!state.textOffers.length && !state.studioOffers.length) {
-      state.selectedOfferId = null;
-      state.selectedStudioOfferId = null;
       state.statusMessage = "No model offers available.";
       notify();
       return;
     }
     if (
-      !state.selectedOfferId ||
-      !state.textOffers.some((offer) => offer.id === state.selectedOfferId)
+      !state.workspaceLoading && !state.selectedOfferId
     ) {
       state.selectedOfferId = state.textOffers[0]?.id ?? null;
     }
     if (
-      !state.selectedStudioOfferId ||
-      !state.studioOffers.some((offer) => offer.id === state.selectedStudioOfferId)
+      !state.selectedStudioOfferId
     ) {
       state.selectedStudioOfferId = state.studioOffers[0]?.id ?? null;
     }
@@ -611,6 +633,7 @@ export function createAssistantApp({
     state.sessions = workspace.sessions;
     state.draft = workspace.draft;
     state.selectedOfferId = workspace.selected_offer_id;
+    state.selectedModelCid = workspace.selected_model_cid;
       state.workspaceVersion = 0;
       state.savedWorkspaceVersion = 0;
       state.saveQueued = false;
@@ -633,8 +656,7 @@ export function createAssistantApp({
     state.activeMode = activeSession?.mode === MODE_BUILD ? MODE_BUILD : MODE_CHAT;
     if (
       state.textOffers.length &&
-      (!state.selectedOfferId ||
-        !state.textOffers.some((offer) => offer.id === state.selectedOfferId))
+      !state.selectedOfferId && !state.offersError
     ) {
       state.selectedOfferId = state.textOffers[0].id;
     }
@@ -897,7 +919,9 @@ export function createAssistantApp({
     notify();
   }
 
-  function setSelectedOfferId(nextOfferId) {
+  function setSelectedOfferId(nextOfferId, modelCid = null) {
+    const offers = state.activeMode === MODE_STUDIO ? state.studioOffers : state.textOffers;
+    if (state.offersLoading || state.workspaceLoading || state.offersError || !selectedModelOffer(offers, nextOfferId, modelCid, state.models)) return;
     if (state.activeMode === MODE_STUDIO) {
       state.selectedStudioOfferId = nextOfferId || null;
       state.studioResult = null;
@@ -905,6 +929,7 @@ export function createAssistantApp({
       return;
     }
     state.selectedOfferId = nextOfferId || null;
+    state.selectedModelCid = modelCid;
     markWorkspaceDirty();
     notify();
   }
@@ -915,7 +940,7 @@ export function createAssistantApp({
         state.studioOffers.find((offer) => offer.id === state.selectedStudioOfferId) || null
       );
     }
-    return state.textOffers.find((offer) => offer.id === state.selectedOfferId) || null;
+    return selectedModelOffer(state.textOffers, state.selectedOfferId, state.selectedModelCid, state.models);
   }
 
   function clearPollTimer() {
@@ -1134,7 +1159,7 @@ export function createAssistantApp({
       state.activeMode === MODE_STUDIO ? state.studioDraft : state.draft;
     const prompt = boundedText(promptSource.trim(), MAX_MESSAGE_CONTENT_BYTES);
     const offer = selectedOffer();
-    if (!prompt || !offer || state.offersLoading || state.workspaceLoading) {
+    if (!prompt || !offer || state.offersLoading || state.offersError || state.workspaceLoading || (state.activeRun && !state.activeRun.terminal)) {
       notify();
       return false;
     }
@@ -1273,6 +1298,16 @@ export function createAssistantApp({
 
   return {
     initialize,
+    refreshModels: loadOffers,
+    openModels() {
+      try {
+        const origin = new URL(homeOrigin);
+        if (!["http:", "https:"].includes(origin.protocol) || origin.origin !== homeOrigin) return false;
+      } catch { return false; }
+      if (!homeToken || !targetWindow || targetWindow === sourceWindow) return false;
+      targetWindow.postMessage({ type: "home:open-target", homeToken, target: "system", query: { settings: "models" } }, homeOrigin);
+      return true;
+    },
     snapshot,
     createSession,
     selectSession,
@@ -1741,16 +1776,31 @@ export function mountAssistantApp(root, app) {
       offerNode.append(option);
       offerNode.disabled = true;
     } else {
+      if (!view.offersReady.some(offer => offer.id === view.selectedOfferId) ||
+          (view.selectedModelCid != null && !view.modelChoices.some(row => row.cid === view.selectedModelCid && row.offerId === view.selectedOfferId))) {
+        const missing = document.createElement("option");
+        missing.value = ""; missing.textContent = "Chosen model unavailable"; missing.selected = true;
+        offerNode.append(missing);
+      }
       for (const offer of view.offersReady) {
+        if (view.modelChoices.some(model => model.offerId === offer.id)) continue;
         const option = document.createElement("option");
         option.value = offer.id;
         option.textContent = studioActive
           ? `${offer.title} - ${offer.mediaLabel}`
           : offer.title;
-        option.selected = offer.id === view.selectedOfferId;
+        option.selected = offer.id === view.selectedOfferId && view.selectedModelCid == null;
         offerNode.append(option);
       }
-      offerNode.disabled = false;
+      for (const model of view.modelChoices) {
+        const option = document.createElement("option");
+        option.value = `content:${model.cid}`;
+        option.textContent = model.title;
+        option.title = model.cid;
+        option.selected = (view.selectedModelCid == null || model.cid === view.selectedModelCid) && model.offerId === view.selectedOfferId;
+        offerNode.append(option);
+      }
+      offerNode.disabled = view.offersLoading || Boolean(view.offersError) || view.workspaceLoading;
     }
   }
 
@@ -1764,7 +1814,11 @@ export function mountAssistantApp(root, app) {
     }
     const action = button.dataset.action;
     const sessionId = button.dataset.sessionId || "";
-    if (action === "select-session") {
+    if (action === "open-models") {
+      app.openModels();
+    } else if (action === "refresh-models") {
+      void app.refreshModels();
+    } else if (action === "select-session") {
       app.selectSession(sessionId);
     } else if (action === "toggle-pin") {
       app.togglePinSession(sessionId);
@@ -1792,7 +1846,8 @@ export function mountAssistantApp(root, app) {
   });
 
   offerNode.addEventListener("change", () => {
-    app.setSelectedOfferId(offerNode.value);
+    const model = app.snapshot().modelChoices.find(row => `content:${row.cid}` === offerNode.value);
+    app.setSelectedOfferId(model?.offerId || offerNode.value, model?.cid ?? null);
     rerender();
   });
 
