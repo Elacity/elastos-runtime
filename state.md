@@ -70,14 +70,33 @@ volatile proof logs remain outside the repository.
 
 ## Browser contract and device qualification
 
-The task Mac now uses dependency repair `cbb1e099`, rootfs
-`d03ec02910defddfda432f0897b6f21b178eff52817df2e7b709bec7e1afa5aa`.
-Guest control remains source `6f5d48ae`, helper hash
-`eb963971286e8b82d95896c4ba8a849c9938d24dee8dc2a5936784a4564cb489`.
-Runtime, adapter, VZ helper, kernel and Browser UI were reused and verified.
-The installed startup helper and gst-python override match the exported image.
+The task Mac now runs inspection source `4dd0a216`, Runtime hash
+`cc5603ecd197ebc9b9807252147dc7af754af1602276ce1b22137547351272ff`
+and adapter hash `d6b372c0754ebedbe05a1b80de2df61c898e3b23170e9bcd807713c3daf09426`.
+Its rootfs is `32dde56898859e05c00b0eb753c2365a65015a859cef1c71401245e0eff91ded`
+and initrd is `47fca80f800d616f00f0da3e090bf3ddcea196d6486ae763cbe7ab6b1ce87ccd`.
+The reviewed Engine helper has hash
+`02a0b1601c6d8a1a7fc34ddcd3f3c95e5524dc8648102b61d19810a0a8a97d69`
+in source, installed host helper, rootfs and initrd. The image change replaces
+that one script; all other 4,592 initrd entries remain identical. The kernel,
+VZ helper, Browser UI and corrected media dependencies were reused. Image-set,
+filesystem, provider and restart checks pass; four served Browser assets match
+source and installed bytes.
 
-The current initrd is `bfe15d7a854c1d7c8193ce5ddcc37a3b844387653241c0d702f1cf9681ff813d`.
+Run 60 passes the ordinary installed journey and native Engine inspection:
+18 accessibility nodes over three response pages include the exact text entered
+through the Browser UI. Navigation rejects the old cursor with `stale_inspection`.
+Viewer reload takes 1077 ms and close clears all 13 effects in 661 ms. Run 61
+adds decoded audio before and after a 5001 ms HTTP/TURN cut; all 39 steady samples
+pass in each audio probe, recovery takes 1753 ms and close takes 802 ms. Both runs
+end with zero Runtime/control obligations. Independent review of this new
+installed inspection evidence is pending. The earlier run 57 audio failure,
+full operator behavior and all qualification requirements remain open.
+
+The preceding image used dependency repair `cbb1e099`, rootfs
+`d03ec02910defddfda432f0897b6f21b178eff52817df2e7b709bec7e1afa5aa`
+and guest control `6f5d48ae`. Its RNG initrd was
+`bfe15d7a854c1d7c8193ce5ddcc37a3b844387653241c0d702f1cf9681ff813d`.
 It enables the existing `virtio_rng` driver through the committed build script;
 all other 4,592 archive entries retain their content and ownership. The rootfs,
 kernel, native helpers and UI stay unchanged. Run 54 confirms random readiness
@@ -119,10 +138,10 @@ Installed run 59 reaches Home, both controlled pages, decoded WebRTC frames and
 exact UI text before the operator inspection route returns HTTP 404. Close
 clears all 13 effects in 684 ms, with zero remaining obligations. The bounded
 native accessibility inspection source passes 61 JavaScript and seven Rust
-checks and coordinator review. Installing that source and repeating the journey
-is the next operator milestone; source evidence alone leaves B04 open.
+checks and coordinator review. The subsequent installed results above exercise
+that source. Full B04 remains open for actions, delegation, handoff and adapters.
 
-Earlier evidence for the same rootfs with the preceding initrd follows.
+Earlier evidence for dependency repair `cbb1e099` with its first initrd follows.
 
 Runs 50–52 pass Home launch, controlled navigation, advancing decoded WebRTC
 frames, exact text, scrolling and fresh Home close. Each close confirms all 13

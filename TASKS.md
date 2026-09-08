@@ -79,7 +79,7 @@ alongside the local, operator and remote journeys.
   producer/receiver evidence; concurrent compilation is a hypothesis only.
   The same audio threshold applies to every repeat. Full sustained-use and
   human listening acceptance remain open.
-- **B04.inspect / active / delegated source owner; coordinator reviews.**
+- **B04.inspect / verifying / coordinator; independent installed review pending.**
   Prerequisite: the accepted owner/page contract and existing Engine CDP access.
   Deliver a bounded, capability-negotiated snapshot of the actual Engine page
   with document generation and pagination. Test owner success, foreign-owner
@@ -87,6 +87,11 @@ alongside the local, operator and remote journeys.
   navigation. The first installed proof reads a controlled form from the page
   visible to the human. Actions, writer leases, handoff and adapter conformance
   are its immediate successors; a snapshot alone leaves B04 open.
+  Source `4dd0a216` passes the installed journey in run 60: actual typed field,
+  three response pages, stale cursor after UI navigation, reload and 13-effect
+  cleanup. Run 61 adds decoded audio and five-second connection-cut recovery.
+  The delegated source owner now works on writer admission and typed actions
+  while the coordinator integrates installation and remote service work.
 - **B08/B09.first-remote / active / independent delegated source owner.**
   Prerequisite: accepted Engine/Exit identity and Runtime service contracts.
   Identify the first missing product operation for A/B/A and A/A/B against
