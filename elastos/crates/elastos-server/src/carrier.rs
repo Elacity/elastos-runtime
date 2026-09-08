@@ -65,6 +65,9 @@ use crate::operator_control::{OperatorHandler, OperatorRuntimeContext, OPERATOR_
 use crate::sources::TrustedSource;
 
 const CARRIER_ALPN: &[u8] = b"elastos/carrier/1";
+#[path = "carrier_file.rs"]
+mod file_transfer;
+pub(crate) use file_transfer::fetch_file_from_trusted_source_to;
 #[path = "carrier_exit.rs"]
 mod browser_exit;
 pub(crate) use browser_exit::{
@@ -1231,12 +1234,7 @@ async fn handle_file_stream(
                 .await?;
                 return Ok(());
             }
-            let content = tokio::fs::read(&file_path).await?;
-            let len = content.len() as u64;
-            send.write_all(&len.to_be_bytes()).await?;
-            send.write_all(&content).await?;
-            send.finish()?;
-            send.stopped().await.ok();
+            let len = file_transfer::send_file(send, &file_path).await?;
             info!("carrier: served file {} ({} bytes)", path, len);
         }
         "content_fetch" => {

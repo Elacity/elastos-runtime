@@ -4,19 +4,23 @@
 use super::{ComponentsManifest, PlatformInfo};
 use anyhow::{bail, ensure, Context};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub(super) const NAME: &str = "browser-vm-image";
 pub(super) const INSTALL_PATH: &str = "browser-vm/image-set";
 const RECEIPT: &str = "browser-vm-rootfs-manifest.json";
 const RECEIPT_HASH: &str = ".elastos-image-manifest-sha256";
 const FILES: [&str; 4] = [RECEIPT, "rootfs.ext4", "vmlinux", "initrd"];
-// Existing Carrier file replies are buffered and bounded to 200 MiB.
-const MAX_ARCHIVE_SIZE: u64 = 200 * 1024 * 1024;
+// An exact stamped size bounds each disk-backed transfer independently of RAM.
+const MAX_ARCHIVE_SIZE: u64 = 64 * 1024 * 1024 * 1024;
+const IO_CHUNK_SIZE: usize = 64 * 1024;
 const STAGING_PREFIX: &str = ".browser-image-stage-";
 const VERIFIED_SET_CACHE_LIMIT: usize = 8;
 
@@ -187,7 +191,10 @@ fn validate_info(info: &PlatformInfo) -> anyhow::Result<()> {
         info.size.is_some_and(|size| size > 0),
         "Browser image release package requires its archive size"
     );
-    ensure!(info.size.is_some_and(|size| size <= MAX_ARCHIVE_SIZE), "Browser image archive exceeds the current 200 MiB Carrier file limit; release acquisition requires a supported artifact transport");
+    ensure!(
+        info.size.is_some_and(|size| size <= MAX_ARCHIVE_SIZE),
+        "Browser image archive exceeds the 64 GiB package bound"
+    );
     Ok(())
 }
 
@@ -254,6 +261,14 @@ pub(super) fn validate_request(
 }
 
 fn verify_payload(bundle: &Path, platform: &str) -> anyhow::Result<()> {
+    verify_payload_with_cancel(bundle, platform, None)
+}
+
+fn verify_payload_with_cancel(
+    bundle: &Path,
+    platform: &str,
+    cancelled: Option<&AtomicBool>,
+) -> anyhow::Result<()> {
     for name in FILES {
         ensure!(
             fs::symlink_metadata(bundle.join(name))?
@@ -262,7 +277,7 @@ fn verify_payload(bundle: &Path, platform: &str) -> anyhow::Result<()> {
             "Browser image package {name} must be a regular file"
         );
     }
-    verify_payload_paths(&FILES.map(|name| bundle.join(name)), platform)
+    verify_payload_paths_with_cancel(&FILES.map(|name| bundle.join(name)), platform, cancelled)
 }
 
 pub(super) fn verify_legacy_or_missing_release(data: &Path, platform: &str) -> anyhow::Result<()> {
@@ -285,6 +300,14 @@ pub(super) fn verify_legacy_or_missing_release(data: &Path, platform: &str) -> a
 }
 
 fn verify_payload_paths(paths: &[PathBuf; 4], platform: &str) -> anyhow::Result<()> {
+    verify_payload_paths_with_cancel(paths, platform, None)
+}
+
+fn verify_payload_paths_with_cancel(
+    paths: &[PathBuf; 4],
+    platform: &str,
+    cancelled: Option<&AtomicBool>,
+) -> anyhow::Result<()> {
     let target = guest_platform(platform)?;
     let receipt_path = &paths[0];
     ensure!(
@@ -320,7 +343,7 @@ fn verify_payload_paths(paths: &[PathBuf; 4], platform: &str) -> anyhow::Result<
                 && hash
                     .bytes()
                     .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                && super::file_matches_checksum(&path, &format!("sha256:{hash}"))?,
+                && hash_reader(&mut fs::File::open(path)?, cancelled)? == hash,
             "Browser image {name} checksum mismatch"
         );
     }
@@ -387,19 +410,165 @@ pub(super) fn verify_installed(
     })
 }
 
-pub(super) fn install_archive(
+fn check_cancelled(cancelled: Option<&AtomicBool>) -> anyhow::Result<()> {
+    ensure!(
+        !cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)),
+        "Browser image preparation cancelled (previous set preserved)"
+    );
+    Ok(())
+}
+
+fn hash_reader(reader: &mut impl Read, cancelled: Option<&AtomicBool>) -> anyhow::Result<String> {
+    let mut hash = Sha256::new();
+    let mut chunk = [0u8; IO_CHUNK_SIZE];
+    loop {
+        check_cancelled(cancelled)?;
+        let count = reader.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&chunk[..count]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+// Dropping the async preparation cancels its blocking reader before commit.
+// The anonymous download file and TempDir stages clean up when their owners exit.
+#[derive(Default)]
+struct PreparationCancellation(Arc<AtomicBool>);
+
+impl Drop for PreparationCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+struct CancellableReader<'a, R> {
+    reader: R,
+    cancelled: &'a AtomicBool,
+}
+
+impl<R: Read> Read for CancellableReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("Browser image preparation cancelled"));
+        }
+        self.reader.read(buffer)
+    }
+}
+
+pub(super) async fn install_via_carrier(
+    data: &Path,
+    info: &PlatformInfo,
+    dest: &Path,
+    platform: &str,
+) -> anyhow::Result<()> {
+    validate_request(data, info, dest, platform)?;
+    let source = crate::sources::load_trusted_sources(data)?
+        .default_source()
+        .cloned()
+        .ok_or_else(super::missing_trusted_source_error)?;
+    let parent = dest.parent().unwrap();
+    fs::create_dir_all(parent)?;
+    let size = info.size.unwrap();
+    check_disk_space(parent, size)?;
+    let cancellation = PreparationCancellation::default();
+    // tempfile creates an unlinked/private file on supported Unix Engine hosts.
+    // Process exit or cancellation cannot leave a partial archive pathname.
+    let temporary = tempfile::tempfile_in(parent)?;
+    let mut download = tokio::fs::File::from_std(temporary);
+    let mut checkpoint = 0;
+    let mut progress = |received: u64, total: u64| -> anyhow::Result<()> {
+        check_cancelled(Some(&cancellation.0))?;
+        if received == 0
+            || received == total
+            || received.saturating_sub(checkpoint) >= 16 * 1024 * 1024
+        {
+            check_disk_space(parent, total.saturating_sub(received))?;
+            checkpoint = received;
+            tracing::info!(
+                component = NAME,
+                phase = "downloading",
+                bytes_received = received,
+                total_bytes = total,
+                "Browser image preparation"
+            );
+        }
+        Ok(())
+    };
+    // Progress can continue beyond the old 30-second total limit. Each Carrier
+    // read/write still has a 30-second idle limit, with one hour for all routes.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60 * 60),
+        crate::carrier::fetch_file_from_trusted_source_to(
+            &source,
+            info.release_path.as_deref().unwrap(),
+            &mut download,
+            size,
+            &mut progress,
+        ),
+    )
+    .await
+    .context("Browser image download exceeded its one-hour deadline (previous set preserved)")??;
+    tokio::time::timeout(std::time::Duration::from_secs(30), download.sync_all())
+        .await
+        .context("Browser image download sync deadline")??;
+    let file = download.into_std().await;
+    let data = data.to_path_buf();
+    let info = info.clone();
+    let platform = platform.to_owned();
+    let cancelled = cancellation.0.clone();
+    tokio::task::spawn_blocking(move || {
+        install_archive_reader(&data, file, &info, &platform, &cancelled)
+    })
+    .await?
+}
+
+#[cfg(test)]
+fn install_archive(
     data: &Path,
     bytes: &[u8],
     info: &PlatformInfo,
     platform: &str,
 ) -> anyhow::Result<()> {
+    install_archive_reader(
+        data,
+        std::io::Cursor::new(bytes),
+        info,
+        platform,
+        &AtomicBool::new(false),
+    )
+}
+
+fn install_archive_reader(
+    data: &Path,
+    mut reader: impl Read + Seek,
+    info: &PlatformInfo,
+    platform: &str,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<()> {
     let dest = data.join(INSTALL_PATH);
     validate_request(data, info, &dest, platform)?;
+    check_cancelled(Some(cancelled))?;
     ensure!(
-        info.size == Some(bytes.len() as u64),
+        info.size == Some(reader.seek(SeekFrom::End(0))?),
         "Browser image archive is incomplete: size mismatch"
     );
-    super::verify_checksum(NAME, bytes, info)?;
+    reader.rewind()?;
+    tracing::info!(
+        component = NAME,
+        phase = "verifying",
+        "Browser image preparation"
+    );
+    ensure!(
+        info.checksum.as_deref()
+            == Some(&format!(
+                "sha256:{}",
+                hash_reader(&mut reader, Some(cancelled))?
+            )),
+        "Browser image archive checksum mismatch (previous set preserved)"
+    );
+    reader.rewind()?;
     let parent = dest.parent().unwrap();
     fs::create_dir_all(parent)?;
     let _install_lock = lock_installation(parent)?;
@@ -423,7 +592,13 @@ pub(super) fn install_archive(
         .tempdir_in(parent)?;
     let bundle = staging.path().join(NAME);
     fs::create_dir(&bundle)?;
-    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+    let reader = CancellableReader { reader, cancelled };
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(reader));
+    tracing::info!(
+        component = NAME,
+        phase = "installing",
+        "Browser image preparation"
+    );
     let mut found = BTreeSet::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -461,7 +636,7 @@ pub(super) fn install_archive(
         found.len() == FILES.len(),
         "Browser image archive is missing a required image-set file"
     );
-    verify_payload(&bundle, platform)?;
+    verify_payload_with_cancel(&bundle, platform, Some(cancelled))?;
     super::write_platform_cache_metadata(info, &bundle)?;
     fs::write(
         bundle.join(RECEIPT_HASH),
@@ -472,6 +647,7 @@ pub(super) fn install_archive(
     }
     let mut created = Vec::<PathBuf>::new();
     let outcome = (|| {
+        check_cancelled(Some(cancelled))?;
         check_aliases(data, platform, false)?;
         for (alias, file) in aliases(platform) {
             let alias = data.join(alias);
@@ -485,6 +661,7 @@ pub(super) fn install_archive(
             bail!("Browser image acquisition requires a supported Unix Engine host");
             created.push(alias);
         }
+        check_cancelled(Some(cancelled))?;
         replace_directory(&bundle, &dest)
     })();
     if outcome.is_err() {
@@ -667,6 +844,162 @@ mod tests {
             4,
             "only image-set, install lock and two aliases remain"
         );
+    }
+
+    #[test]
+    fn browser_image_disk_reader_verifies_before_replacing_and_cleans_cancelled_staging() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let (bytes, info) = archive(&fixture(b"working-image"));
+        let mut file = tempfile::tempfile_in(temp.path()).unwrap();
+        file.write_all(&bytes).unwrap();
+        assert_eq!(
+            fs::read_dir(temp.path()).unwrap().count(),
+            0,
+            "download file has no orphan pathname"
+        );
+        install_archive_reader(
+            temp.path(),
+            &mut file,
+            &info,
+            "darwin-arm64",
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        verify_installed(temp.path(), &info, "darwin-arm64").unwrap();
+        let (replacement, next_info) = archive(&fixture(b"replacement"));
+        struct CancelAfterVerification<'a> {
+            reader: std::io::Cursor<&'a [u8]>,
+            cancelled: &'a AtomicBool,
+            rewinds: usize,
+        }
+        impl Read for CancelAfterVerification<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                assert!(bytes.len() <= IO_CHUNK_SIZE);
+                self.reader.read(bytes)
+            }
+        }
+        impl Seek for CancelAfterVerification<'_> {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                if matches!(position, SeekFrom::Start(0)) {
+                    self.rewinds += 1;
+                    if self.rewinds == 2 {
+                        self.cancelled.store(true, Ordering::Release);
+                    }
+                }
+                self.reader.seek(position)
+            }
+        }
+        let cancelled = AtomicBool::new(false);
+        let reader = CancelAfterVerification {
+            reader: std::io::Cursor::new(&replacement),
+            cancelled: &cancelled,
+            rewinds: 0,
+        };
+        let error =
+            install_archive_reader(temp.path(), reader, &next_info, "darwin-arm64", &cancelled)
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("cancelled"));
+        verify_installed(temp.path(), &info, "darwin-arm64").unwrap();
+        assert_eq!(
+            fs::read_dir(temp.path().join("browser-vm"))
+                .unwrap()
+                .count(),
+            4
+        );
+        let owner = PreparationCancellation::default();
+        let flag = owner.0.clone();
+        drop(owner);
+        assert!(install_archive_reader(temp.path(), file, &info, "darwin-arm64", &flag).is_err());
+        verify_installed(temp.path(), &info, "darwin-arm64").unwrap();
+    }
+
+    #[test]
+    fn browser_image_streaming_metadata_accepts_large_exact_size_and_retains_bound() {
+        let (_, mut info) = archive(&fixture(b"image"));
+        info.size = Some(200 * 1024 * 1024 + 1);
+        validate_info(&info).unwrap();
+        info.size = Some(MAX_ARCHIVE_SIZE);
+        validate_info(&info).unwrap();
+        info.size = Some(MAX_ARCHIVE_SIZE + 1);
+        assert!(validate_info(&info).is_err());
+    }
+
+    #[tokio::test]
+    async fn browser_image_first_party_stream_installs_verified_file_and_preserves_set_on_bad_hash()
+    {
+        use iroh::Watcher;
+        let platform = super::super::detect_platform();
+        let Ok(guest) = guest_platform(&platform) else {
+            return;
+        };
+        let publisher = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let mut files = fixture(b"working-image");
+        let mut receipt: Value = serde_json::from_slice(&files[0].1).unwrap();
+        receipt["target_platform"] = json!(guest);
+        files[0].1 = serde_json::to_vec(&receipt).unwrap();
+        let (bytes, info) = archive(&files);
+        let artifact = elastos_common::localhost::publisher_artifacts_path(publisher.path())
+            .join(info.release_path.as_ref().unwrap());
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, &bytes).unwrap();
+        let (key, did) = elastos_identity::derive_did(&[141; 32]);
+        let node = crate::carrier::start_isolated_carrier_node_with_registry(
+            &key,
+            &did,
+            publisher.path().to_owned(),
+            None,
+        )
+        .await
+        .unwrap();
+        let address = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let address = node.endpoint.watch_addr().get();
+                if !address.addrs.is_empty() {
+                    break address;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let ticket = data_encoding::BASE32_NOPAD
+            .encode(&serde_json::to_vec(&json!({"endpoints":[address]})).unwrap())
+            .to_ascii_lowercase();
+        let sources = serde_json::from_value(json!({
+            "schema":"elastos.trusted-sources/v1", "default_source":"test",
+            "sources":[{"name":"test","publisher_node_id":node.endpoint.id().to_string(),"connect_ticket":ticket}]
+        })).unwrap();
+        crate::sources::save_trusted_sources(target.path(), &sources).unwrap();
+        let dest = target.path().join(INSTALL_PATH);
+        super::super::install_first_party_component_via_carrier(target.path(), NAME, &info, &dest)
+            .await
+            .unwrap();
+        verify_installed(target.path(), &info, &platform).unwrap();
+        let mut corrupt = info.clone();
+        corrupt.checksum = Some(format!("sha256:{}", "0".repeat(64)));
+        let error = super::super::install_first_party_component_via_carrier(
+            target.path(),
+            NAME,
+            &corrupt,
+            &dest,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("checksum mismatch"));
+        verify_installed(target.path(), &info, &platform).unwrap();
+        assert_eq!(
+            fs::read_dir(target.path().join("browser-vm"))
+                .unwrap()
+                .count(),
+            4,
+            "download and failed stages leave only the installed set, aliases and lock"
+        );
+        crate::carrier::CarrierRuntimeService::new(node)
+            .shutdown()
+            .await
+            .unwrap();
     }
 
     #[test]

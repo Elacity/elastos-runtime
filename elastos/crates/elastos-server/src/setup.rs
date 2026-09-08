@@ -2245,21 +2245,19 @@ pub(crate) async fn install_first_party_component_via_carrier(
     dest: &Path,
 ) -> anyhow::Result<()> {
     if name == browser_vm_image::NAME {
-        browser_vm_image::validate_request(data_dir, platform_info, dest, &detect_platform())?;
+        return browser_vm_image::install_via_carrier(
+            data_dir,
+            platform_info,
+            dest,
+            &detect_platform(),
+        )
+        .await;
     }
     let release_path = platform_info.release_path.as_deref().ok_or_else(|| {
         anyhow::anyhow!("missing release_path for first-party component '{}'", name)
     })?;
     let bytes = fetch_first_party_component_via_carrier(data_dir, release_path).await?;
 
-    if name == browser_vm_image::NAME {
-        let data_dir = data_dir.to_path_buf();
-        let platform_info = platform_info.clone();
-        return tokio::task::spawn_blocking(move || {
-            browser_vm_image::install_archive(&data_dir, &bytes, &platform_info, &detect_platform())
-        })
-        .await?;
-    }
     verify_checksum(name, &bytes, platform_info)?;
 
     let is_model = dest.extension().map(|e| e == "gguf").unwrap_or(false);

@@ -156,6 +156,19 @@ with tempfile.TemporaryDirectory(prefix="browser-image-ownership-") as temp:
         checks.append("new release metadata preserves the immutable previous output pair")
 
         next_archive, next_metadata = root / "next/image.tar.gz", root / "next/components.json"
+        for failure in ["size", "disk"]:
+            patch = (mock.patch.dict(package.__globals__, MAX_ARCHIVE_SIZE=32) if failure == "size"
+                     else mock.patch("shutil.disk_usage", return_value=type("Disk", (), {"free": 99, "total": 1000})()))
+            with patch:
+                try:
+                    package(package_source, "darwin-arm64", next_archive, next_metadata, "test/image.tar.gz")
+                    raise AssertionError("package resource bound was ignored")
+                except ValueError as error:
+                    assert ("package bound" if failure == "size" else "10%") in str(error)
+            assert not next_archive.exists() and not next_metadata.exists()
+            assert not list(next_archive.parent.glob(".browser-image-*"))
+            assert (archive.read_bytes(), metadata.read_bytes()) == before_package
+            checks.append("release packaging preserves existing output and removes partial work after " + failure + " limit")
         original_link = os.link
         def fail_metadata_link(source, destination, *args, **kwargs):
             if Path(destination) == next_metadata.resolve():

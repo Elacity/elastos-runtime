@@ -10,10 +10,33 @@ import hashlib
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
+
+MAX_ARCHIVE_SIZE = 64 * 1024 * 1024 * 1024
+
+
+class PackageWriter:
+    """Bound compressed output and retain the installation volume's free space."""
+    def __init__(self, raw, directory):
+        self.raw, self.directory = raw, directory
+        self.size, self.checkpoint = 0, -16 * 1024 * 1024
+
+    def write(self, data):
+        if self.size + len(data) > MAX_ARCHIVE_SIZE:
+            raise ValueError("image archive exceeds the 64 GiB package bound")
+        if self.size - self.checkpoint >= 16 * 1024 * 1024:
+            usage = shutil.disk_usage(self.directory)
+            # Reserve the next check interval as well as this output chunk.
+            if usage.free - len(data) - 16 * 1024 * 1024 < usage.total // 10:
+                raise ValueError("image packaging must keep 10% free disk space")
+            self.checkpoint = self.size
+        written = self.raw.write(data)
+        self.size += written
+        return written
 
 
 def digest(path):
@@ -61,7 +84,7 @@ def package(image, platform, archive, manifest_output, release_path):
     manifest_output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".browser-image-package-", dir=archive.parent) as temp:
         staged = Path(temp) / "image.tar.gz"
-        with staged.open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+        with staged.open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=PackageWriter(raw, archive.parent), mtime=0) as compressed:
             with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.GNU_FORMAT) as tar:
                 for name, source in sorted(files.items()):
                     content = io.BytesIO(receipt_bytes) if name == "browser-vm-rootfs-manifest.json" else source.open("rb")
@@ -76,8 +99,8 @@ def package(image, platform, archive, manifest_output, release_path):
             if digest(files[name]) != entry["sha256"]:
                 raise ValueError("source image changed during packaging")
         checksum, size = "sha256:" + digest(staged), staged.stat().st_size
-        if size > 200 * 1024 * 1024:
-            raise ValueError("image archive exceeds the current 200 MiB Carrier file limit; release acquisition requires a supported artifact transport")
+        if size > MAX_ARCHIVE_SIZE:
+            raise ValueError("image archive exceeds the 64 GiB package bound")
         component = {"install_path": "browser-vm/image-set", "description": "Verified Browser local Engine image dependency",
                      "platforms": {platform: {"install_path": "browser-vm/image-set", "extract_path": "browser-vm-image",
                                               "strategy": "browser-vm-image", "release_path": release_path,
