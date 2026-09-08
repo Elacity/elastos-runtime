@@ -687,6 +687,26 @@ def rollback_receipt(root, size):
     }
 
 
+def upgrade_rollback_receipt(root, upgrade_log):
+    if root.exists() or root.is_symlink():
+        return rollback_receipt(root, rollback_size(root))
+    # A fresh or fully migrated installation has no objects to move, so the
+    # Runtime returns already_ready and creates no backup directory.
+    try:
+        receipt = json.loads(read_regular(upgrade_log, MAX_RESTART_RECEIPT, owner_only=True))
+    except (ValueError, UnicodeError):
+        reject("principal_root_upgrade_missing_rollback")
+    if receipt != {
+        "schema": "elastos.principal-root.upgrade-receipt/v1",
+        "status": "already_ready",
+        "root_count": 0,
+        "object_count": 0,
+        "roots": [],
+    }:
+        reject("principal_root_upgrade_missing_rollback")
+    return None
+
+
 def validate_receipt_destination(path):
     ensure_owner_directory(path.parent, create=True)
     try:
@@ -1059,7 +1079,7 @@ def active_restart(context, wait_seconds):
             context["rollback"],
             context["upgrade_log"],
         )
-        rollback = rollback_receipt(context["rollback"], rollback_size(context["rollback"]))
+        rollback = upgrade_rollback_receipt(context["rollback"], context["upgrade_log"])
         pid, identity = start_gateway(
             gateway,
             addr,
