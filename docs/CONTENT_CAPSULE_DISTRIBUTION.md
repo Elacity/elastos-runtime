@@ -13,9 +13,14 @@ admit that exact package through bounded local Content reads. Marketplace and
 System source views expose preparation and Keep controls. Assistant and Home
 Agent select current ready offers and preserve optional content CID intent.
 The isolated cold Qwen source/process proof covers admission, reply, active
-cancellation, exact restart replay and Keep persistence. Operator-signed
-packaging for an installed Home, combined GUI/retention acceptance and network
-catalog updates remain open.
+cancellation, exact restart replay and Keep persistence with a fixture catalog
+and successful authority-revalidation callback. Operator-signed packaging,
+bounded local Content import and installed catalog visibility are verified.
+The actual installed Use failed after metadata progress, before admission or
+activation; its exact exception was not retained. That result and cleanup facts
+are recorded in [state.md](../state.md#current-isolated-owner-home).
+Combined GUI/retention acceptance, content-to-Agent handoff and bounded off-box
+delivery remain open. This is a local foundation for full model distribution.
 
 The implemented content plane already provides `elastos://content` publish,
 fetch, status, ensure, repair, and unpublish operations. It records signed local
@@ -33,6 +38,10 @@ URL entry in Home.
 - A GGUF model is a `role=content`, `type=data` capsule whose manifest describes
   the model format, quantization, resource requirements, license, provenance,
   and compatible model-provider interface.
+- The intended model consumer is Agent/chat, analogous to a video's Player.
+  Marketplace is primary content discovery; System also manages models.
+  Selection carries content identity. Runtime owns admission and run authority,
+  and the model provider owns execution. The content capsule remains passive.
 - The canonical identity is the CID of the complete immutable capsule closure,
   including the manifest and payload. Payload hashes may remain in the manifest
   for format-specific verification, but they do not create a second package
@@ -70,7 +79,8 @@ The first delivery slice packages the currently verified Qwen GGUF as one
 content capsule and makes it available to the existing local model provider.
 This is required for the current closeout, not a later catalog-only milestone.
 The person selects or uses the model; Runtime resolves and prepares its exact
-content. Settings may offer Keep on this device or release local retention.
+content and retains the selected local model for repeated use. System owns
+explicit storage removal with recoverability checks, warnings and consent.
 Transfer and installation are backend mechanisms, not a traditional download
 workflow, file picker or editable model path. It uses this sequence:
 
@@ -98,17 +108,22 @@ workflow, file picker or editable model path. It uses this sequence:
    private canonical artifact descriptor that it revalidates before inference.
    Package identity remains separate from service-offer identity and install
    authority.
-7. Marketplace Models browse/details/Use, System model management and existing
+7. Marketplace content browse/details/Use, System model management and existing
    Assistant/Home Agent pickers project the same catalog, inventory and offer
    records. They show availability, Preparing with progress, Ready, or an
-   actionable failed, offline or incompatible state. Composer Open Models hands
-   preparation to System; inference waits for admission and provider readiness.
+   actionable failed, offline or incompatible state. The intended Open handoff
+   selects that model in Agent/chat and composes preparation with use; inference
+   waits for admission and provider readiness. Current Open Models instead
+   targets System and still requires the bounded adaptation below.
    A pin is retention, not evidence of trust, license acceptance or inference readiness.
    Runtime keeps paths and backend routes private. Selection preserves drafts
    and existing runs and never silently substitutes another model.
 
-Later catalog updates may arrive through content or Carrier providers. Runtime
-applies the same publisher-signature and CID checks before Home projects them.
+Off-box catalog and package delivery belongs to the existing Content and
+availability contracts over Carrier. Runtime applies the same publisher,
+identity and authority checks. The bounded preparation path currently dispatches
+locally and excludes availability retrieval; this paragraph defines intended
+distribution, not implemented remote model transfer.
 
 The CID proves the closure bytes. The publisher signature proves who made the
 source claim. Availability receipts prove accepted retention. Runtime owns
@@ -132,7 +147,7 @@ Acceptance requires:
   keeps host paths and backend routes private;
 - restart proof that preserves the single admitted record without another
   transfer, followed by one fresh model request that produces one inference
-  through the admitted artifact, plus explicit release of local retention,
+  through the retained admitted artifact, plus explicit System storage removal,
   busy/run protection, unpin policy, provider cleanup, removal receipt and
   partial-file cleanup; and
 - installed negative tests for an incorrect CID, signature, publisher, digest,
@@ -161,13 +176,24 @@ manifest, size, compatibility, license-policy, or availability check leaves no
 partially admitted capsule.
 
 Runtime may cache bytes for ordinary on-demand use. Keep on this device requests
-explicit local retention beyond that cache policy. Releasing Keep makes bytes
-eligible for eviction; it does not immediately delete them. Actual free-space
+explicit local retention beyond that cache policy. Releasing Keep removes only
+the caller's retention claim. Bytes become eligible for eviction only when other
+claims and references permit it; release does not immediately delete them. Actual free-space
 removal waits for active references and run settlement, then updates inventory
 and the removal receipt. Cached, kept, admitted and ready remain distinct facts
 in the same inventory records. The signed catalog identity remains visible with
 its actual availability after local eviction. Unpinning local bytes says nothing
-about whether another provider retains the CID.
+about whether another provider retains the CID. Catalog identity, local retention,
+reachable retained copies and inference placement are distinct. Releasing Keep
+neither proves a reachable remote copy nor selects remote inference. The current
+local-only preparation path cannot promise refetch after eviction.
+
+Accepted UX policy, with implementation pending: ordinary Use retains the selected local model for
+repeated use. System owns storage management and checks recoverability evidence
+before an ordinary Free up space action. Possible loss of the sole copy requires
+a clear warning and explicit consent. The Keep/release behavior described above
+is current implementation evidence; it does not establish this accepted flow.
+Remote inference remains a separately selected service.
 
 ## Implemented catalog metadata profile
 
@@ -177,7 +203,9 @@ Q4_K_M, llama.cpp and `elastos.provider.model` version `0.1.0`. It requires
 Apache-2.0 license references for the base and quantized model, a provenance
 notice, bounded owner/repository identifiers and exact 40-character lowercase
 Git revisions. The declared memory floor is 1 to 1,048,576 MiB. This profile
-grants no execution, viewer, storage or provider capability. Other formats,
+grants no execution, storage or provider capability and currently rejects the
+`viewer` field. Generic content manifests support that field as a handoff hint;
+the model-specific restriction needs compatibility review. Other formats,
 licenses and provenance schemes remain outside this closeout.
 
 The existing `_elastos_object.json` owns file paths, exact sizes and SHA-256
@@ -246,9 +274,10 @@ Isolated process tests exercise fresh Use through real Content, Registry,
 the native bridge and Kubo, including cold exact-Qwen admission, reuse without
 Content reads, a real reply, active cancellation and exact restart replay.
 Keep persists and owned processes/staging are cleaned up. Cancellation records
-unknown settlement when backend stop is unconfirmed. The catalog signer is an
-isolated test publisher; installed acceptance needs its own operator-signed
-catalog and receipt. Current evidence and limits are in [state.md](../state.md).
+unknown settlement when backend stop is unconfirmed. The catalog signer and
+successful revalidation callback belong to the fixture. They do not prove the
+installed Home grant/session path. The installed operator catalog and receipt
+exist, but full Use failed; current evidence and limits are in [state.md](../state.md).
 Resource samples do not establish continuous peaks or complete idle/busy
 retention and eviction acceptance.
 
@@ -265,13 +294,45 @@ hashes, and the provider verifies payloads before each new engine start.
 Dispatch readiness describes the current binding; an actual run proves
 inference.
 
+## Content-to-consumer review
+
+The existing viewer relationship is identity and handoff metadata, not a grant
+to execute or read content. Home validates the sending frame and target, and
+Runtime issues and checks the consumer's launch context. Protected video passes
+only mint identity to Player; its scoped Runtime operations supply playback
+authority. Model selection should preserve the analogous separation between
+content CID and the consumer's typed model-run authority.
+
+| Existing path to reuse | Bounded change to review |
+| --- | --- |
+| `gateway_capsule_catalog/read_model.rs` already merges signed passive model entries into the capsule catalog. | Make Marketplace the primary content discovery path; retain System management and one catalog. Review the exact-one-entry validation and both helpers' at-most-one limit before broader choices. |
+| Generic `CapsuleManifest.viewer`, viewer compatibility audit and Home open-target handoff describe a content consumer. | The model profile rejects `viewer`; the current audit also requires an installed viewer-role target with a content interface. Agent/Assistant use their own roles and model interfaces. Map compatible selection explicitly rather than removing checks or relabeling execution as passive content. |
+| Library's protected-video handoff and Home launch context keep identity separate from authority. | Define the smallest exact-CID selection handoff into Agent/chat, preserving drafts, current launch binding and deliberate run intent. Current ready-only choices and Open Models to System do not provide this flow. |
+| Runtime preparation inventory, private artifact descriptors and the existing model provider own admission, retention and execution. | Compose selection with preparation while retaining fail-closed admission, exact offer binding and cancellation/outcome ownership. The content manifest supplies no execution capability. |
+| Content/availability own delivery; Carrier is the private off-box transport. | Adapt bounded local preparation reads to that delivery contract with finite byte/time/cancellation limits. Both the ordinary whole-file materializer and `viewer_gateway::viewer_content`, which reads the entrypoint into browser-delivered bytes, are unsuitable for model weights. Reuse handoff identity, not those byte paths. |
+
+Review in this order:
+
+1. Reproduce the first failed boundary with the actual package facts and Home
+   authority revalidation. Preserve structured phase/error evidence through
+   cleanup: safe bounded public status and detailed Runtime-private diagnostics.
+   Determine the cause before changing behavior or retrying installed Use.
+2. Map the existing contracts above for model-to-Agent selection and bounded
+   Carrier-backed off-box Content. Retain passive content, publisher trust,
+   consumer authority, the current registry and inventory.
+3. Propose the smallest coherent adaptation and focused rejection tests. After
+   review, require installed Marketplace-to-Agent selection, preparation and
+   exact-offer/reply proof, then the existing retention/onboarding/window checks
+   before publication. Local success and off-box delivery receive separate
+   verdicts; Browser repair retains its own owner.
+
 ## Source prerequisites and bounded implementation plan
 
 The following separates implemented primitives from remaining package work:
 
 | Existing surface | Current state and required extension |
 | --- | --- |
-| `elastos/crates/elastos-common/src/manifest.rs` | The bounded passive metadata profile above is implemented. Preparation must verify its declared facts against the complete fetched package before admission. |
+| `elastos/crates/elastos-common/src/manifest.rs` | The bounded passive metadata profile above is implemented, including the current viewer rejection. Review handoff compatibility separately from execution authority; preparation verifies facts against the complete fetched package. |
 | `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | The catalog projects installed inventory plus signed model metadata and caller-scoped admission, Keep and dispatch readiness. The preparation inventory owns reservations and admission receipts. Marketplace/System consume these facts; Assistant/Home Agent match exact ready offers and preserve optional CID intent. |
 | `elastos/crates/elastos-server/src/content.rs` | Preparation uses the explicit bounded local-fetch loop. Ordinary `fetch_bytes_via_provider` and `materialize_data_capsule` still drain whole files. `import_exact` and aggregate `import_object` remain capped at 64 MiB and 512 files; these are separate paths. |
 | `elastos/crates/elastos-runtime/src/provider/registry.rs` | Bounded reads validate and consume the native range once for Bytes and Stream. Ordinary `open_provider_stream` still decodes the full response into `ProviderStreamSession.bytes`; consumer chunking alone does not bound producer memory or cancel network work. |
@@ -313,7 +374,8 @@ Implemented source boundaries and remaining acceptance:
    before each read and observes backend capacity in bounded byte windows.
    Source tests cover slow/oversized/ignored-range failures, cancellation,
    duplicate selection, low disk and exact restart cleanup. The cold Qwen
-   process proof exercises the full closure. Installed memory/disk observations
+   process proof exercises the full closure with fixture authority revalidation.
+   Installed memory/disk observations
    and complete lifecycle acceptance remain separate from these fixtures.
 3. **Retention closure.** Additive activation is implemented through the existing
    Init boundary. Runtime holds the existing inventory worker lock through startup
@@ -345,15 +407,19 @@ Implemented source boundaries and remaining acceptance:
    Assistant/Home Agent keep exact offer/CID intent in existing workspaces and
    use current unique ready mappings. Missing choices and failed refreshes
    preserve drafts and accepted runs; new dispatch requires current readiness
-   and deliberate Send. Open Models uses the existing Home handoff to System.
-   Source fixtures cover these boundaries. Verify the combined installed views,
+   and deliberate Send. Current Open Models uses the Home handoff to System;
+   the content-to-Agent review above covers the intended discovery/use flow.
+   Source fixtures cover the current boundaries. Verify the combined installed views,
    offline/incompatible states and busy-safe eviction with the exact model.
    Keep ordinary app catalog behavior and hosted configuration unchanged.
-5. **Installed proof and publication review.** After source review, use the existing
-   authorized isolated proof scope with a compatible fresh install and no
-   model bytes or operator offer preconfiguration. Select the real signed Qwen
-   entry, prepare, receive a real reply through the existing typed run contract,
-   restart, reuse without transfer, release Keep and verify busy-safe eviction.
+5. **Installed proof and publication review.** Reuse the operator-signed package,
+   bounded local import and installed artifact receipts. Resolve the observed
+   Use failure before retry; record fresh-install prerequisites separately from
+   the existing owner Home. After reviewed adaptation, select the real signed
+   Qwen entry in Marketplace and open Agent/chat, prepare, receive a real reply
+   through the existing typed run contract,
+   restart, reuse without transfer, and verify explicit recoverability-aware
+   removal through System storage management with busy-safe eviction.
    The generic directory publisher currently reads whole files into a base64
    JSON array. Large-model bootstrap must use bounded operator/provider import
    or a separately verified publisher repair. Capacity admission covers the
@@ -368,9 +434,12 @@ Implemented source boundaries and remaining acceptance:
 
 The first package is the currently verified Qwen3.5-9B Q4_K_M with the existing
 llama.cpp engine; `components.json` estimates 6170 MB, which is not an exact
-signed closure size. Packaging must establish exact bytes, complete-closure CID,
-publisher signature/trust, base and quantization licenses/provenance, resource
-limits and real availability. The existing engine's platform/checksum receipt
+signed closure size. The local operator package records exact bytes,
+complete-closure CID, publisher signature/trust, licenses, provenance claims,
+resource limits and local availability. Its verified scope and upstream
+provenance limits are in [state.md](../state.md#current-isolated-owner-home).
+That local package proof does not establish off-box distribution. The existing
+engine's platform/checksum receipt
 and shared libraries must work on a genuinely fresh supported install; missing
 engine or unsupported hardware yields an actionable incompatible/unavailable
 state rather than using an ambient executable or another model. Engine delivery

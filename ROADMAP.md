@@ -139,10 +139,16 @@ in the UI. Recipients verify it before retaining, mounting, or forking it.
 The contract and its limits live in
 [Content availability](docs/CONTENT_AVAILABILITY.md).
 
-The first package-delivery milestone is the verified local Qwen model as a
-signed, CID-identified content capsule installed through typed Runtime Get. Its
-ordered flow and acceptance gate live in
+The first package-delivery milestone is a signed, CID-identified Qwen content
+capsule used through Runtime-owned preparation. Source has bounded local
+admission/offer binding and reply/reuse fixture proof; installed Use and cold
+peer delivery remain unaccepted. The intended experience uses Marketplace
+discovery/Open into Home Agent, retains the selected local model, and provides
+recoverability-aware removal in System. Generic Get is not current shipped
+support. The contract lives in
 [Content capsule distribution](docs/CONTENT_CAPSULE_DISTRIBUTION.md).
+Execution and proof dependencies live in
+[Builder-only execution](TASKS.md#builder-only-execution).
 
 ### 3. Build Runtime-mediated protected content
 
@@ -502,12 +508,18 @@ It must not create a separate trust root or expose key material to apps.
 
 AI providers and agents need explicit identity, capabilities, budget policy,
 data access, and audit. Hosted credentials stay inside configured providers.
-Local and hosted models should expose the same typed Runtime contract.
+Local and hosted models use the same typed Runtime contract. Chat Completions
+and Responses adapters have fixture coverage; real configured provider
+compatibility and installed lifecycle proof remain open.
 Installed provider acceptance precedes service publication. Runtime publishes
 the operator-selected signed offer and owns principal-scoped grants. The
 destination Runtime authorizes each remote request, and Carrier transports only
 the route that Runtime selected. Local-engine sharing and hosted-API sharing
 have separate acceptance tracks in [Model provider](docs/MODEL_PROVIDER.md).
+Carrier ingress bounds and destination-owned remote authority precede peer
+acceptance. Hosted-sharing policy and full Jetson target proof remain requested
+work with credential, terms, access and hardware prerequisites, even when source
+review publication occurs earlier.
 
 Operator tools should derive decisions from source, signed artifacts, and
 machine-readable evidence. Durable docs should record contracts and current

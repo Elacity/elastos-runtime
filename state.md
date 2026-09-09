@@ -8,18 +8,24 @@ volatile proof logs remain outside the repository.
 
 ## Release Posture
 
-- A fresh fetch records `origin/main` at `8ac18bec` as the released `v0.7.0`
+- The recorded coordination fetch places `origin/main` at `8ac18bec` as the released `v0.7.0`
   source and `origin/upstream/0.7.1-dev` at `6c61c990` as the active
   integration line.
 - Released `v0.7.0` already carries the coordinated workspace version,
   changelog, manifest bumps, and lock refresh. Installed artifacts report
   `0.7.0` only after the checked publish flow stamps
   `ELASTOS_RELEASE_VERSION`; unstamped source builds report `0.7.0-dev`.
-- Cached historical tracking is `origin/feat/0.7.1-integration@5ba1faa0`.
+- The former integration branch ended at `5ba1faa0`.
   PR58 merged it into `origin/upstream/0.7.1-dev@6c61c990`, then the integration
   branch was deleted. The setup guard is equivalent to the local guard.
-  The reviewed local history and model preparation work await explicit
-  publication after local reconciliation and installed acceptance.
+  Reviewed code checkpoint `05ee824dcc0b0bde75908af89a90e9fb17bceb76`, tree
+  `9c6b096b19968ef021dd8e9daba2ae1f4e331278`, preserves the normal PR58 merge
+  and model preparation work, and adds bounded failure diagnostics. Its checked
+  comparison before documentation reconciliation is 49 commits ahead and zero
+  behind the fetched development line; the remote integration branch
+  is deleted. Publication awaits the user's manual branch check and explicit
+  approval. Independently owned Browser and dKMS release acceptance can remain
+  open when source is published for review.
   Local merge `91209988`, tree `16f8f020`, preserves the five reviewed groups:
   artifact verification `c95cf4c9`, local-engine lifecycle `7c4fc929`, hosted
   evidence `fcb8fc5e`, Responses and honest cancellation `0d768415`, and delivery
@@ -37,8 +43,8 @@ volatile proof logs remain outside the repository.
   `2f844cef`, key reconstruction `467a6c03`, custody provider `1b7fa732`,
   Wallet rights `c9e82e75`, Runtime `a8ac6dc8`, and rights `3627da01`.
   Every tip is an ancestor of the published lifecycle and is already present
-  in the active integration. The latest published protected-branch repairs
-  need no new extraction.
+  in the active integration. Those earlier repairs need no new extraction;
+  Irzhy's open follow-up stack below remains separate and unmerged.
 - `main` and `origin/upstream/0.7.1-dev` already include the reviewed Home
   audit fixes, the named principal-root write policy, checkout-bound test
   fixtures, the privacy-reviewed audit workbook, the completed-mint adoption
@@ -72,6 +78,82 @@ volatile proof logs remain outside the repository.
   transport before the Runtime-selected custody target handles the request.
   Public provider projection excludes these targets.
 
+### Public coordination and overlaps
+
+Analyser's recorded fetch and public GitHub review observed development at
+`6c61c990` and main at `8ac18bec`. Development includes PR58, PR52/54 and the
+rebased PR55 work. PR55 is closed with
+[Irzhy's equivalence mapping](https://github.com/Elacity/elastos-runtime/pull/55#issuecomment-5585799199).
+That review compared candidate `94ed0dc6` with development: 48 ahead and zero
+behind, with 216 changed files and 44,446 additions/2,350 deletions. The later
+reviewed diagnostic code checkpoint is `05ee824d`, tree `9c6b096b`; its checked
+pre-documentation comparison is 49 ahead and zero behind the same fetched
+development ref. The documentation reconciliation describes the owned execution
+queue. Installed owner Home remains at `94ed0dc6`, separately identified below.
+
+| Public work at the review checkpoint | Recorded layer and ownership |
+| --- | --- |
+| [PR60](https://github.com/Elacity/elastos-runtime/pull/60) at `617796a9` | Open, four commits for installed proof and product fixes; Irzhy owns review and integration. |
+| [PR59](https://github.com/Elacity/elastos-runtime/pull/59) at `25ab205e` | Open, follows PR60: cutover `3dc4e66d`, then separate dead-code cleanup `25ab205e`. Review both against current callers. |
+| [PR62](https://github.com/Elacity/elastos-runtime/pull/62) at `decab1f5` | Open, one documentation-plan commit with 18 tasks for Creator, nonmedia, audio, cleanup and the crypto review package. It is a plan, not implemented support. |
+
+At that review, the development head and all three PR heads had successful CI. PR60/59 reported
+installed Anvil/Base-fork proof with three containers. That evidence is distinct
+from independent hardware/operators, real funded Base and Brave GUI acceptance,
+which remain open. Issue #48 remains open: golden vectors and a review package do not
+constitute independent crypto review. PR51 marks checks #45/#46 complete while
+their implementation PR60/59 remains unmerged; checklist state, source
+integration and installed acceptance are separate layers. PR15's latest
+substantive comments are from August 28; the authority, KID, payment and royalty
+answers there remain the reference rather than a new unresolved discussion.
+
+The recorded Browser review inspected unpublished, dirty
+`fix/browser-maturity@8feb264c`, tree `093b3b2`, with last integrated point
+`32c3d8d1`. Against candidate `94ed0dc6`, 21 commits were integration-only and
+120 were Browser-only. That comparison is historical; the owner has advanced
+the branch. Current Browser execution belongs to its canonical
+`docs/BROWSER_ACCEPTANCE.md` and `TASKS.md`, with a pinned reviewed boundary
+required before integration. At the recorded checkpoint its owner reported
+bounded local AV/input/close and remote Exit checks; remote Engine first page,
+actual operator workflow, AV reliability, soak, target/human and update gates
+remain open. Integration requires a pinned reviewed boundary under that owner's
+milestones, rather than merging a moving dirty branch.
+
+Public `scripts/install.sh` and README instructions currently support Linux;
+Mac evidence is source-home staging. System projects trusted-source/update
+policy through `setSourceState` and `system_source_summary`, and development
+builds disable update checks. The existing public-install operator and Home
+frontdoor smokes are reuse points. Current Mac artifact/restart proof establishes
+neither clean public installation nor ordinary GUI update acceptance; latest
+target/live update proof remains pending.
+
+At that review, a read-only trial merge of candidate `94ed0dc6` with the
+follow-up stack reported 27
+shared files and six conflicts: `TASKS.md`, `state.md`,
+`capsules/model-provider/src/execution.rs`, `components.json`,
+`elastos/crates/elastos-runtime/src/provider/bridge.rs`, and
+`elastos/crates/elastos-server/src/documents.rs`. It changed no checkout files.
+The shared-file review needs these owner decisions before integration:
+
+- The model execution conflict is a test polling fixture; preserve the current
+  execution contract while comparing deterministic test behavior.
+- The bridge change adds a 30-second warning and tracing around raw requests;
+  retain current bounded reads, response association and lifecycle ownership.
+- Incoming cleanup removes `DocumentsSaveRequest`, but this candidate uses it
+  with `if_revision`. Retain the used type and conditional-save behavior.
+- Review component inventory and current docs semantically. The Home Library
+  open-target allowlist omits `elacity-player`; PR62 task 1 assigns that repair
+  to Irzhy. Coordinate the boundary rather than duplicating it locally.
+
+First agree these overlaps, diagnose the installed model failure with real Home
+authority, and review the minimal Marketplace-to-Agent/System-storage adaptation.
+Then complete this branch's onboarding/window/save/update checks and manual
+handoff for review publication. Integrate the reviewed PR60, PR59 and selected
+PR62 work with the Browser owner's work only after review, then verify all five
+release journeys on one checked build. Creator/nonmedia/audio scope requires
+explicit agreement; it is neither silently deferred nor complete. The single
+active sequence and owners are in [TASKS.md](TASKS.md#now).
+
 ## Branch Hygiene
 
 - Local UIUX subgroup branches are extraction scaffolding already contained in
@@ -87,6 +169,78 @@ volatile proof logs remain outside the repository.
   cleanup; published source does not make every older hunk equivalent.
 
 ## Installed candidate proof
+
+### Current isolated owner Home
+
+The isolated owner Home now binds source
+`94ed0dc6a5573768cb3d120604e08b820927fa88`, tree
+`12127653a63d64a6cd4f6b39b42f56d5082344b7`. The canonical installation and
+strict restart receipts pass. Built and installed Runtime SHA-256 is
+`1aade5a37fa3e76171ae886002d89d527f0df956bcdcb7fbd22b1f23d8d59f90`
+(82,382,768 bytes). Home returns HTTP 200. The 121 artifact files and 18
+contained engine symlinks match the reviewed set; 64 capsule files match source
+and installation, and all 46 served browser assets also match manifest hashes.
+The updated native dependency closure and engine receipt are verified. Model
+and IPFS providers registered through the existing Runtime registry.
+
+A real local operator-signed catalog validates through the exact Runtime read
+model. The pinned complete package was imported with bounded streaming into a
+new owner-only Content backend repository; exact CAR size/hash/root checks and
+four installed bounded offline reads pass. Existing Content repositories and
+model inputs were preserved. The existing IPFS provider owns this backend.
+Publisher trust and observed availability are separate facts; upstream model
+authors did not sign this operator package. The catalog has a bounded acceptance
+window and explicit local admission budgets. An independent fresh Home reload
+rendered the desktop, and System Models showed the verified local Qwen catalog,
+public CID and 6,169,366,387-byte package: Not prepared, Use enabled and Keep
+disabled. The subsequent user Use action showed Preparation failed. Its durable
+record is terminal failed with 24,403 of 6,169,366,387 bytes completed and a
+727-byte index. The completed count equals the four metadata files. Progress
+is recorded before each final file check, so evidence narrows the failure to
+the last metadata-file check or the first weights-window boundary; the exact
+exception is unknown. Settlement removed staging and released the reservation.
+Admission and model activation were not reached; the retained activation-pending
+flag does not establish activation. The installed Runtime logs the private exception at debug
+level, which the installed log did not retain. Offer/reply, Keep and shared
+selection remain pending. Unauthenticated catalog access correctly returned
+HTTP 403; this attempt produced no inference.
+
+Reviewed source `05ee824d` retains a finite failure phase in the existing
+preparation record, projects a bounded public class, and correlates structured
+private warnings with the operation. Its five-case focused Rust test passes:
+metadata integrity, first weights fetch, header, real Home grant revocation
+after metadata, and failed drain retaining staging/charge. The shared UI failure
+smoke also passes. This is source diagnostic proof; it is not installed here
+and does not identify or repair the older failure. That record's cause remains
+unknown until a bounded installed reproduction establishes it.
+
+All 490 unrelated artifact records retain their captured bytes and metadata.
+Sixteen of 18 post-stop private file records are unchanged; the two changed
+records contain Runtime auth/session and audit state. Protected principal,
+passkey, enrollment and root-protection field hashes match. User-root, Profile,
+Wallet and private configuration bytes are preserved. The canonical root check
+reported already ready with zero roots and objects to upgrade. Earlier
+concurrent browser-state/auth changes were classified before the fresh baseline
+rather than restored. The prior gateway, provider children and exact-owned
+managed child exited; temporary import/export processes were reaped. The
+separately owned rollback remained intact. Free space and the remaining model
+admission reserve stay above the 10% floor.
+
+The service has the known unconfigured inactive custody warning; media
+configuration and Browser VM artifact prerequisites remain unchanged. Artifact,
+service and preservation checks pass, as do the fresh reload and Models catalog
+observations above. An earlier separate acceptance tab showed a blank frame;
+this remains an unconfirmed historical tab/tool observation rather than a Home
+startup blocker. Its 44 bootstrap assets and 32 static module links also passed.
+The model journey now has a confirmed installed failure; combined onboarding
+and capsule acceptance, and final review/handoff remain pending. Analyser owns these
+manual checks. Browser window, chooser, guest-service and lifecycle acceptance
+remain separately owned and do not block documentation or branch review.
+[Builder-only execution](TASKS.md#builder-only-execution) maps the remaining
+owned Home/model work into nine ordered steps using the existing source and
+process proofs, with external prerequisites and separate owner gates explicit.
+
+### Earlier installed journeys and separate targets
 
 - Browser remains a separately owned acceptance dependency. Its owner reports
   newer local checks and open startup/refresh issues, but those updates lack a
@@ -240,7 +394,8 @@ The integrated source includes these durable facts:
   Workspace/Chain formatting, Home/public-copy entropy and diff checks pass.
   These prove metadata consistency and publisher verification,
   including rejection paths; the composed preparation proof is recorded below.
-  Installed Homes remain unchanged. Model-provider consumes Runtime-owned
+  Those metadata tests alone provide source proof. The current installed result
+  is recorded above. Model-provider consumes Runtime-owned
   private artifact/offer configuration. Marketplace and System source views
   consume the shared projection. Model and Assistant Truth below records the
   existing Qwen operator bootstrap.
@@ -253,13 +408,24 @@ The integrated source includes these durable facts:
   receipts own retention evidence, Runtime owns policy and atomic admission,
   and content and availability providers own backend selection and routes.
   Package identity remains separate from model service offers.
+- The existing capsule catalog already merges signed passive model metadata.
+  Current verification requires exactly one model entry, and both shared model
+  helpers allow at most one. `ModelContentMetadata::validate` rejects `viewer`
+  alongside executable authority, while the generic content manifest supports
+  a viewer handoff. This is a contract mismatch to review, not permission to
+  remove passive-content or authority checks. Agent exposes ready models only
+  and Open Models targets System; Marketplace and System share the same
+  management view. The intended Marketplace model-content to Agent/chat flow
+  remains an adaptation and installed-proof requirement.
 - Explicit `bounded_read: true` now carries a closed range through local
   Content to native IPFS, with a 64 KiB per-read cap and five-second total HTTP
   and body deadline. Native reads use the ready backend and its existing activity
   record, with redirects and proxy inheritance disabled. They perform no startup,
   pin, retry or fallback. Runtime checks the private CID/path/range receipt and
   exact byte count, consumes the range once, and removes that receipt from Bytes
-  and Stream output. Remote bounded calls fail before dispatch.
+  and Stream output. Remote bounded calls fail before dispatch, and bounded
+  Content fetch bypasses availability-provider retrieval. This is a local
+  foundation, not verified Carrier-backed off-box model distribution.
 - Complete `_elastos_object.json` reads use `max_bytes` up to 64 KiB, with
   Kubo length capped at one extra byte. EOF within the cap and an exact private
   CID/path/completed/length receipt are required. Runtime preserves whitespace
@@ -312,7 +478,12 @@ The integrated source includes these durable facts:
   replay across restart and persisted Keep. The publisher used an isolated
   operator-attested signed catalog. Both Kubo children, the native providers
   and the temporary root were cleaned up. This does not establish upstream
-  publisher identity, per-run backend stop or installed behavior.
+  publisher identity, per-run backend stop or installed behavior. It supplies a
+  fixture catalog and successful revalidation callback rather than the installed
+  Home grant/session path. Native preflight covered the index and selected
+  weights ranges, not a complete installed Use. The failed installed attempt
+  requires first-boundary reproduction and structured private/public failure
+  evidence before a functional repair or retry.
   Process-tree memory and disk observations are samples, not continuous peaks;
   complete idle/busy retention and eviction acceptance remains open.
 - Focused source gates pass: 204 model-provider library tests, five provider
@@ -345,8 +516,9 @@ The integrated source includes these durable facts:
   deliberate Send; accepted runs retain their existing resume and cancel path.
   Only an empty initial choice uses the existing first-offer default. Open Models
   uses the registered Home frame and token to open System Models. Source unit,
-  actual-page browser and workspace roundtrip tests pass. Combined installed
-  composer acceptance remains open; installed Homes and user data are unchanged.
+  actual-page browser and workspace roundtrip tests pass. These assets now have
+  exact isolated owner-Home installation parity; combined installed composer
+  acceptance remains open.
 - Large-model publication needs a bounded operator/provider bootstrap path or a
   separately verified publisher repair. The current generic directory publisher
   reads whole files and builds a base64 JSON array. Cold-proof capacity must
@@ -489,7 +661,7 @@ complete. Installed proof and the atomic authority cutover remain open.
   Recovery Kit and created a Profile. The exported bundle explicitly omitted
   People identity and preceded the Profile by 15 seconds. Root recovery is
   configured; that downloaded kit does not cover the later Profile.
-  The owner installation now binds `abefc7ae`, tree `81d89d5a`. Runtime and
+  The earlier owner installation bound `abefc7ae`, tree `81d89d5a`. Runtime and
   object-provider built and installed hashes match. The five changed
   Home/System/People assets match source, installed, served and manifest hashes.
   Strict restart returned HTTP 200. Home reload replaced the previous managed
@@ -762,13 +934,14 @@ complete. Installed proof and the atomic authority cutover remain open.
 - The current `components.json` bootstrap pins the Mac evaluation artifacts to
   immutable upstream publisher revisions and SHA-256 values: Qwen3.5-9B Q4_K_M
   is the stable candidate, PrismML Bonsai 8B Q1_0 is experimental, and llama.cpp
-  `b10516` supplies the macOS arm64 engine bundle. The private operator offer
-  selects the canonical installed path and digest. The current closeout must
-  replace this setup-only product dependency with CID-addressed selection and
-  Runtime preparation for that one Qwen package. Existing engine verification
-  remains required on a fresh installation. Real catalog publisher trust,
-  signed closure identity and availability deployment still need evidence;
-  fixture keys and CIDs do not establish production readiness.
+  `b10516` supplies the macOS arm64 engine bundle. The earlier direct-offer
+  evaluation used the canonical installed path and digest. The current owner
+  Home instead has a real operator-signed CID catalog, complete pinned Content
+  package and verified engine, as recorded under Installed candidate proof.
+  Runtime preparation and exact offer binding have source/process proof;
+  installed authenticated Use and reply remain open. The source bootstrap URLs
+  remain operator setup inputs, while the current model selection contract uses
+  the catalog CID. The separate evaluation Home retains its earlier receipt.
 - The pinned Mac evaluation ran both candidates through llama.cpp. Bonsai
   passed and was lighter and faster in the three-prompt comparison. Qwen passed
   with thinking disabled and remains the stable-quality candidate. The local
@@ -1048,10 +1221,10 @@ complete. Installed proof and the atomic authority cutover remain open.
   Uncertain replies retain the original intent and deadline; cached responses
   retry exact completion. Signed-in Home preserves its current account.
   Installed passkey, recovery and Save/Later proof remains open.
-- Installed owner and Qwen Homes remain on `abefc7ae` and `8e6d298d`,
-  respectively. Their guidance, focus and artifact evidence applies to those
-  trees. The current onboarding and window source changes await combined
-  installed acceptance.
+- The owner Home now has `94ed0dc6` artifact/startup/preservation proof; the
+  separate Qwen evaluation Home retains `8e6d298d`. Earlier guidance and focus
+  observations keep their original source scope. Current onboarding and window
+  assets are installed, while their combined manual acceptance remains open.
 - Optional single/multiple/hybrid window metadata passes through the existing
   manifest, Runtime catalog and launch path. The 41-manifest source inventory
   has ten single, six hybrid, one multiple, two content, two shells, two owned
@@ -1100,7 +1273,7 @@ complete. Installed proof and the atomic authority cutover remain open.
 | Current navigation | Home regression proves verified A-to-B selection restores B alongside independent C with fresh tokens. The grouped consumer regression covers real Library/Archive/GBA/Chat selectors, relay and restore, failed/stale loads, picker exclusion and GBA save conflicts. |
 | Documents and GBA saves | Documents save 13/close 9 and GBA save 18 pass. Real-Brave Documents layout/conflict and GBA opaque-frame proof pass with the shared module; storage and two-file failure limits remain in their sections above. |
 | Picker delivery | Home/Library/Archive 18 and Browser/CDP 16 pass. The real-Brave Library menu fixture passes exact Archive request/document/acknowledgement delivery, visible standalone status and existing file/extract assertions. Its Browser chooser receiver is a fixture. |
-| Generated Chat | Native tests pass 30/30. Regenerated JS/WASM pass all nine configured real-Brave scenarios: bootstrap/reload/reopen, failures, stale switches and 375/640/1280 layouts. Installed artifact parity remains open. |
+| Generated Chat | Native tests pass 30/30. Regenerated JS/WASM pass all nine configured real-Brave scenarios: bootstrap/reload/reopen, failures, stale switches and 375/640/1280 layouts. Current source/installed/served artifact parity passes; the combined installed Chat journey remains open. |
 | Host fixture lifecycle | Restored-Browser Brave proof records one Home refresh, two open requests, one provider effect, one cleanup effect and zero remaining pages/VMs. Fixture contracts pass 10/10, including error preservation, Shutdown and unique generations. Home bridge, Home/public-copy/Browser entropy, syntax, diff and applicable formatting checks pass. |
 
 - Hosted target fixtures require the existing Runtime proxy, use one adapter

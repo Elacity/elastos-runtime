@@ -12,133 +12,217 @@ Do not add new product surface area until the `Now` section is materially tighte
 
 ## Now
 
-Goal: prepare this branch for final manual Brave acceptance of first-run
-creation/recovery, capsule window and selection policies, and one CID-addressed
-local Qwen Use/Keep/selection path. Complete model integration, then combined
-isolated acceptance and human review. Browser repairs belong to another session;
-their acceptance evidence remains visible and separate.
+Goal: make the five release journeys below reliable on one reviewed candidate.
+The current candidate is installed with artifact parity verified. Model failure
+diagnosis, unified model handoff/storage design and combined acceptance remain
+open. Exact public refs, CI and shared-source overlaps are in
+[state.md](state.md#public-coordination-and-overlaps).
 
-Active priority index:
+| Release journey | Source and installed evidence | Remaining proof and owner |
+| --- | --- | --- |
+| Clean install and setup | Public installer is Linux-only; Mac is source-home staging. Existing owner Home artifact/preservation checks and installer fixtures are reuse evidence. | Analyser coordinates clean Linux install/setup and human onboarding with Sash; Mac staging receives its own verdict. Reuse public-install/operator and Home-frontdoor smokes rather than equating artifact restart with clean install. |
+| Discover and apply updates | System projects trusted source/update policy; development builds disable update checks. Existing operator/update fixtures are reuse points. | Analyser verifies ordinary discovery/application, receipts, restart and account/data preservation on an eligible target/build. Latest target/live and GUI update acceptance remain pending; release owners retain publication authority. |
+| Obtain a model and run local AI | Local signed package, bounded import, catalog and native Qwen fixture proof pass. Installed CID Use failed after metadata progress. | Builder diagnoses with real Home authority, then proposes Marketplace-to-Agent selection and System storage management. Analyser verifies fresh retrieval/readiness/reply, reuse and retention. Carrier/Content owner reviews off-box delivery. |
+| Browser | Separately owned, unintegrated branch reports bounded local AV/input/close and remote Exit tests; source and target receipts retain partial verdicts. | Browser owner supplies a pinned reviewed merge boundary, then remote Engine first page, operator workflow, AV reliability, soak/target/human/update proof. Analyser records matching integrated evidence; source checks do not establish release readiness. |
+| Publish an asset with dKMS | Current typed/source proofs; Irzhy's unmerged stack reports installed Anvil/Base-fork proof with three containers. | Irzhy owns the reviewed proof/cutover/product-plan stack. Agree release scope for Creator, nonmedia and audio; real funded Base, independent operators/hardware, Brave journey and external crypto review remain distinct gates. |
 
-- current priority: operator-signed catalog setup and combined isolated Home
-  acceptance of the reviewed source
-  using the [installed provenance in state.md](state.md).
-  Reviewed onboarding/window/save source work remains part of this closeout.
-  Complete artifact parity, source review and final human Brave checks before
-  explicit GitHub publication.
-  Live deployment, data migration and paid calls require separate authorization
-- released line: `origin/main@8ac18bec` is `v0.7.0`. Keep follow-up work on
-  `origin/upstream/0.7.1-dev` until the reviewed 0.7.1 line is ready. The
-  checked publish flow still owns release stamping
-- cached historical tracking is `origin/feat/0.7.1-integration@5ba1faa0`.
-  That branch was merged through PR58 into `origin/upstream/0.7.1-dev@6c61c990`
-  and deleted. The reviewed local history and model preparation work await
-  explicit publication after local reconciliation and installed acceptance.
-  Local merge `91209988` preserves the five reviewed model/delivery groups
-  through `ed275ba0` and the three reviewed auth commits through `43b8f830`.
-  Earlier candidate `900d7e5c` remains the broad installed UIUX and
-  protected-content proof. The reviewed PR52, PR54, and PR55 source slices
-  remain part of the current candidate
-- integrated UIUX source evidence: published
-  `origin/feat/0.7-uiux-candidate` at `8b547590`; this ref is donor evidence,
-  not installed, live, or release truth
-- current protected-content source stack is already in `origin/main` and
-  `origin/upstream/0.7.1-dev`, including the exact PR43 mint-adoption commit
-  `58ebfb23`. The audit fixes retain mixed source and installed evidence.
-  Each remaining GUI gate needs its own verdict
-- separately authorized after localhost: install the same reviewed tree on the
-  seed and the third custody node with matching stable receipts
-- all other work remains queued below
+Browser execution belongs to the owner's canonical `docs/BROWSER_ACCEPTANCE.md`
+and `TASKS.md` on `fix/browser-maturity`. That mission owns installed core,
+operator workflow, Engine/Exit placements and full B01–B16 qualification,
+including profiles, file/Wallet/accessibility and install/update. Its bounded
+local proof and failed pre-effect remote open retain separate verdicts.
+Before integrating a pinned reviewed boundary, map this file's older Browser
+requirements into that mission; preserve distinct acceptance until mapped.
+A source HEAD alone does not identify an installed artifact.
 
-Builder implements bounded source steps. The Analyser reviews proof and advances
-gates. Routine local testing stays within the authorized isolated scope. Anders
-approves remote publication, live deployment, data migration, paid calls and
-human acceptance. Sash and Irzhy review the areas that they own or changed.
+### Builder-only execution
+
+This is the execution queue for our Home/model work. Builder owns bounded source
+repairs and focused tests on the approved integration line. Analyser owns
+independent review, shared-resource coordination and installed/manual acceptance;
+Anders owns final acceptance and publication approval. Browser implementation,
+image/update internals and dapp internals belong to the Browser owner. Irzhy owns
+dKMS, custody and asset mint/buy/play. Ordinary Wallet and connector behavior
+remains in our Home acceptance without expanding into those excluded effects.
+
+Existing source tests are reuse evidence, not installed verdicts. Preserve
+accounts, Wallets, passkeys, profiles, content, drafts and accepted runs. Start
+only the current reviewed boundary; repair later code only after reproducing a
+defect or agreeing its missing contract. Cargo, transfer, inference and target
+work require the coordinated resource window and explicit target authority.
+
+The numbered steps give the preferred dependency order, with one implementation
+boundary active at a time. Missing peer, credential or hardware inputs keep
+that exact proof pending while already-ready ordinary Home, local lifecycle or
+installer checks can proceed. Immediately before each relevant step, review and
+freeze its handoff, retention, transfer or remote-authority contract choices.
+
+#### 1. Establish and repair the preparation failure
+
+**Status:** focused diagnostic source verification passed; installed cause and
+causal repair remain open. The five-case
+`model_preparation_failure_phase_survives_cleanup_with_real_home_revalidation`
+test and `scripts/model-preparation-failure-smoke.mjs` pass: metadata integrity,
+first weights read, header, real Home grant revocation after metadata, and failed
+drain preserving bytes/charge. This proves the diagnostic boundary, not the
+cause of the installed failure. Next, Analyser performs a bounded installed
+diagnostic/reproduction on the exact package and artifact tuple. The older
+failed record retains unknown cause.
+
+**Pass:** identify the actual failed boundary, implement its minimal causal
+repair and regression, and prove fresh admission, the matching Qwen offer, one
+real reply and zero-transfer reuse. Record cleanup or honest uncertainty.
+Diagnostics and imported-copy fixtures alone cannot close this step.
+
+#### 2. Unify model discovery, selection and storage
+
+**Status:** implementation required after step 1 and contract review.
+Use Marketplace for primary model discovery/details and Open into the existing
+Home Agent through catalog/Home handoff. Preserve exact CID, drafts, selected
+offer and accepted run identity across Home Agent and standalone Assistant.
+System manages the same inventory: Use retains the selected local model for
+reliable repeated use; explicit removal checks active runs and recoverability,
+with warning and consent for possible loss of the sole copy. Remote inference
+is a separately selected service.
+
+**Pass:** focused model-management/selection smokes plus installed discovery,
+Open, reply, reload/restart reuse and safe removal. Review viewer-role
+compatibility without routing weights through browser viewer-content, and
+bounded catalog/helper behavior for multiple entries. Keep one catalog,
+admission inventory, ProviderRegistry and run journal. Exact multi-entry limits,
+handoff metadata and recoverability evidence require review before coding.
+
+#### 3. Prove genuine cold CID delivery
+
+**Status:** bounded delivery adaptation and peer proof required after steps 1–2.
+Current model reads are Local-only and bypass availability; generic whole-file
+or whole-response paths do not provide bounded model transfer. Coordinate with
+the Carrier/Content owner before shared edits. Bound incoming bytes, time and
+concurrent streams before external peer acceptance, preserving current provider
+invocation and one Carrier stack.
+
+**Pass:** a cold recipient with no model bytes obtains the trusted closure
+through Content/availability and Carrier authority. Verify signature, CID,
+resources and size incrementally; deny tamper and handle offline, cancellation,
+interruption/restart and cleanup with exact identity. Measure a small real
+transfer first, including throughput, resource and cancellation bounds, before
+the full model proof. Independent peer identity, reachable retained content and
+a reviewed transport boundary are inputs; local imported-copy proof is separate.
+
+#### 4. Complete Home and ordinary capsule acceptance
+
+**Status:** verify existing code; repair only reproduced defects. Depends on a
+reviewed installed candidate and disposable owner/enabled-guest fixtures.
+Reuse auth/recovery tests and `recovery-profile-setup-smoke.mjs`,
+`home-recovery-save-smoke.mjs`, window/deep-link/picker smokes,
+`documents-save-conflict-smoke.mjs`, `gba-save-conflict-smoke.mjs`,
+System window-policy and shell recovery/Inbox tests.
+
+**Pass:** Create and Recover, initial Profile, separate Save/Later guidance,
+exact recovery-kit coverage and restart; non-Browser/non-protected-player rows
+of the [capsule matrix](#capsule-window-acceptance); deep links, drafts, picker
+acknowledgements, conditional/two-window Documents save, GBA conflict/selection,
+ordinary Archive/Library files, Chat, repeated System Save, direct
+Desktop/Terminal switching and exact Inbox handoff. Preserve ordinary Wallet
+and connector behavior. Source-green negatives are reused unless changed or
+contradicted; each installed gate receives its own verdict.
+
+#### 5. Close local Agent/model lifecycle acceptance
+
+**Status:** existing contract/fixtures to verify after steps 1–2, with bounded
+repairs only where proof fails. Use the existing provider run tests, model
+selection smoke and installed Home Agent/Assistant surfaces.
+
+**Pass:** one typed reply and exact outcome, explicit selection, stop with
+confirmed settlement or honest unknown, lost-response/saved-run recovery,
+reload/restart and draft preservation, exact request identity, no implicit
+redispatch, and cleanup. Test provider failure and retained terminal replay.
+For a missing saved run, preserve the unsent draft and old identity; Check
+status or explicit New chat must not silently repeat the request.
+Home Agent and Assistant retain their owned surfaces; Studio/tools expansion
+and a catalog redesign are outside this completion set.
+
+#### 6. Prove configured hosted API use
+
+**Status:** installed verification pending; Chat Completions and Responses
+adapters already have fixture coverage. After the shared run boundary is
+verified, operator credentials, route policy and an approved paid-call budget
+are explicit inputs.
+
+**Pass:** real configured routes show truthful requested/resolved model and
+usage/cost facts, safe credential storage, one dispatch, failure/cancel/restart,
+redaction and cleanup through the same typed run contract. Reuse adapter fixture
+tests and installed Agent/Assistant acceptance. Verify each claimed provider's
+compatibility; an OpenAI-compatible label is not proof. Reuse the two adapters
+rather than four vendor-specific providers. Codex agent execution is separate.
+
+#### 7. Complete remote inference, hosted sharing and Jetson proof
+
+**Status:** authority adaptation plus peer/target verification required.
+Local-engine sharing depends on steps 3 and 5; hosted sharing also depends on
+step 6 and policy review. Reuse signed service offer/request/approval/grant/
+select/revoke contracts. Model is currently excluded from the provider
+allowlist; adding it alone does not establish remote authority. Map authenticated
+source Runtime plus principal/capsule/run to destination-owned authority before
+dispatch, preserving one registry and run journal.
+
+**Pass:** two real Runtimes with independent identities prove cross-issuer and
+cross-principal denial, exact result ownership, limits, expiry/revoke,
+disconnect/restart and cleanup. Then prove hosted-sharing terms, prompt privacy,
+consumer/operator consent and cost/rate enforcement. Prove a full Jetson
+destination Runtime when access and hardware are available. Target preflight
+must establish actual RAM, GPU, engine and model compatibility; the Mac model
+is not assumed to fit that hardware. Hosted sharing and
+Jetson remain requested, outstanding work even if a staged source review ships
+earlier. Destination mapping and hosted terms are review boundaries, not assumed
+completed design.
+
+#### 8. Verify clean install and ordinary update/repair
+
+**Status:** existing mechanisms to verify for our changed components; repair
+only reproduced failures. Analyser coordinates the fresh Linux public path
+with Sash and records Mac source-home staging separately. Reuse public-install,
+source-home install/runtime smoke, trusted-update and frontdoor tests.
+
+**Pass:** trusted artifact selection and source/built/installed/served parity,
+private config/identity/draft retention, interruption/failure repair and an
+ordinary release update on an eligible build. A development build's disabled
+update control does not prove updates. Use the existing installer/updater;
+Browser image/update internals and Irzhy's provider changes stay owner-scoped.
+
+#### 9. Review, accept and publish the scoped work
+
+**Status:** final verification and review, after the applicable preceding
+source/installed steps. Reuse focused Rust/JS tests, formatting, diff and
+Home/public-copy entropy gates; inspect authority boundaries and shared-file
+overlaps. Keep reviewable commits on the approved line, exact source/artifact/
+manual receipts, local hygiene and remote divergence, current state facts and
+remaining tasks.
+
+**Pass:** Analyser reviews the diff/evidence and Anders performs the manual
+acceptance, then explicitly approves source-review publication. Tested source
+slices may be reviewed earlier with credential, peer and hardware gates marked
+open, listing the exact unmet cold-delivery, hosted-use and remote/Jetson
+obligations from steps 3, 6 and 7. This is a deliberately partial milestone;
+full Builder completion requires the whole agreed set. Full combined release separately requires
+the Browser owner's and Irzhy's accepted scopes and integrated artifact proof.
+Installation, paid calls, migration, deployment and publication retain their
+specific approvals.
 
 ### Integrated UIUX and protected-content proof
 
-Verified integrated source and installed localhost truth is in
-[state.md](state.md). Candidate assembly, source checks, isolated installation,
-and the broad manual Brave journey are complete on `900d7e5c`. The journey
-found open first-run, Browser startup, model, collaboration, and
-protected-content prerequisites. It did not change the pending Wallet approval.
+Current source and installed verdicts live in [state.md](state.md). The model
+foundation includes bounded local preparation, admission/offer binding and
+native Qwen fixture proof; the installed Use failure remains open under
+[Builder step 1](#1-establish-and-repair-the-preparation-failure).
+Home/capsule acceptance uses [step 4](#4-complete-home-and-ordinary-capsule-acceptance)
+and the matrix below. These are evidence surfaces for the single Builder queue,
+not another implementation sequence.
 
-Open gates, in order. Source integration comes before combined isolated
-acceptance. Browser implementation belongs to its separate owner.
-
-1. [ ] Prepare one real operator-signed pinned catalog and exact-source setup
-   for the authorized isolated Home. Cold delivery, admission, ready reply,
-   active unknown cancellation, exact restart replay and Keep persistence
-   passed in the combined source/process proof. Complete installed idle/busy
-   retention and reclamation acceptance.
-   Package the exact existing Qwen model and verified engine for isolated
-   setup with a real pinned signed catalog and complete closure, publisher trust
-   and honest availability evidence. Distinguish verified upstream references
-   from conversion facts that the publisher attests. Git carries code, tests,
-   docs and manifests; large model bytes and private keys stay in operator
-   storage. Prove a cold exact-model reply, restart without another transfer,
-   cancel/cleanup, and retention while idle and busy. Source fixtures establish
-   neither production publisher identity nor installed model readiness.
-   The generic directory publisher still reads whole files into a base64 JSON
-   array. Use bounded operator/provider import with a recorded bootstrap receipt,
-   or separately fix and prove that publisher before sending a large model
-   through it. Reserve the complete proof layout, including any separate
-   publisher backend copy, above the 10% free-space floor.
-2. [ ] Complete combined installed Home acceptance and the manual Brave
-   checklist with exact installed artifact parity. Preserve
-   current accounts, Wallets, passkeys, profiles and content; use disposable
-   fresh profiles for first-run checks.
-   Complete owner and enabled-guest Create/Recover, verified-kit import,
-   separate Recovery Kit Save/Later, focus and reload. Include intent binding,
-   initial Profile creation, prompt-loss retry, rejected-name correction,
-   cached completion, cancellation, uncertain replies, wrong kit or actor and
-   partial Wallet restore. Verify the typed System import guidance after
-   incomplete sign-in, unknown readiness, reminders and Chat.
-   Complete window and current-selection policy across all 41 capsule
-   manifests below: reuse with current deep links and drafts, explicit
-   independent windows, launch races and saved positions. Verify exact
-   opener/document/chooser binding, acknowledgement before close, and
-   stale/replaced/duplicate denial, including asynchronous upload.
-   Use the Browser owner's reviewed artifacts and evidence for Browser window,
-   chooser, guest-service and lifecycle cases.
-   Verify repeated Save through one System window and current Documents,
-   Library, Archive, GBA and Chat selection restore with fresh Runtime authority.
-   Keep pickers, drafts and effects outside restored selectors. Complete
-   public share-reader navigation, GBA same-game conflict/reconciliation,
-   Documents two-window saves and selected Player sessions. Preserve the
-   stored winner and losing draft, pause autosave on conflict, and require
-   deliberate recovery after an uncertain create or body-before-metadata write.
-   Complete installed model draft/run preservation, uncertain outcome,
-   Marketplace/System/Assistant/Home Agent shared views, offline/error and
-   incompatible states, busy-safe eviction and shared-view idempotence,
-   cancellation, restart and exact terminal-result checks. Backend stop or
-   honest unknown settlement remains the cancellation rule; stream closure
-   alone does not prove backend stop.
-   Include isolated first-owner origin/RP admission and typed denials.
-   Windows enrollment and same-principal linking remain separate follow-up.
-3. [ ] Reconcile source and installed proof, docs, remote divergence and
-   reviewable commit groups for publication preparation.
-   Preserve reviewed history; compare changed upstream patches before adding
-   them. Finish the relevant source gates, exact artifact receipts and a concise
-   manual Brave checklist for Anders covering onboarding, recovery, windows,
-   selection, saves and the one Qwen Use/Keep path. Publish for review only
-   after his review and explicit approval. Keep release and deployment decisions
-   separate from source or isolated acceptance.
-
-External Browser evidence remains a separately owned acceptance dependency.
-The earlier hosted service smoke failed at
-`engine_close_indeterminate` because its v1 close result does not meet the
-generation-bound v2 terminal-receipt contract. Keep that historical receipt
-separate from the owner's newer work. Require matching source and installed
-receipts before adopting a repair or claiming this integration's Browser
-journey passes; changing external status alone is not proof here.
-
-Funded protected-content rollout remains later, under the
-[protected-content acceptance contract](docs/PROTECTED_CONTENT.md). Its owner
-retains the signed three-operator custody composition, Chain configuration,
-three-replica repair, funded mint/buy/read/restart proof, stable target receipts
-and explicit atomic-cutover authorization gates. Hosted services, Jetson and
-standing mandates also remain later.
+Browser target proof remains with its owner. Protected-content composition,
+Chain configuration, funded transactions, repair, cutover and external crypto
+review remain with Irzhy and the release owners under
+[PROTECTED_CONTENT.md](docs/PROTECTED_CONTENT.md).
 
 ### Capsule window acceptance
 
@@ -158,26 +242,26 @@ proof and current-navigation restore acceptance. Source receipts are in
 | Owned Agent surface (1) | `home-agent` | Keep the existing owned Agent surface. |
 | Runtime service (18) | `availability-provider`, `browser-engine-adapter`, `chain-provider`, `content-block-graph-provider`, `decrypt-provider`, `did-provider`, `drm-provider`, `exit-provider`, `ipfs-provider`, `key-provider`, `model-provider`, `net-provider`, `object-provider`, `operator-drive-adapter`, `rights-provider`, `tunnel-provider`, `wallet-provider`, `webspace-provider` | Runtime owns service lifecycle; these entries do not create ordinary app windows. |
 
-When the reviewed model-content manifest lands, update this inventory and its
-count. Model content is provider-consumed content: opening it uses the existing
-Agent or model-selection surface, not a new model app window. Its package
-contract stays in [Content capsule distribution](docs/CONTENT_CAPSULE_DISTRIBUTION.md).
-
-CID-addressed Qwen use and local retention are current closeout gates, with the
-implementation sequence
+The installed signed model catalog adds one provider-consumed content entry
+alongside these 41 repository manifests. Its intended handoff selects content
+in the existing Agent or model-selection surface rather than creating a model
+app window. That handoff remains under review. Its package contract stays
 in [Content capsule distribution](docs/CONTENT_CAPSULE_DISTRIBUTION.md).
-Remote hosted service publication, Jetson proof, Windows target proof and
-standing mandates remain later tracks. Protected-content live and funding
-prerequisites retain their separate acceptance and authorization gates.
+
+The model implementation and acceptance sequence is
+[Builder-only execution](#builder-only-execution). Hosted service publication
+and Jetson remain outstanding there. Windows target proof and standing mandates
+retain their existing separate scope. Browser and protected-player rows in this
+matrix belong to their respective owners, not Builder's ordinary capsule gate.
 
 ### Required transport gate before peer acceptance
 
-- [ ] The Carrier owner starts `fix/carrier-request-bounds` from the then-current
-  development line. Bound bytes, deadline, and concurrent stream resources at
-  the incoming request frame before JSON decode, while preserving current
-  provider-invocation semantics. Cover oversized, slow, truncated, and valid
-  calls. Finish before externally exposed CID, remote-model, or protected peer
-  acceptance. Review the broader signed-protocol work separately.
+- [ ] Coordinate the existing Carrier ingress work with its owner under
+  [Builder step 3](#3-prove-genuine-cold-cid-delivery), before external CID,
+  remote-model or protected peer acceptance. Preserve current provider
+  invocation; cover oversized, slow, incomplete and valid frames and concurrent
+  resource bounds. Agree the shared-code boundary without another Carrier stack
+  or branch. Broader signed-protocol work retains its separate review.
 
 ### Home audit follow-up
 
@@ -564,33 +648,12 @@ installed behavior and public-live behavior require separate evidence.
 - [ ] Keep unfinished surfaces out of the main live path unless they launch from Home and return cleanly.
 - [ ] Rehearse and simplify the Home/People/Spaces/System story so the front door feels useful without internal-runtime narration.
 - [ ] Extend `elastos.runtime.services/v1` beyond local configured-provider cards and conversation offers: remote Exit, storage, relay, model, and hosting offers must arrive as provider-backed `elastos.service.offer/v1` records through People/Carrier, and enabling one must create/select a principal-scoped provider grant instead of giving capsules direct People-state authority.
-  - [ ] Model Provider subtask: follow the independent backend and consumption
-    tracks in [Model provider](docs/MODEL_PROVIDER.md#deployment-and-placement).
-    Source and installed evidence stays in [state.md](state.md).
-
-    1. Rerun local Qwen completion, cancellation with confirmed backend stop or
-       explicit unknown settlement, restart, and cleanup on the exact candidate.
-       Verify missing saved-run recovery in Brave on the corrected installation:
-       preserve the unsent draft and old run identity, then use
-       Check status or explicit New chat without an automatic redispatch.
-    2. Prove real operator-configured Chat Completions and Responses routes with
-       fallback disabled, truthful provider/model and usage/cost facts, one
-       dispatch, redaction, cancellation, restart, and cleanup.
-    3. After local-engine installed acceptance and Carrier ingress bounds, prove
-       sharing the Mac model with another Runtime. The destination must verify
-       the signed offer/grant and map the authenticated source Runtime plus
-       consumer principal/capsule/run into destination-owned authority before
-       provider dispatch. Current local bindings and an added Carrier allowlist
-       entry alone are insufficient. Test forged `runtime_binding` and identical
-       principal strings from different Runtime issuers, with host Home,
-       workspace, and other runs isolated. Apply the contract's remote lifecycle,
-       limits, consent, and revoke/expiry acceptance without another sharing API.
-    4. Treat hosted sharing as a separate track requiring installed hosted proof,
-       upstream terms/resale/privacy review, and operator cost/rate limits.
-       Local-model sharing can proceed independently of hosted credentials.
-    5. Prove a full Jetson destination Runtime before considering a smaller
-       provider host. Keep content-package CID delivery separate from model
-       service publication and Codex agent execution.
+  - [ ] Model Provider work follows [Builder steps 5–7](#5-close-local-agentmodel-lifecycle-acceptance):
+    local lifecycle and saved-run recovery; real Chat Completions/Responses;
+    destination-authorized local sharing; hosted-sharing terms/privacy/cost;
+    and full Jetson proof. These requested tracks remain open until their
+    own evidence passes. Contracts stay in [MODEL_PROVIDER.md](docs/MODEL_PROVIDER.md),
+    verified facts in [state.md](state.md).
 - [ ] Promote principal-owned Appearance state into a DID-anchored profile/settings object that syncs through Carrier/provider policy and projects back into `localhost://Users/<principal-root>/.AppData/ElastOS/Home/Appearance/...` per trusted device.
 - [ ] Keep `Apps` as the public catalog term and `capsules` as the internal/runtime term; do not expose both as competing public nouns.
 - [ ] Keep settings in `System`; keep files, documents, and provider-backed storage in their owning apps instead of recreating a generic System Storage section.

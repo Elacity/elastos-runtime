@@ -225,10 +225,15 @@ The current closeout includes the complete path from trusted model discovery
 to a real local reply for one verified Qwen package. Runtime source now verifies
 the bounded signed catalog metadata described in
 [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md#implemented-catalog-metadata-profile).
-Its model rows remain unprepared. Transfer, package admission, offer binding and
-the following UI flow remain pending implementation.
-Marketplace adds Models browse/details/Use within the existing app; System
-manages the same model records and local retention. Assistant and Home Agent
+Source includes bounded local Content preparation, verified package admission,
+admitted-artifact offer binding and native Qwen reply/reuse fixture proof.
+System and Marketplace project model preparation; installed Use has failed
+before admission, with its exact cause still unknown. These facts do not prove
+cold peer delivery or the complete installed journey.
+
+The intended flow uses Marketplace for model discovery/details and Open into
+Home Agent, with exact CID selection through the existing Home handoff. System
+manages the same model records and local storage. Assistant and Home Agent
 keep their existing pickers and typed run lifecycle. These are projections of
 one Runtime catalog, admission inventory and offer binding, not separate model
 stores. A model remains identifiable by complete-closure CID even when its
@@ -237,20 +242,23 @@ bytes are not local.
 Selecting a model may ask Runtime to prepare it under current authority. The
 person sees availability, Preparing/progress, Ready or actionable failure,
 offline and incompatibility states. Preparation can be cancelled or retried.
-Ordinary on-demand use may cache bytes. Keep on this device requests explicit
-retention; releasing Keep makes them evictable once active references and run
-settlement permit removal. The same inventory distinguishes cache, Keep,
-admission and readiness, while catalog identity stays visible. A local pin alone
+The accepted behavior is that Use retains the selected local model for reliable
+repeated use. System owns explicit storage removal, with active-run protection,
+recoverability evidence, and warning/consent for possible loss of the sole copy.
+Current Keep/release fixtures describe the older implementation; this adaptation
+and its installed proof remain open. Remote inference is a separately selected
+service. The same inventory distinguishes retention, admission and readiness,
+while catalog identity stays visible. A local pin alone
 proves neither trust nor engine readiness. There is no user GGUF download,
 file-picker or private
 path configuration step in this product flow.
 
 Runtime validates signed publisher/catalog and package facts, resource policy,
 engine compatibility and content integrity before deriving a private verified
-artifact descriptor for the model provider. Startup currently loads static
-operator offers; the new admitted-content binding must reuse the existing
-ProviderRegistry and run journal and preserve other configured capabilities.
-An idle-safe provider refresh may expose the newly admitted local offer; a busy
+artifact descriptor for the model provider. Source supports operator offers and
+admitted-content binding through the existing ProviderRegistry and run journal,
+while preserving other configured capabilities. An idle-safe provider refresh
+can expose the newly admitted local offer; a busy
 or unknown-settlement run prevents destructive reconfiguration and removal.
 Content preparation status is distinct from a dispatched model run.
 
@@ -262,9 +270,10 @@ Drafts and existing runs survive selection, progress, cancel, retry and restart.
 The ordinary explicit Send/run action dispatches once only when that selected
 model and provider are ready.
 
-The bounded transfer, manifest/inventory limits, proposed preparation/retention
-intents, commit order and tests are in
-[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md#source-prerequisites-and-bounded-implementation-plan).
+Bounded transfer and manifest/inventory limits are in
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
+The single execution queue and proof dependencies are in
+[Builder-only execution](../TASKS.md#builder-only-execution).
 Fresh-install acceptance must prove the compatible engine and its verified
 libraries are available, then select the real signed catalog entry with no
 pre-existing GGUF or private offer setup and obtain a real Qwen reply. Exact
@@ -288,8 +297,8 @@ pass installed lifecycle tests before it can be shared:
    shutdown, restart, and orphan cleanup. Consider MLX only if the common
    engine path proves insufficient.
 3. Prove hosted inference locally. Use the current OpenAI-compatible Chat
-   Completions seam where it conforms for OpenRouter, Venice, and xAI/Grok. Add
-   one provider-internal OpenAI Responses API adapter.
+   Completions seam where it conforms for OpenRouter, Venice, and xAI/Grok.
+   Prove the existing provider-internal OpenAI Responses API adapter separately.
 4. Prove optional sharing of the accepted Mac local model with another Runtime.
    This requires signed offer and grant admission plus bounded Carrier ingress;
    hosted credentials and a Jetson deployment are separate acceptance tracks.
