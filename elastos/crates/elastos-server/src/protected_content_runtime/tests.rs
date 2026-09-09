@@ -57,18 +57,20 @@ use x_wing::TryKeyInit as _;
 use super::{
     invoke_json_provider, list_unresolved_runtime_releases, load_or_persist_runtime_mint_intent,
     load_runtime_custody_composition, load_runtime_custody_composition_config,
-    load_runtime_media_provider_bridge_config,
-    load_runtime_protected_content_chain_provider_config, prepare_runtime_custody_library_source,
-    prepare_runtime_media_provider_prerequisite_with_path, publish_runtime_custody_library_object,
-    publish_runtime_custody_library_source, register_custody_provider,
-    register_custody_runtime_provider_target, register_protect_provider,
+    load_runtime_custody_purchase, load_runtime_media_provider_bridge_config,
+    load_runtime_protected_content_chain_provider_config, persist_runtime_custody_purchase,
+    prepare_runtime_custody_library_source, prepare_runtime_media_provider_prerequisite_with_path,
+    publish_runtime_custody_library_object, publish_runtime_custody_library_source,
+    register_custody_provider, register_custody_runtime_provider_target, register_protect_provider,
     register_protected_content_decrypt_provider, resolve_runtime_rights_policy,
     runtime_media_source_digest, runtime_mint_journal, runtime_protected_content_id,
-    runtime_purchase_path, unresolved_release_audit_records, write_owner_only_bytes,
-    InactiveCustodyProvider, RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile,
-    RuntimeCustodyLibraryPublishInput, RuntimeCustodyLibrarySourceInput,
-    RuntimeCustodyPurchaseAccessEvidenceRecord, RuntimeCustodyPurchaseProgress,
-    RuntimeCustodyPurchaseRecord, RuntimeCustodyPurchaseStageRecord, RuntimeCustodyRegistryAdapter,
+    runtime_purchase_lock_path, runtime_purchase_lock_test_overlap_detected, runtime_purchase_path,
+    unresolved_release_audit_records, write_owner_only_bytes, InactiveCustodyProvider,
+    RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile,
+    RuntimeCustodyConfirmedPurchaseStage, RuntimeCustodyLibraryPublishInput,
+    RuntimeCustodyLibrarySourceInput, RuntimeCustodyPurchaseAccessEvidenceRecord,
+    RuntimeCustodyPurchaseProgress, RuntimeCustodyPurchaseRecord,
+    RuntimeCustodyPurchaseStageRecord, RuntimeCustodyRegistryAdapter,
     RuntimeCustodyRouteBindingConfig, RuntimeCustodyRouteTransportConfig,
     RuntimeCustodyTerminalPurchaseRecord, RuntimeDecryptRegistryAdapter,
     RuntimeLibraryMediaPreparation, CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1,
@@ -5409,6 +5411,217 @@ fn runtime_custody_composition_rejects_unsafe_or_symlinked_paths() {
         .expect("expected hard-link rejection")
         .to_string()
         .contains("hard-linked"));
+}
+
+/// A self-contained, schema-valid purchase record for exercising the
+/// purchase-ledger file-discipline path directly, without standing up the
+/// full mint/listing/profile harness that `persist_runtime_custody_purchase_for_mint`
+/// requires. `load_runtime_custody_purchase`/`persist_runtime_custody_purchase`
+/// only check the record's own schema and principal identity, so this fixture
+/// does not need to reference a real listing.
+fn sample_purchase_record() -> (String, Digest32, RuntimeCustodyPurchaseRecord) {
+    let principal_id = "person:local:ledger-fixture".to_string();
+    let mint_id = Digest32::new([0x77; 32]);
+    let record = RuntimeCustodyPurchaseRecord {
+        schema: RUNTIME_PURCHASE_SCHEMA_V1.to_string(),
+        principal_id: principal_id.clone(),
+        profile_did: "did:key:z6MkFixture".to_string(),
+        mint_id: hex::encode(mint_id.as_bytes()),
+        content_id: "content:fixture".to_string(),
+        cid: "bafyfixture".to_string(),
+        listing_sha256: format!("sha256:{}", hex::encode([0x11; 32])),
+        seller_address: "0x1111111111111111111111111111111111111111".to_string(),
+        chain_namespace: "eip155".to_string(),
+        network: "esc-mainnet".to_string(),
+        ledger: "erc721".to_string(),
+        token_id: "1".to_string(),
+        operative: "buy".to_string(),
+        price: "1000000000000000000".to_string(),
+        pay_token: "0x0000000000000000000000000000000000000000".to_string(),
+        payment_processor: None,
+        availability_receipt_digest: format!("sha256:{}", hex::encode([0x22; 32])),
+        account_id: "wallet-account-fixture".to_string(),
+        address: wallet_address_hex(wallet(7)),
+        approval_stage: None,
+        buy_stage: RuntimeCustodyPurchaseStageRecord {
+            stage: "buy".to_string(),
+            effect_id: "runtime-effect:11111111111111111111111111111111".to_string(),
+            approval_request_id: "wallet-request:11111111111111111111111111111111".to_string(),
+            request_sha256: format!("sha256:{}", hex::encode([0x33; 32])),
+            chain_namespace: "eip155".to_string(),
+            network: "esc-mainnet".to_string(),
+            to: "0x2222222222222222222222222222222222222222".to_string(),
+            value: "0x1".to_string(),
+            data: "0x".to_string(),
+        },
+        progress: RuntimeCustodyPurchaseProgress::Complete {
+            terminal: RuntimeCustodyTerminalPurchaseRecord {
+                chain_transaction: format!("0x{}", hex::encode([0xaa; 32])),
+                wallet_binding: ValidatedChainOutcomeBindingV1::ManagedSigned {
+                    signed_transaction_sha256: format!("sha256:{}", hex::encode([0xab; 32])),
+                },
+                chain_observation: json!({
+                    "schema": "elastos.chain.broadcast_receipt/v1",
+                    "network": "esc-mainnet",
+                }),
+                access_evidence: RuntimeCustodyPurchaseAccessEvidenceRecord {
+                    schema: "elastos.chain.protected-content-purchase-access/v1".to_string(),
+                    request_id: "purchase-access:fixture".to_string(),
+                    network: "esc-mainnet".to_string(),
+                    chain_id: 8453,
+                    wallet: wallet_address_hex(wallet(7)),
+                    content_access_id: "content-access:fixture".to_string(),
+                    has_access: true,
+                    finalized_block_number: 44,
+                    finalized_block_hash: format!("0x{}", hex::encode([0xad; 32])),
+                    finalized_block_timestamp: 1,
+                    observed_at: 1,
+                },
+                confirmed_at: 1,
+                bought_at: 1,
+            },
+        },
+        created_at: 1,
+        updated_at: 1,
+    };
+    (principal_id, mint_id, record)
+}
+
+fn sample_confirmed_purchase_stage() -> RuntimeCustodyConfirmedPurchaseStage {
+    RuntimeCustodyConfirmedPurchaseStage {
+        chain_transaction: format!("0x{}", hex::encode([0xaa; 32])),
+        wallet_binding: ValidatedChainOutcomeBindingV1::ManagedSigned {
+            signed_transaction_sha256: format!("sha256:{}", hex::encode([0xab; 32])),
+        },
+        chain_observation: json!({
+            "schema": "elastos.chain.broadcast_receipt/v1",
+            "network": "esc-mainnet",
+        }),
+        confirmed_at: 1,
+    }
+}
+
+/// A ledger record written before `confirmed_approval` existed serialized
+/// `Pending` with only `confirmed_buy` (both already `skip_serializing_if`,
+/// so an unset field was omitted, not written as `null`). Such a record must
+/// still deserialize with the new field defaulting to `None`, a record with
+/// neither stage confirmed must serialize identically regardless of Runtime
+/// version, and a record carrying the pre-upgrade `confirmed_buy` alone must
+/// keep deserializing once `confirmed_approval` is added alongside it.
+#[test]
+fn runtime_custody_purchase_progress_pending_stays_compatible_across_confirmed_approval() {
+    // Oldest possible shape: neither field ever existed on disk.
+    let bare_pending = json!({ "state": "pending" });
+    assert_eq!(
+        serde_json::from_value::<RuntimeCustodyPurchaseProgress>(bare_pending.clone()).unwrap(),
+        RuntimeCustodyPurchaseProgress::Pending {
+            confirmed_approval: None,
+            confirmed_buy: None,
+        }
+    );
+    // ... and a record with neither stage confirmed still serializes to
+    // exactly that shape today, so a no-op resave never rewrites bytes an
+    // operator or diff tool would see as changed.
+    assert_eq!(
+        serde_json::to_value(RuntimeCustodyPurchaseProgress::Pending {
+            confirmed_approval: None,
+            confirmed_buy: None,
+        })
+        .unwrap(),
+        bare_pending
+    );
+
+    // Pre-upgrade shape: only `confirmed_buy` was ever recorded.
+    let confirmed_buy = sample_confirmed_purchase_stage();
+    let pre_upgrade_json = json!({
+        "state": "pending",
+        "confirmed_buy": serde_json::to_value(&confirmed_buy).unwrap(),
+    });
+    let deserialized: RuntimeCustodyPurchaseProgress = serde_json::from_value(
+        pre_upgrade_json.clone(),
+    )
+    .expect("a Pending record written before confirmed_approval existed must still deserialize");
+    assert_eq!(
+        deserialized,
+        RuntimeCustodyPurchaseProgress::Pending {
+            confirmed_approval: None,
+            confirmed_buy: Some(confirmed_buy.clone()),
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(&deserialized).unwrap(),
+        pre_upgrade_json,
+        "a pre-upgrade record with only confirmed_buy set must round-trip byte-identically"
+    );
+
+    // Once populated, both stages round-trip and remain independently legible.
+    let confirmed_approval = sample_confirmed_purchase_stage();
+    let both_confirmed = RuntimeCustodyPurchaseProgress::Pending {
+        confirmed_approval: Some(confirmed_approval.clone()),
+        confirmed_buy: Some(confirmed_buy.clone()),
+    };
+    let round_tripped: RuntimeCustodyPurchaseProgress =
+        serde_json::from_value(serde_json::to_value(&both_confirmed).unwrap()).unwrap();
+    assert_eq!(round_tripped, both_confirmed);
+}
+
+#[cfg(unix)]
+#[test]
+fn load_runtime_custody_purchase_refuses_symlinked_record() {
+    let dir = tempfile::tempdir().unwrap();
+    owner_only_dir(dir.path());
+    let (principal, mint_id, record) = sample_purchase_record();
+    persist_runtime_custody_purchase(dir.path(), &record).unwrap();
+    let path = runtime_purchase_path(dir.path(), &principal, mint_id);
+    let real = path.with_extension("real");
+    std::fs::rename(&path, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &path).unwrap();
+    assert!(load_runtime_custody_purchase(dir.path(), &principal, mint_id).is_err());
+}
+
+#[test]
+fn persist_runtime_custody_purchase_serializes_concurrent_writers() {
+    let dir = tempfile::tempdir().unwrap();
+    owner_only_dir(dir.path());
+    let (principal, mint_id, base_record) = sample_purchase_record();
+    // Each thread writes a byte-distinguishable record (not a clone of the
+    // same bytes) so the final file can only look intact by virtue of one
+    // writer's complete record having won, never by chance identity between
+    // writers papering over a torn or interleaved write.
+    let account_ids: Vec<String> = (0..8)
+        .map(|index| format!("wallet-account-fixture-{index}"))
+        .collect();
+    let handles: Vec<_> = account_ids
+        .iter()
+        .cloned()
+        .map(|account_id| {
+            let dir = dir.path().to_path_buf();
+            let mut record = base_record.clone();
+            record.account_id = account_id;
+            std::thread::spawn(move || persist_runtime_custody_purchase(&dir, &record).unwrap())
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    // The real proof of serialization: no two persist calls for this lock
+    // path ever held the critical section at the same time. Content
+    // round-tripping alone (checked below) would already pass even with the
+    // lock removed, since `fs::rename` is independently atomic per writer.
+    assert!(
+        !runtime_purchase_lock_test_overlap_detected(&runtime_purchase_lock_path(
+            dir.path(),
+            &principal
+        )),
+        "two persist_runtime_custody_purchase calls held the purchase lock concurrently"
+    );
+    let persisted = load_runtime_custody_purchase(dir.path(), &principal, mint_id)
+        .unwrap()
+        .expect("a purchase record survives concurrent writers");
+    assert!(
+        account_ids.contains(&persisted.account_id),
+        "persisted record must be exactly one writer's complete record, not a mix"
+    );
 }
 
 #[cfg(unix)]

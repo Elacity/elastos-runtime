@@ -14,7 +14,7 @@
     "capabilities": [
       {
         "resource": "elastos://browser-engine/*",
-        "actions": ["read", "write"],
+        "actions": ["read", "write", "delete"],
         "operations": ["status", "launch", "attach_stream", "close_page", "page_status", "diagnostics", "input", "webrtc_signal"]
       }
     ],

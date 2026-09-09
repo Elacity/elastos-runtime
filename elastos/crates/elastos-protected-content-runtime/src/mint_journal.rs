@@ -3234,12 +3234,12 @@ fn read_nested(payload: &[u8], off: &mut usize) -> Result<Vec<u8>, RuntimeMintJo
     Ok(slice.to_vec())
 }
 
-struct ExclusiveFileLock {
+pub struct ExclusiveFileLock {
     _lock: Flock<File>,
 }
 
 impl ExclusiveFileLock {
-    fn acquire(path: &Path) -> Result<Self, RuntimeMintJournalError> {
+    pub fn acquire(path: &Path) -> Result<Self, RuntimeMintJournalError> {
         if let Some(parent) = path.parent() {
             create_owner_only_directory(parent)?;
             validate_owner_only_directory(parent)?;

@@ -7434,6 +7434,150 @@ async fn test_runtime_custody_buy_erc20_orders_approval_then_buy_without_duplica
     );
 }
 
+/// Once the ERC-20 approval stage has confirmed on chain, a retried `buy`
+/// must not re-drive it: no extra Wallet lookup for the already-confirmed
+/// approval effect, and the persisted record remembers the confirmation so
+/// it can be skipped instead of re-derived from scratch on every call.
+#[tokio::test]
+async fn test_runtime_custody_buy_confirmed_approval_stage_is_not_redriven() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &wallet_account_id,
+        10,
+    )
+    .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-approval-idempotent",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x93, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        false,
+    );
+    let app = gateway_router(state.clone());
+    let buy_body = json!({ "mint_id": hex::encode(facts.mint_id.as_bytes()) });
+
+    // Priming call: creates the approval and buy stages; approval pending.
+    let (priming_status, priming_payload) =
+        post_library(app.clone(), &token, "buy", buy_body.clone()).await;
+    assert_eq!(priming_status, StatusCode::OK);
+    assert_eq!(priming_payload["status"], "error");
+    assert_eq!(
+        priming_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+    wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+
+    // First counted call: the approval stage's transaction confirms on chain
+    // within this call; the buy stage raises its own (still pending)
+    // approval and the purchase stays pending overall.
+    let first_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (first_status, first_payload) =
+        post_library(app.clone(), &first_token, "buy", buy_body.clone()).await;
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(first_payload["status"], "error");
+    assert_eq!(
+        first_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+
+    let purchase_after_first = crate::protected_content_runtime::load_runtime_custody_purchase(
+        dir.path(),
+        &authority.principal_id,
+        facts.mint_id,
+    )
+    .unwrap()
+    .unwrap();
+    match &purchase_after_first.progress {
+        crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+            confirmed_approval,
+            confirmed_buy,
+        } => {
+            assert!(
+                confirmed_approval.is_some(),
+                "approval stage must be confirmed after the first call"
+            );
+            assert!(
+                confirmed_buy.is_none(),
+                "buy stage must still be pending after the first call"
+            );
+        }
+        other => panic!("expected a pending purchase, got {other:?}"),
+    }
+
+    // Second counted call: the already-confirmed approval stage must not be
+    // re-driven. Only the buy stage's still-pending Wallet approval should
+    // be looked up (two `ListApprovals` reads: one from the exact-effect
+    // recovery, one from the completion check) -- not a third for approval.
+    wallet_provider.clear_requests().await;
+    let second_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (second_status, second_payload) = post_library(app, &second_token, "buy", buy_body).await;
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(second_payload["status"], "error");
+    assert_eq!(
+        second_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+    let second_call_ops = wallet_provider.recorded_v2_operation_kinds().await;
+    let list_approvals_count = second_call_ops
+        .iter()
+        .filter(|kind| **kind == WalletOperationKind::ListApprovals)
+        .count();
+    assert_eq!(
+        list_approvals_count, 2,
+        "confirmed approval stage must not be re-driven: {second_call_ops:?}"
+    );
+
+    let purchase_after_second = crate::protected_content_runtime::load_runtime_custody_purchase(
+        dir.path(),
+        &authority.principal_id,
+        facts.mint_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(
+            &purchase_after_second.progress,
+            crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+                confirmed_approval: Some(_),
+                confirmed_buy: None,
+            }
+        ),
+        "approval stays confirmed and buy stays pending: {:?}",
+        purchase_after_second.progress
+    );
+}
+
 #[tokio::test]
 async fn test_runtime_custody_buy_access_corroboration_stays_nonterminal_until_allow() {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
@@ -7532,7 +7676,8 @@ async fn test_runtime_custody_buy_access_corroboration_stays_nonterminal_until_a
         assert!(matches!(
             purchase.progress,
             crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
-                confirmed_buy: Some(_)
+                confirmed_buy: Some(_),
+                ..
             }
         ));
     }
@@ -7552,6 +7697,124 @@ async fn test_runtime_custody_buy_access_corroboration_stays_nonterminal_until_a
     assert_eq!(ok_status, StatusCode::OK);
     assert_eq!(ok_payload["status"], "ok");
     assert_eq!(ok_payload["data"]["availability"]["status"], "buyer_owned");
+}
+
+/// #49 item 3: chain-provider answers `unknown_protected_content_object`
+/// when the content access id the buy is resolving is not bound on chain at
+/// all — distinct from `Error`'s transient/stale-observation failure, which
+/// stays the ordinary "pending" retry above. An unbound target can never
+/// become bound by retrying, so it must surface as a real buy failure
+/// instead of parking behind the pending message forever. The ledger keeps
+/// its `Pending` semantics untouched (no new terminal state): the buy stage
+/// the chain confirmed earlier stays recorded, only the access check fails.
+#[tokio::test]
+async fn buy_reports_unbound_content_access_id() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &wallet_account_id,
+        10,
+    )
+    .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-unbound",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x97, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        true,
+    );
+    let app = gateway_router(state);
+
+    // First call raises the Wallet approval for the (native, single-step)
+    // buy transaction; the purchase record is created as
+    // `Pending { confirmed_buy: None }`.
+    let _ = post_library(
+        app.clone(),
+        &token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+        }),
+    )
+    .await;
+    let _tx_hash = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    let signed_transaction = wallet_provider
+        .provider
+        .latest_transaction_signed_transaction()
+        .await
+        .expect("completed mock transaction");
+    reset_mock_chain_broadcast_count(&signed_transaction);
+
+    // The replay call completes the buy transaction (confirmed_buy becomes
+    // `Some`) and then resolves purchase access, which the mock now answers
+    // unbound.
+    set_mock_protected_content_purchase_access_unbound();
+    let replay_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (status, payload) = post_library(
+        app,
+        &replay_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "error");
+    assert_eq!(
+        payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNBOUND_MESSAGE
+    );
+
+    let purchase = crate::protected_content_runtime::load_runtime_custody_purchase(
+        dir.path(),
+        &authority.principal_id,
+        facts.mint_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(
+            purchase.progress,
+            crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+                confirmed_buy: Some(_),
+                ..
+            }
+        ),
+        "the confirmed buy stage stays recorded and the ledger never \
+         advances to Complete on an unbound access check: {purchase:?}"
+    );
 }
 
 #[tokio::test]

@@ -51,8 +51,8 @@ use elastos_protected_content_runtime::RuntimeProviderCallError;
 use elastos_protected_content_runtime::{
     cancel_prepared_recipient, cancel_prepared_recipient_with_result_by_handle,
     close_viewer_session_with_result, open_viewer_session, prepare_recipient,
-    read_viewer_media_part, resolve_runtime_mint_selected_nodes, PersistedRuntimeMint,
-    PersistedRuntimeReleaseOperation, RuntimeContentAvailabilityRequirement,
+    read_viewer_media_part, resolve_runtime_mint_selected_nodes, ExclusiveFileLock,
+    PersistedRuntimeMint, PersistedRuntimeReleaseOperation, RuntimeContentAvailabilityRequirement,
     RuntimeCustodyTerminalKind, RuntimeDecryptProvider, RuntimeMediaPreparationRecord,
     RuntimeMediaPreparationState, RuntimeMintConfiguredCustodyProvider, RuntimeMintCoordinator,
     RuntimeMintCoordinatorError, RuntimeMintCoordinatorOutcome, RuntimeMintCreatorTerminalEvidence,
@@ -141,6 +141,8 @@ pub(crate) const RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE: &str =
     "Runtime custody purchase is denied before buy";
 pub(crate) const RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE: &str =
     "Runtime custody purchase is pending exact Wallet or Chain settlement";
+pub(crate) const RUNTIME_CUSTODY_PURCHASE_UNBOUND_MESSAGE: &str =
+    "Runtime custody purchase target is not bound on chain";
 pub(crate) const RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody purchase is unavailable";
 pub(crate) const RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE: &str =
@@ -5171,7 +5173,15 @@ pub(crate) struct RuntimeCustodyTerminalPurchaseRecord {
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum RuntimeCustodyPurchaseProgress {
     Pending {
-        #[serde(skip_serializing_if = "Option::is_none")]
+        /// Set once the ERC-20 approval stage's transaction has confirmed on
+        /// chain, so a retried buy skips re-driving an already-confirmed
+        /// approval instead of re-requesting it from the Wallet every call.
+        /// Absent for two-legitimate-different reasons: native-token
+        /// purchases that never had an approval stage, and records written
+        /// before this field existed -- both must keep deserializing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed_approval: Option<RuntimeCustodyConfirmedPurchaseStage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         confirmed_buy: Option<RuntimeCustodyConfirmedPurchaseStage>,
     },
     Complete {
@@ -6718,6 +6728,37 @@ pub(crate) fn persist_runtime_custody_creator_listing(
     persist_runtime_custody_listing(data_dir, &expected)
 }
 
+/// Opens a purchase-ledger record file for read, refusing symlinks,
+/// non-regular files, and hard-linked files — the same discipline
+/// `open_runtime_media_source_file` applies to media source input.
+#[cfg(unix)]
+fn open_owner_only_runtime_record_file(path: &Path) -> anyhow::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let opened = options.open(path).ok().and_then(|file| {
+        let metadata = file.metadata().ok()?;
+        (metadata.is_file() && metadata.nlink() == 1).then_some(file)
+    });
+    let Some(file) = opened else {
+        tracing::warn!(path = %path.display(), "purchase ledger record rejected");
+        anyhow::bail!("Runtime custody purchase is invalid");
+    };
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_owner_only_runtime_record_file(path: &Path) -> anyhow::Result<fs::File> {
+    let opened = fs::File::open(path).ok().and_then(|file| {
+        let metadata = file.metadata().ok()?;
+        metadata.is_file().then_some(file)
+    });
+    let Some(file) = opened else {
+        tracing::warn!(path = %path.display(), "purchase ledger record rejected");
+        anyhow::bail!("Runtime custody purchase is invalid");
+    };
+    Ok(file)
+}
+
 pub(crate) fn load_runtime_custody_purchase(
     data_dir: &Path,
     principal_id: &str,
@@ -6727,7 +6768,10 @@ pub(crate) fn load_runtime_custody_purchase(
     if !path.exists() {
         return Ok(None);
     }
-    let record: RuntimeCustodyPurchaseRecord = serde_json::from_slice(&fs::read(path)?)?;
+    let mut file = open_owner_only_runtime_record_file(&path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let record: RuntimeCustodyPurchaseRecord = serde_json::from_slice(&bytes)?;
     if record.schema != RUNTIME_PURCHASE_SCHEMA_V1 || record.principal_id != principal_id {
         anyhow::bail!("Runtime custody purchase is invalid");
     }
@@ -6795,10 +6839,90 @@ fn validate_runtime_custody_viewer_asset(
     package.decode_and_validate()
 }
 
+/// Test-only observability for the purchase-ledger lock: proves
+/// `persist_runtime_custody_purchase` callers for the *same* lock path never
+/// hold their critical section concurrently, without exposing anything from
+/// production builds. Keyed by lock path so unrelated tests running in
+/// parallel (distinct temp data dirs) cannot produce a false positive.
+/// Compiled out entirely outside `cfg(test)`.
+#[cfg(test)]
+static RUNTIME_PURCHASE_LOCK_TEST_STATE: OnceLock<StdMutex<HashMap<PathBuf, (usize, bool)>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn runtime_purchase_lock_test_state() -> &'static StdMutex<HashMap<PathBuf, (usize, bool)>> {
+    RUNTIME_PURCHASE_LOCK_TEST_STATE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Held for the lifetime of one `persist_runtime_custody_purchase` critical
+/// section. Records entry/exit against `path`'s holder count and latches
+/// `true` if a second holder for the same path is ever observed while this
+/// one is still live — the exact overlap `ExclusiveFileLock` must prevent.
+/// The deliberate sleep widens the window: while this probe is alive the
+/// real OS-level `flock` is held, so every other thread contending for the
+/// same lock path is genuinely parked in the kernel, not merely lucky not to
+/// race. That turns "no overlap ever observed" from a probabilistic outcome
+/// into a deterministic one.
+#[cfg(test)]
+struct RuntimePurchaseLockTestProbe {
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl RuntimePurchaseLockTestProbe {
+    fn enter(path: PathBuf) -> Self {
+        {
+            let mut state = runtime_purchase_lock_test_state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = state.entry(path.clone()).or_insert((0, false));
+            entry.0 += 1;
+            if entry.0 > 1 {
+                entry.1 = true;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        Self { path }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RuntimePurchaseLockTestProbe {
+    fn drop(&mut self) {
+        let mut state = runtime_purchase_lock_test_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = state.get_mut(&self.path) {
+            entry.0 -= 1;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_purchase_lock_test_overlap_detected(path: &Path) -> bool {
+    runtime_purchase_lock_test_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+        .is_some_and(|(_, overlapped)| *overlapped)
+}
+
 pub(crate) fn persist_runtime_custody_purchase(
     data_dir: &Path,
     purchase: &RuntimeCustodyPurchaseRecord,
 ) -> anyhow::Result<()> {
+    let lock_path = runtime_purchase_lock_path(data_dir, &purchase.principal_id);
+    #[cfg(unix)]
+    if let Some(parent) = lock_path.parent() {
+        ensure_owner_only_runtime_storage_parent(parent)?;
+    }
+    #[cfg(not(unix))]
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _lock = ExclusiveFileLock::acquire(&lock_path)?;
+    #[cfg(test)]
+    let _lock_test_probe = RuntimePurchaseLockTestProbe::enter(lock_path.clone());
     write_owner_only_bytes(
         &runtime_purchase_path(
             data_dir,
@@ -7692,6 +7816,19 @@ fn runtime_purchase_path(data_dir: &Path, principal_id: &str, mint_id: Digest32)
         .join(format!("{}.json", hex::encode(mint_id.as_bytes())))
 }
 
+/// The lock file guarding a principal's purchase-ledger directory. Every
+/// `persist_runtime_custody_purchase` call for this principal serializes
+/// through this lock before writing, so two concurrent purchase writes never
+/// race on the durable record's rename.
+fn runtime_purchase_lock_path(data_dir: &Path, principal_id: &str) -> PathBuf {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(principal_id.as_bytes());
+    data_dir
+        .join(RUNTIME_PURCHASE_ROOT)
+        .join(hex::encode(hasher.finalize()))
+        .join(".lock")
+}
+
 fn runtime_viewer_path(data_dir: &Path, principal_id: &str, mint_id: Digest32) -> PathBuf {
     let mut hasher = sha2::Sha256::new();
     hasher.update(principal_id.as_bytes());
@@ -7708,6 +7845,8 @@ fn runtime_storage_write_error(reason: String) -> anyhow::Error {
 
 #[cfg(unix)]
 fn ensure_owner_only_runtime_storage_parent(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
     let mut missing = Vec::new();
     let mut cursor = path;
     loop {
@@ -7737,8 +7876,23 @@ fn ensure_owner_only_runtime_storage_parent(path: &Path) -> anyhow::Result<()> {
             .ok_or_else(|| runtime_storage_write_error("parent path is unavailable".to_string()))?;
     }
     for dir in missing.iter().rev() {
-        fs::create_dir(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        // A sibling writer racing to bootstrap the same directory chain (for
+        // example, another principal's first purchase creating the shared
+        // `runtime-purchases/` root) may have created this exact level
+        // between our existence check above and this call. Create with mode
+        // 0700 atomically (the same idiom `create_owner_only_directory` uses
+        // elsewhere in this codebase) rather than `mkdir` then `chmod`: a
+        // losing racer's `AlreadyExists` is only ever returned after the
+        // winner's `mkdir(..., 0700)` has already completed in the kernel,
+        // so there is no window where the directory briefly has loose
+        // default permissions for the validation pass below to observe.
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     for dir in missing {
         let metadata = fs::symlink_metadata(&dir)
@@ -7804,7 +7958,11 @@ fn write_owner_only_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     {
         let temp_path = runtime_storage_temp_path(path)?;
         let mut options = fs::OpenOptions::new();
-        options.create_new(true).write(true).mode(0o600);
+        options
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         let mut file = options.open(&temp_path)?;
         let result = (|| -> anyhow::Result<()> {
             file.write_all(bytes)?;

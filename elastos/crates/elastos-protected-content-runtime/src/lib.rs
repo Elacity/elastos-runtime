@@ -30,11 +30,12 @@ pub use mint::{
     RuntimeMintNonterminalReason, RuntimeMintSelectedNode,
 };
 pub use mint_journal::{
-    PersistedRuntimeMint, RuntimeContentAvailabilityRequirement, RuntimeCustodyTerminalKind,
-    RuntimeMediaPreparationRecord, RuntimeMediaPreparationState, RuntimeMintCreatorDesiredTerms,
-    RuntimeMintCreatorEffectBinding, RuntimeMintCreatorState, RuntimeMintCreatorTerminalEvidence,
-    RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal, RuntimeMintJournalError,
-    RuntimeMintNodeBinding, RuntimeMintNodeReceipt, RuntimeVerifiedContentAvailability,
+    ExclusiveFileLock, PersistedRuntimeMint, RuntimeContentAvailabilityRequirement,
+    RuntimeCustodyTerminalKind, RuntimeMediaPreparationRecord, RuntimeMediaPreparationState,
+    RuntimeMintCreatorDesiredTerms, RuntimeMintCreatorEffectBinding, RuntimeMintCreatorState,
+    RuntimeMintCreatorTerminalEvidence, RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal,
+    RuntimeMintJournalError, RuntimeMintNodeBinding, RuntimeMintNodeReceipt,
+    RuntimeVerifiedContentAvailability,
 };
 pub use open::{
     bind_buy, cancel_prepared_recipient, cancel_prepared_recipient_with_result_by_handle,

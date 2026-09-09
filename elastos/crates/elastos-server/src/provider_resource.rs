@@ -157,7 +157,7 @@ pub fn provider_operation_action(scheme: &str, op: &str) -> Option<Action> {
             "runs_create" | "runs_cancel" => Some(Action::Execute),
             _ => None,
         },
-        "object" => object_op_required_action(op),
+        "object" => object_operation_action(op),
         "operator-drive-adapter" => match op {
             "status" | "metadata_index" | "read_bytes" => Some(Action::Read),
             "write_bytes" => Some(Action::Write),
@@ -248,7 +248,7 @@ fn ipfs_op_required_action(op: &str) -> Option<Action> {
     }
 }
 
-fn object_op_required_action(op: &str) -> Option<Action> {
+fn object_operation_action(op: &str) -> Option<Action> {
     match op {
         "roots"
         | "list"
@@ -263,7 +263,10 @@ fn object_op_required_action(op: &str) -> Option<Action> {
         | "close_viewer" => Some(Action::Read),
         "import_runtime_custody" => Some(Action::Write),
         "write" | "mkdir" | "rename" | "move" | "copy" | "trash" | "restore" | "publish"
-        | "unpublish" | "repair" | "share" | "buy" => Some(Action::Write),
+        | "unpublish" | "repair" | "share" => Some(Action::Write),
+        // `buy` spends the user's money: it must never be satisfied by a
+        // capsule that only holds generic object write authority.
+        "buy" => Some(Action::Buy),
         "delete_permanently" | "empty_trash" => Some(Action::Delete),
         _ => None,
     }
@@ -724,12 +727,29 @@ mod tests {
             let authority = manifest
                 .authority
                 .unwrap_or_else(|| panic!("{scheme} provider manifest must declare authority"));
-            for capability in authority.capabilities {
-                for operation in capability.operations {
+            for capability in &authority.capabilities {
+                for operation in &capability.operations {
+                    let action = provider_operation_action(scheme, operation);
                     assert!(
-                        provider_operation_action(scheme, &operation).is_some(),
+                        action.is_some(),
                         "{scheme}/{operation} in {} must have a canonical Runtime action",
                         path.display()
+                    );
+                    let action = action.unwrap();
+                    // The manifest's own declared `actions` must cover every
+                    // action its `operations` actually require -- otherwise a
+                    // narrower action (e.g. `buy`) can silently ride on a
+                    // broader one already listed there (e.g. `write`), which
+                    // is exactly how `buy` used to be an alias for `write`.
+                    assert!(
+                        capability
+                            .actions
+                            .iter()
+                            .any(|declared| declared == action.to_string().as_str()),
+                        "{scheme}/{operation} in {} requires action `{action}`, but the \
+                         manifest's declared actions {:?} do not include it",
+                        path.display(),
+                        capability.actions
                     );
                 }
             }
@@ -1438,5 +1458,15 @@ mod tests {
             .unwrap(),
             "elastos://chain/esc-mainnet/broadcast_transaction"
         );
+    }
+
+    #[test]
+    fn buy_requires_its_own_action() {
+        // The real "does the manifest's declared `actions` list cover `buy`"
+        // check lives in `first_party_provider_authority_operations_have_action_mapping`
+        // below, against the actual `capsules/object-provider/capsule.json` --
+        // a check built from a fixture the test itself constructs cannot fail
+        // on a production regression (e.g. deleting `"buy"` from that file).
+        assert_eq!(object_operation_action("buy"), Some(Action::Buy));
     }
 }

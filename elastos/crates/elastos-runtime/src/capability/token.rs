@@ -111,6 +111,10 @@ pub enum Action {
     Message,
     Delete,
     Admin,
+    /// Spend the user's money. Distinct from `Write` so that generic write
+    /// authority on a resource (e.g. `elastos://object/*`) never doubles as
+    /// authority to purchase against it.
+    Buy,
 }
 
 impl fmt::Display for Action {
@@ -122,6 +126,7 @@ impl fmt::Display for Action {
             Action::Message => write!(f, "message"),
             Action::Delete => write!(f, "delete"),
             Action::Admin => write!(f, "admin"),
+            Action::Buy => write!(f, "buy"),
         }
     }
 }

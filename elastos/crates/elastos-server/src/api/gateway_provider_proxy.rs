@@ -2557,8 +2557,27 @@ async fn resolve_runtime_custody_purchase_access(
         }),
     )
     .await;
-    let Ok(response) = response else {
-        return Ok(None);
+    let response = match response {
+        Ok(response) => response,
+        Err((status, message)) => {
+            let code = message.split(':').next().unwrap_or_default().trim();
+            if status == StatusCode::BAD_REQUEST && code == "unknown_protected_content_object" {
+                tracing::warn!(
+                    %request_id,
+                    "protected-content purchase target unbound on chain"
+                );
+                anyhow::bail!(
+                    crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNBOUND_MESSAGE
+                );
+            }
+            tracing::debug!(
+                %request_id,
+                status = status.as_u16(),
+                error = %message,
+                "protected-content purchase access resolution failed closed"
+            );
+            return Ok(None);
+        }
     };
     let access: ResolvedProtectedContentPurchaseAccess =
         serde_json::from_value(response).map_err(purchase_unavailable!())?;
@@ -2634,6 +2653,48 @@ async fn complete_runtime_custody_purchase_stage(
         )));
     }
     Ok(Some(completion))
+}
+
+/// The confirmed approval and buy stages currently recorded on a `Pending`
+/// purchase. `runtime_custody_buy_via_gateway` returns the terminal response
+/// as soon as it observes `Complete` (before ever reaching a stage-progress
+/// read), so every caller of this function has already ruled that out --
+/// panicking on it rather than defaulting to "nothing confirmed yet" matters,
+/// because `None` here is exactly the value that would re-enable re-driving
+/// an already-confirmed (or already-complete) stage.
+fn pending_stages(
+    progress: &crate::protected_content_runtime::RuntimeCustodyPurchaseProgress,
+) -> (
+    Option<crate::protected_content_runtime::RuntimeCustodyConfirmedPurchaseStage>,
+    Option<crate::protected_content_runtime::RuntimeCustodyConfirmedPurchaseStage>,
+) {
+    match progress {
+        crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+            confirmed_approval,
+            confirmed_buy,
+        } => (confirmed_approval.clone(), confirmed_buy.clone()),
+        crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Complete { .. } => {
+            unreachable!("terminal purchases return early before reaching stage-progress reads")
+        }
+    }
+}
+
+/// Build the confirmed-stage record for a purchase stage from its Runtime
+/// transaction completion, or `None` if the completion has no validated
+/// Chain outcome attached yet (the caller must treat that the same as
+/// pending -- `RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE`/`purchase_unavailable_missing!`).
+fn confirmed_stage(
+    completion: RuntimeTransactionCompletion,
+) -> Option<crate::protected_content_runtime::RuntimeCustodyConfirmedPurchaseStage> {
+    let outcome = completion.validated_chain_outcome?;
+    Some(
+        crate::protected_content_runtime::RuntimeCustodyConfirmedPurchaseStage {
+            chain_transaction: completion.transaction_hash,
+            wallet_binding: outcome.binding,
+            chain_observation: outcome.chain_observation,
+            confirmed_at: outcome.confirmed_at,
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3439,6 +3500,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                 buy_stage: runtime_custody_purchase_stage_record("buy", &buy_request)?,
                 progress:
                     crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+                        confirmed_approval: None,
                         confirmed_buy: None,
                     },
                 created_at: now,
@@ -3489,10 +3551,19 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
         )?;
     }
 
-    if let Some(approval_request) = approval_request.as_ref() {
+    let (confirmed_approval_stage, _) = pending_stages(&purchase.progress);
+
+    // Once the approval stage has confirmed on chain it is durable: skip
+    // re-driving it (and re-touching the Wallet for it) on every retry.
+    // `RuntimeCustodyPurchaseProgress::Pending` only remembered the buy
+    // stage's confirmation before, so a still-pending buy stage forced this
+    // block to run again on each call even after approval was long settled.
+    if let (Some(approval_request), None) =
+        (approval_request.as_ref(), confirmed_approval_stage.as_ref())
+    {
         let approval_completion =
             complete_runtime_custody_purchase_stage(state, authority, approval_request).await?;
-        if approval_completion.is_none() {
+        let Some(approval_completion) = approval_completion else {
             purchase.updated_at = crate::auth::now_ts();
             crate::protected_content_runtime::persist_runtime_custody_purchase(
                 &state.data_dir,
@@ -3501,11 +3572,26 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
             anyhow::bail!(
                 crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
             );
-        }
+        };
+        let Some(confirmed_approval) = confirmed_stage(approval_completion) else {
+            return Err(purchase_unavailable_missing!()());
+        };
+        let (_, confirmed_buy) = pending_stages(&purchase.progress);
+        purchase.progress =
+            crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+                confirmed_approval: Some(confirmed_approval),
+                confirmed_buy,
+            };
+        purchase.updated_at = crate::auth::now_ts();
+        crate::protected_content_runtime::persist_runtime_custody_purchase(
+            &state.data_dir,
+            &purchase,
+        )?;
     }
 
     if let crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
         confirmed_buy: None,
+        ..
     } = &purchase.progress
     {
         let buy_completion =
@@ -3520,29 +3606,14 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                 crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
             );
         };
-        let wallet_binding = buy_completion
-            .validated_chain_outcome
-            .as_ref()
-            .map(|outcome| {
-                (
-                    outcome.binding.clone(),
-                    outcome.chain_observation.clone(),
-                    outcome.confirmed_at,
-                )
-            });
-        let Some((wallet_binding, chain_observation, confirmed_at)) = wallet_binding else {
+        let Some(confirmed_buy) = confirmed_stage(buy_completion) else {
             return Err(purchase_unavailable_missing!()());
         };
+        let (confirmed_approval, _) = pending_stages(&purchase.progress);
         purchase.progress =
             crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
-                confirmed_buy: Some(
-                    crate::protected_content_runtime::RuntimeCustodyConfirmedPurchaseStage {
-                        chain_transaction: buy_completion.transaction_hash,
-                        wallet_binding,
-                        chain_observation,
-                        confirmed_at,
-                    },
-                ),
+                confirmed_approval,
+                confirmed_buy: Some(confirmed_buy),
             };
         purchase.updated_at = crate::auth::now_ts();
         crate::protected_content_runtime::persist_runtime_custody_purchase(
@@ -3554,12 +3625,14 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
     let confirmed_buy = match &purchase.progress {
         crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
             confirmed_buy: Some(confirmed_buy),
+            ..
         } => confirmed_buy.clone(),
         crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Complete { .. } => {
             return Ok(runtime_custody_buy_terminal_response(&purchase));
         }
         crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
             confirmed_buy: None,
+            ..
         } => anyhow::bail!(
             crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
         ),

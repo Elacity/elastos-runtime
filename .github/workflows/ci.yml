@@ -52,6 +52,8 @@ jobs:
           node scripts/people-discovery-smoke.mjs
       - name: Browser close handshake
         run: node --test scripts/browser-window-close-handshake.test.mjs
+      - name: library browser unit tests
+        run: node --test capsules/library/browser/src/*.test.mjs
 
   lint:
     name: lint

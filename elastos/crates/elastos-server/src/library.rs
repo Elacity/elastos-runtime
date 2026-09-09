@@ -6487,17 +6487,7 @@ fn viewer_ids_for_name(name: &str) -> Vec<&'static str> {
     let lower = name.to_lowercase();
     if archive_family_for_name(&lower).is_some() {
         vec!["archive-manager"]
-    } else if lower.ends_with(".md") || lower.ends_with(".txt") {
-        vec!["documents"]
-    } else if lower.ends_with(".png")
-        || lower.ends_with(".jpg")
-        || lower.ends_with(".jpeg")
-        || lower.ends_with(".gif")
-    {
-        vec!["image-viewer"]
-    } else if lower.ends_with(".mp4") {
-        vec!["video-viewer"]
-    } else if lower.ends_with(".pdf") {
+    } else if lower.ends_with(".md") || lower.ends_with(".txt") || lower.ends_with(".pdf") {
         vec!["documents"]
     } else if lower.ends_with(".gba") {
         vec!["gba-emulator"]
@@ -6521,8 +6511,6 @@ fn installed_viewer_option(data_dir: &Path, id: &str) -> Option<LibraryViewerOpt
 fn viewer_label(id: &str) -> &str {
     match id {
         "documents" => "Documents",
-        "image-viewer" => "Image Viewer",
-        "video-viewer" => "Video Viewer",
         "gba-emulator" => "GBA Emulator",
         "archive-manager" => "Archive",
         _ => id,
@@ -6572,6 +6560,23 @@ fn anyhow_error_detail(error: &anyhow::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn viewer_ids_for_name_only_names_installed_capsule_ids() {
+        for name in ["clip.mp4", "photo.png", "photo.jpg", "art.gif", "song.mp3"] {
+            assert!(
+                super::viewer_ids_for_name(name).is_empty(),
+                "{name} must not name a phantom viewer"
+            );
+        }
+        assert_eq!(super::viewer_ids_for_name("notes.md"), vec!["documents"]);
+        assert_eq!(super::viewer_ids_for_name("paper.pdf"), vec!["documents"]);
+        assert_eq!(super::viewer_ids_for_name("game.gba"), vec!["gba-emulator"]);
+        assert_eq!(
+            super::viewer_ids_for_name("bundle.zip"),
+            vec!["archive-manager"]
+        );
+    }
+
     #[test]
     fn provider_error_from_keeps_the_stable_message_and_exposes_the_cause_chain() {
         let error = anyhow::anyhow!("(400, \"upstream_rpc_error: reverted\")")
