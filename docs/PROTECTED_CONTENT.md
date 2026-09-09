@@ -1,9 +1,10 @@
 # Protected content
 
 Protected content is Runtime-mediated. Library and Marketplace own the creator
-and buyer experience, and `elacity-player` owns video presentation. Runtime
-owns authority, durable operations, provider selection, Wallet and Chain
-coordination, lifecycle, audit, and settlement.
+and buyer experience, `elacity-player` owns video presentation, and `creator`
+uploads a file through the Library transport and protects-and-lists it in one
+flow. Runtime owns authority, durable operations, provider selection, Wallet
+and Chain coordination, lifecycle, audit, and settlement.
 
 The intended content-distribution contract gives free and protected content
 the same package identity and availability path. Protected content adds rights,
@@ -20,7 +21,8 @@ protected-content authority.
 
 The source path has one operation sequence:
 
-1. Library submits a typed source object and the permitted product terms.
+1. Library or Creator submits a typed source object and the permitted product
+   terms.
 2. Runtime creates the durable operation identity and selects the private
    `media-provider`.
 3. `media-provider` prepares bounded clear fMP4 in Runtime-authorized private

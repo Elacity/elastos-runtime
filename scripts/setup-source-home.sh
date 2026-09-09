@@ -609,6 +609,7 @@ APP_CAPSULES=(
     browser
     documents
     library
+    creator
     elacity-player
     marketplace
     archive-manager

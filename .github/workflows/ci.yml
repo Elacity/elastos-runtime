@@ -54,6 +54,8 @@ jobs:
         run: node --test scripts/browser-window-close-handshake.test.mjs
       - name: library browser unit tests
         run: node --test capsules/library/browser/src/*.test.mjs
+      - name: creator browser unit tests
+        run: node --test capsules/creator/browser/*.test.mjs
 
   lint:
     name: lint

@@ -76,6 +76,7 @@ DEFAULT_CAPSULES=(
     inbox
     assistant
     home-agent
+    creator
     elacity-player
 )
 CAPSULES=("${DEFAULT_CAPSULES[@]}")
@@ -110,6 +111,7 @@ REQUIRED_SUPPORTED_CAPSULES=(
     inbox
     assistant
     home-agent
+    creator
     elacity-player
 )
 SUPPORT_BINARY_ASSETS=(
@@ -866,6 +868,7 @@ build_platform_independent_direct_assets() {
         chat-room \
         assistant \
         home-agent \
+        creator \
         elacity-player; do
         if [[ -n "${ARTIFACTS_DIR:-}" && -f "${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" ]]; then
             archive="${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz"

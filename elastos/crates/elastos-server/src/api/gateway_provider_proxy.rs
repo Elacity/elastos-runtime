@@ -387,7 +387,7 @@ pub(super) async fn gateway_library_upload(
     let context = match require_home_launch_token_for_any_context(
         &state.data_dir,
         &headers,
-        &[LIBRARY_CAPSULE_ID],
+        &[LIBRARY_CAPSULE_ID, CREATOR_CAPSULE_ID],
     ) {
         Ok(context) => context,
         Err(err) => return gateway_provider_error_response("object", err),
@@ -540,7 +540,7 @@ pub(super) async fn gateway_library_upload_start(
     let context = match require_home_launch_token_for_any_context(
         &state.data_dir,
         &headers,
-        &[LIBRARY_CAPSULE_ID],
+        &[LIBRARY_CAPSULE_ID, CREATOR_CAPSULE_ID],
     ) {
         Ok(context) => context,
         Err(err) => return gateway_provider_error_response("object", err),
@@ -637,7 +637,7 @@ pub(super) async fn gateway_library_upload_chunk(
     let context = match require_home_launch_token_for_any_context(
         &state.data_dir,
         &headers,
-        &[LIBRARY_CAPSULE_ID],
+        &[LIBRARY_CAPSULE_ID, CREATOR_CAPSULE_ID],
     ) {
         Ok(context) => context,
         Err(err) => return gateway_provider_error_response("object", err),
@@ -713,7 +713,7 @@ pub(super) async fn gateway_library_upload_finish(
     let context = match require_home_launch_token_for_any_context(
         &state.data_dir,
         &headers,
-        &[LIBRARY_CAPSULE_ID],
+        &[LIBRARY_CAPSULE_ID, CREATOR_CAPSULE_ID],
     ) {
         Ok(context) => context,
         Err(err) => return gateway_provider_error_response("object", err),
@@ -1614,9 +1614,7 @@ pub(super) async fn gateway_provider_proxy(
             _ => &[DOCUMENTS_CAPSULE_ID],
         },
         "object" => match op.as_str() {
-            "roots"
-            | "list"
-            | "stat"
+            "list"
             | "read"
             | "download"
             | "write"
@@ -1635,12 +1633,12 @@ pub(super) async fn gateway_provider_proxy(
             | "archive_preview_entry"
             | "archive_extract_entries"
             | "compress_archive"
-            | "publish"
             | "unpublish"
             | "repair"
             | "share"
             | "shared_access"
             | "events" => &[LIBRARY_CAPSULE_ID],
+            "roots" | "stat" | "publish" => &[LIBRARY_CAPSULE_ID, CREATOR_CAPSULE_ID],
             "open_viewer" | "read_viewer" | "close_viewer" => &[ELACITY_PLAYER_CAPSULE_ID],
             "import_runtime_custody" => &[LIBRARY_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
             "list_runtime_custody" | "buy" => &[LIBRARY_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],

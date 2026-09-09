@@ -39,6 +39,7 @@ TARGETS=(
   inbox/browser
   chat-room/browser
   library/browser
+  creator/browser
   marketplace/browser
   documents/browser
   archive-manager/browser

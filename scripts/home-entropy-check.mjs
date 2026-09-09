@@ -1846,7 +1846,7 @@ const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260805a";
 const homeClipboardAssetVersion = "home-20260726a";
 const homeGuiAssetVersion = "home-20260813a";
-const homeShellHostAssetVersion = "home-20260908a";
+const homeShellHostAssetVersion = "home-20260909a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -2285,6 +2285,10 @@ assert(
 assert(
   shellJs.includes('browser: new Set(["library"])'),
   "Home must allow Browser to route file chooser requests into Library through an explicit source gate",
+);
+assert(
+  shellJs.includes('creator: new Set(["library"])'),
+  "Home must allow Creator to route users into Library after a listing",
 );
 assert(
   shellJs.includes('"gba-emulator": new Set(["library"])') &&

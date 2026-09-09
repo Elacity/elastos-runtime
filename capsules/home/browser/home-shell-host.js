@@ -17,7 +17,7 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-20260908a";
+} from "./shell-core.js?v=home-20260909a";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -27,11 +27,11 @@ import {
   profileReadinessActionTarget,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260908a";
+} from "./shell-auth.js?v=home-20260909a";
 import {
   handleHomeWalletConnectorEffect,
   WALLET_CONNECTOR_EFFECT_TYPE,
-} from "./home-wallet-connector-host.js?v=home-20260908a";
+} from "./home-wallet-connector-host.js?v=home-20260909a";
 import {
   createHomeClipboardFrameState,
   createHomeClipboardHost,
@@ -73,6 +73,7 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "archive-manager": new Set(["library"]),
   browser: new Set(["library"]),
   "chat-room": new Set(["library"]),
+  creator: new Set(["library"]),
   "gba-emulator": new Set(["library"]),
   "home-cli": "visible-target",
   "home-gui": "visible-target",
