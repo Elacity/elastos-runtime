@@ -15,7 +15,8 @@ import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { browserOpenResponseEvidence } from "./lib/browser-open-failure.mjs";
 import { browserJourneyTargetConfig, readBrowserJourneyHealth, readBrowserJourneyReceipt,
-  browserJourneyEngineChoice, browserJourneyEngineRoute } from "./lib/browser-journey-target.mjs";
+  browserJourneyEngineChoice, browserJourneyEngineRoute, browserJourneyFixtureUrl,
+  browserJourneyProfileStorage, browserJourneyProfileBinding } from "./lib/browser-journey-target.mjs";
 import { installBrowserJourneyAudioProbe, controlledTonePresent } from "./lib/browser-journey-audio.mjs";
 import { diagnoseBrowserJourneyRecovery } from "./lib/browser-journey-recovery.mjs";
 import { diagnoseBrowserViewerReload, readBrowserViewerReloadDocument, browserViewerSignalMetadata } from "./lib/browser-journey-viewer-reload.mjs";
@@ -166,7 +167,8 @@ const CHECK_BROWSER_CONTROLLED_RECOVERY = process.env.HOME_VIRTUAL_AUTH_BROWSER_
 const CHECK_BROWSER_VIEWER_RELOAD = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_VIEWER_RELOAD === "1";
 const BROWSER_CONTROLLED_TURN_TEST_HOME = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_TURN_TEST_HOME || "";
 const REQUIRE_BROWSER_VZ_TRANSPORT = process.env.HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VZ_TRANSPORT === "1";
-const BROWSER_JOURNEY_TARGET = CHECK_BROWSER_CONTROLLED_JOURNEY ? browserJourneyTargetConfig(process.env) : null;
+const BROWSER_JOURNEY_TARGET = CHECK_BROWSER_CONTROLLED_JOURNEY || process.env.HOME_VIRTUAL_AUTH_BROWSER_PROFILE_MODE ||
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_PROFILE_MARKER ? browserJourneyTargetConfig(process.env) : null;
 const CHECK_BROWSER_EMBEDDED_RECOVERY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_EMBEDDED_RECOVERY === "1";
 const BROWSER_OPEN_URLS = parseBrowserOpenUrls(process.env.HOME_VIRTUAL_AUTH_BROWSER_OPEN_URLS);
@@ -2784,6 +2786,8 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
   const fixture = BROWSER_JOURNEY_TARGET;
   const run = randomUUID();
   const result = { schema: "elastos.browser.controlled-journey/v1", run, pages: [] };
+  if (fixture.profile) result.profile = { schema: "elastos.browser.profile-journey/v1", ...fixture.profile,
+    run, started_at: Date.now(), complete: false, documents: [] };
   let engineChoice = null;
   const openRoutes = new Map();
   const captureRoute = async response => {
@@ -2798,6 +2802,23 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
   };
   page.on("response", captureRoute);
   const readReceipt = options => readBrowserJourneyReceipt(fixture, run, options);
+  const checkProfileDocument = async (name, pageId, afterSequence = 0) => {
+    if (!fixture.profile) return;
+    markStage(`browser:profile-${fixture.profile.mode}-${name}`);
+    const event = await waitForJourneyEvidence(async () => {
+      const receipt = await readReceipt();
+      result.profile.receipt = receipt;
+      return browserJourneyProfileStorage(fixture, run, receipt, name, afterSequence);
+    }, value => Boolean(value), "Engine profile storage completion", 20_000);
+    const summary = await browserApi(appFrame, token,
+      `/api/apps/browser/summary?browser_instance=${encodeURIComponent(windowIdentity.instance)}`, { timeoutMs: 15_000 });
+    assert(summary.ok, "Browser profile ownership summary is unavailable");
+    const binding = browserJourneyProfileBinding(fixture, summary.body, pageId, appFrame.url(), token);
+    assert(!result.profile.binding || JSON.stringify(binding) === JSON.stringify(result.profile.binding),
+      "Browser profile identity changed within this phase", { previous: result.profile.binding, observed: binding });
+    result.profile.binding = binding;
+    result.profile.documents.push({ name, page_id: pageId, event });
+  };
   let failure = null, inputObserver = null, operatorClosePromise = null;
   const stopInputObservation = async failed => {
     try { await inputObserver?.stop(failed); }
@@ -2845,7 +2866,9 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
     result.prior_open_settlements = settled.map(({ open_id, body }) => ({ open_id, settlement: body }));
     for (const name of ["main", "nav"]) {
       markStage(`browser:controlled-${name}`);
-      const url = `${fixture.origin}/${name}?run=${run}${CHECK_BROWSER_CONTROLLED_MEDIA ? "&media=1" : ""}${browserQualification ? "&qualification=1" : ""}`;
+      const documentSequence = fixture.profile ? (await readReceipt()).events.at(-1)?.sequence || 0 : 0;
+      const url = browserJourneyFixtureUrl(fixture, run, name,
+        { media: CHECK_BROWSER_CONTROLLED_MEDIA, qualification: Boolean(browserQualification) });
       const navigationStarted = performance.now();
       await appFrame.locator("#browser-url").fill(url);
       await appFrame.locator("#browser-url").press("Enter");
@@ -2890,6 +2913,7 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
       result.pages.push({ name, url, page_id: status.page_id, load, video: { ready, decoded }, navigation_status: navigationStatus,
         ...(engineChoice ? { engine_route: result.engine_route } : {}),
         timing: { status_ready_ms: statusReadyMs, decoded_progress_ms: Math.round(performance.now() - navigationStarted) } });
+      await checkProfileDocument(name, status.page_id, documentSequence);
     }
     const current = result.pages.at(-1);
     inputObserver = await observeControlledBrowserInput(page, appFrame, token, current.page_id);
@@ -2985,7 +3009,8 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
     if (CHECK_BROWSER_CONTROLLED_INSPECTION) {
       markStage("browser:operator-stale-reference");
       const resetSequence = (await readReceipt()).events.at(-1)?.sequence || 0;
-      const url = `${fixture.origin}/main?run=${run}${CHECK_BROWSER_CONTROLLED_MEDIA ? "&media=1" : ""}${browserQualification ? "&qualification=1" : ""}`;
+      const url = browserJourneyFixtureUrl(fixture, run, "main",
+        { media: CHECK_BROWSER_CONTROLLED_MEDIA, qualification: Boolean(browserQualification) });
       await appFrame.locator("#browser-url").fill(url);
       await appFrame.locator("#browser-url").press("Enter");
       await waitForJourneyEvidence(() => browserApi(appFrame, token,
@@ -3003,7 +3028,10 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
         event.type === "load" && event.page === "main" && event.sequence > resetSequence), "controlled main document reload");
       result.inspection.after_navigation_load = resetReceipt.events.find(event =>
         event.type === "load" && event.page === "main" && event.sequence > resetSequence);
+      await checkProfileDocument("main", current.page_id, resetSequence);
     }
+    // Recheck after optional recovery/reload, including every retained failure event.
+    if (fixture.profile) await checkProfileDocument(CHECK_BROWSER_CONTROLLED_INSPECTION ? "main" : "nav", current.page_id);
     if (CHECK_BROWSER_CONTROLLED_OPERATOR) {
       try {
         result.operator = await runControlledBrowserOperator(appFrame, token, current.page_id,
@@ -3039,6 +3067,7 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
     failure.details = { ...failure.details, controlled_journey: result };
     throw failure;
   }
+  if (fixture.profile) { result.profile.complete = true; result.profile.completed_at = Date.now(); }
   return { page_id: result.pages.at(-1).page_id, display_mode: BROWSER_OPEN_DISPLAY_MODE, controlled_journey: result };
 }
 

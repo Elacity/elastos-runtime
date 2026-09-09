@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { createHash } from "node:crypto";
 import { createBrowserJourneyFixture } from "./browser-journey-fixture.mjs";
 import { readBrowserViewerReloadDocument } from "./browser-journey-viewer-reload.mjs";
 import { browserJourneyTargetConfig, readBrowserJourneyReceipt,
-  browserJourneyEngineChoice, browserJourneyEngineRoute } from "./browser-journey-target.mjs";
+  browserJourneyEngineChoice, browserJourneyEngineRoute, browserJourneyFixtureUrl,
+  browserJourneyProfileStorage, browserJourneyProfileBinding } from "./browser-journey-target.mjs";
 
 const source = readFileSync(new URL("../home-passkey-virtual-auth-smoke.mjs", import.meta.url), "utf8");
 function harnessFunction(name, globals = {}) {
@@ -18,6 +20,7 @@ function harnessFunction(name, globals = {}) {
     CHECK_BROWSER_CONTROLLED_OPERATOR: false, CHECK_BROWSER_CONTROLLED_JOURNEY: false,
     BROWSER_REMOTE_EXIT_ID: "", browserQualification: null, qualificationCancellation: null,
     BROWSER_JOURNEY_TARGET: browserJourneyTargetConfig(), browserJourneyEngineChoice, browserJourneyEngineRoute,
+    browserJourneyFixtureUrl, browserJourneyProfileStorage, browserJourneyProfileBinding,
     readBrowserJourneyReceipt: (config, run, options) => readBrowserJourneyReceipt(config, run,
       { ...options, fetchImpl: globals.fetch || fetch }), ...globals });
 }
@@ -408,11 +411,17 @@ test("journey preserves click/key timing and exact close even when diagnostic st
   for (const variant of ["success", "input-failure", "stop-reject", "stop-throw", "input-failure-stop-throw",
     "operator-success", "operator-media-success", "operator-before-close-failure", "operator-after-close-failure",
     "operator-pending-close-failure", "operator-qualification-success", "operator-qualification-failure",
-    "remote-engine-success", "remote-engine-wrong-adapter", "remote-engine-unavailable"]) {
+    "remote-engine-success", "remote-engine-wrong-adapter", "remote-engine-unavailable",
+    "profile-write", "profile-read", "profile-storage-failure", "profile-binding-failure", "profile-close-failure", "profile-inspection-reload"]) {
     const remote = variant.startsWith("remote-engine-");
+    const profile = variant.startsWith("profile-");
+    const profileFails = profile && variant.endsWith("failure");
+    const profileReload = variant === "profile-inspection-reload";
     const routeFails = variant === "remote-engine-wrong-adapter";
     const setupFails = variant === "remote-engine-unavailable";
-    const target = browserJourneyTargetConfig(remote ? { HOME_VIRTUAL_AUTH_BROWSER_ENGINE_ID: "remote-engine-test",
+    const target = browserJourneyTargetConfig(profile ? { HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_JOURNEY: "1",
+      HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VZ_TRANSPORT: "1", HOME_VIRTUAL_AUTH_BROWSER_PROFILE_MODE: variant === "profile-read" ? "read" : "write",
+      HOME_VIRTUAL_AUTH_BROWSER_PROFILE_MARKER: "profile-marker-123" } : remote ? { HOME_VIRTUAL_AUTH_BROWSER_ENGINE_ID: "remote-engine-test",
       HOME_VIRTUAL_AUTH_BROWSER_FIXTURE_ORIGIN: "http://fixture.example:61512",
       HOME_VIRTUAL_AUTH_BROWSER_FIXTURE_ADMIN_ORIGIN: "http://localhost:61512",
       HOME_VIRTUAL_AUTH_BROWSER_ALLOW_REMOTE_FIXTURE: "1" } : {});
@@ -420,10 +429,11 @@ test("journey preserves click/key timing and exact close even when diagnostic st
     const stages = [];
     const inputFails = variant.includes("input-failure");
     const operatorEnabled = variant.startsWith("operator-");
+    const inspectionEnabled = operatorEnabled || profileReload;
     const qualification = variant.includes("qualification");
     const qualificationFails = variant === "operator-qualification-failure";
     const operatorFails = operatorEnabled && variant.endsWith("failure") && !qualificationFails;
-    const media = variant === "operator-media-success" || qualification;
+    const media = variant === "operator-media-success" || qualification || profileReload;
     const runId = "journey-test-run";
     const events = [];
     const closes = [], inputActions = [];
@@ -431,6 +441,7 @@ test("journey preserves click/key timing and exact close even when diagnostic st
     const operatorError = Object.assign(new Error("operator probe failed"), { evidence: { ok: false, failure: "typed-fixture-error" } });
     const qualificationError = Object.assign(new Error("qualification probe failed"), { qualification: { failure: "fixture-gap" } });
     let url = "";
+    const urls = [];
     let pageName = "";
     let value = "";
     let frames = 0, inspectReads = 0, operatorCalls = 0, finishClose;
@@ -438,15 +449,28 @@ test("journey preserves click/key timing and exact close even when diagnostic st
     const report = type => events.push({ sequence: events.length + 1, type, page: pageName, value, scroll_y: type === "scroll" ? 640 : 0,
       ...(type === "audio" ? { audio_state: "running", frequency_hz: 440 } : {}),
       input_rect: { x: 32, y: 150, width: 480, height: 60 } });
+    const profileEvent = () => events.push({ sequence: events.length + 1, type: "profile_storage", page: pageName,
+      profile_storage: { schema: "elastos.browser.profile-storage/v1", ...target.profile,
+        measurement_ok: true, ok: true, error: null, cookie: { present: true, matches: true },
+        local_storage: { present: true, matches: true }, indexed_db: { present: true, matches: true,
+          write_request_succeeded: target.profile.mode === "write", write_committed: target.profile.mode === "write",
+          read_request_succeeded: true, read_completed: variant !== "profile-storage-failure" } } });
+    const principal = "person:local:profile123";
+    const browserToken = profile ? Buffer.from(JSON.stringify({ signer_did: "did:key:runtime123", payload: {
+      schema: "elastos.home.launch-token/v4", principal_id: principal, launch_context: { executable_actor: "browser" } } })).toString("base64url") : "browser-token";
+    const hash = value => createHash("sha256").update(value).digest("hex");
+    const short = value => `sha256:${hash(value).slice(0, 16)}`;
+    const activePageId = () => events.some(e => e.page === "nav") ? "page-nav" : "page-main";
     const appFrame = {
+      url: () => "http://localhost:8090/apps/browser/",
       waitForFunction: async () => { addressWaits++; },
       evaluate: async () => ({}),
       locator: selector => ["#browser-settings", "#browser-settings-close", "#browser-engine"].includes(selector) ? {
         click: async () => {}, selectOption: async id => { selectedEngine = id; }, inputValue: async () => selectedEngine,
       } : ({ waitFor: async () => {}, hover: async () => {}, click: async () => { inputActions.push("click"); if (media) report("audio"); },
         evaluate: async fn => fn({ dataset: { visible: "false" }, querySelector: () => ({ textContent: "" }) }),
-        fill: async target => { url = target; pageName = new URL(target).pathname.slice(1); value = ""; },
-        press: async key => { assert.equal(key, "Enter"); report("load"); },
+        fill: async target => { urls.push(target); url = target; pageName = new URL(target).pathname.slice(1); value = ""; },
+        press: async key => { assert.equal(key, "Enter"); report("load"); if (profile) profileEvent(); },
         pressSequentially: async character => { inputActions.push("key"); if (inputFails) throw inputError; value += character; report("input"); },
       }),
     };
@@ -455,10 +479,14 @@ test("journey preserves click/key timing and exact close even when diagnostic st
     const window = { instance: "instance-one" };
     const journey = harnessFunction("runControlledBrowserJourney", {
       CHECK_BROWSER_CONTROLLED_RECOVERY: false,
-      CHECK_BROWSER_VIEWER_RELOAD: false,
-      CHECK_BROWSER_CONTROLLED_INSPECTION: operatorEnabled,
+      CHECK_BROWSER_VIEWER_RELOAD: profileReload,
+      CHECK_BROWSER_CONTROLLED_INSPECTION: inspectionEnabled,
       CHECK_BROWSER_CONTROLLED_OPERATOR: operatorEnabled,
       CHECK_BROWSER_CONTROLLED_MEDIA: media, controlledTonePresent: () => true,
+      runControlledBrowserViewerReload: async (_page, _frame, _token, _receipt, expectedUrl) => {
+        assert.equal(expectedUrl, urls[1]); assert.equal(new URL(expectedUrl).searchParams.get("profile"), "write");
+        return { ok: true };
+      },
       browserQualification: qualification ? { observe: async options => {
         assert.equal(options.pageId, "page-nav"); assert.equal(options.appFrame, appFrame);
         assert.equal(typeof options.interact, "function"); assert.equal((await options.readStatus()).body.direct_network, false);
@@ -476,7 +504,8 @@ test("journey preserves click/key timing and exact close even when diagnostic st
         assert.equal(requestUrl, `${target.adminOrigin}/receipt?run=${runId}`);
         assert.equal(options.credentials, "omit");
         return { ok: true, status: 200,
-          json: async () => ({ schema: "elastos.browser.journey-receipt/v1", run: runId, events }) };
+          json: async () => ({ schema: "elastos.browser.journey-receipt/v1", run: runId, events,
+            ...(profile ? { profile_probe: target.profile } : {}) }) };
       },
       waitForEmbeddedBrowserPage: async () => `page-${pageName}`,
       browserApi: async (_frame, _token, path, options) => {
@@ -484,6 +513,13 @@ test("journey preserves click/key timing and exact close even when diagnostic st
           assert.equal(path, "/api/apps/browser/summary?browser_instance=instance-one");
           assert.equal(options.timeoutMs, 15_000);
           summaryReads++;
+          if (profile) return { ok: true, body: { schema: "elastos.browser.runtime/v1", principal_id: principal,
+            sessions: { lifecycle: { schema: "elastos.browser.lifecycle-status/v1", sessions: [{ phase: "ACTIVE_SESSION",
+              page_id: short(activePageId()), principal_id: short(principal),
+              profile_key_hash: variant === "profile-binding-failure" && pageName === "nav" ? short("wrong-profile") : short(`profile-${hash(principal)}`) }] },
+            recoverable_page: { schema: "elastos.browser.recoverable-page/v1", state: "active", page_id: activePageId(),
+              service_selection: { schema: "elastos.browser.service-selection/v1", engine_id: "" },
+              engine_page: { page_id: activePageId(), adapter: "browser-vm-test", provider: "browser-engine" } } } } };
           if (setupFails) return { ok: true, body: { engine_adapter: { adapters: [] } } };
           const adapter = { id: target.engineId, direct_network: false, wallet_injection: false };
           return { ok: true, body: { engine_adapter: { adapters: [adapter], remote_services: { offers: [{ state: "approved",
@@ -510,7 +546,7 @@ test("journey preserves click/key timing and exact close even when diagnostic st
       remoteVideoClickPositionForPagePoint: async () => { inputActions.push("geometry"); return { x: 50, y: 50 }; },
       observeControlledBrowserInput: async (actualPage, actualFrame, token, pageId) => {
         assert.equal(actualPage, page); assert.equal(actualFrame, appFrame);
-        assert.equal(token, "browser-token"); assert.equal(pageId, "page-nav");
+        assert.equal(token, browserToken); assert.equal(pageId, "page-nav");
         inputActions.push("observe");
         return { evidence: { observer: {} }, stop: failure => {
           inputActions.push(failure ? "failure-stop" : "stop");
@@ -520,6 +556,7 @@ test("journey preserves click/key timing and exact close even when diagnostic st
       },
       closeControlledBrowserWindow: async (...args) => {
         closes.push(args);
+        if (variant === "profile-close-failure") throw new Error("profile close failed");
         return variant === "operator-pending-close-failure" ? pendingClose : { receipt: { closed: true } };
       },
       runControlledBrowserOperator: async (frame, token, pageId, expectedUrl, readReceipt, close) => {
@@ -540,7 +577,14 @@ test("journey preserves click/key timing and exact close even when diagnostic st
         return { ok: true };
       },
     });
-    if (setupFails) await assert.rejects(journey(page, appFrame, window, "browser-token", baseline, []), error => {
+    if (profileFails) await assert.rejects(journey(page, appFrame, window, browserToken, baseline, []), error => {
+      assert.match(error.message, /profile (storage|lifecycle|close)/);
+      assert.equal(error.details.controlled_journey.profile.complete, false);
+      assert.ok(error.details.controlled_journey.profile.receipt.events.some(event => event.type === "profile_storage"));
+      if (variant !== "profile-close-failure") assert.ok(error.details.controlled_journey.close.receipt.closed);
+      return true;
+    });
+    else if (setupFails) await assert.rejects(journey(page, appFrame, window, browserToken, baseline, []), error => {
       assert.match(error.message, /Requested Browser Engine is absent from the Runtime inventory/);
       assert.equal(error.details.controlled_journey.requested_engine_id, target.engineId);
       return true;
@@ -554,9 +598,26 @@ test("journey preserves click/key timing and exact close even when diagnostic st
       return true;
     });
     else {
-      const result = await journey(page, appFrame, window, "browser-token", baseline, []);
+      const result = await journey(page, appFrame, window, browserToken, baseline, []);
       assert.equal(result.page_id, "page-nav");
       assert.ok(result.controlled_journey.pages.every(row => new URL(row.url).origin === target.origin));
+      if (profile) {
+        assert.equal(result.controlled_journey.profile.complete, true);
+        assert.equal(result.controlled_journey.profile.mode, target.profile.mode);
+        assert.equal(result.controlled_journey.profile.documents.length, profileReload ? 4 : 3);
+        assert.equal(result.controlled_journey.profile.binding.principal_sha256, hash(principal));
+        assert.equal(result.controlled_journey.profile.binding.engine_id, "", "ordinary Automatic Engine selection");
+        for (const url of urls) {
+          const query = new URL(url).searchParams;
+          assert.equal(query.get("run"), runId); assert.equal(query.get("profile"), target.profile.mode);
+          assert.equal(query.get("marker"), target.profile.marker);
+        }
+        if (profileReload) {
+          assert.equal(urls.length, 3); assert.equal(inspectReads, 3);
+          assert.equal(result.controlled_journey.viewer_reload.ok, true);
+          assert.ok(result.controlled_journey.audio_after_recovery);
+        }
+      } else assert.equal(result.controlled_journey.profile, undefined);
       if (remote) {
         assert.equal(result.controlled_journey.requested_engine_id, target.engineId);
         assert.equal(result.controlled_journey.engine_route.adapter_id, "browser-vm-test");
@@ -569,19 +630,20 @@ test("journey preserves click/key timing and exact close even when diagnostic st
     }
     assert.equal(closes.length, 1);
     assert.equal(operatorCalls, operatorEnabled && !qualificationFails ? 1 : 0);
-    assert.equal(summaryReads, remote ? setupFails ? 1 : routeFails ? 2 : 3 : 0);
+    assert.equal(summaryReads, profile ? variant === "profile-storage-failure" ? 0 :
+      variant === "profile-binding-failure" ? 2 : profileReload ? 4 : 3 : remote ? setupFails ? 1 : routeFails ? 2 : 3 : 0);
     if (setupFails) {
       assert.equal(addressWaits, 0); assert.equal(selectedEngine, "");
       assert.equal(stages[0], "browser:controlled-engine-selection");
       assert.ok(!stages.includes("browser:controlled-address-ready"));
     }
-    if (routeFails || setupFails) assert.deepEqual(inputActions, []);
+    if (routeFails || setupFails || profileFails && variant !== "profile-close-failure") assert.deepEqual(inputActions, []);
     else {
       assert.deepEqual(inputActions.slice(0, 4), ["observe", "geometry", "click", "key"]);
       assert.equal(inputActions[4], inputFails ? "failure-stop" : "stop");
     }
-    assert.deepEqual(closes[0].slice(0, 5), [page, appFrame, window, "browser-token", baseline]);
-    assert.equal(closes[0][5]?.expectedPageId, setupFails || routeFails || inputFails || qualificationFails || variant === "operator-before-close-failure" ? null : "page-nav");
+    assert.deepEqual(closes[0].slice(0, 5), [page, appFrame, window, browserToken, baseline]);
+    assert.equal(closes[0][5]?.expectedPageId, setupFails || routeFails || profileFails && variant !== "profile-close-failure" || inputFails || qualificationFails || variant === "operator-before-close-failure" ? null : "page-nav");
   }
 });
 
