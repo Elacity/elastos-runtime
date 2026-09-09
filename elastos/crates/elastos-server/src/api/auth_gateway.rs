@@ -2916,12 +2916,9 @@ fn refresh_session_inner(
         expires_at: now.saturating_add(AUTH_SESSION_TTL_SECS),
         apps: previous.apps,
     };
-    crate::auth::renew_session_grant(&auth_data_dir, grant.clone())?;
-    if auth_data_dir != state.data_dir {
-        let _ = crate::auth::renew_session_grant(&state.data_dir, grant.clone());
-    }
-    crate::auth::append_audit_event(
+    crate::auth::renew_session_grant_with_audit(
         &auth_data_dir,
+        grant.clone(),
         audit_event(AuditEventInput {
             event_type: "auth.session.refreshed",
             principal_id: Some(grant.principal_id.clone()),
@@ -2933,6 +2930,9 @@ fn refresh_session_inner(
             ..AuditEventInput::default()
         }),
     )?;
+    if auth_data_dir != state.data_dir {
+        let _ = crate::auth::renew_session_grant(&state.data_dir, grant.clone());
+    }
     let home_token =
         issue_home_launch_token_for_auth_grant(&state.data_dir, HOME_CAPSULE_ID, &grant)?;
     let system_token = issue_home_launch_token_for_auth_grant(
@@ -8426,6 +8426,49 @@ mod tests {
         .expect("an open child token must survive host session renewal");
         assert!(!response.home_token.is_empty());
         assert!(!response.system_token.is_empty());
+    }
+
+    #[test]
+    fn refresh_session_audit_and_save_failures_issue_no_tokens() {
+        for fault in [
+            crate::auth::RecoveryReassignmentTestFault::AuditChainRejection,
+            crate::auth::RecoveryReassignmentTestFault::AuthStateSave,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let _auth_data_dir =
+                super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
+            let state = test_gateway_state(temp.path());
+            let credential = test_credential();
+            seed_test_passkey_principal(
+                &state,
+                &credential,
+                "https://elastos.elacitylabs.com",
+                crate::auth::RuntimePrincipalRole::Admin,
+            );
+            let grant = issue_passkey_session_grant(
+                &state,
+                "identity-test",
+                &credential,
+                "https://elastos.elacitylabs.com",
+                true,
+                "test passkey grant",
+            )
+            .unwrap();
+            let auth_path = crate::auth::auth_state_path(temp.path()).unwrap();
+            let before = std::fs::read(&auth_path).unwrap();
+            crate::auth::inject_recovery_reassignment_test_fault(temp.path(), fault);
+            let result = refresh_session_inner(&state, &home_token_headers(&grant.home_token));
+            let error = result
+                .err()
+                .expect("failed refresh must return no token response");
+            assert!(error.to_string().contains(&format!("{fault:?}")));
+            assert_eq!(std::fs::read(&auth_path).unwrap(), before);
+            super::super::gateway::require_home_token_context(
+                temp.path(),
+                &home_token_headers(&grant.home_token),
+            )
+            .expect("failed refresh preserves existing Home authority");
+        }
     }
 
     #[test]

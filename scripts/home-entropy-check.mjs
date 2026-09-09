@@ -11588,7 +11588,7 @@ assert(
 assert(
   gatewayApi.includes("pub(crate) fn home_launch_auth_data_dir") &&
     authGatewayApi.includes("home_launch_auth_data_dir(&state.data_dir)") &&
-    authGatewayApi.includes("crate::auth::renew_session_grant(&auth_data_dir") &&
+    /crate::auth::renew_session_grant_with_audit\(\s*&auth_data_dir\s*,\s*grant\.clone\(\)/.test(authGatewayApi) &&
     authGatewayApi.includes("an open child token must survive host session renewal") &&
     authGatewayApi.includes("crate::auth::revoke_session_grant(&auth_data_dir") &&
     authGatewayApi.includes(

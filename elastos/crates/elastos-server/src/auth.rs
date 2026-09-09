@@ -3805,23 +3805,52 @@ pub fn store_session_grant(data_dir: &Path, grant: AuthSessionGrantV1) -> anyhow
 }
 
 pub fn renew_session_grant(data_dir: &Path, grant: AuthSessionGrantV1) -> anyhow::Result<()> {
+    mutate_auth_state(data_dir, |state| renew_session_in_state(state, grant))
+}
+
+fn renew_session_in_state(state: &mut AuthState, grant: AuthSessionGrantV1) -> anyhow::Result<()> {
+    let stored = state
+        .sessions
+        .iter_mut()
+        .find(|stored| stored.grant.session_id == grant.session_id)
+        .ok_or_else(|| anyhow!("auth session not found"))?;
+    if stored.revoked_at.is_some() {
+        anyhow::bail!("auth session is not active");
+    }
+    if stored.grant.grant_id != grant.grant_id
+        || stored.grant.principal_id != grant.principal_id
+        || stored.grant.proof_binding_id != grant.proof_binding_id
+    {
+        anyhow::bail!("auth session authority context mismatch");
+    }
+    stored.grant = grant;
+    Ok(())
+}
+
+/// Commit renewal and its signed audit event before the caller issues tokens.
+pub(crate) fn renew_session_grant_with_audit(
+    data_dir: &Path,
+    grant: AuthSessionGrantV1,
+    event: RuntimeAuditEventV1,
+) -> anyhow::Result<()> {
+    if event.schema != RuntimeAuditEventV1::SCHEMA
+        || event.event_type != "auth.session.refreshed"
+        || event.result != "ok"
+        || event.principal_id.as_deref() != Some(grant.principal_id.as_str())
+        || event.proof_binding_id.as_deref() != Some(grant.proof_binding_id.as_str())
+        || event.session_id.as_deref() != Some(grant.session_id.as_str())
+    {
+        anyhow::bail!("auth session refresh audit binding mismatch");
+    }
+    let event = sign_audit_event(data_dir, event)?;
     mutate_auth_state(data_dir, |state| {
-        let stored = state
-            .sessions
-            .iter_mut()
-            .find(|stored| stored.grant.session_id == grant.session_id)
-            .ok_or_else(|| anyhow!("auth session not found"))?;
-        if stored.revoked_at.is_some() {
-            anyhow::bail!("auth session is not active");
-        }
-        if stored.grant.grant_id != grant.grant_id
-            || stored.grant.principal_id != grant.principal_id
-            || stored.grant.proof_binding_id != grant.proof_binding_id
-        {
-            anyhow::bail!("auth session authority context mismatch");
-        }
-        stored.grant = grant;
-        Ok(())
+        renew_session_in_state(state, grant)?;
+        #[cfg(test)]
+        consume_recovery_reassignment_test_fault(
+            data_dir,
+            RecoveryReassignmentTestFault::AuditChainRejection,
+        )?;
+        push_audit_event(data_dir, state, event)
     })
 }
 
@@ -7717,6 +7746,214 @@ mod tests {
             occurred_at: index,
             signer_did: None,
             signature: None,
+        }
+    }
+
+    fn refresh_audit(grant: &AuthSessionGrantV1, index: u64) -> RuntimeAuditEventV1 {
+        RuntimeAuditEventV1 {
+            event_type: "auth.session.refreshed".into(),
+            principal_id: Some(grant.principal_id.clone()),
+            proof_binding_id: Some(grant.proof_binding_id.clone()),
+            session_id: Some(grant.session_id.clone()),
+            result: "ok".into(),
+            occurred_at: now_ts(),
+            ..test_audit_event(index)
+        }
+    }
+
+    fn refresh_fixture(data_dir: &Path, events: u64) -> AuthSessionGrantV1 {
+        let now = now_ts();
+        let principal =
+            upsert_principal_for_binding(data_dir, passkey_binding(1, now, now), now).unwrap();
+        let grant = AuthSessionGrantV1 {
+            schema: AuthSessionGrantV1::SCHEMA.into(),
+            grant_id: "grant:refresh".into(),
+            session_id: "auth:refresh".into(),
+            principal_id: principal.principal_id,
+            proof_binding_id: principal.proof_binding_id,
+            issued_at: now,
+            expires_at: now + 3600,
+            apps: vec!["home".into(), "system".into()],
+        };
+        let mut state = load_auth_state(data_dir).unwrap();
+        for index in 0..3 {
+            let mut session = grant.clone();
+            if index > 0 {
+                session.session_id = format!("auth:other:{index}");
+            }
+            state.sessions.push(StoredAuthSession {
+                grant: session,
+                revoked_at: None,
+            });
+        }
+        // Build valid signed fixture links directly, then run the full verifier
+        // at persistence. Avoid 512 progressively larger setup mutations.
+        for index in 1..=events {
+            let event = sign_audit_event(data_dir, test_audit_event(index)).unwrap();
+            let link = sign_audit_chain_link(data_dir, state.audit_chain.last(), &event).unwrap();
+            state.audit.push(event);
+            state.audit_chain.push(link);
+        }
+        state.audit_chain_state = Some(
+            sign_audit_chain_state(
+                data_dir,
+                state.audit_chain_state.as_ref().unwrap().activated_at,
+                state.audit_chain.last(),
+            )
+            .unwrap(),
+        );
+        save_auth_state(data_dir, &state).unwrap();
+        grant
+    }
+
+    fn refresh_persisted_bytes(data_dir: &Path) -> (Vec<u8>, Vec<u8>) {
+        (
+            std::fs::read(auth_state_path(data_dir).unwrap()).unwrap(),
+            std::fs::read(audit_chain_activation_path(data_dir).unwrap()).unwrap(),
+        )
+    }
+
+    #[test]
+    fn refresh_fusion_halves_verified_passes_with_512_signed_events() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path();
+        let mut grant = refresh_fixture(data, 512);
+        let initial = load_auth_state(data).unwrap(); // warm the exact file cache
+        assert_eq!(initial.principals.len(), 1);
+        assert_eq!(initial.sessions.len(), 3);
+        grant.expires_at += 60;
+        let before = verify_audit_chain_call_count(data);
+        renew_session_grant(data, grant.clone()).unwrap();
+        append_audit_event(data, refresh_audit(&grant, 513)).unwrap();
+        let separate = verify_audit_chain_call_count(data) - before;
+        assert_eq!(separate, 6);
+        let prior = load_auth_state(data).unwrap(); // verify and warm for the fused operation
+        grant.expires_at += 60;
+        let before = verify_audit_chain_call_count(data);
+        renew_session_grant_with_audit(data, grant.clone(), refresh_audit(&grant, 514)).unwrap();
+        let fused = verify_audit_chain_call_count(data) - before;
+        assert_eq!(fused, 3);
+        println!("refresh_fusion: retained_events=512 separate_verifies={separate} fused_verifies={fused}");
+        let after = load_auth_state(data).unwrap();
+        assert_eq!(
+            serde_json::to_value(&after.sessions[0].grant).unwrap(),
+            serde_json::to_value(&grant).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&after.sessions[1..]).unwrap(),
+            serde_json::to_value(&prior.sessions[1..]).unwrap()
+        );
+        assert_eq!(after.audit.len(), 512);
+        assert_eq!(after.audit_chain.len(), 512);
+        assert_eq!(
+            after
+                .audit
+                .iter()
+                .filter(|event| event.event_id == "audit:test:514")
+                .count(),
+            1
+        );
+        let event = after.audit.last().unwrap();
+        assert_eq!(event.event_type, "auth.session.refreshed");
+        assert_eq!(
+            event.principal_id.as_deref(),
+            Some(grant.principal_id.as_str())
+        );
+        assert_eq!(
+            event.proof_binding_id.as_deref(),
+            Some(grant.proof_binding_id.as_str())
+        );
+        assert_eq!(event.session_id.as_deref(), Some(grant.session_id.as_str()));
+        assert_eq!(after.audit_chain.last().unwrap().sequence, 514);
+        assert_eq!(after.audit_chain_anchor.as_ref().unwrap().sequence, 2);
+        assert_eq!(
+            load_audit_chain_activation(data)
+                .unwrap()
+                .unwrap()
+                .checkpoint,
+            audit_chain_checkpoint(&after).unwrap().unwrap()
+        );
+    }
+
+    #[test]
+    fn refresh_fusion_rejects_authority_and_audit_mismatches_without_writes() {
+        for case in [
+            "missing",
+            "revoked",
+            "grant",
+            "principal",
+            "proof",
+            "audit_schema",
+            "audit_type",
+            "audit_result",
+            "audit_principal",
+            "audit_proof",
+            "audit_session",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let data = root.path();
+            let mut grant = refresh_fixture(data, 2);
+            grant.expires_at += 60;
+            match case {
+                "missing" => grant.session_id = "auth:missing".into(),
+                "revoked" => mutate_auth_state(data, |state| {
+                    state.sessions[0].revoked_at = Some(now_ts());
+                    Ok(())
+                })
+                .unwrap(),
+                "grant" => grant.grant_id = "grant:other".into(),
+                "principal" => grant.principal_id = "person:other".into(),
+                "proof" => grant.proof_binding_id = "proof:other".into(),
+                _ => {}
+            }
+            let mut event = refresh_audit(&grant, 3);
+            match case {
+                "audit_schema" => event.schema = "wrong".into(),
+                "audit_type" => event.event_type = "wrong".into(),
+                "audit_result" => event.result = "denied".into(),
+                "audit_principal" => event.principal_id = None,
+                "audit_proof" => event.proof_binding_id = Some("proof:other".into()),
+                "audit_session" => event.session_id = Some("auth:other".into()),
+                _ => {}
+            }
+            let before = refresh_persisted_bytes(data);
+            let error = renew_session_grant_with_audit(data, grant, event).unwrap_err();
+            // Verified loads prune revoked sessions before renewal admission.
+            assert!(
+                error.to_string().contains(if case.starts_with("audit_") {
+                    "audit binding mismatch"
+                } else if matches!(case, "missing" | "revoked") {
+                    "session not found"
+                } else {
+                    "authority context mismatch"
+                }),
+                "{case}: {error}"
+            );
+            assert_eq!(refresh_persisted_bytes(data), before, "{case}");
+        }
+    }
+
+    #[test]
+    fn refresh_fusion_audit_and_save_failure_preserve_grant_and_checkpoint() {
+        for fault in [
+            RecoveryReassignmentTestFault::AuditChainRejection,
+            RecoveryReassignmentTestFault::AuthStateSave,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let data = root.path();
+            let mut grant = refresh_fixture(data, 2);
+            let original_expiry = grant.expires_at;
+            grant.expires_at += 60;
+            let before = refresh_persisted_bytes(data);
+            inject_recovery_reassignment_test_fault(data, fault);
+            let error =
+                renew_session_grant_with_audit(data, grant.clone(), refresh_audit(&grant, 3))
+                    .unwrap_err();
+            assert!(error.to_string().contains(&format!("{fault:?}")));
+            assert_eq!(refresh_persisted_bytes(data), before);
+            let state = load_auth_state(data).unwrap();
+            assert_eq!(state.sessions[0].grant.expires_at, original_expiry);
+            assert_eq!(state.audit.len(), 2);
         }
     }
 
