@@ -21,7 +21,8 @@ volatile proof logs remain outside the repository.
   Reviewed code checkpoint `05ee824dcc0b0bde75908af89a90e9fb17bceb76`, tree
   `9c6b096b19968ef021dd8e9daba2ae1f4e331278`, preserves the normal PR58 merge
   and model preparation work, and adds bounded failure diagnostics. Its checked
-  comparison before documentation reconciliation is 49 commits ahead and zero
+  pre-handover comparison at documentation commit `e9b9baf71bea7b4abe427fe9f00034d4b9904bbe`,
+  tree `c7ab978bde5599164b7ce3a0b9c456d331f75834`, was 50 commits ahead and zero
   behind the fetched development line; the remote integration branch
   is deleted. Publication awaits the user's manual branch check and explicit
   approval. Independently owned Browser and dKMS release acceptance can remain
@@ -87,9 +88,10 @@ rebased PR55 work. PR55 is closed with
 That review compared candidate `94ed0dc6` with development: 48 ahead and zero
 behind, with 216 changed files and 44,446 additions/2,350 deletions. The later
 reviewed diagnostic code checkpoint is `05ee824d`, tree `9c6b096b`; its checked
-pre-documentation comparison is 49 ahead and zero behind the same fetched
-development ref. The documentation reconciliation describes the owned execution
-queue. Installed owner Home remains at `94ed0dc6`, separately identified below.
+pre-handover comparison at documentation commit `e9b9baf7` was 50 ahead and zero behind the
+same fetched development ref. These commits remain local. The documentation
+reconciliation describes the owned execution queue; the later handover commit
+changes documentation only. Installed owner Home remains at `94ed0dc6`, separately identified below.
 
 | Public work at the review checkpoint | Recorded layer and ownership |
 | --- | --- |
@@ -212,7 +214,38 @@ metadata integrity, first weights fetch, header, real Home grant revocation
 after metadata, and failed drain retaining staging/charge. The shared UI failure
 smoke also passes. This is source diagnostic proof; it is not installed here
 and does not identify or repair the older failure. That record's cause remains
-unknown until a bounded installed reproduction establishes it.
+unknown; a later reproduction can identify its own failure, but does not by
+itself prove the historical cause.
+
+### Diagnostic build and handover checkpoint
+
+The clean `e9b9baf7` source produced a Runtime-only release build with Rust
+1.91.0, `RUSTFLAGS='-D warnings'`, `--locked` and one build job. The build
+completed on 2026-09-09 in 9m18s using the existing shared target. Runtime
+SHA-256 is `fa84c79d9bbccddc1084a2b386e6f07fa58ad0c60fc58fe3ede7e53a5ab2e6db`
+(82,275,744 bytes). The source diagnostic test and UI smoke above remain the
+last focused execution proof; documentation closeout reuses that proof.
+The handover commit follows this successful build and preserves its actual
+`e9b9baf7` provenance. Verify that relevant build inputs and configuration remain
+unchanged and that the artifact hash matches before reuse; documentation alone
+does not require another build.
+
+Read-only installation preflight verified the installed Runtime, retained
+recovery binary and existing components/capsule receipt bindings, with 17.9%
+disk free. The diagnostic installation and Retry remain held: Analyser could
+read the signed-in Home, but clicks and Tab had no visible effect, coordinate
+control returned `noWindowsAvailable`, and extension tab access timed out.
+Normal-UI cancellation therefore remains an external prerequisite. The proposed
+resource window ended without an installation, restart, transfer or inference.
+The existing failed preparation record and installed source remain unchanged.
+
+[The handover](docs/audits/2026-09-09-home-model-handover.md) links the nine-step Builder plan and its first
+next action. Exact operator paths, receipt hashes and recovery retention are in
+the private operator ledger. Publication still requires review and explicit
+approval; these local tests and build do not establish public CI or installed
+diagnostic acceptance.
+
+### Installed preservation evidence
 
 All 490 unrelated artifact records retain their captured bytes and metadata.
 Sixteen of 18 post-stop private file records are unchanged; the two changed

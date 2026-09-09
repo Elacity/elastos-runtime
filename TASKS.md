@@ -13,9 +13,11 @@ Do not add new product surface area until the `Now` section is materially tighte
 ## Now
 
 Goal: make the five release journeys below reliable on one reviewed candidate.
-The current candidate is installed with artifact parity verified. Model failure
+The owner Home has verified artifact parity for its installed revision; later
+diagnostic source and its release build await installed proof. Model failure
 diagnosis, unified model handoff/storage design and combined acceptance remain
-open. Exact public refs, CI and shared-source overlaps are in
+open. Resume from [the handover](docs/audits/2026-09-09-home-model-handover.md).
+Exact public refs, CI and shared-source overlaps are in
 [state.md](state.md#public-coordination-and-overlaps).
 
 | Release journey | Source and installed evidence | Remaining proof and owner |
@@ -59,14 +61,18 @@ freeze its handoff, retention, transfer or remote-authority contract choices.
 
 #### 1. Establish and repair the preparation failure
 
-**Status:** focused diagnostic source verification passed; installed cause and
+**Status:** focused diagnostic source verification and the Runtime release build
+passed; installed cause and
 causal repair remain open. The five-case
 `model_preparation_failure_phase_survives_cleanup_with_real_home_revalidation`
 test and `scripts/model-preparation-failure-smoke.mjs` pass: metadata integrity,
 first weights read, header, real Home grant revocation after metadata, and failed
 drain preserving bytes/charge. This proves the diagnostic boundary, not the
-cause of the installed failure. Next, Analyser performs a bounded installed
-diagnostic/reproduction on the exact package and artifact tuple. The older
+cause of the installed failure. First restore demonstrably effective Home UI
+controls: reads work, but clicks failed, so normal-UI cancellation is unproven.
+Analyser then arranges a fresh resource window for the reviewed Runtime-only
+diagnostic installation and one bounded reproduction on the exact package and
+artifact tuple. Neither that installation nor Retry has occurred. The older
 failed record retains unknown cause.
 
 **Pass:** identify the actual failed boundary, implement its minimal causal
