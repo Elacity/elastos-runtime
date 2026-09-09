@@ -72,8 +72,8 @@ volatile proof logs remain outside the repository.
 
 The current task Mac runs Runtime `690170bc`, SHA-256
 `f5b012ae4f704bf22cb94aa51699f29082839727b4ddbd4493b7b14d26c557bf`.
-The Linux consumer/Exit runs the operation diagnostic `70dccb34`, SHA-256
-`1701fad008811fd3dffd4d4c75d7ec6657fea9f598bf2bfcc4420369eb2d63ae`.
+The Linux consumer/Exit runs `b8c78d79`, SHA-256
+`47ca650f8033727bfe57c20b52d4392fdb52d2f085b60307a5394697c44a87a3`.
 Both installed and served artifact checks pass. The Mac now has the `2cdc9535`
 operator invitation, reference-fill adapter, Browser UI and Engine helper.
 The matching adapter hash is
@@ -90,6 +90,21 @@ all 13 close effects in 788 ms. Independent review accepts that bounded scope.
 Observed dropped frames and cumulative audio loss keep media-quality and
 latency-distribution claims outside this result.
 
+The Linux update includes the directional Exit EOF repair `a3471808`; its
+original regression fails and the two repaired stream-direction cases pass
+independent review. Runtime, adapter and served Browser assets have matching
+installation receipts, and the five task configurations retain their hashes.
+With this Linux consumer/Exit and the unchanged Mac Engine, run 96 completes
+Home launch, controlled navigation, decoded video, typing, inspection, short
+audio and scrolling. Viewer reload fails the unchanged five-second gate with
+`state_deadline`. Completed Runtime samples retain the same page binding; the
+new viewer requests display reattachment before the deadline. Subsequent close confirms all 13
+effects in 1888 ms; Runtime and VM control obligations return to zero. This is
+a passed ordinary-browsing and close milestone within a failed integrated
+remote run. Independent review accepts the ordinary actions and exact close. Input and bootstrap delays still
+prevent a smoothness claim; recovery and the remaining placements stay open.
+
+The following remote failures refer to the earlier Linux diagnostic installation.
 Earlier exact local artifact sets pass decoded media, navigation, input, native
 operator handoff and cleanup. After the controlled fixture received an exact
 Exit destination exception and the current Engine request received approval,
@@ -136,6 +151,28 @@ with zero Browser pages and VMs at both boundaries. The first five seconds of
 sampled stacks include repeated collaboration validation; that short sample
 does not account for the entire observation. The synthetic benchmark and its
 tamper/no-write checks are independently reviewed in source `6ceb6089`.
+
+Persistence write attempt 94 fails at Home readiness before Browser allocation;
+the paired read is stopped. Two subsequent Home observations and a matching
+Runtime stack sample locate delays in session renewal, the shared auth-state
+lock and repeated signed-audit validation. Reviewed source `de0a299e` commits
+renewal and its audit append in one existing state mutation. All 24 focused
+Rust checks pass; the measured test path performs three validation passes
+instead of six. The installed Runtime still predates this repair, so installed
+latency attribution remains pending.
+
+Reviewed source `52238f2f` addresses a separate profile safety defect: an
+existing disk mount failure previously triggered formatting. The host now
+owns exclusive disk creation and a one-use initialization marker, and the
+guest formats only that newly created disk. The original destructive behavior
+fails the regression; 14 generated guest-shell and four VZ tests pass. Matching
+host and guest installation and actual profile persistence remain pending.
+Linux Browser profile disk attachment is a remaining implementation gap.
+Reviewed source `6ff70451` adds exact selected-file-byte evidence to the
+controlled upload fixture; an installed Library upload remains pending.
+All B01-B16 requirements remain open for their full qualification. The planned
+eight-hour run start was missed; launch campaigns, uninterrupted 30-minute
+media, eight-hour mixed use and final human/device acceptance have yet to run.
 
 The following paragraphs retain earlier bounded evidence. The earlier operator
 checkpoint used Runtime source `0244cc0c`, hash

@@ -37,6 +37,10 @@ audio, reload and separately authorized native operator actions. Runs 92/93
 add independent acceptance on the current installed artifact set, including
 bounded actual Camofox and Playwright operation. Current evidence and artifact
 identity are in [state.md](state.md#browser-contract-and-device-qualification).
+Run 96 also completes ordinary browsing through the Linux consumer/Exit and
+Mac Engine, then confirms all 13 close effects. Its viewer reload fails the
+five-second recovery gate. This advances the remote contract milestone while
+the integrated remote journey remains failed.
 The initrd-only RNG activation removes an observed five-second bootstrap delay;
 current launcher samples range from about 9 to 11 seconds. A decoded-audio
 repeat fails with long silence, while a later controlled interruption passes
@@ -147,6 +151,18 @@ alongside the local, operator and remote journeys.
   waits, full actionability,
   files, profiles and declared Camoufox conformance remain open.
 - **B08/B09.first-remote / active / independent delegated source owner.**
+  The Linux consumer now runs `b8c78d79`, including the independently reviewed
+  directional Exit EOF repair `a3471808`. Its original regression fails and
+  both repaired stream-direction tests pass. Installed provider, capsule,
+  served-asset and configuration parity pass. With the unchanged Mac Engine,
+  run 96 completes Home launch, decoded video, navigation, typing, inspection,
+  short audio and scrolling. Viewer reload then fails at `state_deadline`;
+  the retained page binding remains valid and display reattachment starts
+  within the observation window. Exact close confirms all 13 effects in
+  1888 ms and leaves Runtime/control obligations at zero. Independent review
+  accepts the ordinary actions and exact close. Diagnose the first reload delay and
+  repeat the same A/B/A journey with the existing five-second acceptance gate.
+  The following account preserves the earlier failed attempts.
   `caa5d90f` is independently accepted after 45 focused tests. Normal Engine
   sharing, request, approval and selection pass. The first Linux Home → Mac
   Engine → Linux Exit attempt fails at Carrier connection before allocation.
@@ -249,10 +265,21 @@ alongside the local, operator and remote journeys.
   B12 first proves cookies, local storage and committed IndexedDB across an
   explicit close and reopen of the same principal/profile. The opt-in fixture
   passes independent source review, including commit/abort and read-without-write
-  cases; actual Engine persistence remains unverified. Encrypted checkpoint transfer, recovery
+  cases. Write attempt 94 fails during Home startup before Browser allocation;
+  the paired read is stopped. Reviewed source `de0a299e` combines session renewal
+  and its audit append in one state update; 24 Rust checks pass, including an
+  actual reduction from six to three signature-validation passes. Install it
+  and repeat the same Home and Browser journey before attributing a latency fix.
+  Reviewed source `52238f2f` preserves existing profile bytes on mount failure;
+  the original destructive path fails its regression and 14 guest-shell plus
+  four VZ tests pass. Install matching host and guest artifacts before the
+  persistence pair. Linux Browser profile disk attachment still needs
+  implementation. Actual Engine persistence remains unverified. Encrypted checkpoint transfer, recovery
   and ephemeral-profile deletion still need implementation and proof. B13 first
   uses the existing object-granted upload path with a bounded file and an exact
-  destination hash. Complete downloads to selected storage, large-transfer
+  destination hash. Reviewed fixture source `6ff70451` checks the actual
+  selected 64 KiB file bytes; installed positive and changed-byte cases remain
+  pending. Complete downloads to selected storage, large-transfer
   progress/cancel/integrity, actual Wallet consent flows and human screen-reader
   access to Engine-page controls retain their acceptance requirements. B15
   first binds a real distributable image and matching helpers in the existing
