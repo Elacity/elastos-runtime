@@ -83,7 +83,12 @@ and initrd is `d928d9f69e7929049575cb1f4c6366f87f66c62cf11921faddb5bb2963c5462c`
 One guest helper changed in the rootfs and initrd; the kernel and media
 dependencies were reused. The bounded audio observer from `6896fee5` remains.
 This diagnostic image and the debug Runtime builds supply bounded functional
-evidence; release performance and device qualification remain open.
+evidence; release performance and device qualification remain open. Run 92
+passes the local Home journey on this exact set: decoded video/audio,
+navigation, typing, scrolling, Engine inspection, viewer reload in 3872 ms and
+all 13 close effects in 788 ms. Independent review accepts that bounded scope.
+Observed dropped frames and cumulative audio loss keep media-quality and
+latency-distribution claims outside this result.
 
 Earlier exact local artifact sets pass decoded media, navigation, input, native
 operator handoff and cleanup. After the controlled fixture received an exact
@@ -108,8 +113,15 @@ Source `2cdc9535` adds explicit owner invitation, separately authenticated
 operator inspection, reference replacement/clear and detach. Independent review
 accepts 103 Node and 27 Rust checks. The matching set is installed. Source
 `74d5b272` adds a bounded adapter exercised by the unchanged Playwright SDK;
-58 focused Node checks pass independent review. Actual installed Camofox and
-Playwright owner approval, fill, clear, revocation and detach are next. Full
+58 focused Node checks pass independent review. Run 93 now passes the actual
+installed bounded Camofox and Playwright workflow. Browser Settings issues a
+page invitation and explicit owner approval; each separate operator inspects,
+fills and clears the real Engine field, is denied after revocation, and detaches
+while preserving the owner's page. Exact fixture events and advancing decoded
+frames verify the effects. Both tone probes pass 38 steady samples; viewer
+reload takes 3766 ms and the outer UI close confirms all 13 effects in 944 ms,
+with zero Runtime/control obligations. Independent review accepts this scope
+against the pinned SDK, helper, harness and installed artifacts. Full
 Playwright/Camoufox, profiles, daily workflows, update, authority, media,
 endurance, device and human acceptance retain their original requirements.
 A bounded idle sample also finds roughly one CPU core used by the task Runtime
@@ -119,6 +131,11 @@ uses about 1.38 CPU seconds for five full validation reads. Signature tampering
 is rejected and the measured paths make zero state writes. This cost alone
 does not explain the full idle observation. Its cause and the intermittent
 audio failures remain open.
+A later 60-second idle observation of the current Runtime uses 34.4 CPU seconds,
+with zero Browser pages and VMs at both boundaries. The first five seconds of
+sampled stacks include repeated collaboration validation; that short sample
+does not account for the entire observation. The synthetic benchmark and its
+tamper/no-write checks are independently reviewed in source `6ceb6089`.
 
 The following paragraphs retain earlier bounded evidence. The earlier operator
 checkpoint used Runtime source `0244cc0c`, hash

@@ -33,8 +33,9 @@ qualification; the delivery slices below drive current work. B01 stays open for
 its support matrix while its accepted contract unblocks dependent work.
 
 The task Mac passes the requested Home-to-close journey, including decoded
-audio, reload and separately authorized native operator actions. Run 82 has
-independent acceptance after the restored-address publication repair. Current evidence and artifact
+audio, reload and separately authorized native operator actions. Runs 92/93
+add independent acceptance on the current installed artifact set, including
+bounded actual Camofox and Playwright operation. Current evidence and artifact
 identity are in [state.md](state.md#browser-contract-and-device-qualification).
 The initrd-only RNG activation removes an observed five-second bootstrap delay;
 current launcher samples range from about 9 to 11 seconds. A decoded-audio
@@ -139,8 +140,11 @@ alongside the local, operator and remote journeys.
   and clear passes 103 Node and 27 Rust checks and is installed with matching
   Runtime, adapter, Browser UI and guest helper. The unchanged Playwright SDK
   exercises the bounded adapter in `74d5b272`; 58 checks pass independent review.
-  Complete the actual installed Camofox and Playwright approval, fill, clear,
-  revocation and detach workflow. General selectors, waits, full actionability,
+  Run 93 passes independent review of actual installed Camofox and Playwright
+  owner invitation/approval, inspection, fill, clear, revocation rejection and
+  detach while preserving the same page. The combined media/reload journey
+  closes all 13 effects and returns Runtime/control to zero. General selectors,
+  waits, full actionability,
   files, profiles and declared Camoufox conformance remain open.
 - **B08/B09.first-remote / active / independent delegated source owner.**
   `caa5d90f` is independently accepted after 45 focused tests. Normal Engine
