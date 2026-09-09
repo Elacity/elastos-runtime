@@ -917,6 +917,7 @@ cmdline_value() {
 
 profile_key="$(cmdline_value elastos.browser_profile || true)"
 profile_disk_policy="$(cmdline_value elastos.browser_profile_disk || true)"
+profile_disk_initialize="$(cmdline_value elastos.browser_profile_initialize || true)"
 mount_browser_profile_disk() {
   key="$1"
   disk="/dev/vdb"
@@ -932,10 +933,22 @@ mount_browser_profile_disk() {
   mkdir -p "$mount_dir"
   if ! grep -qs " $mount_dir " /proc/mounts 2>/dev/null; then
     if ! mount -t ext4 -o rw,noatime "$disk" "$mount_dir" 2>/dev/null; then
+      # Only the host's exclusively created disk has this one-use marker.
+      # A mount failure or absent filesystem signature cannot authorize format.
+      marker="ELASTOS_BROWSER_PROFILE_NEW_V1:$key"
+      if [ "$profile_disk_initialize" != "new" ] ||
+         [ "$(dd if="$disk" bs=1 count="${#marker}" 2>/dev/null)" != "$marker" ]; then
+        echo "browser-vm-selkies-start: Browser profile mount failed; existing disk preserved; profile recovery is required" >&2
+        exit 1
+      fi
       command -v mke2fs >/dev/null 2>&1 || {
         echo "browser-vm-selkies-start: mke2fs is required to initialize Browser profile disk" >&2
         exit 1
       }
+      # Consume and flush the intent before format, including failed format.
+      # Reusing these boot arguments must never reformat an initialized disk.
+      dd if=/dev/zero of="$disk" bs=1 count="${#marker}" conv=notrunc 2>/dev/null || exit 1
+      sync || exit 1
       mke2fs -q -t ext4 -F "$disk"
       mount -t ext4 -o rw,noatime "$disk" "$mount_dir"
     fi

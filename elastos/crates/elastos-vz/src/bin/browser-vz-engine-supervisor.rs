@@ -476,6 +476,11 @@ async fn run() -> Result<(), String> {
             .as_ref()
             .expect("Browser VZ profile disk owner")
             .profile_key,
+        owner
+            .profile_disk
+            .as_ref()
+            .expect("Browser VZ profile disk owner")
+            .initialize,
     );
     owner.turn_process = true;
     owner.turn_cleanup = TurnCleanupEvidence::Indeterminate;
@@ -2397,6 +2402,7 @@ fn profile_disk_from_request(request: &Value) -> Result<(String, PathBuf), Strin
 struct PreparedBrowserProfileDisk {
     profile_key: String,
     path: PathBuf,
+    initialize: bool,
     _lock: LifetimeFileLock,
 }
 
@@ -2406,28 +2412,45 @@ fn prepare_browser_profile_disk(request: &Value) -> Result<PreparedBrowserProfil
         fs::create_dir_all(parent)
             .map_err(|err| format!("create Browser profile disk root failed: {err}"))?;
     }
-    ensure_sparse_profile_disk(&disk_path)?;
+    let lock =
+        LifetimeFileLock::acquire_disk_sidecar(&disk_path, "principal Browser profile disk")?;
+    let initialize = ensure_sparse_profile_disk(&disk_path, &profile_key)?;
     Ok(PreparedBrowserProfileDisk {
         profile_key,
-        _lock: LifetimeFileLock::acquire_disk_sidecar(
-            &disk_path,
-            "principal Browser profile disk",
-        )?,
+        initialize,
+        _lock: lock,
         path: disk_path,
     })
 }
 
-fn append_browser_profile_boot_arg(boot_args: &mut String, profile_key: &str) {
+fn append_browser_profile_boot_arg(boot_args: &mut String, profile_key: &str, initialize: bool) {
+    // This host owns profile arguments, including any caller-supplied override.
+    *boot_args = boot_args
+        .split_whitespace()
+        .filter(|arg| {
+            !arg.starts_with("elastos.browser_profile=")
+                && !arg.starts_with("elastos.browser_profile_disk=")
+                && !arg.starts_with("elastos.browser_profile_initialize=")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     *boot_args = format!(
         "{boot_args} elastos.browser_profile={profile_key} elastos.browser_profile_disk=required"
     );
+    if initialize {
+        boot_args.push_str(" elastos.browser_profile_initialize=new");
+    }
 }
 
 #[cfg(test)]
 fn attach_browser_profile_disk(vm_config: &mut VmConfig, request: &Value) -> Result<(), String> {
     let profile_disk = prepare_browser_profile_disk(request)?;
     vm_config.data_disk_path = Some(profile_disk.path);
-    append_browser_profile_boot_arg(&mut vm_config.boot_args, &profile_disk.profile_key);
+    append_browser_profile_boot_arg(
+        &mut vm_config.boot_args,
+        &profile_disk.profile_key,
+        profile_disk.initialize,
+    );
     Ok(())
 }
 
@@ -2447,9 +2470,17 @@ fn validate_profile_disk_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn ensure_sparse_profile_disk(path: &Path) -> Result<(), String> {
-    if path.exists() {
-        return Ok(());
+fn ensure_sparse_profile_disk(path: &Path, profile_key: &str) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.nlink() != 1 {
+                return Err("Browser profile disk must be a regular file with one link".to_string());
+            }
+            // Existing bytes, including incomplete creation, never renew intent.
+            return Ok(false);
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("inspect Browser profile disk failed: {error}")),
     }
     let size_mib = env_u64(
         "ELASTOS_BROWSER_VM_PROFILE_DISK_MIB",
@@ -2458,19 +2489,28 @@ fn ensure_sparse_profile_disk(path: &Path) -> Result<(), String> {
     if !(128..=65536).contains(&size_mib) {
         return Err("ELASTOS_BROWSER_VM_PROFILE_DISK_MIB must be 128..65536".to_string());
     }
-    let file = File::create(path).map_err(|err| {
-        format!(
-            "create Browser profile disk {} failed: {err}",
-            path.display()
-        )
-    })?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|err| {
+            format!(
+                "create Browser profile disk {} failed: {err}",
+                path.display()
+            )
+        })?;
     file.set_len(size_mib * 1024 * 1024).map_err(|err| {
         format!(
             "resize Browser profile disk {} failed: {err}",
             path.display()
         )
     })?;
-    Ok(())
+    // The guest consumes this marker before its sole authorized format attempt.
+    file.write_all(format!("ELASTOS_BROWSER_PROFILE_NEW_V1:{profile_key}").as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|err| format!("initialize Browser profile disk intent failed: {err}"))?;
+    Ok(true)
 }
 
 fn browser_vm_manifest(memory_mib: u32, vcpu_count: u8) -> CapsuleManifest {
@@ -4494,6 +4534,40 @@ mod tests {
         assert!(vm_config
             .boot_args
             .contains("elastos.browser_profile_disk=required"));
+        assert!(vm_config
+            .boot_args
+            .contains("elastos.browser_profile_initialize=new"));
+        let marker = b"ELASTOS_BROWSER_PROFILE_NEW_V1:profile-99bb2b58175e1e062cd2fb6b1b00feec63d169f520dd0a8cfe7230517cfc43e4";
+        let mut header = vec![0; marker.len()];
+        File::open(&disk_path)
+            .unwrap()
+            .read_exact(&mut header)
+            .unwrap();
+        assert_eq!(header.as_slice(), marker);
+        assert_eq!(fs::metadata(&disk_path).unwrap().mode() & 0o777, 0o600);
+
+        // Reattaching even a marked, unformatted disk never renews creation
+        // intent; stale boot arguments from the first attachment are removed.
+        attach_browser_profile_disk(&mut vm_config, &request).unwrap();
+        assert!(!vm_config
+            .boot_args
+            .contains("elastos.browser_profile_initialize="));
+        File::open(&disk_path)
+            .unwrap()
+            .read_exact(&mut header)
+            .unwrap();
+        assert_eq!(header.as_slice(), marker);
+
+        // A corrupt or signature-free existing profile must remain byte exact.
+        fs::write(&disk_path, b"existing profile with unreadable filesystem").unwrap();
+        attach_browser_profile_disk(&mut vm_config, &request).unwrap();
+        assert_eq!(
+            fs::read(&disk_path).unwrap(),
+            b"existing profile with unreadable filesystem"
+        );
+        assert!(!vm_config
+            .boot_args
+            .contains("elastos.browser_profile_initialize="));
     }
 
     #[test]
@@ -4520,6 +4594,7 @@ mod tests {
             }
         });
         let owner = prepare_browser_profile_disk(&request).unwrap();
+        assert!(owner.initialize);
         let lock_path = disk_lifetime_lock_path(&disk_path);
         assert_eq!(
             lock_path,
@@ -4540,7 +4615,36 @@ mod tests {
         assert_eq!(typed["path"], disk_path.to_string_lossy().as_ref());
 
         drop(owner);
-        prepare_browser_profile_disk(&request).unwrap();
+        assert!(!prepare_browser_profile_disk(&request).unwrap().initialize);
+    }
+
+    #[test]
+    fn profile_initialization_rejects_symlink_and_preserves_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("existing");
+        let disk = tmp.path().join("profile.ext4");
+        fs::write(&target, b"existing profile bytes").unwrap();
+        std::os::unix::fs::symlink(&target, &disk).unwrap();
+        assert!(ensure_sparse_profile_disk(&disk, "profile-test").is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"existing profile bytes");
+        fs::remove_file(&target).unwrap();
+        assert!(ensure_sparse_profile_disk(&disk, "profile-test").is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn profile_initialization_intent_is_owned_by_exclusive_creation() {
+        let mut args = "console=hvc0 elastos.browser_profile_initialize=new elastos.browser_profile=other elastos.browser_profile_disk=other".to_string();
+        append_browser_profile_boot_arg(&mut args, "profile-owned", false);
+        assert_eq!(args, "console=hvc0 elastos.browser_profile=profile-owned elastos.browser_profile_disk=required");
+        append_browser_profile_boot_arg(&mut args, "profile-owned", true);
+        assert_eq!(
+            args.matches("elastos.browser_profile_initialize=new")
+                .count(),
+            1
+        );
+        append_browser_profile_boot_arg(&mut args, "profile-owned", false);
+        assert!(!args.contains("elastos.browser_profile_initialize="));
     }
 
     #[test]
