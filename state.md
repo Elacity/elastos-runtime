@@ -1,27 +1,34 @@
 # State
 
-Last updated: 2026-09-03 UTC
+Last updated: 2026-09-09 UTC
 
 This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
 volatile proof logs remain outside the repository.
 
+Source, installed artifacts, and acceptance verdicts stay distinct. A green
+source CI run, an installed receipt, and a person-visible journey are three
+different claims.
+
 ## Release Posture
 
-- A fresh fetch records `origin/main` at `8ac18bec` as the released `v0.7.0`
-  source and `origin/upstream/0.7.1-dev` at `c511b133` as the active
-  integration line.
+- A fresh fetch on 2026-09-09 records `origin/main` at `8ac18bec` as the
+  released `v0.7.0` source and `origin/upstream/0.7.1-dev` at `6c61c990` as
+  the active integration line and [PR51](https://github.com/Elacity/elastos-runtime/pull/51)
+  head. PR51 is the release PR (`main` ← `upstream/0.7.1-dev`). Its source CI
+  is green on that tip. Its checklist marks issues #45 and #46 complete while
+  those implementations remain on open stacked PRs.
 - Released `v0.7.0` already carries the coordinated workspace version,
   changelog, manifest bumps, and lock refresh. Installed artifacts report
   `0.7.0` only after the checked publish flow stamps
   `ELASTOS_RELEASE_VERSION`; unstamped source builds report `0.7.0-dev`.
-- Local candidate `900d7e5c` has tree `c9a9effe` and is 30 commits ahead of
-  `origin/upstream/0.7.1-dev@c511b133`. It contains the reviewed PR52 source at
-  `origin/feat/protected-content-installed-provisioning@4d688cc5`, PR54 at
-  `origin/feat/home-first-run-seed-0.7.1@2a49ea57`, and the PR55 Home Agent
-  source from `origin/feat/home-shelf-assistant-face-0.7.1@923193bb`. PR54 and
-  PR55 remain the original feature review slices. The tested candidate still
-  needs publication and combined team review before a merge decision.
+- The former local candidate `900d7e5c` (tree `c9a9effe`) is now an ancestor
+  of `6c61c990`. It landed through [PR58](https://github.com/Elacity/elastos-runtime/pull/58)
+  together with PR52 (`4d688cc5` installed provisioning), PR54 (`2a49ea57`
+  Home first-run seed), and the PR55 Home Agent source. PR55 closed as
+  equivalent content already on upstream. Combined team review of the
+  integration tip, and installed acceptance on that exact revision, remain
+  open.
 - The published protected-content stack is contracts `0c56c56a`, custody
   `2f844cef`, key reconstruction `467a6c03`, custody provider `1b7fa732`,
   Wallet rights `c9e82e75`, Runtime `a8ac6dc8`, and rights `3627da01`.
@@ -38,10 +45,21 @@ volatile proof logs remain outside the repository.
   and Home Agent shell checks. Remote CI remains separate from these local
   checks.
 - `origin/upstream/0.7.1-dev` also carries Irzhy's verified Base 8453 probe
-  evidence, shared build-artifact staging, upstream collaboration work, and
-  Browser local-exit orphan cleanup. The protected-content source path remains
-  inactive. Installed proof on isolated localhost, the seed and third custody
-  node, and one atomic cutover remain open.
+  evidence, shared build-artifact staging, upstream collaboration work,
+  Browser local-exit orphan cleanup, Home first-run seed, Home Agent on the
+  typed model contract, and installed-custody provisioning commands. The
+  protected-content source path remains inactive on this tip. PR60 holds the
+  installed inactive e2e proof and harness evidence. PR59 holds the atomic
+  cutover. PR62 holds the 2026-09-08 follow-up plan for issues #42, #48, and
+  #49; its 18 tasks remain open. Issue #42 later added custody enrollment and
+  committee workflows; that scope sits outside PR62.
+- Mac-local unpublished work remains off GitHub. A 2026-09 operator review
+  recorded local `feat/0.7.1-integration` ahead of `6c61c990` and
+  `fix/browser-maturity` with Browser qualification work, including a
+  Home/model preparation failure after metadata progress and a remote
+  Browser viewer-reload failure. This Cloud checkout cannot read those
+  trees. Attach a Mac Cursor worker, or publish those branches, before
+  anyone treats them as candidate source.
 - Commits `3026992b`, `ed7a8bfc`, and `7f6e47f9` provide portable listing
   publication and import, buyer purchase, and buyer open, read, and close
   without creator Runtime mint state. The package binds the public custody
@@ -78,8 +96,11 @@ volatile proof logs remain outside the repository.
 ## Installed candidate proof
 
 - The isolated localhost installation at `localhost:61380` has source commit
-  `900d7e5c` and tree `c9a9effe`. This is installed acceptance for that local
-  candidate. It is not seed, third-node, or cutover proof.
+  `900d7e5c` and tree `c9a9effe`. That commit is now an ancestor of
+  `origin/upstream/0.7.1-dev@6c61c990`. The run is installed acceptance for
+  that historical candidate. It is not seed, third-node, cutover, or current-tip
+  proof. Re-run installed acceptance on the exact reviewed 0.7.1 candidate
+  before any release claim.
 - The manual Brave journey opened and inspected System, Home launcher and
   windows, Profile and People, Chat, Inbox, Wallet, Marketplace, Services,
   Library, Archive, Documents, Player, standalone Assistant, Home Agent, GBA
@@ -758,6 +779,11 @@ complete. Installed proof and the atomic authority cutover remain open.
 
 ## Open Blockers
 
-- Product Browser completion is not claimed.
+- Product Browser completion is not claimed. Track remaining Browser goals as
+  Now J4 B01–B16 in [TASKS.md](TASKS.md).
 - Manual installed-device checks on Mac and Linux/aarch64 targets are still
-  required before release handoff.
+  required before release handoff. J1 (install and first setup) is the first
+  person-visible increment on the public `6c61c990` line.
+- Mac-local unpublished Home/model diagnostics and Browser qualification
+  remain unreachable from this Cloud checkout until a Mac Cursor worker is
+  attached or those branches are published.

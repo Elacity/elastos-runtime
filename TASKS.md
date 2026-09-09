@@ -12,107 +12,178 @@ Do not add new product surface area until the `Now` section is materially tighte
 
 ## Now
 
-Read this section as strict priority order for this branch. Do not start a lower
-section if a higher section is incoherent, unverified, or too large to review.
+Read this section as strict priority order. Finish one user journey before
+opening the next. A lower journey stays queued while a higher one is
+incoherent, unverified, or too large to review.
 
-Active priority index:
+0.7.1 is the follow-up to released `v0.7.0`. The product goal is one reviewed
+candidate a person can install, update, run local AI on, browse with, and use
+to publish a protected asset. Every visible Home surface on that candidate
+stays stable and coherent.
 
-- current priority: publish the tested local candidate for team review after
-  explicit push authorization, then review the combined candidate on its exact
-  revision. The candidate is not ready to merge
-- released line: `origin/main@8ac18bec` is `v0.7.0`. Keep follow-up work on
-  `origin/upstream/0.7.1-dev` until the reviewed 0.7.1 line is ready. The
-  checked publish flow still owns release stamping
-- local candidate `900d7e5c` contains the reviewed PR52 source at
-  `origin/feat/protected-content-installed-provisioning@4d688cc5`, PR54 at
-  `origin/feat/home-first-run-seed-0.7.1@2a49ea57`, and the PR55 Home Agent
-  source from `origin/feat/home-shelf-assistant-face-0.7.1@923193bb`. PR54 and
-  PR55 remain the original feature review slices
-- integrated UIUX source evidence: published
-  `origin/feat/0.7-uiux-candidate` at `8b547590`; this ref is donor evidence,
-  not installed, live, or release truth
-- current protected-content source stack is already in `origin/main` and
-  `origin/upstream/0.7.1-dev`, including the exact PR43 mint-adoption commit
-  `58ebfb23`. The audit fixes retain mixed source and installed evidence.
-  Each remaining GUI gate needs its own verdict
-- separately authorized after localhost: install the same reviewed tree on the
-  seed and the third custody node with matching stable receipts
-- all other work remains queued below
+Active ownership, fetched 2026-09-09:
 
-### Integrated UIUX and protected-content proof
+- released line: `origin/main@8ac18bec` is `v0.7.0`. The checked publish flow
+  still owns release stamping
+- public development line and [PR51](https://github.com/Elacity/elastos-runtime/pull/51)
+  head: `origin/upstream/0.7.1-dev@6c61c990`. PR51 is the release PR
+  (`main` ← `upstream/0.7.1-dev`). Its source CI is green on that tip. Its
+  checklist marks #45 and #46 complete while those implementations remain on
+  open stacked PRs. Treat the checklist as intent; [state.md](state.md) owns
+  source, installed-artifact, and acceptance verdicts separately
+- already on the public development line: PR52 (installed provisioning), PR54
+  (Home first-run seed), and PR58 (integration of provisioning, first-run, and
+  Home Agent). PR55 closed because its Home Agent commits are already on
+  upstream through PR58
+- Irzhy's open stack, newest push 2026-09-09: [PR60](https://github.com/Elacity/elastos-runtime/pull/60)
+  → [PR59](https://github.com/Elacity/elastos-runtime/pull/59) →
+  [PR62](https://github.com/Elacity/elastos-runtime/pull/62). PR60 carries
+  installed inactive e2e proof and harness evidence. PR59 performs the atomic
+  cutover. PR62 currently holds the follow-up plan for issues #42, #48, and
+  #49; its 18 implementation tasks remain open. The later #42 comment adds
+  custody enrollment and committee workflows; PR62 leaves those queued
+- Mac-local unpublished trees remain off GitHub. A 2026-09 operator review
+  recorded local `feat/0.7.1-integration` ahead of `6c61c990` and
+  `fix/browser-maturity` with Browser qualification work. This Cloud checkout
+  reads only fetched refs. Attach a Mac Cursor worker, or publish those
+  branches, before anyone treats them as candidate source
 
-Verified integrated source and installed localhost truth is in
-[state.md](state.md). Candidate assembly, source checks, isolated installation,
-and the broad manual Brave journey are complete on `900d7e5c`. The journey
-found open first-run, Browser startup, model, collaboration, and
-protected-content prerequisites. It did not change the pending Wallet approval.
+The five release journeys below are the only Now work. Home/model and Browser
+details live under J3 and J4. Protected-content implementation stays on
+Irzhy's stack until a reviewed merge reaches upstream. Home then proves the
+person-visible mint, buy, and open path on that build.
 
-Open gates, in order:
+### J1. Install and first setup
 
-1. [ ] After explicit authorization, publish the tested candidate for team
-   review. Review the combined candidate on its exact revision before any
-   merge decision.
-2. [ ] After PR54 and PR55 review results or merge commits reach upstream,
-   rebuild or rebase the candidate on that updated upstream. Drop
-   patch-equivalent duplicates and retain the unique integration fixes.
-3. [ ] Rerun the source gates and isolated installed acceptance on that exact
-   rebuilt candidate.
-4. [ ] After separate authorization, install the same reviewed tree on the
-   seed and the third custody node with matching stable Runtime, component,
-   capsule metadata, provider, static audit, installation, and platform
-   restart receipts.
-5. [ ] Provision one real signed owner-only 2-of-3 custody composition across
-   three distinct operators and failure domains.
-6. [ ] Install the private multi-RPC Chain configuration and verify the exact
-   deployed Base network, contract, token, emitter, and finality authority.
-7. [ ] Prove exactly three protected-content replicas and repair after one
-    replica is lost.
-8. [ ] Fund the creator and buyer Base accounts, then run the Brave
-    two-Runtime journey: mint, list, and share on localhost; import, deny,
-    buy, open, play, and close on the seed. Prove one bound KID with allowed,
-    denied, and unbound reads, the CentralStorage binding, the exact
-    `AuthorityGateway.buyAccess` receipt and event, restart, replay, tamper
-    rejection, settlement, cleanup, and zero unresolved state.
-9. [ ] Complete the remaining installed UIUX cases for first-run recovery and
-    Profile creation, configured model execution, collaboration, Browser
-    startup diagnostics, and protected-content prerequisites. Keep the broad
-    localhost journey as completed evidence rather than repeating it.
-10. [ ] Make one atomic cutover that selects the Runtime-owned
-    protected-content path and removes the provisional `drm`, `rights`, `key`,
-    and `decrypt` authority surfaces from startup, registration, resources,
-    packaging, tests, and docs.
+A person downloads ElastOS, runs setup, creates a passkey and Profile, and
+reaches a coherent empty first-run Home.
 
-The operator-owned model-provider configuration remains a separate installed
-Assistant proof item. Missing configuration is an honest zero-offer state.
+- [ ] Prove public install and source-home setup on one clean Mac and one
+  clean Linux target from the exact candidate revision. Record matching
+  installation receipts, component checksums, and the `home` setup profile.
+- [ ] Prove first-run: empty desktop, Marketplace pinned, Recovery Kit
+  ready, and Profile create carrying the display name into the form.
+- [ ] Restore Desktop/Terminal switching on the installed Home so the shell
+  stays visible through the transition. Verify Inbox handoff and native
+  Terminal Chat on that same installation.
+
+### J2. Update to the latest version
+
+A person on `v0.7.0` updates to the candidate and keeps identity, passkey,
+and Home data.
+
+- [ ] Prove the update path from published `v0.7.0` to the candidate binary
+  and capsules. The person sees the new version and keeps the existing Home.
+- [ ] Keep public-install identity and operator smokes on the staged or
+  published manifest. Source-local Carrier setup stays green with
+  `scripts/local-carrier-setup-smoke.sh`.
+
+### J3. Download a model and run local AI
+
+Home Agent already speaks the typed model contract and reports an honest
+zero-offer state when no model is configured. The person needs one working
+Get-and-run path. This is the Home/model queue:
+
+1. [ ] Keep Home Agent on the typed `offers_list` / `runs_*` contract and
+   the honest zero-offer copy.
+2. [ ] Restore effective Home model controls after the failed installed
+   model-preparation attempt. Capture one bounded diagnostic on the
+   installation that failed after metadata progress. Source diagnostics
+   exist on unpublished Mac work; they need that host or a published branch
+   before anyone installs them.
+3. [ ] Validate the operator-owned `providers/model-provider/config.json`
+   path and fail closed when the file is missing or unsafe.
+4. [ ] Evaluate Qwen3.5-9B Q4_K_M as the Mac baseline and PrismML Bonsai 8B
+   Q1 as the low-memory comparison.
+5. [ ] Install one model artifact through the content-capsule path in
+   [docs/CONTENT_CAPSULE_DISTRIBUTION.md](docs/CONTENT_CAPSULE_DISTRIBUTION.md).
+6. [ ] Prove the `model-provider` llama.cpp engine lifecycle on macOS Metal:
+   verified artifacts, health, limits, stream, cancel, restart, shutdown,
+   and orphan cleanup.
+7. [ ] Run one Home Agent turn against that local offer and show the answer
+   in the Agent Space.
+8. [ ] Prove hosted Chat Completions locally, then add the provider-internal
+   OpenAI Responses adapter with explicit provider, cost, privacy, limits,
+   and resolved-model facts.
+9. [ ] Add optional `elastos.service.offer/v1` publication only after the
+   local path works.
+
+### J4. Use the Browser
+
+Browser stays a bounded Runtime Browser. Every Browser requirement maps into
+B01–B16 so later sections restated the same goal only by these ids.
+
+- [ ] B01 Local page open through the Runtime Browser Engine Adapter
+- [ ] B02 Accepted video
+- [ ] B03 Accepted audio with user-gesture unlock
+- [ ] B04 Trusted input and scroll
+- [ ] B05 Explicit close and orphan cleanup
+- [ ] B06 Page heartbeat and Runtime reconnect
+- [ ] B07 Remote engine open
+- [ ] B08 Remote viewer reload after a working remote session
+- [ ] B09 Principal-owned Browser profiles
+- [ ] B10 Browser helper and engine updates
+- [ ] B11 Wallet dapp approval through Inbox
+- [ ] B12 Concurrent local and remote sessions where claimed
+- [ ] B13 Mac VZ adapter evidence
+- [ ] B14 Jetson crosvm adapter evidence
+- [ ] B15 Sustained reliability and long-hold
+- [ ] B16 Broader device acceptance
+
+Unpublished Mac `fix/browser-maturity` holds later installed progress for
+B01–B07. B08 remains a known remote-reload failure. This Cloud environment
+has no KVM and leaves product Browser media to a suitable host.
+
+### J5. Publish, buy, and open a protected asset
+
+A creator protects and lists an asset. A buyer imports, buys, opens, and
+closes it. Runtime keeps the protect, media, custody, and decrypt path
+private.
+
+Irzhy owns the source stack. Home owns the person-visible journey on the
+merged candidate.
+
+- [ ] Review PR60 (installed inactive e2e proof) against current
+  `upstream/0.7.1-dev` callers, then merge it after review.
+- [ ] Review PR59 (atomic cutover) against those same callers. One cleanup
+  removes a document-save type that local Home still uses for save-conflict
+  protection; keep that Home behavior.
+- [ ] Keep PR62 as the follow-up plan for #42 gaps 1–3, #48, and #49.
+  Arrange the external crypto review from the #48 package. Custody
+  enrollment and committee UX from the later #42 comment stay queued after
+  the person-visible mint, buy, and open path.
+- [ ] After the reviewed stack lands, prove clean installation plus the
+  Brave mint → list → buy → open → play → close journey on that exact
+  build. Include one bound KID with allowed, denied, and unbound reads,
+  the CentralStorage binding, the exact `AuthorityGateway.buyAccess`
+  receipt and event, restart, replay, tamper rejection, settlement, and
+  cleanup.
+- [ ] Seed and third-node hardware, distinct operators, and the real Base
+  deployment remain separate operator gates after the localhost journey.
 
 ### Home audit follow-up
 
-- [ ] Diagnose and prove direct Desktop/Terminal switching on the installed
-  Home. Host-authority and startup-replay repairs have source coverage, but
-  an installed transition can still leave a blank shell. Verify the exact
-  Inbox handoff through that transition and native Terminal Chat separately.
+Keep these after J1–J5. They refine surfaces the journeys already use.
+
 - [ ] Prove recovery coverage when a Profile is created after the first
-  recovery-kit download, plus clean first-run Profile and window placement.
-- [ ] Complete Browser input ordering, lifecycle and accepted media proof on
-  the target installation. Source checks cover only their stated contracts.
+  recovery-kit download, plus clean first-run window placement.
 - [ ] Finish document-dialog keyboard focus and the remaining app-by-app
-  acceptance matrix. Preserve failed, partial and prerequisite-blocked results
-  as separate outcomes; a visible control alone is a partial observation.
-- [ ] Inventory and test the standalone Assistant's distinct Chat, Build, and
-  Studio behavior. Keep it as an explicitly scoped optional app, or migrate
-  its useful behavior and remove it. The default product should present one
-  clear Agent surface through Home Agent.
-- [ ] Define typed Runtime operations before adding Home Agent tools, Library
-  reads, web search, Studio, Usage, or sampling controls. Each surface stays
-  behind its owning operation and its authority checks.
+  acceptance matrix. Preserve failed, partial, and prerequisite-blocked
+  results as separate outcomes; a visible control alone is a partial
+  observation.
+- [ ] Inventory standalone Assistant versus Home Agent. The default product
+  presents one Agent surface through Home Agent.
+- [ ] Define typed Runtime operations before adding Home Agent tools,
+  Library reads, web search, Studio, Usage, or sampling controls. Each
+  surface stays behind its owning operation and its authority checks.
 - [ ] Verify completed-mint adoption after a restart on the installed path.
-  Reconcile partial settled mint records and their custody cleanup obligations;
-  the source adoption repair only rolls forward fully completed records.
+  Reconcile partial settled mint records and their custody cleanup
+  obligations; the source adoption repair only rolls forward fully
+  completed records.
 - [ ] Turn the journey audit register into an automated pre-release gate:
-  extract Journey Matrix rows with complete verdicts into scripted checks that
-  run before every release, following the existing smoke-script pattern.
-  Journeys whose proof needs installed evidence stay manual and keep their
-  register verdicts authoritative.
+  extract Journey Matrix rows with complete verdicts into scripted checks
+  that run before every release. Journeys whose proof needs installed
+  evidence stay manual and keep their register verdicts authoritative.
 - [ ] Review Irzhy's PR15 follow-up on pinning the canonical
   `has_access_by_content_id` selector (`0x54d42821`). Current configuration
   validates its shape. Use a gated channel for deny proofs; a permissive
@@ -229,7 +300,7 @@ preserved; an older implementation is not evidence that it fits current contract
 
 #### First run on a clean Home
 
-- [ ] Complete the clean macOS Browser installation path. Source-home setup
+- [ ] Complete the clean macOS Browser installation path (J4 B13). Source-home setup
   already installs provider/helper components and generates Browser config;
   a fresh target still needs the matching VM substrate and installed product
   proof. Define their package/profile ownership and use
@@ -323,7 +394,8 @@ preserved; an older implementation is not evidence that it fits current contract
 - [ ] Keep Browser included but explicitly limited: address intermittent
   restart, non-retained `ela.city` login, and slow performance before claiming
   full Browser reliability. Preserve exact-once Wallet approval and
-  Runtime-only networking while fixing these issues.
+  Runtime-only networking while fixing these issues. Track the product goals
+  as Now J4 B01–B16.
 - [ ] Decide the policy for plaintext principal roots. The current
   hidden upgrade migrates only roots that already have protection metadata; it
   is not a general 0.5-to-0.6 data migration. Either provide an explicit,
@@ -344,10 +416,12 @@ preserved; an older implementation is not evidence that it fits current contract
 ### 0. Branch readiness and reviewability
 
 Branch assumptions: `origin/main@8ac18bec` contains the released `v0.7.0`
-source. `origin/upstream/0.7.1-dev@c511b133` is the active integration line.
-PR52 (`4d688cc5`) and PR54 (`2a49ea57`) are active review branches. Use
-[state.md](state.md) and fetched refs for exact checkpoints. Published source,
-installed behavior and public-live behavior require separate evidence.
+source. `origin/upstream/0.7.1-dev@6c61c990` is the active integration line
+and PR51 head. PR52 and PR54 already landed through PR58. Open
+protected-content work stays on PR60 → PR59 → PR62. Use [state.md](state.md)
+and fetched refs for exact checkpoints. Published source, installed behavior
+and public-live behavior require separate evidence. The Now journeys J1–J5
+own release order; the lists below keep review and proof detail.
 
 - [ ] Keep this branch reviewable: split changes into coherent commit slices with no corrective commits, no hidden migrations, and no unrelated local artifacts.
 - [ ] Keep oversized-file cleanup frozen unless branch review exposes a concrete no-behavior blocker. The existing Browser/Wallet/provider cleanup is already split into focused sibling modules: Browser gateway, Wallet gateway, Wallet UI send/receive/create/request/state/preference flows, wallet-provider EVM crypto, and wallet-provider approval test groups. Keep those seams stable and verified. Do not split `capsules/browser/browser/browser.js` further unless a diagnostic-frame/session seam is proven mechanical and behavior-free. Treat `gateway_tests/room.rs`, `gateway_room.rs`, `gateway_tests/home_system.rs`, `room_service.rs`, `auth_gateway.rs`, and `home_cmd.rs` as later cleanup unless they become direct release-review blockers. Keep `scripts/home-entropy-check.mjs` as a broad alignment gate for now, but do not let it accumulate new product logic. Each future split must be no-behavior, separately testable, and covered by the narrow Rust/JS smoke commands for that surface.
@@ -472,7 +546,7 @@ installed behavior and public-live behavior require separate evidence.
 - [ ] Rehearse and simplify the Home/People/Spaces/System story so the front door feels useful without internal-runtime narration.
 - [ ] Extend `elastos.runtime.services/v1` beyond local configured-provider cards and conversation offers: remote Exit, storage, relay, model, and hosting offers must arrive as provider-backed `elastos.service.offer/v1` records through People/Carrier, and enabling one must create/select a principal-scoped provider grant instead of giving capsules direct People-state authority.
   - [ ] Model Provider subtask: keep one typed `model-provider` contract and
-    complete it in this order:
+    complete it in the Now J3 Home/model queue. The technical order remains:
 
     1. evaluate Qwen3.5-9B Q4_K_M as the Mac baseline and PrismML Bonsai 8B Q1
        as the low-memory comparison; keep Qwen3.8-27B and Bonsai 27B as later
