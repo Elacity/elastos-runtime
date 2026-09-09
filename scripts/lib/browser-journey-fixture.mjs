@@ -82,7 +82,47 @@ export async function browserProfileStorageProbe({ mode, marker }) {
   return evidence;
 }
 
-function fixturePage(page, run, media = false, qualification = false, profile = null) {
+// Serialized into the opt-in page; only the selected File's bytes are read.
+export async function browserFileInputProbe(input, { expected_sha256 }) {
+  if (!/^[a-f0-9]{64}$/.test(expected_sha256)) throw new Error("invalid file probe");
+  const started = performance.now(), deadline = started + 5000;
+  const result = { schema: "elastos.browser.file-input/v1", expected_sha256, size_bytes: null, sha256: null,
+    read_completed: false, hash_completed: false, measurement_ok: false, matches: false, ok: false, error: null, elapsed_ms: 0 };
+  let stopped = false, timer;
+  const current = () => { if (stopped || performance.now() >= deadline) throw new Error("file_timeout"); };
+  try {
+    const files = input.files;
+    if (!files || files.length !== 1) throw new Error("invalid_selection");
+    const file = files[0];
+    if (Number.isSafeInteger(file.size) && file.size >= 0) result.size_bytes = file.size;
+    if (result.size_bytes !== 65536) throw new Error("invalid_size");
+    if (globalThis.isSecureContext !== true || !globalThis.crypto?.subtle) throw new Error("hash_unavailable");
+    await Promise.race([
+      (async () => {
+        const bytes = await file.arrayBuffer().catch(() => { throw new Error("read_failed"); });
+        current();
+        result.read_completed = true;
+        if (bytes.byteLength !== 65536) throw new Error("invalid_size");
+        const digest = await crypto.subtle.digest("SHA-256", bytes).catch(() => { throw new Error("hash_failed"); });
+        current();
+        result.sha256 = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+        result.hash_completed = result.measurement_ok = true;
+        result.matches = result.ok = result.sha256 === expected_sha256;
+      })(),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("file_timeout")), 5000); }),
+    ]);
+  } catch (error) {
+    result.error = ["invalid_selection", "invalid_size", "hash_unavailable", "read_failed", "hash_failed", "file_timeout"]
+      .includes(error.message) ? error.message : "read_failed";
+  } finally {
+    stopped = true;
+    clearTimeout(timer);
+    result.elapsed_ms = Math.max(0, Math.floor(performance.now() - started));
+  }
+  return result;
+}
+
+function fixturePage(page, run, media = false, qualification = false, profile = null, fileProbe = null) {
   return `<!doctype html><html lang="en"><meta charset="utf-8">
 <title>Browser journey ${page}</title>
 <style>
@@ -97,7 +137,8 @@ function fixturePage(page, run, media = false, qualification = false, profile = 
   <h1>Browser journey ${page}</h1>
   <label for="journey-input">Test text</label>
   <input id="journey-input" maxlength="96" autocomplete="off">
-  <a id="journey-next" href="/nav?run=${run}${profile ? `&profile=${profile.mode}&marker=${profile.marker}` : ""}">Open navigation page</a>
+  <a id="journey-next" href="/nav?run=${run}${profile ? `&profile=${profile.mode}&marker=${profile.marker}` : ""}${fileProbe ? `&file=upload&sha256=${fileProbe.expected_sha256}` : ""}">Open navigation page</a>
+  ${fileProbe ? '<label for="journey-file">Select the 64KiB test file from Library</label><input id="journey-file" type="file">' : ""}
   <div id="journey-motion" aria-label="Continuous test motion"></div>
   ${media ? "<p>Click the text field to start a quiet 440 Hz audio test tone.</p>" : ""}
   <p>Scroll down to move this page.</p>
@@ -122,17 +163,19 @@ function fixturePage(page, run, media = false, qualification = false, profile = 
   }, { once: true });
   let sent = 0;
   let pending = Promise.resolve();
-  function report(type, profileStorage) {
+  function report(type, profileStorage, fileInput) {
     if (sent >= ${qualification ? 8192 : MAX_EVENTS}) return;
     sent++;
     const rect = input.getBoundingClientRect();
     const event = { type, page, value: input.value, scroll_x: scrollX, scroll_y: scrollY,
       ...(type === "profile_storage" ? { profile_storage: profileStorage } : {}),
+      ...(type === "file_input" ? { file_input: fileInput } : {}),
       ...(type === "audio" ? { audio_state: toneContext.state, frequency_hz: 440 } : {}),
       input_rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
     document.querySelector('#journey-observation').textContent = type === "profile_storage" ?
       'Profile ' + profileStorage.mode + ': ' + (profileStorage.ok ? 'marker matches' : 'incomplete') +
         ' | IndexedDB write committed: ' + profileStorage.indexed_db.write_committed :
+      type === "file_input" ? 'File SHA-256: ' + (fileInput.ok ? 'matches' : 'incomplete or different') :
       'Text: ' + input.value + ' | Scroll: ' + Math.round(scrollY);
     pending = pending.then(async () => {
       const response = await fetch('/events?run=' + run, {
@@ -150,6 +193,17 @@ function fixturePage(page, run, media = false, qualification = false, profile = 
   });
   report('load');
   ${profile ? `(${browserProfileStorageProbe.toString()})(${JSON.stringify(profile)}).then(value => report('profile_storage', value));` : ""}
+  ${fileProbe ? `const fileInput = document.querySelector('#journey-file');
+  let fileProbeStarted = false;
+  const measureFile = () => {
+    if (fileProbeStarted) return;
+    fileProbeStarted = true;
+    fileInput.removeEventListener('input', measureFile);
+    fileInput.removeEventListener('change', measureFile);
+    (${browserFileInputProbe.toString()})(fileInput, ${JSON.stringify(fileProbe)}).then(value => report('file_input', null, value));
+  };
+  fileInput.addEventListener('input', measureFile);
+  fileInput.addEventListener('change', measureFile);` : ""}
 </script></html>`;
 }
 
@@ -178,10 +232,16 @@ export function createBrowserJourneyFixture({ now = Date.now } = {}) {
             url.searchParams.getAll("profile").length !== 1 || url.searchParams.getAll("marker").length !== 1)) {
           json(400, { error: "invalid profile probe" }); return;
         }
+        const fileMode = url.searchParams.get("file"), expected = url.searchParams.get("sha256");
+        const fileProbe = fileMode === null && expected === null ? null : { mode: fileMode, expected_sha256: expected };
+        if (fileProbe && (fileMode !== "upload" || !/^[a-f0-9]{64}$/.test(expected || "") ||
+            url.searchParams.getAll("file").length !== 1 || url.searchParams.getAll("sha256").length !== 1)) {
+          json(400, { error: "invalid file probe" }); return;
+        }
         if (!runs.has(run)) {
           if (runs.size >= MAX_RUNS) { json(429, { error: "fixture run capacity" }); return; }
           runs.set(run, { created_at: now(), last_seen: now(), events: [], sequence: 0,
-            qualification: url.searchParams.get("qualification") === "1", profile });
+            qualification: url.searchParams.get("qualification") === "1", profile, fileProbe });
         }
         const record = runs.get(run);
         if (record.qualification !== (url.searchParams.get("qualification") === "1")) {
@@ -190,9 +250,12 @@ export function createBrowserJourneyFixture({ now = Date.now } = {}) {
         if (JSON.stringify(record.profile) !== JSON.stringify(profile)) {
           json(409, { error: "fixture profile contract changed" }); return;
         }
+        if (JSON.stringify(record.fileProbe) !== JSON.stringify(fileProbe)) {
+          json(409, { error: "fixture file contract changed" }); return;
+        }
         record.last_seen = now();
         res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-        res.end(fixturePage(url.pathname.slice(1), run, url.searchParams.get("media") === "1", record.qualification, profile));
+        res.end(fixturePage(url.pathname.slice(1), run, url.searchParams.get("media") === "1", record.qualification, profile, fileProbe));
         return;
       }
       const record = runs.get(run);
@@ -201,6 +264,7 @@ export function createBrowserJourneyFixture({ now = Date.now } = {}) {
       if (req.method === "GET" && url.pathname === "/receipt") {
         json(200, { schema: "elastos.browser.journey-receipt/v1", run, events: record.events,
           ...(record.profile ? { profile_probe: record.profile } : {}),
+          ...(record.fileProbe ? { file_probe: record.fileProbe } : {}),
           ...(record.qualification ? { observation: "bounded-v1", total_events: record.sequence,
             dropped_events: record.sequence - record.events.length } : {}) });
         return;
@@ -217,7 +281,7 @@ export function createBrowserJourneyFixture({ now = Date.now } = {}) {
       }
       const event = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       const rect = event?.input_rect;
-      if (!event || !["load", "input", "scroll", "audio", "profile_storage"].includes(event.type) ||
+      if (!event || !["load", "input", "scroll", "audio", "profile_storage", "file_input"].includes(event.type) ||
           !["main", "nav"].includes(event.page) || typeof event.value !== "string" ||
           event.value.length > 96 || !rect ||
           ![event.scroll_x, event.scroll_y, rect.x, rect.y, rect.width, rect.height]
@@ -227,7 +291,25 @@ export function createBrowserJourneyFixture({ now = Date.now } = {}) {
       if (event.type === "audio" && (event.audio_state !== "running" || event.frequency_hz !== 440)) {
         json(400, { error: "invalid audio event" }); return;
       }
-      let profileStorage;
+      let profileStorage, fileInput;
+      if (event.type === "file_input") {
+        const p = event.file_input;
+        const digest = typeof p?.sha256 === "string" && /^[a-f0-9]{64}$/.test(p.sha256);
+        if (!record.fileProbe || p?.schema !== "elastos.browser.file-input/v1" ||
+            p.expected_sha256 !== record.fileProbe.expected_sha256 ||
+            !(p.size_bytes === null || Number.isSafeInteger(p.size_bytes) && p.size_bytes >= 0) ||
+            !Number.isSafeInteger(p.elapsed_ms) || p.elapsed_ms < 0 ||
+            ![p.read_completed, p.hash_completed, p.measurement_ok, p.matches, p.ok].every(v => typeof v === "boolean") ||
+            ![null, "invalid_selection", "invalid_size", "hash_unavailable", "read_failed", "hash_failed", "file_timeout"].includes(p.error) ||
+            p.measurement_ok !== p.hash_completed || p.measurement_ok !== (p.error === null) ||
+            (p.hash_completed ? !digest || !p.read_completed || p.size_bytes !== 65536 || p.elapsed_ms >= 5000 : p.sha256 !== null) ||
+            p.matches !== (p.hash_completed && p.sha256 === p.expected_sha256) || p.ok !== p.matches) {
+          json(400, { error: "invalid file input event" }); return;
+        }
+        fileInput = { schema: p.schema, expected_sha256: p.expected_sha256, size_bytes: p.size_bytes, sha256: p.sha256,
+          read_completed: p.read_completed, hash_completed: p.hash_completed, measurement_ok: p.measurement_ok,
+          matches: p.matches, ok: p.ok, error: p.error, elapsed_ms: p.elapsed_ms };
+      }
       if (event.type === "profile_storage") {
         const p = event.profile_storage, idb = p?.indexed_db;
         const matches = value => value && typeof value.present === "boolean" && typeof value.matches === "boolean" &&
@@ -260,6 +342,7 @@ export function createBrowserJourneyFixture({ now = Date.now } = {}) {
         type: event.type, page: event.page, value: event.value,
         ...(event.type === "audio" ? { audio_state: event.audio_state, frequency_hz: event.frequency_hz } : {}),
         ...(profileStorage ? { profile_storage: profileStorage } : {}),
+        ...(fileInput ? { file_input: fileInput } : {}),
         scroll_x: event.scroll_x, scroll_y: event.scroll_y,
         input_rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } });
       json(200, { ok: true });
