@@ -132,6 +132,12 @@ in the UI. Recipients verify it before retaining, mounting, or forking it.
 
 The contract and its limits live in
 [Content availability](docs/CONTENT_AVAILABILITY.md).
+Protected use and key release stay in
+[Protected content](docs/PROTECTED_CONTENT.md).
+Downloadable models and other portable data use
+[Content capsule distribution](docs/CONTENT_CAPSULE_DISTRIBUTION.md).
+A later storage and access abstraction remains planned work; changing test
+and proof status stays in [state.md](state.md).
 
 ### 3. Build Runtime-mediated protected content
 
