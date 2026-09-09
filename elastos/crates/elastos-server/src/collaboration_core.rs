@@ -2058,6 +2058,255 @@ mod tests {
         .unwrap()
     }
 
+    // Synthetic signed state only. Construction/signing and writes stay outside
+    // the measured reads; no installed Runtime data is accepted by this fixture.
+    fn signed_validation_fixture(
+        fixture: &Fixture,
+        core: &CollaborationCore,
+        tombstones: usize,
+        outgoing: usize,
+        payload_bytes: usize,
+    ) -> CoreState {
+        assert!(tombstones <= MAX_INCOMING_RECORDS_AND_TOMBSTONES);
+        assert!(outgoing <= MAX_OUTGOING_RECORDS);
+        assert!(payload_bytes <= 16 * 1024);
+        assert!(outgoing * (payload_bytes + 8192) + tombstones * 2048 <= MAX_CORE_STATE_BYTES);
+        let (remote_key, _) = generate_keypair();
+        let remote = fixture.authority(remote_key);
+        let local_profile = core.authority.sender_profile_for_test().unwrap();
+        let remote_profile = remote.sender_profile_for_test().unwrap();
+        let payload = serde_json::json!({"content":"x".repeat(payload_bytes)});
+        let mut state = core.empty_state();
+        for index in 0..outgoing {
+            let prepared = core
+                .authority
+                .prepare_profile_outgoing(
+                    &local_profile,
+                    SERVICE,
+                    "elastos.chat.message/v1",
+                    payload.clone(),
+                    NOW,
+                    TTL,
+                )
+                .unwrap();
+            let authorized = remote
+                .authorize_incoming(
+                    prepared.envelope_bytes(),
+                    &core.authority.local_device_did(),
+                    NOW,
+                )
+                .unwrap();
+            state.outgoing.push(OutgoingRecord {
+                operation: operation(
+                    core,
+                    &format!("validation-bench:{index}"),
+                    "elastos.chat.message/v1",
+                    &payload,
+                    TTL,
+                ),
+                envelope: String::from_utf8(prepared.envelope_bytes().to_vec()).unwrap(),
+                local_product_projection: OutgoingProductProjectionState::Complete,
+                remote_acceptance_receipts: vec![String::from_utf8(
+                    remote.prepare_acceptance_receipt(&authorized, NOW).unwrap(),
+                )
+                .unwrap()],
+            });
+        }
+        for _ in 0..tombstones {
+            let prepared = remote
+                .prepare_profile_outgoing(
+                    &remote_profile,
+                    SERVICE,
+                    "elastos.chat.message/v1",
+                    payload.clone(),
+                    NOW,
+                    TTL,
+                )
+                .unwrap();
+            let authorized = core
+                .authority
+                .authorize_incoming(prepared.envelope_bytes(), &remote.local_device_did(), NOW)
+                .unwrap();
+            state.incoming_tombstones.push(IncomingTombstone {
+                acceptance_receipt: String::from_utf8(
+                    core.authority
+                        .prepare_acceptance_receipt(&authorized, NOW)
+                        .unwrap(),
+                )
+                .unwrap(),
+                retain_until: tombstone_retention_deadline(NOW),
+            });
+        }
+        core.validate_state(&state).unwrap();
+        core.ensure_state_directory().unwrap();
+        core.write_state(&state).unwrap();
+        state
+    }
+
+    fn quiet_worker_validation_reads(core: &CollaborationCore) -> anyhow::Result<()> {
+        // Chat and presence independently request the same outgoing projection
+        // list, then transport retry reads outgoing, then both read handoffs.
+        for _ in 0..2 {
+            anyhow::ensure!(core.pending_outgoing_product_projections(NOW)?.is_empty());
+        }
+        anyhow::ensure!(core.pending_outgoing(NOW)?.is_empty());
+        for _ in 0..2 {
+            anyhow::ensure!(core.pending_product_handoffs()?.is_empty());
+        }
+        Ok(())
+    }
+
+    fn assert_validation_fixture_rejects_tampering(core: &CollaborationCore, state: &CoreState) {
+        let original = canonical_state_bytes(state).unwrap();
+        // Change only one valid hex signature byte. Preserve JSON canonicality,
+        // sizes, identity fields and authority bindings, including the last row.
+        for outgoing_receipt in [false, true] {
+            let mut damaged = state.clone();
+            let receipt = if outgoing_receipt {
+                let Some(entry) = damaged.outgoing.last_mut() else {
+                    continue;
+                };
+                &mut entry.remote_acceptance_receipts[0]
+            } else {
+                let Some(entry) = damaged.incoming_tombstones.last_mut() else {
+                    continue;
+                };
+                &mut entry.acceptance_receipt
+            };
+            let mut signed: SignedCollaborationAcceptanceReceipt =
+                serde_json::from_str(receipt).unwrap();
+            let replacement = if signed.signature.starts_with('0') {
+                "1"
+            } else {
+                "0"
+            };
+            signed.signature.replace_range(..1, replacement);
+            *receipt = String::from_utf8(
+                canonical_signed_collaboration_acceptance_receipt_bytes(&signed).unwrap(),
+            )
+            .unwrap();
+            write_owner_only(
+                &core.state_path(),
+                &canonical_state_bytes(&damaged).unwrap(),
+            );
+            assert!(quiet_worker_validation_reads(core).is_err());
+            assert!(core.summary().is_err());
+            write_owner_only(&core.state_path(), &original);
+            quiet_worker_validation_reads(core).unwrap();
+        }
+    }
+
+    #[test]
+    fn signed_validation_fixture_keeps_noop_reads_and_ack_read_only_and_rejects_tampering() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let state = signed_validation_fixture(&fixture, &core, 3, 2, 128);
+        let original = fs::read(core.state_path()).unwrap();
+        core.inject_write_fault(WriteFault::BeforeWrite);
+        quiet_worker_validation_reads(&core).unwrap();
+        let hash = collaboration_message_envelope_sha256(state.outgoing[0].envelope.as_bytes());
+        core.acknowledge_outgoing_product_projection(&hash).unwrap();
+        core.acknowledge_outgoing_product_projection(&hash).unwrap();
+        assert!(
+            core.take_write_fault() == Some(WriteFault::BeforeWrite),
+            "no-op paths attempted a state write"
+        );
+        assert_eq!(fs::read(core.state_path()).unwrap(), original);
+        assert_validation_fixture_rejects_tampering(&core, &state);
+    }
+
+    // Run alone, after the shared-cache owner releases it. Use the same bounded
+    // parameters with cargo test's normal profile and --release. No timing gate:
+    // this reports validation cost, not an installed-idle or network benchmark.
+    #[test]
+    #[ignore = "opt-in signed-state validation CPU benchmark; reserve host compute first"]
+    fn benchmark_signed_collaboration_idle_validation() {
+        fn parameter(name: &str, default: usize, maximum: usize) -> usize {
+            let value = match std::env::var(name) {
+                Ok(raw) => raw
+                    .parse::<usize>()
+                    .expect("benchmark parameter must be an integer"),
+                Err(std::env::VarError::NotPresent) => default,
+                Err(_) => panic!("benchmark parameter must be Unicode"),
+            };
+            assert!(value <= maximum, "benchmark parameter exceeds its bound");
+            value
+        }
+        fn cpu_micros() -> Option<u128> {
+            #[cfg(unix)]
+            {
+                let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+                if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+                    return None;
+                }
+                let usage = unsafe { usage.assume_init() };
+                Some(
+                    (usage.ru_utime.tv_sec as u128 + usage.ru_stime.tv_sec as u128) * 1_000_000
+                        + usage.ru_utime.tv_usec as u128
+                        + usage.ru_stime.tv_usec as u128,
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        }
+        let tombstones = parameter(
+            "COLLAB_VALIDATION_BENCH_TOMBSTONES",
+            64,
+            MAX_INCOMING_RECORDS_AND_TOMBSTONES,
+        );
+        let outgoing = parameter("COLLAB_VALIDATION_BENCH_OUTGOING", 8, MAX_OUTGOING_RECORDS);
+        let payload_bytes = parameter("COLLAB_VALIDATION_BENCH_PAYLOAD_BYTES", 256, 16 * 1024);
+        let iterations = parameter("COLLAB_VALIDATION_BENCH_ITERATIONS", 3, 100);
+        assert!(iterations > 0 && tombstones + outgoing > 0);
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let state = signed_validation_fixture(&fixture, &core, tombstones, outgoing, payload_bytes);
+        let original = fs::read(core.state_path()).unwrap();
+        quiet_worker_validation_reads(&core).unwrap(); // Untimed warm read.
+        core.inject_write_fault(WriteFault::BeforeWrite);
+        let cpu_start = cpu_micros();
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            quiet_worker_validation_reads(&core).unwrap();
+        }
+        let wall_us = start.elapsed().as_micros();
+        let cpu_us = cpu_micros().zip(cpu_start).map(|(end, start)| end - start);
+        let mut noop_ack_wall_us = None;
+        let mut noop_ack_cpu_us = None;
+        if let Some(entry) = state.outgoing.first() {
+            let hash = collaboration_message_envelope_sha256(entry.envelope.as_bytes());
+            let cpu_start = cpu_micros();
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                core.acknowledge_outgoing_product_projection(&hash).unwrap();
+            }
+            noop_ack_wall_us = Some(start.elapsed().as_micros());
+            noop_ack_cpu_us = cpu_micros().zip(cpu_start).map(|(end, start)| end - start);
+        }
+        assert!(
+            core.take_write_fault() == Some(WriteFault::BeforeWrite),
+            "measured paths attempted a state write"
+        );
+        assert_eq!(fs::read(core.state_path()).unwrap(), original);
+        assert_validation_fixture_rejects_tampering(&core, &state);
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"elastos.collaboration.validation-benchmark/v1",
+                "synthetic_signed_state":true,"debug_assertions":cfg!(debug_assertions),
+                "state_bytes":original.len(),"outgoing":outgoing,"incoming":0,
+                "tombstones":tombstones,"acceptance_receipts":outgoing+tombstones,
+                "payload_bytes":payload_bytes,"iterations":iterations,"validation_reads_per_iteration":5,
+                "wall_us":wall_us,"process_cpu_us":cpu_us,
+                "noop_ack_iterations":if outgoing > 0 {iterations} else {0},
+                "noop_ack_wall_us":noop_ack_wall_us,"noop_ack_process_cpu_us":noop_ack_cpu_us,
+                "measured_state_writes":0,"tampered_signature_rejected":true
+            })
+        );
+    }
+
     fn transport_rejection(
         core: &CollaborationCore,
         frame: &[u8],
