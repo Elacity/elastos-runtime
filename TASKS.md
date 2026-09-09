@@ -62,231 +62,60 @@ In particular, B12 profiles, B13 daily workflows/accessibility/Wallet, B14 lease
 and authority, and B15 update/repair need implementation and behavioral evidence
 alongside the local, operator and remote journeys.
 
-### Next executable slices
+### Resume queue after the requested pause
 
-- **B02.acquire / active / delegated source owner; coordinator integrates.** The empty-data-root artifact step
-  acquires no image and reports four missing files. Explicit selection of the
-  verified local store installs a matching set without rebuilding. Complete
-  Runtime artifact acquisition through the existing package installer and
-  repeat the fresh Home journey. A developer-supplied store is useful integration
-  evidence but leaves the out-of-box acceptance requirement open.
-  Reviewed source `7879f439` connects verified packaging and acquisition before
-  first-party local Engine readiness, including atomic replacement and cached
-  byte verification. Its 25 Rust and 26 source/package checks pass. Next prove
-  an actual publishable bundle and matching helpers through the existing
-  installer. Reviewed source `e61603fe` removes the observed 200 MiB image
-  transfer limit with bounded disk streaming; 34 Rust and 28 script checks pass.
-  The verified 898 MB real image package is ready. Actual large-image transfer
-  and independent fresh installation are next;
-  existing verified images remain the installed test input.
-- **B02.startup / verifying / coordinator; independent review pending.**
-  Prerequisites: accepted compatibility contract, image `d03ec029`, and reviewed
-  installed runs 50-52. Reuse Runtime, native helpers, image and UI unless a
-  changed input requires rebuilding. First capture the current launch stages
-  with passive observation. Runs 53/54 confirm that enabling the existing RNG
-  driver removes the five-second delay; the same installed journey passes in
-  runs 54/55. Review the archive and journey receipts before closing this bounded
-  repair. Rootfs, kernel and native binaries were reused. Formal percentile
-  qualification and the remaining startup delay stay in B11.
-- **B11.decoded-audio / active / coordinator.** The controlled tone passes in
-  run 56 and before/after the five-second HTTP/TURN cut in run 58. Run 57 has
-  long silent gaps before its cut. Retain that failure and diagnose it with
-  producer/receiver evidence; concurrent compilation is a hypothesis only.
-  The same audio threshold applies to every repeat. Full sustained-use and
-  human listening acceptance remain open.
-  Run 72 adds a second failure: the received tone fades late in the probe while
-  the track stays live/unmuted and before/after packet counters show zero loss.
-  Source `c5630e40` adds exact-receiver RTP counters alongside PCM and retains
-  the thresholds. Independently reviewed runs 75/76 pass tone before and after
-  reload/interruption plus native operator handoff and exact cleanup. Their
-  short probes establish the combined local journey. Diagnose the intermittent
-  failures with synchronized producer/receiver evidence during sustained use;
-  full media qualification remains open.
-  Reviewed observer `6896fee5` passes source and real GStreamer checks. Installed
-  diagnostic runs 84/85 pass the short combined journey on unchanged media
-  settings. Run 85 localizes startup sequence gaps to the queue, while both
-  measured tone windows stay stable. Keep the sustained failure open; capture
-  producer and receiver timing during a failing run before changing media.
-- **B04.operator-admission / active / delegated source owner.**
-  Prerequisite: the accepted owner/page contract and existing Engine CDP access.
-  Deliver a bounded, capability-negotiated snapshot of the actual Engine page
-  with document generation and pagination. Test owner success, foreign-owner
-  rejection before dispatch, a close/reply race and stale references after
-  navigation. The first installed proof reads a controlled form from the page
-  visible to the human. Actions, writer leases, handoff and adapter conformance
-  are its immediate successors; a snapshot alone leaves B04 open.
-  Source `4dd0a216` passes the installed journey in run 60: actual typed field,
-  three response pages, stale cursor after UI navigation, reload and 13-effect
-  cleanup. Run 61 adds decoded audio and five-second connection-cut recovery.
-  Independent agent review accepts both installed inspection runs. The next
-  slice connects explicit page-owner approval to a separately authenticated
-  operator, then uses the existing typed input path. Home launch tokens retain
-  their non-delegatable authority. Writer admission, revocation, handoff and
-  adapter conformance stay open while the coordinator integrates installation
-  and remote service work.
-  Reviewed source `9e6693d6` adds the bounded owner-approved click/type writer.
-  The installed journey exposes an unset viewport check in run 69. Repair
-  `cb03a719` passes 67 focused tests and run 70: separate operator attach, explicit
-  owner approval, click/type, human takeover, revoked-input rejection and exact
-  13-effect close. Independent installed review and the combined viewer-reload
-  repeat are next. Playwright, Camofox/Camoufox, remote operator identity and the
-  full action/profile/file conformance requirements remain open.
-  The corrected real CDP wrapper dispatches each action once; a native pending
-  marker keeps human handoff behind uncertain effects. Its 74 JavaScript and
-  12 Python checks plus Runtime/common/adapter regressions pass. The changed guest scripts and adapter are installed. Prove actual ref actions, handoff,
-  revocation and close. Operator adapters and broader workflow gates stay open.
-  Independent review now accepts combined runs 70, 73-76 and 82 in their stated
-  media/recovery scopes. Run 82 confirms separate attach, reference actions,
-  human handoff and revoked writer rejection after viewer reload. The next
-  implementation requirement is actual framework adapter conformance; repeat
-  native admission only when changed inputs or a diagnosed defect require it.
-  Source `2cdc9535` owner invitation, separate operator approval, reference fill
-  and clear passes 103 Node and 27 Rust checks and is installed with matching
-  Runtime, adapter, Browser UI and guest helper. The unchanged Playwright SDK
-  exercises the bounded adapter in `74d5b272`; 58 checks pass independent review.
-  Run 93 passes independent review of actual installed Camofox and Playwright
-  owner invitation/approval, inspection, fill, clear, revocation rejection and
-  detach while preserving the same page. The combined media/reload journey
-  closes all 13 effects and returns Runtime/control to zero. General selectors,
-  waits, full actionability,
-  files, profiles and declared Camoufox conformance remain open.
-- **B08/B09.first-remote / active / independent delegated source owner.**
-  The Linux consumer now runs `b8c78d79`, including the independently reviewed
-  directional Exit EOF repair `a3471808`. Its original regression fails and
-  both repaired stream-direction tests pass. Installed provider, capsule,
-  served-asset and configuration parity pass. With the unchanged Mac Engine,
-  run 96 completes Home launch, decoded video, navigation, typing, inspection,
-  short audio and scrolling. Viewer reload then fails at `state_deadline`;
-  the retained page binding remains valid and display reattachment starts
-  within the observation window. Exact close confirms all 13 effects in
-  1888 ms and leaves Runtime/control obligations at zero. Independent review
-  accepts the ordinary actions and exact close. Diagnose the first reload delay and
-  repeat the same A/B/A journey with the existing five-second acceptance gate.
-  The following account preserves the earlier failed attempts.
-  `caa5d90f` is independently accepted after 45 focused tests. Normal Engine
-  sharing, request, approval and selection pass. The first Linux Home → Mac
-  Engine → Linux Exit attempt fails at Carrier connection before allocation.
-  Consumer-only diagnostic `70dccb34` is installed. An exact destination policy
-  admits the controlled fixture. The current Engine request receives normal
-  owner approval. A/B/A then loads its first page with exact remote Engine
-  binding and decoded WebRTC frames, before navigation fails at remote input.
-  Later status and close calls fail and the page retires. Final counts are
-  zero; the acquired page's complete 13-effect receipt remains missing.
-  Mac diagnostic `690170bc` preserves the existing deadlines and lifecycle
-  policy while reporting the fixed execution and retirement stages. Its repeat
-  reaches decoded remote media, then fails at `input/runtime_operation` after
-  five seconds. Guest CDP navigation also times out; the owner-watchdog warning
-  is absent. Trace the native serialized control path and guest navigation,
-  compare the same candidate locally, and repair the first responsible
-  component before repeating the remote journey. Final zero counts do not
-  replace the missing acquired-page close receipt. The original Carrier
-  connection failure remains unexplained.
-  Full media, placement, recovery and cleanup requirements remain open.
-  Source `1a47ddc6` binds canonical journey Engine/window receipts; `30fa0a68`
-  corrects its introduced inventory-read deadline. Source `8feb264c` selects
-  and raises the exact owned window through Home controls; 332 unit checks and
-  an actual overlapping-window fixture pass. The installed pre-effect close
-  passes. Preserve the earlier failed runs and qualify broader Home restoration.
-  The following paragraphs retain earlier evidence.
-  Prerequisite: accepted Engine/Exit identity and Runtime service contracts.
-  Identify the first missing product operation for A/B/A and A/A/B against
-  available peers, then repair that component with a bounded regression.
-  First proof must use independent Runtime identities and normal service
-  authority. Coordinator schedules actual target execution. Loopback identity
-  tests can unblock implementation; physical LAN/WAN proof remains required.
-  Accepted source slice `cb78ccb9` connects Services to signed People contacts
-  and rechecks authority before approval and grant installation. The next
-  source slice `faa1e581` makes Exit configuration parse and waits for provider
-  acknowledgement before enabling use. Required decision revisions preserve
-  a newer denial against an old approval. Independent source review accepts
-  71 Home and 32 Exit tests; matching installed activation is next. The source
-  owner has completed authenticated Carrier grant admission and bounded
-  revocation in `21028a46`, with independent review. Both installed Runtime
-  roles and the relay match that candidate; local run 63 passes video/audio,
-  input, reload and exact close. Remote Engine offer/invocation proceeds in
-  parallel. The isolated Linux
-  consumer/Exit build and installed Home sign-in now pass. Both test
-  installations use the private collaboration configuration. Normal People
-  contact acceptance and remote Exit offer discovery pass. Runtime `6c8b0d96`
-  fixes configured Carrier use. Installed Inbox `5c9c5c4b` exposes owner approval;
-  ordinary two-Home approval and Exit activation now pass after Inbox reopening.
-  Source `92f04e0e` moves receive progress into Runtime's background worker.
-  Installed diagnosis found the two-connection grant quota. Source `0244cc0c`
-  preserves approved limits and admits normal page concurrency. A/A/B now loads
-  Example Domain, decodes WebRTC frames, navigates, rejects use after owner
-  denial, and closes all 13 effects with zero control counts. Background grant
-  denial/renewal passes with consumer Services/Inbox closed. Controlled remote
-  audio/input and full revocation UX remain pending. In particular, reject a
-  known revoked Exit before replacement Engine allocation and identify that
-  authority failure clearly; finish navigation status when content is ready.
-  Local runs 63/64 have independent acceptance. Combined-image run 65 confirms
-  media/input/reload and actual cleanup but fails a harness baseline equality;
-  resolve that condition before counting a full pass. Engine availability probes
-  pass source review at `54df379a`; the delegated owner implements full remote
-  page/stream/media binding. All five placements retain their full requirements.
-  The fresh Linux restart repair `2b640973` passes its active target smoke and
-  installed Home proof with reused native binaries.
-- **B06.restored-address / accepted bounded repair / coordinator; agent reviewed.**
-  Run 81 reproduces the reload binding failure: Browser publishes the restored
-  page before its fresh address is ready. Source `417cda95` retains internal
-  cleanup ownership immediately and publishes the public page after address
-  restoration and an owner recheck. The deferred-response regression fails on
-  the old ordering; 200 focused checks pass after repair. Run 82 passes decoded
-  media, navigation, input, reload in 1584 ms, native operator handoff and close
-  in 811 ms with all 13 effects and zero Runtime/control obligations. The image
-  and native binaries were reused. Earlier startup run 77 and Home setup runs
-  78-80 remain failed; a fresh viewer profile passes 81/82 but does not establish
-  the cause of the older profile's setup failures. Full B06 remains open.
-- **B16.execution-runner / active / coordinator; source agent reviewed.**
-  Source `16299f1b` supplies a bounded installed lifecycle probe with frozen
-  artifacts, process identities, exact cleanup and retained failures. Source
-  `35b41c64` adds reviewed sustained input/time/frame consistency checks. A
-  single probe cannot qualify lifecycle repetitions. The first installed probe
-  completes the controlled journey and cleanup, then rejects the planned Brave
-  vendor version against the actual Chromium version reported by the viewer.
-  The coordinator corrects that plan field and repeats the same frozen journey.
-  The repeat reaches decoded video, typing and inspection, then fails the tone
-  check with increasing audio packet loss. Exact close still clears all 13
-  effects and leaves the Runtime/control empty. Diagnose the audio producer and
-  receiver together before assigning a passing endurance result.
-  The full cycle, launch-distribution, media and eight-hour workloads retain
-  their original requirements. Visible-input latency and synchronized A/V
-  offset measurements remain explicit gaps in the current runner.
-  Reviewed source `c17776f5` binds exact Engine/Exit and fixture configuration,
-  the actual launch/close VM identity, and sampled process/control identity.
-  Its 337 Node checks pass. Run one installed probe before the campaigns;
-  warm conditioning remains unsupported. One qualifying 100-cold-launch
-  campaign can also supply the 100 lifecycle facts when all cleanup criteria
-  are retained. The current mixed workload's idle periods mean that its first
-  half hour cannot substitute for the uninterrupted 30-minute media run.
+Work stopped at the user's request on 2026-09-09 for a usage-reset handover.
+The local branch and frozen source edits are preserved. The final private
+handover identifies exact artifact receipts, process ownership, patches and
+commands. A fresh session first reconciles those receipts with actual state.
+Source acceptance, installed journey acceptance and full qualification remain
+separate results. B01-B16 acceptance criteria and checkboxes below are unchanged.
 
-- **B12/B13/B15.remaining-features / ready source work; target proof scheduled by
-  coordinator.** These goals include implementation gaps as well as testing.
-  B12 first proves cookies, local storage and committed IndexedDB across an
-  explicit close and reopen of the same principal/profile. The opt-in fixture
-  passes independent source review, including commit/abort and read-without-write
-  cases. Write attempt 94 fails during Home startup before Browser allocation;
-  the paired read is stopped. Reviewed source `de0a299e` combines session renewal
-  and its audit append in one state update; 24 Rust checks pass, including an
-  actual reduction from six to three signature-validation passes. Install it
-  and repeat the same Home and Browser journey before attributing a latency fix.
-  Reviewed source `52238f2f` preserves existing profile bytes on mount failure;
-  the original destructive path fails its regression and 14 guest-shell plus
-  four VZ tests pass. Install matching host and guest artifacts before the
-  persistence pair. Linux Browser profile disk attachment still needs
-  implementation. Actual Engine persistence remains unverified. Encrypted checkpoint transfer, recovery
-  and ephemeral-profile deletion still need implementation and proof. B13 first
-  uses the existing object-granted upload path with a bounded file and an exact
-  destination hash. Reviewed fixture source `6ff70451` checks the actual
-  selected 64 KiB file bytes; installed positive and changed-byte cases remain
-  pending. Complete downloads to selected storage, large-transfer
-  progress/cancel/integrity, actual Wallet consent flows and human screen-reader
-  access to Engine-page controls retain their acceptance requirements. B15
-  first binds a real distributable image and matching helpers in the existing
-  component manifest and installer. Cross-component health settlement,
-  supported profile migration/rollback and upstream Engine security maintenance
-  remain open. Source preparation can proceed while a fixed installed candidate
-  runs; deployment and disruptive tests require the target owner's next slot.
+1. **B06/B08 remote reload:** review the frozen viewer scheduling and observation
+   patches, then install only the accepted UI change and repeat the same A/B/A
+   journey. Keep the current Runtime/image/helper set for attribution. The next
+   evidence must show timely display attachment, fresh decoded frames, retained
+   page/profile/services, input and all 13 close effects. Keep run 96 failed.
+2. **B02/B03/B11 Home and responsiveness:** install the reviewed `de0a299e`
+   Runtime candidate and repeat Home timing on the same principal, then the
+   canonical Browser journey. Measure an optimized candidate before release
+   performance claims. Diagnose idle CPU and intermittent audio with matched
+   producer/receiver evidence. Preserve normal fresh sign-in qualification.
+3. **B12/B13 state and daily operations:** install matched host/guest profile
+   protection `52238f2f`; run a new write/close/read pair for cookies, local
+   storage and committed IndexedDB. Preserve failed write 94 and stopped read 95.
+   Prove the reviewed 64 KiB Library upload and changed-byte rejection. Implement
+   Linux profile attachment, protected checkpoints/approved transfer, crash
+   recovery and ephemeral deletion. Downloads, large-file progress/cancel,
+   Wallet consent/return semantics and human accessibility remain open.
+4. **B04/B07/B08/B09/B10/B14 independent source and target work:** extend the
+   bounded installed operator surface to the complete shared workflow; qualify
+   Playwright, Camofox and declared Camoufox paths. Prove two-session progress
+   under a stalled operation. Complete A/A/A, A/B/A, A/A/B, A/B/B and A/B/C with
+   real approved peers, controlled destination/DNS evidence, recovery and
+   revocation. Expired-service selection, pre-allocation revocation and leases
+   retain their UX and authority checks. Use one owner for the shared Mac.
+5. **B02/B15 installation and update:** execute the frozen staged-executable
+   regression red/green tests before source acceptance. Bind the actual image
+   and matching helpers to the distributable component manifest and ordinary
+   installer. Prove missing/corrupt/incompatible/interrupted acquisition,
+   component health settlement, profile migration/rollback and upstream Engine
+   security maintenance. Sash and a second maintainer need the normal install
+   journey. Publication and public deployment require their own authorization.
+6. **B01/B05/B06/B11/B16 qualification:** certify each claimed role and device
+   on one frozen compatible candidate. Run launch/cycle distributions, continuous
+   media, mixed use, manual UX and the objective audit. The runner still needs
+   valid warm conditioning, input-to-visible latency and synchronized A/V offset
+   evidence. A qualifying 100-cold campaign may also supply the 100 lifecycle
+   facts when every cleanup requirement is retained. Idle periods in mixed use
+   do not count toward uninterrupted 30-minute A/V.
+   Reconcile the objective audit's older provider-documentation predicates with
+   the current Runtime contract while preserving real media and manual UX gates.
+
+The planned soak start was missed and none of the required full campaigns has
+started. The original deadline remains recorded below as history; the next
+session must establish a feasible execution schedule from remaining work.
+The user has not waived any acceptance requirement.
 
 ### Time and resource control
 

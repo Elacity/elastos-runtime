@@ -70,702 +70,105 @@ volatile proof logs remain outside the repository.
 
 ## Browser contract and device qualification
 
-The current task Mac runs Runtime `690170bc`, SHA-256
-`f5b012ae4f704bf22cb94aa51699f29082839727b4ddbd4493b7b14d26c557bf`.
-The Linux consumer/Exit runs `b8c78d79`, SHA-256
-`47ca650f8033727bfe57c20b52d4392fdb52d2f085b60307a5394697c44a87a3`.
-Both installed and served artifact checks pass. The Mac now has the `2cdc9535`
-operator invitation, reference-fill adapter, Browser UI and Engine helper.
-The matching adapter hash is
-`192139afe6b274a25bc258648aa84cb98309b708ad3a7d86996ba9095be93c57`.
-Its rootfs is `58c82e397fa97d900159ba1a0a7854505cb1bce1f5e11a2c2a8e40e5a7f03971`
-and initrd is `d928d9f69e7929049575cb1f4c6366f87f66c62cf11921faddb5bb2963c5462c`.
-One guest helper changed in the rootfs and initrd; the kernel and media
-dependencies were reused. The bounded audio observer from `6896fee5` remains.
-This diagnostic image and the debug Runtime builds supply bounded functional
-evidence; release performance and device qualification remain open. Run 92
-passes the local Home journey on this exact set: decoded video/audio,
-navigation, typing, scrolling, Engine inspection, viewer reload in 3872 ms and
-all 13 close effects in 788 ms. Independent review accepts that bounded scope.
-Observed dropped frames and cumulative audio loss keep media-quality and
-latency-distribution claims outside this result.
+The Browser mission is paused at the user's request on 2026-09-09. All B01-B16
+full acceptance gates remain open. The accepted contract permits dependent work
+to continue; B01's open support matrix does not block every implementation slice.
+[Acceptance requirements](docs/BROWSER_ACCEPTANCE.md),
+[support matrix](docs/BROWSER_SUPPORT.md), and the
+[resume queue](TASKS.md#browser-maturity-workstream) remain canonical.
 
-The Linux update includes the directional Exit EOF repair `a3471808`; its
-original regression fails and the two repaired stream-direction cases pass
-independent review. Runtime, adapter and served Browser assets have matching
-installation receipts, and the five task configurations retain their hashes.
-With this Linux consumer/Exit and the unchanged Mac Engine, run 96 completes
-Home launch, controlled navigation, decoded video, typing, inspection, short
-audio and scrolling. Viewer reload fails the unchanged five-second gate with
-`state_deadline`. Completed Runtime samples retain the same page binding; the
-new viewer requests display reattachment before the deadline. Subsequent close confirms all 13
-effects in 1888 ms; Runtime and VM control obligations return to zero. This is
-a passed ordinary-browsing and close milestone within a failed integrated
-remote run. Independent review accepts the ordinary actions and exact close. Input and bootstrap delays still
-prevent a smoothness claim; recovery and the remaining placements stay open.
+The task Mac and Linux consumer/Exit have these installed artifacts:
 
-The following remote failures refer to the earlier Linux diagnostic installation.
-Earlier exact local artifact sets pass decoded media, navigation, input, native
-operator handoff and cleanup. After the controlled fixture received an exact
-Exit destination exception and the current Engine request received approval,
-A/B/A loads its first page and decodes WebRTC frames. Runtime evidence binds
-that page to the selected remote Engine. Navigation then fails at the remote
-input operation; later status and close calls fail and the page retires. Final
-Runtime/control counts return to zero, but the acquired page lacks its complete
-13-effect close receipt. The full remote journey remains failed. The initial
-Carrier connection failure also remains unexplained. The installed `690170bc`
-repeat again reaches a decoded remote page, then reports a five-second deadline
-at `input/runtime_operation`. Subsequent status calls also wait at that stage.
-Guest evidence records `Page.navigate` and `Runtime.evaluate` timeouts; the new
-owner-watchdog retirement warning is absent. Final counts are zero and the
-owned window closes, while the complete acquired-page close receipt remains
-missing. The native provider serializes commands until each response drains,
-which can hold status and close behind navigation. This explains a possible
-secondary delay; the first navigation stall still needs a causal test. Existing
-deadlines and lifecycle policy remain unchanged.
+| Artifact | Verified source or SHA-256 |
+| --- | --- |
+| Mac Runtime, source `690170bc` | `f5b012ae4f704bf22cb94aa51699f29082839727b4ddbd4493b7b14d26c557bf` |
+| Mac Engine adapter | `192139afe6b274a25bc258648aa84cb98309b708ad3a7d86996ba9095be93c57` |
+| Mac rootfs | `58c82e397fa97d900159ba1a0a7854505cb1bce1f5e11a2c2a8e40e5a7f03971` |
+| Mac initrd | `d928d9f69e7929049575cb1f4c6366f87f66c62cf11921faddb5bb2963c5462c` |
+| Linux Runtime, source `b8c78d79` | `47ca650f8033727bfe57c20b52d4392fdb52d2f085b60307a5394697c44a87a3` |
+| Linux Engine adapter | `83b59f996fae053b66bfaf9a88111c77e0c8846966335d6724d4462a8c0c52c7` |
+| Browser UI on both installations | `f8515b7a28d8bd3dd191ce21ea5c6d1b8c7ed2eadf69852c8cdfd5128fee7ea0` |
+| WebRTC viewer on both installations | `f42217e02d39983924ab9311633c6a91696d8f8eb635317c3ffe7d185944a6e7` |
 
-Source `2cdc9535` adds explicit owner invitation, separately authenticated
-operator inspection, reference replacement/clear and detach. Independent review
-accepts 103 Node and 27 Rust checks. The matching set is installed. Source
-`74d5b272` adds a bounded adapter exercised by the unchanged Playwright SDK;
-58 focused Node checks pass independent review. Run 93 now passes the actual
-installed bounded Camofox and Playwright workflow. Browser Settings issues a
-page invitation and explicit owner approval; each separate operator inspects,
-fills and clears the real Engine field, is denied after revocation, and detaches
-while preserving the owner's page. Exact fixture events and advancing decoded
-frames verify the effects. Both tone probes pass 38 steady samples; viewer
-reload takes 3766 ms and the outer UI close confirms all 13 effects in 944 ms,
-with zero Runtime/control obligations. Independent review accepts this scope
-against the pinned SDK, helper, harness and installed artifacts. Full
-Playwright/Camoufox, profiles, daily workflows, update, authority, media,
-endurance, device and human acceptance retain their original requirements.
-A bounded idle sample also finds roughly one CPU core used by the task Runtime
-with zero Browser pages/VMs; collaboration verification/projection appears in
-the active stacks. A synthetic debug benchmark with the installed record count
-uses about 1.38 CPU seconds for five full validation reads. Signature tampering
-is rejected and the measured paths make zero state writes. This cost alone
-does not explain the full idle observation. Its cause and the intermittent
-audio failures remain open.
-A later 60-second idle observation of the current Runtime uses 34.4 CPU seconds,
-with zero Browser pages and VMs at both boundaries. The first five seconds of
-sampled stacks include repeated collaboration validation; that short sample
-does not account for the entire observation. The synthetic benchmark and its
-tamper/no-write checks are independently reviewed in source `6ceb6089`.
+Installed, served and provider checks pass for these sets. The Linux update
+preserves all five task configuration hashes. Native Runtime builds are debug
+builds, and the Mac image includes a bounded audio observer. They establish
+functional results; release performance still needs an exact release candidate.
+The kernel, media dependencies and matching helpers were reused wherever their
+inputs stayed unchanged. The final source-only patches below are not installed.
 
-Persistence write attempt 94 fails at Home readiness before Browser allocation;
-the paired read is stopped. Two subsequent Home observations and a matching
-Runtime stack sample locate delays in session renewal, the shared auth-state
-lock and repeated signed-audit validation. Reviewed source `de0a299e` commits
-renewal and its audit append in one existing state mutation. All 24 focused
-Rust checks pass; the measured test path performs three validation passes
-instead of six. The installed Runtime still predates this repair, so installed
-latency attribution remains pending.
+Independent review accepts these bounded installed milestones:
 
-Reviewed source `52238f2f` addresses a separate profile safety defect: an
-existing disk mount failure previously triggered formatting. The host now
-owns exclusive disk creation and a one-use initialization marker, and the
-guest formats only that newly created disk. The original destructive behavior
-fails the regression; 14 generated guest-shell and four VZ tests pass. Matching
-host and guest installation and actual profile persistence remain pending.
-Linux Browser profile disk attachment is a remaining implementation gap.
-Reviewed source `6ff70451` adds exact selected-file-byte evidence to the
-controlled upload fixture; an installed Library upload remains pending.
-All B01-B16 requirements remain open for their full qualification. The planned
-eight-hour run start was missed; launch campaigns, uninterrupted 30-minute
-media, eight-hour mixed use and final human/device acceptance have yet to run.
+| Journey | Passed | Remaining limitation |
+| --- | --- | --- |
+| Local 92 | Home launch, controlled navigation, decoded video/audio, typing, scrolling, Engine inspection, viewer reload in 3872 ms, all 13 close effects in 788 ms, final Runtime/control counts zero | Individual functional sample; observed dropped frames and cumulative audio loss do not establish quality or latency distributions. |
+| Operator 93 | Actual installed Camofox and unchanged Playwright SDK workflow: owner invitation/approval, inspection, fill/clear, revoked-writer rejection and detach preserving the owner's page; media, reload and all 13 close effects also pass | Bounded adapter surface. General selectors, waits, actionability, frames, files, headless handoff and declared Camoufox/Firefox conformance remain open. |
+| Remote 96, A/B/A | Linux Home/consumer and Exit with Mac Engine: approved selection, controlled page, decoded frames, navigation, typing, inspection, short audio and scrolling; exact close in 1888 ms, all 13 effects absent and Runtime/control counts zero | Integrated run fails viewer reload at the unchanged five-second gate. Completed Runtime samples retain page binding; fresh viewer media is unproved before the deadline. |
+| Earlier A/A/B | Mac consumer/Engine uses approved Linux Exit for a public page and navigation; denial and renewal propagate; exact close reaches zero obligations | Controlled remote audio/input, pre-allocation revocation behavior and all placements still need proof on the final candidate. |
 
-The following paragraphs retain earlier bounded evidence. The earlier operator
-checkpoint used Runtime source `0244cc0c`, hash
-`91457075a95661b70242b9ce379f2054868e95f2d643a80c766218bc28ab78f8`.
-The `92f04e0e` Engine adapter is
-`3c9a7d4816f0cfb4d7c1f511a93a3d33279aea5101c14d8ba71e1ed5082ac651`.
-Its rootfs is `a0a5dddedbf6230eaf647e80e60f7c280df5ef39a2a527bb50f28c8fe94311f8`
-and initrd is `b770af7ee0d6d4fede3d7208d1568bc1df5befc3e54c802b7ba58dd26493850d`.
-The Engine helper hash is
-`9b272fc67eb082388c138d8d2a85e12c2a2f9f99a240f7fc4041d3d1b21b452e`.
-The image reuses the verified Chromium and media dependencies, replaces three
-guest files, and changes only the matching helper in the initrd. Image-set,
-filesystem, provider and restart checks pass. The Exit provider, relay, kernel,
-VZ helper and Browser UI are reused from their preceding verified receipts.
+Remote 96 first fails at `state_deadline` in the reload observation. Viewer
+page-status takes 1019 ms and precedes display attachment, which starts 3464 ms
+after reload. The observation also reads summary, remote status and local media
+serially; its failed substep was not recorded. A frozen UI scheduling patch
+starts status and attachment together after retained-owner admission, and a
+separate observation change records bounded substep timing. Source verification
+passes 302 focused tests, including an old-order regression failure, and
+independent review accepts the bounded slice. The dedicated delayed-JSON
+observer test and installed repeat remain pending. Existing authority checks
+and the five-second criterion remain.
 
-Run 60 passes the ordinary installed journey and native Engine inspection:
-18 accessibility nodes over three response pages include the exact text entered
-through the Browser UI. Navigation rejects the old cursor with `stale_inspection`.
-Viewer reload takes 1077 ms and close clears all 13 effects in 661 ms. Run 61
-adds decoded audio before and after a 5001 ms HTTP/TURN cut; all 39 steady samples
-pass in each audio probe, recovery takes 1753 ms and close takes 802 ms. Both runs
-end with zero Runtime/control obligations. Independent agent review accepts
-this bounded installed inspection evidence. The earlier run 57 audio failure,
-full operator behavior and all qualification requirements remain open.
+Earlier source and installed work provides Engine 2.1 readiness, image-set
+verification, bounded image acquisition, explicit Engine/Exit selection,
+Runtime-owned launch/close settlement, input and restored-address repairs,
+WebRTC attachment/recovery, Engine-page inspection and scoped operator writes.
+The RNG initrd change removes an observed five-second bootstrap delay; measured
+launcher samples still range around 9-11 seconds. These are accepted contract
+or bounded journey milestones, not completion of their full acceptance areas.
+A real roughly 898 MB image package is verified locally. Ordinary automatic
+acquisition of a complete published compatible set and second-maintainer setup
+remain open; source-home preparation still uses operator-supplied artifacts.
 
-Run 62 returns the Runtime/Exit activation change to the installed journey,
-reusing twelve Browser artifacts. Core browsing, native inspection, stale
-references, viewer reload and cleanup pass. Both decoded-tone probes, before
-and after reload, pass all 39 steady samples. Reload takes 3156 ms and close
-clears all 13 effects in 664 ms. Independent agent review accepts this bounded
-run; ordinary cross-Runtime service approval is still required to prove
-installed activation.
+| Additional source work | Evidence and installed status |
+| --- | --- |
+| `a3471808`, directional Exit EOF | Original regression fails; both repaired stream-direction tests pass independent review. Installed in Linux `b8c78d79`. Remote 96 advances past the prior navigation stall, but one pass does not establish sole cause or repeatability. |
+| `de0a299e`, auth renewal and audit in one state mutation | Independent review and 24 actual Rust checks pass, including six-to-three validation passes. A Mac Runtime candidate built successfully; installation and measured Home attribution remain pending. |
+| `52238f2f`, preserve existing profile disks after mount failure | Original destructive path fails its regression; 14 generated guest-shell and four VZ tests pass independent review. Install the matching host and guest together before persistence proof. Linux Browser profile disk attachment still needs implementation. |
+| `b8c78d79`, paired profile fixture/harness | Reviewed write/close/read proof for cookies, local storage and committed IndexedDB. Attempt 94 fails Home startup before Browser allocation; paired read 95 was stopped. Actual persistence remains unverified. |
+| `6ff70451`, selected upload bytes | Reviewed fixture validates an actual 64 KiB file and destination hash. Installed Library upload and changed-byte negative case remain pending. |
+| Frozen update candidate validation patch | Validates the staged executable before replacing the working Runtime. Three real-subprocess regression fixtures are prepared; actual Rust red/green execution and installed update proof remain pending. |
 
-Run 63 passes the same local journey on the authenticated Carrier candidate:
-decoded video/audio, navigation, typing, scrolling, inspection and viewer reload.
-Reload takes 3143 ms; close clears all 13 effects in 658 ms and leaves zero
-Runtime/control obligations. Thirteen existing artifacts are reused. This
-proves local regression behavior after the Carrier change; remote placement
-requires its own installed journey.
+Failures remain explicit. Earlier remote attempts include an unexplained Carrier
+connection failure and navigation timeouts with incomplete close receipts.
+Audio runs 57 and 72 and lifecycle probe 02 fail with silence or loss; later
+short passing probes do not explain them. A 60-second idle observation consumes
+34.4 CPU seconds with zero pages/VMs. Collaboration validation appears in sampled
+stacks, while a separate Home trace identifies auth-lock contention and repeated
+audit validation. These observations do not establish the full idle-CPU cause.
+Sash's failure on his own installation has no matching diagnostic receipt yet.
 
-Source `21028a46` binds remote Exit use to the running Runtime endpoint,
-signed Services approval, current accepted contact, exact principal and grant,
-expiry and quotas. Independent review accepts 20 stream tests, an actual
-Services-issued Browser caller test and 18 relay tests. The relay rejects
-private IPv4-mapped IPv6 and unverified upstream proxy DNS for public-only grants.
-Source `7879f439` adds verified image packaging and lazy acquisition before
-first-party local Engine readiness. Source `e61603fe` replaces the confirmed
-200 MiB buffered image limit with bounded disk transfer and streamed verification.
-Its 34 Rust and 28 packaging/source checks pass. A real image exceeded the old
-limit after only 614 MB of input. The actual image package is 897,973,643 bytes with SHA-256
-`143f7103d54e08665674a5e3d65026e050ac6cfd7b78c62dbaff4c8a0ead989f`.
-It passes package and image verification. Publication and fresh automatic
-installed acquisition remain qualification requirements.
+The observed Mac is ARM64 with 24 GiB RAM and macOS 26.5.2. The Linux AMD64
+server supplies consumer/Exit evidence and has no KVM device. Every support
+matrix row retains full device, media, recovery and human qualification.
+Required 100 cold launches, 100 warm launches, 100 lifecycle cycles,
+uninterrupted 30-minute A/V and eight-hour mixed use have not started. The
+planned soak start was missed. The current runner lacks warm conditioning,
+input-to-visible latency and synchronized A/V offset proof. Full completion
+within the original deadline is unsupported.
 
-An isolated Linux candidate now has a separately built Runtime and ten native
-providers for the consumer and Exit roles. Its Runtime hash is
-`0dd634d6fe8361ba8984e334dca1423bc7a26408eede4c9a8c005c3b8df05b1c`
-from source `0244cc0c`.
-Its matching `21028a46` Exit relay hash is
-`a9e79e8db5d8e4f810633a734ced073018ffdfe7db280209d1d9898fb5a5b5b6`.
-Fresh startup exposed a restart-script error: an `already_ready` migration
-creates no rollback, while the script required one. Source `2b640973` corrects
-that case and retains rejection of unproved missing backups. The full Linux
-restart smoke passes, including repeat start, failure cleanup and artifact
-parity. Native binaries were reused for this script repair. Installed Home and
-Services return matching HTTP 200 content; Brave creates a separate test owner,
-opens Browser through Home and checks unsupported-viewer rejection before page
-allocation. This target has no KVM and supplies no local Engine qualification.
-Both owned installations use the same private collaboration configuration.
-Normal People discovery, Inbox contact acceptance and the remote Exit offer
-projection pass. Source `6c8b0d96` routes Services through that running Runtime;
-its 16 isolated Services regressions pass. Installed testing then found that
-Inbox received requests only on launch and lacked Services approval controls.
-The `5c9c5c4b` Inbox page is installed and hash-verified on both Homes. Normal
-request delivery after Inbox reopening, visible owner approval and consumer
-Exit activation pass. Installed cause logging identifies the first remote use
-failure: the grant's two concurrent connections cannot serve a normal page.
-Source `0244cc0c` gives new owner approvals 64 connections per person/grant and
-a host limit of 256. Signed limits are validated and enforced at both ends;
-existing grants keep their limits until renewed. Independent review accepts
-31 passing test executions (30 distinct tests).
+The final Home entropy, Browser entropy, display-mode and formatting checks
+pass. The objective audit returns failure because accepted provider media and
+matching manual UX evidence are absent. Two older documentation predicates also
+fail; they already failed before this cleanup and need reconciliation with the
+current Runtime contract. This audit establishes no product-readiness result.
 
-The installed A/A/B path now loads Example Domain through the selected Linux
-Exit with 738 decoded WebRTC frames. Navigation changes the native document
-and reaches 3,884 decoded frames. Owner denial and renewal reach the consumer
-while its Services/Inbox windows remain closed. After denial, the provider
-rejects further connections; the exact page closes with all 13 effects absent
-and final control counts zero. Remote controlled audio/input, complete placement
-coverage and human UX remain open. Revocation currently reaches a generic Engine
-error after replacement allocation, and navigation status can retain “Opening”
-after content changes. Source `855624dd` clears the completed navigation status;
-run 82 verifies that UI behavior. The pre-allocation revocation check and its
-user-facing authority error remain open.
-
-Run 64 returns these Runtime and Inbox changes to the local Home journey.
-Controlled navigation, decoded media, native inspection, typing, scrolling and
-viewer reload pass. Reload takes 1406 ms; close takes 718 ms, clears all 13 effects
-and leaves zero Runtime/control obligations. Independent review accepts runs 63/64 after 104 assertions and 40 evidence
-hash checks. Run 57's audio silence remains unexplained.
-
-Run 65 exercises the combined operator image: decoded media, navigation, typing,
-scrolling, native inspection and reload pass. Its exact close clears all 13
-effects in 675 ms and ends with zero Runtime/control counts. Its original verdict
-stays failed. Source `137a95ab` corrects the harness to require the configured
-empty Runtime and retain entry counts. Subsequent runs confirm exact cleanup.
-
-Reviewed source `92f04e0e` adds Runtime background request/decision receive with
-23 combined regressions. Source `9e6693d6` adds a short owner-approved operator
-writer and native reference click/type. Tests cover the real CDP retry wrapper
-and late-effect handoff: 74 JavaScript and 12 Python cases, plus the common,
-adapter and Runtime authority tests. Run 69 reaches owner approval but its first
-click fails: the Engine checks viewport fields absent from the actual page object.
-Source `cb03a719` reads the live CDP viewport; independent review accepts its 67
-focused tests. The installed repair changes one Engine script in the existing
-rootfs and initrd, while reusing Runtime `0244cc0c` and matching native helpers.
-Run 70 passes local controlled browsing, decoded media, inspection, separate
-operator attach, owner approval, native reference click/type, human handoff and
-revoked-input rejection. Close takes 747 ms, clears all 13 effects and leaves zero
-Runtime/control obligations. Independent agent review accepts this bounded
-operator proof. Full adapter and human qualification remain open.
-
-Run 68 fails viewer reload before operator admission. Its original evidence lacks
-the failed binding predicate. Source `649132fc` retains named, redacted predicate
-results with 135 passing recovery/reload tests and preserves the original checks.
-Run 73 passes reload and native operator handoff together: decoded video resumes
-in 1600 ms and close clears all effects in 741 ms. Run 74 passes the five-second
-HTTP/TURN interruption and native operator handoff, recovering in 1167 ms and
-closing in 771 ms. Both end with zero Runtime/control obligations; controlled
-audio is outside these diagnostic runs. Independent agent review accepts both
-scoped results. Run 75 then passes the full tone, reload and operator journey,
-with reload in 3277 ms and close in 783 ms. Run 76 passes tone before and after
-the connection cut, input/video recovery in 1637 ms and close in 749 ms. Both
-clear all 13 effects and leave zero Runtime/control obligations. Independent
-review accepts these short combined journeys. The unexplained run 68 failure
-and sustained qualification remain open.
-
-Run 81 reproduces the reload binding failure with a fresh viewer profile and
-identifies the public page being exposed before its restored address. Source
-`417cda95` preserves immediate internal cleanup ownership and delays public page
-publication until the fresh address and owner recheck are complete. The old
-ordering fails its deferred-response regression; 200 focused checks pass after
-repair. The installed Browser UI has SHA-256
-`5b065c0df1fac8a79c4e7e84ebb490309c3a275075050ef72f97974d8b831258`;
-the verified image and native binaries are unchanged. Independent agent review
-accepts the source and run 82: the full controlled media/navigation/input journey,
-viewer reload in 1584 ms, separately approved native reference actions, human
-handoff and revoked writer rejection pass. Close takes 811 ms, confirms all 13
-effects and leaves zero Runtime/control obligations. Run 81 retains its failed
-reload verdict and successful exact cleanup. Run 68 retains its original failure;
-the later reproduction establishes the repaired ordering defect.
-
-Reviewed source `caa5d90f` binds remote Engine preparation, launch, media, input,
-and retirement to Runtime service authority. All 45 focused regressions pass;
-independent review accepts the final source after cancel/launch admission,
-reservation identity and retirement retry repairs. Both task Runtimes are
-installed with matching build and installed hashes. The Mac Runtime is
-`2d3603f65aa418244a321ef6766ae14349cbf9a9e08b0b3ede64b6f549a5324b`;
-the Linux Runtime is
-`06658eef9f0796f081e3a0894c838644a0880e093bb91ad399c467d48e1562fd`.
-Both serve viewer code
-`f42217e02d39983924ab9311633c6a91696d8f8eb635317c3ffe7d185944a6e7`.
-The matching native helpers are reused. The next installed proof uses Linux
-Home, the Mac Engine and the Linux Exit through normal service approval.
-Source acceptance and installation leave remote product qualification open.
-
-Source `6896fee5` supplies an opt-in, 60-second audio queue observer. Independent
-review and matching GStreamer tests accept its bounded counters and detachment;
-media properties are unchanged. A task image adds only the observer and its
-launch flag, while retaining the verified kernel, initrd and native helpers.
-On Runtime `0244cc0c`, diagnostic runs 84/85 pass controlled video, tone,
-navigation, input, reload, native operator handoff and all 13 close effects,
-with zero Runtime/control obligations. Run 84's post-close disk capture misses
-the producer log. Run 85's live capture proves queue-local startup sequence
-gaps, followed by stable measured tone windows. Its receiver records zero new
-loss during both tone checks. This does not explain lifecycle probe 02's
-sustained audio loss; synchronized failure evidence and full media qualification
-remain open. The diagnostic image is an experiment, not a release candidate.
-
-Run 83 retains a failed controlled remote Exit attempt: the selected Exit
-rejects the private fixture address before allocating a page, stream or VM.
-The next controlled fixture uses its task host's public address with the same
-destination restrictions. No firewall or public-live change is made.
-
-Run 77 fails startup with an open conflict whose exact plain-text reason was
-absent from the original evidence. Its native terminal record later confirms all
-13 cleanup effects, outside the failed journey's close bound. Source `64cebf15`
-records a bounded typed reason for a repeated plain-text conflict. Runs 78-80
-fail during Home setup before Browser allocation. A fresh task viewer profile
-passes Home in 81/82 with the same Runtime principal; that observation leaves
-the prior profile/setup failure's cause open.
-
-Source `16299f1b` adds installed lifecycle execution with artifact/process binding
-and exact cleanup. Independent review accepts that bounded probe path. Reviewed
-source `35b41c64` checks sustained input cadence, host/receiver elapsed-time
-agreement and frame deltas against reported continuity. Source tests establish
-the recorder's behavior; real endurance, synchronized A/V offset, input-to-visible
-latency and required human acceptance remain pending. The first installed
-lifecycle probe completes the journey and cleanup but fails viewer identity:
-the plan supplied Brave's vendor version while the harness reports Chromium's
-version. That plan mismatch is retained and corrected for the next probe.
-The repeat fails the decoded tone after controlled navigation, video, typing
-and inspection. Audio packet loss increases during that sample; the receiver
-stays connected and live. Its exact close clears all 13 effects in 1312 ms and
-leaves zero Runtime/control obligations. The source and installed artifacts
-remain unchanged; this failure joins the open intermittent audio diagnosis.
-
-Run 72 fails the controlled audio check when the received tone fades near the
-end of its 2.5-second sample. The receiver stays live and unmuted; before/after
-packet counters report zero loss. These observations do not identify the cause.
-Source `c5630e40` records bounded statistics from the exact audio receiver
-alongside PCM. All four run 75/76 probe windows show increasing packets and
-energy with unchanged concealment counters. Concealment rises during run 76's
-intentional cut despite zero reported packet loss. Earlier failures still need
-a matched producer/receiver observation; passing repeats retain those failures.
-Its exact close clears all effects in 919 ms. Run 71 separately fails during
-Home sign-out before Browser allocation. Source `35bf30ea` bounds auth fetches
-and offers explicit signed-Home reuse for focused Browser journeys, with five
-source tests. Default Home sign-in/sign-out qualification stays unchanged.
-Source `54df379a` adds signed remote Engine availability probes; full remote page,
-stream and media binding is still being implemented. The combined source
-candidate is installed; remote Engine and sustained journeys are next. The
-updated Engine image package is complete locally, with SHA-256
-`761e7d35f1dca8c6d8785cc7dc5724c9dd458fe86c8dba0069a63658f4e5f4c3`.
-Fresh acquisition and second-maintainer installation remain pending. B01-B16 retain all media,
-performance, recovery, device, human and release gates. Public live is unchanged.
-
-The preceding image used dependency repair `cbb1e099`, rootfs
-`d03ec02910defddfda432f0897b6f21b178eff52817df2e7b709bec7e1afa5aa`
-and guest control `6f5d48ae`. Its RNG initrd was
-`bfe15d7a854c1d7c8193ce5ddcc37a3b844387653241c0d702f1cf9681ff813d`.
-It enables the existing `virtio_rng` driver through the committed build script;
-all other 4,592 archive entries retain their content and ownership. The rootfs,
-kernel, native helpers and UI stay unchanged. Run 54 confirms random readiness
-before bootstrap and removes the observed five-second delay. Its launcher
-sample is 9251 ms against baseline run 53 at 14392 ms; headed samples 55/56 are
-11271/9651 ms. These are individual samples, and full startup budgets stay open.
-Runs 54/55 pass the core journey, reload and all 13 close effects.
-
-An opt-in controlled audio test generates a quiet 440 Hz tone in the Engine page
-and examines decoded PCM from the product WebRTC receiver. Run 56 passes this
-check plus core browsing, reload and cleanup. Run 57 fails with long silent gaps
-before the planned network cut; its close still clears all 13 effects. The
-cause remains unresolved. Run 58 passes decoded tone before and after a 5001 ms
-HTTP/TURN interruption, with video/input recovery in 1751 ms and exact cleanup
-in 684 ms. That passing run preserves the unexplained failure in run 57.
-Independent agent review accepts the bounded audio evidence in run 58 and the
-failure classification in run 57. Test commit `a1260f19` adds the opt-in probe;
-21 focused checks include resource cleanup on probe failure. Review of the RNG
-repair, sustained A/V, formal distributions and human checks remain open.
-The tested host is an Apple M5 Mac with 24 GiB RAM,
-macOS 26.5.2; this supplies no minimum-hardware or additional-device verdict.
-
-Source commit `cb78ccb9` makes Services use the signed contacts accepted through
-People. It rechecks contact and endpoint ownership before approval or grant
-installation. The old implementation failed the signed-contact regression;
-nine Services tests pass after the repair. The coordinator reviewed this source
-slice; installed remote-service proof remains pending. Source `faa1e581` adds
-provider-acknowledged Exit configuration activation and preserves newer pending
-or committed access decisions against stale approvals. Independent source
-review accepts 71 Home and 32 Exit tests, including held or missing ACKs, failed
-state writes and decision ordering. Matching installed activation, authenticated
-Carrier grant admission, bounded revocation and remote Engine offer/invocation
-remain separate proof or implementation requirements.
-
-The fresh artifact acquisition stage at `a1260f19` reports four missing files
-and installs none when the new data root has no selected artifact store.
-Selecting the verified local store links all four files and passes image-set
-verification without rebuilding. The probe links were then removed and the
-source artifacts retained. This is a bounded source-home installation check;
-automatic package acquisition and a complete fresh Home journey remain open.
-
-Installed run 59 reaches Home, both controlled pages, decoded WebRTC frames and
-exact UI text before the operator inspection route returns HTTP 404. Close
-clears all 13 effects in 684 ms, with zero remaining obligations. The bounded
-native accessibility inspection source passes 61 JavaScript and seven Rust
-checks and coordinator review. The subsequent installed results above exercise
-that source. Full B04 remains open for actions, delegation, handoff and adapters.
-
-Earlier evidence for dependency repair `cbb1e099` with its first initrd follows.
-
-Runs 50–52 pass Home launch, controlled navigation, advancing decoded WebRTC
-frames, exact text, scrolling and fresh Home close. Each close confirms all 13
-cleanup effects and zero remaining Runtime/control obligations. Runs 50/52 also
-pass viewer reload in 1515/3236 ms. Run 51 passes a 5001 ms HTTP/TURN cut,
-4315 ms media stall, same-owner recovery in 1774 ms and exact cleanup in 686 ms.
-Independent agent review accepts all three raw receipt sets. Launcher readiness
-samples remain 14230/15403 ms; these samples already exceed the proposed
-five-second cold-launch budget, and a formal distribution remains pending.
-The delivery queue in TASKS runs startup/fresh-install, operator and remote
-work through their accepted contracts while B01 qualification stays open.
-
-The earlier image `395a8c78` failed cold startup in runs 45–49 after its ICE hook.
-A matching-library test reproduces native heap corruption in the unchanged
-Selkies data-channel Structure constructor. The image omitted gst-python, which
-provides that Python constructor. Installing `python3-gst-1.0` makes the same
-call pass. Source `cbb1e099` supplies the dependency, removes the old fraction
-workarounds and checks override identity, real values and Selkies initialization
-before image creation. Ten isolated real video offer/stop cycles pass without
-the recorded heap, GObject or mutable-structure errors. The separate guarded
-ICE ownership repair remains covered by its reference-balance tests.
-
-Earlier independently accepted core, reload and interruption receipts remain
-historical evidence for their exact images. The source-only RNG change remains
-outside the current image. All results are local development evidence;
-publication and full B01–B16 media, endurance, lease, remote placement, device,
-operator-adapter and human acceptance remain open.
-
-Browser B01 is in progress. The contract is in
-[docs/BROWSER_PROTOCOL.md](docs/BROWSER_PROTOCOL.md), and the role-specific
-qualification matrix is in [docs/BROWSER_SUPPORT.md](docs/BROWSER_SUPPORT.md).
-The fresh Mac fixture at source `21966efe5c43b8f7859734c24c8fc7fa405366a8`
-and tree `d8c8bf4e03907a0f91b7828e66de47fef245d888` now contains the matching
-Runtime, providers, signed VZ launcher and complete guest image. A read-only
-comparison passed for all 13 components in its fixture receipt. Strict startup
-also verified the Runtime, component metadata, served Home and identical Browser
-control helpers in source, installation, initrd and rootfs. Home returned 200;
-the Engine readiness endpoint returned ready. These are installed prerequisites,
-with product interaction and device certification still open.
-The first journey attempt signed in successfully, then its old desktop-shortcut
-selector timed out before Browser launch. The harness now uses Home's existing
-Shelf/launcher path and reuses a visible restored window. Source-home IPC defaults
-now bind to the Runtime data directory; the installed Exit helper started with
-its own socket. The fixture also now uses canonical setup's TURN executable
-selection. Neither observation establishes the cause of Sash's reported failure.
-The next run booted the VM and reached guest page opening, then failed after
-126.6 seconds. Its terminal receipt confirmed VM, TURN, bridges, sockets and
-session-directory cleanup. A subsequent guest-log capture identified repeated
-failure before website navigation: Chromium rejected the Runtime online-state
-projection. Chromium 150 clears an override with zero latency and disabled
-throughputs, restoring the no-NIC guest's offline state. Source repair
-`ee5a84025f235497b553a04c52551f7974ddf704` supplies an active navigator-state hint;
-traffic remains owned by Runtime. Its no-NIC regression reproduced the old failure
-and passes with the repair. The rebuilt guest image passed source and installed
-preflight; source, installed, initrd and rootfs helper hashes match. Installed
-guest logs now report online and show the start of website navigation.
-The controlled localhost page then failed before Engine effects: Net rejected
-the destination before consulting Exit, despite its exact configured grant.
-A focused stream change gives Exit the destination decision while Net validates
-the request and acquires no connection. Seven Net tests and the existing exact
-private-target Exit regressions pass. The rebuilt Net provider is installed with
-matching build/install hashes and updated component metadata for the next journey.
-The fixture is composed: Runtime source remains `21966efe`, guest source is
-`ee5a8402`, and separate patch receipts bind later provider/config changes.
-The installed Net repair permits the controlled target to reach the guest.
-Chromium then reports `ERR_NAME_NOT_RESOLVED`: its implicit loopback bypass
-skips the Runtime proxy. A real Chromium regression reproduces that failure
-and loads the same URL through the proxy when the bypass is disabled. The
-guest launch flag repair is installed from `9f4e123a`, with matching rootfs,
-kernel, initrd and helper checks. Run 09 reached controlled main/navigation
-decoded frames, observed text input and scroll, and confirmed exact UI-close
-cleanup. A later test-only summary failed its opaque-origin contract, so a
-repeat run retained the full passing receipt. Run 11 completed with zero exit
-status. Main decoded frames advanced from 452 to 456, navigation from 910 to
-912, and input reached 1020. Fixture events contain every expected typed prefix
-and scrolling. The fresh close matches the page, cleanup handle and UI request;
-all 13 VZ terminal effects and zero Runtime sessions/obligations were verified.
-Independent agent review accepts runs 11 and 12 for this narrow journey. Run 10 stalled before Browser launch
-and remains an unresolved Home setup observation. Both successful controlled
-navigations took about 15 seconds; source inspection found a second wait for
-an already-consumed DOM readiness event. The `b0f648ee` repair removes that
-second wait. Five focused command regressions and the guest control-only smoke
-pass. The matching guest image passes run 12: main and next-page status are ready
-in 334/105 ms, with decoded progress in 563/335 ms. Strict VZ close proof confirms
-all 13 effects and zero Runtime obligations. Source hashes were captured before
-execution and checked after it. Run 13 repeats the full journey and cleanup.
-Its diagnostic sample shows the native helper waiting for bootstrap receipt
-completion. The guest retains its 30-second descriptor timer and paused socket
-after success. `085d49e7` clears that timer and closes after receipt flush; a real
-socket regression passes. Installed run 14 passes the journey but retains a
-33,983 ms Engine launch. Native `8c09a6db` then reads the bounded bootstrap JSON
-line without waiting for peer closure. Its 37 binary tests pass; installed run
-15 passes the journey but retains the startup delay. These repairs therefore
-establish their socket and framing behavior, not the desired startup speed.
-Independent review accepts installed `98ab05a7` run 16 with the stricter
-`9923983c` journey harness.
-Its reviewed close checks require the last exercised page, exact frame/origin/
-token authority, and matching pending/terminal UI ownership. All 13 cleanup
-properties pass. Private guest observations locate about 18.6 seconds in video
-signaling and 4 seconds in audio signaling after the initial website load.
-The installed Selkies async peer retry handlers each use `time.sleep(2)`, blocking
-the shared signaling loop. Source `56ce99e4` yields during those waits and
-preserves their two-second interval. Five regressions pass, including the
-bounded reproduction of both original blocking handlers. Independent review
-accepts installed run 17: Engine launch readiness is 13,829 ms; controlled
-main/navigation decoded progress is 280/132 ms. Exact UI close confirms all 13
-VZ effects and zero Runtime obligations. This single run establishes improvement;
-the full latency distribution and startup target remain open. Run 19 then
-exposes a startup UI race: an enabled address field accepts navigation before
-the pending default launch settles. Repair `f5192b2e` keeps startup controls
-pending; four focused regressions pass and served assets match the installation.
-Run 20 passes the controlled pages, decoded video, input, scrolling and exact
-cleanup. B06 stops before interruption because its wrapper omits the fixture
-URL. The corrected probe also addresses two review findings: it requires new
-frames after recovery input and restores the connection on time when a final
-cut observation is unfinished. Its 75 combined checks pass with independent
-source review. Run 21 reproduces a product failure: a viewer status request
-fails during the cut, Browser requests close two milliseconds later, and video
-disappears while Runtime still owns the active page. The diagnostic restores
-the connection; explicit close then confirms all 13 effects and zero Runtime
-obligations. Installed repair `40044c11` passes independent run-22 review for
-preserving the same page and media through five failed status requests during
-a 5001 ms HTTP cut. Fresh close again proves all 13 effects and zero obligations.
-Full B06 remains open because media continued during the cut: Chromium's P2P
-packet-loss interceptor applies to UDP, while this VZ path uses TCP TURN.
-The reviewed probe at `5f6aaafc` also interrupts the task-owned relay. Independent
-review accepts run 24 for a 5000 ms HTTP/media cut, a 4302 ms media stall, retained
-page/profile/service bindings, resumed video, and exact cleanup of all 13 effects
-with zero Runtime obligations. The relay resumes with matching process identity
-and its safeguard exits. Full recovery fails exact input acceptance: rapid
-`-recovered` typing produces `-recoveedr`. All characters arrive within 280 ms;
-the second `r` arrives last. Source diagnosis finds independent printable-key
-Runtime HTTP requests, which can overtake one another. B05 input dispatch
-ordering is the next repair, followed by this same B06 journey. The evidence
-does not establish that the interruption causes the input defect.
-Guest and native artifacts remain those accepted in run 17; this input repair
-can reuse them. Installed `23a42fb4` uses an owner-bound input queue, caps pending
-operations at 128, rejects canceled dependencies, and ignores old-owner results.
-The 20 focused tests cover rapid text, following keys/pointers, page changes,
-uncertain failure and the real clipboard bridge; 113 combined checks pass.
-Independent review accepts run 25 with matching served UI and reused guest,
-native and Runtime artifacts. Home launch, controlled navigation, decoded video,
-typing and scrolling pass. The 5001 ms HTTP/media cut causes a 4387 ms media
-stall; same-page recovery with exact rapid text and new decoded frames completes
-in 1404 ms. All 29 observations preserve bindings. Fresh UI close confirms all
-13 effects and zero Runtime sessions/cleanup obligations, and the relay safeguard
-exits. This is accepted evidence for the bounded interruption case. Full
-B01/B05/B06, mixed-transport input ordering, media/device, percentile and human
-qualification remain open. Run 26 reproduces viewer-document reload failure:
-startup closes the retained page 56 ms after document commit and creates an
-unwanted replacement. Home close remains pending during the replacement open.
-The replacement later has a terminal 13-effect receipt, and fresh signed Runtime
-observation confirms zero obligations; its cleanup trigger is unconfirmed.
-The active source repair restores the retained owner and carries the original
-Engine/Exit choices separately from resolved routing. Installed reload recovery
-remains pending. Installed UI `1a3d72f4` and Runtime `bfd52f56` pass the ordinary
-journey in run 27. A new viewer commits in 14 ms; all 21 Runtime binding samples
-match and the reload sends no page open/close request. Usable display recovery
-misses the five-second deadline. Fresh Home close confirms all 13 effects and
-zero obligations, reaches terminal state at 514 ms, and detaches at 516 ms.
-The next run captures bounded guest signaling diagnostics on these same
-installed artifacts before selecting the Engine repair. Run 28 records retained
-viewer ownership, zero frames and only the original video/audio answers. Its
-source diagnosis finds that reload used redacted status display data. Installed
-UI `f2c41bc2` restores from Runtime display authority; 152 combined UI tests pass.
-Run 29 now forwards new video/audio answers to the Engine but still decodes zero
-frames during the five-second reload window. The ordinary journey and exact
-13-effect close pass. A fresh Engine display attachment is the next repair.
-GStreamer result handling remains a source diagnosis; these logs do not expose
-its remote-description result. Runs 28/29 include diagnostic overhead and do
-not contribute formal latency distributions. Fresh attachment source now has
-independent acceptance for Engine `88717e13`, VM proxy `f0d4a8bb`, and viewer
-ownership guards. Source tests preserve typed errors, exact owner state and
-close priority across delayed responses. The guest image build passes with the
-reviewed control overlay on the verified `56ce99e4` input archive. Independent review accepts Runtime and
-peer signaling before installation and run 30. Full recovery qualification
-remains open.
-Installed run 30 now receives decoded video in the new document at the first
-observed 2494 ms, retains all 15 binding samples, and receives exact reload text.
-The ordinary journey and 13-effect cleanup pass, with terminal close in 564 ms
-and zero Runtime obligations. The aggregate reload probe still fails its
-five-second deadline: after input, decoded frames advance from 57 to 76 while
-the cached byte counter remains 13208 until its next one-second refresh. Fresh
-on-demand viewer diagnostics are the next measurement repair; the original
-recovery thresholds remain unchanged. Runtime, adapter, image and native helper
-artifacts remain reusable for this UI/diagnostic slice. Installed fresh metrics
-`4ed67aa0` retain the same five-second criteria. Run 31 receives zero new frames,
-so repeatability is still unresolved. Run 32 with typed signaling and UI status
-evidence passes in 3168 ms on those same artifacts: attachment and two answers
-return HTTP 200, exact text plus fresh frame/byte progress pass, and all 13
-cleanup effects settle in 545 ms with zero obligations. Independent agent review accepts
-this bounded run; repeated recovery remains open.
-Run 33 then fails fresh attachment with HTTP 503 in 27 ms. The guest signaling
-broker rejects fixed viewer UID 1 before the old producer finishes retirement.
-Normal browsing and exact cleanup pass. Source `b7ec14fc` passes 28
-attachment regressions, the Selkies smoke and independent agent review. It retries
-only the exact legacy UID rejection before HELLO acknowledgment, inside the
-existing four-second deadline. Its installed image passes run 34 in 3143 ms
-and run 36 in 3163 ms. Repeat run 35 reaches the four-second attachment deadline;
-normal browsing and exact cleanup pass in all three. Repeated recovery remains
-open. Run 37 fails at initial typing before reload; exact cleanup still passes.
-Installed UI `a80b230a` awaits the Runtime click acknowledgment before text
-insertion. Run 38 passes normal browsing, reload in 3116 ms and exact cleanup
-in 872 ms; independent agent review accepts this bounded evidence. Attribution
-of run 37 remains provisional. Installed B02 readiness `3f47bfc1` passes three
-child checks: a valid TURN executable is ready, while absent and nonexistent
-programs return unavailable/preparation_required. Configuration stays unchanged
-and these checks acquire no page or VM. Run 39 fails before acquisition because
-an operator omitted control prewarm after replacing the scripts. Completing the
-configured restart resolves that setup omission. Run 40 passes normal browsing
-and exact cleanup in 648 ms, but reload again reaches the four-second attachment
-deadline. Full recovery and fresh-installer acceptance remain open.
-Source `e9950532` starts fresh video/audio attachment together, covering a
-source-proven producer-retry delay. Source `6f5d48ae` makes retained diagnostic
-log reads passive; earlier observer runs remain outside formal latency
-distributions. The aggregate source passes 38 focused tests and the full
-Selkies smoke. Its new image is built and awaiting verified export/install and
-the same installed journey. Runtime, adapter, native helpers and UI are reused.
-The bounded input observer now accepts both supported origins; its request
-frame, URL, page and authority filters remain exact and 31 harness tests pass.
-Guest Node also starts about five seconds after its shell launch;
-initial entropy is 1 and no hardware RNG is selected. That secondary cause needs
-its own experiment. Run 16 includes diagnostic overhead and is excluded from
-formal latency distributions. Native diagnostics `8c127d2f` are installed with
-the framing repair: completed guest HTTP failures enter cleanup promptly in
-source tests, while detailed logs stay behind the private control endpoint.
-The deterministic installed failure test remains open.
-The Browser status module at `dd36a332` also preserves authority after a policy
-403; source, installed and served module hashes match. Eleven focused status
-tests pass; real policy-denial close/recovery qualification remains open.
-The initial compatibility slice shares Engine protocol and request types,
-validates declared Engine capabilities before launch, and preserves explicit
-operator selection. Installed acceptance of this slice remains open.
-Browser settings retain a missing selected Engine or Exit as unavailable until
-the operator changes it. Automatic Engine selection remains with Runtime.
-The web Runtime adapter checks WebRTC viewer eligibility before page replacement
-and Engine dispatch. Tests prove that viewer denial preserves an existing page
-and acquires no new page or stream. An isolated installed Mac run at
-`1588529bf57278f9ba2558751efbd0d3ce0acd34` passed the focused Browser viewer
-preflight in headless Brave 152.0.7977.76. It completed passkey creation and
-sign-in, opened Browser through Home's Shelf and sandbox, showed the disabled
-WebRTC error, sent zero Engine open requests, retained zero Runtime sessions,
-and closed the Browser window. Source, installed and served assets were checked.
-This fixture had no VM image; media, Engine operation and device certification
-remain open. The broader System and shell-switch journeys were outside this run.
-Home's visible passkey control now participates in the accessibility tree;
-the installed sign-in used its role and label.
-Mac and Linux host adapters now query their virtualization APIs for eligibility.
-The Mac unit check ran locally; the Linux-specific KVM query still needs a
-Linux test run.
-
-The current source adds Engine protocol 2.1 readiness before profile preparation
-and launch effects. Runtime retains explicit Engine choice and can automatically
-select another compatible, ready entry from the admitted inventory. VM host
-readiness verifies the image set and host eligibility; successful checks are
-reused while artifact identities remain unchanged. A failed prewarm retains the
-other configured adapters. Browser maps typed readiness failures to repair and
-selection instructions. Installed Runtime, control-service and helper parity,
-normal remote Runtime service admission, and device/media proof remain open.
-Source verification passed 10 shared-contract tests, 80 Engine tests, 225 Browser
-Runtime library tests, 15 Browser startup tests, 43 Browser JavaScript tests and
-26 artifact/control-service cases. The last group includes real ext4 inspection,
-readiness cache reuse, invalidation after a kernel change, and zero page/VM
-acquisition and bounded probe termination. A read-only run of the built VZ helper
-reports preparation required before the official signing step and available
-host support after signing the same development build. That check launched no VM
-and changed no installed artifact. These are source and controlled fixture
-results; independent review and installed acceptance remain open.
-
-Read-only target observations on 2026-09-07 identify a macOS 26.5.2 ARM64
-machine with 24 GiB RAM, 10 logical CPUs and hardware virtualization reported
-available; its Brave version is 152.1.94.119. A Linux AMD64 server reports
-kernel 6.8.0-136-generic, 8 logical CPUs, approximately 15.2 GiB RAM and no KVM
-device. Those observations identify test roles, not certified product support.
-The Linux server can be considered for Exit/remote-consumer qualification;
-local Engine qualification requires a separate KVM target.
-
-The existing journey register retains intermittent Browser startup/navigation
-and recovery failures, incomplete media proof, and unverified remote Engine/Exit
-selection. Every matrix row remains pending installed qualification for the
-Browser maturity changes. Existing installed observations retain their original
-source bindings and verdicts.
-
-Source-home setup now verifies rootfs, kernel and initrd as one build-manifest
-set before creating artifact links. It includes the manifest in managed Runtime
-projections and preserves existing and shared files. Automatic guest patching
-and its guest-helper cross-build were removed from setup; guest changes use the
-image builder. Target maintenance verifies image integrity and guest parity
-before host-helper writes. Its guest mismatch path preserves the image, initrd
-and receipt. This replaces the known setup path that changed image bytes while
-leaving a stale receipt. Automatic package acquisition, publisher admission,
-source-bound guest builds, atomic host/guest updates and product proof remain open.
-The shared image-set check and readiness cache use the same initrd selection as
-the Linux crosvm and Mac VZ launchers. Seventeen setup cases and 27 artifact/control
-cases passed, including a real ext4/cpio maintenance rejection that preserves
-guest and host files. The repository entropy, display-mode and formatting gates
-passed. A read-only admission attempt against the existing Mac artifact store
-rejected the changed image in 2.9 seconds; source hashes and the isolated test
-Home remained unchanged. These are installation-source and rejection results;
-positive installed Browser operation and independent review remain open.
-
-The existing Mac image has a SHA-256 that differs from its sidecar manifest.
-The previous rootfs preflight skipped the receipt when `debugfs` was available
-and passed that image. The revised check rejects it in both inspection modes.
-Seventeen regression cases passed, including a real 64 MiB ext4 fixture, changed
-image bytes, missing receipts, wrong architecture and missing guest dependencies.
-Read-only checks of the existing 8 GiB image took about three seconds per hash
-on this Mac. Runtime package admission still needs implementation;
-these checks do not establish launch or media readiness. The embedded Browser
-control helper also differs from current source, so source parity and the
-artifact receipt still require repair. The user's active test Home lacks the required
-VM helper and image set. Neither installation supplies a current B01 product
-acceptance receipt. This identifies local repair work; it does not establish
-the cause of another operator's startup failure.
+Runtime continues to own host compatibility, service selection, capabilities,
+lifecycle and audit. Providers own rendering, page semantics and egress;
+Carrier transports authorized remote effects. Human and agent operations share
+page authority. Profile protection/transfer, complete daily workflows and Wallet,
+human accessibility, bounded leases/revocation, updates and security maintenance
+retain their requirements. Public live and published source are unchanged by
+this mission. Earlier per-run detail is retained in Git history and private
+hash-bound receipts rather than duplicated as current truth.
 
 ## Branch Hygiene
 
