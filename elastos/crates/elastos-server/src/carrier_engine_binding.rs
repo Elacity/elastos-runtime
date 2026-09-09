@@ -170,6 +170,13 @@ mod egress {
     }
     static BINDINGS: OnceLock<Mutex<BTreeMap<(PathBuf, String), Binding>>> = OnceLock::new();
 
+    #[cfg(test)]
+    pub(super) async fn slots_for_test(data_dir: &Path, page: &str) -> Arc<Semaphore> {
+        BINDINGS.get_or_init(Default::default).lock().await[&(data_dir.to_owned(), page.to_owned())]
+            .slots
+            .clone()
+    }
+
     pub(crate) async fn bind(
         data_dir: &Path,
         peer: iroh::PublicKey,
@@ -282,7 +289,12 @@ mod egress {
             result = async {
                 tokio::try_join!(
                     async {tokio::io::copy(&mut recv, &mut output).await?; output.shutdown().await},
-                    async {tokio::io::copy(&mut input, &mut *send).await?; Ok::<_, std::io::Error>(())},
+                    async {
+                        tokio::io::copy(&mut input, &mut *send).await?;
+                        // Exit EOF must reach the Engine while its request half stays open.
+                        send.finish().ok();
+                        Ok::<_, std::io::Error>(())
+                    },
                 )?;
                 Ok::<_, anyhow::Error>(())
             } => {result?;}
@@ -345,6 +357,17 @@ pub(crate) use egress::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    async fn wait_for_egress_slots(slots: &tokio::sync::Semaphore) -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while slots.available_permits() != 128 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("Engine egress slot was not released")
+    }
 
     #[test]
     fn legacy_approval_does_not_acquire_execution_on_upgrade() {
@@ -475,6 +498,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let slots = egress::slots_for_test(consumer_root.path(), &owner.page_id).await;
         let echo = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut bytes = [0; 4];
@@ -530,8 +554,161 @@ mod tests {
         assert!(connect_egress(&engine.endpoint, &owner, "stream:owned")
             .await
             .is_err());
+        wait_for_egress_slots(&slots).await.unwrap();
         anonymous.close().await;
         engine.endpoint.close().await;
         consumer.endpoint.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn egress_propagates_each_eof_without_waiting_for_reverse_stream() {
+        use iroh::Watcher as _;
+        use std::{sync::Arc, time::Duration};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let consumer_root = tempfile::tempdir().unwrap();
+        let engine_root = tempfile::tempdir().unwrap();
+        let consumer_key = ed25519_dalek::SigningKey::from_bytes(&[26; 32]);
+        let engine_key = ed25519_dalek::SigningKey::from_bytes(&[27; 32]);
+        let consumer_did =
+            super::super::public_key_to_did(&iroh::SecretKey::from_bytes(&[26; 32]).public())
+                .unwrap();
+        let engine_did =
+            super::super::public_key_to_did(&iroh::SecretKey::from_bytes(&[27; 32]).public())
+                .unwrap();
+        let consumer = super::super::start_isolated_carrier_node_with_registry(
+            &consumer_key,
+            &consumer_did,
+            consumer_root.path().into(),
+            None,
+        )
+        .await
+        .unwrap();
+        let engine = super::super::start_isolated_carrier_node_with_registry(
+            &engine_key,
+            &engine_did,
+            engine_root.path().into(),
+            None,
+        )
+        .await
+        .unwrap();
+        engine
+            .memory_lookup
+            .add_endpoint_info(consumer.endpoint.watch_addr().get());
+        let path = consumer_root.path().join("exit.sock");
+        let listener = Arc::new(tokio::net::UnixListener::bind(&path).unwrap());
+        let (grant, request) = owner_fixture();
+        let mut owner = RemoteEngineOwner::from_launch(&grant, &request).unwrap();
+        owner.requester_endpoint = consumer.endpoint.id().to_string();
+        bind_egress(
+            consumer_root.path(),
+            engine.endpoint.id(),
+            &owner.page_id,
+            &owner.generation,
+            "stream:eof",
+            &path,
+        )
+        .await
+        .unwrap();
+        let slots = egress::slots_for_test(consumer_root.path(), &owner.page_id).await;
+        let exercise = async {
+            for exit_first in [true, false] {
+                let listener = listener.clone();
+                let mut exit = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await?;
+                    let mut request = [0; 4];
+                    socket.read_exact(&mut request).await?;
+                    ensure!(&request == b"test", "wrong Engine request");
+                    if exit_first {
+                        socket.write_all(b"pass").await?;
+                        socket.shutdown().await?;
+                        // Sending FIN must leave the request direction writable.
+                        let mut tail = [0; 4];
+                        socket
+                            .read_exact(&mut tail)
+                            .await
+                            .context("Exit lost reverse tail after sending FIN")?;
+                        ensure!(&tail == b"tail", "Engine reverse traffic was lost");
+                    }
+                    let mut byte = [0; 1];
+                    ensure!(socket.read(&mut byte).await? == 0, "Engine EOF missing");
+                    if !exit_first {
+                        // The response starts only after the Engine request EOF.
+                        socket.write_all(b"pass").await?;
+                        socket.shutdown().await?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                });
+                let transfer = tokio::time::timeout(Duration::from_secs(8), async {
+                    let mut stream = connect_egress(&engine.endpoint, &owner, "stream:eof").await?;
+                    stream.send.write_all(b"test").await?;
+                    if !exit_first {
+                        stream.send.finish()?;
+                    }
+                    let mut reply = [0; 4];
+                    stream
+                        .recv
+                        .read_exact(&mut reply)
+                        .await
+                        .context("Engine lost Exit response")?;
+                    ensure!(&reply == b"pass", "wrong Exit response");
+                    let suffix =
+                        tokio::time::timeout(Duration::from_secs(2), stream.recv.read_to_end(1024))
+                            .await
+                            .context("Exit EOF withheld while Engine writer remains open")??;
+                    ensure!(suffix.is_empty(), "unexpected Exit response suffix");
+                    if exit_first {
+                        ensure!(
+                            slots.available_permits() == 127,
+                            "Exit EOF released a still-active reverse stream"
+                        );
+                        stream.send.write_all(b"tail").await?;
+                        stream.send.finish()?;
+                    }
+                    // Retain the connection while the Exit drains the reverse bytes.
+                    Ok::<_, anyhow::Error>(stream)
+                })
+                .await
+                .context("Engine EOF transfer deadline")
+                .and_then(|result| result);
+                // Capture failure before cleanup: even the expected old-code timeout
+                // must leave no Exit task, endpoint or retained binding behind.
+                let peer_result = if transfer.is_ok() {
+                    match tokio::time::timeout(Duration::from_secs(2), &mut exit).await {
+                        Ok(result) => result
+                            .context("Exit task panicked")
+                            .and_then(|result| result),
+                        Err(_) => {
+                            exit.abort();
+                            let _ = exit.await;
+                            Err(anyhow::anyhow!("Exit task deadline"))
+                        }
+                    }
+                } else {
+                    exit.abort();
+                    let _ = exit.await;
+                    Ok(())
+                };
+                let stream = transfer?;
+                peer_result?;
+                let stopped = tokio::time::timeout(Duration::from_secs(2), stream.send.stopped())
+                    .await
+                    .context("Engine send acknowledgement deadline")??;
+                ensure!(
+                    stopped.is_none(),
+                    "Exit stopped the Engine stream before delivery"
+                );
+                wait_for_egress_slots(&slots).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let removed = remove_egress(consumer_root.path(), &owner.page_id, &owner.generation).await;
+        let released = wait_for_egress_slots(&slots).await;
+        engine.shutdown().await;
+        consumer.shutdown().await;
+        removed.unwrap();
+        released.unwrap();
+        exercise.unwrap();
     }
 }
