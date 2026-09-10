@@ -7007,6 +7007,88 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn offline_upgrade_existing_backup_guard_rejects_verified_plaintext_without_mutation() {
+        use std::os::unix::fs::MetadataExt;
+
+        let fixture = OfflineMigrationFixture::new(2);
+        let data_dir = fixture.data_dir.path();
+        let declarations = vec![PrincipalRootUpgradeDeclarationV1 {
+            principal_id: fixture.principal_id.clone(),
+            localhost_root: fixture.localhost_root.clone(),
+            inventory: vec![PrincipalRootProtectedObjectDeclarationV1::root(format!(
+                "{}/.AppData/LocalHost/GBA",
+                fixture.localhost_root
+            ))],
+        }];
+        let plans = preflight_declared_principal_root_upgrade(data_dir, &declarations).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].objects.len(), 2);
+
+        let backups = data_dir.join("backups");
+        create_owner_only_dir(&backups).unwrap();
+        let sentinel = backups.join("c1-ready-sentinel");
+        create_owner_only_dir(&sentinel).unwrap();
+        let sentinel_before = std::fs::symlink_metadata(&sentinel).unwrap();
+        let object_hashes = fixture
+            .object_paths
+            .iter()
+            .map(|path| sha256_label(&std::fs::read(path).unwrap()))
+            .collect::<Vec<_>>();
+        let auth_path = auth_state_path(data_dir).unwrap();
+        let activation_path = audit_chain_activation_path(data_dir).unwrap();
+        let auth_hash = sha256_label(&std::fs::read(&auth_path).unwrap());
+        let activation_hash = sha256_label(&std::fs::read(&activation_path).unwrap());
+
+        let error = migrate_declared_principal_roots_offline(data_dir, &sentinel, || {
+            Ok(declarations.clone())
+        })
+        .expect_err("existing sentinel must stop a verified nonempty migration plan");
+
+        assert_eq!(
+            error.to_string(),
+            "principal-root upgrade backup directory must not already exist"
+        );
+        fixture.assert_all_plaintext();
+        for (path, expected) in fixture.object_paths.iter().zip(object_hashes) {
+            assert_eq!(sha256_label(&std::fs::read(path).unwrap()), expected);
+        }
+        assert_eq!(sha256_label(&std::fs::read(auth_path).unwrap()), auth_hash);
+        assert_eq!(
+            sha256_label(&std::fs::read(activation_path).unwrap()),
+            activation_hash
+        );
+        let sentinel_after = std::fs::symlink_metadata(&sentinel).unwrap();
+        assert_eq!(sentinel_before.dev(), sentinel_after.dev());
+        assert_eq!(sentinel_before.ino(), sentinel_after.ino());
+        assert_eq!(sentinel_after.mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read_dir(&sentinel).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1);
+        assert!(!principal_root_migration_journal_path(data_dir)
+            .unwrap()
+            .exists());
+        assert!(
+            !std::fs::read_dir(auth_state_path(data_dir).unwrap().parent().unwrap())
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".principal-root-migration-"))
+        );
+
+        // The same verified plan succeeds when the sole refusal condition is removed.
+        std::fs::remove_dir(&sentinel).unwrap();
+        let receipt =
+            migrate_declared_principal_roots_offline(data_dir, &sentinel, || Ok(declarations))
+                .unwrap();
+        assert_eq!(receipt.status, "migrated");
+        assert_eq!(receipt.root_count, 1);
+        assert_eq!(receipt.object_count, 2);
+        fixture.assert_all_encrypted();
+    }
+
     #[test]
     fn offline_upgrade_preflights_every_configured_root_before_mutation() {
         let data_dir = tempfile::tempdir().unwrap();
