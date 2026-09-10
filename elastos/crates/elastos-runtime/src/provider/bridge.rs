@@ -18,6 +18,8 @@ use super::registry::{
 
 /// Timeout for provider requests (30 seconds)
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often a still-pending raw provider request is named at warn.
+const PENDING_REQUEST_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Timeout for provider init (10 seconds)
 const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -367,30 +369,73 @@ impl ProviderBridge {
     {
         let io = Arc::clone(&self.io);
         tokio::spawn(async move {
-            let mut io = io.lock().await;
-
-            // Serialize and write request
+            // Serialize first so the op can be named in the trace even when
+            // the request is an untyped JSON value.
             let json = serde_json::to_string(&request).map_err(BridgeError::Serde)?;
-            io.writer
-                .write_all(json.as_bytes())
-                .await
-                .map_err(BridgeError::Io)?;
-            io.writer.write_all(b"\n").await.map_err(BridgeError::Io)?;
-            io.writer.flush().await.map_err(BridgeError::Io)?;
-
-            // Read response line
-            let mut line = String::new();
-            let n = io
-                .reader
-                .read_line(&mut line)
-                .await
-                .map_err(BridgeError::Io)?;
-
-            if n == 0 {
-                return Err(BridgeError::ProcessExited);
+            let op = serde_json::from_str::<serde_json::Value>(&json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("op")
+                        .and_then(|op| op.as_str().map(str::to_string))
+                })
+                .unwrap_or_else(|| "?".to_string());
+            let started = std::time::Instant::now();
+            // A raw request has no timeout (media preparation and custody
+            // rounds legitimately run long) and holds this bridge's I/O
+            // lock until the provider answers, so a provider that never
+            // answers wedges every later call to it silently. Name the
+            // wait while it lasts instead of only after it ends.
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let pending_op = op.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = &mut stop_rx => break,
+                        _ = tokio::time::sleep(PENDING_REQUEST_WARN_INTERVAL) => {
+                            tracing::warn!(
+                                op = %pending_op,
+                                elapsed_secs = started.elapsed().as_secs(),
+                                "provider request still pending"
+                            );
+                        }
+                    }
+                }
+            });
+            let mut io = io.lock().await;
+            tracing::debug!(
+                op = %op,
+                lock_wait_ms = started.elapsed().as_millis() as u64,
+                "provider request sent"
+            );
+            let result: Result<String, BridgeError> = async {
+                io.writer
+                    .write_all(json.as_bytes())
+                    .await
+                    .map_err(BridgeError::Io)?;
+                io.writer.write_all(b"\n").await.map_err(BridgeError::Io)?;
+                io.writer.flush().await.map_err(BridgeError::Io)?;
+                // Read response line
+                let mut line = String::new();
+                let n = io
+                    .reader
+                    .read_line(&mut line)
+                    .await
+                    .map_err(BridgeError::Io)?;
+                if n == 0 {
+                    return Err(BridgeError::ProcessExited);
+                }
+                Ok(line)
             }
-
-            Ok(line)
+            .await;
+            let _ = stop_tx.send(());
+            tracing::debug!(
+                op = %op,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                ok = result.is_ok(),
+                "provider request settled"
+            );
+            result
         })
         .await
         .map_err(|err| BridgeError::TaskJoin(err.to_string()))?

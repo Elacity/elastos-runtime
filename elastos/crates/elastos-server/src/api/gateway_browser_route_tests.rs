@@ -3809,14 +3809,17 @@ fn completed_browser_transaction_approval(
         payload: payload.clone(),
         expires_at: 20,
     };
-    let wallet_request_sha256 = WalletProviderRequestV2::new(context, request_id, 1, 2, operation)
-        .unwrap()
-        .request_sha256;
+    let wallet_request =
+        WalletProviderRequestV2::new(context, request_id, 1, 2, operation).unwrap();
+    // The seeded approval must carry the binding the mock wallet derives for
+    // this authority, or attaching the validated Chain outcome is refused as
+    // a conflict and the effect never completes.
+    let authority_binding = mock_wallet_authority_binding(&wallet_request.authority);
     json!({
         "schema": "elastos.wallet.approval_request/v1",
         "request_id": request_id,
-        "wallet_request_sha256": wallet_request_sha256,
-        "authority_binding": format!("0x{}", "c".repeat(64)),
+        "wallet_request_sha256": wallet_request.request_sha256,
+        "authority_binding": authority_binding,
         "kind": "signature",
         "status": "completed",
         "intent": "transaction_intent",
@@ -4458,7 +4461,7 @@ async fn external_browser_transaction_app(
         "data": "0x",
         "wallet_intent": "transaction_intent"
     });
-    let wallet_request_sha256 = WalletProviderRequestV2::new(
+    let wallet_request = WalletProviderRequestV2::new(
         context,
         request_id,
         1,
@@ -4473,8 +4476,10 @@ async fn external_browser_transaction_app(
             expires_at: 20,
         },
     )
-    .unwrap()
-    .request_sha256;
+    .unwrap();
+    // Same rule as completed_browser_transaction_approval: the seeded approval
+    // carries the binding the mock wallet derives for this authority.
+    let authority_binding = mock_wallet_authority_binding(&wallet_request.authority);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -4482,8 +4487,8 @@ async fn external_browser_transaction_app(
         approvals: TokioMutex::new(vec![json!({
             "schema": "elastos.wallet.approval_request/v1",
             "request_id": request_id,
-            "wallet_request_sha256": wallet_request_sha256,
-            "authority_binding": format!("0x{}", "e".repeat(64)),
+            "wallet_request_sha256": wallet_request.request_sha256,
+            "authority_binding": authority_binding,
             "kind": "signature",
             "status": "completed",
             "intent": "transaction_intent",

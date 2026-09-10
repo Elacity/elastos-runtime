@@ -60,19 +60,39 @@ Open gates, in order:
 4. [ ] After separate authorization, install the same reviewed tree on the
    seed and the third custody node with matching stable Runtime, component,
    capsule metadata, provider, static audit, installation, and platform
-   restart receipts.
+   restart receipts. The `deploy/custody-host/` simulation-only harness
+   proves the same node-provisioning, peer-add, and restart-resurrection
+   mechanics on one host (see [state.md](state.md)); it is not evidence of
+   installation on distinct seed/third-node hardware, which remains open.
 5. [ ] Provision one real signed owner-only 2-of-3 custody composition across
-   three distinct operators and failure domains.
+   three distinct operators and failure domains. The composition ceremony
+   and its offline verify path are proven over three real node descriptors
+   and real Carrier transport dial proofs on the simulation-only harness
+   (see [state.md](state.md)); a composition across genuinely distinct
+   operators and failure domains remains open.
 6. [ ] Install the private multi-RPC Chain configuration and verify the exact
    deployed Base network, contract, token, emitter, and finality authority.
 7. [ ] Prove exactly three protected-content replicas and repair after one
-    replica is lost.
+    replica is lost. Proven on the simulation-only harness on 2026-09-07 (see
+    [state.md](state.md)): the availability receipt records three replicas
+    with a live multi-peer proof, one stopped replica is repaired by
+    `content repair-worker --force` and the status reads healthy again, and
+    the viewer opens on the repaired set. The same proof on distinct
+    seed/third-node hardware remains open with gate 4.
 8. [ ] Fund the creator and buyer Base accounts, then run the Brave
     two-Runtime journey: mint, list, and share on localhost; import, deny,
     buy, open, play, and close on the seed. Prove one bound KID with allowed,
     denied, and unbound reads, the CentralStorage binding, the exact
     `AuthorityGateway.buyAccess` receipt and event, restart, replay, tamper
-    rejection, settlement, cleanup, and zero unresolved state.
+    rejection, settlement, cleanup, and zero unresolved state. The installed
+    headless journey is proven end to end on the simulation-only harness
+    against an Anvil fork of Base
+    (`scripts/protected-content-installed-e2e-proof.sh`, finalize
+    `overall_ok: true` on 2026-09-07, see [state.md](state.md)): mint, buy,
+    open, allowed/denied/unbound reads, the `buyAccess` receipt finalized on
+    two evidence sources, restart, replay, tamper rejection, cleanup. Still
+    open here: the same journey through Brave on the seed, and against the
+    real Base deployment with the operator-funded accounts.
 9. [ ] Complete the remaining installed UIUX cases for first-run recovery and
     Profile creation, configured model execution, collaboration, Browser
     startup diagnostics, and protected-content prerequisites. Keep the broad

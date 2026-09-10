@@ -77,6 +77,16 @@ Common branch gates include:
 - `protected-content-provider-contract-smoke.sh` as the fail-closed retirement
   guard for the provisional rights, key, decrypt, and DRM providers; it does not
   verify the canonical v1 custody path
+- `protected-content-installed-e2e-proof.sh` drives the installed two-Runtime
+  protected-content journey phase by phase (provision, preflight,
+  chain-config-real, wallet-setup, mint, availability, buy, open,
+  drill-custody, drill-replica, negative, restart, cleanup, finalize, all)
+  against a real installed client Runtime and the `deploy/custody-host/`
+  three-node harness; its own `--help` documents the full runbook order,
+  including the Home-token login sequence the HTTP journey phases need.
+  `protected-content-installed-e2e-proof-smoke.sh` is its no-docker,
+  no-live-gateway smoke: driver syntax, usage/phase coverage, and argument
+  handling only, not the journey itself
 - `people-conversations-local-smoke.sh` for profile, discovery, contacts, and
   Chat handoff
 - `capsule-inspector-act-check.sh` for Inspector scope and Inbox approval
@@ -131,6 +141,20 @@ receipt-output argument.
 fresh request-bound passkey token in
 `ELASTOS_FRESH_PASSKEY_HOME_TOKEN`. Import into the same root is opt-in through
 `ELASTOS_RECOVERY_KIT_IMPORT=1`.
+
+`custody-harness-ci-smoke.sh` is the CI-safe machinery rehearsal for the
+protected-content dKMS ceremony and custody harness: it builds the
+`deploy/custody-host/` image, brings up a fresh throwaway instance of the
+three-node compose harness, runs `protected-content-installed-e2e-proof.sh`'s
+`provision` and `preflight` phases against a throwaway client identity,
+asserts both receipt blocks report `ok: true`, then tears everything down
+(restoring any already-running default harness project it had to stop first).
+It proves the provisioning and preflight machinery only, not the live HTTP
+journey or drill phases.
+
+`deploy/custody-host/` builds that simulation-only container image and
+same-host, container-per-node three-node compose harness; see its own README
+for the explicit simulation boundary and the operator flow it supports.
 
 ## Subdirectories
 

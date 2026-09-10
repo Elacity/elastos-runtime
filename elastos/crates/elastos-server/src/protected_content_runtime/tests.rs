@@ -63,9 +63,9 @@ use super::{
     publish_runtime_custody_library_source, register_inactive_custody_provider,
     register_inactive_custody_runtime_provider_target, register_protect_provider,
     register_protected_content_decrypt_provider, resolve_runtime_rights_policy,
-    runtime_mint_journal, runtime_protected_content_id, runtime_purchase_path, source_media_digest,
-    unresolved_release_audit_records, write_owner_only_bytes, InactiveCustodyProvider,
-    RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile,
+    runtime_media_source_digest, runtime_mint_journal, runtime_protected_content_id,
+    runtime_purchase_path, unresolved_release_audit_records, write_owner_only_bytes,
+    InactiveCustodyProvider, RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile,
     RuntimeCustodyLibraryPublishInput, RuntimeCustodyLibrarySourceInput,
     RuntimeCustodyPurchaseAccessEvidenceRecord, RuntimeCustodyPurchaseProgress,
     RuntimeCustodyPurchaseRecord, RuntimeCustodyPurchaseStageRecord, RuntimeCustodyRegistryAdapter,
@@ -478,6 +478,9 @@ impl Provider for ContentAvailabilityTestProvider {
         self.requests.lock().await.push(request.clone());
         match request.get("op").and_then(Value::as_str) {
             Some("publish") => self.publish(request).await,
+            Some("ensure") => Ok(ok_provider_response(json!({
+                "availability": { "status": self.config.status.clone() },
+            }))),
             Some("status") => self.status().await,
             Some("fetch") => self.fetch(request).await,
             _ => Err(ProviderError::Provider(
@@ -1140,7 +1143,7 @@ async fn publish_protected_content_for_test(
         directory.path(),
         &media,
         &requirement,
-        NOW,
+        || NOW,
     )
     .await
 }
@@ -1561,7 +1564,7 @@ async fn protected_content_publish_sends_exact_three_replica_live_requirement() 
         directory.path(),
         &media,
         &requirement,
-        NOW,
+        || NOW,
     )
     .await
     .unwrap();
@@ -1611,7 +1614,7 @@ async fn protected_content_publish_rejects_mismatched_policy_or_count_before_pro
             directory.path(),
             &media,
             &requirement,
-            NOW,
+            || NOW,
         )
         .await
         .expect_err("mismatched protected availability requirement must fail closed");
@@ -1722,15 +1725,41 @@ async fn runtime_custody_prebuy_availability_refetches_fresh_exact_receipt_witho
     assert_eq!(verified.observed_replicas(), 3);
 
     let requests = harness.content_provider.requests().await;
-    assert!(requests
+    // A fresh observation: `ensure` under the exact listing bindings, then
+    // the receipt it produced, never a republish.
+    let ensure = requests
         .iter()
-        .any(|request| request.get("op").and_then(Value::as_str) == Some("status")));
+        .find(|request| request.get("op").and_then(Value::as_str) == Some("ensure"))
+        .expect("prebuy verification must ensure the CID again");
+    assert_eq!(
+        ensure["availability_policy"],
+        super::PROTECTED_CONTENT_REPLICATION_POLICY
+    );
+    assert_eq!(ensure["availability_requirements"]["min_replicas"], 3);
+    assert_eq!(
+        ensure["availability_requirements"]["require_live_multi_peer_proof"],
+        true
+    );
+    assert_eq!(ensure["object_did"], listing.package.content_id);
+    assert_eq!(
+        ensure["publisher_did"],
+        listing.package.publisher_profile_did
+    );
+    let ensure_index = requests
+        .iter()
+        .position(|request| request.get("op").and_then(Value::as_str) == Some("ensure"))
+        .unwrap();
+    let status_index = requests
+        .iter()
+        .position(|request| request.get("op").and_then(Value::as_str) == Some("status"))
+        .expect("receipt is read after ensure");
+    assert!(ensure_index < status_index);
     assert!(requests
         .iter()
         .any(|request| request.get("op").and_then(Value::as_str) == Some("fetch")));
     assert!(requests.iter().all(|request| matches!(
         request.get("op").and_then(Value::as_str),
-        Some("status" | "fetch")
+        Some("ensure" | "status" | "fetch")
     )));
     assert!(!requests
         .iter()
@@ -7060,7 +7089,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
         content_directory.path(),
         mint_draft.media_identity(),
         &requirement,
-        crate::auth::now_ts(),
+        crate::auth::now_ts,
     )
     .await
     .unwrap();
@@ -8116,7 +8145,10 @@ fn media_preparation_source_input(
     principal_id: &str,
 ) -> RuntimeCustodyLibrarySourceInput {
     RuntimeCustodyLibrarySourceInput {
-        object_uri: "localhost://Users/test/Documents/source.mp4".to_string(),
+        object_uri: format!(
+            "{}/Documents/source.mp4",
+            crate::auth::principal_localhost_root(principal_id)
+        ),
         principal_id: principal_id.to_string(),
         source_file_path: root.join("source.mp4"),
         wallet_account_id: "wallet-account-1".to_string(),
@@ -8744,6 +8776,21 @@ async fn runtime_custody_library_publish_requires_reconciliation_for_partial_set
 }
 
 #[cfg(unix)]
+/// The publish input and the later media source must name the same object
+/// under the principal's own root: the mint intent request id is derived
+/// from the object binding, and a recovery-activated principal can only read
+/// objects stored under its protected root.
+fn pre_dispatch_retry_publish_input() -> RuntimeCustodyLibraryPublishInput {
+    let principal_id = "person:local:runtime-custody-pre-dispatch-retry";
+    let mut input = library_publish_test_input(principal_id);
+    input.object_uri = format!(
+        "{}/Documents/media",
+        crate::auth::principal_localhost_root(principal_id)
+    );
+    input
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn runtime_custody_library_publish_retries_exactly_when_protect_never_dispatches() {
     let protect_binary = required_test_binary_path(TEST_PROTECT_PROVIDER_BIN_ENV);
@@ -8753,7 +8800,7 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
     write_device_key(&data_dir, 0x21);
     let (epoch, _composition_now) = write_library_publish_test_composition(&data_dir);
     let registry = Arc::new(ProviderRegistry::new());
-    let input = library_publish_test_input("person:local:runtime-custody-pre-dispatch-retry");
+    let input = pre_dispatch_retry_publish_input();
     let request_id = library_publish_request_id(&input);
     let first = publish_runtime_custody_library_object(&data_dir, registry.clone(), input)
         .await
@@ -8818,7 +8865,7 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
     let published = publish_runtime_custody_library_object(
         &data_dir,
         registry.clone(),
-        library_publish_test_input("person:local:runtime-custody-pre-dispatch-retry"),
+        pre_dispatch_retry_publish_input(),
     )
     .await
     .expect("exact retry must reuse the persisted intent");
@@ -8847,12 +8894,37 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
     let media_provider_root = data_dir.join("protected-content/media-provider");
     owner_only_dir(&media_provider_root);
     owner_only_dir(&media_provider_root.join("staging"));
-    let source_file_path = temp.path().join("completed-source.mp4");
-    fs::write(&source_file_path, b"completed source media").unwrap();
-    fs::set_permissions(&source_file_path, fs::Permissions::from_mode(0o600)).unwrap();
+    // The principal's root is recovery-activated (protected) by the profile
+    // authority above, so the source object must be stored as a protected
+    // principal-root envelope like a real Library write; the replay is keyed
+    // on the plaintext digest.
+    let retry_principal = "person:local:runtime-custody-pre-dispatch-retry";
+    let retry_localhost_root = crate::auth::principal_localhost_root(retry_principal);
+    let retry_object_uri = format!("{retry_localhost_root}/Documents/media");
+    let source_file_path =
+        elastos_common::localhost::rooted_localhost_fs_path(&data_dir, &retry_object_uri).unwrap();
+    let mut source_ancestors: Vec<PathBuf> = source_file_path
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| dir.starts_with(&data_dir) && *dir != data_dir)
+        .map(Path::to_path_buf)
+        .collect();
+    source_ancestors.reverse();
+    for dir in source_ancestors {
+        owner_only_dir(&dir);
+    }
+    crate::auth::write_protected_principal_root_object(
+        &data_dir,
+        retry_principal,
+        &retry_localhost_root,
+        &retry_object_uri,
+        &source_file_path,
+        b"completed source media",
+    )
+    .unwrap();
     let source = RuntimeCustodyLibrarySourceInput {
-        object_uri: "localhost://Users/test/Documents/media".to_string(),
-        principal_id: "person:local:runtime-custody-pre-dispatch-retry".to_string(),
+        object_uri: retry_object_uri.clone(),
+        principal_id: retry_principal.to_string(),
         source_file_path: source_file_path.clone(),
         wallet_account_id: "wallet-account-1".to_string(),
         wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
@@ -8865,7 +8937,7 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
         &source.principal_id,
         &source.object_uri,
         &source.source_storage,
-        source_media_digest(&source_file_path).unwrap(),
+        runtime_media_source_digest(b"completed source media"),
         MEDIA_PROVIDER_ID,
         source.wallet_account_id.clone(),
         source.wallet_account_address.clone(),
@@ -8899,7 +8971,7 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
     let replay = publish_runtime_custody_library_object(
         &data_dir,
         registry,
-        library_publish_test_input("person:local:runtime-custody-pre-dispatch-retry"),
+        pre_dispatch_retry_publish_input(),
     )
     .await
     .expect("completed mint replay must remain idempotent without providers");
@@ -9781,6 +9853,276 @@ impl Provider for LibraryReleaseWalletProvider {
     }
 }
 
+/// A managed-account wallet: the rights-signature request first lands as a
+/// pending approval; only after `approve` does the exact same request replay
+/// the Wallet's stored result inside its approval envelope (the shape the
+/// real wallet-provider answers with).
+struct ManagedReleaseWalletProvider {
+    approved: std::sync::Mutex<std::collections::HashSet<String>>,
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+impl ManagedReleaseWalletProvider {
+    fn new() -> Self {
+        Self {
+            approved: std::sync::Mutex::new(std::collections::HashSet::new()),
+            seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn approve(&self, request_id: &str) {
+        self.approved.lock().unwrap().insert(request_id.to_string());
+    }
+
+    fn seen_request_ids(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for ManagedReleaseWalletProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "managed release wallet provider is invoke-only".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["wallet"]
+    }
+
+    fn name(&self) -> &'static str {
+        "wallet"
+    }
+
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        let inner = request.get("request").cloned().ok_or_else(|| {
+            ProviderError::Provider("wallet request is missing the v2 envelope".to_string())
+        })?;
+        let bytes = serde_json::to_vec(&inner)
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        let now = crate::auth::now_ts();
+        let wallet_request = WalletProviderRequestV2::decode_at(&bytes, now)
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        self.seen
+            .lock()
+            .unwrap()
+            .push(wallet_request.request_id.clone());
+        let approved = self
+            .approved
+            .lock()
+            .unwrap()
+            .contains(&wallet_request.request_id);
+        let approval_request = json!({
+            "schema": "elastos.wallet.approval_request/v1",
+            "request_id": wallet_request.request_id,
+            "intent": "protected_content_rights_signature",
+            "status": if approved { "completed" } else { "pending" },
+        });
+        let data = if approved {
+            let (account_id, canonical_rights_request_hex) = match &wallet_request.operation {
+                WalletProviderOperationV2::RequestProtectedContentRightsSignature {
+                    account_id,
+                    canonical_rights_request_hex,
+                    ..
+                } => (account_id.clone(), canonical_rights_request_hex.clone()),
+                _ => {
+                    return Err(ProviderError::Provider(
+                        "managed release wallet expected a protected-content rights signature"
+                            .to_string(),
+                    ));
+                }
+            };
+            let rights_bytes = hex::decode(&canonical_rights_request_hex)
+                .map_err(|error| ProviderError::Provider(error.to_string()))?;
+            let rights_request = RightsRequestV1::from_canonical_bytes(&rights_bytes)
+                .map_err(|error| ProviderError::Provider(error.to_string()))?;
+            let key = WalletSigningKey::from_slice(&[7; 32])
+                .map_err(|error| ProviderError::Provider(error.to_string()))?;
+            let (signature, recovery_id) = key
+                .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(
+                    &rights_bytes,
+                ))
+                .map_err(|error| ProviderError::Provider(error.to_string()))?;
+            let mut signature_bytes = signature.to_bytes().to_vec();
+            signature_bytes.push(recovery_id.to_byte());
+            let signed = WalletSignedRightsRequestV1::new(rights_request, signature_bytes)
+                .map_err(|error| ProviderError::Provider(error.to_string()))?;
+            let result = ProtectedContentRightsSignatureResultV1::new(
+                account_id,
+                wallet_address_hex(wallet(7)),
+                hex::encode(signed.canonical_bytes().unwrap()),
+            )
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+            json!({
+                "approval_request": approval_request,
+                "requires_approval": false,
+                "signature": Value::Null,
+                "signed_result": serde_json::to_value(result)
+                    .map_err(|error| ProviderError::Provider(error.to_string()))?,
+                "signature_receipt": { "request_id": wallet_request.request_id },
+            })
+        } else {
+            json!({
+                "approval_request": approval_request,
+                "requires_approval": true,
+                "signature": Value::Null,
+            })
+        };
+        let wallet_response =
+            WalletProviderResponseV2::for_request(&wallet_request, WalletResultV2::Ok { data });
+        Ok(ok_provider_response(
+            serde_json::to_value(wallet_response)
+                .map_err(|error| ProviderError::Provider(error.to_string()))?,
+        ))
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_release_wallet_pends_on_managed_approval_and_resumes_exact_request() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-managed-release";
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    let buy = super::reconstructed_buy_receipt(
+        mint.draft(),
+        mint.content_availability().unwrap(),
+        &purchase,
+        &current_profile_did,
+    )
+    .unwrap();
+    let wallet = Arc::new(ManagedReleaseWalletProvider::new());
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("wallet", wallet.clone())
+        .await
+        .unwrap();
+    let session = super::derive_runtime_custody_session_binding(
+        principal_id,
+        &current_profile_did,
+        TEST_VIEWER_LAUNCH_ID,
+        "proof:alpha",
+        "runtime-session:alpha",
+        "grant:alpha",
+        mint.draft().mint_id(),
+    )
+    .unwrap();
+    let invocation = || super::RuntimeReleaseWalletInvocation {
+        principal_id,
+        account_id: &purchase.account_id,
+        proof_binding_id: "proof:alpha",
+        session_id: "runtime-session:alpha",
+        grant_id: "grant:alpha",
+        mint_id: mint.draft().mint_id(),
+        runtime_session_binding: session,
+    };
+    let now = crate::auth::now_ts();
+    let recipient = recipient_identity(0x30);
+
+    // First shot: the managed account holds the request as a pending approval.
+    let (request_bytes, approval_request_id) = match super::invoke_runtime_release_wallet(
+        registry.as_ref(),
+        &buy,
+        &recipient,
+        invocation(),
+        None,
+        now,
+    )
+    .await
+    .unwrap()
+    {
+        super::RuntimeReleaseWalletOutcome::PendingApproval {
+            request_bytes,
+            approval_request_id,
+        } => (request_bytes, approval_request_id),
+        super::RuntimeReleaseWalletOutcome::Signed { .. } => panic!("expected pending approval"),
+    };
+    let decoded = WalletProviderRequestV2::decode_at(&request_bytes, now).unwrap();
+    assert_eq!(approval_request_id, decoded.request_id);
+
+    // Replaying the exact request before approval stays pending on the SAME
+    // wallet request (no second approval is raised).
+    match super::invoke_runtime_release_wallet(
+        registry.as_ref(),
+        &buy,
+        &recipient,
+        invocation(),
+        Some(&request_bytes),
+        now,
+    )
+    .await
+    .unwrap()
+    {
+        super::RuntimeReleaseWalletOutcome::PendingApproval {
+            request_bytes: replayed,
+            approval_request_id: replayed_id,
+        } => {
+            assert_eq!(replayed, request_bytes);
+            assert_eq!(replayed_id, approval_request_id);
+        }
+        super::RuntimeReleaseWalletOutcome::Signed { .. } => panic!("expected pending approval"),
+    }
+
+    // A replay bound to a different recipient identity is refused: the
+    // persisted request must belong to the prepared recipient being resumed.
+    let foreign = super::invoke_runtime_release_wallet(
+        registry.as_ref(),
+        &buy,
+        &recipient_identity(0x31),
+        invocation(),
+        Some(&request_bytes),
+        now,
+    )
+    .await;
+    assert_eq!(
+        foreign.unwrap_err().to_string(),
+        super::RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE
+    );
+
+    // Approved: the exact replay yields the signed rights for the SAME
+    // request, decoded out of the Wallet's approval envelope.
+    wallet.approve(&approval_request_id);
+    let (signed_request_bytes, response_bytes, signed_rights) = signed_release_wallet_outcome(
+        super::invoke_runtime_release_wallet(
+            registry.as_ref(),
+            &buy,
+            &recipient,
+            invocation(),
+            Some(&request_bytes),
+            now,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(signed_request_bytes, request_bytes);
+    assert_eq!(signed_rights.request().recipient(), &recipient);
+    assert_eq!(
+        signed_rights.request().binding(),
+        &buy.binding_for_session(session).unwrap()
+    );
+    super::wallet_signed_rights_from_bytes(&signed_request_bytes, &response_bytes).unwrap();
+    assert_eq!(
+        wallet.seen_request_ids(),
+        vec![approval_request_id.clone(); 3],
+        "every shot replayed the identical wallet request"
+    );
+}
+
 #[cfg(unix)]
 pub(crate) fn write_device_key(data_dir: &Path, seed: u8) {
     let identity = data_dir.join("identity");
@@ -9867,6 +10209,22 @@ async fn runtime_custody_purchase_reconstruction_rejects_mismatched_profile_did(
         .contains("Runtime custody chain evidence is invalid"));
 }
 
+fn signed_release_wallet_outcome(
+    outcome: super::RuntimeReleaseWalletOutcome,
+) -> (Vec<u8>, Vec<u8>, WalletSignedRightsRequestV1) {
+    match outcome {
+        super::RuntimeReleaseWalletOutcome::Signed {
+            request_bytes,
+            response_bytes,
+            signed_rights,
+        } => (request_bytes, response_bytes, *signed_rights),
+        super::RuntimeReleaseWalletOutcome::PendingApproval {
+            approval_request_id,
+            ..
+        } => panic!("release wallet unexpectedly pending approval {approval_request_id}"),
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn runtime_custody_release_wallet_uses_fresh_binding_per_session() {
@@ -9947,9 +10305,11 @@ async fn runtime_custody_release_wallet_uses_fresh_binding_per_session() {
             mint_id: mint.draft().mint_id(),
             runtime_session_binding: session_a,
         },
+        None,
         now,
     )
     .await
+    .map(signed_release_wallet_outcome)
     .unwrap();
     let expected_a = buy.binding_for_session(session_a).unwrap();
     assert_eq!(signed_a.request().binding(), &expected_a);
@@ -9979,9 +10339,11 @@ async fn runtime_custody_release_wallet_uses_fresh_binding_per_session() {
             mint_id: mint.draft().mint_id(),
             runtime_session_binding: session_b,
         },
+        None,
         now,
     )
     .await
+    .map(signed_release_wallet_outcome)
     .unwrap();
     let expected_b = buy.binding_for_session(session_b).unwrap();
     assert_eq!(signed_b.request().binding(), &expected_b);
@@ -12738,5 +13100,70 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wal
     assert_eq!(
         record.lifecycle_status,
         super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_media_preparation_stages_plaintext_from_a_protected_principal_root() {
+    // Once recovery is activated the principal root is encrypted: the source
+    // object on disk is an `elastos.principal-root.object/v1` envelope, not
+    // the media bytes. The Runtime must stage the decrypted plaintext for the
+    // media provider (a raw copy would hand ffprobe ciphertext).
+    let temp = tempfile::tempdir().unwrap();
+    let (data_dir, staging_root) = setup_media_preparation_root(temp.path());
+    let principal_id = "person:local:media-protected-root";
+    let mut input = media_preparation_source_input(temp.path(), principal_id);
+    let localhost_root = crate::auth::principal_localhost_root(principal_id);
+    let source_path =
+        elastos_common::localhost::rooted_localhost_fs_path(&data_dir, &input.object_uri).unwrap();
+    // Protected writes require an owner-only ancestry under the data dir.
+    let mut ancestors: Vec<PathBuf> = source_path
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| dir.starts_with(&data_dir) && *dir != data_dir)
+        .map(Path::to_path_buf)
+        .collect();
+    ancestors.reverse();
+    for dir in ancestors {
+        owner_only_dir(&dir);
+    }
+    input.source_file_path = source_path.clone();
+    crate::auth::store_test_principal_root_protection(&data_dir, principal_id);
+    let plaintext = b"protected source media".to_vec();
+    crate::auth::write_protected_principal_root_object(
+        &data_dir,
+        principal_id,
+        &localhost_root,
+        &input.object_uri,
+        &source_path,
+        &plaintext,
+    )
+    .unwrap();
+    let stored = fs::read(&source_path).unwrap();
+    assert_ne!(stored, plaintext);
+    assert!(stored.starts_with(b"{"));
+
+    let provider = Arc::new(TestMediaPreparationProvider {
+        staging_root: staging_root.clone(),
+        requests: Mutex::new(Vec::new()),
+        response: TestMediaPreparationResponse::Prepared,
+    });
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_runtime_provider_target(MEDIA_PROVIDER_ID, provider.clone())
+        .await
+        .unwrap();
+    let prepared = prepare_runtime_custody_library_source(&data_dir, registry.as_ref(), &input)
+        .await
+        .expect("protected source must prepare");
+    assert!(matches!(
+        prepared,
+        RuntimeLibraryMediaPreparation::Prepared(_)
+    ));
+    let operation_id = provider.requests.lock().await[0].clone();
+    assert_eq!(
+        fs::read(staging_root.join(operation_id).join("input.bin")).unwrap(),
+        plaintext
     );
 }
