@@ -22,6 +22,9 @@ approved plan retains full release acceptance.
   `564c5dddeebbd4f963182c05a240a157f6d1a775`, one commit after that fetched
   development ref. This is the scoped C1 source; journey donor intake follows
   under C2–C5. Publication and seed deployment remain pending.
+- Follow-up source commits are `92d1a31f` for fresh Linux setup/restart,
+  `e3478890` for installer platform/process handling and `c97e1c67` for dated
+  hosted evidence. Their file hashes match the reviewed test receipts.
 - Local integration donor `6972e165` is clean, tree `8b32a72a`, 51 ahead and
   zero behind dev. Browser donor `50196355`, tree `f650c4dd`, is 164 ahead
   and two behind dev, with seven preserved dirty files at the review snapshot.
@@ -49,12 +52,27 @@ approved plan retains full release acceptance.
   including signed publisher envelopes and RFC 8032 vectors. Independent
   comparison with a second Ed25519 implementation accepted 128 valid signatures
   and rejected 256 modified inputs. Canonical Mac data/process handling and
-  complete candidate installation remain open; this source proof does not
-  claim a published Mac installer.
+  complete candidate installation remain open at that bootstrap snapshot.
+  The subsequent platform slice passes 38 tests covering canonical Mac/Linux
+  data paths and process ownership. It preserves another installation sharing
+  a binary and retains state when captured children survive shutdown. Independent
+  review passed. Real three-platform installation remains open.
 - The existing 30-minute monitor is active. Nine independent process cases
   passed review. Its first real observation exposed task permission limits;
   a writable shared state and coordinator reads resolved them in a second real
-  observation. Timer delivery remains to be observed. Old tasks retain their pause.
+  observation. The recurring timer subsequently delivered and the monitor wrote
+  and verified its observation. Old tasks retain their pause.
+- Seed preparation reproduced W2's two Linux prerequisites: an `already_ready`
+  upgrade creates no backup directory, and inherited shared-write permissions
+  can make the installation unsafe. The repairs pass focused Mac/Linux tests,
+  including empty and malformed receipts, inherited permissions and preserved
+  existing artifacts. A fresh full target setup will repeat installation and
+  startup using the completed build cache.
+- Hosted website evidence can now identify a dated operator check of source,
+  tree and artifact hashes on the exact serving origin. Its source template
+  stays unverified until public proof. The follow-up passes 22 website tests,
+  six truth checks and four rendered receipt cases; it keeps install actions
+  unavailable. This dated record makes no claim of continuous verification.
 
 The source and installed sections below preserve the earlier evidence snapshot.
 Their original identities qualify those results. Current milestone receipts
