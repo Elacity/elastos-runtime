@@ -108,6 +108,16 @@ approved plan retains full release acceptance.
   Current tag assets and source-home receipts alone do not establish the
   required ordinary update path.
 
+- The visitor page has been revised after user content review. It explains
+  local-first apps, Home and access control; release metadata, unavailable
+  installer controls and copied setup commands are removed. The page works
+  without JavaScript. Dated deployment receipt validation remains in operator
+  tooling; it has no visitor-facing status widget. Three viewport/keyboard
+  checks and the website truth checks pass. This revised website has not been
+  staged on the seed or deployed; the prior website package needs replacement.
+  The Claude reference informed product framing, while its stable-release,
+  installer and older publishing claims were excluded.
+
 The source and installed sections below preserve the earlier evidence snapshot.
 Their original identities qualify those results. Current milestone receipts
 above take precedence where the work has moved; remaining sections are refreshed

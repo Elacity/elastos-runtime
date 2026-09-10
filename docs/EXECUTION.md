@@ -34,7 +34,7 @@ release work keeps its full acceptance.
 
 | Milestone | Observable acceptance |
 | --- | --- |
-| C1-site | The landing page explains the product, opens `/home/`, works at desktop and mobile widths, and supports keyboard use. Published installer, source candidate and hosted Home have distinct facts. Missing, mismatched or unsupported release data leaves an honest available action. A computed checksum is identified as a checksum. |
+| C1-site | The landing page explains the product, opens `/home/`, works at desktop and mobile widths, and supports keyboard use. The visitor page focuses on Home and useful actions. Source, hosted Home and published installer identities remain distinct in operator records. Installer promotion requires accepted release and platform evidence. |
 | C1-home | `/home` resolves to `/home/`; index and relative assets use the existing Home capsule handler and response policy. Old root bookmarks reach the new entry. Sign-out returns there. Capsule launch identity, API paths and Runtime authority remain coherent. |
 | C1-proof | Source checks, actual rendered success/failure states and an independent review pass at the named revision. The process resumes at the same next action and detects stale proof, owner conflicts and repeated failures in bounded scenario tests. |
 | C1-seed | An approved candidate is installed on the seed with preserved identity and user state. Site and Home artifacts match its receipt. The public root and `/home/` work; sign-in, sign-out and an ordinary app launch have target evidence. |

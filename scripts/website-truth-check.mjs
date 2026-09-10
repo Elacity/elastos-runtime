@@ -4,14 +4,14 @@ import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, resolve, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { hostedStatus, HOME_PATH } from "../website/elastos/site.mjs";
+import { validHostedReceipt } from "./website-claims.mjs";
+const HOME_PATH = "/home/";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const site = resolve(repo, "website/elastos");
 const read = (path) => readFileSync(resolve(site, path), "utf8");
 const html = read("index.html");
 const css = read("site.css");
-const module = read("site.mjs");
 const facts = JSON.parse(read("claims.json"));
 const checks = [];
 function check(name, run) {
@@ -28,26 +28,20 @@ check("facts identify source and dated evidence", () => {
   assert.match(facts.public_observation.observed_at, /^\d{4}-\d{2}-\d{2}$/);
   for (const key of ["release_head_sha256", "release_sha256", "installer_sha256"]) assert.match(facts.public_observation[key], /^[a-f0-9]{64}$/);
   assert.deepEqual(facts.public_observation.evidence, ["/release-head.json", "/release.json", "/install.sh"]);
-  if (facts.hosted.status === "verified") assert.ok(hostedStatus(facts.hosted, new URL(facts.hosted.target).origin).evidence, "hosted version needs a dated deployment receipt");
+  if (facts.hosted.status === "verified") assert.ok(validHostedReceipt(facts.hosted, new URL(facts.hosted.target).origin), "hosted version needs a dated deployment receipt");
   else assert.equal(facts.hosted.status, "unverified");
 });
 
-check("static fallback agrees with facts", () => {
-  assert.ok(html.includes(`${facts.candidate.version} candidate`));
-  assert.ok(html.includes(`Last observed: ${facts.public_observation.version} · Linux only`));
-  assert.ok(facts.public_observation.platforms.every((value) => value.endsWith("-linux")));
-  assert.ok(html.includes(`datetime="${facts.reviewed_at}"`));
-  assert.match(html, /<button\b[^>]*id="copy-install"[^>]*disabled[^>]*>/);
-  assert.ok(!/curl[^<\n]+install\.sh\s*\|\s*bash/.test(html + module), "this pilot must not offer an unchecked install command");
-  assert.ok(!module.includes("enabled: true"), "installation enablement is outside this pilot");
-  assert.ok(html.includes(`git switch --create feat/local-home-preview ${facts.candidate.base_commit}`), "source setup must use the exact reviewed commit");
-  for (const journey of facts.journeys) {
-    const block = html.match(new RegExp(`<details[^>]*data-journey="${journey.id}"[\\s\\S]*?</details>`))?.[0];
-    assert.ok(block, `missing journey ${journey.id}`);
-    assert.ok(block.includes(journey.status));
-    assert.ok(block.includes(journey.evidence));
-  }
-  assert.equal(facts.journeys.length, 5);
+check("visitor content stays useful without release services", () => {
+  assert.ok(!/<script\b/i.test(html), "the visitor page should work without JavaScript");
+  assert.ok(!/<button\b[^>]*disabled/i.test(html), "avoid unavailable action controls");
+  assert.ok(!html.includes("install.sh"), "published installer promotion needs its own acceptance");
+  assert.ok(html.includes("Development preview."));
+  assert.ok(html.includes("Sign in with your passkey."));
+  assert.ok(html.includes("guest access is open"));
+  assert.ok(html.includes("Recovery Kit"));
+  assert.ok(html.includes("For developers"));
+  assert.ok(!/Version awaiting verification|Release proof open|Device proof open|See the evidence|Publisher DID|Installer SHA-256/i.test(html));
 });
 
 const endpoints = new Set(["/", HOME_PATH, "/install.sh", "/release-head.json", "/release.json", "/claims.json"]);
@@ -91,15 +85,14 @@ check("page and evidence links resolve", () => {
 check("the primary action opens Home on this server", () => {
   assert.match(html, new RegExp(`id="open-home" href="${HOME_PATH}"`));
   assert.ok(!html.includes('href="http://localhost'), "local source examples stay separate from the primary link");
-  assert.ok(!/fetch\([^\n]*(?:localhost|127\.0\.0\.1|https?:\/\/)/.test(module), "page must not probe a host or fetch another origin");
 });
 
 check("copy and claims describe evidence honestly", () => {
   const text = html.replace(/<[^>]+>/g, " ");
   assert.ok(!/PC2|chat --nick|md-viewer|works today|first 10 minutes|latest version|verified download|signature verified/i.test(text));
   assert.ok(!/class="verified"|✓/.test(html));
-  assert.ok(!/\/Users\/|\/private\/tmp\/|\.ssh\//.test(html + module + JSON.stringify(facts)), "private operator detail in public source");
-  assert.ok(!/data:image|unpkg\.com|fonts\.google|react-dom/.test(html + css + module));
+  assert.ok(!/\/Users\/|\/private\/tmp\/|\.ssh\//.test(html + JSON.stringify(facts)), "private operator detail in public source");
+  assert.ok(!/data:image|unpkg\.com|fonts\.google|react-dom/.test(html + css));
 });
 
 check("assets have source parity", () => {
@@ -108,7 +101,7 @@ check("assets have source parity", () => {
     ["elastos-mark.svg", "capsules/home/browser/elastos-home-icon.svg"],
     ["home-wallpaper.webp", "capsules/home-gui/browser/wallpaper.webp"],
     ["Inter-latin-var.woff2", "capsules/home/browser/assets/fonts/Inter-latin-var.woff2"],
-    ...["documents", "library", "wallet", "browser"].map((app) => [`${app}.png`, `capsules/${app}/browser/icons/icon-128.png`]),
+    ...["documents", "library", "people", "system"].map((app) => [`${app}.png`, `capsules/${app}/browser/icons/icon-128.png`]),
   ];
   for (const [asset, source] of pairs) assert.ok(readFileSync(resolve(site, "assets", asset)).equals(readFileSync(resolve(repo, source))), `asset differs from source: ${asset}`);
   assert.deepEqual(readdirSync(resolve(site, "assets")).sort(), pairs.map(([asset]) => asset).sort());
