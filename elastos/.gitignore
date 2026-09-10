@@ -5,6 +5,10 @@
 # Sub-workspace locks are gitignored (independent builds)
 capsules/*/Cargo.lock
 tools/*/Cargo.lock
+# Native release helpers require reviewed dependency locks.
+!tools/browser-engine-supervisor/Cargo.lock
+!tools/browser-native-proxy-engine/Cargo.lock
+!tools/browser-stream-bridge/Cargo.lock
 !tools/componentize/Cargo.lock
 
 # Node.js
