@@ -151,6 +151,7 @@ fn parse_action(s: &str) -> Option<elastos_runtime::capability::Action> {
         "message" => Action::Message,
         "delete" => Action::Delete,
         "admin" => Action::Admin,
+        "buy" => Action::Buy,
         _ => return None,
     })
 }
@@ -1508,6 +1509,7 @@ mod tests {
         assert!(parse_action("message").is_some());
         assert!(parse_action("delete").is_some());
         assert!(parse_action("admin").is_some());
+        assert!(parse_action("buy").is_some());
     }
 
     #[test]

@@ -5,8 +5,10 @@ const MINT_ID_HEX_RE = /^[0-9a-f]{64}$/;
 export const MAX_VIEWER_SEGMENT_COUNT = 512;
 export const MAX_VIEWER_MEDIA_PART_BYTES = 2 * 1024 * 1024;
 const MAX_VIEWER_MEDIA_PART_BASE64_BYTES = Math.ceil(MAX_VIEWER_MEDIA_PART_BYTES / 3) * 4;
+const VIEWER_CONTENT_KIND_MEDIA = "media";
 const OPEN_RESPONSE_KEYS = [
   "codecs",
+  "content_kind",
   "expires_at",
   "has_init_segment",
   "mime_type",
@@ -107,6 +109,9 @@ export function parseViewerOpenData(data, expectedMintId) {
   const expiresAt = Number(data.expires_at);
   if (
     data.schema !== VIEWER_OPEN_SCHEMA ||
+    // The player renders media sessions only: an object session's geometry is
+    // not a segment ladder, so refuse it here rather than misread its fields.
+    data.content_kind !== VIEWER_CONTENT_KIND_MEDIA ||
     mintId !== expectedMintId ||
     !MINT_ID_HEX_RE.test(mintId) ||
     !VIEWER_HANDLE_HEX_RE.test(viewerSessionHandle) ||

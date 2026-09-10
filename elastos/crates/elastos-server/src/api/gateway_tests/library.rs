@@ -28,6 +28,7 @@ fn protected_content_gateway_mock_test_guard() -> &'static tokio::sync::Mutex<()
 }
 
 const ELACITY_PLAYER_CAPSULE_ID_FOR_TEST: &str = "elacity-player";
+const ELACITY_READER_CAPSULE_ID_FOR_TEST: &str = "elacity-reader";
 const RUNTIME_PORTABLE_LISTING_TEST_CID: &str =
     "bafybeibwzif2r5tn7z7cq4f5a2mmepmab4s4m5a2hqu5v4f4uzkd3t2u7m";
 
@@ -419,7 +420,9 @@ fn seed_completed_runtime_custody_mint(
         crate::auth::now_ts(),
         elastos_protected_content_contracts::Digest32::new([0xa1; 32]),
         draft.encrypted_content().clone(),
-        draft.media_identity().media_manifest_root(),
+        elastos_protected_content_runtime::RuntimeVerifiedContentIdentityRootV1::for_media(
+            draft.media_identity().unwrap(),
+        ),
     )
     .unwrap();
     journal
@@ -428,7 +431,7 @@ fn seed_completed_runtime_custody_mint(
     seed_mock_published_protected_content(
         &content_id,
         &publisher_profile_did,
-        draft.media_identity(),
+        draft.media_identity().unwrap(),
         &protected_init_segment,
         &protected_segments,
         evidence.checked_at(),
@@ -6885,6 +6888,7 @@ async fn test_runtime_custody_buy_raw_provider_call_requires_gateway_wallet_auth
             "mint_id": "00".repeat(32),
         }),
         None,
+        crate::library::LibraryRequestRoute::UnverifiedCaller,
     )
     .await;
     assert_eq!(response["status"], "error");
@@ -7434,6 +7438,150 @@ async fn test_runtime_custody_buy_erc20_orders_approval_then_buy_without_duplica
     );
 }
 
+/// Once the ERC-20 approval stage has confirmed on chain, a retried `buy`
+/// must not re-drive it: no extra Wallet lookup for the already-confirmed
+/// approval effect, and the persisted record remembers the confirmation so
+/// it can be skipped instead of re-derived from scratch on every call.
+#[tokio::test]
+async fn test_runtime_custody_buy_confirmed_approval_stage_is_not_redriven() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &wallet_account_id,
+        10,
+    )
+    .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-approval-idempotent",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x93, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        false,
+    );
+    let app = gateway_router(state.clone());
+    let buy_body = json!({ "mint_id": hex::encode(facts.mint_id.as_bytes()) });
+
+    // Priming call: creates the approval and buy stages; approval pending.
+    let (priming_status, priming_payload) =
+        post_library(app.clone(), &token, "buy", buy_body.clone()).await;
+    assert_eq!(priming_status, StatusCode::OK);
+    assert_eq!(priming_payload["status"], "error");
+    assert_eq!(
+        priming_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+    wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+
+    // First counted call: the approval stage's transaction confirms on chain
+    // within this call; the buy stage raises its own (still pending)
+    // approval and the purchase stays pending overall.
+    let first_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (first_status, first_payload) =
+        post_library(app.clone(), &first_token, "buy", buy_body.clone()).await;
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(first_payload["status"], "error");
+    assert_eq!(
+        first_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+
+    let purchase_after_first = crate::protected_content_runtime::load_runtime_custody_purchase(
+        dir.path(),
+        &authority.principal_id,
+        facts.mint_id,
+    )
+    .unwrap()
+    .unwrap();
+    match &purchase_after_first.progress {
+        crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+            confirmed_approval,
+            confirmed_buy,
+        } => {
+            assert!(
+                confirmed_approval.is_some(),
+                "approval stage must be confirmed after the first call"
+            );
+            assert!(
+                confirmed_buy.is_none(),
+                "buy stage must still be pending after the first call"
+            );
+        }
+        other => panic!("expected a pending purchase, got {other:?}"),
+    }
+
+    // Second counted call: the already-confirmed approval stage must not be
+    // re-driven. Only the buy stage's still-pending Wallet approval should
+    // be looked up (two `ListApprovals` reads: one from the exact-effect
+    // recovery, one from the completion check) -- not a third for approval.
+    wallet_provider.clear_requests().await;
+    let second_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (second_status, second_payload) = post_library(app, &second_token, "buy", buy_body).await;
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(second_payload["status"], "error");
+    assert_eq!(
+        second_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+    let second_call_ops = wallet_provider.recorded_v2_operation_kinds().await;
+    let list_approvals_count = second_call_ops
+        .iter()
+        .filter(|kind| **kind == WalletOperationKind::ListApprovals)
+        .count();
+    assert_eq!(
+        list_approvals_count, 2,
+        "confirmed approval stage must not be re-driven: {second_call_ops:?}"
+    );
+
+    let purchase_after_second = crate::protected_content_runtime::load_runtime_custody_purchase(
+        dir.path(),
+        &authority.principal_id,
+        facts.mint_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(
+            &purchase_after_second.progress,
+            crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+                confirmed_approval: Some(_),
+                confirmed_buy: None,
+            }
+        ),
+        "approval stays confirmed and buy stays pending: {:?}",
+        purchase_after_second.progress
+    );
+}
+
 #[tokio::test]
 async fn test_runtime_custody_buy_access_corroboration_stays_nonterminal_until_allow() {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
@@ -7532,7 +7680,8 @@ async fn test_runtime_custody_buy_access_corroboration_stays_nonterminal_until_a
         assert!(matches!(
             purchase.progress,
             crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
-                confirmed_buy: Some(_)
+                confirmed_buy: Some(_),
+                ..
             }
         ));
     }
@@ -7552,6 +7701,124 @@ async fn test_runtime_custody_buy_access_corroboration_stays_nonterminal_until_a
     assert_eq!(ok_status, StatusCode::OK);
     assert_eq!(ok_payload["status"], "ok");
     assert_eq!(ok_payload["data"]["availability"]["status"], "buyer_owned");
+}
+
+/// #49 item 3: chain-provider answers `unknown_protected_content_object`
+/// when the content access id the buy is resolving is not bound on chain at
+/// all — distinct from `Error`'s transient/stale-observation failure, which
+/// stays the ordinary "pending" retry above. An unbound target can never
+/// become bound by retrying, so it must surface as a real buy failure
+/// instead of parking behind the pending message forever. The ledger keeps
+/// its `Pending` semantics untouched (no new terminal state): the buy stage
+/// the chain confirmed earlier stays recorded, only the access check fails.
+#[tokio::test]
+async fn buy_reports_unbound_content_access_id() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &wallet_account_id,
+        10,
+    )
+    .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-unbound",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x97, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        true,
+    );
+    let app = gateway_router(state);
+
+    // First call raises the Wallet approval for the (native, single-step)
+    // buy transaction; the purchase record is created as
+    // `Pending { confirmed_buy: None }`.
+    let _ = post_library(
+        app.clone(),
+        &token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+        }),
+    )
+    .await;
+    let _tx_hash = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    let signed_transaction = wallet_provider
+        .provider
+        .latest_transaction_signed_transaction()
+        .await
+        .expect("completed mock transaction");
+    reset_mock_chain_broadcast_count(&signed_transaction);
+
+    // The replay call completes the buy transaction (confirmed_buy becomes
+    // `Some`) and then resolves purchase access, which the mock now answers
+    // unbound.
+    set_mock_protected_content_purchase_access_unbound();
+    let replay_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (status, payload) = post_library(
+        app,
+        &replay_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "error");
+    assert_eq!(
+        payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNBOUND_MESSAGE
+    );
+
+    let purchase = crate::protected_content_runtime::load_runtime_custody_purchase(
+        dir.path(),
+        &authority.principal_id,
+        facts.mint_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(
+            purchase.progress,
+            crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+                confirmed_buy: Some(_),
+                ..
+            }
+        ),
+        "the confirmed buy stage stays recorded and the ledger never \
+         advances to Complete on an unbound access check: {purchase:?}"
+    );
 }
 
 #[tokio::test]
@@ -8138,7 +8405,10 @@ async fn run_runtime_custody_portable_listing_import(
         protected_content_identity: &'a str,
         mint_id: &'a str,
         publisher_profile_did: &'a str,
-        media_identity_base64: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        media_identity_base64: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content_identity_base64: Option<&'a str>,
         key_envelope_identity_base64: &'a str,
         rights_policy_identity_base64: &'a str,
         content_key_commitment_base64: &'a str,
@@ -8186,7 +8456,8 @@ async fn run_runtime_custody_portable_listing_import(
             protected_content_identity: &listing.package.content_id,
             mint_id: &listing.package.mint_id,
             publisher_profile_did: &listing.package.publisher_profile_did,
-            media_identity_base64: &listing.package.media_identity_base64,
+            media_identity_base64: listing.package.media_identity_base64.as_deref(),
+            content_identity_base64: listing.package.content_identity_base64.as_deref(),
             key_envelope_identity_base64: &listing.package.key_envelope_identity_base64,
             rights_policy_identity_base64: &listing.package.rights_policy_identity_base64,
             content_key_commitment_base64: &listing.package.content_key_commitment_base64,
@@ -8773,6 +9044,7 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
         open_keys,
         std::collections::BTreeSet::from([
             "codecs",
+            "content_kind",
             "expires_at",
             "has_init_segment",
             "mime_type",
@@ -8781,6 +9053,10 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
             "segment_count",
             "viewer_session_handle",
         ])
+    );
+    assert_eq!(
+        open_payload["data"]["content_kind"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_MEDIA
     );
     assert_eq!(
         open_payload["data"]["segment_count"].as_u64(),
@@ -9619,6 +9895,30 @@ async fn test_library_provider_runtime_custody_viewer_ops_require_player_launch_
         "home launch token is not authorized for this viewer"
     );
 
+    // Session binding v3 admits a second viewer capsule. A reader launch token
+    // whose `selected_resource` matches its `executable_actor` must clear the
+    // proxy's viewer admission — it is then denied by the Runtime for the
+    // ordinary reason (no purchase), not by the proxy's 403.
+    let reader_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        ELACITY_READER_CAPSULE_ID_FOR_TEST,
+        &authority,
+    );
+    let (reader_status, reader_payload) = post_library(
+        app.clone(),
+        &reader_token,
+        "open_viewer",
+        json!({ "mint_id": "00".repeat(32) }),
+    )
+    .await;
+    assert_eq!(reader_status, StatusCode::OK, "{reader_payload}");
+    assert_eq!(reader_payload["status"], "error", "{reader_payload}");
+    assert_eq!(
+        reader_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE,
+        "{reader_payload}"
+    );
+
     let player_token = projection_launch_token_for_authority_context(
         dir.path(),
         ELACITY_PLAYER_CAPSULE_ID_FOR_TEST,
@@ -9652,6 +9952,67 @@ async fn test_library_provider_runtime_custody_viewer_ops_require_player_launch_
         .await
         .unwrap();
     assert_eq!(wrong_origin.status(), StatusCode::FORBIDDEN);
+}
+
+/// The protected-publish content-type gate.
+///
+/// `library_publish` routes `video/*`/`audio/*` to the unchanged media
+/// transcode path and everything else to the EPC1 object path. Before
+/// `mime_for_name` was widened, every media container but `.mp4`/`.mp3`
+/// resolved to `application/octet-stream` and was sealed as an object instead
+/// — un-openable, and poisoning the source's authority shape for any later
+/// retry. Media families must now pass the gate, and a type the table does not
+/// know must be refused outright rather than minted.
+#[tokio::test]
+async fn test_library_provider_runtime_custody_publish_gates_on_content_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let unsupported = crate::library::RUNTIME_CUSTODY_PUBLISH_UNSUPPORTED_TYPE_MESSAGE;
+
+    for name in [
+        "clip.mkv",
+        "clip.mov",
+        "clip.webm",
+        "clip.m4v",
+        "clip.avi",
+        "clip.ts",
+        "song.m4a",
+        "song.wav",
+        "song.flac",
+        "song.ogg",
+        "song.opus",
+        "notes.md",
+        "shot.png",
+        "book.pdf",
+    ] {
+        let uri = format!("{root}/Documents/gate-{name}");
+        write_library_bytes(&app, &token, &uri, b"source-bytes").await;
+        let (status, payload) = publish_runtime_custody(&app, &token, &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(
+            payload["message"].as_str().unwrap_or_default(),
+            unsupported,
+            "{name} must pass the protected-publish content-type gate: {payload}"
+        );
+    }
+
+    for name in ["archive.xyz", "blob.bin", "noextension", "shot.heic"] {
+        let uri = format!("{root}/Documents/gate-{name}");
+        write_library_bytes(&app, &token, &uri, b"source-bytes").await;
+        assert_runtime_custody_publish_error(
+            dir.path(),
+            &app,
+            &token,
+            &authority.principal_id,
+            &uri,
+            unsupported,
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
@@ -10083,4 +10444,202 @@ async fn test_library_provider_unpublish_and_repair_update_status() {
         status["data"]["published"]["availability"]["status"],
         "local_pinned"
     );
+}
+
+// Task 7 (#42 gap 2): the `creator` app capsule uploads through the Library
+// transport and protects-and-lists in one flow. These two tests prove the
+// gateway allowlist change: a Creator launch token may reach the upload and
+// publish routes Library already used, but stays refused everywhere else in
+// the Library-only object surface.
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_creator_token_can_upload_and_publish_runtime_custody() {
+    // Mirrors test_runtime_custody_typed_publish_buy_open_read_segment_and_close's
+    // protect-and-list happy path fixture-for-fixture. The only deliberate
+    // differences are: (1) the creator's launch token is a Creator token, not
+    // a Library token, and (2) the source file reaches Library through the
+    // upload route Creator actually uses, not the "write" op. Creator's job
+    // ends at a successful listing, so this test stops there (no buy/open).
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    reset_mock_content_publish_requests();
+    reset_mock_chain_raw_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    registry
+        .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "object",
+            std::sync::Arc::new(crate::library::ObjectProvider::new(
+                dir.path().to_path_buf(),
+                std::sync::Arc::downgrade(&registry),
+            )),
+        )
+        .await
+        .unwrap();
+
+    let _process_fixture = crate::protected_content_runtime::tests::register_runtime_custody_process_providers_for_test_registry(
+        dir.path(),
+        &registry,
+    )
+    .await;
+    crate::protected_content_runtime::tests::register_runtime_custody_mock_media_provider_for_test_registry(
+        dir.path(),
+        &registry,
+    )
+    .await;
+    let creator = passkey_authority_with_profile_role_credential(
+        dir.path(),
+        "creator",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-creator",
+    );
+    let buyer = passkey_authority_with_profile_role_credential(
+        dir.path(),
+        "buyer",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-buyer",
+    );
+    let creator_token = app_token_for_authority(dir.path(), CREATOR_CAPSULE_ID, &creator);
+    let _buyer_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &buyer);
+    let _player_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        ELACITY_PLAYER_CAPSULE_ID_FOR_TEST,
+        &buyer,
+    );
+    let creator_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&creator.principal_id, 1)
+        .await;
+    let replacement_creator_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&creator.principal_id, 3)
+        .await;
+    let buyer_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&buyer.principal_id, 2)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &creator.principal_id,
+        "eip155:8453",
+        &creator_account_id,
+        10,
+    )
+    .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &buyer.principal_id,
+        "eip155:8453",
+        &buyer_account_id,
+        10,
+    )
+    .await;
+    let app = gateway_router(state.clone());
+
+    let creator_root = crate::auth::principal_localhost_root(&creator.principal_id);
+    let uri = format!("{creator_root}/Creator/protected-runtime-proof.mp4");
+
+    // The point of this test: a Creator-launched token can reach the upload
+    // route that used to be Library-only. Library's own upload coverage
+    // already proves the transport mechanics; here we only need it to work.
+    let (upload_status, _upload_headers, upload) =
+        put_library_upload(app.clone(), &creator_token, &uri, b"media").await;
+    assert_eq!(upload_status, StatusCode::OK, "{upload}");
+    assert_eq!(upload["status"], "ok", "{upload}");
+
+    let publish_body = json!({
+        "uri": uri,
+        "protection": {
+            "mode": "runtime_custody",
+            "copies": "0x2",
+            "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+        },
+    });
+    let (publish_pending_status, publish_pending) =
+        post_library(app.clone(), &creator_token, "publish", publish_body.clone()).await;
+    assert_eq!(publish_pending_status, StatusCode::OK);
+    assert_eq!(publish_pending["status"], "error");
+    assert_eq!(
+        publish_pending["message"],
+        "Runtime custody creator mint is pending exact Wallet or Chain settlement"
+    );
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &creator.principal_id,
+        "eip155:8453",
+        &replacement_creator_account_id,
+        20,
+    )
+    .await;
+    let creator_signed_transaction = {
+        let _ = wallet_provider
+            .provider
+            .complete_latest_transaction_approval()
+            .await;
+        wallet_provider
+            .provider
+            .latest_transaction_signed_transaction()
+            .await
+            .expect("completed creator transaction")
+    };
+    reset_mock_chain_broadcast_count(&creator_signed_transaction);
+
+    let (publish_ok_status, publish_ok) =
+        post_library(app.clone(), &creator_token, "publish", publish_body).await;
+    assert_eq!(publish_ok_status, StatusCode::OK);
+    assert_eq!(publish_ok["status"], "ok", "{publish_ok}");
+    let mint_id_hex = publish_ok["data"]["content_security"]["mint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mint_id = elastos_protected_content_contracts::Digest32::new(
+        hex::decode(&mint_id_hex).unwrap().try_into().unwrap(),
+    );
+    let persisted_mint = crate::protected_content_runtime::runtime_mint_journal(dir.path())
+        .load(mint_id)
+        .unwrap();
+    assert_eq!(
+        persisted_mint
+            .creator_state()
+            .unwrap()
+            .desired_terms()
+            .wallet_account_id(),
+        creator_account_id
+    );
+}
+
+#[tokio::test]
+async fn test_creator_token_is_refused_library_only_ops() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), CREATOR_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Creator/refused.txt");
+
+    for op in ["list", "write", "trash"] {
+        let body = json!({ "uri": uri }).to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri(format!("/api/provider/object/{op}"))
+                    .header("x-elastos-home-token", &token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "op={op}");
+    }
 }

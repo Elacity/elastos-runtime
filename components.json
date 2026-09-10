@@ -1111,6 +1111,20 @@
         }
       }
     },
+    "creator": {
+      "install_path": "capsules/creator",
+      "description": "Protect a file and list it for sale in one flow",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "creator.tar.gz",
+          "extract_path": "creator",
+          "install_path": "capsules/creator"
+        }
+      }
+    },
     "elacity-player": {
       "install_path": "capsules/elacity-player",
       "description": "Protected video viewer capsule through Runtime-scoped object-provider access.",
@@ -1386,6 +1400,7 @@
         "browser",
         "documents",
         "library",
+        "creator",
         "elacity-player",
         "marketplace",
         "archive-manager",
@@ -1438,6 +1453,7 @@
         "protected-content-decrypt-provider",
         "documents",
         "library",
+        "creator",
         "elacity-player",
         "marketplace",
         "archive-manager",
@@ -1505,6 +1521,7 @@
         "protected-content-decrypt-provider",
         "documents",
         "library",
+        "creator",
         "elacity-player",
         "marketplace",
         "archive-manager",
@@ -1556,6 +1573,7 @@
         "tunnel-provider",
         "documents",
         "library",
+        "creator",
         "elacity-player",
         "marketplace",
         "archive-manager",
@@ -1609,6 +1627,7 @@
         "tunnel-provider",
         "documents",
         "library",
+        "creator",
         "elacity-player",
         "marketplace",
         "archive-manager",

@@ -22,6 +22,7 @@ enum MockProtectedContentPurchaseAccessMode {
     Allow,
     Deny,
     Error,
+    Unbound,
 }
 
 #[derive(Clone)]
@@ -326,6 +327,17 @@ fn set_mock_protected_content_purchase_access_error() {
         .lock()
         .unwrap()
         .access_mode = MockProtectedContentPurchaseAccessMode::Error;
+}
+
+/// The content access id the buy is resolving against was never bound on
+/// chain — the same `unknown_protected_content_object` code chain-provider's
+/// real rights observation answers (`capsules/chain-provider/src/main.rs`),
+/// as opposed to `Error`'s unrelated transient/stale-observation code.
+fn set_mock_protected_content_purchase_access_unbound() {
+    mock_protected_content_purchase_fixture()
+        .lock()
+        .unwrap()
+        .access_mode = MockProtectedContentPurchaseAccessMode::Unbound;
 }
 
 fn set_mock_protected_content_listing_quantity(quantity: &str) {
@@ -866,6 +878,13 @@ impl Provider for MockChainProvider {
                         "status": "error",
                         "code": "stale_protected_content_purchase_access_observation",
                         "message": "mock protected-content purchase access is unavailable"
+                    }));
+                }
+                if fixture.access_mode == MockProtectedContentPurchaseAccessMode::Unbound {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "unknown_protected_content_object",
+                        "message": "protected-content content access id is not bound on chain"
                     }));
                 }
                 Ok(json!({

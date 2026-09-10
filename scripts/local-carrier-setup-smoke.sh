@@ -128,6 +128,7 @@ for capsule in \
     system \
     services \
     documents \
+    creator \
     elacity-player \
     inbox \
     library \
@@ -183,6 +184,7 @@ PEOPLE_CAPSULE_DIR="${REPO_ROOT}/capsules/people" \
 BROWSER_CAPSULE_DIR="${REPO_ROOT}/capsules/browser" \
 DOCUMENTS_CAPSULE_DIR="${REPO_ROOT}/capsules/documents" \
 LIBRARY_CAPSULE_DIR="${REPO_ROOT}/capsules/library" \
+CREATOR_CAPSULE_DIR="${REPO_ROOT}/capsules/creator" \
 MARKETPLACE_CAPSULE_DIR="${REPO_ROOT}/capsules/marketplace" \
 ARCHIVE_MANAGER_CAPSULE_DIR="${REPO_ROOT}/capsules/archive-manager" \
 ASSISTANT_CAPSULE_DIR="${REPO_ROOT}/capsules/assistant" \
@@ -292,6 +294,7 @@ browser_capsules = {
     "documents": pathlib.Path(os.environ["DOCUMENTS_CAPSULE_DIR"]),
     "inbox": pathlib.Path(os.environ["INBOX_CAPSULE_DIR"]),
     "library": pathlib.Path(os.environ["LIBRARY_CAPSULE_DIR"]),
+    "creator": pathlib.Path(os.environ["CREATOR_CAPSULE_DIR"]),
     "marketplace": pathlib.Path(os.environ["MARKETPLACE_CAPSULE_DIR"]),
     "archive-manager": pathlib.Path(os.environ["ARCHIVE_MANAGER_CAPSULE_DIR"]),
     "assistant": pathlib.Path(os.environ["ASSISTANT_CAPSULE_DIR"]),
@@ -494,6 +497,8 @@ for installed in \
     "${DATA_DIR}/capsules/library/browser/library.css" \
     "${DATA_DIR}/capsules/library/browser/src/app.js" \
     "${DATA_DIR}/capsules/library/browser/icons/folder.svg" \
+    "${DATA_DIR}/capsules/creator/browser/index.html" \
+    "${DATA_DIR}/capsules/creator/browser/creator.js" \
     "${DATA_DIR}/capsules/marketplace/browser/index.html" \
     "${DATA_DIR}/capsules/marketplace/browser/marketplace.css" \
     "${DATA_DIR}/capsules/marketplace/browser/marketplace.js" \

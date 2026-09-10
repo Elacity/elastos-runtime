@@ -9,6 +9,7 @@
 mod custody;
 mod decrypt;
 mod media;
+mod object;
 mod protect;
 mod rights;
 #[cfg(test)]
@@ -39,6 +40,11 @@ pub use media::{
     ValidatedClearFmp4MediaSessionLayoutV1, ValidatedClearFmp4SampleLayoutV1,
     ValidatedClearFmp4SegmentLayoutV1, CENC_FMP4_MEDIA_SUITE_ID_V1,
     MAX_CENC_FMP4_MEDIA_IDENTITY_BYTES_V1,
+};
+pub use object::{
+    ChunkedPayloadObjectIdentityV1, MAX_CHUNKED_PAYLOAD_OBJECT_IDENTITY_BYTES_V1,
+    MAX_OBJECT_CHUNKS_V1, MAX_OBJECT_FRAMED_CHUNK_BYTES_V1, MAX_OBJECT_FRAMED_HEADER_BYTES_V1,
+    MAX_OBJECT_PLAINTEXT_BYTES_V1, MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1,
 };
 pub use protect::{
     ProtectProviderRequestOpV1, ProtectProviderRequestV1, ProtectProviderResponseStatusV1,

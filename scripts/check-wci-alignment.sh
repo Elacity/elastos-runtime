@@ -1080,7 +1080,7 @@ protected_home_dependencies = {
     "media-provider",
     "protected-content-decrypt-provider",
 }
-protected_home_surface = {"library", "marketplace", "elacity-player"}
+protected_home_surface = {"library", "creator", "marketplace", "elacity-player"}
 for profile_name, profile in sorted(components["profiles"].items()):
     profile_list = profile.get("components") or []
     profile_components = set(profile_list)

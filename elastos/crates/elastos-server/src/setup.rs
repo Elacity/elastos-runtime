@@ -2695,6 +2695,7 @@ mod tests {
             "media-provider",
             "protected-content-decrypt-provider",
             "library",
+            "creator",
             "marketplace",
             "elacity-player",
         ];
@@ -3078,6 +3079,44 @@ mod tests {
                     .iter()
                     .any(|value| value == "elacity-player"),
                 "profile {profile} must include the Elacity Player capsule"
+            );
+        }
+    }
+
+    #[test]
+    fn creator_capsule_is_packaged_with_a_capsule_owned_icon() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("capsules/creator/capsule.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["schema"], "elastos.capsule/v1");
+        assert_eq!(manifest["name"], "creator");
+        assert_eq!(manifest["icon"], "browser/icons");
+        assert_eq!(manifest["entrypoint"], "browser/index.html");
+
+        for file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"] {
+            assert!(
+                root.join("capsules/creator/browser/icons")
+                    .join(file)
+                    .is_file(),
+                "missing Creator icon asset {file}"
+            );
+        }
+
+        let components: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
+        assert_eq!(
+            components["external"]["creator"]["install_path"],
+            "capsules/creator"
+        );
+        for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
+            assert!(
+                components["profiles"][profile]["components"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == "creator"),
+                "profile {profile} must include the Creator capsule"
             );
         }
     }

@@ -76,11 +76,12 @@ pub async fn request_capability(
         "delete" => Action::Delete,
         "message" => Action::Message,
         "admin" => Action::Admin,
+        "buy" => Action::Buy,
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!(
-                    "Invalid action: {}. Expected: read, write, execute, delete, message, admin",
+                    "Invalid action: {}. Expected: read, write, execute, delete, message, admin, buy",
                     input.action
                 ),
             ));

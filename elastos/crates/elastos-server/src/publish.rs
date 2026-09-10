@@ -39,6 +39,7 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
     "inbox",
     "assistant",
     "home-agent",
+    "creator",
     "elacity-player",
 ];
 const DEFAULT_PUBLISH_CAPSULES: &[&str] = HOME_PUBLISH_CAPSULES;
@@ -76,6 +77,7 @@ const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
     "inbox",
     "assistant",
     "home-agent",
+    "creator",
     "elacity-player",
 ];
 const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary", "jetson-test"];

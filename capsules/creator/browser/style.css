@@ -1,0 +1,534 @@
+:root {
+  color-scheme: dark;
+  --bg: var(--el-bg);
+  --panel: var(--el-surface-raised);
+  --panel-soft: var(--el-inset);
+  --line: var(--el-hairline);
+  --line-strong: var(--el-hairline-strong);
+  --ink: var(--el-text);
+  --muted: var(--el-muted);
+  --accent: var(--el-accent);
+  --accent-soft: var(--el-accent-faint);
+  --good: var(--el-ok);
+  --danger: var(--el-danger);
+  --radius: var(--el-radius-lg);
+  font-family: var(--el-font);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  background: var(--bg);
+  color: var(--ink);
+  display: flex;
+  justify-content: center;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.locked-shell {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.locked-card {
+  max-width: 420px;
+  padding: 30px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  border-radius: var(--radius);
+}
+
+.eyebrow {
+  margin: 0 0 6px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.subtitle {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.shell {
+  width: 100%;
+  max-width: 560px;
+  margin: 0 auto;
+  padding: 40px 24px 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.creator-header h1 {
+  margin: 0;
+  font-size: 1.4rem;
+  letter-spacing: -0.01em;
+}
+
+/* A stack of cards, not one flat form — each phase of the flow (choose a
+   file, describe and price it, protect and list) gets its own panel. */
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px;
+}
+
+.form-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.drop {
+  border: 1.5px dashed var(--line-strong);
+  border-radius: var(--radius);
+  padding: 26px 18px;
+  text-align: center;
+  color: var(--muted);
+  cursor: pointer;
+  transition: border-color var(--el-dur-2) var(--el-ease), background-color var(--el-dur-2) var(--el-ease);
+}
+
+.drop-compact {
+  padding: 16px;
+}
+
+.drop:hover,
+.drop:focus-visible,
+.drop.over {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  outline: none;
+}
+
+.drop-title {
+  display: block;
+  color: var(--ink);
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0 0 4px;
+}
+
+.drop-meta {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 2px 8px;
+  border-radius: var(--el-radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+}
+
+/* A muted variant of .badge for structure that is present but not wired to
+   any backend yet — deliberately unlike the accent badge above, which marks
+   a real, active property (a chosen file's kind). */
+.badge-muted {
+  margin: 6px 0 0;
+  background: var(--panel-soft);
+  color: var(--muted);
+}
+
+.row {
+  display: flex;
+  gap: 12px;
+}
+
+.row > .field {
+  flex: 1;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field label {
+  font-size: var(--el-text-sm);
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.field input,
+.field select,
+.field textarea {
+  border: 1px solid var(--line);
+  border-radius: var(--el-radius-md);
+  background: var(--panel-soft);
+  color: var(--ink);
+  padding: 9px 11px;
+  font-size: 0.9rem;
+  outline: none;
+}
+
+.field textarea {
+  resize: vertical;
+  min-height: 64px;
+}
+
+.field input:focus-visible,
+.field select:focus-visible,
+.field textarea:focus-visible {
+  border-color: var(--accent);
+}
+
+.hint {
+  margin: 0;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-weight: 500;
+  font-size: 0.86rem;
+  color: var(--ink);
+}
+
+.check input {
+  width: auto;
+}
+
+.thumb-preview-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.thumb-preview-img {
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: var(--el-radius-sm);
+  border: 1px solid var(--line);
+}
+
+/* Access-method selector cards (free / buy_once / buy_and_resell). Only
+   buy_once is connected to the publish request this runtime accepts; the
+   other two carry a "Not connected" marker (.badge-muted) rather than being
+   removed, so the page shows the real shape of the product. */
+.method-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.method {
+  border: 1.5px solid var(--line);
+  border-radius: var(--el-radius-md);
+  padding: 10px 8px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color var(--el-dur-2) var(--el-ease), background-color var(--el-dur-2) var(--el-ease);
+}
+
+.method:hover {
+  border-color: var(--accent);
+}
+
+.method.sel {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.method strong {
+  display: block;
+  font-size: 0.82rem;
+  color: var(--ink);
+}
+
+.method-desc {
+  display: block;
+  font-size: 0.66rem;
+  color: var(--muted);
+}
+
+/* Royalty split rows — cosmetic today (see .royalty-field's hint): no
+   publish field exists for payee splits, so this never leaves the browser. */
+.royalty-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+  align-items: center;
+}
+
+.royalty-row input {
+  border: 1px solid var(--line);
+  border-radius: var(--el-radius-md);
+  background: var(--panel-soft);
+  color: var(--ink);
+  padding: 8px 10px;
+  font-size: 0.82rem;
+}
+
+.ry-addr {
+  flex: 1;
+}
+
+.ry-pct {
+  width: 72px;
+}
+
+.ry-del {
+  border: 1px solid var(--line);
+  background: var(--panel-soft);
+  color: var(--danger);
+  border-radius: var(--el-radius-sm);
+  width: 30px;
+  height: 34px;
+  cursor: pointer;
+  flex: none;
+}
+
+.btn-add {
+  border: 1px dashed var(--line-strong);
+  background: transparent;
+  color: var(--accent);
+  border-radius: var(--el-radius-sm);
+  padding: 7px 12px;
+  font-size: 0.76rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.royalty-total {
+  margin: 6px 0 0;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.royalty-total.ok {
+  color: var(--good);
+}
+
+.royalty-total.bad {
+  color: var(--danger);
+}
+
+.preview-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.preview-controls input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.btn {
+  border: 1px solid var(--line);
+  border-radius: var(--el-radius-md);
+  background: var(--panel-soft);
+  padding: 8px 14px;
+  cursor: pointer;
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--line-strong);
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  width: 100%;
+  border-color: transparent;
+  background: var(--el-accent);
+  color: var(--el-accent-ink);
+  padding: 11px 14px;
+  font-size: 0.92rem;
+}
+
+/* A disabled primary button gets its own muted treatment rather than a
+   dimmed accent — a half-opacity blue reads as broken, not "not yet". */
+.btn-primary:disabled {
+  background: var(--panel-soft);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+/* The calm secondary action offered after a listing succeeds — bordered and
+   accent-colored rather than filled, so it reads as the lower-emphasis choice
+   next to "Open in Library". */
+.btn-secondary {
+  border-color: transparent;
+  background: transparent;
+  color: var(--accent);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: var(--accent-soft);
+}
+
+/* The single progress tracker (dkms's collapsible encode/publish detail
+   panel, repurposed as the one real stepper — the separate Upload/Protect/
+   List list this used to sit above was removed). Two of its five stages
+   ("Transcode & fragment", "Publish to storage") have no client-observable
+   signal and are marked .not-tracked; the rest are driven live. */
+.tech-progress {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--el-radius-md);
+  background: var(--panel-soft);
+}
+
+.tech-progress > summary {
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.tech-progress[open] > summary {
+  margin-bottom: 8px;
+}
+
+.tech-progress .hint {
+  margin-top: 8px;
+}
+
+/* Marks a stage this client has no way to observe — its dot never becomes
+   active or done, so this note is the only signal for why it stays neutral
+   the whole time, instead of looking broken or forgotten. */
+.not-tracked {
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-style: italic;
+  margin-left: 2px;
+}
+
+.steps {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+}
+
+.steps li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.82rem;
+  color: var(--muted);
+  padding: 6px 2px;
+}
+
+.steps li .dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--line);
+  flex: none;
+}
+
+.steps li.active {
+  color: var(--ink);
+}
+
+.steps li.active .dot {
+  border-color: var(--accent);
+}
+
+.steps li.done .dot {
+  border-color: var(--good);
+  background: var(--good);
+}
+
+.steps li.err {
+  color: var(--danger);
+}
+
+.steps li.err .dot {
+  border-color: var(--danger);
+  background: var(--danger);
+}
+
+.status {
+  min-height: 1.2em;
+  margin: 12px 0 0;
+  font-size: 0.84rem;
+  color: var(--muted);
+}
+
+.status.ok {
+  color: var(--good);
+}
+
+.status.err {
+  color: var(--danger);
+}
+
+#enable-trading-button {
+  margin-top: 10px;
+}
+
+.success-panel {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.success-title {
+  margin: 0;
+  font-weight: 600;
+  color: var(--good);
+}
+
+.mint-id {
+  margin: 0;
+  font-family: var(--el-font-mono);
+  font-size: 0.78rem;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.success-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}

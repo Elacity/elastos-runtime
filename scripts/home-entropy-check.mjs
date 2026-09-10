@@ -1846,7 +1846,7 @@ const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260805a";
 const homeClipboardAssetVersion = "home-20260726a";
 const homeGuiAssetVersion = "home-20260813a";
-const homeShellHostAssetVersion = "home-20260802a";
+const homeShellHostAssetVersion = "home-20260909a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -2287,9 +2287,15 @@ assert(
   "Home must allow Browser to route file chooser requests into Library through an explicit source gate",
 );
 assert(
+  shellJs.includes('creator: new Set(["library"])'),
+  "Home must allow Creator to route users into Library after a listing",
+);
+assert(
   shellJs.includes('"gba-emulator": new Set(["library"])') &&
-    shellJs.includes('library: new Set(["archive-manager", "documents", "gba-emulator", "library"])'),
-  "Home must allow GBA to open Library and Library to return compatible ROMs while keeping both directions source-gated",
+    shellJs.includes(
+      'library: new Set(["archive-manager", "documents", "elacity-player", "gba-emulator", "library"])',
+    ),
+  "Home must allow GBA to open Library, Library to return compatible ROMs, and Library to open protected media in Elacity Player, all source-gated",
 );
 assert(
   shellIndex.includes(`home-shell-host.js?v=${homeShellHostAssetVersion}`),
@@ -4739,6 +4745,13 @@ for (const [profileName, profile] of Object.entries(components.profiles)) {
     }
   }
 }
+const marketplaceManifest = JSON.parse(read("capsules/marketplace/capsule.json"));
+assert(
+  marketplaceManifest.interfaces.some((iface) =>
+    iface.methods.some((m) => m.resource === "elastos://object/*" && m.operation === "buy" && m.approval === "user"),
+  ),
+  "Marketplace must declare the protected-content buy affordance it exercises",
+);
 for (const provider of protectedRuntimeProviders) {
   assert(
     publishReleaseSupportEntries.filter((component) => component === provider).length === 1,

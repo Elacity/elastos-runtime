@@ -46,6 +46,40 @@
           "operation": "install"
         }
       ]
+    },
+    {
+      "id": "elastos.marketplace.protected-content",
+      "version": "0.1.0",
+      "description": "Buy listed protected content and import it into Library",
+      "methods": [
+        {
+          "id": "content.buy",
+          "description": "Buy one copy of a listed protected item with the default wallet.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "buy"
+        },
+        {
+          "id": "content.import",
+          "description": "Import a bought protected item into Library.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "import_runtime_custody"
+        },
+        {
+          "id": "content.list",
+          "description": "List protected items available to buy.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://object/*",
+          "operation": "list_runtime_custody"
+        }
+      ]
     }
   ],
   "resources": {

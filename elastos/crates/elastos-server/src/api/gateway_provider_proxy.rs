@@ -28,6 +28,7 @@ const MODEL_OBJECT_OUTPUT_SCHEMA: &str = "elastos.model.output.object/v1";
 const MODEL_CONTENT_OUTPUT_SCHEMA: &str = "elastos.model.output.content/v1";
 const MODEL_OUTPUT_URI_MAX_BYTES: usize = 4 * 1024;
 const ELACITY_PLAYER_CAPSULE_ID: &str = "elacity-player";
+const ELACITY_READER_CAPSULE_ID: &str = "elacity-reader";
 static LIBRARY_UPLOAD_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Deserialize)]
@@ -291,6 +292,10 @@ struct ResolvedProtectedContentPurchaseStep {
 type ResolvedProtectedContentPurchaseAccess =
     crate::protected_content_runtime::RuntimeCustodyPurchaseAccessEvidenceRecord;
 
+/// Writer twin of `protected_content_runtime`'s `RuntimePortableMetadata`
+/// reader: same field order, same "exactly one identity field, absent one
+/// skipped" rule, so a media metadata document keeps its exact pre-object
+/// bytes and an object one carries `content_identity_base64` instead.
 #[derive(Serialize)]
 struct RuntimeCustodyCreatorMetadata<'a> {
     schema: &'static str,
@@ -302,7 +307,10 @@ struct RuntimeCustodyCreatorMetadata<'a> {
     protected_content_identity: &'a str,
     mint_id: String,
     publisher_profile_did: &'a str,
-    media_identity_base64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media_identity_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_identity_base64: Option<String>,
     key_envelope_identity_base64: String,
     rights_policy_identity_base64: String,
     content_key_commitment_base64: String,
@@ -387,7 +395,7 @@ pub(super) async fn gateway_library_upload(
     let context = match require_home_launch_token_for_any_context(
         &state.data_dir,
         &headers,
-        &[LIBRARY_CAPSULE_ID],
+        &[LIBRARY_CAPSULE_ID, CREATOR_CAPSULE_ID],
     ) {
         Ok(context) => context,
         Err(err) => return gateway_provider_error_response("object", err),
@@ -540,7 +548,7 @@ pub(super) async fn gateway_library_upload_start(
     let context = match require_home_launch_token_for_any_context(
         &state.data_dir,
         &headers,
-        &[LIBRARY_CAPSULE_ID],
+        &[LIBRARY_CAPSULE_ID, CREATOR_CAPSULE_ID],
     ) {
         Ok(context) => context,
         Err(err) => return gateway_provider_error_response("object", err),
@@ -637,7 +645,7 @@ pub(super) async fn gateway_library_upload_chunk(
     let context = match require_home_launch_token_for_any_context(
         &state.data_dir,
         &headers,
-        &[LIBRARY_CAPSULE_ID],
+        &[LIBRARY_CAPSULE_ID, CREATOR_CAPSULE_ID],
     ) {
         Ok(context) => context,
         Err(err) => return gateway_provider_error_response("object", err),
@@ -713,7 +721,7 @@ pub(super) async fn gateway_library_upload_finish(
     let context = match require_home_launch_token_for_any_context(
         &state.data_dir,
         &headers,
-        &[LIBRARY_CAPSULE_ID],
+        &[LIBRARY_CAPSULE_ID, CREATOR_CAPSULE_ID],
     ) {
         Ok(context) => context,
         Err(err) => return gateway_provider_error_response("object", err),
@@ -1614,9 +1622,7 @@ pub(super) async fn gateway_provider_proxy(
             _ => &[DOCUMENTS_CAPSULE_ID],
         },
         "object" => match op.as_str() {
-            "roots"
-            | "list"
-            | "stat"
+            "list"
             | "read"
             | "download"
             | "write"
@@ -1635,13 +1641,15 @@ pub(super) async fn gateway_provider_proxy(
             | "archive_preview_entry"
             | "archive_extract_entries"
             | "compress_archive"
-            | "publish"
             | "unpublish"
             | "repair"
             | "share"
             | "shared_access"
             | "events" => &[LIBRARY_CAPSULE_ID],
-            "open_viewer" | "read_viewer" | "close_viewer" => &[ELACITY_PLAYER_CAPSULE_ID],
+            "roots" | "stat" | "publish" => &[LIBRARY_CAPSULE_ID, CREATOR_CAPSULE_ID],
+            "open_viewer" | "read_viewer" | "close_viewer" => {
+                &[ELACITY_PLAYER_CAPSULE_ID, ELACITY_READER_CAPSULE_ID]
+            }
             "import_runtime_custody" => &[LIBRARY_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
             "list_runtime_custody" | "buy" => &[LIBRARY_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
             _ => {
@@ -1706,15 +1714,18 @@ pub(super) async fn gateway_provider_proxy(
     };
     let is_protected_viewer_op =
         scheme == "object" && matches!(op.as_str(), "open_viewer" | "read_viewer" | "close_viewer");
+    const NOT_AUTHORIZED_FOR_VIEWER: (StatusCode, &str) = (
+        StatusCode::FORBIDDEN,
+        "home launch token is not authorized for this viewer",
+    );
     if is_protected_viewer_op
-        && (required.launch_context.selected_resource != ELACITY_PLAYER_CAPSULE_ID
-            || required.launch_context.executable_actor != ELACITY_PLAYER_CAPSULE_ID)
+        && (required.launch_context.selected_resource != required.launch_context.executable_actor
+            || !matches!(
+                required.launch_context.executable_actor.as_str(),
+                ELACITY_PLAYER_CAPSULE_ID | ELACITY_READER_CAPSULE_ID
+            ))
     {
-        return (
-            StatusCode::FORBIDDEN,
-            "home launch token is not authorized for this viewer",
-        )
-            .into_response();
+        return NOT_AUTHORIZED_FOR_VIEWER.into_response();
     }
     let context = required.context.clone();
     let principal_id = context.principal_id.clone();
@@ -1773,6 +1784,11 @@ pub(super) async fn gateway_provider_proxy(
             object.remove("grant_id");
             object.remove("wallet_request_hex");
             object.remove("wallet_response_hex");
+            object.remove("executable_actor");
+            object.insert(
+                "executable_actor".to_string(),
+                serde_json::Value::String(required.launch_context.executable_actor.clone()),
+            );
             if let Some(proof) = context
                 .proof_binding_id
                 .as_deref()
@@ -1802,6 +1818,22 @@ pub(super) async fn gateway_provider_proxy(
             );
         }
     }
+    // Session binding v3, kind <-> viewer: `open_viewer` additionally
+    // requires the admitted viewer to be the ONE that matches this mint's
+    // own content kind (media -> player, object -> reader). This is NOT
+    // decided here: `RuntimeMintJournal::load` unconditionally calls
+    // `ensure_root_dir`, so a speculative pre-dispatch load (keyed off the
+    // client-supplied, not-yet-authorized `mint_id`) would create this
+    // Runtime's mint-journal directory as a side effect of every
+    // `open_viewer` call — including ones from a principal who has never
+    // minted anything (confirmed: it broke a gateway test's cross-runtime
+    // isolation assertion). The check instead runs inside
+    // `open_runtime_custody_viewer`, after the normal purchase/listing/draft
+    // load that a legitimate open already performs, so it adds no new
+    // filesystem footprint. Its rejection surfaces as
+    // `RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE` there rather than the literal
+    // "not authorized for this viewer" 403 this comment's neighbour uses —
+    // see the Task 13 report for why that tradeoff was made deliberately.
     if scheme == "object" && op == "shared_access" {
         if let Some(object) = request.as_object_mut() {
             object.remove("recipient_proof");
@@ -1925,6 +1957,10 @@ pub(super) async fn gateway_provider_proxy(
             wallet_authority
                 .as_ref()
                 .map(|authority| (&state, authority)),
+            // This function verified the home launch token above and
+            // overwrote `executable_actor` with the verified value, which is
+            // what makes the protected viewer operations admissible at all.
+            crate::library::LibraryRequestRoute::VerifiedGatewayLaunchToken,
         )
         .await
     } else {
@@ -2557,8 +2593,27 @@ async fn resolve_runtime_custody_purchase_access(
         }),
     )
     .await;
-    let Ok(response) = response else {
-        return Ok(None);
+    let response = match response {
+        Ok(response) => response,
+        Err((status, message)) => {
+            let code = message.split(':').next().unwrap_or_default().trim();
+            if status == StatusCode::BAD_REQUEST && code == "unknown_protected_content_object" {
+                tracing::warn!(
+                    %request_id,
+                    "protected-content purchase target unbound on chain"
+                );
+                anyhow::bail!(
+                    crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNBOUND_MESSAGE
+                );
+            }
+            tracing::debug!(
+                %request_id,
+                status = status.as_u16(),
+                error = %message,
+                "protected-content purchase access resolution failed closed"
+            );
+            return Ok(None);
+        }
     };
     let access: ResolvedProtectedContentPurchaseAccess =
         serde_json::from_value(response).map_err(purchase_unavailable!())?;
@@ -2636,30 +2691,81 @@ async fn complete_runtime_custody_purchase_stage(
     Ok(Some(completion))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The confirmed approval and buy stages currently recorded on a `Pending`
+/// purchase. `runtime_custody_buy_via_gateway` returns the terminal response
+/// as soon as it observes `Complete` (before ever reaching a stage-progress
+/// read), so every caller of this function has already ruled that out --
+/// panicking on it rather than defaulting to "nothing confirmed yet" matters,
+/// because `None` here is exactly the value that would re-enable re-driving
+/// an already-confirmed (or already-complete) stage.
+fn pending_stages(
+    progress: &crate::protected_content_runtime::RuntimeCustodyPurchaseProgress,
+) -> (
+    Option<crate::protected_content_runtime::RuntimeCustodyConfirmedPurchaseStage>,
+    Option<crate::protected_content_runtime::RuntimeCustodyConfirmedPurchaseStage>,
+) {
+    match progress {
+        crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+            confirmed_approval,
+            confirmed_buy,
+        } => (confirmed_approval.clone(), confirmed_buy.clone()),
+        crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Complete { .. } => {
+            unreachable!("terminal purchases return early before reaching stage-progress reads")
+        }
+    }
+}
+
+/// Build the confirmed-stage record for a purchase stage from its Runtime
+/// transaction completion, or `None` if the completion has no validated
+/// Chain outcome attached yet (the caller must treat that the same as
+/// pending -- `RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE`/`purchase_unavailable_missing!`).
+fn confirmed_stage(
+    completion: RuntimeTransactionCompletion,
+) -> Option<crate::protected_content_runtime::RuntimeCustodyConfirmedPurchaseStage> {
+    let outcome = completion.validated_chain_outcome?;
+    Some(
+        crate::protected_content_runtime::RuntimeCustodyConfirmedPurchaseStage {
+            chain_transaction: completion.transaction_hash,
+            wallet_binding: outcome.binding,
+            chain_observation: outcome.chain_observation,
+            confirmed_at: outcome.confirmed_at,
+        },
+    )
+}
+
+/// `mime_type`/`codecs` are derived from the mint draft's own content
+/// identity rather than taken as caller parameters. For media that is the
+/// identical value the caller used to pass (`RuntimeMintDraft::new` is built
+/// from the same two strings, and `verify_runtime_portable_metadata` already
+/// asserts the published document matches the identity), so the emitted bytes
+/// do not move; for an object there is no caller-side codecs string at all.
 async fn publish_runtime_custody_creator_metadata(
     registry: &ProviderRegistry,
     data_dir: &std::path::Path,
     object_uri: &str,
-    mime_type: &str,
-    codecs: &str,
     facts: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
     mint: &elastos_protected_content_runtime::PersistedRuntimeMint,
     publisher_profile_did: &str,
 ) -> anyhow::Result<(String, String)> {
     let draft = mint.draft();
+    let (media_identity_base64, content_identity_base64) =
+        crate::protected_content_runtime::runtime_portable_identity_fields(
+            draft.content_identity(),
+        )?;
     let metadata = RuntimeCustodyCreatorMetadata {
         schema: "elastos.protected-content.metadata/v1",
         name: runtime_custody_metadata_name(object_uri),
-        mime_type,
-        codecs,
+        mime_type: draft.content_identity().content_type(),
+        codecs: crate::protected_content_runtime::runtime_portable_content_codecs(
+            draft.content_identity(),
+        ),
         encrypted_content_cid: &facts.content_cid,
         content_access_id: format!("0x{}", hex::encode(draft.content_access_id().as_bytes())),
         protected_content_identity: &facts.content_id,
         mint_id: hex::encode(draft.mint_id().as_bytes()),
         publisher_profile_did,
-        media_identity_base64: base64::engine::general_purpose::STANDARD
-            .encode(draft.media_identity().canonical_bytes()?),
+        media_identity_base64,
+        content_identity_base64,
         key_envelope_identity_base64: base64::engine::general_purpose::STANDARD
             .encode(draft.key_envelope().canonical_bytes()?),
         rights_policy_identity_base64: base64::engine::general_purpose::STANDARD
@@ -3439,6 +3545,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                 buy_stage: runtime_custody_purchase_stage_record("buy", &buy_request)?,
                 progress:
                     crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+                        confirmed_approval: None,
                         confirmed_buy: None,
                     },
                 created_at: now,
@@ -3489,10 +3596,19 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
         )?;
     }
 
-    if let Some(approval_request) = approval_request.as_ref() {
+    let (confirmed_approval_stage, _) = pending_stages(&purchase.progress);
+
+    // Once the approval stage has confirmed on chain it is durable: skip
+    // re-driving it (and re-touching the Wallet for it) on every retry.
+    // `RuntimeCustodyPurchaseProgress::Pending` only remembered the buy
+    // stage's confirmation before, so a still-pending buy stage forced this
+    // block to run again on each call even after approval was long settled.
+    if let (Some(approval_request), None) =
+        (approval_request.as_ref(), confirmed_approval_stage.as_ref())
+    {
         let approval_completion =
             complete_runtime_custody_purchase_stage(state, authority, approval_request).await?;
-        if approval_completion.is_none() {
+        let Some(approval_completion) = approval_completion else {
             purchase.updated_at = crate::auth::now_ts();
             crate::protected_content_runtime::persist_runtime_custody_purchase(
                 &state.data_dir,
@@ -3501,11 +3617,26 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
             anyhow::bail!(
                 crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
             );
-        }
+        };
+        let Some(confirmed_approval) = confirmed_stage(approval_completion) else {
+            return Err(purchase_unavailable_missing!()());
+        };
+        let (_, confirmed_buy) = pending_stages(&purchase.progress);
+        purchase.progress =
+            crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+                confirmed_approval: Some(confirmed_approval),
+                confirmed_buy,
+            };
+        purchase.updated_at = crate::auth::now_ts();
+        crate::protected_content_runtime::persist_runtime_custody_purchase(
+            &state.data_dir,
+            &purchase,
+        )?;
     }
 
     if let crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
         confirmed_buy: None,
+        ..
     } = &purchase.progress
     {
         let buy_completion =
@@ -3520,29 +3651,14 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                 crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
             );
         };
-        let wallet_binding = buy_completion
-            .validated_chain_outcome
-            .as_ref()
-            .map(|outcome| {
-                (
-                    outcome.binding.clone(),
-                    outcome.chain_observation.clone(),
-                    outcome.confirmed_at,
-                )
-            });
-        let Some((wallet_binding, chain_observation, confirmed_at)) = wallet_binding else {
+        let Some(confirmed_buy) = confirmed_stage(buy_completion) else {
             return Err(purchase_unavailable_missing!()());
         };
+        let (confirmed_approval, _) = pending_stages(&purchase.progress);
         purchase.progress =
             crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
-                confirmed_buy: Some(
-                    crate::protected_content_runtime::RuntimeCustodyConfirmedPurchaseStage {
-                        chain_transaction: buy_completion.transaction_hash,
-                        wallet_binding,
-                        chain_observation,
-                        confirmed_at,
-                    },
-                ),
+                confirmed_approval,
+                confirmed_buy: Some(confirmed_buy),
             };
         purchase.updated_at = crate::auth::now_ts();
         crate::protected_content_runtime::persist_runtime_custody_purchase(
@@ -3554,12 +3670,14 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
     let confirmed_buy = match &purchase.progress {
         crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
             confirmed_buy: Some(confirmed_buy),
+            ..
         } => confirmed_buy.clone(),
         crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Complete { .. } => {
             return Ok(runtime_custody_buy_terminal_response(&purchase));
         }
         crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
             confirmed_buy: None,
+            ..
         } => anyhow::bail!(
             crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
         ),
@@ -3661,8 +3779,6 @@ async fn runtime_custody_publish_creator_tail_from_facts(
                 registry.as_ref(),
                 &state.data_dir,
                 &input.object_uri,
-                &input.mime_type,
-                &input.codecs,
                 &facts,
                 &mint,
                 &publisher_profile_did,
