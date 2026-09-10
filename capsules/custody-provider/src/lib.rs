@@ -272,7 +272,8 @@ fn rename_without_replacement(from: &Path, to: &Path) -> Result<(), CustodyProvi
     let to = CString::new(to.as_os_str().as_bytes())
         .map_err(|_| CustodyProviderStateRootError::ProvisioningFailed)?;
     let result = unsafe {
-        nix::libc::renameat2(
+        nix::libc::syscall(
+            nix::libc::SYS_renameat2,
             nix::libc::AT_FDCWD,
             from.as_ptr(),
             nix::libc::AT_FDCWD,
@@ -650,6 +651,30 @@ mod tests {
     fn owner_only_dir(path: &Path) {
         fs::create_dir_all(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rename_without_replacement_preserves_collision_and_moves_new_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let existing = temp.path().join("existing");
+        owner_only_dir(&source);
+        owner_only_dir(&existing);
+        fs::write(source.join("identity"), b"source").unwrap();
+        fs::write(existing.join("identity"), b"existing").unwrap();
+
+        assert!(matches!(
+            rename_without_replacement(&source, &existing),
+            Err(CustodyProviderStateRootError::Conflict)
+        ));
+        assert_eq!(fs::read(source.join("identity")).unwrap(), b"source");
+        assert_eq!(fs::read(existing.join("identity")).unwrap(), b"existing");
+
+        let destination = temp.path().join("destination");
+        rename_without_replacement(&source, &destination).unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination.join("identity")).unwrap(), b"source");
     }
 
     #[cfg(unix)]
