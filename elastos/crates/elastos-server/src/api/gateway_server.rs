@@ -50,6 +50,46 @@ pub(crate) async fn start_gateway_server_with_collaboration_context(
     cache_dir: PathBuf,
     data_dir: PathBuf,
 ) -> anyhow::Result<()> {
+    start_gateway_server_with_ready(
+        addr,
+        provider_registry,
+        collaboration,
+        cache_dir,
+        data_dir,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn start_gateway_server_with_ready(
+    addr: &str,
+    provider_registry: Option<Arc<ProviderRegistry>>,
+    collaboration: GatewayCollaborationContext,
+    cache_dir: PathBuf,
+    data_dir: PathBuf,
+    on_ready: Option<fn(&str)>,
+) -> anyhow::Result<()> {
+    start_gateway_server_with_shutdown(
+        addr,
+        provider_registry,
+        collaboration,
+        cache_dir,
+        data_dir,
+        on_ready,
+        shutdown_signal(),
+    )
+    .await
+}
+
+async fn start_gateway_server_with_shutdown(
+    addr: &str,
+    provider_registry: Option<Arc<ProviderRegistry>>,
+    collaboration: GatewayCollaborationContext,
+    cache_dir: PathBuf,
+    data_dir: PathBuf,
+    on_ready: Option<fn(&str)>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     crate::auth::verify_auth_audit_chain_ready(&data_dir)?;
     let listener = TcpListener::bind(addr).await?;
     let gateway_local_control = match provider_registry.as_ref() {
@@ -75,6 +115,7 @@ pub(crate) async fn start_gateway_server_with_collaboration_context(
     let browser_lifecycle_reconciler =
         super::gateway_browser::start_browser_lifecycle_reconciler(state.clone())
             .map_err(anyhow::Error::msg)?;
+    let home_url = format!("{gateway_api_url}/home/");
     let app = gateway_router_with_api_url(state, gateway_api_url);
     let advertised = advertised_gateway_urls(addr);
     println!("ElastOS Gateway v{}", GATEWAY_VERSION);
@@ -93,12 +134,15 @@ pub(crate) async fn start_gateway_server_with_collaboration_context(
     }
     println!();
     println!("  Cache is unbounded (Tier 1) — delete cache dir to reclaim space");
+    if let Some(on_ready) = on_ready {
+        on_ready(&home_url);
+    }
     let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async {
-        shutdown_signal().await;
+    .with_graceful_shutdown(async move {
+        shutdown.await;
         println!("\nShutting down gateway...");
     })
     .await;
@@ -234,6 +278,149 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod trusted_gateway_tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    static READY_URL: Mutex<Option<oneshot::Sender<String>>> = Mutex::new(None);
+
+    fn record_ready(url: &str) {
+        let parsed = url::Url::parse(url).unwrap();
+        // The callback must run after a listener exists, even before HTTP is polled.
+        std::net::TcpStream::connect((parsed.host_str().unwrap(), parsed.port().unwrap())).unwrap();
+        READY_URL
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .send(url.to_string())
+            .unwrap();
+    }
+
+    fn unexpected_ready(_: &str) {
+        panic!("failed gateway startup must not open Home");
+    }
+
+    fn unused_localhost_address() -> String {
+        let listener = std::net::TcpListener::bind("localhost:0").unwrap();
+        format!("localhost:{}", listener.local_addr().unwrap().port())
+    }
+
+    #[tokio::test]
+    async fn browser_home_ready_serves_router_and_shutdown_releases_resources() {
+        let temp = tempfile::tempdir().unwrap();
+        let addr = unused_localhost_address();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        *READY_URL.lock().unwrap() = Some(ready_tx);
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let task_addr = addr.clone();
+        let data = temp.path().to_path_buf();
+        let task_data = data.clone();
+        let server = tokio::spawn(async move {
+            start_gateway_server_with_shutdown(
+                &task_addr,
+                None,
+                GatewayCollaborationContext::default(),
+                task_data.join("cache"),
+                task_data,
+                Some(record_ready),
+                async {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await
+        });
+        let home = tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(home, format!("http://{addr}/home/"));
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/healthz"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        // A late startup failure after binding must still leave the callback untouched.
+        let duplicate = start_gateway_server_with_ready(
+            &unused_localhost_address(),
+            None,
+            GatewayCollaborationContext::default(),
+            data.join("cache"),
+            data.clone(),
+            Some(unexpected_ready),
+        )
+        .await
+        .unwrap_err();
+        assert!(duplicate
+            .to_string()
+            .contains("already running for this data root"));
+
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // Reusing both the address and data root proves listener/reconciler cleanup.
+        start_gateway_server_with_shutdown(
+            &addr,
+            None,
+            GatewayCollaborationContext::default(),
+            data.join("cache"),
+            data,
+            None,
+            async {},
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn browser_home_ready_is_skipped_when_port_is_occupied() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let error = start_gateway_server_with_ready(
+            &listener.local_addr().unwrap().to_string(),
+            None,
+            GatewayCollaborationContext::default(),
+            temp.path().join("cache"),
+            temp.path().to_path_buf(),
+            Some(unexpected_ready),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_home_ready_is_skipped_when_auth_setup_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = crate::auth::auth_state_path(temp.path()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"invalid auth state").unwrap();
+        let error = start_gateway_server_with_ready(
+            &unused_localhost_address(),
+            None,
+            GatewayCollaborationContext::default(),
+            temp.path().join("cache"),
+            temp.path().to_path_buf(),
+            Some(unexpected_ready),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("failed to parse auth state"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn trusted_gateway_api_url_preserves_operator_localhost() {

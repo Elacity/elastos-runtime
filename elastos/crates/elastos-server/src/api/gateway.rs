@@ -165,6 +165,7 @@ pub(crate) use gateway_room::{
 pub(crate) use gateway_server::advertised_gateway_urls;
 pub use gateway_server::start_gateway_server;
 pub(crate) use gateway_server::start_gateway_server_with_collaboration_context;
+pub(crate) use gateway_server::start_gateway_server_with_ready;
 pub use gateway_server::GatewayCollaborationContext;
 use gateway_site::*;
 pub(super) use gateway_site::{content_type, validate_file_path};

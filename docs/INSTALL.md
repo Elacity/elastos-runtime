@@ -16,9 +16,10 @@ preparation; developers can use the [Mac source guide](MAC.md).
 
 The candidate installer detects the platform, verifies the signed release,
 installs Runtime, and fetches the Home profile from the trusted publisher. It
-opens Home in the terminal. On a headless connection, setup completes and prints
-the installed binary's full path for opening Home later. The installer uses that
-path directly, so editing PATH is optional.
+starts Home at `http://localhost:8090/home/` and opens your browser. Keep the
+terminal open while you use Home; Ctrl+C stops it. With no interactive terminal,
+setup completes and prints the full command for opening Home later. The installer
+uses the installed binary's full path, so editing PATH is optional.
 
 For automated provisioning or a different setup profile, use `--install-only`:
 

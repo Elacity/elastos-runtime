@@ -25,8 +25,8 @@
 #   1. elastos binary → ~/.local/bin/elastos
 #   2. components.json → the platform's ElastOS application-data directory
 #
-# After bootstrap, setup installs the Home profile and opens Home in the
-# terminal. Use --install-only for automated provisioning or other profiles.
+# After bootstrap, setup installs the Home profile and opens browser Home.
+# Use --install-only for automated provisioning or other profiles.
 #
 # Trust model:
 #   1. Bootstrap over the stamped publisher URL (or explicit operator/debug CID gateway)
@@ -143,8 +143,9 @@ show_help() {
     echo "  macOS registry: ~/Library/Application Support/elastos/components.json"
     echo ""
     echo -e "${BOLD}After installation:${NC}"
-    echo "  Setup installs the Home profile, then opens Home in your terminal."
-    echo "  On a headless connection, the installer prints the command to open Home."
+    echo "  Setup installs the Home profile, then opens Home in your browser."
+    echo "  Keep the terminal open while using Home; Ctrl+C stops it."
+    echo "  Without an interactive terminal, the installer prints the launch command."
     echo ""
     echo -e "${BOLD}Trust model:${NC}"
     echo "  All artifacts signed with Ed25519. install.sh is the explicit"
@@ -746,8 +747,8 @@ PY_RELEASE_IDENTITY
     fi
 }
 
-# Complete setup without reading the curl pipe as input. Interactive Home owns
-# the controlling terminal; headless provisioning finishes without a renderer.
+# Setup leaves the curl pipe unread. Browser Home runs in the controlling
+# terminal; non-interactive provisioning prints the command for a later launch.
 finish_install() {
     local runtime_bin="${INSTALL_DIR}/elastos"
     if [[ "$INSTALL_ONLY" == true || "$INSTALL_ONLY" == 1 ]]; then
@@ -758,10 +759,10 @@ finish_install() {
     "$runtime_bin" setup </dev/null || return $?
     if ( : </dev/tty ) 2>/dev/null && [[ -t 1 ]]; then
         info "Opening Home..."
-        "$runtime_bin" </dev/tty || return $?
+        "$runtime_bin" home --browser </dev/tty || return $?
     else
-        info "Home is ready. Open it from a terminal:"
-        printf '  %q\n' "$runtime_bin"
+        info "Home is installed. Open it from a terminal:"
+        printf '  %q home --browser\n' "$runtime_bin"
     fi
 }
 

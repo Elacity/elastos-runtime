@@ -320,7 +320,7 @@ class CompletionTests(unittest.TestCase):
             install_dir.mkdir()
             runtime = install_dir / "elastos"
             runtime.write_text("#!/bin/bash\n"
-                               'printf "%s\\n" "${1:-home}" >> "$CALLS"\n'
+                               'printf "%s\\n" "$*" >> "$CALLS"\n'
                                'if [[ "${1:-}" == setup ]]; then\n'
                                '  if read -r unexpected; then exit 98; fi\n'
                                '  exit "$SETUP_EXIT"\n'
@@ -372,13 +372,14 @@ class CompletionTests(unittest.TestCase):
     def test_headless_setup_does_not_consume_script_pipe_or_open_renderer(self):
         status, calls, output = self.run_completion()
         self.assertEqual((status, calls), (0, ["setup"]))
-        self.assertIn("Home is ready", output)
+        self.assertIn("Home is installed", output)
         self.assertIn("installed\\ runtime/elastos", output)
+        self.assertIn("home --browser", output)
 
     def test_setup_failure_stops_before_home_and_success_message(self):
         status, calls, output = self.run_completion(setup_exit=23)
         self.assertEqual((status, calls), (23, ["setup"]))
-        self.assertNotIn("Home is ready", output)
+        self.assertNotIn("Home is installed", output)
 
     def test_install_only_skips_both_setup_and_home(self):
         for value in ["true", "1"]:
@@ -387,11 +388,11 @@ class CompletionTests(unittest.TestCase):
 
     def test_terminal_install_sets_up_then_opens_home_with_tty(self):
         status, calls, _ = self.run_completion(terminal=True)
-        self.assertEqual((status, calls), (0, ["setup", "home"]))
+        self.assertEqual((status, calls), (0, ["setup", "home --browser"]))
 
     def test_home_failure_is_reported(self):
         status, calls, _ = self.run_completion(terminal=True, home_exit=24)
-        self.assertEqual((status, calls), (24, ["setup", "home"]))
+        self.assertEqual((status, calls), (24, ["setup", "home --browser"]))
 
 
 class BindingTests(unittest.TestCase):

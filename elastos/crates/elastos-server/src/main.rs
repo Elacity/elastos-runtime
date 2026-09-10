@@ -272,6 +272,10 @@ enum Commands {
 
     /// Launch Home
     Home {
+        /// Open local Home in the default web browser
+        #[arg(long, conflicts_with_all = &["status", "json"])]
+        browser: bool,
+
         /// Print a local Home-state probe without opening the home-cli surface
         #[arg(long)]
         status: bool,
@@ -1221,6 +1225,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Commands::Home {
+        browser: false,
         status: false,
         json: false,
     });
@@ -1280,7 +1285,14 @@ async fn main() -> anyhow::Result<()> {
             return chat_cmd::run_chat(nick, connect).await;
         }
 
-        Commands::Home { status, json } => {
+        Commands::Home {
+            browser,
+            status,
+            json,
+        } => {
+            if browser {
+                return gateway_entry::run_browser_home().await;
+            }
             return home_cmd::run(status, json).await;
         }
 
@@ -2159,6 +2171,45 @@ mod tests {
     use clap::Parser;
     use sha2::Digest;
     use std::fs;
+
+    #[test]
+    fn home_browser_cli_preserves_terminal_default_and_probe_options() {
+        assert!(super::Cli::try_parse_from(["elastos"])
+            .unwrap()
+            .command
+            .is_none());
+        let terminal = super::Cli::try_parse_from(["elastos", "home"]).unwrap();
+        assert!(matches!(
+            terminal.command,
+            Some(super::Commands::Home {
+                browser: false,
+                status: false,
+                json: false
+            })
+        ));
+        let browser = super::Cli::try_parse_from(["elastos", "home", "--browser"]).unwrap();
+        assert!(matches!(
+            browser.command,
+            Some(super::Commands::Home { browser: true, .. })
+        ));
+        for probe in ["--status", "--json"] {
+            assert!(super::Cli::try_parse_from(["elastos", "home", probe]).is_ok());
+            assert!(super::Cli::try_parse_from(["elastos", "home", "--browser", probe]).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_browser_process_group_keeps_the_terminal_frontdoor_policy() {
+        use std::io::IsTerminal;
+
+        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        for args in [Vec::new(), vec!["home"], vec!["home", "--browser"]] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(super::should_isolate_process_group(&args), !interactive);
+        }
+        assert!(super::should_isolate_process_group(&["serve".to_string()]));
+    }
 
     #[test]
     fn verify_component_binary_with_data_dir_rejects_dev_path() {
