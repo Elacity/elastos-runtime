@@ -17,7 +17,7 @@ const require = createRequire(new URL("../elastos/tools/browser-playwright-engin
 const { chromium } = require("playwright");
 
 const ELASTOS_BASE_URL = (process.env.ELASTOS_BASE_URL || "http://localhost:8090").replace(/\/+$/, "");
-const HOME_URL = process.env.HOME_URL || `${ELASTOS_BASE_URL}/apps/home/`;
+const HOME_URL = process.env.HOME_URL || `${ELASTOS_BASE_URL}/home/`;
 const TEST_NAME = process.env.HOME_VIRTUAL_AUTH_NAME || `Agent Smoke ${new Date().toISOString()}`;
 const HEADLESS = process.env.HOME_VIRTUAL_AUTH_HEADED !== "1";
 const PRESERVE_PROFILE = process.env.HOME_VIRTUAL_AUTH_PRESERVE_PROFILE === "1";
@@ -2639,7 +2639,11 @@ async function signBackIn(page) {
 async function checkHomePublicCopy(page) {
   await waitForSignedHome(page);
   const homeGuiFrame = await waitForCapsuleFrame(page, "home-gui");
-  await homeGuiFrame.waitForFunction(() => Boolean(document.body), null, { timeout: 15_000 });
+  await homeGuiFrame.waitForFunction(
+    () => document.body?.dataset.homeStatus === "ready",
+    null,
+    { timeout: 15_000 },
+  );
   const state = await homeGuiFrame.evaluate(() => {
     const visible = (node) => {
       const style = window.getComputedStyle(node);
@@ -2660,6 +2664,7 @@ async function checkHomePublicCopy(page) {
       horizontal_overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 2,
     };
   });
+  assert(state.text.length > 0, "Home GUI copy check needs rendered content", state);
   const internalCopy = state.text.match(/\b(runtime mirror|permissioned runtime|projection|schema|derived facts?|runtime facts?|capsules?|providers?|capabilit(?:y|ies)|affordances?|authority boundary|provider boundary|gate preview|runtime-owned|host-loaded|structured home intents?|provider operation|launch token|hostcall|objects?)\b/i);
   assert(!internalCopy, "Home GUI exposed implementation copy", { match: internalCopy?.[0], state });
   assert(state.duplicate_headings.length === 0, "Home GUI rendered duplicate visible headings", state);
@@ -2679,6 +2684,18 @@ async function openDesktopAppWindow(page, target) {
   await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
   await waitForSignedHome(page);
   const homeGuiFrame = await waitForCapsuleFrame(page, "home-gui");
+  await homeGuiFrame.waitForFunction(
+    () => document.body?.dataset.homeStatus === "ready",
+    null,
+    { timeout: 20_000 },
+  );
+  // This smoke checks app entry. Recovery Kit and Profile completion have
+  // their own journey proof; use the visible reminder's close control here.
+  const setupReminder = homeGuiFrame.locator("#setup-sheet");
+  if (await setupReminder.isVisible()) {
+    await homeGuiFrame.locator("#setup-sheet-close").click();
+    await setupReminder.waitFor({ state: "hidden", timeout: 5_000 });
+  }
   if (target === "system") {
     await homeGuiFrame.locator("#toolbar-home").click();
     await homeGuiFrame.locator("#identity-menu-system").click();
@@ -3693,6 +3710,7 @@ async function main() {
       principal_id: passkey.principal_id,
       role: passkey.role,
       virtual_authenticator_credentials: credentialStore,
+      first_run_setup_checked: false,
       system_fields: system.fields,
       home_public_copy: homePublicCopy,
       shell_switch: shellSwitch,

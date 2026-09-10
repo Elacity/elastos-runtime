@@ -2,6 +2,17 @@
 
 Last updated: 2026-09-10 UTC
 
+- Latest private working-build proof: Runtime `b726db95` reports 0.7.1, with
+  built, installed and running SHA-256
+  `9a618d0566cb9fa3449e562a9ff813949a80a171356f93061e6265ce2b3f6759`.
+  The separately reviewed storefront is `3a1c5b0f`. Target artifact checks,
+  virtual passkey registration/sign-out/sign-in, nonempty rendered Home and
+  ordinary System Settings entry pass. Test credential revocation passes.
+  The smoke waits for the desktop projection before closing its setup reminder;
+  it explicitly leaves Recovery Kit/Profile completion and the full app matrix
+  to their journey acceptance. The zero-migration guard preserved protected
+  state. Public live is unchanged; final release assembly follows source freeze.
+
 This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
 volatile proof logs remain outside the repository.
