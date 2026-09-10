@@ -19,6 +19,14 @@ work, rather than a link to a private local Runtime. [Execution](docs/EXECUTION.
 owns the verification recipes and monitoring decisions; [state.md](state.md)
 owns source, installed and public facts.
 
+Session handover: [2026-09-10 execution handover](docs/audits/2026-09-10-execution-handover.md).
+Anders requested closeout at 49% weekly usage; resume only on request. After the
+current J1 repairs, prioritize the two visible Home assistants (one reported
+outdated), the model loading failure, and the Browser loading failure. Reproduce
+on the installed artifact before donor integration. Preserve user drafts and
+identity while converging on the intended single assistant. Reconcile branches
+and worktrees before merging; these reported failures remain open acceptance.
+
 This is the current execution queue. Older references below are retained
 follow-up obligations, not permission to bypass this order or the release gate.
 The C1-C7 sequence in the approved plan controls integration and publication.

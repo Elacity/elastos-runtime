@@ -25,11 +25,22 @@ Last updated: 2026-09-10 UTC
 
 - Mac testing exposed unclosed download connections, slow gateway shutdown
   and duplicate media-tool installation. Carrier repair `4e62b6db` passes six
-  focused lifecycle tests and basic repository gates. Gateway and media setup
-  repairs are in progress. These repairs await combined installed verification.
-  User-requested recovery now enters kit selection before passkey setup in
-  working source; exact Profile DID/name restoration and retry behavior are
-  under review. The installed preview retains its earlier recovery flow.
+  focused lifecycle tests and basic repository gates. Gateway connection closure passes five isolated tests; media setup reuse
+  passes seven setup/cache checks. These repairs await combined installed verification.
+  Recovery source `67572db1` enters kit selection before passkey setup;
+  exact Profile DID/name restoration, Home summary and retry checks pass. The installed preview retains its earlier recovery flow.
+
+- Closeout user findings: two Home assistant surfaces (one reported outdated),
+  model loading failure and Browser loading failure. Both `assistant` and
+  `home-agent` capsules exist in this candidate; their intended roles and
+  installed launch paths need reconciliation before retiring either surface.
+  These are priority open J3/J4 product issues, not verified capabilities.
+- Refreshed origin still has dev at `6c61c990`. The protected-content follow-up
+  branch moved from `decab1f5` to `06179578`; re-review its current PR62 scope
+  rather than relying on the older plan snapshot. Closeout inventory found
+  75 local branches and 12 worktrees. Dirty donor work is preserved; the detached
+  Browser build is reachable from `fix/browser-maturity`. Repository-wide
+  branch consolidation remains open.
 
 This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
