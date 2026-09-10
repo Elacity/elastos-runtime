@@ -94,6 +94,8 @@ approved plan retains full release acceptance.
   Ordinary seed UI checks then completed Recovery Kit and Profile creation.
   A subsequent full app smoke stops at its outdated System launcher selector;
   automated shell/app-matrix acceptance remains open in J1/C2.
+  The driver now uses the source-defined ElastOS menu and System Settings
+  control. Syntax, entropy and format checks pass; target rerun is pending.
 - The monitor delivered recurring observations but misapplied a historical stop
   from a prior mission. The original message date and scope established the
   error; the correction was withdrawn and the freshness rule is now explicit.

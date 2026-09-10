@@ -2679,10 +2679,15 @@ async function openDesktopAppWindow(page, target) {
   await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
   await waitForSignedHome(page);
   const homeGuiFrame = await waitForCapsuleFrame(page, "home-gui");
-  await homeGuiFrame.locator("#launcher-toggle").click();
-  const card = homeGuiFrame.locator(`#launcher-grid [data-target="${target}"]`).first();
-  await card.waitFor({ state: "visible", timeout: 10_000 });
-  await card.click();
+  if (target === "system") {
+    await homeGuiFrame.locator("#toolbar-home").click();
+    await homeGuiFrame.locator("#identity-menu-system").click();
+  } else {
+    await homeGuiFrame.locator("#launcher-toggle").click();
+    const card = homeGuiFrame.locator(`#launcher-grid [data-target="${target}"]`).first();
+    await card.waitFor({ state: "visible", timeout: 10_000 });
+    await card.click();
+  }
   // The desktop restores persisted windows at boot and restore can steal
   // focus from the window the launcher just opened, so bind to the newest
   // window for the target rather than whichever one holds the active class.
@@ -2727,7 +2732,7 @@ async function launchSystem(page, homeToken) {
   }, homeToken);
   assertIsolatedLaunchRoute(route, "system");
   // Capsule documents only accept API calls from their sandboxed (opaque
-  // origin) window frames, so open System through the desktop launcher the
+  // origin) window frames, so open System through the ElastOS menu the
   // way a person does instead of navigating the trusted Home page to it.
   const systemFrame = await openDesktopAppWindow(page, "system");
   await systemFrame.locator(".settings-container").waitFor({ state: "visible", timeout: 20_000 });
