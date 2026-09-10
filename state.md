@@ -66,13 +66,45 @@ approved plan retains full release acceptance.
   upgrade creates no backup directory, and inherited shared-write permissions
   can make the installation unsafe. The repairs pass focused Mac/Linux tests,
   including empty and malformed receipts, inherited permissions and preserved
-  existing artifacts. A fresh full target setup will repeat installation and
-  startup using the completed build cache.
+  existing artifacts. The repaired frozen source `3e27cac8`, tree
+  `619657c5fee77bb226d5dedff689f873cbfb93e6`, completes fresh target
+  installation and startup using the completed build cache. Built, installed
+  and running Runtime SHA-256 is
+  `cac06eaef00b95559a5415ddce2ef4c3ba428d9c47deb34eb13121e2624e8947`.
+  All 25 HTTP checks pass, including website/Home artifact parity, redirects,
+  manifest identity and traversal rejection. Private desktop/mobile layout,
+  passkey sign-out/sign-in, Recovery Kit download and Profile creation pass.
+  The public target package is prepared. Public deployment and full journey
+  acceptance remain open.
 - Hosted website evidence can now identify a dated operator check of source,
   tree and artifact hashes on the exact serving origin. Its source template
   stays unverified until public proof. The follow-up passes 22 website tests,
   six truth checks and four rendered receipt cases; it keeps install actions
   unavailable. This dated record makes no claim of continuous verification.
+
+- Subsequent delivery source `a0743a17` binds the exact release envelope bytes
+  to a digest in the signed head. Independent review, 42 installer tests and
+  ten updater tests pass across both metadata transports. This source is outside
+  frozen seed `3e27cac8`. New clients require binding-ready publisher metadata;
+  publication and rollback must preserve that ordering.
+- Installed browser QA exposed stale driver controls and expired-token cleanup.
+  The repaired driver preserves recoverable test credentials, checks the actual
+  cleared sandbox and uses the visible returning-user control. Independent
+  review accepts the repair. Failed attempts remain in private evidence.
+  Ordinary seed UI checks then completed Recovery Kit and Profile creation.
+  A subsequent full app smoke stops at its outdated System launcher selector;
+  automated shell/app-matrix acceptance remains open in J1/C2.
+- The monitor delivered recurring observations but misapplied a historical stop
+  from a prior mission. The original message date and scope established the
+  error; the correction was withdrawn and the freshness rule is now explicit.
+- The user reported 20% weekly usage before the first public result. Current
+  execution is focused on C1 public website/Home delivery. Broader installer
+  and journey work stays queued at this boundary.
+- The public `v0.7.0` tag is `8ac18bec`; the distinct local `0.7.0` tag is
+  `3585f340`. The old updater selects release platform by CPU architecture,
+  so its Mac first hop needs an actual baseline and a recorded bridge decision.
+  Current tag assets and source-home receipts alone do not establish the
+  required ordinary update path.
 
 The source and installed sections below preserve the earlier evidence snapshot.
 Their original identities qualify those results. Current milestone receipts

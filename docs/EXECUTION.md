@@ -76,6 +76,10 @@ Record a restart and the observed result through the public route.
 The existing heartbeat reads the current checkpoint and changed evidence.
 It observes the active coordinator and its explicit owners. Old paused tasks
 keep their pause until an assignment transfers their work.
+Before a stop correction, verify the original user message's date, task and
+scope against the current mission. A historical stop in a reused monitor task
+does not cancel a later authorized mission. Report uncertainty when the source
+instruction cannot be established.
 The monitor writes observations and pending corrections to its private shared
 state in a writable operator folder. The coordinator reads that record at each
 changed milestone and every 30 minutes, then records adoption in its checkpoint.
