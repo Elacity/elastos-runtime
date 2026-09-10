@@ -996,7 +996,7 @@ fn cross_build_details(arch: &str, ws_root: &Path) -> anyhow::Result<CrossBuildD
     let target_dir = cargo_target_dir(ws_root);
     match arch {
         "aarch64" => Ok(CrossBuildDetails {
-            binary_path: target_dir.join("aarch64-unknown-linux-gnu/release/elastos"),
+            binary_path: target_dir.join("aarch64-unknown-linux-musl/release/elastos"),
             artifacts_dir: "artifacts-aarch64",
         }),
         other => anyhow::bail!("Unsupported cross architecture: {}", other),
@@ -1987,6 +1987,22 @@ mod tests {
         assert!(err
             .to_string()
             .contains("--cross aarch64 with --skip-build requested"));
+
+        let selected = super::REQUIRED_SUPPORTED_PUBLISH_CAPSULES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        let target_dir = super::cargo_target_dir(temp.path());
+        let gnu = target_dir.join("aarch64-unknown-linux-gnu/release/elastos");
+        std::fs::create_dir_all(gnu.parent().unwrap()).unwrap();
+        std::fs::write(&gnu, b"stale gnu build").unwrap();
+        let err = validate_publish_inputs(&options, temp.path(), &selected).unwrap_err();
+        assert!(err.to_string().contains("aarch64-unknown-linux-musl"));
+
+        let musl = target_dir.join("aarch64-unknown-linux-musl/release/elastos");
+        std::fs::create_dir_all(musl.parent().unwrap()).unwrap();
+        std::fs::write(&musl, b"publisher musl build").unwrap();
+        validate_publish_inputs(&options, temp.path(), &selected).unwrap();
     }
 
     #[test]

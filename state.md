@@ -129,8 +129,12 @@ approved plan retains full release acceptance.
   the Darwin ARM ledger before the repair. The three-platform ledger test and
   all 21 publisher tests pass; shell export checks pass for three host/cross
   combinations. Independent source review found no further affected consumers.
-  Native Mac support-asset targeting, complete artifact assembly and fresh
-  installation remain delivery work.
+  Native support assets now select the host OS target while microVM guests
+  retain Linux targets. ARM Linux preflight now checks the musl artifact used
+  by the shell publisher; GNU-only input rejects before publication. Three
+  native/guest target cases and all 21 publisher tests pass with independent
+  source review. Complete artifact assembly and fresh installation remain
+  delivery work.
 
 The source and installed sections below preserve the earlier evidence snapshot.
 Their original identities qualify those results. Current milestone receipts

@@ -1146,11 +1146,19 @@ esac
 
 HOST_DATA_DIR="$(default_elastos_data_dir)"
 
-# Host musl target for rootfs compilation.
+# MicroVM guests use Linux even when the publisher runs on macOS.
 case "${ARCH}" in
-    x86_64)  HOST_RUST_TARGET="x86_64-unknown-linux-musl" ;;
-    aarch64) HOST_RUST_TARGET="aarch64-unknown-linux-musl" ;;
+    x86_64)  GUEST_RUST_TARGET="x86_64-unknown-linux-musl" ;;
+    aarch64) GUEST_RUST_TARGET="aarch64-unknown-linux-musl" ;;
     *) die "No musl target for host arch: ${ARCH}" ;;
+esac
+
+# Providers run on the host, independently of the microVM guest target.
+case "${PLATFORM}" in
+    *-linux)       NATIVE_RUST_TARGET="$GUEST_RUST_TARGET" ;;
+    x86_64-darwin)  NATIVE_RUST_TARGET="x86_64-apple-darwin" ;;
+    aarch64-darwin) NATIVE_RUST_TARGET="aarch64-apple-darwin" ;;
+    *) die "No native Rust target for ${PLATFORM}" ;;
 esac
 
 # ── Cross-compilation setup ──────────────────────────────────────────
@@ -1473,7 +1481,7 @@ else
 
     # Phase 1: Compile all capsule binaries sequentially (Cargo handles internal
     # parallelism; avoids lock contention from concurrent cargo invocations).
-    info "  Compiling capsule binaries (${HOST_RUST_TARGET})..."
+    info "  Compiling capsule binaries (${GUEST_RUST_TARGET})..."
     for capsule in "${CAPSULES[@]}"; do
         capsule_dir="$(resolve_capsule_dir "$capsule" || true)"
         capsule_type=""
@@ -1482,7 +1490,7 @@ else
         fi
         if [[ "$capsule_type" == "microvm" && -n "$capsule_dir" && -f "${capsule_dir}/Cargo.toml" ]]; then
             info "    ${capsule} (host)..."
-            (cd "$capsule_dir" && cargo build --release --target "$HOST_RUST_TARGET" 2>&1) \
+            (cd "$capsule_dir" && cargo build --release --target "$GUEST_RUST_TARGET" 2>&1) \
                 || die "Compile failed for ${capsule}"
         fi
     done
@@ -1491,7 +1499,7 @@ else
     VSOCK_PROXY_DIR="elastos/tools/vsock-proxy"
     if [[ -f "${VSOCK_PROXY_DIR}/Cargo.toml" ]]; then
         info "    vsock-proxy (host)..."
-        (cd "$VSOCK_PROXY_DIR" && cargo build --release --target "$HOST_RUST_TARGET" 2>&1) \
+        (cd "$VSOCK_PROXY_DIR" && cargo build --release --target "$GUEST_RUST_TARGET" 2>&1) \
             || die "Compile failed for vsock-proxy"
     fi
 
@@ -1524,7 +1532,7 @@ else
             fi
         fi
         info "    ${capsule} (rootfs)..."
-        ./scripts/build/build-rootfs.sh "$capsule" --skip-compile --target "$HOST_RUST_TARGET" --output "$ARTIFACTS_DIR" \
+        ./scripts/build/build-rootfs.sh "$capsule" --skip-compile --target "$GUEST_RUST_TARGET" --output "$ARTIFACTS_DIR" \
             >"${ROOTFS_LOGS_DIR}/${capsule}.log" 2>&1 \
             || die "Rootfs build failed for ${capsule}. Check log: ${ROOTFS_LOGS_DIR}/${capsule}.log"
     done
@@ -1679,7 +1687,7 @@ info "Publishing direct share/open support assets..."
 UNIVERSAL_DIRECT_ASSETS=$(build_platform_independent_direct_assets "$PLATFORM")
 UNIVERSAL_PROVIDER_CAPSULE_METADATA_ASSETS=$(build_platform_independent_provider_capsule_metadata_assets)
 UNIVERSAL_DIRECT_ASSETS=$(merge_direct_assets "$UNIVERSAL_DIRECT_ASSETS" "$UNIVERSAL_PROVIDER_CAPSULE_METADATA_ASSETS")
-HOST_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets "$PLATFORM" "$SETUP_PLATFORM" "$HOST_RUST_TARGET" false)
+HOST_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets "$PLATFORM" "$SETUP_PLATFORM" "$NATIVE_RUST_TARGET" false)
 HOST_DIRECT_ASSETS=$(merge_direct_assets "$HOST_PLATFORM_DIRECT_ASSETS" "$UNIVERSAL_DIRECT_ASSETS")
 CROSS_DIRECT_ASSETS="{}"
 if [[ -n "$CROSS_ARCH" ]]; then
@@ -1754,16 +1762,16 @@ info "Publishing elastos binary to IPFS..."
 # Stage runtime binary into TMPDIR so publish works from any checkout path.
 STAGED_ELASTOS="${TMPDIR}/elastos"
 if [[ -n "$CARGO_TARGET_DIR" ]]; then
-    HOST_MUSL_ELASTOS="${CARGO_TARGET_DIR}/${HOST_RUST_TARGET}/release/elastos"
+    HOST_MUSL_ELASTOS="${CARGO_TARGET_DIR}/${NATIVE_RUST_TARGET}/release/elastos"
 else
-    HOST_MUSL_ELASTOS="elastos/target/${HOST_RUST_TARGET}/release/elastos"
+    HOST_MUSL_ELASTOS="elastos/target/${NATIVE_RUST_TARGET}/release/elastos"
 fi
 if [[ "$PLATFORM" == *-linux ]]; then
-    ensure_rust_target_installed "$HOST_RUST_TARGET"
+    ensure_rust_target_installed "$NATIVE_RUST_TARGET"
     if [[ "$SKIP_BUILD" != true ]]; then
         if [[ ! -f "$HOST_MUSL_ELASTOS" ]] || ([[ -f "$ELASTOS" ]] && [[ "$HOST_MUSL_ELASTOS" -ot "$ELASTOS" ]]); then
             info "Building portable musl runtime binary for host (${PLATFORM})..."
-            (cd elastos && cargo build --release --target "${HOST_RUST_TARGET}" -p elastos-server) \
+            (cd elastos && cargo build --release --target "${NATIVE_RUST_TARGET}" -p elastos-server) \
                 || die "Portable musl build failed for ${PLATFORM}"
         fi
     fi
