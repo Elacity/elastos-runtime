@@ -519,6 +519,50 @@ def test_setup_stage_cleanup(temp_root):
             raise AssertionError(f"setup changed the built Runtime during {mode}")
 
 
+def test_setup_private_directories(fixture):
+    setup = SETUP.read_text(encoding="utf-8")
+    header = setup.split("ROOT=", 1)[0]
+    function = "ensure_owner_only_data_dir() {" + setup.split(
+        "ensure_owner_only_data_dir() {", 1
+    )[1].split("\ncapsule_entrypoint()", 1)[0]
+    body = '\nDATA_DIR="$1"\nensure_owner_only_data_dir\n'
+    generate = '\nmkdir "$DATA_DIR/config"\nprintf private > "$DATA_DIR/config/new.json"\n'
+
+    for mask in ("0022", "0002"):
+        data = fixture / f"umask-{mask}"
+        run(["bash", "-c", f"umask {mask}\n" + header + function + body + generate, "setup", str(data)])
+        for path in (data, data / "bin", data / "receipts", data / "config"):
+            if stat.S_IMODE(path.stat().st_mode) != 0o700:
+                raise AssertionError(f"setup directory retained inherited umask {mask}")
+        if stat.S_IMODE((data / "config/new.json").stat().st_mode) != 0o600:
+            raise AssertionError("setup generated group-readable or writable private output")
+
+    existing = fixture / "existing-directories"
+    for path in (existing, existing / "bin", existing / "receipts"):
+        path.mkdir(mode=0o775)
+        path.chmod(0o775)
+    keep = existing / "bin/preserved-artifact"
+    keep.write_bytes(b"preserve this artifact")
+    keep.chmod(0o644)
+    run(["bash", "-c", header + function + body, "setup", str(existing)])
+    for path in (existing, existing / "bin", existing / "receipts"):
+        if stat.S_IMODE(path.stat().st_mode) != 0o700:
+            raise AssertionError("setup did not prepare an existing owned directory")
+    if keep.read_bytes() != b"preserve this artifact" or stat.S_IMODE(keep.stat().st_mode) != 0o644:
+        raise AssertionError("directory preparation changed an existing artifact")
+
+    outside = fixture / "outside-directory"
+    outside.mkdir(mode=0o755)
+    outside.chmod(0o755)
+    for name in ("bin", "receipts"):
+        data = fixture / f"linked-{name}"
+        data.mkdir(mode=0o700)
+        (data / name).symlink_to(outside, target_is_directory=True)
+        result = run(["bash", "-c", header + function + body, "setup", str(data)], check=False)
+        if result.returncode == 0 or stat.S_IMODE(outside.stat().st_mode) != 0o755:
+            raise AssertionError("setup followed a managed directory symlink")
+
+
 def assert_setup_orchestration():
     setup = SETUP.read_text(encoding="utf-8")
     call = 'python3 "${ROOT}/scripts/install-source-home-runtime.py"'
@@ -566,6 +610,7 @@ def main():
         test_unsafe_destinations(fixture)
         test_untrusted_built_runtime(fixture)
         test_setup_stage_cleanup(fixture)
+        test_setup_private_directories(fixture)
         unexpected = [path for path in outer.iterdir() if path.name != "fixture"]
         if unexpected:
             raise AssertionError(f"installer left residue outside the fixture: {unexpected}")

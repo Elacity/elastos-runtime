@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -740,8 +741,25 @@ install_collaboration_startup_config() {
 }
 
 ensure_owner_only_data_dir() {
-    mkdir -p "${DATA_DIR}"
-    chmod 700 "${DATA_DIR}"
+    python3 - "${DATA_DIR}" <<'PY'
+import os
+import pathlib
+import sys
+
+data_dir = pathlib.Path(sys.argv[1])
+try:
+    for path in (data_dir, data_dir / "bin", data_dir / "receipts"):
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if os.fstat(descriptor).st_uid != os.geteuid():
+                raise OSError("directory owner mismatch")
+            os.fchmod(descriptor, 0o700)
+        finally:
+            os.close(descriptor)
+except OSError:
+    raise SystemExit("source-home data, bin, and receipt directories must be owned directories")
+PY
 }
 
 capsule_entrypoint() {
