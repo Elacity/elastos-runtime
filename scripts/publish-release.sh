@@ -212,11 +212,11 @@ default_elastos_data_dir() {
         printf '%s\n' "${ELASTOS_DATA_DIR}"
         return
     fi
-    if [[ -n "${XDG_DATA_HOME:-}" ]]; then
-        printf '%s\n' "${XDG_DATA_HOME%/}/elastos"
-        return
-    fi
-    printf '%s\n' "${HOME}/.local/share/elastos"
+    (
+        # The publisher enters the repository root before defining helpers.
+        source scripts/install.sh
+        installer_data_dir "$HOME" "${XDG_DATA_HOME:-}"
+    )
 }
 
 discover_source_bootstrap_json() {

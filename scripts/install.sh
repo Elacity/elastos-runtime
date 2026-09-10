@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# ElastOS Installer — Linux preview web bootstrap, then Carrier-backed updates/setup
+# ElastOS Installer — signed web bootstrap, then Carrier-backed updates/setup
 #
 # Usage:
-#   curl -fsSL https://<publisher-origin>/install.sh | bash   # Linux x86_64/aarch64 preview
+#   curl -fsSL https://<publisher-origin>/install.sh | bash
 #
 #   ELASTOS_HEAD_CID=QmXyz ELASTOS_MAINTAINER_DID=did:key:z6Mk... \
 #     curl -fsSL https://<explicit-gateway>/ipfs/<installer-cid>/install.sh | bash
@@ -23,7 +23,7 @@
 #
 # Downloads exactly 2 files:
 #   1. elastos binary → ~/.local/bin/elastos
-#   2. components.json → ${XDG_DATA_HOME:-~/.local/share}/elastos/components.json
+#   2. components.json → the platform's ElastOS application-data directory
 #
 # Capsules are NOT pre-installed. They are downloaded on-demand by the
 # supervisor when a command needs them (e.g., `elastos chat` downloads
@@ -35,7 +35,7 @@
 #   3. Follow latest_release_cid to release.json
 #   4. Verify release signature
 #   5. Download binary + components.json, verify SHA-256
-#   6. Install to ~/.local/bin/elastos + ${XDG_DATA_HOME:-~/.local/share}/elastos/
+#   6. Install to ~/.local/bin/elastos + the platform's ElastOS data directory
 #   7. Save trusted-source Carrier metadata for later `setup` and `update`
 #
 # Fails closed if trust anchors or signature verification fail, unless the
@@ -44,6 +44,7 @@
 # Dependencies: curl, python3 (stdlib only), sha256sum|shasum
 #
 
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
 set -euo pipefail
 
 # ── Trust anchors (baked in by publish-release.sh) ────────────────────
@@ -118,11 +119,11 @@ NC='\033[0m'
 show_help() {
     echo ""
     echo -e "${BOLD}ElastOS Installer${NC}"
-    echo "  Current public install preview: Linux x86_64/aarch64."
-    echo "  macOS uses source-home staging for now; see docs/MAC.md."
+    echo "  Release lookup: Linux x86_64/aarch64 and macOS Apple silicon."
+    echo "  The signed release determines which platforms have downloads."
     echo ""
     echo -e "${BOLD}Usage:${NC}"
-    echo "  curl -fsSL https://<publisher-origin>/install.sh | bash   # Linux x86_64/aarch64 preview"
+    echo "  curl -fsSL https://<publisher-origin>/install.sh | bash"
     echo "  curl -fsSL https://<explicit-gateway>/ipfs/<installer-cid>/install.sh | bash   # operator/debug only"
     echo "  ./scripts/install.sh [options]"
     echo ""
@@ -139,6 +140,7 @@ show_help() {
     echo -e "${BOLD}What gets installed:${NC}"
     echo "  ~/.local/bin/elastos                     Runtime binary"
     echo "  \${XDG_DATA_HOME:-~/.local/share}/elastos/components.json   Capsule registry"
+    echo "  macOS registry: ~/Library/Application Support/elastos/components.json"
     echo ""
     echo -e "${BOLD}What does NOT get installed:${NC}"
     echo "  Capsules are downloaded on-demand when you run commands."
@@ -155,12 +157,30 @@ show_help() {
     echo ""
     exit 0
 }
+fi
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
-die()  { echo -e "${RED}Error:${NC} $*" >&2; exit 1; }
-info() { echo -e "  ${GREEN}▶${NC} $*"; }
-warn() { echo -e "  ${YELLOW}!${NC} $*"; }
+die()  { echo -e "${RED:-}Error:${NC:-} $*" >&2; exit 1; }
+info() { echo -e "  ${GREEN:-}▶${NC:-} $*"; }
+warn() { echo -e "  ${YELLOW:-}!${NC:-} $*"; }
+
+installer_data_dir() {
+    local home_dir="$1"
+    local xdg_data_home="${2:-}"
+    [[ "$home_dir" == /* ]] || die "Home directory must be an absolute path"
+    case "$(uname -s)" in
+        Darwin) printf '%s\n' "${home_dir%/}/Library/Application Support/elastos" ;;
+        Linux)
+            if [[ "$xdg_data_home" == /* ]]; then
+                printf '%s\n' "${xdg_data_home%/}/elastos"
+            else
+                printf '%s\n' "${home_dir%/}/.local/share/elastos"
+            fi
+            ;;
+        *) die "Unsupported OS: $(uname -s)" ;;
+    esac
+}
 
 detect_platform() {
     OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -175,7 +195,11 @@ detect_platform() {
 
     case "${OS}" in
         linux)  PLATFORM="${ARCH}-linux" ;;
-        *) die "Unsupported OS: ${OS}. Current public install preview is Linux-only." ;;
+        darwin)
+            [[ "$ARCH" == aarch64 ]] || die "macOS release lookup requires Apple silicon"
+            PLATFORM="aarch64-darwin"
+            ;;
+        *) die "Unsupported OS: ${OS}" ;;
     esac
 }
 
@@ -265,110 +289,234 @@ sha256_file() {
     fi
 }
 
-stop_stale_runtime_if_needed() {
-    local coords_path="$1"
-    local label="$2"
-    local expected_sha="$3"
-    local pid=""
-    local running_sha=""
-
-    [[ -f "$coords_path" ]] || return 0
-
-    read -r pid running_sha < <(python3 - "$coords_path" <<'PY'
+installer_runtime_control() {
+    # All callers stop verified processes before changing the selected install.
+    # Smoke cleanup can disable the binary scan when using a shared branch binary.
+    python3 - "$@" <<'PY_RUNTIME_CONTROL'
 import json
-import sys
-
-path = sys.argv[1]
-try:
-    data = json.load(open(path, "r", encoding="utf-8"))
-except Exception:
-    print("")
-    sys.exit(0)
-pid = data.get("pid", "")
-sha = data.get("binary_sha256", "")
-print(f"{pid} {sha}")
-PY
-    )
-
-    if [[ -z "$pid" ]]; then
-        rm -f "$coords_path"
-        return 0
-    fi
-
-    if [[ ! -d "/proc/${pid}" ]]; then
-        rm -f "$coords_path"
-        return 0
-    fi
-
-    if [[ -n "$running_sha" && "$running_sha" == "$expected_sha" ]]; then
-        return 0
-    fi
-
-    info "Stopping stale ${label} (pid ${pid}) so the new install starts cleanly"
-    kill "${pid}" 2>/dev/null || true
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        [[ ! -d "/proc/${pid}" ]] && break
-        sleep 0.2
-    done
-    if [[ -d "/proc/${pid}" ]]; then
-        kill -9 "${pid}" 2>/dev/null || true
-    fi
-    rm -f "$coords_path"
-}
-
-stop_stale_installed_elastos_processes() {
-    local label="$1"
-    local expected_sha="$2"
-    shift 2
-    local binary="${INSTALL_DIR}/elastos"
-    local pid=""
-    local running_sha=""
-
-    [[ -x "$binary" ]] || return 0
-
-    while IFS= read -r pid; do
-        [[ -n "$pid" ]] || continue
-        [[ -d "/proc/${pid}" ]] || continue
-        running_sha=$(sha256_file "/proc/${pid}/exe" 2>/dev/null || true)
-        if [[ -n "$running_sha" && "$running_sha" == "$expected_sha" ]]; then
-            continue
-        fi
-        info "Stopping stale ${label} (pid ${pid}) so the new install starts cleanly"
-        kill "${pid}" 2>/dev/null || true
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            [[ ! -d "/proc/${pid}" ]] && break
-            sleep 0.2
-        done
-        if [[ -d "/proc/${pid}" ]]; then
-            kill -9 "${pid}" 2>/dev/null || true
-        fi
-    done < <(python3 - "$binary" "$@" <<'PY'
 import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
 import sys
+import time
 
-binary = os.path.realpath(sys.argv[1])
-expected_args = sys.argv[2:]
+PREFIXES = ("serve", "gateway", "room open")
 
-for pid in os.listdir("/proc"):
-    if not pid.isdigit():
-        continue
+
+def process_snapshot(pid):
+    if type(pid) is not int or not 1 < pid < 2**31:
+        raise ValueError("Runtime PID must be a positive process ID greater than one")
     try:
-        raw = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
-    except Exception:
-        continue
-    raw = [item.decode("utf-8", "ignore") for item in raw if item]
-    if not raw:
-        continue
-    try:
-        exe = os.path.realpath(raw[0])
-    except Exception:
-        continue
-    if exe != binary:
-        continue
-    if raw[1:1 + len(expected_args)] == expected_args:
-        print(pid)
-PY
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        raise ValueError("Runtime process belongs to another owner")
+    result = subprocess.run(
+        ["ps", "-ww", "-p", str(pid), "-o", "uid=", "-o", "lstart=", "-o", "stat=", "-o", "command="],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, LC_ALL="C"), text=True, check=False,
     )
+    if result.returncode:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        raise ValueError("Runtime process identity is unavailable")
+    parts = result.stdout.strip().split(None, 7)
+    if len(parts) != 8 or not parts[0].isdigit():
+        raise ValueError("Runtime process identity is ambiguous")
+    if int(parts[0]) != os.geteuid():
+        raise ValueError("Runtime process belongs to another owner")
+    if parts[6].startswith("Z"):
+        return None
+    return (" ".join(parts[1:6]), parts[7])
+
+
+def matches_command(snapshot, binary, prefixes=PREFIXES):
+    for prefix in prefixes:
+        command = binary + " " + prefix
+        if snapshot[1] == command or snapshot[1].startswith(command + " "):
+            return True
+    return False
+
+
+def stop_owned_process(pid, expected, binary, prefixes=PREFIXES):
+    if not matches_command(expected, binary, prefixes):
+        raise ValueError("Runtime process does not match the selected binary and command")
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        current = process_snapshot(pid)
+        if current is None:
+            return
+        if current != expected:
+            raise ValueError("Runtime process identity changed; preserved the new process")
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return
+        for _ in range(20):
+            current = process_snapshot(pid)
+            if current is None:
+                return
+            if current != expected:
+                raise ValueError("Runtime process identity changed; preserved the new process")
+            time.sleep(0.1)
+    raise ValueError("Runtime process did not stop; preserved its state")
+
+
+def read_coords(path):
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(descriptor, "rb") as source:
+        metadata = os.fstat(source.fileno())
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & 0o077):
+            raise ValueError("Runtime coordinates require an owner-only regular file")
+        data = source.read(65537)
+    if len(data) > 65536:
+        raise ValueError("Runtime coordinates exceed the size limit")
+    value = json.loads(data)
+    pid = value.get("pid")
+    if type(pid) is not int or not 1 < pid < 2**31:
+        raise ValueError("Runtime coordinates contain an invalid PID")
+    return (pid, data, metadata.st_dev, metadata.st_ino, metadata.st_mtime)
+
+
+def remove_dead_coords(path, recorded):
+    current = read_coords(path)
+    if current is None:
+        return
+    if current != recorded or process_snapshot(recorded[0]) is not None:
+        raise ValueError("Runtime coordinates changed; preserved the new state")
+    path.unlink()
+
+
+def selected_processes(binary):
+    result = subprocess.run(
+        ["ps", "-ww", "-u", str(os.geteuid()), "-o", "pid=", "-o", "command="],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, LC_ALL="C"), text=True, check=False,
+    )
+    if result.returncode:
+        raise ValueError("Cannot inspect processes for the selected installation")
+    found = {}
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) != 2 or not fields[0].isdigit():
+            continue
+        if not matches_command(("", fields[1]), binary):
+            if matches_command(("", fields[1]), os.path.basename(binary)):
+                raise ValueError("A Runtime command has an ambiguous binary path; close it and retry")
+            continue
+        pid = int(fields[0])
+        snapshot = process_snapshot(pid)
+        if snapshot is not None:
+            if not matches_command(snapshot, binary):
+                raise ValueError("Runtime process changed during inspection")
+            found[pid] = snapshot
+    return found
+
+
+def descendant_processes(parents):
+    if not parents:
+        return {}
+    result = subprocess.run(
+        ["ps", "-axo", "pid=", "-o", "ppid="],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, LC_ALL="C"), text=True, check=False,
+    )
+    if result.returncode:
+        raise ValueError("Cannot inspect Runtime child processes")
+    relationships = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not all(field.isdigit() for field in fields):
+            raise ValueError("Runtime child process ownership is ambiguous")
+        relationships.append(tuple(map(int, fields)))
+    found = {}
+    family = set(parents)
+    while True:
+        children = {pid for pid, parent in relationships if parent in family and pid not in family}
+        if not children:
+            return found
+        for pid in children:
+            snapshot = process_snapshot(pid)
+            if snapshot is not None:
+                found[pid] = snapshot
+        family.update(children)
+
+
+def wait_for_descendants(children):
+    # One overall deadline, independent of the number of captured children.
+    deadline = time.monotonic() + 2
+    pending = dict(children)
+    while pending:
+        for pid, expected in list(pending.items()):
+            current = process_snapshot(pid)
+            if current is None:
+                del pending[pid]
+            elif current != expected:
+                raise ValueError("Runtime child identity changed; preserved its state")
+        if not pending:
+            return
+        if time.monotonic() >= deadline:
+            raise ValueError("Runtime child remains active; preserved its state")
+        time.sleep(0.1)
+
+
+def stop_installation(data_dir, binary, scan_binary):
+    binary = os.path.abspath(binary)
+    data_dir = Path(data_dir)
+    records = []
+    selected = {}
+    # Validate every recorded owner before sending the first signal.
+    for name in ("runtime-coords.json", "home-runtime-coords.json", "gateway-runtime-coords.json"):
+        path = data_dir / name
+        recorded = read_coords(path)
+        if recorded is None:
+            continue
+        records.append((path, recorded))
+        pid = recorded[0]
+        snapshot = process_snapshot(pid)
+        if snapshot is not None:
+            if not matches_command(snapshot, binary):
+                raise ValueError("Recorded Runtime is foreign or ambiguous; preserved its process and state")
+            # ps lstart and this Python process use the same local timezone.
+            # Its second precision rejects definite PID reuse; coordinates do
+            # not yet carry a process birth identity for finer comparisons.
+            started = time.mktime(time.strptime(snapshot[0], "%a %b %d %H:%M:%S %Y"))
+            if started > int(recorded[4]):
+                raise ValueError("Runtime process started after its ownership record; preserved its process and state")
+            selected[pid] = snapshot
+    if scan_binary:
+        for pid, snapshot in selected_processes(binary).items():
+            if pid not in selected:
+                raise ValueError("A process using this binary has no ownership record in the selected data directory; close it and retry")
+            if selected[pid] != snapshot:
+                raise ValueError("Runtime process identity changed during inspection")
+    children = descendant_processes(selected)
+    for pid, snapshot in selected.items():
+        stop_owned_process(pid, snapshot, binary)
+    wait_for_descendants(children)
+    if scan_binary and selected_processes(binary):
+        raise ValueError("A new Runtime started during cleanup; preserved its state")
+    for path, recorded in records:
+        remove_dead_coords(path, recorded)
+
+
+if __name__ == "__main__":
+    try:
+        if len(sys.argv) != 4 or sys.argv[3] not in ("true", "false"):
+            raise ValueError("Expected data directory, Runtime binary and binary-scan flag")
+        stop_installation(sys.argv[1], sys.argv[2], sys.argv[3] == "true")
+    except (ValueError, OSError, TypeError, AttributeError) as error:
+        print("Runtime cleanup stopped: " + str(error), file=sys.stderr)
+        sys.exit(1)
+PY_RUNTIME_CONTROL
 }
 
 # Fetch a CID from IPFS gateways (tries each in order)
@@ -592,6 +740,12 @@ PY_RELEASE_IDENTITY
 
 # ── Parse args ────────────────────────────────────────────────────────
 
+# Repo smoke/publisher helpers source these definitions inside a subshell.
+# The downloaded installer remains one self-contained script.
+if [[ "${BASH_SOURCE[0]:-$0}" != "$0" ]]; then
+    return 0
+fi
+
 ALLOW_UNSIGNED=false
 INSTALL_DIR="${HOME}/.local/bin"
 
@@ -788,6 +942,12 @@ sha256_check "${TMPDIR}/components.json" "$COMPONENTS_SHA256"
 
 # ── Install (2 files) ────────────────────────────────────────────────
 
+DATA_DIR="$(installer_data_dir "$HOME" "${XDG_DATA_HOME:-}")"
+info "Stopping verified Runtime processes for this installation before its protected-root check..."
+installer_runtime_control "$DATA_DIR" "${INSTALL_DIR}/elastos" true \
+    || die "Close this installation's Runtime and retry; its existing files were preserved"
+info "Open Home again after installation to reconnect."
+
 info "Installing binary to ${INSTALL_DIR}/elastos..."
 mkdir -p "$INSTALL_DIR"
 TMP_INSTALL_BIN="${INSTALL_DIR}/.elastos.install.tmp"
@@ -800,7 +960,6 @@ if ! printf '%s' "${INSTALLED_VERSION_OUTPUT}" | grep -Fq "${RELEASE_VERSION}"; 
     die "Installed binary version mismatch at ${INSTALL_DIR}/elastos\n  Expected: ${RELEASE_VERSION}\n  Got:      ${INSTALLED_VERSION_OUTPUT:-<no output>}"
 fi
 
-DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/elastos"
 mkdir -p "$DATA_DIR"
 
 # Evict stale cached capsules when components.json changes (CID mismatch).
@@ -831,11 +990,6 @@ fi
 
 info "Installing components.json to ${DATA_DIR}/..."
 cp "${TMPDIR}/components.json" "${DATA_DIR}/components.json"
-
-stop_stale_runtime_if_needed "${DATA_DIR}/runtime-coords.json" "runtime" "${BINARY_SHA256}"
-stop_stale_runtime_if_needed "${DATA_DIR}/home-runtime-coords.json" "Home runtime" "${BINARY_SHA256}"
-stop_stale_installed_elastos_processes "Room gateway" "${BINARY_SHA256}" room open
-stop_stale_installed_elastos_processes "gateway" "${BINARY_SHA256}" gateway
 
 PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"
 info "Verifying and upgrading configured protected roots while Runtime is stopped..."

@@ -8,24 +8,29 @@ source "${SCRIPT_DIR}/lib/public-install-guards.sh"
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
 FORCE_RELAY_ONLY="${ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY:-0}"
 HOME_DIR="$(mktemp -d /tmp/elastos-public-home-XXXXXX)"
+DATA_DIR=""
 
 cleanup() {
-    cleanup_elastos_runtime_home "$HOME_DIR"
+    if [[ -n "$DATA_DIR" ]] && ! cleanup_elastos_runtime_home "$HOME_DIR" "$DATA_DIR" "${RUN_BIN:-${HOME_DIR}/.local/bin/elastos}"; then
+        echo "[public-home-frontdoor] cleanup could not verify shutdown; preserved ${HOME_DIR}" >&2
+        exit 1
+    fi
     rm -rf "$HOME_DIR"
 }
 trap cleanup EXIT
+DATA_DIR="$(elastos_runtime_data_dir "$HOME_DIR" "${HOME_DIR}/xdg-data")"
 
 echo "[public-home-frontdoor] install from public gateway"
 HOME="$HOME_DIR" \
 XDG_DATA_HOME="$HOME_DIR/xdg-data" \
 ELASTOS_PUBLISHER_GATEWAY="$PUBLISHER_GATEWAY" \
-bash -lc 'curl -fsSL "${ELASTOS_PUBLISHER_GATEWAY%/}/install.sh" | bash' \
-    >/tmp/elastos-public-home-install.log
+bash --noprofile --norc -c 'set -eo pipefail; curl -fsSL "${ELASTOS_PUBLISHER_GATEWAY%/}/install.sh" | bash' \
+    >"${HOME_DIR}/install.log"
 
 INSTALLED_BIN="$HOME_DIR/.local/bin/elastos"
 RUN_BIN="${ELASTOS_BIN_OVERRIDE:-$INSTALLED_BIN}"
-SOURCES_PATH="$HOME_DIR/xdg-data/elastos/sources.json"
-INSTALLED_COMPONENTS_MANIFEST="$HOME_DIR/xdg-data/elastos/components.json"
+SOURCES_PATH="$DATA_DIR/sources.json"
+INSTALLED_COMPONENTS_MANIFEST="$DATA_DIR/components.json"
 if [[ ! -x "$INSTALLED_BIN" ]]; then
     echo "[public-home-frontdoor] installed binary missing: $INSTALLED_BIN" >&2
     exit 1
@@ -86,7 +91,7 @@ guard_branch_binary_requires_checksummed_public_manifest "$INSTALLED_COMPONENTS_
 HOME="$HOME_DIR" \
 XDG_DATA_HOME="$HOME_DIR/xdg-data" \
 ELASTOS_COMPONENTS_MANIFEST="$INSTALLED_COMPONENTS_MANIFEST" \
-"$RUN_BIN" setup >/tmp/elastos-public-home-setup.log
+"$RUN_BIN" setup >"${HOME_DIR}/setup.log"
 
 echo "[public-home-frontdoor] prove installed elastos -> home -> chat -> home/quit/esc -> home"
 HOME_DIR="$HOME_DIR" RUN_BIN="$RUN_BIN" ELASTOS_COMPONENTS_MANIFEST="$INSTALLED_COMPONENTS_MANIFEST" python3 - <<'PY'
