@@ -38,10 +38,10 @@
 #   6. Install to ~/.local/bin/elastos + ${XDG_DATA_HOME:-~/.local/share}/elastos/
 #   7. Save trusted-source Carrier metadata for later `setup` and `update`
 #
-# Fails closed: if trust anchors are missing or OpenSSL doesn't support
-# Ed25519 and --allow-unsigned is not passed, the installer exits.
+# Fails closed if trust anchors or signature verification fail, unless the
+# operator explicitly selects --allow-unsigned.
 #
-# Dependencies: curl, python3, openssl (1.1.1+ for Ed25519), sha256sum|shasum
+# Dependencies: curl, python3 (stdlib only), sha256sum|shasum
 #
 
 set -euo pipefail
@@ -218,8 +218,10 @@ print(node_id)
         return 0
     fi
 
-    local refreshed=()
-    mapfile -t refreshed <<<"$parsed"
+    local refreshed=() line
+    while IFS= read -r line; do
+        refreshed+=("$line")
+    done <<<"$parsed"
     if [[ "${SOURCE_CONNECT_TICKET_EXPLICIT}" != true ]]; then
         SOURCE_CONNECT_TICKET="${refreshed[0]:-}"
     fi
@@ -374,7 +376,7 @@ ipfs_fetch() {
     local cid="$1"
     local output="$2"
     local url
-    for gw in "${GATEWAYS[@]}"; do
+    for gw in ${GATEWAYS[@]+"${GATEWAYS[@]}"}; do
         url="${gw}/ipfs/${cid}"
         if curl -fsSL --max-time 30 -o "$output" "$url" 2>/dev/null; then
             LAST_SUCCESS_GATEWAY="$gw"
@@ -391,106 +393,21 @@ ipfs_fetch() {
 json_get() {
     local file="$1"
     local expr="$2"
-    python3 -c "
+    python3 - "$file" "$expr" <<'PY'
 import json, sys
-with open('${file}', 'r') as f:
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
     d = json.load(f)
 try:
-    v = ${expr}
+    v = eval(sys.argv[2], {"d": d})
     if v is None:
         sys.exit(0)
     print(v)
 except (KeyError, TypeError, IndexError):
     sys.exit(0)
-"
-}
-
-# Compact JSON payload (equivalent to jq -c '.payload')
-json_payload() {
-    local file="$1"
-    python3 -c "
-import json
-with open('${file}', 'r') as f:
-    d = json.load(f)
-print(json.dumps(d['payload'], separators=(',', ':')))"
-}
-
-# Canonical sorted JSON (equivalent to jq -cS .)
-json_canonical() {
-    python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-print(json.dumps(d, separators=(',', ':'), sort_keys=True))"
-}
-
-hex_to_bin() {
-    local hex="$1"
-    local output="$2"
-    python3 - "$hex" "$output" <<'PY'
-import pathlib
-import sys
-
-hex_data = sys.argv[1].strip()
-output = pathlib.Path(sys.argv[2])
-output.write_bytes(bytes.fromhex(hex_data))
 PY
 }
 
 # ── Ed25519 verification ─────────────────────────────────────────────
-
-has_ed25519() {
-    if openssl list -public-key-algorithms 2>/dev/null | grep -qi "ED25519"; then
-        return 0
-    fi
-    openssl genpkey -algorithm ED25519 -out /dev/null >/dev/null 2>&1
-}
-
-decode_did_to_hex() {
-    local did="$1"
-    local multibase="${did#did:key:z}"
-    [[ "$multibase" == "$did" ]] && die "Invalid DID format: $did"
-
-    local raw_hex
-    if command -v python3 &>/dev/null; then
-        raw_hex=$(python3 -c "
-import sys
-ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
-def b58decode(s):
-    n = 0
-    for c in s:
-        n = n * 58 + ALPHABET.index(c)
-    pad = len(s) - len(s.lstrip('1'))
-    result = []
-    while n > 0:
-        result.append(n & 0xff)
-        n >>= 8
-    return bytes(pad) + bytes(reversed(result))
-raw = b58decode('${multibase}')
-if len(raw) != 34 or raw[0] != 0xed or raw[1] != 0x01:
-    print('ERROR', file=sys.stderr)
-    sys.exit(1)
-print(raw[2:].hex())
-") || die "Failed to decode DID"
-    elif command -v perl &>/dev/null; then
-        raw_hex=$(perl -e '
-my @alpha = split //, "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-my %val; $val{$alpha[$_]} = $_ for 0..57;
-my $s = "'"${multibase}"'";
-use Math::BigInt;
-my $n = Math::BigInt->new(0);
-$n = $n * 58 + $val{$_} for split //, $s;
-my $hex = $n->as_hex(); $hex =~ s/^0x//;
-$hex = "0" . $hex if length($hex) % 2;
-while (length($hex) < 68) { $hex = "00" . $hex; }
-die "Bad multicodec" unless substr($hex, 0, 4) eq "ed01";
-print substr($hex, 4);
-') || die "Failed to decode DID"
-    else
-        die "Need python3 or perl for base58 decoding"
-    fi
-
-    echo "$raw_hex"
-}
 
 verify_signature() {
     local json_file="$1"
@@ -502,52 +419,174 @@ verify_signature() {
         return 0
     fi
 
-    if ! has_ed25519; then
-        die "OpenSSL does not support Ed25519 on this system.\n  Install OpenSSL 1.1.1+ or pass --allow-unsigned (NOT recommended)."
-    fi
+    if ! python3 - "$json_file" "$domain" "$expected_did" <<'PY_ED25519'
+# RFC 8032 sections 5.1.3, 5.1.4 and 5.1.7:
+# https://www.rfc-editor.org/rfc/rfc8032.html#section-5.1
+# Verification only: all curve operations below use public data.
+import hashlib
+import json
+import re
+import sys
 
-    local payload sig_hex signer_did payload_signer_did
-    payload=$(json_payload "$json_file")
-    sig_hex=$(json_get "$json_file" 'd["signature"]')
-    signer_did=$(json_get "$json_file" 'd["signer_did"]')
-    payload_signer_did=$(json_get "$json_file" 'd.get("payload",{}).get("signer_did","")')
+FIELD = 2**255 - 19
+ORDER = 2**252 + 27742317777372353535851937790883648493
+D = -121665 * pow(121666, FIELD - 2, FIELD) % FIELD
+SQRT_MINUS_ONE = pow(2, (FIELD - 1) // 4, FIELD)
+IDENTITY = (0, 1, 1, 0)
 
-    if [[ "$signer_did" != "$expected_did" ]]; then
-        die "Signer mismatch!\n  Expected: ${expected_did}\n  Got:      ${signer_did}"
-    fi
-    if [[ -n "$payload_signer_did" && "$payload_signer_did" != "$signer_did" ]]; then
-        die "Payload/envelope signer mismatch!\n  Payload:  ${payload_signer_did}\n  Envelope: ${signer_did}"
-    fi
 
-    local canonical
-    canonical=$(echo -n "$payload" | json_canonical)
+def point_add(left, right):
+    x1, y1, z1, t1 = left
+    x2, y2, z2, t2 = right
+    a = (y1 - x1) * (y2 - x2) % FIELD
+    b = (y1 + x1) * (y2 + x2) % FIELD
+    c = 2 * D * t1 * t2 % FIELD
+    d = 2 * z1 * z2 % FIELD
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % FIELD, g * h % FIELD, f * g % FIELD, e * h % FIELD)
 
-    local digest_hex
-    digest_hex=$(printf '%s\0%s' "$domain" "$canonical" | sha256sum | cut -d' ' -f1 2>/dev/null) \
-        || digest_hex=$(printf '%s\0%s' "$domain" "$canonical" | shasum -a 256 | cut -d' ' -f1)
 
-    local pubkey_hex
-    pubkey_hex=$(decode_did_to_hex "$signer_did")
+def point_mul(scalar, point):
+    result = IDENTITY
+    while scalar:
+        if scalar & 1:
+            result = point_add(result, point)
+        point = point_add(point, point)
+        scalar >>= 1
+    return result
 
-    local der_prefix="302a300506032b6570032100"
-    local tmpdir
-    tmpdir=$(mktemp -d)
 
-    hex_to_bin "${der_prefix}${pubkey_hex}" "${tmpdir}/pubkey.der"
-    openssl pkey -inform DER -pubin -in "${tmpdir}/pubkey.der" -out "${tmpdir}/pubkey.pem" 2>/dev/null \
-        || die "Failed to create PEM from public key"
+def point_equal(left, right):
+    return ((left[0] * right[2] - right[0] * left[2]) % FIELD == 0
+            and (left[1] * right[2] - right[1] * left[2]) % FIELD == 0)
 
-    hex_to_bin "$digest_hex" "${tmpdir}/digest.bin"
-    hex_to_bin "$sig_hex" "${tmpdir}/sig.bin"
 
-    if openssl pkeyutl -verify -pubin -inkey "${tmpdir}/pubkey.pem" \
-        -in "${tmpdir}/digest.bin" -sigfile "${tmpdir}/sig.bin" \
-        -rawin 2>/dev/null; then
-        rm -rf "$tmpdir"
-        info "Signature verified"
-    else
-        rm -rf "$tmpdir"
+def decode_point(encoded):
+    if len(encoded) != 32:
+        raise ValueError("Ed25519 point must contain 32 bytes")
+    packed = int.from_bytes(encoded, "little")
+    y, sign = packed & (2**255 - 1), packed >> 255
+    if y >= FIELD:
+        raise ValueError("Noncanonical Ed25519 point")
+    y_squared = y * y % FIELD
+    x_squared = (y_squared - 1) * pow(D * y_squared + 1, FIELD - 2, FIELD) % FIELD
+    x = pow(x_squared, (FIELD + 3) // 8, FIELD)
+    if (x * x - x_squared) % FIELD:
+        x = x * SQRT_MINUS_ONE % FIELD
+    if (x * x - x_squared) % FIELD or (x == 0 and sign):
+        raise ValueError("Invalid Ed25519 point")
+    if x & 1 != sign:
+        x = FIELD - x
+    return (x, y, 1, x * y % FIELD)
+
+
+BASE = decode_point(bytes.fromhex("58" + "66" * 31))
+
+
+def verify_ed25519(public_key, message, signature):
+    if len(signature) != 64:
+        raise ValueError("Ed25519 signature must contain 64 bytes")
+    public = decode_point(public_key)
+    r_point = decode_point(signature[:32])
+    scalar = int.from_bytes(signature[32:], "little")
+    if scalar >= ORDER:
+        raise ValueError("Noncanonical Ed25519 scalar")
+    # The installer accepts canonical points and the strict verification
+    # equation. Reject small-order keys and R values, including the identity.
+    if any(point_equal(point_mul(8, point), IDENTITY) for point in (public, r_point)):
+        raise ValueError("Small-order Ed25519 point")
+    challenge = int.from_bytes(
+        hashlib.sha512(signature[:32] + public_key + message).digest(), "little"
+    ) % ORDER
+    if not point_equal(point_mul(scalar, BASE), point_add(r_point, point_mul(challenge, public))):
+        raise ValueError("Ed25519 signature does not match")
+
+
+def decode_did_key(did):
+    if not isinstance(did, str) or not did.startswith("did:key:z"):
+        raise ValueError("Expected an Ed25519 did:key with base58btc encoding")
+    encoded = did[len("did:key:z"):]
+    if not 1 <= len(encoded) <= 64:
+        raise ValueError("Invalid DID key length")
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    number = 0
+    for char in encoded:
+        number = number * 58 + alphabet.index(char)
+    raw = (b"\0" * (len(encoded) - len(encoded.lstrip("1")))
+           + number.to_bytes((number.bit_length() + 7) // 8, "big"))
+    if len(raw) != 34 or raw[:2] != b"\xed\x01":
+        raise ValueError("DID key must use the Ed25519 multicodec")
+    return raw[2:]
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON field: " + key)
+        result[key] = value
+    return result
+
+
+def verify_envelope(json_file, domain, expected_did):
+    with open(json_file, "r", encoding="utf-8") as source:
+        envelope = json.load(source, object_pairs_hook=unique_object)
+    signer = envelope["signer_did"]
+    if not expected_did or signer != expected_did:
+        raise ValueError("Envelope signer differs from the pinned maintainer DID")
+    payload = envelope["payload"]
+    if not isinstance(payload, dict):
+        raise ValueError("Release payload must be a JSON object")
+    if "signer_did" in payload and payload["signer_did"] != signer:
+        raise ValueError("Payload and envelope signer differ")
+    signature = envelope["signature"]
+    if not isinstance(signature, str) or not re.fullmatch(r"[0-9a-fA-F]{128}", signature):
+        raise ValueError("Signature must contain 64 hex-encoded bytes")
+    # Matches the publisher's compact sorted UTF-8 JSON and Runtime's
+    # SHA256(domain + NUL + payload), signed with ordinary Ed25519.
+    canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True,
+                           ensure_ascii=False, allow_nan=False).encode("utf-8")
+    digest = hashlib.sha256(domain.encode("utf-8") + b"\0" + canonical).digest()
+    verify_ed25519(decode_did_key(signer), digest, bytes.fromhex(signature))
+
+
+if __name__ == "__main__":
+    try:
+        verify_envelope(*sys.argv[1:])
+    except (ValueError, TypeError, KeyError, OSError, AttributeError) as error:
+        print("Signature verification failed: " + str(error), file=sys.stderr)
+        sys.exit(1)
+PY_ED25519
+    then
         die "Signature verification FAILED"
+    fi
+    info "Signature verified"
+}
+
+validate_release_identity() {
+    # Both envelopes are verified before this check. A publisher URL can serve
+    # documents from different publications while its files are being replaced.
+    if ! python3 - "$1" "$2" <<'PY_RELEASE_IDENTITY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        head = json.load(source)["payload"]
+    with open(sys.argv[2], encoding="utf-8") as source:
+        release = json.load(source)["payload"]
+    if head.get("schema") != "elastos.release.head/v1" or release.get("schema") != "elastos.release/v1":
+        raise ValueError("Unexpected release schema")
+    for field in ("version", "channel"):
+        value = head.get(field)
+        if not isinstance(value, str) or not value or release.get(field) != value:
+            raise ValueError("Release head and release " + field + " must match")
+except (ValueError, TypeError, KeyError, OSError, AttributeError) as error:
+    print("Release identity check failed: " + str(error), file=sys.stderr)
+    sys.exit(1)
+PY_RELEASE_IDENTITY
+    then
+        die "Release schema, version or channel mismatch; retry after the publisher finishes updating"
     fi
 }
 
@@ -594,7 +633,7 @@ if [[ ${#CLI_GATEWAYS[@]} -gt 0 ]]; then
 elif [[ -n "${ELASTOS_IPFS_GATEWAYS:-}" ]]; then
     GATEWAYS=()
     IFS=', ' read -r -a ENV_GATEWAYS <<< "${ELASTOS_IPFS_GATEWAYS}"
-    for gw in "${ENV_GATEWAYS[@]}"; do
+    for gw in ${ENV_GATEWAYS[@]+"${ENV_GATEWAYS[@]}"}; do
         [[ -z "$gw" ]] && continue
         gw="${gw%/}"
         gw="${gw%/ipfs}"
@@ -633,12 +672,6 @@ done
 
 if ! command -v sha256sum &>/dev/null && ! command -v shasum &>/dev/null; then
     die "Neither sha256sum nor shasum found"
-fi
-
-if [[ "$ALLOW_UNSIGNED" != true ]]; then
-    if ! has_ed25519; then
-        die "OpenSSL does not support Ed25519 on this system.\n  Install OpenSSL 1.1.1+ or pass --allow-unsigned (NOT recommended).\n  Failing closed for your safety."
-    fi
 fi
 
 echo ""
@@ -697,6 +730,7 @@ RELEASE_SCHEMA=$(json_get "${TMPDIR}/release.json" 'd["payload"]["schema"]') \
 
 info "Verifying release signature..."
 verify_signature "${TMPDIR}/release.json" "elastos.release.v1" "$MAINTAINER_DID"
+validate_release_identity "${TMPDIR}/release-head.json" "${TMPDIR}/release.json"
 
 # ── Extract platform info ────────────────────────────────────────────
 
