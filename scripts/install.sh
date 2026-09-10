@@ -712,19 +712,27 @@ PY_ED25519
 }
 
 validate_release_identity() {
-    # Both envelopes are verified before this check. A publisher URL can serve
-    # documents from different publications while its files are being replaced.
+    # Both envelopes are verified before this check, on every transport.
+    # The signed digest binds exact envelope bytes; the CID stays content identity.
     if ! python3 - "$1" "$2" <<'PY_RELEASE_IDENTITY'
+import hashlib
 import json
+import re
 import sys
 
 try:
     with open(sys.argv[1], encoding="utf-8") as source:
         head = json.load(source)["payload"]
-    with open(sys.argv[2], encoding="utf-8") as source:
-        release = json.load(source)["payload"]
+    with open(sys.argv[2], "rb") as source:
+        release_bytes = source.read()
+    release = json.loads(release_bytes)["payload"]
     if head.get("schema") != "elastos.release.head/v1" or release.get("schema") != "elastos.release/v1":
         raise ValueError("Unexpected release schema")
+    expected = head.get("release_sha256")
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise ValueError("Release head requires a lowercase SHA-256 envelope binding; ask the publisher to update its metadata")
+    if hashlib.sha256(release_bytes).hexdigest() != expected:
+        raise ValueError("Release envelope differs from the signed head")
     for field in ("version", "channel"):
         value = head.get(field)
         if not isinstance(value, str) or not value or release.get(field) != value:
@@ -734,7 +742,7 @@ except (ValueError, TypeError, KeyError, OSError, AttributeError) as error:
     sys.exit(1)
 PY_RELEASE_IDENTITY
     then
-        die "Release schema, version or channel mismatch; retry after the publisher finishes updating"
+        die "Release binding or metadata mismatch; retry after the publisher finishes updating"
     fi
 }
 

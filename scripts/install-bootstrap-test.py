@@ -33,6 +33,28 @@ PROCESSES = {"__name__": "installer_test"}
 exec(compile(PROCESS_SOURCE, str(INSTALLER) + ":runtime-control", "exec"), PROCESSES)
 PUBLISHER_DID = "did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj"
 
+
+def binding_fixture():
+    # Fixed OpenSSL Ed25519 vectors from the disposable seed [7; 32]. This is
+    # a test identity. Running these stdlib tests needs neither a key nor OpenSSL.
+    did = "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z"
+    payload = {"schema": "elastos.release/v1", "version": "0.7.1", "channel": "stable",
+               "platforms": {"x86_64-linux": {
+                   "binary": {"cid": "binary-a", "sha256": "a" * 64},
+                   "components": {"cid": "components", "sha256": "b" * 64}}}}
+    first = {"payload": payload, "signer_did": did,
+             "signature": "e976be583f98da06863071e4f2006dc2ea97fd77451fbc278ef23fcc3e1f97bad27abe6f617c11b262994838b49896b2ded44b57531f62d3bcea70e2cefd2b06"}
+    second = copy.deepcopy(first)
+    second["payload"]["platforms"]["x86_64-linux"]["binary"]["cid"] = "binary-b"
+    second["signature"] = "b3cff75e82eb740d0112fb5e58568badc6d99586f800fbd8a602ba1491ff896ff816e46a29178c7a9ed4a0689e3355501e88602ce26bb5e588b05f835c207707"
+    head = {"payload": {"schema": "elastos.release.head/v1", "version": "0.7.1", "channel": "stable",
+                        "latest_release_cid": "release-a",
+                        "release_sha256": "3dcb060f99a9b300ace45ae82ac722189a9740a349fa631bbd7eb1fd9e0dcd36"},
+            "signer_did": did,
+            "signature": "8a248801f576beb6b053fa2f52637b2d3087f2804e44434c4d18abea47007dd24e81781f8c390d414d1b8b34055a06b81f0bd78dc83afa2ce152b59a8fce1101"}
+    encode = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    return did, encode(head), encode(first), encode(second)
+
 # Public key, message and signature from RFC 8032 section 7.1, tests 1, 2,
 # 3 and SHA(abc). These fixed vectors exercise the implementation above.
 # https://www.rfc-editor.org/rfc/rfc8032.html#section-7.1
@@ -239,11 +261,130 @@ refresh_source_bootstrap_from_publisher
         with tempfile.TemporaryDirectory() as directory:
             paths = [Path(directory, name) for name in ("head.json", "release.json")]
             for index, (first, second, accepted) in enumerate(cases):
-                paths[0].write_text(json.dumps(first))
                 paths[1].write_text(json.dumps(second))
+                first = copy.deepcopy(first)
+                first["payload"]["release_sha256"] = hashlib.sha256(paths[1].read_bytes()).hexdigest()
+                paths[0].write_text(json.dumps(first))
                 result = shell('validate_release_identity "$1" "$2"\n', *paths)
                 with self.subTest(case=index):
                     self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+
+
+def run_offline_installer(head, release, did, transport="publisher", system="Linux", machine="x86_64"):
+    # Only transport and uname are replaced. The complete installer executes,
+    # and every artifact request fails before installation or external access.
+    with tempfile.TemporaryDirectory(prefix="installer-offline-") as directory:
+        root = Path(directory)
+        mockbin = root / "mocks"
+        mockbin.mkdir()
+        (root / "release-head.json").write_bytes(head)
+        (root / "release.json").write_bytes(release)
+        (root / "requests").write_text("")
+        (mockbin / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo "$MOCK_SYSTEM";; -m) echo "$MOCK_MACHINE";; esac\n')
+        (mockbin / "curl").write_text('''#!/bin/sh
+destination=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in -o) destination="$2"; shift 2;; *) url="$1"; shift;; esac
+done
+printf '%s\\n' "$url" >> "$FIXTURES/requests"
+case "$url" in
+  */release-head.json|*/ipfs/head-a) cp "$FIXTURES/release-head.json" "$destination";;
+  */release.json|*/ipfs/"$FIXTURE_RELEASE_CID") cp "$FIXTURES/release.json" "$destination";;
+  *) echo artifact-request-blocked >&2; exit 93;;
+esac
+''')
+        for path in mockbin.iterdir():
+            path.chmod(0o755)
+        options = (["--publisher-gateway", "https://test.invalid"] if transport == "publisher" else
+                   ["--gateway", "https://test.invalid", "--head-cid", "head-a"])
+        result = shell('''
+export HOME="$1/home" FIXTURES="$1" PATH="$1/mocks:$PATH"
+export ELASTOS_PUBLISHER_GATEWAY="" ELASTOS_HEAD_CID="" ELASTOS_IPFS_GATEWAYS=""
+export ELASTOS_SOURCE_CONNECT_TICKET="" ELASTOS_PUBLISHER_NODE_ID=""
+export MOCK_SYSTEM="$4" MOCK_MACHINE="$5" FIXTURE_RELEASE_CID="$6"
+exec "$2" --noprofile --norc "$3" "${@:7}"
+''', root, OPTIONS.bash, INSTALLER, system, machine,
+                       json.loads(head)["payload"]["latest_release_cid"],
+                       "--maintainer-did", did, *options)
+        if (root / "home/.local/bin/elastos").exists():
+            raise AssertionError("Offline fixture reached installation")
+        return result, (root / "requests").read_text().splitlines()
+
+
+class BindingTests(unittest.TestCase):
+    def test_exact_signed_release_required_even_at_same_version(self):
+        did, head, first, second = binding_fixture()
+        with tempfile.TemporaryDirectory(prefix="installer-binding-") as directory:
+            paths = [Path(directory, name) for name in ("head.json", "release.json")]
+            paths[0].write_bytes(head)
+            for name, candidate, accepted in [("matching", first, True), ("other signed release", second, False),
+                                               ("whitespace", first + b" ", False)]:
+                paths[1].write_bytes(candidate)
+                result = shell('''
+verify_signature "$1" elastos.release.head.v1 "$3"
+verify_signature "$2" elastos.release.v1 "$3"
+validate_release_identity "$1" "$2"
+''', *paths, did)
+                with self.subTest(case=name):
+                    self.assertEqual(result.stdout.count("Signature verified"), 2, result.stderr)
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+    def test_missing_or_invalid_digest_fails_closed(self):
+        _, head, release, _ = binding_fixture()
+        with tempfile.TemporaryDirectory(prefix="installer-binding-") as directory:
+            paths = [Path(directory, name) for name in ("head.json", "release.json")]
+            paths[1].write_bytes(release)
+            for value in [None, 7, "", "a" * 63, "G" * 64, "A" * 64, "0" * 64]:
+                first = json.loads(head)
+                first["payload"]["release_sha256"] = value
+                paths[0].write_text(json.dumps(first))
+                result = shell('validate_release_identity "$1" "$2"\n', *paths)
+                with self.subTest(value=value):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Release identity check failed", result.stderr)
+
+    def test_binding_precedes_artifacts_on_publisher_and_cid_transports(self):
+        did, head, first, second = binding_fixture()
+        changed_byte = first.replace(b'"version":"0.7.1"', b'"version":"0.8.1"')
+        self.assertNotEqual(first, changed_byte)
+        for transport in ["publisher", "cid"]:
+            for name, release, matching in [("matching", first, True), ("other signed release", second, False),
+                                            ("whitespace", first + b" ", False), ("one byte", changed_byte, False)]:
+                result, requests = run_offline_installer(head, release, did, transport)
+                with self.subTest(transport=transport, case=name):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(len(requests), 3 if matching else 2, result.stdout + result.stderr)
+                    self.assertEqual(requests[0], "https://test.invalid/" + ("release-head.json" if transport == "publisher" else "ipfs/head-a"))
+                    self.assertEqual(requests[1], "https://test.invalid/" + ("release.json" if transport == "publisher" else "ipfs/release-a"))
+                    if matching:
+                        self.assertEqual(requests[2], "https://test.invalid/" + ("artifacts/elastos-x86_64-linux" if transport == "publisher" else "ipfs/binary-a"))
+                    else:
+                        self.assertIn("Signature verification FAILED" if name == "one byte" else
+                                      "Release envelope differs from the signed head", result.stderr)
+        result, requests = run_offline_installer(head, first, did, system="Darwin", machine="arm64")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No release available for platform: aarch64-darwin", result.stderr)
+        self.assertEqual(len(requests), 2)
+
+    def test_publisher_hashes_the_final_envelope_bytes_into_head_payload(self):
+        source = INSTALLER.with_name("publish-release.sh").read_text()
+        sha_helper = source[source.index("sha256() {"):source.index("\nfile_size() {")]
+        envelope_write = source[source.index('echo "$RELEASE_JSON" > "${TMPDIR}/release.json"'):source.index('info "Publishing release.json to IPFS..."')]
+        head_payload = source[source.index("HEAD_PAYLOAD=$(jq"):source.index('info "Signing release head..."')]
+        with tempfile.TemporaryDirectory(prefix="publisher-binding-") as directory:
+            result = shell(sha_helper + '''
+TMPDIR="$1"
+RELEASE_JSON='{"payload":{"note":"café"},"signature":"test"}'
+CHANNEL=stable VERSION=0.7.1 RELEASE_CID=release-a RELEASE_OBJECT_CID=object-a
+SIGNER_DID=test PREV_HEAD_CID=null
+now_unix() { echo 1; }
+''' + envelope_write + head_payload + '\nprintf "%s\\n" "$HEAD_PAYLOAD"\n', directory)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            written = Path(directory, "release.json").read_bytes()
+            payload = json.loads(result.stdout)
+            self.assertTrue(written.endswith(b"\n"))
+            self.assertEqual(payload["release_sha256"], hashlib.sha256(written).hexdigest())
+            self.assertEqual(payload["latest_release_cid"], "release-a")
 
 
 class DataPathTests(unittest.TestCase):
@@ -634,58 +775,16 @@ class PublisherFixtureTests(unittest.TestCase):
             result = shell('verify_signature "$1" "$2" "$3"\n', path, domain, did)
             self.assertNotEqual(result.returncode, 0)
 
-    def test_installer_checks_signatures_and_identity_before_artifact_request(self):
-        # Execute the entire installer with only uname/curl replaced. curl reads
-        # retained local bytes and rejects artifact requests. No install runs.
-        with tempfile.TemporaryDirectory(prefix="installer-offline-") as directory:
-            root = Path(directory)
-            mockbin = root / "mocks"
-            mockbin.mkdir()
-            (mockbin / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo "${MOCK_SYSTEM:-Linux}";; -m) echo "${MOCK_MACHINE:-x86_64}";; esac\n')
-            (mockbin / "curl").write_text('''#!/bin/sh
-destination=""
-while [ "$#" -gt 0 ]; do
-    case "$1" in -o) destination="$2"; shift 2;; *) url="$1"; shift;; esac
-done
-printf '%s\\n' "$url" >> "$FIXTURES/requests"
-case "$url" in
-  */release-head.json) cp "$FIXTURES/release-head.json" "$destination";;
-  */release.json) cp "$FIXTURES/release.json" "$destination";;
-  *) echo artifact-request-blocked >&2; exit 93;;
-esac
-''')
-            for path in mockbin.iterdir():
-                path.chmod(0o755)
-            first = json.loads((self.fixtures / "release-head.json").read_text())
-            second = json.loads((self.fixtures / "release.json").read_text())
-            for field, system, machine in [("version", "Linux", "x86_64"), ("channel", "Linux", "x86_64"),
-                                           (None, "Linux", "x86_64"), (None, "Darwin", "arm64")]:
-                altered = copy.deepcopy(second)
-                if field:
-                    altered["payload"][field] = "other"
-                (root / "release-head.json").write_text(json.dumps(first))
-                (root / "release.json").write_text(json.dumps(altered))
-                (root / "requests").write_text("")
-                # Mutations use --allow-unsigned to isolate the identity gate.
-                # The matching case uses both real signed documents and the
-                # pinned DID, then stops at the mock artifact request.
-                result = shell('''
-export HOME="$1/home" FIXTURES="$1" PATH="$1/mocks:$PATH"
-export ELASTOS_PUBLISHER_GATEWAY=https://test.invalid
-export MOCK_SYSTEM="$4" MOCK_MACHINE="$5"
-exec "$2" --noprofile --norc "$3" "${@:6}"
-''', root, OPTIONS.bash, INSTALLER, system, machine,
-                    *(["--allow-unsigned"] if field else ["--maintainer-did", PUBLISHER_DID]))
-                with self.subTest(field=field, system=system):
-                    self.assertNotEqual(result.returncode, 0)
-                    expected = ("Release identity check failed" if field else
-                                "No release available for platform: aarch64-darwin" if system == "Darwin" else
-                                "artifact-request-blocked")
-                    self.assertIn(expected, result.stderr)
-                    self.assertEqual((root / "requests").read_text().splitlines(),
-                                     ["https://test.invalid/release-head.json", "https://test.invalid/release.json"]
-                                     + ([] if field or system == "Darwin" else ["https://test.invalid/artifacts/elastos-x86_64-linux"]))
-                    self.assertFalse((root / "home/.local/bin/elastos").exists())
+    def test_unbound_signed_legacy_publication_is_rejected_before_artifacts(self):
+        for transport in ["publisher", "cid"]:
+            result, requests = run_offline_installer(
+                (self.fixtures / "release-head.json").read_bytes(),
+                (self.fixtures / "release.json").read_bytes(), PUBLISHER_DID, transport)
+            with self.subTest(transport=transport):
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout.count("Signature verified"), 2)
+                self.assertIn("requires a lowercase SHA-256 envelope binding", result.stderr)
+                self.assertEqual(len(requests), 2)
 
 
 if __name__ == "__main__":

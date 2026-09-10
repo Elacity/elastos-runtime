@@ -1907,6 +1907,7 @@ RELEASE_JSON=$(jq -n \
     '{ payload: $payload, signature: $signature, signer_did: $signer_did }')
 
 echo "$RELEASE_JSON" > "${TMPDIR}/release.json"
+RELEASE_SHA256=$(sha256 "${TMPDIR}/release.json")
 
 info "Publishing release.json to IPFS..."
 RELEASE_CID=$(ipfs_add "${TMPDIR}/release.json")
@@ -1961,6 +1962,7 @@ HEAD_PAYLOAD=$(jq -ncS \
     --arg schema "elastos.release.head/v1" \
     --arg channel "$CHANNEL" \
     --arg latest_release_cid "$RELEASE_CID" \
+    --arg release_sha256 "$RELEASE_SHA256" \
     --arg release_object_cid "$RELEASE_OBJECT_CID" \
     --arg version "$VERSION" \
     --argjson updated_at "$(now_unix)" \
@@ -1970,6 +1972,7 @@ HEAD_PAYLOAD=$(jq -ncS \
         schema: $schema,
         channel: $channel,
         latest_release_cid: $latest_release_cid,
+        release_sha256: $release_sha256,
         release_object_cid: $release_object_cid,
         version: $version,
         updated_at: $updated_at,
