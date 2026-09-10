@@ -559,7 +559,7 @@ fn bring_loopback_up() -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     let mut req = LinuxIfReq::loopback_up();
-    let result = unsafe { libc::ioctl(fd, libc::SIOCSIFFLAGS, &mut req) };
+    let result = unsafe { libc::ioctl(fd, libc::SIOCSIFFLAGS as _, &mut req) };
     let close_result = unsafe { libc::close(fd) };
     if result != 0 {
         return Err(std::io::Error::last_os_error());
