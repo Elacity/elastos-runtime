@@ -124,6 +124,14 @@ approved plan retains full release acceptance.
   loads Rust into the shell and supplies the required collaboration setup mode.
   These documentation corrections preserve the open Content/Carrier acceptance.
 
+- Release publisher manifests now use full OS/CPU platform filenames in local
+  exports and ledger reads. A regression reproduced Linux ARM capsule data in
+  the Darwin ARM ledger before the repair. The three-platform ledger test and
+  all 21 publisher tests pass; shell export checks pass for three host/cross
+  combinations. Independent source review found no further affected consumers.
+  Native Mac support-asset targeting, complete artifact assembly and fresh
+  installation remain delivery work.
+
 The source and installed sections below preserve the earlier evidence snapshot.
 Their original identities qualify those results. Current milestone receipts
 above take precedence where the work has moved; remaining sections are refreshed

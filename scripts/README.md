@@ -15,6 +15,8 @@ automatically a stable end-user command.
 - `share-demo.sh` runs the focused sharing demo.
 - `setup-crosvm.sh` installs VM prerequisites.
 - `publish-release.sh` is the low-level release publisher.
+- `python3 scripts/publish-platform-artifacts-test.py` checks its local platform
+  manifest exports without signing or uploading.
 - `vendor-walletconnect-adapter.sh` refreshes the pinned WalletConnect asset.
 
 Use the `justfile` for repository gates:

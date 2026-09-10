@@ -1318,8 +1318,7 @@ fn build_release_ledger_entry(
 }
 
 fn components_artifact_path(artifacts_dir: &Path, platform: &str) -> PathBuf {
-    let arch = platform.split('-').next().unwrap_or(platform);
-    artifacts_dir.join(format!("components-{}.json", arch))
+    artifacts_dir.join(format!("components-{platform}.json"))
 }
 
 fn print_release_diff_summary(
@@ -1843,9 +1842,22 @@ mod tests {
     }
 
     #[test]
-    fn test_build_release_ledger_entry_reads_artifacts() {
+    fn test_build_release_ledger_entry_keeps_three_platforms_distinct() {
         let temp = tempfile::tempdir().unwrap();
         let artifacts_dir = temp.path();
+        let platforms = ["x86_64-linux", "aarch64-linux", "aarch64-darwin"];
+        let descriptors = platforms
+            .iter()
+            .map(|platform| {
+                (
+                    *platform,
+                    serde_json::json!({
+                        "binary": { "cid": format!("binary-{platform}") },
+                        "components": { "cid": format!("components-{platform}") }
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         std::fs::write(
             artifacts_dir.join("release.json"),
             serde_json::json!({
@@ -1853,12 +1865,7 @@ mod tests {
                     "channel": "stable",
                     "version": "0.11.0",
                     "released_at": 42,
-                    "platforms": {
-                        "x86_64-linux": {
-                            "binary": { "cid": "binary-cid" },
-                            "components": { "cid": "components-cid" }
-                        }
-                    }
+                    "platforms": descriptors
                 },
                 "signer_did": "did:key:z6Mktest"
             })
@@ -1867,48 +1874,62 @@ mod tests {
         .unwrap();
         std::fs::write(
             artifacts_dir.join("release-head.json"),
-            serde_json::json!({
-                "payload": {
-                    "latest_release_cid": "release-cid"
-                }
-            })
-            .to_string(),
+            serde_json::json!({ "payload": { "latest_release_cid": "release-cid" } }).to_string(),
         )
         .unwrap();
-        std::fs::write(
+        for platform in platforms {
+            std::fs::write(
+                artifacts_dir.join(format!("components-{platform}.json")),
+                serde_json::json!({
+                    "external": {},
+                    "profiles": {},
+                    "capsules": {
+                        "home": { "cid": format!("home-{platform}"), "sha256": "a", "size": 1, "platforms": [platform] }
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        // Old architecture-only files can remain from a previous publication.
+        // They must never substitute for either ARM platform's actual manifest.
+        std::fs::copy(
+            artifacts_dir.join("components-x86_64-linux.json"),
             artifacts_dir.join("components-x86_64.json"),
-            serde_json::json!({
-                "external": {},
-                "profiles": {},
-                "capsules": {
-                    "chat": { "cid": "cid-chat-1", "sha256": "a", "size": 1, "platforms": ["x86_64-linux"] }
-                }
-            })
-            .to_string(),
+        )
+        .unwrap();
+        std::fs::copy(
+            artifacts_dir.join("components-aarch64-linux.json"),
+            artifacts_dir.join("components-aarch64.json"),
         )
         .unwrap();
 
-        let entry = build_release_ledger_entry(
-            artifacts_dir,
-            "release-cid",
-            "head-cid",
-            &["chat".to_string()],
-        )
-        .unwrap();
+        let read = || {
+            build_release_ledger_entry(
+                artifacts_dir,
+                "release-cid",
+                "head-cid",
+                &["home".to_string()],
+            )
+        };
+        let entry = read().unwrap();
         assert_eq!(entry.version, "0.11.0");
         assert_eq!(entry.channel, "stable");
         assert_eq!(entry.release_cid, "release-cid");
         assert_eq!(entry.head_cid, "head-cid");
         assert_eq!(entry.signer_did, "did:key:z6Mktest");
-        assert_eq!(
-            entry
-                .platforms
-                .get("x86_64-linux")
-                .unwrap()
-                .capsules
-                .get("chat"),
-            Some(&"cid-chat-1".to_string())
-        );
+        assert_eq!(entry.platforms.len(), 3);
+        for platform in platforms {
+            let record = &entry.platforms[platform];
+            assert_eq!(record.binary_cid, format!("binary-{platform}"));
+            assert_eq!(record.components_cid, format!("components-{platform}"));
+            assert_eq!(record.capsules["home"], format!("home-{platform}"));
+        }
+        std::fs::remove_file(artifacts_dir.join("components-aarch64-darwin.json")).unwrap();
+        assert!(read()
+            .unwrap_err()
+            .to_string()
+            .contains("components-aarch64-darwin.json"));
     }
 
     #[test]

@@ -1737,13 +1737,13 @@ CROSS_BINARY_SIZE=""
 if [[ -n "$CROSS_ARCH" && "$CROSS_CAPSULE_ENTRIES" != "{}" ]]; then
     info "Generating components.json for ${CROSS_PLATFORM}..."
     CROSS_COMPONENTS_JSON=$(generate_components_json "$CROSS_CAPSULE_ENTRIES" "$CROSS_DIRECT_ASSETS")
-    echo "$CROSS_COMPONENTS_JSON" > "${TMPDIR}/components-${CROSS_ARCH}.json"
-    validate_generated_components_json "${TMPDIR}/components-${CROSS_ARCH}.json" "$CROSS_SETUP_PLATFORM"
-    CROSS_COMPONENTS_SHA256=$(sha256 "${TMPDIR}/components-${CROSS_ARCH}.json")
-    CROSS_COMPONENTS_SIZE=$(file_size "${TMPDIR}/components-${CROSS_ARCH}.json")
+    echo "$CROSS_COMPONENTS_JSON" > "${TMPDIR}/components-${CROSS_PLATFORM}.json"
+    validate_generated_components_json "${TMPDIR}/components-${CROSS_PLATFORM}.json" "$CROSS_SETUP_PLATFORM"
+    CROSS_COMPONENTS_SHA256=$(sha256 "${TMPDIR}/components-${CROSS_PLATFORM}.json")
+    CROSS_COMPONENTS_SIZE=$(file_size "${TMPDIR}/components-${CROSS_PLATFORM}.json")
 
     info "Publishing components.json (${CROSS_PLATFORM}) to IPFS..."
-    CROSS_COMPONENTS_CID=$(ipfs_add "${TMPDIR}/components-${CROSS_ARCH}.json")
+    CROSS_COMPONENTS_CID=$(ipfs_add "${TMPDIR}/components-${CROSS_PLATFORM}.json")
     info "Components CID (${CROSS_PLATFORM}): ${CROSS_COMPONENTS_CID}"
 fi
 
@@ -2140,9 +2140,10 @@ mkdir -p artifacts
 cp "$STAMPED_INSTALL" artifacts/install.sh
 cp "${TMPDIR}/release.json" artifacts/release.json
 cp "${TMPDIR}/release-head.json" artifacts/release-head.json
-cp "${TMPDIR}/components.json" artifacts/components-x86_64.json
-[[ -f "${TMPDIR}/components-${CROSS_ARCH:-}.json" ]] && \
-    cp "${TMPDIR}/components-${CROSS_ARCH}.json" "artifacts/components-${CROSS_ARCH}.json"
+cp "${TMPDIR}/components.json" "artifacts/components-${PLATFORM}.json"
+if [[ -n "$CROSS_PLATFORM" && -f "${TMPDIR}/components-${CROSS_PLATFORM}.json" ]]; then
+    cp "${TMPDIR}/components-${CROSS_PLATFORM}.json" "artifacts/components-${CROSS_PLATFORM}.json"
+fi
 info "Installer CID: ${INSTALL_SCRIPT_CID}"
 
 # Save release metadata to runtime-owned publisher state for gateway serving.
@@ -2159,8 +2160,8 @@ if [[ -n "${CROSS_ELASTOS:-}" && -f "${CROSS_ELASTOS}" ]]; then
     cp "${CROSS_ELASTOS}" "${PUBLISHER_ARTIFACTS_DIR}/elastos-${CROSS_PLATFORM}"
 fi
 cp "${TMPDIR}/components.json" "${PUBLISHER_ARTIFACTS_DIR}/components-${PLATFORM}.json"
-if [[ -n "${CROSS_PLATFORM:-}" && -f "${TMPDIR}/components-${CROSS_ARCH}.json" ]]; then
-    cp "${TMPDIR}/components-${CROSS_ARCH}.json" "${PUBLISHER_ARTIFACTS_DIR}/components-${CROSS_PLATFORM}.json"
+if [[ -n "${CROSS_PLATFORM:-}" && -f "${TMPDIR}/components-${CROSS_PLATFORM}.json" ]]; then
+    cp "${TMPDIR}/components-${CROSS_PLATFORM}.json" "${PUBLISHER_ARTIFACTS_DIR}/components-${CROSS_PLATFORM}.json"
 fi
 # Copy first-party support assets for Carrier-served setup fetches.
 for f in "${TMPDIR}/supported-assets-${PLATFORM}"/*; do
