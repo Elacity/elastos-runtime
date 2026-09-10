@@ -52,6 +52,8 @@ python3 scripts/release-platform-input.py verify /path/to/new-platform-input
 
 The worker builds native Runtime/provider files with locked dependencies, copies
 tracked app sources and rebuilt entrypoints, and writes unsigned local inputs.
+Home CLI is a platform-specific capsule archive that includes its native renderer
+at `home-cli/bin/home-cli`; both setup and Runtime use that installed path.
 The receipt binds the source commit/tree, lockfiles, tool versions, component
 template and each output's size/hash. It records helpers absent from the source
 platform matrix. Generic provider VM archives remain a separate build path.

@@ -74,6 +74,10 @@ def check_version(version):
 def check_binary(path, platform):
     with path.open("rb") as source:
         header = source.read(64)
+    check_native_header(header, path.stat().st_mode, platform, path.name)
+
+
+def check_native_header(header, mode, platform, label):
     machine = PLATFORMS[platform][2]
     if platform.endswith("-linux"):
         valid = (len(header) == 64 and header[:7] == b"\x7fELF\x02\x01\x01"
@@ -83,15 +87,16 @@ def check_binary(path, platform):
         valid = (len(header) >= 32 and header[:4] == b"\xcf\xfa\xed\xfe"
                  and struct.unpack_from("<I", header, 4)[0] == machine
                  and struct.unpack_from("<I", header, 12)[0] == 2)
-    if not valid or not path.stat().st_mode & 0o111:
-        raise ValueError(f"{path.name}: expected executable for {platform}")
+    if not valid or not mode & 0o111:
+        raise ValueError(f"{label}: expected executable for {platform}")
 
 
-def check_archive(path, extract_path=None, provider=False):
+def check_archive(path, extract_path=None, provider=False, home_cli_platform=None):
     seen = set()
     regular = set()
     links = set()
     contract = None
+    renderer = "home-cli/bin/home-cli"
     with tarfile.open(path, "r|gz") as archive:
         for entry in archive:
             name = entry.name.rstrip("/")
@@ -99,8 +104,8 @@ def check_archive(path, extract_path=None, provider=False):
                     or any(p in {"", ".", ".."} for p in name.split("/"))
                     or name in seen):
                 raise ValueError(f"{path.name}: unsafe or duplicate archive member {name!r}")
-            if any(str(parent) in links for parent in PurePosixPath(name).parents):
-                raise ValueError(f"{path.name}: archive member beneath a link: {name}")
+            if any(str(parent) in links or str(parent) in regular for parent in PurePosixPath(name).parents):
+                raise ValueError(f"{path.name}: archive member beneath a file or link: {name}")
             if entry.issym():
                 target = entry.linkname
                 resolved = posixpath.normpath(posixpath.join(posixpath.dirname(name), target))
@@ -113,12 +118,21 @@ def check_archive(path, extract_path=None, provider=False):
             elif not (entry.isfile() or entry.isdir()):
                 raise ValueError(f"{path.name}: unsupported archive entry type: {name}")
             if entry.isfile():
+                if any(other.startswith(name + "/") for other in seen):
+                    raise ValueError(f"{path.name}: file replaces archive parent: {name}")
                 regular.add(name)
+            if home_cli_platform is not None and name == renderer:
+                if not entry.isfile():
+                    raise ValueError(f"{path.name}: Home CLI renderer must be a regular file")
+                check_native_header(archive.extractfile(entry).read(64), entry.mode,
+                                    home_cli_platform, renderer)
             if provider and name == f"{extract_path}/capsule.json":
                 if not entry.isfile() or entry.size > 1024 * 1024:
                     raise ValueError(f"{path.name}: invalid provider capsule manifest")
                 contract = json.load(archive.extractfile(entry))
             seen.add(name)
+    if home_cli_platform is not None and (extract_path != "home-cli" or renderer not in regular):
+        raise ValueError(f"{path.name}: Home CLI native renderer is missing")
     if not seen:
         raise ValueError(f"{path.name}: empty app archive")
     if extract_path is not None:
@@ -214,7 +228,8 @@ def check_contents(root, platform, omissions):
             if info.get("install_path", entry.get("install_path", "")).startswith("bin/"):
                 check_binary(path, platform)
             elif info.get("extract_path"):
-                check_archive(path, info["extract_path"], provider=is_provider_metadata)
+                check_archive(path, info["extract_path"], provider=is_provider_metadata,
+                              home_cli_platform=platform if name == "home-cli" and not is_provider_metadata else None)
             elif expected_install and expected_install.startswith("capsules/"):
                 raise ValueError(f"{name}: capsule artifact needs an extraction path")
     check_binary(regular_file(root / "artifacts", f"elastos-{platform}"), platform)

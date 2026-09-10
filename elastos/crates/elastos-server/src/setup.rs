@@ -2535,6 +2535,45 @@ mod tests {
     // its await without blocking the runtime; sync tests use blocking_lock.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    #[cfg(unix)]
+    #[test]
+    fn home_cli_renderer_archive_extraction_preserves_native_bytes_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let native = fs::read(std::env::current_exe().unwrap()).unwrap();
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(native.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "home-cli/bin/home-cli", native.as_slice())
+            .unwrap();
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+        let info: PlatformInfo = serde_json::from_value(serde_json::json!({
+            "release_path": format!("home-cli-{}.tar.gz", detect_platform()),
+            "install_path": "capsules/home-cli",
+            "extract_path": "home-cli",
+            "checksum": format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes)))
+        }))
+        .unwrap();
+        verify_checksum("home-cli", &bytes, &info).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let installed = temp.path().join("capsules/home-cli");
+        extract_from_tarball(&bytes, &installed, &info).unwrap();
+        let renderer = installed.join("bin/home-cli");
+        assert_eq!(fs::read(&renderer).unwrap(), native);
+        assert_eq!(
+            fs::metadata(&renderer).unwrap().permissions().mode() & 0o111,
+            0o111
+        );
+        assert!(!temp.path().join("bin/home-cli").exists());
+        let mut corrupt = bytes;
+        corrupt[0] ^= 1;
+        assert!(verify_checksum("home-cli", &corrupt, &info).is_err());
+    }
+
     #[test]
     fn test_detect_platform() {
         let p = detect_platform();

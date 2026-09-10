@@ -91,7 +91,7 @@ while IFS= read -r name; do SUPPORT_BINARY_ASSETS+=("$name"); done < "$WORK_DIR/
 
 # locate-project reads workspace ownership without resolving or generating locks.
 missing_locks=()
-for name in elastos "${SUPPORT_BINARY_ASSETS[@]}"; do
+for name in elastos home-cli "${SUPPORT_BINARY_ASSETS[@]}"; do
     if [[ "$name" == elastos ]]; then
         capsule_dir=elastos
     else

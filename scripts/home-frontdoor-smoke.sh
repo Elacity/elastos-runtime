@@ -145,7 +145,15 @@ cargo build --manifest-path "$ROOT/capsules/object-provider/Cargo.toml" --releas
 cargo build --manifest-path "$ROOT/capsules/content-block-graph-provider/Cargo.toml" --release >/dev/null
 
 echo "[home-frontdoor] build Home CLI renderer"
-cargo build --manifest-path "$ROOT/capsules/home-cli/Cargo.toml" --release --bin home-cli >/dev/null
+HOME_CLI_RENDERER=$(cargo build --locked --manifest-path "$ROOT/capsules/home-cli/Cargo.toml" --release --bin home-cli --message-format=json | python3 -c '
+import json, sys
+artifacts = [json.loads(line) for line in sys.stdin]
+paths = [item["executable"] for item in artifacts if item.get("reason") == "compiler-artifact"
+         and item.get("target", {}).get("name") == "home-cli" and item.get("executable")]
+if len(paths) != 1:
+    raise SystemExit("expected one built Home CLI renderer")
+print(paths[0])')
+export HOME_CLI_RENDERER
 
 echo "[home-frontdoor] verify first-party runtime projection entrypoints"
 for capsule in \
@@ -249,6 +257,11 @@ def write_capsule_archive(name, capsule_dir):
         browser_dir = capsule_dir / "browser"
         if browser_dir.is_dir():
             tar.add(browser_dir, arcname=f"{name}/browser")
+        if name == "home-cli":
+            renderer = pathlib.Path(os.environ["HOME_CLI_RENDERER"])
+            if not renderer.is_file() or renderer.is_symlink() or not os.access(renderer, os.X_OK):
+                raise SystemExit(f"missing built Home CLI renderer: {renderer}")
+            tar.add(renderer, arcname="home-cli/bin/home-cli")
     data = archive.read_bytes()
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
@@ -326,6 +339,8 @@ if [[ ! -d "$INSTALLED_HOME_CLI_DIR" ]]; then
     echo "[home-frontdoor] installed Home CLI capsule missing after setup: $INSTALLED_HOME_CLI_DIR" >&2
     exit 1
 fi
+test -x "$INSTALLED_HOME_CLI_DIR/bin/home-cli"
+cmp "$HOME_CLI_RENDERER" "$INSTALLED_HOME_CLI_DIR/bin/home-cli"
 for installed in \
     "$HOME_DIR/xdg-data/elastos/capsules/home/browser/index.html" \
     "$HOME_DIR/xdg-data/elastos/capsules/home-cli/browser/index.html" \
@@ -572,5 +587,7 @@ run_home_case(
     ),
 )
 
-print("[home-frontdoor] OK")
 PY
+test -x "$INSTALLED_HOME_CLI_DIR/bin/home-cli"
+cmp "$HOME_CLI_RENDERER" "$INSTALLED_HOME_CLI_DIR/bin/home-cli"
+echo "[home-frontdoor] OK"

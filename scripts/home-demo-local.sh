@@ -29,7 +29,7 @@ Usage:
   bash scripts/home-demo-local.sh --home /tmp/elastos-demo-fixed
 
 What it does:
-  1. Builds the repo-local elastos binary and Home CLI component (unless --skip-build)
+  1. Builds the repo-local elastos binary (unless --skip-build)
   2. Installs into a clean temp home using the canonical maintainer DID + gateway
   3. Generates a local override manifest for the current demo profile
   4. Reuses host-installed `crosvm` / `vmlinux` when available
@@ -137,8 +137,6 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     echo "[home-demo-local] build elastos binary"
     host_cargo build --manifest-path "$ROOT/elastos/Cargo.toml" -p elastos-server
 
-    echo "[home-demo-local] build Home CLI renderer"
-    host_cargo build --manifest-path "$ROOT/capsules/home-cli/Cargo.toml" --release --bin home-cli
 fi
 
 echo "[home-demo-local] install clean temp-home runtime"
@@ -194,15 +192,29 @@ if os.path.exists(installed_path):
     with open(installed_path, "r", encoding="utf-8") as f:
         installed = json.load(f)
 
+# Current Runtime requires the renderer inside the published native capsule.
+# An older universal archive cannot provide that renderer.
+home_cli = (installed.get("external") or {}).get("home-cli", {})
+home_cli_info = (home_cli.get("platforms") or {}).get(setup_platform, {})
+if (home_cli_info.get("release_path") != f"home-cli-{setup_platform}.tar.gz"
+        or home_cli_info.get("extract_path") != "home-cli"):
+    raise SystemExit(
+        "Published Home CLI input is incompatible with current Runtime. "
+        f"This demo requires a native home-cli archive for {setup_platform}; "
+        "rerun after that release is available."
+    )
+
 for name, source_component in data.get("external", {}).items():
     installed_component = (installed.get("external") or {}).get(name)
     if not installed_component:
         continue
     source_platforms = source_component.setdefault("platforms", {})
-    for plat, plat_info in (installed_component.get("platforms") or {}).items():
-        merged = copy.deepcopy(source_platforms.get(plat, {}))
-        merged.update(plat_info)
-        source_platforms[plat] = merged
+    installed_platforms = installed_component.get("platforms") or {}
+    alias = {"linux-amd64": "x86_64-linux", "linux-arm64": "aarch64-linux"}.get(setup_platform)
+    for key in (setup_platform, alias, "*"):
+        if key in installed_platforms:
+            source_platforms[setup_platform] = copy.deepcopy(installed_platforms[key])
+            break
 
 for name, install_path_env, sha_env, size_env in (
     ("crosvm", "HOST_CROSVM_PATH", "HOST_CROSVM_SHA", "HOST_CROSVM_SIZE"),
@@ -235,6 +247,10 @@ HOME="$DEMO_HOME" \
 XDG_DATA_HOME="$XDG_DATA_HOME" \
 ELASTOS_DATA_DIR="$ELASTOS_DATA_DIR" \
 "$ROOT/elastos/target/debug/elastos" setup --profile demo
+test -x "$ELASTOS_DATA_DIR/capsules/home-cli/bin/home-cli" || {
+    echo "[home-demo-local] published Home CLI archive did not install its native renderer" >&2
+    exit 1
+}
 
 mkdir -p "$SITE_SRC"
 cat > "$SITE_SRC/index.html" <<'HTML'

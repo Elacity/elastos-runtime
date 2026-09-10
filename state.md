@@ -112,7 +112,9 @@ approved plan retains full release acceptance.
   One command installs the older public 0.1.2 Linux preview; Apple silicon
   developers have a source-guide link, and 0.7.1 downloads remain in preparation.
   Current content and local source/served parity checks pass. The private seed
-  website package still needs this copy revision before deployment review.
+  website package now serves this copy revision: all eleven website files and
+  the complete staged artifact set pass source/hash checks. Public copy review
+  and deployment approval remain open.
 - The candidate installer now runs Home setup and opens terminal Home after
   verified bootstrap. It uses the installed binary's absolute path and reads
   interactive input from the terminal. Headless setup prints the launch path;
@@ -180,8 +182,21 @@ approved plan retains full release acceptance.
   source, component template, native OS/CPU, provider contracts and exact file
   inventory. Sixteen admission test groups and five preparation fixture tests
   pass, including synthetic builds for all three platforms. Independent source
-  review found no remaining issues. Linux helper lockfiles, actual native builds,
+  review found no remaining issues. Actual native builds,
   publisher import, external dependencies and fresh installs remain open.
+
+- Three standalone Linux Browser helpers now have tracked Cargo lockfiles.
+  Their registry versions and checksums match the existing Runtime workspace
+  pins. Offline locked dependency resolution passes for all three projects.
+
+- Home CLI delivery now uses one platform-specific capsule archive containing
+  its native terminal renderer. Runtime and source-home provisioning use the
+  same installed capsule path. Checks reject missing, non-executable, malformed
+  or wrong-platform renderers before launch. A real Mac renderer build and
+  archive extraction match byte for byte; narrow Rust extraction/launch tests
+  and eight preparation fixtures pass. Development fixtures use the installed
+  renderer, and the demo reports incompatible older releases before launch.
+  Full signed fresh-device acceptance remains open.
 
 The source and installed sections below preserve the earlier evidence snapshot.
 Their original identities qualify those results. Current milestone receipts

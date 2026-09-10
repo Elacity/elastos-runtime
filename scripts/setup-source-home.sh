@@ -864,6 +864,10 @@ install_app_capsules() {
         fi
         mkdir -p "${dest}/$(dirname "$entrypoint")"
         install -m 644 "$built_entrypoint" "${dest}/${entrypoint}"
+        if [[ "$capsule" == home-cli ]]; then
+            mkdir -p "${dest}/bin"
+            install -m 755 "$(cargo_built_binary_path "${ROOT}/capsules/home-cli/Cargo.toml" release home-cli)" "${dest}/bin/home-cli"
+        fi
     done
 }
 
@@ -1850,7 +1854,6 @@ prepare_media_provider_prerequisite
 echo "[setup-source-home] install native providers and stamp manifest"
 mkdir -p "${DATA_DIR}/bin"
 install -m 755 "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release shell)" "${DATA_DIR}/bin/shell"
-install -m 755 "$(cargo_built_binary_path "${ROOT}/capsules/home-cli/Cargo.toml" release home-cli)" "${DATA_DIR}/bin/home-cli"
 source_home_binary_names | while IFS= read -r provider; do
     install -m 755 "$(cargo_built_binary_path "$(source_home_binary_manifest_path "${provider}")" release "${provider}")" "${DATA_DIR}/bin/${provider}"
 done

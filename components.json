@@ -927,11 +927,27 @@
       "install_path": "capsules/home-cli",
       "description": "First-party Home CLI capsule required for the default elastos surface",
       "platforms": {
-        "*": {
+        "linux-amd64": {
           "cid": "",
           "checksum": "",
           "size": 0,
-          "release_path": "home-cli.tar.gz",
+          "release_path": "home-cli-linux-amd64.tar.gz",
+          "extract_path": "home-cli",
+          "install_path": "capsules/home-cli"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "home-cli-linux-arm64.tar.gz",
+          "extract_path": "home-cli",
+          "install_path": "capsules/home-cli"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "home-cli-darwin-arm64.tar.gz",
           "extract_path": "home-cli",
           "install_path": "capsules/home-cli"
         }

@@ -2,6 +2,7 @@
 """Run the preparation worker with real packaging/receipts and fake native builds."""
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -9,6 +10,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 SOURCE = Path(__file__).resolve().parent.parent
@@ -103,6 +105,13 @@ class PrepareWorkerTest(unittest.TestCase):
                 "entrypoint": "browser/index.html"}))
             external[name] = {"install_path": f"capsules/{name}",
                               "platforms": {"*": self.stale_descriptor(name)}}
+            if name == "home-cli":
+                (capsule / "Cargo.toml").write_text('[package]\nname="home-cli"\nversion="0.1.0"\n')
+                (capsule / "Cargo.lock").write_text("version = 4\n")
+                external[name]["platforms"] = {
+                    platform: self.stale_descriptor(f"{name}-{platform}")
+                    for platform in ("linux-amd64", "linux-arm64", "darwin-arm64")
+                }
         (self.repo / "components.json").write_text(json.dumps({
             "schema": "elastos.components/v1", "external": external,
             "profiles": {"home": {"components": ["home", "shell"]}}}))
@@ -170,11 +179,17 @@ class PrepareWorkerTest(unittest.TestCase):
         with tarfile.open(output / "artifacts/home.tar.gz") as archive:
             self.assertFalse(any("secret" in name for name in archive.getnames()))
             self.assertEqual(archive.extractfile("home/browser/index.html").read(), b"tracked-home")
+        self.assertFalse((output / "artifacts/home-cli.tar.gz").exists())
+        with tarfile.open(output / "artifacts/home-cli-darwin-arm64.tar.gz") as archive:
+            renderer = archive.getmember("home-cli/bin/home-cli")
+            self.assertTrue(renderer.isfile())
+            self.assertEqual(renderer.mode & 0o111, 0o111)
+            self.assertEqual(archive.extractfile(renderer).read()[:4], b"\xcf\xfa\xed\xfe")
         result = self.command("python3", "scripts/release-platform-input.py", "verify", str(output))
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = [json.loads(line) for line in (self.root / "cargo.log").read_text().splitlines()]
         builds = [entry for entry in commands if entry["args"][0] == "build"]
-        self.assertEqual(len(builds), 1 + len(self.native) - len(LINUX_ONLY))
+        self.assertEqual(len(builds), 2 + len(self.native) - len(LINUX_ONLY))
         for build in builds:
             self.assertIn("--locked", build["args"])
             self.assertIn("aarch64-apple-darwin", build["args"])
@@ -189,6 +204,89 @@ class PrepareWorkerTest(unittest.TestCase):
         output, result = self.prepare(env={**self.env, "FAIL_BUILD": "1"})
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(output.exists())
+
+    def test_source_home_installs_renderer_after_copying_capsule_tree(self):
+        source = (SOURCE / "scripts/setup-source-home.sh").read_text()
+        names = ("cargo_target_root_for_manifest", "cargo_built_binary_path", "capsule_entrypoint",
+                 "capsule_runtime_abi", "is_runtime_projection_capsule", "is_content_data_capsule",
+                 "copy_capsule_tree", "install_app_capsules")
+        functions = "\n".join(name + "() {" + source.split(name + "() {", 1)[1]
+                              .split("\n}\n", 1)[0] + "\n}\n" for name in names)
+        built = self.root / "built/release/home-cli"
+        built.parent.mkdir(parents=True)
+        built.write_bytes(b"rebuilt renderer")
+        built.chmod(0o755)
+        stale = self.repo / "capsules/home-cli/bin/home-cli"
+        stale.parent.mkdir()
+        stale.write_bytes(b"stale ignored source renderer")
+        data = self.root / "source-home-data"
+        env = {**self.env, "ROOT": str(self.repo), "DATA_DIR": str(data),
+               "CARGO_TARGET_DIR": str(self.root / "built")}
+        result = self.command("/bin/bash", "-euc", functions +
+                              "\nAPP_CAPSULES=(home-cli)\ninstall_app_capsules\n", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installed = data / "capsules/home-cli/bin/home-cli"
+        self.assertEqual(installed.read_bytes(), built.read_bytes())
+        self.assertEqual(installed.stat().st_mode & 0o111, 0o111)
+        self.assertFalse((data / "bin/home-cli").exists())
+
+    def test_development_archives_carry_the_built_renderer(self):
+        supplied = os.environ.get("ELASTOS_TEST_HOME_CLI_RENDERER")
+        renderer = Path(supplied) if supplied else self.root / "renderer"
+        if not supplied:
+            renderer.write_bytes(b"renderer fixture")
+            renderer.chmod(0o755)
+        for script in ("home-frontdoor-smoke.sh", "local-carrier-setup-smoke.sh"):
+            with self.subTest(script=script):
+                source = (SOURCE / "scripts" / script).read_text()
+                function = "def write_capsule_archive" + source.split("def write_capsule_archive", 1)[1].split(
+                    '\nwrite_capsule_archive(', 1)[0]
+                artifacts = self.root / script
+                artifacts.mkdir()
+                descriptor = {"release_path": "home-cli-darwin-arm64.tar.gz"}
+                scope = {"json": json, "os": os, "pathlib": __import__("pathlib"),
+                         "tarfile": tarfile, "hashlib": hashlib, "artifacts_dir": artifacts,
+                         "platform_info": lambda name: descriptor}
+                exec(compile(function, script, "exec"), scope)
+                with patch.dict(os.environ, {"HOME_CLI_RENDERER": str(renderer)}):
+                    scope["write_capsule_archive"]("home-cli", self.repo / "capsules/home-cli")
+                archive = artifacts / descriptor["release_path"]
+                self.assertEqual(descriptor["checksum"], "sha256:" + hashlib.sha256(archive.read_bytes()).hexdigest())
+                installed = artifacts / "data/capsules"
+                installed.mkdir(parents=True)
+                result = self.command("tar", "xzf", str(archive), "-C", str(installed))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                native = installed / "home-cli/bin/home-cli"
+                self.assertEqual(native.read_bytes(), renderer.read_bytes())
+                self.assertEqual(native.stat().st_mode & 0o111, 0o111)
+                with patch.dict(os.environ, {"HOME_CLI_RENDERER": str(self.root / "missing-renderer")}):
+                    with self.assertRaisesRegex(SystemExit, "missing built Home CLI renderer"):
+                        scope["write_capsule_archive"]("home-cli", self.repo / "capsules/home-cli")
+
+    def test_demo_rejects_old_input_and_overlays_selected_platform(self):
+        source = (SOURCE / "scripts/home-demo-local.sh").read_text()
+        body = source.split('    "$SETUP_PLATFORM" <<\'PY\'\n', 1)[1].split("\nPY\n", 1)[0]
+        installed = self.root / "installed-components.json"
+        output = self.root / "demo-components.json"
+        native_info = {"release_path": "home-cli-linux-amd64.tar.gz", "extract_path": "home-cli"}
+        installed.write_text(json.dumps({"external": {
+            "home-cli": {"platforms": {"*": {"release_path": "home-cli.tar.gz"}}},
+            "shell": {"platforms": {"*": {"checksum": "sha256:published-shell"}}},
+        }}))
+        command = ["python3", "-", str(self.repo / "components.json"), str(installed), str(output), "linux-amd64"]
+        result = subprocess.run(command, input=body, text=True, capture_output=True, env=self.env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Published Home CLI input is incompatible", result.stderr)
+        self.assertFalse(output.exists())
+        data = json.loads(installed.read_text())
+        data["external"]["home-cli"]["platforms"] = {"linux-amd64": native_info}
+        installed.write_text(json.dumps(data))
+        result = subprocess.run(command, input=body, text=True, capture_output=True, env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prepared = json.loads(output.read_text())
+        self.assertEqual(prepared["external"]["shell"]["platforms"]["linux-amd64"],
+                         {"checksum": "sha256:published-shell"})
+        self.assertEqual(prepared["external"]["home-cli"]["platforms"]["linux-amd64"], native_info)
 
     def test_linux_missing_locks_stops_before_build(self):
         output, result = self.prepare(env={**self.env, "MOCK_OS": "Linux", "MOCK_ARCH": "x86_64"})

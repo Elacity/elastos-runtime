@@ -184,6 +184,49 @@ class PlatformInputTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected executable"):
             inputs.verify(root)
 
+    def test_home_cli_requires_a_delivered_native_renderer(self):
+        platform = "aarch64-darwin"
+        root = self.bundles[platform]
+        path = root / "artifacts/home-cli-darwin-arm64.tar.gz"
+        template = json.loads((root / "components-template.json").read_text())
+        template["external"]["home-cli"] = {
+            "install_path": "capsules/home-cli", "platforms": {"darwin-arm64": {
+                "install_path": "capsules/home-cli", "release_path": path.name,
+                "extract_path": "home-cli"}}}
+        self.write_json(root / "components-template.json", template)
+        manifest = json.loads((root / "components.json").read_text())
+        manifest["external"]["home-cli"] = copy.deepcopy(template["external"]["home-cli"])
+        for case in ("valid", "missing", "wrong-os", "wrong-cpu", "nonexec", "symlink"):
+            with tarfile.open(path, "w:gz") as archive:
+                contract = tarfile.TarInfo("home-cli/capsule.json")
+                payload = b'{"name":"home-cli"}'
+                contract.size = len(payload)
+                archive.addfile(contract, io.BytesIO(payload))
+                if case != "missing":
+                    info = tarfile.TarInfo("home-cli/bin/home-cli")
+                    info.mode = 0o644 if case == "nonexec" else 0o755
+                    payload = binary("aarch64-linux" if case == "wrong-os" else platform)
+                    if case == "wrong-cpu":
+                        payload = bytearray(payload)
+                        struct.pack_into("<I", payload, 4, 0x01000007)
+                    if case == "symlink":
+                        info.type = tarfile.SYMTYPE
+                        info.linkname = "../other"
+                        archive.addfile(info)
+                    else:
+                        info.size = len(payload)
+                        archive.addfile(info, io.BytesIO(payload))
+            descriptor = manifest["external"]["home-cli"]["platforms"]["darwin-arm64"]
+            descriptor.update(checksum="sha256:" + inputs.digest(path), size=path.stat().st_size)
+            self.write_json(root / "components.json", manifest)
+            self.refresh(root)
+            with self.subTest(case=case):
+                if case == "valid":
+                    inputs.verify(root)
+                else:
+                    with self.assertRaisesRegex(ValueError, "renderer|expected executable"):
+                        inputs.verify(root)
+
     def test_unsafe_archive_members_and_links_reject(self):
         path = self.root / "bad.tar.gz"
         for entries in (
@@ -192,6 +235,8 @@ class PlatformInputTest(unittest.TestCase):
             [("home/link", b"", "../../escape")],
             [("home/link", b"", "dir"), ("home/link/child", b"bad", None)],
             [("home/link/child", b"bad", None), ("home/link", b"", "dir")],
+            [("home/bin", b"file", None), ("home/bin/renderer", b"child", None)],
+            [("home/bin/renderer", b"child", None), ("home/bin", b"file", None)],
         ):
             with self.subTest(entries=entries):
                 path.write_bytes(archive_bytes(entries))

@@ -116,7 +116,15 @@ echo "[local-carrier-setup] building current binary and first-party Home core as
 (cd "${REPO_ROOT}/capsules/wallet-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/object-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/content-block-graph-provider" && cargo build --release)
-(cd "${REPO_ROOT}/capsules/home-cli" && cargo build --release --bin home-cli)
+HOME_CLI_RENDERER=$(cargo build --locked --manifest-path "${REPO_ROOT}/capsules/home-cli/Cargo.toml" --release --bin home-cli --message-format=json | python3 -c '
+import json, sys
+artifacts = [json.loads(line) for line in sys.stdin]
+paths = [item["executable"] for item in artifacts if item.get("reason") == "compiler-artifact"
+         and item.get("target", {}).get("name") == "home-cli" and item.get("executable")]
+if len(paths) != 1:
+    raise SystemExit("expected one built Home CLI renderer")
+print(paths[0])')
+export HOME_CLI_RENDERER
 for capsule in \
     home \
     home-cli \
@@ -276,6 +284,11 @@ def write_capsule_archive(name, capsule_dir):
         browser_dir = capsule_dir / "browser"
         if browser_dir.is_dir():
             tar.add(browser_dir, arcname=f"{name}/browser")
+        if name == "home-cli":
+            renderer = pathlib.Path(os.environ["HOME_CLI_RENDERER"])
+            if not renderer.is_file() or renderer.is_symlink() or not os.access(renderer, os.X_OK):
+                raise SystemExit(f"missing built Home CLI renderer: {renderer}")
+            tar.add(renderer, arcname="home-cli/bin/home-cli")
     data = archive.read_bytes()
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
@@ -511,6 +524,8 @@ do
 done
 
 STATUS_OUT="${TEST_ROOT}/home-status.txt"
+test -x "${DATA_DIR}/capsules/home-cli/bin/home-cli"
+cmp "$HOME_CLI_RENDERER" "${DATA_DIR}/capsules/home-cli/bin/home-cli"
 (
     cd "${ELASTOS_ROOT}"
     XDG_DATA_HOME="${XDG_DATA_HOME}" \

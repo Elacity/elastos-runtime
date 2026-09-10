@@ -559,6 +559,7 @@ build_support_binary() {
 build_packaged_capsule_archive() {
     local platform="$1"
     local capsule_name="$2"
+    local native_renderer="${3:-}"
     local capsule_dir capsule_type entrypoint stage_root archive
 
     capsule_dir=$(resolve_capsule_dir "$capsule_name" || true)
@@ -585,6 +586,12 @@ build_packaged_capsule_archive() {
             ;;
     esac
 
+    if [[ -n "$native_renderer" ]]; then
+        [[ "$capsule_name" == home-cli && -x "$native_renderer" && ! -L "$native_renderer" ]] \
+            || die "Home CLI packaging requires a built native renderer"
+        mkdir -p "${stage_root}/${capsule_name}/bin" || return
+        install -m 755 "$native_renderer" "${stage_root}/${capsule_name}/bin/home-cli" || return
+    fi
     create_capsule_tar "$archive" "$stage_root" "$capsule_name" || return
     echo "$archive"
 }
@@ -868,7 +875,7 @@ build_supported_direct_assets() {
     local setup_platform="$2"
     local target="${3:-}"
     local use_cross="${4:-false}"
-    local stage_dir updates_json name binary staged install_path release_path
+    local stage_dir updates_json name binary staged install_path release_path archive
 
     stage_dir="${TMPDIR}/supported-assets-${platform}"
     mkdir -p "$stage_dir" || return
@@ -882,6 +889,14 @@ build_supported_direct_assets() {
         install_path="bin/${name}"
         updates_json=$(record_direct_asset "$updates_json" "$name" "$staged" "$install_path" "$release_path") || return
     done
+
+    # Home CLI remains one capsule; its terminal renderer makes this archive native.
+    binary=$(build_support_binary home-cli "$platform" "$target" "$use_cross") || return
+    archive=$(build_packaged_capsule_archive "$platform" home-cli "$binary") || return
+    release_path="home-cli-${setup_platform}.tar.gz"
+    staged="${stage_dir}/${release_path}"
+    cp "$archive" "$staged" || return
+    updates_json=$(record_direct_asset "$updates_json" home-cli "$staged" "capsules/home-cli" "$release_path" home-cli) || return
 
     stamp_direct_assets "$setup_platform" "$updates_json"
 }
@@ -942,7 +957,6 @@ build_platform_independent_direct_assets() {
     updates_json='{}'
 
     for capsule in \
-        home-cli \
         home-gui \
         home \
         system \
@@ -1802,6 +1816,12 @@ HOST_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets "$PLATFORM" "$SETUP_
 CROSS_DIRECT_ASSETS="{}"
 if [[ -n "$CROSS_ARCH" ]]; then
     CROSS_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets "$CROSS_PLATFORM" "$CROSS_SETUP_PLATFORM" "$CROSS_RUST_TARGET" true)
+fi
+
+# Registry and setup delivery must identify the same native Home CLI package.
+cp "${TMPDIR}/supported-assets-${PLATFORM}/home-cli-${SETUP_PLATFORM}.tar.gz" "${ARTIFACTS_DIR}/home-cli.capsule.tar.gz"
+if [[ -n "$CROSS_ARCH" ]]; then
+    cp "${TMPDIR}/supported-assets-${CROSS_PLATFORM}/home-cli-${CROSS_SETUP_PLATFORM}.tar.gz" "${CROSS_ARTIFACTS_DIR}/home-cli.capsule.tar.gz"
 fi
 
 info "Publishing capsule artifacts to IPFS..."
