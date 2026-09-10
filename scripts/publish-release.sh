@@ -534,12 +534,12 @@ build_support_binary() {
     info "  Building ${name} (${platform})..." >&2
     if [[ -n "$target" ]]; then
         if [[ "$use_cross" == true ]] && command -v cross >/dev/null 2>&1; then
-            (cd "$capsule_dir" && "${CROSS_ENV[@]}" cross build --release --target "$target") >&2
+            (cd "$capsule_dir" && "${CROSS_ENV[@]}" cross build --release --target "$target") >&2 || return
         else
-            (cd "$capsule_dir" && cargo build --release --target "$target") >&2
+            (cd "$capsule_dir" && cargo build --release --target "$target") >&2 || return
         fi
     else
-        (cd "$capsule_dir" && cargo build --release) >&2
+        (cd "$capsule_dir" && cargo build --release) >&2 || return
     fi
 
     binary=$(support_binary_build_path "$name" "$target")
@@ -560,23 +560,23 @@ build_packaged_capsule_archive() {
     entrypoint=$(capsule_manifest_field "$capsule_name" "entrypoint")
     stage_root="${TMPDIR}/support-assets-${platform}-${capsule_name}"
     archive="${TMPDIR}/support-assets-${platform}/${capsule_name}.tar.gz"
-    rm -rf "$stage_root"
-    mkdir -p "${stage_root}/${capsule_name}" "$(dirname "$archive")"
+    rm -rf "$stage_root" || return
+    mkdir -p "${stage_root}/${capsule_name}" "$(dirname "$archive")" || return
 
     case "$capsule_type" in
         data)
-            copy_clean_capsule_tree "$capsule_dir" "${stage_root}/${capsule_name}"
+            copy_clean_capsule_tree "$capsule_dir" "${stage_root}/${capsule_name}" || return
             [[ -f "${stage_root}/${capsule_name}/${entrypoint}" ]] || die "${capsule_name} data entrypoint missing after packaging: ${entrypoint}"
             ;;
         wasm)
-            stage_wasm_capsule "$capsule_name" "$capsule_dir" "${stage_root}/${capsule_name}"
+            stage_wasm_capsule "$capsule_name" "$capsule_dir" "${stage_root}/${capsule_name}" || return
             ;;
         *)
             die "Unsupported packaged app capsule type for ${capsule_name}: ${capsule_type}"
             ;;
     esac
 
-    create_capsule_tar "$archive" "$stage_root" "$capsule_name"
+    create_capsule_tar "$archive" "$stage_root" "$capsule_name" || return
     echo "$archive"
 }
 
@@ -625,18 +625,18 @@ build_packaged_provider_capsule_metadata_archive() {
     stage_root="${TMPDIR}/provider-contract-${capsule_name}"
     archive_dir="${TMPDIR}/supported-provider-contract-archives"
     archive="${archive_dir}/${capsule_name}-capsule-metadata.tar.gz"
-    rm -rf "$stage_root"
-    mkdir -p "${stage_root}/${capsule_name}" "$archive_dir"
+    rm -rf "$stage_root" || return
+    mkdir -p "${stage_root}/${capsule_name}" "$archive_dir" || return
 
-    cp "${capsule_dir}/capsule.json" "${stage_root}/${capsule_name}/capsule.json"
+    cp "${capsule_dir}/capsule.json" "${stage_root}/${capsule_name}/capsule.json" || return
     for size in 32 64 128 256; do
         source="${capsule_dir}/${icon_dir}/icon-${size}.png"
         [[ -f "$source" ]] || die "${capsule_name} provider capsule icon missing: ${icon_dir}/icon-${size}.png"
-        mkdir -p "${stage_root}/${capsule_name}/${icon_dir}"
-        cp "$source" "${stage_root}/${capsule_name}/${icon_dir}/icon-${size}.png"
+        mkdir -p "${stage_root}/${capsule_name}/${icon_dir}" || return
+        cp "$source" "${stage_root}/${capsule_name}/${icon_dir}/icon-${size}.png" || return
     done
 
-    create_capsule_tar "$archive" "$stage_root" "$capsule_name"
+    create_capsule_tar "$archive" "$stage_root" "$capsule_name" || return
     echo "$archive"
 }
 
@@ -715,9 +715,9 @@ stage_wasm_capsule() {
     runtime_abi=$(capsule_manifest_field "$capsule_name" "runtime_abi")
 
     if [[ "$runtime_abi" == "elastos.component/v1" ]]; then
-        ensure_rust_target_installed "wasm32-unknown-unknown"
+        ensure_rust_target_installed "wasm32-unknown-unknown" || return
         info "  Building ${capsule_name} Component..." >&2
-        scripts/build-component-capsule.sh "$capsule_dir" >&2
+        scripts/build-component-capsule.sh "$capsule_dir" >&2 || return
     elif [[ "$runtime_abi" == "elastos.runtime-projection/v1" ]]; then
         info "  Using ${capsule_name} Runtime projection from source..." >&2
     else
@@ -734,12 +734,12 @@ stage_wasm_capsule() {
     done
     [[ -n "$built_wasm" ]] || die "${capsule_name} entrypoint missing after build: ${entrypoint}"
 
-    mkdir -p "$dest"
-    cp "${capsule_dir}/capsule.json" "$dest/"
-    cp "$built_wasm" "${dest}/${entrypoint}"
+    mkdir -p "$(dirname "${dest}/${entrypoint}")" || return
+    cp "${capsule_dir}/capsule.json" "$dest/" || return
+    cp "$built_wasm" "${dest}/${entrypoint}" || return
     if [[ -d "${capsule_dir}/browser" ]]; then
-        mkdir -p "${dest}/browser"
-        copy_clean_capsule_tree "${capsule_dir}/browser" "${dest}/browser"
+        mkdir -p "${dest}/browser" || return
+        copy_clean_capsule_tree "${capsule_dir}/browser" "${dest}/browser" || return
     fi
 }
 
@@ -750,31 +750,28 @@ record_direct_asset() {
     local install_path="$4"
     local release_path="$5"
     local extract_path="${6:-}"
-    local cid checksum size
+    local checksum size
 
-    cid=$(ipfs_add "$staged")
-    checksum=$(sha256 "$staged")
-    size=$(file_size "$staged")
+    checksum=$(sha256 "$staged") || return
+    size=$(file_size "$staged") || return
 
     if [[ -n "$extract_path" ]]; then
         echo "$updates_json" | jq \
             --arg name "$name" \
-            --arg cid "$cid" \
             --arg checksum "sha256:${checksum}" \
             --arg install_path "$install_path" \
             --arg extract_path "$extract_path" \
             --arg release_path "$release_path" \
             --argjson size "$size" \
-            '.[$name] = {cid: $cid, checksum: $checksum, size: $size, install_path: $install_path, extract_path: $extract_path, release_path: $release_path}'
+            '.[$name] = {checksum: $checksum, size: $size, install_path: $install_path, extract_path: $extract_path, release_path: $release_path}'
     else
         echo "$updates_json" | jq \
             --arg name "$name" \
-            --arg cid "$cid" \
             --arg checksum "sha256:${checksum}" \
             --arg install_path "$install_path" \
             --arg release_path "$release_path" \
             --argjson size "$size" \
-            '.[$name] = {cid: $cid, checksum: $checksum, size: $size, install_path: $install_path, release_path: $release_path}'
+            '.[$name] = {checksum: $checksum, size: $size, install_path: $install_path, release_path: $release_path}'
     fi
 }
 
@@ -785,15 +782,13 @@ record_provider_capsule_metadata_asset() {
     local install_path="$4"
     local release_path="$5"
     local extract_path="$6"
-    local cid checksum size
+    local checksum size
 
-    cid=$(ipfs_add "$staged")
-    checksum=$(sha256 "$staged")
-    size=$(file_size "$staged")
+    checksum=$(sha256 "$staged") || return
+    size=$(file_size "$staged") || return
 
     echo "$updates_json" | jq \
         --arg name "$name" \
-        --arg cid "$cid" \
         --arg checksum "sha256:${checksum}" \
         --arg install_path "$install_path" \
         --arg extract_path "$extract_path" \
@@ -803,7 +798,6 @@ record_provider_capsule_metadata_asset() {
             install_path: $install_path,
             platforms: {
                 "*": {
-                    cid: $cid,
                     checksum: $checksum,
                     size: $size,
                     install_path: $install_path,
@@ -848,16 +842,16 @@ build_supported_direct_assets() {
     local stage_dir updates_json name binary staged install_path release_path
 
     stage_dir="${TMPDIR}/supported-assets-${platform}"
-    mkdir -p "$stage_dir"
+    mkdir -p "$stage_dir" || return
     updates_json='{}'
 
     for name in "${SUPPORT_BINARY_ASSETS[@]}"; do
-        binary=$(build_support_binary "$name" "$platform" "$target" "$use_cross")
+        binary=$(build_support_binary "$name" "$platform" "$target" "$use_cross") || return
         release_path="${name}-${setup_platform}"
         staged="${stage_dir}/${release_path}"
-        cp "$binary" "$staged"
+        cp "$binary" "$staged" || return
         install_path="bin/${name}"
-        updates_json=$(record_direct_asset "$updates_json" "$name" "$staged" "$install_path" "$release_path")
+        updates_json=$(record_direct_asset "$updates_json" "$name" "$staged" "$install_path" "$release_path") || return
     done
 
     stamp_direct_assets "$setup_platform" "$updates_json"
@@ -915,7 +909,7 @@ build_platform_independent_direct_assets() {
     local archive staged capsule
 
     stage_dir="${TMPDIR}/supported-assets-universal"
-    mkdir -p "$stage_dir"
+    mkdir -p "$stage_dir" || return
     updates_json='{}'
 
     for capsule in \
@@ -945,30 +939,31 @@ build_platform_independent_direct_assets() {
         if [[ -n "${ARTIFACTS_DIR:-}" && -f "${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" ]]; then
             archive="${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz"
         else
-            archive=$(build_packaged_capsule_archive "$platform" "$capsule")
+            archive=$(build_packaged_capsule_archive "$platform" "$capsule") || return
         fi
         release_path="${capsule}.tar.gz"
         staged="${stage_dir}/${release_path}"
-        cp "$archive" "$staged"
-        updates_json=$(record_direct_asset "$updates_json" "$capsule" "$staged" "capsules/${capsule}" "$release_path" "$capsule")
+        cp "$archive" "$staged" || return
+        updates_json=$(record_direct_asset "$updates_json" "$capsule" "$staged" "capsules/${capsule}" "$release_path" "$capsule") || return
     done
 
     stamp_direct_assets "*" "$updates_json"
 }
 
 build_platform_independent_provider_capsule_metadata_assets() {
-    local stage_dir updates_json provider archive staged release_path
+    local stage_dir updates_json provider archive staged release_path providers
 
     stage_dir="${TMPDIR}/supported-provider-contracts-universal"
-    mkdir -p "$stage_dir"
+    mkdir -p "$stage_dir" || return
     updates_json='{}'
 
+    providers=$(provider_capsule_names) || return
     while IFS= read -r provider; do
         [[ -n "$provider" ]] || continue
-        archive=$(build_packaged_provider_capsule_metadata_archive "$provider")
+        archive=$(build_packaged_provider_capsule_metadata_archive "$provider") || return
         release_path="${provider}-capsule-metadata.tar.gz"
         staged="${stage_dir}/${release_path}"
-        cp "$archive" "$staged"
+        cp "$archive" "$staged" || return
         updates_json=$(
             record_provider_capsule_metadata_asset \
                 "$updates_json" \
@@ -977,10 +972,42 @@ build_platform_independent_provider_capsule_metadata_assets() {
                 "capsules/${provider}" \
                 "$release_path" \
                 "$provider"
-        )
-    done < <(provider_capsule_names)
+        ) || return
+    done <<< "$providers"
 
     echo "$updates_json"
+}
+# Attach transport identities only after local asset preparation succeeds.
+# Builders above return unsigned descriptors with no placeholder CIDs.
+publish_direct_assets() {
+    local updates_json="$1"
+    local platform="$2"
+    local release_paths release_path staged candidate cid count
+    release_paths=$(printf '%s\n' "$updates_json" | jq -r \
+        '[.. | objects | .release_path? // empty] | unique[]') || return
+    while IFS= read -r release_path; do
+        [[ -n "$release_path" ]] || continue
+        case "$release_path" in
+            */*|*\\*|.|..) die "Invalid direct asset filename: $release_path" ;;
+        esac
+        staged=""
+        count=0
+        for candidate in \
+            "${TMPDIR}/supported-assets-${platform}/${release_path}" \
+            "${TMPDIR}/supported-assets-universal/${release_path}" \
+            "${TMPDIR}/supported-provider-contracts-universal/${release_path}"; do
+            if [[ -f "$candidate" && ! -L "$candidate" ]]; then
+                staged="$candidate"
+                count=$((count + 1))
+            fi
+        done
+        [[ "$count" == 1 ]] || die "Expected one staged direct asset: $release_path (found $count)"
+        cid=$(ipfs_add "$staged") || return
+        updates_json=$(printf '%s\n' "$updates_json" | jq \
+            --arg path "$release_path" --arg cid "$cid" \
+            'walk(if type == "object" and .release_path? == $path then .cid = $cid else . end)') || return
+    done <<< "$release_paths"
+    printf '%s\n' "$updates_json"
 }
 
 merge_direct_assets() {
@@ -1717,6 +1744,16 @@ publish_platform_capsules() {
     echo "$entries"
 }
 
+info "Preparing direct share/open support assets..."
+UNIVERSAL_DIRECT_ASSETS=$(build_platform_independent_direct_assets "$PLATFORM")
+UNIVERSAL_PROVIDER_CAPSULE_METADATA_ASSETS=$(build_platform_independent_provider_capsule_metadata_assets)
+UNIVERSAL_DIRECT_ASSETS=$(merge_direct_assets "$UNIVERSAL_DIRECT_ASSETS" "$UNIVERSAL_PROVIDER_CAPSULE_METADATA_ASSETS")
+HOST_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets "$PLATFORM" "$SETUP_PLATFORM" "$NATIVE_RUST_TARGET" false)
+CROSS_DIRECT_ASSETS="{}"
+if [[ -n "$CROSS_ARCH" ]]; then
+    CROSS_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets "$CROSS_PLATFORM" "$CROSS_SETUP_PLATFORM" "$CROSS_RUST_TARGET" true)
+fi
+
 info "Publishing capsule artifacts to IPFS..."
 
 # Host platform capsules.
@@ -1731,15 +1768,12 @@ if [[ -n "$CROSS_ARCH" && -d "${CROSS_ARTIFACTS_DIR:-/nonexistent}" ]]; then
     CROSS_CAPSULE_ENTRIES=$(publish_platform_capsules "$CROSS_ARTIFACTS_DIR" "$CROSS_PLATFORM")
 fi
 
-info "Publishing direct share/open support assets..."
-UNIVERSAL_DIRECT_ASSETS=$(build_platform_independent_direct_assets "$PLATFORM")
-UNIVERSAL_PROVIDER_CAPSULE_METADATA_ASSETS=$(build_platform_independent_provider_capsule_metadata_assets)
-UNIVERSAL_DIRECT_ASSETS=$(merge_direct_assets "$UNIVERSAL_DIRECT_ASSETS" "$UNIVERSAL_PROVIDER_CAPSULE_METADATA_ASSETS")
-HOST_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets "$PLATFORM" "$SETUP_PLATFORM" "$NATIVE_RUST_TARGET" false)
+info "Publishing prepared direct assets..."
+UNIVERSAL_DIRECT_ASSETS=$(publish_direct_assets "$UNIVERSAL_DIRECT_ASSETS" "$PLATFORM")
+HOST_PLATFORM_DIRECT_ASSETS=$(publish_direct_assets "$HOST_PLATFORM_DIRECT_ASSETS" "$PLATFORM")
 HOST_DIRECT_ASSETS=$(merge_direct_assets "$HOST_PLATFORM_DIRECT_ASSETS" "$UNIVERSAL_DIRECT_ASSETS")
-CROSS_DIRECT_ASSETS="{}"
 if [[ -n "$CROSS_ARCH" ]]; then
-    CROSS_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets "$CROSS_PLATFORM" "$CROSS_SETUP_PLATFORM" "$CROSS_RUST_TARGET" true)
+    CROSS_PLATFORM_DIRECT_ASSETS=$(publish_direct_assets "$CROSS_PLATFORM_DIRECT_ASSETS" "$CROSS_PLATFORM")
     CROSS_DIRECT_ASSETS=$(merge_direct_assets "$CROSS_PLATFORM_DIRECT_ASSETS" "$UNIVERSAL_DIRECT_ASSETS")
 fi
 

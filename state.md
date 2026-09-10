@@ -164,6 +164,15 @@ approved plan retains full release acceptance.
   Archive hashes change from the previous writer; a new candidate must bind
   the new bytes. Full candidate builds and device installation remain open.
 
+- Direct app, native provider and provider-metadata builders now record local
+  file descriptors before any capsule upload. Publication attaches real CIDs
+  in a separate step. Build and archive failures return through Bash command
+  substitutions, and nested app entrypoints get their parent directory before
+  copying. Ten regression groups pass on macOS and Linux, including four
+  preparation failures that stop before upload. Independent source review and
+  required source checks pass. Transferable platform receipts, full preparation
+  commands and candidate installation remain open.
+
 The source and installed sections below preserve the earlier evidence snapshot.
 Their original identities qualify those results. Current milestone receipts
 above take precedence where the work has moved; remaining sections are refreshed

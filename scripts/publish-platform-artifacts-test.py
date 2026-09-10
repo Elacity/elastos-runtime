@@ -21,6 +21,139 @@ spec.loader.exec_module(integrity)
 
 
 class PlatformArtifactExportTest(unittest.TestCase):
+    def test_direct_asset_publication_attaches_cids_after_preparation(self):
+        source = PUBLISHER.read_text()
+        function = "publish_direct_assets() {" + source.split(
+            "publish_direct_assets() {", 1
+        )[1].split("\n}\n", 1)[0] + "\n}\n"
+        for failure in (None, "upload", "missing", "duplicate", "unsafe"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
+                root = Path(root)
+                for directory, filename in (
+                    ("supported-assets-aarch64-darwin", "shell-darwin-arm64"),
+                    ("supported-assets-universal", "home.tar.gz"),
+                    ("supported-provider-contracts-universal", "shell-metadata.tar.gz"),
+                ):
+                    (root / directory).mkdir()
+                    (root / directory / filename).write_bytes(b"asset")
+                data = {"external": {
+                    "home": {"platforms": {"*": {"release_path": "home.tar.gz", "size": 5}}},
+                    "shell": {
+                        "platforms": {"darwin-arm64": {"release_path": "shell-darwin-arm64", "size": 5}},
+                        "capsule_metadata": {"platforms": {"*": {"release_path": "shell-metadata.tar.gz", "size": 5}}},
+                    },
+                }}
+                if failure == "missing":
+                    (root / "supported-assets-universal/home.tar.gz").unlink()
+                if failure == "duplicate":
+                    (root / "supported-assets-aarch64-darwin/home.tar.gz").write_bytes(b"asset")
+                if failure == "unsafe":
+                    data["external"]["home"]["platforms"]["*"]["release_path"] = "../escape"
+                result = subprocess.run(["bash", "-euc", function + '''
+die() { echo "$*" >&2; exit 1; }
+ipfs_add() {
+    printf '%s\\n' "$(basename "$1")" >> "$TEST_UPLOAD"
+    [[ "$TEST_FAILURE" != upload ]] || return 93
+    printf 'cid-%s\\n' "$(basename "$1")"
+}
+result=$(publish_direct_assets "$TEST_DATA" aarch64-darwin)
+printf '%s\\n' "$result"
+'''], env={**os.environ, "TMPDIR": str(root), "TEST_FAILURE": failure or "",
+           "TEST_DATA": json.dumps(data), "TEST_UPLOAD": str(root / "uploaded")},
+                    capture_output=True, text=True)
+                if failure:
+                    self.assertNotEqual(result.returncode, 0)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    received = json.loads(result.stdout)
+                    for name, component in received["external"].items():
+                        for descriptor in component["platforms"].values():
+                            self.assertEqual(descriptor.pop("cid"), "cid-" + descriptor["release_path"])
+                        if "capsule_metadata" in component:
+                            descriptor = component["capsule_metadata"]["platforms"]["*"]
+                            self.assertEqual(descriptor.pop("cid"), "cid-shell-metadata.tar.gz")
+                    self.assertEqual(received, data)
+                    self.assertEqual(len((root / "uploaded").read_text().splitlines()), 3)
+
+    def test_failed_asset_preparation_stops_before_any_upload(self):
+        source = PUBLISHER.read_text()
+        start = source.index('info "Preparing direct share/open support assets..."')
+        phase = source[start:source.index("# ── Step 5:", start)]
+        for failure in ("apps", "metadata", "native", "cross"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
+                result = subprocess.run(["bash", "-euc", '''
+info() { :; }
+build_platform_independent_direct_assets() { [[ "$TEST_FAILURE" != apps ]] || return 93; echo '{}'; }
+build_platform_independent_provider_capsule_metadata_assets() { [[ "$TEST_FAILURE" != metadata ]] || return 93; echo '{}'; }
+build_supported_direct_assets() {
+    [[ "$TEST_FAILURE" != native ]] || return 93
+    [[ "$TEST_FAILURE" != cross || "$1" != aarch64-linux ]] || return 93
+    echo '{}'
+}
+merge_direct_assets() { echo '{}'; }
+publish_platform_capsules() { touch "$TEST_UPLOAD"; echo '{}'; }
+publish_direct_assets() { touch "$TEST_UPLOAD"; echo '{}'; }
+''' + phase], env={**os.environ, "TEST_FAILURE": failure, "TEST_UPLOAD": str(Path(root) / "uploaded"),
+                  "PLATFORM": "aarch64-darwin", "SETUP_PLATFORM": "darwin-arm64",
+                  "NATIVE_RUST_TARGET": "aarch64-apple-darwin", "CROSS_ARCH": "aarch64",
+                  "CROSS_PLATFORM": "aarch64-linux", "CROSS_SETUP_PLATFORM": "linux-arm64",
+                  "CROSS_RUST_TARGET": "aarch64-unknown-linux-musl", "ARTIFACTS_DIR": root,
+                  "CROSS_ARTIFACTS_DIR": root}, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((Path(root) / "uploaded").exists())
+
+    def test_fresh_projection_packaging_and_asset_records_do_not_publish(self):
+        source = PUBLISHER.read_text()
+        names = ("capsule_manifest_field", "copy_clean_capsule_tree", "create_capsule_tar",
+                 "stage_wasm_capsule", "build_packaged_capsule_archive",
+                 "record_direct_asset", "record_provider_capsule_metadata_asset",
+                 "sha256", "file_size")
+        functions = "\n".join(name + "() {" + source.split(name + "() {", 1)[1].split(
+            "\n}\n", 1)[0] + "\n}\n" for name in names)
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            capsule = root / "source"
+            (capsule / "browser").mkdir(parents=True)
+            (capsule / "browser/index.html").write_text("<title>Home</title>")
+            (capsule / "capsule.json").write_text(json.dumps({
+                "type": "wasm", "entrypoint": "browser/index.html",
+                "runtime_abi": "elastos.runtime-projection/v1",
+            }))
+            result = subprocess.run(["bash", "-euc", functions + '''
+die() { echo "$*" >&2; exit 1; }
+info() { :; }
+resolve_capsule_dir() { echo "$TEST_SOURCE"; }
+ipfs_add() { touch "$TEST_UPLOAD"; echo unexpected-upload; }
+archive=$(build_packaged_capsule_archive aarch64-darwin home)
+record_direct_asset '{}' home "$archive" capsules/home home.tar.gz home > "$TMPDIR/app.json"
+record_provider_capsule_metadata_asset '{}' provider "$archive" capsules/provider provider.tar.gz provider > "$TMPDIR/provider.json"
+'''], env={**os.environ, "TMPDIR": str(root), "TEST_SOURCE": str(capsule),
+           "TEST_UPLOAD": str(root / "uploaded")}, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertFalse((root / "uploaded").exists(), "packaging called IPFS")
+            app = json.loads((root / "app.json").read_text())["home"]
+            metadata = json.loads((root / "provider.json").read_text())["external"]["provider"]["capsule_metadata"]["platforms"]["*"]
+            for record in (app, metadata):
+                self.assertNotIn("cid", record)
+                self.assertGreater(record["size"], 0)
+                self.assertRegex(record["checksum"], r"^sha256:[0-9a-f]{64}$")
+            with tarfile.open(root / "support-assets-aarch64-darwin/home.tar.gz") as archive:
+                self.assertEqual(archive.extractfile("home/browser/index.html").read(), b"<title>Home</title>")
+            # A command substitution on stock Bash disables implicit errexit;
+            # the builder must return an archive-write failure explicitly.
+            result = subprocess.run(["bash", "-euc", functions + '''
+die() { echo "$*" >&2; exit 1; }
+info() { :; }
+resolve_capsule_dir() { echo "$TEST_SOURCE"; }
+create_capsule_tar() { return 93; }
+archive=$(build_packaged_capsule_archive aarch64-darwin home)
+touch "$TEST_FALSE_SUCCESS"
+'''], env={**os.environ, "TMPDIR": str(root), "TEST_SOURCE": str(capsule),
+           "TEST_FALSE_SUCCESS": str(root / "false-success")}, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((root / "false-success").exists())
+
     def test_capsule_archive_is_portable_and_reproducible(self):
         source = PUBLISHER.read_text()
         function = "create_capsule_tar() {" + source.split(
