@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # This fixture owns setup, launch, and cleanup after bootstrap.
 export ELASTOS_INSTALL_ONLY=1
@@ -26,7 +27,7 @@ Usage:
   bash scripts/home-demo-local.sh
   bash scripts/home-demo-local.sh --prepare-only
   bash scripts/home-demo-local.sh --skip-build
-  bash scripts/home-demo-local.sh --home /tmp/elastos-demo-fixed
+  bash scripts/home-demo-local.sh --home "$HOME/.local/share/elastos-demos/fixed"
 
 What it does:
   1. Builds the repo-local elastos binary (unless --skip-build)
@@ -69,7 +70,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$DEMO_HOME" ]]; then
-    DEMO_HOME="$(mktemp -d /tmp/elastos-demo-XXXXXX)"
+    mkdir -p "${HOST_HOME}/.local/share/elastos-demos"
+    DEMO_HOME="$(mktemp -d "${HOST_HOME}/.local/share/elastos-demos/demo-XXXXXX")"
 else
     mkdir -p "$DEMO_HOME"
 fi
@@ -203,6 +205,11 @@ if (home_cli_info.get("release_path") != f"home-cli-{setup_platform}.tar.gz"
         f"This demo requires a native home-cli archive for {setup_platform}; "
         "rerun after that release is available."
     )
+
+media_info = ((installed.get("external") or {}).get("media-tools", {}).get("platforms") or {}).get(setup_platform, {})
+if (media_info.get("release_path") != f"media-tools-{setup_platform}.tar.gz"
+        or media_info.get("extract_path") != "media-tools"):
+    raise SystemExit("Published Home input is missing managed media tools; rerun after a compatible release is available.")
 
 for name, source_component in data.get("external", {}).items():
     installed_component = (installed.get("external") or {}).get(name)

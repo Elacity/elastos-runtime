@@ -91,11 +91,50 @@ def check_native_header(header, mode, platform, label):
         raise ValueError(f"{label}: expected executable for {platform}")
 
 
-def check_archive(path, extract_path=None, provider=False, home_cli_platform=None):
+def check_media_tools_records(records, info, platform):
+    recipe = SOURCE_ROOT / "scripts/media-tools-build.py"
+    wrapper = recipe.with_name("build-media-tools.sh")
+    spec = importlib.util.spec_from_file_location("media_recipe", recipe)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    sources = {name: {"url": url, "sha256": sha} for name, (url, sha) in module.SOURCES.items()}
+    expected = {"schema": "elastos.media-tools-build/v1", "platform": PLATFORMS[platform][0],
+                "sources": sources, "recipe_sha256": digest(recipe), "wrapper_sha256": digest(wrapper)}
+    if not isinstance(info, dict) or any(info.get(k) != v for k, v in expected.items()):
+        raise ValueError("media-tools build metadata differs from the reviewed recipe/platform")
+    required = {"bin/ffmpeg", "bin/ffprobe", "BUILD.md", "sources/media-tools-build.py",
+                "sources/build-media-tools.sh", "licenses/FFmpeg-COPYING.GPLv2", "licenses/x264-COPYING"}
+    required.update("sources/" + name for name in sources)
+    if platform.endswith("-linux"):
+        required.add("licenses/musl-COPYRIGHT")
+    if set(records) != required or info.get("files") != records:
+        raise ValueError("media-tools source/binary inventory or hashes differ from build metadata")
+    if not isinstance(info.get("compiler"), str) or not info["compiler"].strip():
+        raise ValueError("media-tools compiler record is missing")
+    if platform.endswith("-linux"):
+        musl = info.get("musl")
+        if (not isinstance(musl, dict) or not isinstance(musl.get("version"), str)
+                or not musl["version"].strip()
+                or musl.get("license_sha256") != records["licenses/musl-COPYRIGHT"]["sha256"]):
+            raise ValueError("media-tools musl license metadata is missing or differs")
+    for name, source in sources.items():
+        if records["sources/" + name]["sha256"] != source["sha256"]:
+            raise ValueError(f"media-tools source checksum mismatch: {name}")
+    for name, expected_sha in (("sources/media-tools-build.py", expected["recipe_sha256"]),
+                               ("sources/build-media-tools.sh", expected["wrapper_sha256"])):
+        if records[name]["sha256"] != expected_sha:
+            raise ValueError(f"media-tools recipe bytes differ: {name}")
+    if any(record["size"] <= 0 for record in records.values()):
+        raise ValueError("media-tools package contains an empty required file")
+
+
+def check_archive(path, extract_path=None, provider=False, home_cli_platform=None, media_platform=None):
     seen = set()
     regular = set()
     links = set()
     contract = None
+    media_records = {}
+    media_info = None
     renderer = "home-cli/bin/home-cli"
     with tarfile.open(path, "r|gz") as archive:
         for entry in archive:
@@ -104,6 +143,9 @@ def check_archive(path, extract_path=None, provider=False, home_cli_platform=Non
                     or any(p in {"", ".", ".."} for p in name.split("/"))
                     or name in seen):
                 raise ValueError(f"{path.name}: unsafe or duplicate archive member {name!r}")
+            if media_platform is not None and (not name.startswith("media-tools/") and name != "media-tools"
+                                               or not (entry.isfile() or entry.isdir())):
+                raise ValueError(f"{path.name}: media-tools requires regular files within its archive root")
             if any(str(parent) in links or str(parent) in regular for parent in PurePosixPath(name).parents):
                 raise ValueError(f"{path.name}: archive member beneath a file or link: {name}")
             if entry.issym():
@@ -121,6 +163,20 @@ def check_archive(path, extract_path=None, provider=False, home_cli_platform=Non
                 if any(other.startswith(name + "/") for other in seen):
                     raise ValueError(f"{path.name}: file replaces archive parent: {name}")
                 regular.add(name)
+            if media_platform is not None and entry.isfile():
+                stream = archive.extractfile(entry)
+                if name == "media-tools/build-info.json":
+                    if entry.size > 1024 * 1024:
+                        raise ValueError("media-tools build metadata exceeds its bound")
+                    media_info = json.load(stream)
+                else:
+                    header = stream.read(64)
+                    if name in {"media-tools/bin/ffmpeg", "media-tools/bin/ffprobe"}:
+                        check_native_header(header, entry.mode, media_platform, name)
+                    file_hash = hashlib.sha256(header)
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        file_hash.update(chunk)
+                    media_records[name.removeprefix("media-tools/")] = {"sha256": file_hash.hexdigest(), "size": entry.size}
             if home_cli_platform is not None and name == renderer:
                 if not entry.isfile():
                     raise ValueError(f"{path.name}: Home CLI renderer must be a regular file")
@@ -133,6 +189,10 @@ def check_archive(path, extract_path=None, provider=False, home_cli_platform=Non
             seen.add(name)
     if home_cli_platform is not None and (extract_path != "home-cli" or renderer not in regular):
         raise ValueError(f"{path.name}: Home CLI native renderer is missing")
+    if media_platform is not None:
+        if extract_path != "media-tools":
+            raise ValueError("media-tools extraction root differs from its contract")
+        check_media_tools_records(media_records, media_info, media_platform)
     if not seen:
         raise ValueError(f"{path.name}: empty app archive")
     if extract_path is not None:
@@ -231,7 +291,8 @@ def check_contents(root, platform, omissions):
                 check_binary(path, platform)
             elif info.get("extract_path"):
                 check_archive(path, info["extract_path"], provider=is_provider_metadata,
-                              home_cli_platform=platform if name == "home-cli" and not is_provider_metadata else None)
+                              home_cli_platform=platform if name == "home-cli" and not is_provider_metadata else None,
+                              media_platform=platform if name == "media-tools" else None)
             elif expected_install and expected_install.startswith("capsules/"):
                 raise ValueError(f"{name}: capsule artifact needs an extraction path")
     check_binary(regular_file(root / "artifacts", f"elastos-{platform}"), platform)

@@ -253,6 +253,75 @@ class PlatformInputTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "renderer|expected executable"):
                         inputs.verify(root)
 
+    def test_media_tools_requires_native_pair_and_exact_source_bundle(self):
+        platform = "aarch64-darwin"
+        root = self.bundles[platform]
+        scripts = inputs.SOURCE_ROOT / "scripts"
+        scripts.mkdir()
+        sources = {name: ("https://source.invalid/" + name, hashlib.sha256(payload).hexdigest())
+                   for name, payload in (("ffmpeg.tar.xz", b"pinned ffmpeg"), ("x264.tar.bz2", b"pinned x264"))}
+        recipe = ("SOURCES = " + repr(sources) + "\n").encode()
+        wrapper = b"#!/bin/sh\nexec python3 media-tools-build.py \"$@\"\n"
+        (scripts / "media-tools-build.py").write_bytes(recipe)
+        (scripts / "build-media-tools.sh").write_bytes(wrapper)
+        path = root / "artifacts/media-tools-darwin-arm64.tar.gz"
+        template = json.loads((root / "components-template.json").read_text())
+        component = {"install_path": "tools/media-tools", "platforms": {"darwin-arm64": {
+            "install_path": "tools/media-tools", "release_path": path.name, "extract_path": "media-tools"}}}
+        template["external"]["media-tools"] = component
+        self.write_json(root / "components-template.json", template)
+        manifest = json.loads((root / "components.json").read_text())
+        manifest["external"]["media-tools"] = copy.deepcopy(component)
+        for case in ("valid", "missing-pair", "wrong-cpu", "nonexec", "link", "source-mismatch",
+                     "missing-license", "recipe-mismatch", "metadata-mismatch"):
+            payloads = {"bin/ffmpeg": binary(platform), "bin/ffprobe": binary(platform),
+                        "sources/ffmpeg.tar.xz": b"pinned ffmpeg", "sources/x264.tar.bz2": b"pinned x264",
+                        "sources/media-tools-build.py": recipe, "sources/build-media-tools.sh": wrapper,
+                        "licenses/FFmpeg-COPYING.GPLv2": b"GPL", "licenses/x264-COPYING": b"GPL",
+                        "BUILD.md": b"Build from the included source"}
+            if case == "missing-pair":
+                del payloads["bin/ffprobe"]
+            if case == "missing-license":
+                del payloads["licenses/x264-COPYING"]
+            if case == "source-mismatch":
+                payloads["sources/ffmpeg.tar.xz"] = b"different source"
+            if case == "recipe-mismatch":
+                payloads["sources/media-tools-build.py"] = b"different recipe"
+            if case == "wrong-cpu":
+                payloads["bin/ffprobe"] = binary("x86_64-linux")
+            info = {"schema": "elastos.media-tools-build/v1", "platform": "darwin-arm64",
+                    "sources": {name: {"url": url, "sha256": sha} for name, (url, sha) in sources.items()},
+                    "recipe_sha256": hashlib.sha256(recipe).hexdigest(),
+                    "wrapper_sha256": hashlib.sha256(wrapper).hexdigest(), "compiler": "fixture compiler",
+                    "files": {name: {"sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload)}
+                              for name, payload in payloads.items()}}
+            if case == "metadata-mismatch":
+                info["files"]["bin/ffmpeg"]["sha256"] = "0" * 64
+            payloads["build-info.json"] = json.dumps(info).encode()
+            with tarfile.open(path, "w:gz") as archive:
+                for name, payload in payloads.items():
+                    entry = tarfile.TarInfo("media-tools/" + name)
+                    entry.mode = 0o755 if name.startswith("bin/") else 0o644
+                    if case == "nonexec" and name == "bin/ffprobe":
+                        entry.mode = 0o644
+                    if case == "link" and name == "bin/ffprobe":
+                        entry.type = tarfile.SYMTYPE
+                        entry.linkname = "ffmpeg"
+                        archive.addfile(entry)
+                    else:
+                        entry.size = len(payload)
+                        archive.addfile(entry, io.BytesIO(payload))
+            descriptor = manifest["external"]["media-tools"]["platforms"]["darwin-arm64"]
+            descriptor.update(checksum="sha256:" + inputs.digest(path), size=path.stat().st_size)
+            self.write_json(root / "components.json", manifest)
+            self.refresh(root)
+            with self.subTest(case=case):
+                if case == "valid":
+                    inputs.verify(root)
+                else:
+                    with self.assertRaises(ValueError):
+                        inputs.verify(root)
+
     def test_unsafe_archive_members_and_links_reject(self):
         path = self.root / "bad.tar.gz"
         for entries in (

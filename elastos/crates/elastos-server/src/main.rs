@@ -444,9 +444,13 @@ enum Commands {
         #[arg(long)]
         list: bool,
 
-        /// Prepare selected component prerequisites without installing components
+        /// Prepare selected component prerequisites without installing the remaining components
         #[arg(long, hide = true)]
         prerequisites_only: bool,
+
+        /// Developer-supplied directory containing ffmpeg and ffprobe
+        #[arg(long, hide = true, requires = "prerequisites_only")]
+        media_tools_dir: Option<PathBuf>,
     },
 
     /// Manage trusted release sources
@@ -1425,8 +1429,17 @@ async fn main() -> anyhow::Result<()> {
             without,
             list,
             prerequisites_only,
+            media_tools_dir,
         } => {
-            setup::run(profile, with, without, list, prerequisites_only).await?;
+            setup::run(
+                profile,
+                with,
+                without,
+                list,
+                prerequisites_only,
+                media_tools_dir,
+            )
+            .await?;
         }
 
         Commands::Source(cmd) => {

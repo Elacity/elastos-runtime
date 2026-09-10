@@ -989,7 +989,8 @@ if ! printf '%s' "${INSTALLED_VERSION_OUTPUT}" | grep -Fq "${RELEASE_VERSION}"; 
     die "Installed binary version mismatch at ${INSTALL_DIR}/elastos\n  Expected: ${RELEASE_VERSION}\n  Got:      ${INSTALLED_VERSION_OUTPUT:-<no output>}"
 fi
 
-mkdir -p "$DATA_DIR"
+# New Runtime data is private; preserve the mode of an existing installation.
+(umask 077; mkdir -p "$DATA_DIR")
 
 # Evict stale cached capsules when components.json changes (CID mismatch).
 # This forces the supervisor to re-download updated capsule binaries on demand.

@@ -56,6 +56,7 @@ jobs:
           python3 scripts/publish-platform-artifacts-test.py
           python3 scripts/release-platform-input-test.py
           python3 scripts/prepare-release-platform-test.py
+          python3 scripts/media-tools-build-test.py
       - name: Browser close handshake
         run: node --test scripts/browser-window-close-handshake.test.mjs
 
@@ -209,7 +210,7 @@ jobs:
       - name: install host prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y coturn e2fsprogs ffmpeg
+          sudo apt-get install -y coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
       - name: source-home into isolated HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
@@ -224,6 +225,7 @@ jobs:
           export HOME="${SOURCE_HOME}"
           export XDG_DATA_HOME="${SOURCE_HOME}/.local/share"
           export PATH="${CARGO_HOME}/bin:${PATH}"
+          export SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR="$(dirname "$(command -v ffmpeg)")"
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${XDG_DATA_HOME}/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
@@ -321,6 +323,7 @@ jobs:
           export RUSTUP_HOME="${RUSTUP_HOME:-${USER_HOME}/.rustup}"
           export HOME="${MAC_TEST_HOME}"
           export PATH="${CARGO_HOME}/bin:/opt/homebrew/bin:/opt/homebrew/opt/e2fsprogs/sbin:${PATH}"
+          export SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR="$(dirname "$(command -v ffmpeg)")"
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${HOME}/Library/Application Support/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"

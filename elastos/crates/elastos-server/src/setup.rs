@@ -186,9 +186,19 @@ pub async fn run(
     without: Vec<String>,
     list: bool,
     prerequisites_only: bool,
+    media_tools_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let data_dir = data_dir()?;
-    run_with_data_dir(data_dir, profile, with, without, list, prerequisites_only).await
+    run_with_data_dir(
+        data_dir,
+        profile,
+        with,
+        without,
+        list,
+        prerequisites_only,
+        media_tools_dir,
+    )
+    .await
 }
 
 async fn run_with_data_dir(
@@ -198,7 +208,11 @@ async fn run_with_data_dir(
     without: Vec<String>,
     list: bool,
     prerequisites_only: bool,
+    media_tools_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    if media_tools_dir.is_some() && !prerequisites_only {
+        anyhow::bail!("--media-tools-dir requires --prerequisites-only");
+    }
     let manifest = load_manifest()?;
     let platform = detect_platform();
 
@@ -265,7 +279,15 @@ async fn run_with_data_dir(
         return Ok(());
     }
 
-    prepare_selected_component_prerequisites(&data_dir, &components)?;
+    prepare_selected_component_prerequisites(
+        &data_dir,
+        &manifest,
+        &platform,
+        &components,
+        &ipfs_gateways,
+        media_tools_dir.as_deref(),
+    )
+    .await?;
     if prerequisites_only {
         println!("Selected component prerequisites are ready.");
         return Ok(());
@@ -1796,12 +1818,62 @@ fn normalize_profile_name(name: &str) -> &str {
     name
 }
 
-fn prepare_selected_component_prerequisites(
+async fn prepare_selected_component_prerequisites(
     data_dir: &Path,
+    manifest: &ComponentsManifest,
+    platform: &str,
     components: &[String],
+    ipfs_gateways: &[ElastosFetchPath],
+    supplied_tools: Option<&Path>,
 ) -> anyhow::Result<()> {
     if components.iter().any(|name| name == "media-provider") {
-        crate::protected_content_runtime::prepare_runtime_media_provider_prerequisite(data_dir)?;
+        let managed_tools;
+        let tools = if let Some(tools) = supplied_tools {
+            tools
+        } else {
+            let name = "media-tools";
+            let component = manifest.external.get(name).ok_or_else(|| {
+                anyhow::anyhow!("Home media-tools component is missing; run the installer again")
+            })?;
+            let info = resolve_platform_info(component, platform).ok_or_else(|| {
+                anyhow::anyhow!("Home media-tools are unavailable for {platform}")
+            })?;
+            if resolve_install_path(component, Some(info)) != Some("tools/media-tools")
+                || info.extract_path.as_deref() != Some("media-tools")
+                || info.strategy.is_some()
+                || info.release_path.as_deref().is_none_or(str::is_empty)
+            {
+                anyhow::bail!("Home media-tools require a managed release archive");
+            }
+            required_release_artifact_checksum(name, info)?;
+            #[cfg(unix)]
+            crate::protected_content_runtime::ensure_media_provider_directory(
+                data_dir,
+                "Runtime data root",
+            )?;
+            #[cfg(unix)]
+            crate::protected_content_runtime::ensure_media_provider_directory(
+                &data_dir.join("tools"),
+                "Runtime managed tools parent",
+            )?;
+            let dest = data_dir.join("tools/media-tools");
+            if !matches!(
+                component_install_state(data_dir, component, Some(info)),
+                InstallState::Installed
+            ) {
+                let url = resolve_component_download_url(info)
+                    .ok_or_else(|| anyhow::anyhow!("Home media-tools release path is missing"))?;
+                download_component(data_dir, name, &url, info, &dest, ipfs_gateways).await?;
+                maybe_write_component_cache_metadata(manifest, Some(info), name, &dest)?;
+            }
+            managed_tools = dest.join("bin");
+            &managed_tools
+        };
+        crate::protected_content_runtime::prepare_runtime_media_provider_prerequisite(
+            data_dir, tools,
+        )?;
+    } else if supplied_tools.is_some() {
+        anyhow::bail!("--media-tools-dir requires media-provider selection");
     }
     Ok(())
 }
@@ -2507,7 +2579,14 @@ fn atomic_copy_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
 }
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> anyhow::Result<()> {
-    fs::create_dir_all(dest)?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o755);
+    }
+    builder.create(dest)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let path = entry.path();
@@ -2590,10 +2669,21 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn test_non_media_selection_has_no_media_prerequisite_effect() {
+    #[tokio::test]
+    async fn test_non_media_selection_has_no_media_prerequisite_effect() {
         let temp = tempfile::tempdir().unwrap();
-        prepare_selected_component_prerequisites(temp.path(), &["shell".to_string()]).unwrap();
+        let manifest: ComponentsManifest =
+            serde_json::from_value(serde_json::json!({"external": {}, "profiles": {}})).unwrap();
+        prepare_selected_component_prerequisites(
+            temp.path(),
+            &manifest,
+            &detect_platform(),
+            &["shell".to_string()],
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
         assert!(!temp
             .path()
             .join("protected-content/media-provider/config.json")
@@ -2602,7 +2692,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn test_missing_media_prerequisite_fails_before_first_component_install_effect() {
+    async fn test_missing_managed_media_tools_fail_before_first_component_install_effect() {
         let _guard = ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let xdg_data_home = temp.path().join("xdg-data");
@@ -2654,6 +2744,7 @@ mod tests {
             vec![],
             false,
             false,
+            None,
         )
         .await;
 
@@ -2666,8 +2757,207 @@ mod tests {
             None => std::env::remove_var("PATH"),
         }
 
-        assert!(result.unwrap_err().to_string().contains("ffmpeg"));
+        assert!(result.unwrap_err().to_string().contains("media-tools"));
         assert!(!data_dir.join("bin/effect").exists());
+    }
+
+    #[tokio::test]
+    async fn test_explicit_media_tools_require_prerequisite_only_before_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let error = run_with_data_dir(
+            data.clone(),
+            None,
+            vec![],
+            vec![],
+            false,
+            false,
+            Some(temp.path().join("tools")),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("--prerequisites-only"));
+        assert!(!data.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_managed_media_tools_create_private_data_before_fetch() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let platform = detect_platform();
+        let manifest: ComponentsManifest = serde_json::from_value(serde_json::json!({
+            "external": {"media-tools": {
+                "install_path": "tools/media-tools", "platforms": {platform.clone(): {
+                    "release_path": format!("media-tools-{platform}.tar.gz"),
+                    "extract_path": "media-tools", "checksum": format!("sha256:{}", "a".repeat(64))
+                }}
+            }}, "profiles": {}
+        }))
+        .unwrap();
+        let selected = vec!["media-provider".to_owned()];
+        let data = temp.path().join("fresh-data");
+        let error = prepare_selected_component_prerequisites(
+            &data,
+            &manifest,
+            &platform,
+            &selected,
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("Carrier fetch failed"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::metadata(&data).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(!data.join("protected-content").exists());
+
+        let existing = temp.path().join("existing-data");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(existing.join("retained"), "existing installation").unwrap();
+        let error = prepare_selected_component_prerequisites(
+            &existing,
+            &manifest,
+            &platform,
+            &selected,
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("Runtime data root"), "{error}");
+        assert_eq!(
+            fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::read(existing.join("retained")).unwrap(),
+            b"existing installation"
+        );
+        assert!(!existing.join("tools").exists());
+        let linked = temp.path().join("linked-data");
+        symlink(&existing, &linked).unwrap();
+        assert!(prepare_selected_component_prerequisites(
+            &linked,
+            &manifest,
+            &platform,
+            &selected,
+            &[],
+            None,
+        )
+        .await
+        .is_err());
+        assert!(fs::symlink_metadata(&linked).unwrap().is_symlink());
+        assert!(!existing.join("tools").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_managed_media_tools_are_imported_before_other_components() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = ENV_LOCK.lock().await;
+        let parent = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/media-setup-test-fixtures");
+        fs::create_dir_all(&parent).unwrap();
+        // The source parent is deliberately safe even when this test runs under umask 0002.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let temp = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(parent)
+            .unwrap();
+        let data = temp.path().join("data");
+        let package = temp.path().join("package/media-tools/bin");
+        fs::create_dir_all(&package).unwrap();
+        for name in ["ffmpeg", "ffprobe"] {
+            fs::write(package.join(name), name).unwrap();
+            fs::set_permissions(package.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let archive = temp.path().join("media-tools.tar.gz");
+        assert!(std::process::Command::new("tar")
+            .args(["czf", archive.to_str().unwrap(), "-C"])
+            .arg(temp.path().join("package"))
+            .arg("media-tools")
+            .status()
+            .unwrap()
+            .success());
+        let archive_bytes = fs::read(&archive).unwrap();
+        let checksum = format!("sha256:{:x}", sha2::Sha256::digest(&archive_bytes));
+        let effect = temp.path().join("effect");
+        fs::write(&effect, "other component").unwrap();
+        let platform = detect_platform();
+        let manifest_path = temp.path().join("components.json");
+        fs::write(&manifest_path, serde_json::to_vec(&serde_json::json!({
+            "external": {
+                "media-tools": {"install_path": "tools/media-tools", "platforms": {platform.clone(): {
+                    "release_path": format!("media-tools-{platform}.tar.gz"), "extract_path": "media-tools", "checksum": checksum}}},
+                "media-provider": {"platforms": {}},
+                "effect": {"install_path": "bin/effect", "platforms": {platform.clone(): {"strategy": "local-copy", "source": effect}}}
+            }, "profiles": {"home": {"components": ["effect", "media-provider"]}}
+        })).unwrap()).unwrap();
+        let manifest = load_manifest_from_path(&manifest_path).unwrap();
+        let selected = vec!["media-provider".to_owned()];
+        let error = prepare_selected_component_prerequisites(
+            &data,
+            &manifest,
+            &platform,
+            &selected,
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("Carrier fetch failed"),
+            "{error}"
+        );
+        for path in [&data, &data.join("tools")] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        // Resume at the verified archive boundary. Carrier transport has separate fixtures;
+        // extraction, installed cache selection and private import are the production code.
+        let info = resolve_platform_info(&manifest.external["media-tools"], &platform).unwrap();
+        verify_checksum("media-tools", &archive_bytes, info).unwrap();
+        let dest = data.join("tools/media-tools");
+        extract_from_tarball(&archive_bytes, &dest, info).unwrap();
+        maybe_write_component_cache_metadata(&manifest, Some(info), "media-tools", &dest).unwrap();
+        for path in [&dest, &dest.join("bin")] {
+            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o022, 0);
+        }
+        let original = std::env::var_os(COMPONENTS_MANIFEST_ENV);
+        std::env::set_var(COMPONENTS_MANIFEST_ENV, &manifest_path);
+        let result =
+            run_with_data_dir(data.clone(), None, vec![], vec![], false, false, None).await;
+        match original {
+            Some(value) => std::env::set_var(COMPONENTS_MANIFEST_ENV, value),
+            None => std::env::remove_var(COMPONENTS_MANIFEST_ENV),
+        }
+        result.unwrap();
+        assert!(data
+            .join("protected-content/media-provider/config.json")
+            .is_file());
+        for name in ["ffmpeg", "ffprobe"] {
+            let private = data
+                .join("protected-content/media-provider/tools")
+                .join(name);
+            assert_eq!(fs::read(&private).unwrap(), name.as_bytes());
+            assert_eq!(
+                fs::metadata(private).unwrap().permissions().mode() & 0o777,
+                0o500
+            );
+        }
+        assert_eq!(
+            fs::read(data.join("bin/effect")).unwrap(),
+            b"other component"
+        );
     }
 
     #[test]

@@ -59,7 +59,7 @@ use super::{
     load_runtime_custody_composition, load_runtime_custody_composition_config,
     load_runtime_media_provider_bridge_config,
     load_runtime_protected_content_chain_provider_config, prepare_runtime_custody_library_source,
-    prepare_runtime_media_provider_prerequisite_with_path, publish_runtime_custody_library_object,
+    prepare_runtime_media_provider_prerequisite, publish_runtime_custody_library_object,
     publish_runtime_custody_library_source, register_inactive_custody_provider,
     register_inactive_custody_runtime_provider_target, register_protect_provider,
     register_protected_content_decrypt_provider, resolve_runtime_rights_policy,
@@ -3754,7 +3754,7 @@ fn prepare_test_media_prerequisite(data_dir: &Path, root: &Path) {
     owner_only_dir(root);
     write_media_prerequisite(&root.join("ffmpeg"), b"ffmpeg-private-test", 0o700);
     write_media_prerequisite(&root.join("ffprobe"), b"ffprobe-private-test", 0o700);
-    prepare_runtime_media_provider_prerequisite_with_path(data_dir, root.as_os_str()).unwrap();
+    prepare_runtime_media_provider_prerequisite(data_dir, root).unwrap();
 }
 
 #[cfg(unix)]
@@ -3762,7 +3762,7 @@ fn prepare_test_media_prerequisite(data_dir: &Path, root: &Path) {
 fn media_prerequisite_import_is_bounded_private_idempotent_and_never_executes_tools() {
     let temp = safe_ancestor_tempdir();
     let data_dir = temp.path().join("data");
-    let source = temp.path().join("source");
+    let source = temp.path().join("source:tools");
     let marker = temp.path().join("executed");
     owner_only_dir(&source);
     write_media_prerequisite(
@@ -3776,13 +3776,12 @@ fn media_prerequisite_import_is_bounded_private_idempotent_and_never_executes_to
         0o700,
     );
 
-    prepare_runtime_media_provider_prerequisite_with_path(&data_dir, source.as_os_str()).unwrap();
+    prepare_runtime_media_provider_prerequisite(&data_dir, &source).unwrap();
     let config_path = media_config_path(&data_dir);
     let original_config = fs::read(&config_path).unwrap();
     let original_ffmpeg =
         fs::read(data_dir.join("protected-content/media-provider/tools/ffmpeg")).unwrap();
-    prepare_runtime_media_provider_prerequisite_with_path(&data_dir, std::ffi::OsStr::new(""))
-        .unwrap();
+    prepare_runtime_media_provider_prerequisite(&data_dir, &source).unwrap();
 
     assert!(!marker.exists());
     assert_eq!(fs::read(&config_path).unwrap(), original_config);
@@ -3826,9 +3825,28 @@ fn media_prerequisite_import_is_bounded_private_idempotent_and_never_executes_to
     let bounded_bytes = serde_json::to_vec_pretty(&bounded).unwrap();
     fs::write(&config_path, &bounded_bytes).unwrap();
     fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
-    prepare_runtime_media_provider_prerequisite_with_path(&data_dir, std::ffi::OsStr::new(""))
-        .unwrap();
+    prepare_runtime_media_provider_prerequisite(&data_dir, &source).unwrap();
     assert_eq!(fs::read(config_path).unwrap(), bounded_bytes);
+
+    let imported_probe =
+        fs::read(data_dir.join("protected-content/media-provider/tools/ffprobe")).unwrap();
+    write_media_prerequisite(
+        &source.join("ffprobe"),
+        b"different supplied ffprobe",
+        0o700,
+    );
+    let error = prepare_runtime_media_provider_prerequisite(&data_dir, &source).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("differ from the private imported pair"));
+    assert_eq!(
+        fs::read(media_config_path(&data_dir)).unwrap(),
+        bounded_bytes
+    );
+    assert_eq!(
+        fs::read(data_dir.join("protected-content/media-provider/tools/ffprobe")).unwrap(),
+        imported_probe
+    );
 }
 
 #[cfg(unix)]
@@ -3839,9 +3857,7 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     let missing = temp.path().join("missing-tools");
     owner_only_dir(&missing);
     write_media_prerequisite(&missing.join("ffmpeg"), b"ffmpeg", 0o700);
-    let error =
-        prepare_runtime_media_provider_prerequisite_with_path(&missing_data, missing.as_os_str())
-            .unwrap_err();
+    let error = prepare_runtime_media_provider_prerequisite(&missing_data, &missing).unwrap_err();
     assert!(error.to_string().contains("ffprobe"));
     assert!(!media_config_path(&missing_data).exists());
 
@@ -3850,13 +3866,12 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     owner_only_dir(&unsafe_tools);
     write_media_prerequisite(&unsafe_tools.join("ffmpeg"), b"ffmpeg", 0o720);
     write_media_prerequisite(&unsafe_tools.join("ffprobe"), b"ffprobe", 0o700);
-    assert!(prepare_runtime_media_provider_prerequisite_with_path(
-        &unsafe_data,
-        unsafe_tools.as_os_str()
-    )
-    .unwrap_err()
-    .to_string()
-    .contains("ffmpeg prerequisite"));
+    assert!(
+        prepare_runtime_media_provider_prerequisite(&unsafe_data, &unsafe_tools)
+            .unwrap_err()
+            .to_string()
+            .contains("ffmpeg prerequisite")
+    );
     assert!(!media_config_path(&unsafe_data).exists());
 
     let oversized_data = temp.path().join("oversized-data");
@@ -3870,13 +3885,12 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     )
     .unwrap();
     write_media_prerequisite(&oversized_tools.join("ffprobe"), b"ffprobe", 0o700);
-    assert!(prepare_runtime_media_provider_prerequisite_with_path(
-        &oversized_data,
-        oversized_tools.as_os_str()
-    )
-    .unwrap_err()
-    .to_string()
-    .contains("exceeds bounds"));
+    assert!(
+        prepare_runtime_media_provider_prerequisite(&oversized_data, &oversized_tools)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds bounds")
+    );
     assert!(!media_config_path(&oversized_data).exists());
 
     let non_file_data = temp.path().join("non-file-data");
@@ -3884,13 +3898,12 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     owner_only_dir(&non_file_tools);
     owner_only_dir(&non_file_tools.join("ffmpeg"));
     write_media_prerequisite(&non_file_tools.join("ffprobe"), b"ffprobe", 0o700);
-    assert!(prepare_runtime_media_provider_prerequisite_with_path(
-        &non_file_data,
-        non_file_tools.as_os_str()
-    )
-    .unwrap_err()
-    .to_string()
-    .contains("ffmpeg prerequisite"));
+    assert!(
+        prepare_runtime_media_provider_prerequisite(&non_file_data, &non_file_tools)
+            .unwrap_err()
+            .to_string()
+            .contains("ffmpeg prerequisite")
+    );
 
     let unsafe_parent_data = temp.path().join("unsafe-parent-data");
     let unsafe_parent_tools = temp.path().join("unsafe-parent-tools");
@@ -3898,13 +3911,12 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     write_media_prerequisite(&unsafe_parent_tools.join("ffmpeg"), b"ffmpeg", 0o700);
     write_media_prerequisite(&unsafe_parent_tools.join("ffprobe"), b"ffprobe", 0o700);
     fs::set_permissions(&unsafe_parent_tools, fs::Permissions::from_mode(0o770)).unwrap();
-    assert!(prepare_runtime_media_provider_prerequisite_with_path(
-        &unsafe_parent_data,
-        unsafe_parent_tools.as_os_str()
-    )
-    .unwrap_err()
-    .to_string()
-    .contains("prerequisite parent is unsafe"));
+    assert!(
+        prepare_runtime_media_provider_prerequisite(&unsafe_parent_data, &unsafe_parent_tools)
+            .unwrap_err()
+            .to_string()
+            .contains("prerequisite parent is unsafe")
+    );
 
     let linked_data = temp.path().join("linked-data");
     let linked_tools = temp.path().join("linked-tools");
@@ -3916,13 +3928,12 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     )
     .unwrap();
     write_media_prerequisite(&linked_tools.join("ffprobe"), b"ffprobe", 0o700);
-    assert!(prepare_runtime_media_provider_prerequisite_with_path(
-        &linked_data,
-        linked_tools.as_os_str()
-    )
-    .unwrap_err()
-    .to_string()
-    .contains("ffmpeg prerequisite"));
+    assert!(
+        prepare_runtime_media_provider_prerequisite(&linked_data, &linked_tools)
+            .unwrap_err()
+            .to_string()
+            .contains("ffmpeg prerequisite")
+    );
 }
 
 #[cfg(unix)]
@@ -3997,9 +4008,7 @@ fn media_prerequisite_conflict_cleans_only_files_created_by_that_attempt() {
     owner_only_dir(&tools);
     write_media_prerequisite(&tools.join("ffprobe"), b"preserved-conflict", 0o500);
 
-    let error =
-        prepare_runtime_media_provider_prerequisite_with_path(&data_dir, source.as_os_str())
-            .unwrap_err();
+    let error = prepare_runtime_media_provider_prerequisite(&data_dir, &source).unwrap_err();
 
     assert!(error.to_string().contains("ffprobe import conflicts"));
     assert_eq!(

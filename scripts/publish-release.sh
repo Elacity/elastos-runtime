@@ -870,6 +870,31 @@ print(json.dumps({"external": external}))
 PY
 }
 
+build_packaged_media_tools_archive() {
+    local setup_platform="$1"
+    local host_platform cache target_root stage_root archive
+    case "$(uname -s):$(uname -m)" in
+        Darwin:arm64|Darwin:aarch64) host_platform=darwin-arm64 ;;
+        Linux:x86_64) host_platform=linux-amd64 ;;
+        Linux:aarch64|Linux:arm64) host_platform=linux-arm64 ;;
+        *) die "Unsupported native media-tools build platform" ;;
+    esac
+    [[ "$host_platform" == "$setup_platform" ]] \
+        || die "Prepare media-tools on ${setup_platform}; the media builder requires a native host"
+    target_root="${CARGO_TARGET_DIR:-}"
+    if [[ -z "$target_root" ]]; then
+        target_root=$(cd elastos && cargo metadata --locked --offline --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])') || return
+    fi
+    cache="${target_root}/media-tools/${setup_platform}"
+    scripts/build-media-tools.sh --output "$cache" >&2 || return
+    stage_root="${TMPDIR}/media-tools-${setup_platform}"
+    archive="${TMPDIR}/media-tools-${setup_platform}.tar.gz"
+    mkdir -p "$stage_root" || return
+    cp -R "$cache" "${stage_root}/media-tools" || return
+    create_capsule_tar "$archive" "$stage_root" media-tools || return
+    echo "$archive"
+}
+
 build_supported_direct_assets() {
     local platform="$1"
     local setup_platform="$2"
@@ -880,6 +905,12 @@ build_supported_direct_assets() {
     stage_dir="${TMPDIR}/supported-assets-${platform}"
     mkdir -p "$stage_dir" || return
     updates_json='{}'
+
+    archive=$(build_packaged_media_tools_archive "$setup_platform") || return
+    release_path="media-tools-${setup_platform}.tar.gz"
+    staged="${stage_dir}/${release_path}"
+    cp "$archive" "$staged" || return
+    updates_json=$(record_direct_asset "$updates_json" media-tools "$staged" "tools/media-tools" "$release_path" media-tools) || return
 
     for name in "${SUPPORT_BINARY_ASSETS[@]}"; do
         binary=$(build_support_binary "$name" "$platform" "$target" "$use_cross") || return

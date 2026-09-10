@@ -10,7 +10,6 @@
 pub(crate) mod tests;
 
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 #[cfg(unix)]
@@ -1760,28 +1759,31 @@ pub fn load_runtime_media_provider_bridge_config(
     }))
 }
 
-pub(crate) fn prepare_runtime_media_provider_prerequisite(data_dir: &Path) -> anyhow::Result<()> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    prepare_runtime_media_provider_prerequisite_with_path(data_dir, &path)
-}
-
-fn prepare_runtime_media_provider_prerequisite_with_path(
+pub(crate) fn prepare_runtime_media_provider_prerequisite(
     data_dir: &Path,
-    path: &OsStr,
+    tools_dir: &Path,
 ) -> anyhow::Result<()> {
+    // Open the complete supplied pair before creating or changing private state.
+    let mut ffmpeg = open_runtime_media_tool(tools_dir, "ffmpeg")?;
+    let mut ffprobe = open_runtime_media_tool(tools_dir, "ffprobe")?;
     match fs::symlink_metadata(runtime_media_provider_config_path(data_dir)) {
         Ok(_) => {
             load_runtime_media_provider_bridge_config(data_dir)?.ok_or_else(|| {
                 invalid_media_provider_config("config file disappeared during validation")
             })?;
+            let tools = runtime_media_provider_tools_root(data_dir);
+            if !runtime_media_tool_matches(&mut ffmpeg, &tools.join("ffmpeg"), "ffmpeg")?
+                || !runtime_media_tool_matches(&mut ffprobe, &tools.join("ffprobe"), "ffprobe")?
+            {
+                return Err(invalid_media_provider_config(
+                    "supplied media tools differ from the private imported pair",
+                ));
+            }
             return Ok(());
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err(invalid_media_provider_config("config file is unavailable")),
     }
-
-    let mut ffmpeg = open_runtime_media_tool_from_path(path, "ffmpeg")?;
-    let mut ffprobe = open_runtime_media_tool_from_path(path, "ffprobe")?;
     #[cfg(unix)]
     {
         ensure_media_provider_directory(data_dir, "Runtime data root")?;
@@ -1879,7 +1881,7 @@ fn media_path_string(path: &Path, label: &str) -> anyhow::Result<String> {
 }
 
 #[cfg(unix)]
-fn ensure_media_provider_directory(path: &Path, label: &str) -> anyhow::Result<()> {
+pub(crate) fn ensure_media_provider_directory(path: &Path, label: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
 
     match fs::symlink_metadata(path) {
@@ -1910,57 +1912,51 @@ fn ensure_media_provider_directory(path: &Path, label: &str) -> anyhow::Result<(
 }
 
 #[cfg(unix)]
-fn open_runtime_media_tool_from_path(
-    path: &OsStr,
-    name: &str,
-) -> anyhow::Result<RuntimeMediaToolSource> {
-    for directory in std::env::split_paths(path) {
-        let candidate = directory.join(name);
-        let canonical = match fs::canonicalize(&candidate) {
-            Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                return Err(invalid_media_provider_config(format!(
-                    "{name} prerequisite is unavailable"
-                )))
-            }
-        };
-        validate_safe_media_source_parent_chain(&canonical, name)?;
-        let mut options = fs::OpenOptions::new();
-        options.read(true).custom_flags(libc::O_NOFOLLOW);
-        let file = options.open(&canonical).map_err(|_| {
-            invalid_media_provider_config(format!("{name} prerequisite is unavailable"))
-        })?;
-        let metadata = file.metadata().map_err(|_| {
-            invalid_media_provider_config(format!("{name} prerequisite metadata is unavailable"))
-        })?;
-        let mode = metadata.permissions().mode() & 0o777;
-        let uid = unsafe { libc::geteuid() };
-        if !metadata.is_file()
-            || (metadata.uid() != 0 && metadata.uid() != uid)
-            || mode & 0o022 != 0
-            || mode & 0o111 == 0
-            || metadata.nlink() != 1
-            || metadata.len() == 0
-            || metadata.len() > MAX_MEDIA_PROVIDER_IMPORTED_TOOL_BYTES
-        {
-            return Err(invalid_media_provider_config(format!(
-                "{name} prerequisite is unsafe or exceeds bounds"
-            )));
+fn open_runtime_media_tool(tools_dir: &Path, name: &str) -> anyhow::Result<RuntimeMediaToolSource> {
+    let candidate = tools_dir.join(name);
+    let canonical = match fs::canonicalize(&candidate) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(invalid_media_provider_config(format!("media-provider prerequisite '{name}' was not found in the supplied tools directory")));
         }
-        return Ok(RuntimeMediaToolSource {
-            file,
-            size: metadata.len(),
-        });
+        Err(_) => {
+            return Err(invalid_media_provider_config(format!(
+                "{name} prerequisite is unavailable"
+            )))
+        }
+    };
+    validate_safe_media_source_parent_chain(&canonical, name)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(&canonical).map_err(|_| {
+        invalid_media_provider_config(format!("{name} prerequisite is unavailable"))
+    })?;
+    let metadata = file.metadata().map_err(|_| {
+        invalid_media_provider_config(format!("{name} prerequisite metadata is unavailable"))
+    })?;
+    let mode = metadata.permissions().mode() & 0o777;
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || (metadata.uid() != 0 && metadata.uid() != uid)
+        || mode & 0o022 != 0
+        || mode & 0o111 == 0
+        || metadata.nlink() != 1
+        || metadata.len() == 0
+        || metadata.len() > MAX_MEDIA_PROVIDER_IMPORTED_TOOL_BYTES
+    {
+        return Err(invalid_media_provider_config(format!(
+            "{name} prerequisite is unsafe or exceeds bounds"
+        )));
     }
-    Err(invalid_media_provider_config(format!(
-        "media-provider prerequisite '{name}' was not found in the setup process PATH"
-    )))
+    Ok(RuntimeMediaToolSource {
+        file,
+        size: metadata.len(),
+    })
 }
 
 #[cfg(not(unix))]
-fn open_runtime_media_tool_from_path(
-    _path: &OsStr,
+fn open_runtime_media_tool(
+    _tools_dir: &Path,
     _name: &str,
 ) -> anyhow::Result<RuntimeMediaToolSource> {
     anyhow::bail!("owner-only media-provider prerequisite setup is unsupported on this platform")

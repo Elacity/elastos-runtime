@@ -16,6 +16,7 @@ Configure tool paths with:
   ELASTOS_CARGO_BIN
   ELASTOS_NODE_BIN
   ELASTOS_DEBUGFS_BIN
+  SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR (directory containing ffmpeg and ffprobe)
   ELASTOS_COLLABORATION_STARTUP_MODE (configured|isolated)
   ELASTOS_COLLABORATION_STARTUP_CONFIG_INPUT
   ELASTOS_BROWSER_NATIVE_PROXY_BIN
@@ -1734,7 +1735,8 @@ prepare_media_provider_prerequisite() {
     HOME="${HOME}" \
     ELASTOS_COMPONENTS_MANIFEST="${ROOT}/components.json" \
         "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)" \
-        setup --with media-provider --prerequisites-only
+        setup --with media-provider --prerequisites-only \
+        --media-tools-dir "${SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR}"
 }
 
 install_content_publish_backend() {
@@ -1779,6 +1781,16 @@ if [[ "${SETUP_SOURCE_HOME_CONFIG_ONLY:-0}" == "1" ]]; then
     exit 0
 fi
 
+[[ -n "${SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR:-}" ]] || {
+    echo "Set SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR to the reviewed directory containing ffmpeg and ffprobe." >&2
+    exit 1
+}
+for tool in ffmpeg ffprobe; do
+    [[ -x "${SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR}/${tool}" ]] || {
+        echo "Source-home media tool is missing: ${SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR}/${tool}" >&2
+        exit 1
+    }
+done
 browser_vm_backup_retention >/dev/null
 require_minimum_free_space "${ROOT}"
 require_minimum_free_space "${DATA_DIR}"

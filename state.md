@@ -180,10 +180,11 @@ approved plan retains full release acceptance.
   Cargo lockfiles, then exports local artifacts with an unsigned source/file
   receipt. Admission checks all three platform inputs against the candidate
   source, component template, native OS/CPU, provider contracts and exact file
-  inventory. Sixteen admission test groups and five preparation fixture tests
-  pass, including synthetic builds for all three platforms. Independent source
-  review found no remaining issues. Actual native builds,
-  publisher import, external dependencies and fresh installs remain open.
+  inventory. Preparation and admission fixtures pass for all three platforms.
+  Actual Mac preparation passed from the source before managed media delivery;
+  Linux preparation exposed native ioctl and custody-link portability gaps.
+  Final source-bound inputs, publisher import, external dependencies and signed
+  fresh installs remain open.
 
 - Three standalone Linux Browser helpers now have tracked Cargo lockfiles.
   Their registry versions and checksums match the existing Runtime workspace
@@ -197,6 +198,24 @@ approved plan retains full release acceptance.
   and eight preparation fixtures pass. Development fixtures use the installed
   renderer, and the demo reports incompatible older releases before launch.
   Full signed fresh-device acceptance remains open.
+
+- Managed Home now has one media-tools component containing FFmpeg and FFprobe,
+  built from pinned FFmpeg 9.0.1 and x264 sources with their source and licenses.
+  Setup installs and verifies this archive before private media import. Ordinary
+  setup uses the supplied pair; source-home has an explicit developer directory.
+  New data roots and archive directories have explicit permissions. Tests cover
+  common umasks, real archive extraction/import, existing unsafe paths, pair
+  mismatch and source/recipe tampering. Mac tools build with system-only shared
+  dependencies. Signed fresh installation and replacement of older imported
+  media tools remain open.
+
+- The focused required video repair from donor e3a8c4eb makes media-provider
+  accept Runtime's current invocation ABI and normalize FFmpeg DASH segments to
+  the existing zero-based contract. Runtime preserves codec configuration boxes
+  through protection. Provider and contract regressions pass; an actual generated
+  video run through the relocated tools, provider and Runtime validator accepts
+  one track, two segments and 128 samples. Full J5 purchase/playback/cleanup and
+  the required external review remain open.
 
 The source and installed sections below preserve the earlier evidence snapshot.
 Their original identities qualify those results. Current milestone receipts
