@@ -1624,12 +1624,6 @@ impl PersistedRuntimeMint {
             .collect()
     }
 
-    pub fn node_effect_started(&self, node_public_key: NodePublicKey) -> bool {
-        self.node_states
-            .iter()
-            .any(|state| state.binding.node_public_key == node_public_key && state.effect_started)
-    }
-
     pub fn any_effect_started(&self) -> bool {
         self.node_states.iter().any(|state| state.effect_started)
     }

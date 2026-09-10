@@ -213,24 +213,6 @@ impl CapabilityManager {
         signing_key
     }
 
-    /// Create a capability manager with an existing signing key
-    pub fn with_key(
-        signing_key: SigningKey,
-        store: Arc<CapabilityStore>,
-        audit_log: Arc<AuditLog>,
-        metrics: Arc<MetricsManager>,
-    ) -> Self {
-        let verifying_key = signing_key.verifying_key();
-
-        Self {
-            signing_key,
-            verifying_key,
-            store,
-            audit_log,
-            metrics,
-        }
-    }
-
     /// Get the runtime's public key
     pub fn public_key(&self) -> &VerifyingKey {
         &self.verifying_key

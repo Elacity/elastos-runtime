@@ -493,10 +493,6 @@ const RESERVED_SUB_NAMES: &[&str] = &[
     "browser-engine",
     "wallet",
     "library",
-    "drm",
-    "rights",
-    "key",
-    "decrypt",
     "inspect",
     "availability",
     "block-graph",
@@ -2758,10 +2754,6 @@ mod tests {
             "chain",
             "model",
             "wallet",
-            "drm",
-            "rights",
-            "key",
-            "decrypt",
             "availability",
             "block-graph",
             "object",
@@ -2782,7 +2774,7 @@ mod tests {
     async fn runtime_only_targets_coexist_without_capsule_resource_exposure() {
         let registry = ProviderRegistry::new();
         registry
-            .register_sub_provider("decrypt", Arc::new(RawMockProvider))
+            .register_sub_provider("library", Arc::new(RawMockProvider))
             .await
             .unwrap();
         for target in ["protect", "media", "custody", "protected-content-decrypt"] {
@@ -2792,10 +2784,10 @@ mod tests {
                 .unwrap();
         }
 
-        let provisional = registry
+        let capsule_scheme = registry
             .invoke_provider(ProviderInvocation {
                 source: "runtime".to_string(),
-                target: "decrypt".to_string(),
+                target: "library".to_string(),
                 op: "status".to_string(),
                 request: serde_json::json!({"op":"status"}),
                 transfer: ProviderTransfer::Json,
@@ -2806,11 +2798,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            provisional["data"]["runtime_invocation"]["target"],
-            "decrypt"
+            capsule_scheme["data"]["runtime_invocation"]["target"],
+            "library"
         );
-        assert_eq!(registry.sub_provider_schemes().await, vec!["decrypt"]);
-        assert!(!registry.has_ready_runtime_provider_target("decrypt").await);
+        assert_eq!(registry.sub_provider_schemes().await, vec!["library"]);
+        assert!(!registry.has_ready_runtime_provider_target("library").await);
         let registrations = registry.registrations().await;
         for target in ["protect", "media", "custody", "protected-content-decrypt"] {
             let protected = registry
@@ -2863,7 +2855,7 @@ mod tests {
     async fn unregister_api_enforces_provider_target_class() {
         let registry = ProviderRegistry::new();
         registry
-            .register_sub_provider("decrypt", Arc::new(MockProvider::new()))
+            .register_sub_provider("library", Arc::new(MockProvider::new()))
             .await
             .unwrap();
         for target in ["protect", "media", "custody", "protected-content-decrypt"] {
@@ -2893,7 +2885,7 @@ mod tests {
         }
 
         let wrong_runtime_api = registry
-            .unregister_runtime_provider_target("decrypt")
+            .unregister_runtime_provider_target("library")
             .await
             .unwrap_err();
         assert!(wrong_runtime_api
@@ -2902,7 +2894,7 @@ mod tests {
         assert!(matches!(
             registry
                 .route(
-                    "elastos://decrypt/probe",
+                    "elastos://library/probe",
                     "capsule:test",
                     ResourceAction::Write,
                     Some(b"still-registered".to_vec()),

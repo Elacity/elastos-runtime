@@ -7,7 +7,7 @@
 # driver's own --help output and (for the dirty-tree gate) one transient,
 # immediately-removed untracked file under the repo root. Follows the
 # scripts/ smoke harness idiom in
-# scripts/protected-content-provider-contract-smoke.sh (mktemp -d +
+# the retired provisional provider-contract smoke (mktemp -d +
 # trap-guarded cleanup, plain PASS/FAIL lines, exit non-zero on the first
 # failed assertion).
 set -euo pipefail

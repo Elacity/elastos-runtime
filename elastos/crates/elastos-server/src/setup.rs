@@ -2718,7 +2718,7 @@ mod tests {
             "custody-provider",
             "protected-content-decrypt-provider",
         ];
-        let provisional_providers = [
+        let retired_providers = [
             "drm-provider",
             "rights-provider",
             "key-provider",
@@ -2726,7 +2726,7 @@ mod tests {
         ];
         for profile_name in ["blockchain", "full"] {
             let profile = &manifest.profiles[profile_name];
-            for provider in private_providers.into_iter().chain(provisional_providers) {
+            for provider in private_providers {
                 assert_eq!(
                     profile
                         .components
@@ -2737,6 +2737,27 @@ mod tests {
                     "{profile_name} profile must include {provider} exactly once"
                 );
             }
+        }
+        for (profile_name, profile) in &manifest.profiles {
+            for retired in retired_providers {
+                assert!(
+                    !profile
+                        .components
+                        .iter()
+                        .any(|component| component.as_str() == retired),
+                    "{profile_name} profile must not install the retired provisional {retired}"
+                );
+            }
+        }
+        for retired in retired_providers {
+            assert!(
+                !manifest.capsules.contains_key(retired),
+                "retired provisional {retired} must not remain in the capsule inventory"
+            );
+            assert!(
+                !manifest.external.contains_key(retired),
+                "retired provisional {retired} must not remain in external components"
+            );
         }
         let custody_profiles = manifest
             .profiles

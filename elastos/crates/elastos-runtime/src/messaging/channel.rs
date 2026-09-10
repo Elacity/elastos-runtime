@@ -328,12 +328,6 @@ impl MessageChannel {
         let inboxes = self.inboxes.read().await;
         inboxes.contains_key(capsule_id)
     }
-
-    /// Get list of all registered capsules
-    pub async fn list_registered(&self) -> Vec<String> {
-        let inboxes = self.inboxes.read().await;
-        inboxes.keys().cloned().collect()
-    }
 }
 
 #[cfg(test)]

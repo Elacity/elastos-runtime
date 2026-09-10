@@ -11,10 +11,10 @@ key release, and decryption. See
 [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md) for the planned
 catalog and Get contract.
 
-The canonical source path is implemented but inactive. Source tests cover
-same-Runtime and two-Runtime journeys. The installed product still selects the
-provisional `drm`, `rights`, `key`, and `decrypt` authority surfaces until the
-installed proof and atomic cutover are complete.
+The canonical path is the installed product path. Source tests cover
+same-Runtime and two-Runtime journeys, and the installed proof driver recorded
+`finalize` `overall_ok: true` on the simulation-only harness. There is no other
+protected-content authority.
 
 ## Canonical path
 
@@ -81,6 +81,11 @@ before it returns an error.
 Protect, media, and decrypt run as local native provider processes. Custody can
 use Carrier to reach a Runtime-selected remote endpoint. Runtime keeps signed
 operation authority, provider selection, policy, and response verification.
+
+The custody node state root keeps the historical directory name
+`protected-content/custody-provider/inactive`. Provisioned hosts already hold
+state there, so the path is frozen; the name carries no meaning about whether
+the custody plane is active.
 
 ## Identity and rights
 
@@ -154,9 +159,9 @@ listing projections, opaque launch authority, and bounded media output. Runtime
 derives the principal, Wallet account, Chain authority, provider selection,
 availability decision, rights evidence, and effect identity.
 
-Visible protected-content UI may ship only as a disabled/read-only readiness
-rail until the installed path and atomic cutover pass. Source behavior alone is
-not installed or live product evidence.
+Visible protected-content UI is live product surface backed only by the
+Runtime-owned path. Source behavior alone is still not installed or live
+product evidence: each installed claim needs its own receipt.
 
 ## Installed source contract
 
@@ -180,7 +185,7 @@ proof.
 
 Operator provisioning of that configuration is one explicit command surface,
 `elastos protected-content-config`. It creates the policy authority key,
-provisions each custody host's inactive state root and exports its node
+provisions each custody host's state root and exports its node
 descriptor, prints the Runtime operation issuer custody hosts must trust,
 assembles and signs the owner-only 2-of-3 custody composition from three node
 descriptors, and installs the private multi-source Chain configuration. A
@@ -215,7 +220,7 @@ process isolation and real Carrier transport between the containers are
 faithfully simulated, but distinct hardware, distinct operators, and
 distinct failure domains are not, and the image must never hold a real
 recipient's key material. The operator flow over that harness is: each
-node's container provisions its inactive custody state and exports a
+node's container provisions its custody state and exports a
 DID-named public descriptor to a shared handoff directory on first boot, and
 reads the client's protected-content chain configuration back from that same
 directory on every boot (`up.sh sync-chain-config` derives it, rewriting
@@ -255,13 +260,23 @@ part requires:
    including restart, replay, tamper rejection, settlement and cleanup;
    proven headless by the same driver (`finalize` reads `overall_ok: true`,
    see `state.md`), not yet through Brave on the seed;
-8. the manual UIUX matrix in `TASKS.md`; and
-9. one atomic cutover that removes the provisional authority surfaces.
+8. the manual UIUX matrix in `TASKS.md`.
 
-The cutover activates the Runtime-owned path and removes provisional startup,
-registration, resources, packaging, tests, and docs in the same reviewable
-change. It keeps one registry, supervisor, coordinator, journal, and
-protected-content path.
+## Provisional retirement (completed)
+
+The provisional `drm-provider`, `rights-provider`, `key-provider`, and
+`decrypt-provider` capsules, the `elastos://drm`, `elastos://rights`,
+`elastos://key`, and `elastos://decrypt` schemes, the
+`elastos_common::protected_content` DTO surface, the content plane's `sealed`
+object kind, the Library share provider chain, and the provisional
+retirement-guard smoke were removed in one slice. No fallback, dual route, or
+compatibility decoder exists.
+
+The retired names are not reservable: they were removed from the provider
+registry's reserved sub-provider allowlist, so a later provider cannot
+re-register those routes. `scripts/check-wci-alignment.sh` fails if any of them
+reappears in `capsules/`, `components.json`, an install profile, or the
+capability mapping.
 
 Global listing discovery, public custody governance, and document or 3D typed
 viewers are separate later work.

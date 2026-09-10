@@ -845,10 +845,6 @@ impl CapsuleRole {
         matches!(self, Self::Shell | Self::App | Self::Viewer)
     }
 
-    pub fn is_content(&self) -> bool {
-        matches!(self, Self::Content)
-    }
-
     pub fn is_app_viewer_or_content(&self) -> bool {
         matches!(self, Self::App | Self::Viewer | Self::Content)
     }

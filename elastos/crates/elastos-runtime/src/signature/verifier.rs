@@ -1,5 +1,4 @@
 //! Signature verification for capsules
-use std::path::Path;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
@@ -45,27 +44,6 @@ impl SignatureVerifier {
 
         self.add_trusted_key(key);
         Ok(())
-    }
-
-    /// Load trusted keys from a file (one hex-encoded key per line)
-    pub fn load_trusted_keys(&mut self, path: &Path) -> Result<usize> {
-        let content = std::fs::read_to_string(path)?;
-        let mut count = 0;
-
-        for line in content.lines() {
-            let line = line.trim();
-
-            // Skip comments and empty lines
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            self.add_trusted_key_hex(line)?;
-            count += 1;
-        }
-
-        tracing::info!("Loaded {} trusted keys from {:?}", count, path);
-        Ok(count)
     }
 
     /// Get the number of trusted keys

@@ -28,7 +28,12 @@ CANONICAL = {
     "custody-provider": "custody",
     "protected-content-decrypt-provider": "protected-content-decrypt",
 }
-PROVISIONAL = ("drm-provider", "rights-provider", "key-provider", "decrypt-provider")
+RETIRED_PROVISIONAL = (
+    "drm-provider",
+    "rights-provider",
+    "key-provider",
+    "decrypt-provider",
+)
 ROLE_REQUIRED = {
     "home": (
         "chain-provider",
@@ -652,15 +657,10 @@ def build_receipt(args):
     media = audit_media(data_root, findings)
     operator = audit_operator_config(data_root, args.role, findings)
     canonical_selected = sorted(set(selected).intersection(CANONICAL))
-    provisional_selected = sorted(set(selected).intersection(PROVISIONAL))
-    if provisional_selected and canonical_selected:
-        declared_mode = "pre_cutover_coexistence"
-    elif provisional_selected:
-        declared_mode = "provisional_selected"
-    elif canonical_selected:
-        declared_mode = "canonical_declared_unproven"
-    else:
-        declared_mode = "unconfigured"
+    retired_selected = sorted(set(selected).intersection(RETIRED_PROVISIONAL))
+    for retired in retired_selected:
+        findings.artifact(f"retired_provisional_provider_selected:{retired}")
+    declared_mode = "canonical_declared_unproven" if canonical_selected else "unconfigured"
 
     base.update(
         {
@@ -688,7 +688,6 @@ def build_receipt(args):
                 "status": "active_proof_pending",
                 "declared_mode": declared_mode,
                 "canonical_selected": canonical_selected,
-                "provisional_selected": provisional_selected,
             },
             "operator_configuration": operator,
             "media": media,

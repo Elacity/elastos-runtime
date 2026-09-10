@@ -657,17 +657,13 @@ target request.
 
 Availability stores bytes. Rights decide who may use them.
 
-Protected content should be encrypted before it is published. IPFS, Elacity,
-supernodes, and volunteers can store encrypted blocks. In the intended open
-path, Runtime will own the operation. It will verify the authenticated request,
-ask `rights-provider` for typed policy evidence, select custody providers for
-recipient-encrypted contributions, and create a scoped `decrypt-provider`
-session. Carrier will transport only Runtime-selected endpoint traffic.
-
-The current Library path still uses the provisional
-`drm-provider -> rights-provider -> key-provider -> decrypt-provider` sequence.
-Those providers remain fail closed without configured backends. They do not
-implement or verify the intended custody path.
+Protected content is encrypted before it is published. IPFS, Elacity,
+supernodes, and volunteers can store encrypted blocks. Runtime owns the open: it
+verifies the authenticated request, acquires typed Chain rights evidence through
+its own `protected_content_rights_evidence` operation, selects custody providers
+for recipient-encrypted contributions, and opens a scoped session on the
+Runtime-only decrypt target. Carrier transports only Runtime-selected endpoint
+traffic. See [Protected content](PROTECTED_CONTENT.md).
 
 That keeps the core invariant simple:
 

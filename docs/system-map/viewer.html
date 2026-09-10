@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="elastos-c4-sha256" content="59b46bfcfbdc1a1d9ceeb4e601d7c0e04046d20bd26eef3b632d562de39cacf8">
+  <meta name="elastos-c4-sha256" content="8dc7ba8049448abb3e7a41b16da96edce5c49f031d94be76505b1204367896e7">
   <title>ElastOS C4 model</title>
   <style>
     :root {
@@ -628,7 +628,28 @@
           ]
         },
         {
-          id: "deployment", group: "Deployment", number: "14", level: "C4 · Deployment",
+          id: "protected", group: "Dynamics", number: "14", level: "Dynamic view",
+          title: "Protected-content open", question: "Who coordinates rights, custody release, and decryption when a buyer opens protected content?",
+          note: "Each custody node evaluates the same rights request locally before it releases a contribution. The viewer never sees custody endpoints, share bytes, the CEK, or evidence sources.",
+          kind: "sequence",
+          participants: [
+            P("viewer", "elacity-player", "Launched viewer session."), P("runtime", "Runtime", "Release coordinator."),
+            P("journal", "Release journal", "Durable operation and receipt state."), P("chain", "Chain Provider", "Finalized rights evidence."),
+            P("custody", "Custody nodes", "2-of-3, Runtime-selected."), P("decrypt", "Protected-content decrypt", "Runtime-only target.")
+          ],
+          messages: [
+            M("viewer", "runtime", "Open with opaque launch authority"), M("runtime", "journal", "Create signed release operation"),
+            M("runtime", "chain", "protected_content_rights_evidence"), M("chain", "runtime", "Finalized rights evidence", { return: true }),
+            M("runtime", "decrypt", "Prepare recipient key, receive opaque handle"),
+            M("runtime", "custody", "Signed release operation and evidence"),
+            M("custody", "runtime", "Recipient-encrypted contributions and receipts", { return: true }),
+            M("runtime", "decrypt", "Reconstruct in process, open scoped session"),
+            M("runtime", "journal", "Settle terminal receipt"),
+            M("runtime", "viewer", "Bounded ordered media reads", { return: true })
+          ]
+        },
+        {
+          id: "deployment", group: "Deployment", number: "15", level: "C4 · Deployment",
           title: "One node and one peer", question: "Where do the Level 2 containers run on a local installation?",
           note: "This is a generic deployment view. Assign target roles from verified host capabilities recorded in state.md.",
           groups: [G(15, 25, 215, 670, "Person device · Deployment node"), G(250, 25, 720, 670, "ElastOS host machine · Deployment node")],

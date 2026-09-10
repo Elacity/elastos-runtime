@@ -1355,53 +1355,6 @@ pub(crate) fn save_auth_state(data_dir: &Path, state: &AuthState) -> anyhow::Res
     })
 }
 
-pub fn store_challenge(data_dir: &Path, challenge: AuthChallengeV1) -> anyhow::Result<()> {
-    mutate_auth_state(data_dir, |state| {
-        let now = now_ts();
-        prune_auth_state(state, now);
-        state
-            .challenges
-            .retain(|stored| stored.challenge.challenge_id != challenge.challenge_id);
-        state.challenges.push(StoredAuthChallenge {
-            challenge,
-            consumed_at: None,
-        });
-        Ok(())
-    })
-}
-
-pub fn load_challenge(data_dir: &Path, challenge_id: &str) -> anyhow::Result<AuthChallengeV1> {
-    let state = load_auth_state(data_dir)?;
-    let stored = state
-        .challenges
-        .iter()
-        .find(|stored| stored.challenge.challenge_id == challenge_id)
-        .ok_or_else(|| anyhow!("auth challenge not found"))?;
-    if stored.consumed_at.is_some() {
-        anyhow::bail!("auth challenge already consumed");
-    }
-    Ok(stored.challenge.clone())
-}
-
-pub fn consume_challenge(
-    data_dir: &Path,
-    challenge_id: &str,
-    consumed_at: u64,
-) -> anyhow::Result<()> {
-    mutate_auth_state(data_dir, |state| {
-        let stored = state
-            .challenges
-            .iter_mut()
-            .find(|stored| stored.challenge.challenge_id == challenge_id)
-            .ok_or_else(|| anyhow!("auth challenge not found"))?;
-        if stored.consumed_at.is_some() {
-            anyhow::bail!("auth challenge already consumed");
-        }
-        stored.consumed_at = Some(consumed_at);
-        Ok(())
-    })
-}
-
 pub fn upsert_principal_for_binding(
     data_dir: &Path,
     binding: ProofBinding,
@@ -1574,31 +1527,6 @@ pub fn renew_session_grant(data_dir: &Path, grant: AuthSessionGrantV1) -> anyhow
             anyhow::bail!("auth session authority context mismatch");
         }
         stored.grant = grant;
-        Ok(())
-    })
-}
-
-pub fn rotate_session_grant(
-    data_dir: &Path,
-    previous_session_id: &str,
-    grant: AuthSessionGrantV1,
-    revoked_at: u64,
-) -> anyhow::Result<()> {
-    mutate_auth_state(data_dir, |state| {
-        if let Some(previous) = state
-            .sessions
-            .iter_mut()
-            .find(|stored| stored.grant.session_id == previous_session_id)
-        {
-            previous.revoked_at = Some(revoked_at);
-        }
-        state
-            .sessions
-            .retain(|stored| stored.grant.session_id != grant.session_id);
-        state.sessions.push(StoredAuthSession {
-            grant,
-            revoked_at: None,
-        });
         Ok(())
     })
 }

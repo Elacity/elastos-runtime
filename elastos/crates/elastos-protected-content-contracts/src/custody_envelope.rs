@@ -62,10 +62,6 @@ impl NodeCustodyPublicKeyV1 {
     pub const fn as_bytes(&self) -> &[u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES] {
         &self.0
     }
-
-    pub fn matches_public_key_bytes(&self, bytes: &[u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES]) -> bool {
-        &self.0 == bytes
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -272,24 +272,6 @@ pub fn edge_browser_app_path(base_dir: &Path, app_name: &str) -> PathBuf {
         .join(format!("{}.json", sanitize_edge_state_name(app_name)))
 }
 
-pub fn ensure_system_service_roots(base_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut created = ensure_file_backed_roots(base_dir)?;
-    for path in [
-        publisher_artifacts_path(base_dir),
-        publisher_site_releases_root_path(base_dir),
-        edge_bindings_path(base_dir),
-        edge_browser_apps_root_path(base_dir),
-        edge_site_heads_path(base_dir),
-        edge_release_channels_root_path(base_dir),
-        edge_site_history_root_path(base_dir),
-        my_website_root_path(base_dir),
-    ] {
-        std::fs::create_dir_all(&path)?;
-        created.push(path);
-    }
-    Ok(created)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

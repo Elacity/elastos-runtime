@@ -141,7 +141,7 @@ path into release verification.
 ## Typed policy and recipient-key authorization
 
 `RightsPolicyBodyV1` is the v1 immutable policy body. It is intentionally
-narrow and grounded in the current reviewed rights-provider surface:
+narrow and grounded in the reviewed rights-evaluation surface:
 
 - one exact full `EncryptedContentIdentityV1`;
 - one exact 16-byte `ContentAccessIdV1` bound separately from the full
@@ -344,9 +344,9 @@ Ed25519/classical and full PQ authorization is a pre-activation decision. The
 Runtime mint journal can commit 2-of-3 PQ-hybrid envelopes without claiming
 content availability or a catalog path. Buy/open remains blocked until Runtime
 verifies the existing content provider's exact signed availability receipt.
-Remaining inactive e2e and cutover work is tracked in `TASKS.md`.
+Remaining installed proof work is tracked in `TASKS.md`.
 
-The parent branch's provisional `elastos_common::protected_content` DTOs are
-not this canonical contract. Integration must replace that surface atomically
-after independent review. It must not add parallel decoders, migration adapters,
-or compatibility fallbacks.
+The provisional `elastos_common::protected_content` DTOs were never this
+canonical contract, and the atomic cutover removed that surface. No parallel
+decoder, migration adapter, or compatibility fallback was added, and none may
+be introduced.

@@ -218,12 +218,6 @@ impl MetricsManager {
         metrics.get(capsule_id).cloned()
     }
 
-    /// Get all metrics
-    pub fn get_all_metrics(&self) -> HashMap<String, CapsuleMetrics> {
-        let metrics = self.metrics_read();
-        metrics.clone()
-    }
-
     /// Record a capability request for a capsule
     pub fn record_capability_request(&self, capsule_id: &str) {
         self.check_period_reset();

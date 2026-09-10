@@ -1221,17 +1221,13 @@ const providerCapsuleManifests = Object.fromEntries(
     "browser-engine-adapter",
     "chain-provider",
     "content-block-graph-provider",
-    "decrypt-provider",
     "did-provider",
-    "drm-provider",
     "exit-provider",
     "ipfs-provider",
-    "key-provider",
     "model-provider",
     "net-provider",
     "object-provider",
     "operator-drive-adapter",
-    "rights-provider",
     "tunnel-provider",
     "wallet-provider",
     "webspace-provider",
@@ -1535,8 +1531,11 @@ const serverInfra = read("elastos/crates/elastos-server/src/server_infra.rs");
 const componentProvider = read(
   "elastos/crates/elastos-compute/src/providers/component.rs",
 );
-const protectedContent = read(
-  "elastos/crates/elastos-common/src/protected_content.rs",
+const protectedContentDecryptContract = read(
+  "elastos/crates/elastos-protected-content-provider-contracts/src/decrypt.rs",
+);
+const protectedContentProtectContract = read(
+  "elastos/crates/elastos-protected-content-provider-contracts/src/protect.rs",
 );
 const chainProvider = readAll([
   "capsules/chain-provider/src/main.rs",
@@ -3959,20 +3958,6 @@ assert(
   "wallet-provider public interface must expose only read-only status; authority-bound operations stay on the private Wallet Bus",
   walletProviderInterface,
 );
-assertManifestMethod(providerCapsuleManifests, "key-provider", "elastos.provider.key", "release", {
-  risk: "rights",
-  approval: "user",
-  audit: "full",
-  resource: "elastos://key/*",
-  operation: "release",
-});
-assertManifestMethod(providerCapsuleManifests, "rights-provider", "elastos.provider.rights", "can_stream", {
-  risk: "rights",
-  approval: "runtime_policy",
-  audit: "event",
-  resource: "elastos://rights/*",
-  operation: "can_stream",
-});
 assertManifestMethod(providerCapsuleManifests, "object-provider", "elastos.provider.object", "delete_permanently", {
   risk: "privileged",
   approval: "user",
@@ -6960,14 +6945,10 @@ assert(
     libraryDialog.includes("Share Receipt Summary") &&
     libraryDialog.includes("<summary>Technical details</summary>") &&
     libraryDialog.includes("contentSecurity?.published_payload") &&
-    libraryDialog.includes('name="sharePolicy" value="encrypted_recipient" disabled') &&
-    libraryDialog.includes("<strong>Protected sharing</strong>") &&
-    libraryDialog.includes("<strong>Provider Chain</strong>") &&
-    read("docs/PROTECTED_CONTENT.md").includes(
-      "Visible protected-content UI may ship only as a disabled/read-only readiness",
-    ) &&
-    read("docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md").includes(
-      "Library protected-content rail is visible only as disabled/read-only readiness/status",
+    !libraryDialog.includes("encrypted_recipient") &&
+    !libraryDialog.includes("<strong>Provider Chain</strong>") &&
+    libraryDialog.includes(
+      "Protected content is published through Runtime custody and opened in the viewer, not shared from here.",
     ) &&
     libraryMenuSmoke.includes("Share Grants / Key Release") &&
     libraryMenuSmoke.includes("Share Receipt Summary") &&
@@ -7779,21 +7760,12 @@ assert(
   "Runtime WebAuthn response structs must reject hidden extension payloads until client-side PRF wrapping exists",
 );
 assert(
-  protectedContent.includes("pub struct SealedObjectV1") &&
-    protectedContent.includes("#[serde(deny_unknown_fields)]") &&
-    protectedContent.includes(
-      "sealed_object_rejects_unknown_contract_fields",
-    ) &&
-    protectedContent.includes(
-      "sealed_object_rejects_unknown_nested_key_envelope_fields",
-    ) &&
-    protectedContent.includes(
-      "key_release_request_rejects_unknown_contract_fields",
-    ) &&
-    protectedContent.includes(
-      "decrypt_session_request_rejects_unknown_contract_fields",
+  protectedContentDecryptContract.includes("deny_unknown_fields") &&
+    protectedContentProtectContract.includes("deny_unknown_fields") &&
+    protectedContentProtectContract.includes(
+      "protect_wire_rejects_zero_ids_handles_counts_parts_and_unknown_fields",
     ),
-  "Protected-content contracts must reject hidden object, key-release, and decrypt-session authority fields at decode time",
+  "Protected-content provider contracts must reject hidden protect and decrypt authority fields at decode time",
 );
 assert(
   shellStyle.includes(".visually-hidden") &&

@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
@@ -287,11 +287,6 @@ impl AuditLog {
             echo_stdout: false,
             memory_buffer: RwLock::new(VecDeque::with_capacity(MAX_MEMORY_EVENTS)),
         })
-    }
-
-    /// Enable/disable echoing to stdout
-    pub fn set_echo_stdout(&mut self, echo: bool) {
-        self.echo_stdout = echo;
     }
 
     /// Emit an audit event
@@ -585,30 +580,6 @@ impl AuditLog {
         } else {
             Vec::new()
         }
-    }
-
-    /// Get events from file (reads entire log file)
-    ///
-    /// Returns all events from file, or events from memory if no file configured.
-    /// For large logs, prefer recent_events() which uses the memory buffer.
-    pub fn read_from_file(&self, limit: usize) -> Vec<AuditEvent> {
-        if let Some(path) = &self.log_path {
-            if let Ok(file) = File::open(path) {
-                let reader = BufReader::new(file);
-                let events: Vec<AuditEvent> = reader
-                    .lines()
-                    .map_while(Result::ok)
-                    .filter_map(|line| serde_json::from_str(&line).ok())
-                    .collect();
-
-                // Return last `limit` events
-                let start = events.len().saturating_sub(limit);
-                return events[start..].to_vec();
-            }
-        }
-
-        // Fall back to memory buffer
-        self.recent_events(limit)
     }
 
     /// Get total event count in memory buffer

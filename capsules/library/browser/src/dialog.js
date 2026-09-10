@@ -441,9 +441,6 @@ export function createLibraryDialog({
 
   function safeRemoteAccessSummary(payload = {}, object = {}) {
     const metadata = object.metadata || payload.metadata || {};
-    const providerStatus = payload.protected_content
-      || metadata.protected_content
-      || null;
     const grants = Array.isArray(payload.grants)
       ? payload.grants
       : Array.isArray(payload.share_grants)
@@ -469,13 +466,11 @@ export function createLibraryDialog({
       || remoteEnforcement?.key_release_status
       || (keyReleaseRequired ? "required" : "not_required");
     const openStatus = remoteEnforcement?.status
-      || (keyReleaseRequired
-        ? "blocked_until_drm_rights_key_decrypt_providers"
-        : recipientProofRequired
-          ? "recipient_proof_enforced_by_runtime"
-          : policy === "public_link"
-            ? "public_link_ready"
-            : "not_shared");
+      || (recipientProofRequired
+        ? "recipient_proof_enforced_by_runtime"
+        : policy === "public_link"
+          ? "public_link_ready"
+          : "not_shared");
     const status = policy === "recipient_scoped"
       ? "recipient scoped"
       : policy === "public_link"
@@ -495,9 +490,6 @@ export function createLibraryDialog({
         key_release_required: keyReleaseRequired,
         key_release_status: keyReleaseStatus,
         open_status: openStatus,
-        required_providers: remoteEnforcement?.required_providers || keyRelease?.required_providers || null,
-        provider_invocation: remoteEnforcement?.provider_invocation || null,
-        provider_status: providerStatus,
         next: remoteEnforcement?.next || keyRelease?.next || null,
       },
     };
@@ -591,9 +583,7 @@ export function createLibraryDialog({
       key_release: firstGrantKeyRelease,
       remote_enforcement: record?.remote_enforcement,
       content_security: contentSecurity,
-      protected_content: payload?.protected_content || record?.protected_content,
     }, object);
-    const protectedContent = payload?.protected_content || record?.protected_content || null;
     dialog.innerHTML = `
       <div class="dialog-card dialog-card-wide">
         <div>
@@ -625,7 +615,6 @@ export function createLibraryDialog({
           <div><strong>Share Policy</strong><br>${escapeHtml(record?.share_policy || "not shared")}</div>
           <div><strong>Share Grants</strong><br>${escapeHtml(String(shareGrants.length))}</div>
           <div><strong>Remote Open</strong><br>${escapeHtml(remoteAccess.openStatus)}</div>
-          <div><strong>Provider Chain</strong><br>${escapeHtml(protectedContent?.encrypted_recipient_sharing?.status || "-")}</div>
           <div><strong>Payload</strong><br>${escapeHtml(contentSecurity?.published_payload || "-")}</div>
           <div><strong>Key Release</strong><br>${escapeHtml(remoteAccess.keyRelease || contentSecurity?.status || "not required")}</div>
           <div><strong>Revision</strong><br>${escapeHtml(object.revision || "-")}</div>
@@ -634,10 +623,6 @@ export function createLibraryDialog({
           <strong>Remote Access Policy</strong>
           <pre>${escapeHtml(JSON.stringify(remoteAccess.details, null, 2))}</pre>
           </div>
-          ${protectedContent ? `<div class="details-json">
-          <strong>Protected Content Providers</strong>
-          <pre>${escapeHtml(JSON.stringify(protectedContent, null, 2))}</pre>
-          </div>` : ""}
           <div class="details-json">
           <strong>Availability Summary</strong>
           <pre>${escapeHtml(JSON.stringify(availabilitySummary.details, null, 2))}</pre>
@@ -677,7 +662,6 @@ export function createLibraryDialog({
     const keyRelease = payload?.key_release || payload?.grants?.find((grant) => grant?.key_release)?.key_release || null;
     const contentSecurity = payload?.content_security || null;
     const remoteAccess = safeRemoteAccessSummary(payload, object);
-    const protectedContent = payload?.protected_content || null;
     dialog.innerHTML = `
       <div class="dialog-card dialog-card-wide">
         <div>
@@ -702,14 +686,12 @@ export function createLibraryDialog({
             <div><strong>Storage Market</strong><br>${escapeHtml(availabilitySummary.storageMarket)}</div>
             <div><strong>Payload</strong><br>${escapeHtml(contentSecurity?.published_payload || "-")}</div>
             <div><strong>Remote Open</strong><br>${escapeHtml(remoteAccess.openStatus)}</div>
-            <div><strong>Provider Chain</strong><br>${escapeHtml(protectedContent?.encrypted_recipient_sharing?.status || "-")}</div>
-            <div><strong>Key Release</strong><br>${escapeHtml(remoteAccess.keyRelease || keyRelease?.status || "not required")}</div>
+              <div><strong>Key Release</strong><br>${escapeHtml(remoteAccess.keyRelease || keyRelease?.status || "not required")}</div>
             <div><strong>Object</strong><br>${escapeHtml(shortUri(payload?.object_uri || object.uri || ""))}</div>
           </div>
           <strong>Share Receipt Summary</strong>
           <pre>${escapeHtml(JSON.stringify({
             remote_access: remoteAccess.details,
-            protected_content: protectedContent,
             availability: availabilitySummary.details,
             policy,
             grants: payload?.grants || [],
@@ -739,7 +721,6 @@ export function createLibraryDialog({
       access,
       key_release: keyRelease,
       policy: decision.policy || open.policy,
-      protected_content: payload?.protected_content,
     }, object);
     dialog.innerHTML = `
       <div class="dialog-card dialog-card-wide">
@@ -804,13 +785,6 @@ export function createLibraryDialog({
                   <small>Limit access to the people you name.</small>
                 </span>
               </label>
-              <label class="share-option">
-                <input type="radio" name="sharePolicy" value="encrypted_recipient" disabled>
-                <span>
-                  <strong>Protected sharing</strong>
-                  <small>Not available on this device.</small>
-                </span>
-              </label>
             </div>
             <label class="dialog-field">
               <span>Recipients</span>
@@ -819,7 +793,7 @@ export function createLibraryDialog({
             <p class="dialog-hint">Separate recipients with commas or new lines.</p>
             <details class="details-json">
               <summary>Technical details</summary>
-              <p>Specific-person sharing records recipient grants. Protected sharing requires rights, key-release, and decryption services.</p>
+              <p>Specific-person sharing records recipient grants for plain published content. Protected content is published through Runtime custody and opened in the viewer, not shared from here.</p>
             </details>
             <p class="dialog-error hidden" data-share-error></p>
             <div class="button-row">

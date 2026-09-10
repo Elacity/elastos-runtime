@@ -4,6 +4,24 @@ All notable changes to the public ElastOS Runtime repository.
 
 ## [Unreleased]
 
+### Removed
+- The provisional `drm-provider`, `rights-provider`, `key-provider`, and
+  `decrypt-provider` capsules, the `elastos://drm`, `elastos://rights`,
+  `elastos://key`, and `elastos://decrypt` provider schemes, the
+  `elastos_common::protected_content` DTO surface, the content plane's
+  `sealed` object kind, the Library share provider chain, and the
+  `protected-content-provider-contract-smoke` retirement guard. The retired
+  scheme
+  names were also dropped from the provider registry's reserved sub-provider
+  allowlist, so they cannot be re-registered.
+
+### Changed
+- The Runtime-owned protect, media, custody, and decrypt plane with Chain
+  rights evidence is the only protected-content authority. Library `share`,
+  `status`, and `shared_access` no longer project provider readiness; plain
+  published content states that no key release applies, and protected content
+  is published through Runtime custody publish rather than a share policy.
+
 ## [0.7.0] - 2026-08-31
 
 The coordinated workspace version moves to `0.7.0`. Capsule manifests changed
@@ -874,7 +892,7 @@ because no separate patch release was published.
 - Added a canonical `drm-provider.status.required_sequence` for protected-content open orchestration before backend wiring.
 - Added Runtime-owned release receipt and audit steps to the protected-content open sequence.
 - Added the same machine-readable required sequence and runtime events to fail-closed `drm-provider.open` responses.
-- Added `scripts/protected-content-provider-contract-smoke.sh` to exercise protected-content provider capsules through their real JSON line protocol.
+- Added the `protected-content-provider-contract-smoke` retirement guard to exercise the provisional protected-content provider capsules through their real JSON line protocol. (Removed with those capsules after the atomic cutover.)
 - Added `scripts/installed-provider-verify.sh` so installed provider binaries can be checked against the installed `components.json` before live browser testing.
 - Added alignment checks and release-story documentation so the protected-content provider journey proof stays visible in `TASKS.md`, `state.md`, and the runtime repo checklist.
 - Added algorithm metadata to protected-content key envelopes so sealed objects can declare cipher, signature, KEM, and share-scheme choices for PQ-hybrid dKMS work.
