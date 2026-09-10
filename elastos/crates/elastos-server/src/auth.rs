@@ -9,7 +9,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 
 use aes_gcm::{
     aead::{Aead, Payload},
@@ -879,31 +879,11 @@ fn open_audit_chain_activation_lock(data_dir: &Path) -> anyhow::Result<File> {
 }
 
 fn lock_auth_state_file(file: &File) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("failed to lock auth state");
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-    }
-    Ok(())
+    file.lock().context("failed to lock auth state")
 }
 
 fn unlock_auth_state_file(file: &File) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("failed to unlock auth state");
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-    }
-    Ok(())
+    file.unlock().context("failed to unlock auth state")
 }
 
 fn mutate_auth_state<T>(
@@ -4783,6 +4763,52 @@ pub(crate) fn store_test_principal_root_protection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_state_lock_child_probe() {
+        let Some(path) = std::env::var_os("ELASTOS_AUTH_LOCK_TEST_PATH") else {
+            return;
+        };
+        let file = File::options().read(true).write(true).open(path).unwrap();
+        if std::env::var_os("ELASTOS_AUTH_LOCK_TEST_HELD").is_some() {
+            assert!(matches!(
+                file.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+        } else {
+            file.try_lock().unwrap();
+            unlock_auth_state_file(&file).unwrap();
+        }
+    }
+
+    #[test]
+    fn auth_state_lock_excludes_another_process_and_releases() {
+        let root = tempfile::tempdir().unwrap();
+        let file = open_auth_state_lock(root.path()).unwrap();
+        lock_auth_state_file(&file).unwrap();
+        for held in [true, false] {
+            if !held {
+                unlock_auth_state_file(&file).unwrap();
+            }
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "auth::tests::auth_state_lock_child_probe"])
+                .env(
+                    "ELASTOS_AUTH_LOCK_TEST_PATH",
+                    auth_state_lock_path(root.path()).unwrap(),
+                )
+                .env_remove("ELASTOS_AUTH_LOCK_TEST_HELD");
+            if held {
+                child.env("ELASTOS_AUTH_LOCK_TEST_HELD", "1");
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "child lock probe failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
     use elastos_runtime::auth::PasskeyWebAuthnBinding;
 
     #[test]

@@ -2906,7 +2906,7 @@ async fn passkey_register_begin_inner(
     let rp = super::handlers::identity::derive_rp(headers)?;
     let manager = state.identity_manager()?;
     let mut manager = manager.lock().await;
-    let options = manager.begin_principal_registration(&ceremony_id, &rp.id)?;
+    let options = manager.begin_principal_registration(&ceremony_id, &rp.id, &rp.origin)?;
     Ok(PasskeyBeginResponse {
         schema: "elastos.auth.passkey.register.begin/v1".to_string(),
         ceremony_id,
@@ -2982,6 +2982,25 @@ async fn passkey_authenticate_complete_inner(
     )
 }
 
+#[derive(Debug)]
+enum PasskeyRegistrationDenied {
+    FirstOwnerRequiresLocalAccess,
+    GuestRegistrationDisabled,
+}
+
+impl std::fmt::Display for PasskeyRegistrationDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::FirstOwnerRequiresLocalAccess => {
+                "first owner passkey registration requires local Runtime access"
+            }
+            Self::GuestRegistrationDisabled => "guest passkey registration is disabled",
+        })
+    }
+}
+
+impl std::error::Error for PasskeyRegistrationDenied {}
+
 async fn require_passkey_registration_allowed(
     state: &GatewayState,
     local_first_owner: bool,
@@ -2994,12 +3013,12 @@ async fn require_passkey_registration_allowed(
         if local_first_owner {
             return Ok(());
         }
-        anyhow::bail!("first owner passkey registration requires local Runtime access");
+        return Err(PasskeyRegistrationDenied::FirstOwnerRequiresLocalAccess.into());
     }
     if crate::auth::guest_registration_enabled(&state.data_dir)? {
         return Ok(());
     }
-    anyhow::bail!("guest passkey registration is disabled")
+    Err(PasskeyRegistrationDenied::GuestRegistrationDisabled.into())
 }
 
 fn local_first_owner_registration(headers: &HeaderMap, peer: Option<SocketAddr>) -> bool {
@@ -3761,7 +3780,8 @@ fn passkey_verified_response(headers: &HeaderMap, response: PasskeyVerifyRespons
 
 pub(in crate::api) fn auth_error_response(err: anyhow::Error) -> Response {
     let text = err.to_string();
-    let status = if text.contains("missing")
+    let status = if err.is::<PasskeyRegistrationDenied>()
+        || text.contains("missing")
         || text.contains("invalid")
         || text.contains("expired")
         || text.contains("mismatch")
@@ -4085,6 +4105,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_owner_registration_public_begin_returns_forbidden() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", HeaderValue::from_static("https://home.example"));
+        let response = passkey_register_begin(State(state.clone()), None, headers).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !state
+                .identity_manager()
+                .unwrap()
+                .lock()
+                .await
+                .status()
+                .registered
+        );
+        assert_eq!(
+            crate::auth::active_passkey_principal_count(temp.path()).unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn first_owner_registration_public_complete_returns_forbidden() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", HeaderValue::from_static("https://home.example"));
+        let input = serde_json::from_value(json!({
+            "ceremony_id": "passkey:register:absent",
+            "response": {
+                "id": "fixture", "rawId": "fixture", "type": "public-key",
+                "response": { "clientDataJson": "AA", "attestationObject": "AA" }
+            }
+        }))
+        .unwrap();
+        let response =
+            passkey_register_complete(State(state.clone()), None, headers, Json(input)).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !state
+                .identity_manager()
+                .unwrap()
+                .lock()
+                .await
+                .status()
+                .registered
+        );
+        assert_eq!(
+            crate::auth::active_passkey_principal_count(temp.path()).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn registration_denial_is_typed_even_with_context() {
+        for denial in [
+            PasskeyRegistrationDenied::FirstOwnerRequiresLocalAccess,
+            PasskeyRegistrationDenied::GuestRegistrationDisabled,
+        ] {
+            let error = anyhow::Error::new(denial).context("enrollment refused");
+            assert_eq!(auth_error_response(error).status(), StatusCode::FORBIDDEN);
+        }
+        assert_eq!(
+            auth_error_response(anyhow::anyhow!("storage failure")).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
     async fn first_owner_registration_rejects_public_origin() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
@@ -4118,6 +4208,124 @@ mod tests {
 
         assert_eq!(response.schema, "elastos.auth.passkey.register.begin/v1");
         assert_eq!(response.options.public_key.rp.id, "localhost");
+    }
+
+    #[tokio::test]
+    async fn allowed_https_guest_registration_binds_begin_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+        store_test_credential(temp.path(), credential.clone());
+        let admin = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "test existing admin",
+        )
+        .unwrap();
+        crate::auth::set_guest_registration_enabled(temp.path(), true, crate::auth::now_ts())
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", HeaderValue::from_static("https://home.example"));
+        let begin = passkey_register_begin_inner(&state, &headers, false)
+            .await
+            .unwrap();
+        assert_eq!(begin.options.public_key.rp.id, "home.example");
+
+        // A fmt:none ES256 attestation using the P-256 generator point.
+        let credential_id = b"https-guest";
+        let mut auth_data = Sha256::digest(b"home.example").to_vec();
+        auth_data.push(0x45); // user present, user verified, attested credential
+        auth_data.extend_from_slice(&[0; 20]); // sign count and AAGUID
+        auth_data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
+        auth_data.extend_from_slice(credential_id);
+        auth_data.extend_from_slice(
+            &hex::decode(concat!(
+                "a5010203262001215820",
+                "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
+                "225820",
+                "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+            ))
+            .unwrap(),
+        );
+        let mut attestation = vec![0xa3, 0x63];
+        attestation.extend_from_slice(b"fmt");
+        attestation.push(0x64);
+        attestation.extend_from_slice(b"none");
+        attestation.push(0x67);
+        attestation.extend_from_slice(b"attStmt");
+        attestation.extend_from_slice(&[0xa0, 0x68]);
+        attestation.extend_from_slice(b"authData");
+        attestation.extend_from_slice(&[0x58, u8::try_from(auth_data.len()).unwrap()]);
+        attestation.extend_from_slice(&auth_data);
+        let response_for = |challenge: &str| {
+            serde_json::from_value::<RegistrationResponse>(json!({
+                "id": URL_SAFE_NO_PAD.encode(credential_id),
+                "rawId": URL_SAFE_NO_PAD.encode(credential_id),
+                "type": "public-key",
+                "response": {
+                    "clientDataJson": URL_SAFE_NO_PAD.encode(json!({
+                        "type": "webauthn.create", "challenge": challenge,
+                        "origin": "https://home.example"
+                    }).to_string()),
+                    "attestationObject": URL_SAFE_NO_PAD.encode(&attestation)
+                }
+            }))
+            .unwrap()
+        };
+        let response = response_for(&begin.options.public_key.challenge);
+        let result = passkey_register_complete_inner(
+            &state,
+            &headers,
+            PasskeyRegisterCompleteRequest {
+                ceremony_id: begin.ceremony_id,
+                response,
+                display_name: None,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!result.home_token.is_empty());
+        assert_ne!(result.principal_id, admin.principal_id);
+        assert_eq!(
+            crate::auth::load_principal_for_proof_binding(temp.path(), &result.proof_binding_id)
+                .unwrap()
+                .role,
+            crate::auth::RuntimePrincipalRole::Guest
+        );
+        let manager = state.identity_manager().unwrap();
+        let manager = manager.lock().await;
+        assert_eq!(manager.credentials().len(), 2);
+        assert!(manager
+            .credentials()
+            .iter()
+            .any(|credential| credential.rp_id == "home.example"));
+        drop(manager);
+        let credential_path = temp.path().join("identity/credentials.json");
+        let auth_path = crate::auth::auth_state_path(temp.path()).unwrap();
+        let credential_bytes = std::fs::read(&credential_path).unwrap();
+        let auth_bytes = std::fs::read(&auth_path).unwrap();
+        let fresh = passkey_register_begin_inner(&state, &headers, false)
+            .await
+            .unwrap();
+        assert!(passkey_register_complete_inner(
+            &state,
+            &headers,
+            PasskeyRegisterCompleteRequest {
+                ceremony_id: fresh.ceremony_id,
+                response: response_for(&fresh.options.public_key.challenge),
+                display_name: None,
+            },
+            false,
+        )
+        .await
+        .is_err());
+        // A fresh fmt:none ceremony cannot adopt another person's existing key.
+        assert_eq!(std::fs::read(&credential_path).unwrap(), credential_bytes);
+        assert_eq!(std::fs::read(&auth_path).unwrap(), auth_bytes);
     }
 
     #[test]

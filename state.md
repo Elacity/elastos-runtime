@@ -2,6 +2,13 @@
 
 Last updated: 2026-09-10 UTC
 
+- J1 identity foundation integrates registration RP/origin binding and atomic,
+  conflict-safe identity persistence from donors `145fec2b` and `eb25f747`.
+  Forty-seven identity tests, eighteen gateway registration tests and one
+  cross-process auth-lock test pass on macOS ARM64 with Rust 1.91.0. Basic
+  repository gates pass. Existing gateway behavior is preserved. This is source
+  acceptance; installed J1 proof follows the remaining setup changes.
+
 - Latest private working-build proof: Runtime `b726db95` reports 0.7.1, with
   built, installed and running SHA-256
   `9a618d0566cb9fa3449e562a9ff813949a80a171356f93061e6265ce2b3f6759`.
