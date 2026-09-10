@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ElastOS | Your apps. Your Home.</title>
-  <meta name="description" content="Your files, apps and contacts in one desktop. Open ElastOS Home in your browser, or explore the source code and build your own.">
+  <meta name="description" content="Your files, apps and contacts in one desktop. Open ElastOS Home in your browser, or install the Runtime on your own hardware.">
   <meta name="theme-color" content="#050608">
   <link rel="icon" href="./assets/elastos-mark.svg" type="image/svg+xml">
   <link rel="stylesheet" href="./site.css">
@@ -16,7 +16,7 @@
       <a class="brand" href="/" aria-label="ElastOS website"><img src="./assets/elastos-logo.svg" width="168" height="28" alt="ElastOS"></a>
       <nav aria-label="Main navigation">
         <a href="#explore">Explore</a>
-        <a href="#developers">For developers</a>
+        <a href="#install">Install</a>
         <a href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs">Docs</a>
       </nav>
       <a class="header-home" href="/home/">Open Home <span aria-hidden="true">↗</span></a>
@@ -30,7 +30,7 @@
           <p class="hero-lead">ElastOS is a local-first runtime for apps and services. Home gives you a desktop to use them. Each app works with the access you grant.</p>
           <div class="hero-actions">
             <a class="button primary" id="open-home" href="/home/">Open Home <span aria-hidden="true">↗</span></a>
-            <a class="text-link" href="#explore">Explore Home</a>
+            <a class="text-link" href="#install">Install on your device</a>
           </div>
           <p class="action-note">Development preview. Sign in with your passkey.</p>
         </div>
@@ -68,6 +68,64 @@
           <details class="journey">
             <summary><span class="journey-number">03</span><strong>Look after your account</strong><span class="expand" aria-hidden="true">+</span></summary>
             <div class="journey-body"><p>Save a Recovery Kit during setup and keep it somewhere safe. Open System Settings from the ElastOS menu to manage your account, appearance and services.</p></div>
+          </details>
+        </div>
+      </section>
+
+      <section class="section install-section" id="install" aria-labelledby="install-title">
+        <div class="section-intro">
+          <p class="eyebrow">On your hardware</p>
+          <h2 id="install-title">Run your own Home.</h2>
+          <p>Install the Runtime on your computer, then use Home in your browser. Your computer runs the apps and stores your files.</p>
+          <p>The published download is the older 0.1.2 Linux preview. The 0.7.1 development version is available as source code.</p>
+        </div>
+        <div class="platforms">
+          <details class="platform" open>
+            <summary><strong>Linux</strong><span>x86_64 · ARM64</span></summary>
+            <div class="platform-body">
+              <h3>Install the published preview</h3>
+              <p>For version 0.1.2, open a terminal and run:</p>
+              <pre tabindex="0" aria-label="Linux installation commands"><code>curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
+elastos setup
+elastos</code></pre>
+              <p>Requires curl, Python 3 and OpenSSL with Ed25519 support. Home opens after setup; follow its account setup steps.</p>
+              <a href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs/INSTALL.md">Linux installation guide <span aria-hidden="true">↗</span></a>
+            </div>
+          </details>
+          <details class="platform">
+            <summary><strong>macOS</strong><span>Apple silicon · Source build</span></summary>
+            <div class="platform-body">
+              <h3>Build the development version</h3>
+              <p>Use an Apple silicon Mac with Xcode command-line tools, Homebrew, Rust and Node.js. This installs a separate development Home.</p>
+              <p>Install the build tools:</p>
+              <pre tabindex="0" aria-label="Mac build prerequisites"><code>xcode-select --install
+brew install node e2fsprogs coturn ffmpeg
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustup target add wasm32-unknown-unknown</code></pre>
+              <p>When the tools are ready, get the development branch and build:</p>
+              <pre tabindex="0" aria-label="Mac source installation commands"><code>git clone --branch upstream/0.7.1-dev https://github.com/Elacity/elastos-runtime.git
+cd elastos-runtime
+export ELASTOS_SOURCE_HOME="$HOME/elastos-source-home"
+env HOME="$ELASTOS_SOURCE_HOME" \
+  CARGO_HOME="$HOME/.cargo" \
+  RUSTUP_HOME="$HOME/.rustup" \
+  ELASTOS_COLLABORATION_STARTUP_MODE=isolated \
+  scripts/setup-source-home.sh
+scripts/mac-source-home-restart.sh \
+  --test-home "$ELASTOS_SOURCE_HOME" \
+  --addr localhost:61180</code></pre>
+              <p>Open the Home address printed by the restart command. The Mac guide covers build troubleshooting and the extra artifacts required for the Browser app.</p>
+              <a href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs/MAC.md">Mac build guide <span aria-hidden="true">↗</span></a>
+            </div>
+          </details>
+          <details class="platform">
+            <summary><strong>Windows</strong><span>Planned</span></summary>
+            <div class="platform-body">
+              <p>Windows installation is planned through WSL2, which runs a Linux environment on your PC.</p>
+              <a href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs/WINDOWS.md">Windows plan <span aria-hidden="true">↗</span></a>
+            </div>
           </details>
         </div>
       </section>

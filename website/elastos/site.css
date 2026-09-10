@@ -77,7 +77,19 @@ h1 span { color: var(--brand-strong); }
 .section { padding-block: 88px; border-bottom: 1px solid var(--line); }
 h2 { font-size: clamp(30px, 3.15vw, 44px); font-weight: 550; letter-spacing: -.04em; line-height: 1.14; }
 .eyebrow + h2 { margin-top: 17px; }
-.explore-section, .developer-section { display: grid; grid-template-columns: .8fr 1.35fr; gap: 108px; }
+.explore-section, .developer-section, .install-section { display: grid; grid-template-columns: .8fr 1.35fr; gap: 108px; }
+.platforms { min-width: 0; }
+.platform { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-soft); }
+.platform + .platform { margin-top: 14px; }
+.platform summary { padding: 20px 24px; }
+.platform summary strong { font-size: 17px; margin-left: 8px; }
+.platform summary span { display: block; margin-left: 24px; color: var(--muted); font-size: 13px; }
+.platform-body { padding: 0 24px 24px; font-size: 14px; color: var(--muted); }
+.platform-body h3 { font-size: 18px; color: var(--text); }
+.platform-body p { margin-top: 14px; }
+.platform-body > a { display: inline-block; margin-top: 16px; color: var(--text); }
+pre { margin: 18px 0; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); overflow-x: auto; font-size: 12px; line-height: 1.8; tab-size: 2; }
+code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .section-intro > p:not(.eyebrow) { color: var(--muted); margin-top: 23px; }
 .section-intro .text-link { display: inline-block; margin-top: 22px; }
 .journey { border-top: 1px solid var(--line); }
@@ -105,7 +117,7 @@ footer > div a { color: var(--muted); font-size: 12px; text-decoration: none; }
   .hero { gap: 35px; }
   .hero-actions { gap: 18px; }
   .hero-actions .text-link { font-size: 13px; }
-  .explore-section, .developer-section { gap: 60px; }
+  .explore-section, .developer-section, .install-section { gap: 60px; }
 }
 @media (max-width: 760px) {
   .site-header { min-height: 82px; gap: 20px; flex-wrap: wrap; padding-block: 22px; }
@@ -118,7 +130,7 @@ footer > div a { color: var(--muted); font-size: 12px; text-decoration: none; }
   .home-art-surface { min-height: 330px; }
   .app-art { margin-top: 131px; }
   .section { padding-block: 58px; }
-  .explore-section, .developer-section { grid-template-columns: 1fr; gap: 32px; }
+  .explore-section, .developer-section, .install-section { grid-template-columns: 1fr; gap: 32px; }
   .section-intro h2 br { display: none; }
   .section-intro > p:not(.eyebrow) { margin-top: 18px; }
   footer { flex-wrap: wrap; gap: 18px; }

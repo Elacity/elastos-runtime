@@ -1,7 +1,9 @@
 # Release execution
 
-A person opens the public website, understands what they can use, and opens
-Home on the same server. The server runs a reviewed candidate assembled from
+A person opens the public website, understands what they can use, and chooses
+Home on the same server or installation on their own hardware. Installation
+instructions identify the published download and development build separately.
+The server runs a reviewed candidate assembled from
 the active source work. Its deployment receipt identifies the source and served
 artifacts. A public download version has a separate verification record.
 

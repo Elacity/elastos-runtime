@@ -108,15 +108,21 @@ approved plan retains full release acceptance.
   Current tag assets and source-home receipts alone do not establish the
   required ordinary update path.
 
-- The visitor page has been revised after user content review. It explains
-  local-first apps, Home and access control; release metadata, unavailable
-  installer controls and copied setup commands are removed. The page works
-  without JavaScript. Dated deployment receipt validation remains in operator
-  tooling; it has no visitor-facing status widget. Three viewport/keyboard
-  checks and the website truth checks pass. This revised website has not been
-  staged on the seed or deployed; the prior website package needs replacement.
-  The Claude reference informed product framing, while its stable-release,
-  installer and older publishing claims were excluded.
+- The visitor page now offers both Open Home and installation on the user's
+  hardware. It identifies the published Linux download as the older 0.1.2
+  preview, gives Apple silicon source-build steps and labels Windows as planned.
+  The public installer and release manifest were read again and match the
+  recorded hashes. Three viewport/keyboard checks pass with the install panels
+  expanded and JavaScript disabled; all three displayed command blocks pass
+  shell syntax checks. Fresh-device installation remains J1 acceptance.
+  The earlier content revision at `cd7376ec` passed private seed file parity;
+  these newer install instructions need that stage refreshed after copy review.
+  Public live remains unchanged. Version/proof widgets stay in operator tooling.
+- The installation guides now explain that the source Home profile already
+  includes Documents, Library and the CLI's IPFS backend. Getting started omits
+  redundant component setup. The Mac guide selects an explicit development ref,
+  loads Rust into the shell and supplies the required collaboration setup mode.
+  These documentation corrections preserve the open Content/Carrier acceptance.
 
 The source and installed sections below preserve the earlier evidence snapshot.
 Their original identities qualify those results. Current milestone receipts

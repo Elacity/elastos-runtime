@@ -25,7 +25,7 @@ The C1-C7 sequence in the approved plan controls integration and publication.
 
 | ID | Outcome | Status / owner | Required input and next proof |
 | --- | --- | --- | --- |
-| C1-site | A useful, truthful public storefront | Revised copy in user review / coordinator | Visitor content replaces the release audit and unavailable installer controls. Local responsive and keyboard checks pass. Refresh the seed website package after this review. |
+| C1-site | A useful, truthful public storefront | Revised copy in user review / coordinator | Open Home and Install are both visible. Installation distinguishes the older published Linux preview, Apple silicon source build and planned Windows path. Local responsive, keyboard and command-syntax checks pass; fresh-device acceptance stays in J1. Refresh the seed website package after copy review. |
 | C1-home | Human Home entry at `/home/` | Source accepted / coordinator | Route, assets, auth and manifest checks pass. W2's empty-migration receipt and private-directory repairs pass Mac/Linux source smokes. Installed sign-out and shortcut migration remain C1-seed. |
 | C1-proof | The execution loop handles a real reviewed slice | Accepted for source review and monitoring / coordinator | Independent source/rendered review, nine process cases and actual recurring monitor delivery pass. Continue through installed and public proof under C1-seed. |
 | C1-seed | Seed serves the reviewed local candidate and storefront | Private first-win checks pass / coordinator | Frozen 3e27cac8 passes 25 HTTP/artifact checks, desktop/mobile layout, passkey sign-out/sign-in, Recovery Kit and Profile creation. Test-session cleanup is complete. The previous target website package is superseded by the requested copy revision; update its artifact receipt before requesting deployment approval. Journey donors enter C2–C5. |
@@ -656,5 +656,3 @@ and applicable CI lessons. Current video uses `elacity-player`; document and
   network, tool, and approval grants. Keep Codex out of model offers.
 - [ ] Evaluate public dKMS only after permissioned dKMS has release receipts, share rotation, monitoring, node admission policy, staking/slashing assumptions, and external crypto review.
 - [ ] Consider renaming `elastos-server` crate to `elastos-cli`. It is the CLI binary + all commands, not just a server. The current name misleads new developers about what the crate does.
-
-Website follow-up: reconcile the Kubo-specific publishing instructions in `docs/GETTING_STARTED.md` and `docs/INSTALL.md` with the accepted Content/Carrier journey. The visitor page no longer promotes those setup commands or links directly to those guides. Keep actual operator requirements distinct from the ordinary publishing flow.

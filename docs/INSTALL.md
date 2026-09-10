@@ -56,22 +56,32 @@ published install path.
 
 ## Optional components
 
-The default Home setup installs only core components. Add content, site, or
-operator dependencies explicitly:
+The Home profile in this checkout includes Documents, Library, Kubo and the
+IPFS provider. Running an additional setup command for those components repeats
+the default selection. A published release uses its own signed manifest.
+
+Add site-serving tools when operating a website:
 
 ```bash
-# Content-backed share and open
-elastos setup --with kubo --with ipfs-provider --with documents
-
 # Local site preview
 elastos setup --with site-provider
 
 # Ephemeral public site edge
 elastos setup --with site-provider --with tunnel-provider --with cloudflared
-
-# CID-backed site publication
-elastos setup --with kubo --with ipfs-provider
 ```
+
+### Content commands for operators
+
+The current `elastos share` and CID-backed site commands use the Runtime
+content provider with a local IPFS backend. Kubo and the IPFS provider remain
+dependencies of that CLI path. A reduced installation needs those components;
+opening a shared document also needs Documents.
+
+The release plan's Content/Carrier journey has separate acceptance checks.
+Installing the CLI backend establishes its prerequisites; cross-Runtime content
+delivery needs target proof. See [Sites](SITES.md) for the site commands and
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md) for the content
+contract.
 
 ## Setup and content Get are different operations
 

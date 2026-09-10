@@ -35,7 +35,11 @@ check("facts identify source and dated evidence", () => {
 check("visitor content stays useful without release services", () => {
   assert.ok(!/<script\b/i.test(html), "the visitor page should work without JavaScript");
   assert.ok(!/<button\b[^>]*disabled/i.test(html), "avoid unavailable action controls");
-  assert.ok(!html.includes("install.sh"), "published installer promotion needs its own acceptance");
+  assert.ok(html.includes('href="#install"'), "visitors need a device installation path");
+  assert.ok(html.includes(`older ${facts.public_observation.version} Linux preview`), "identify the published installer version separately from development source");
+  assert.ok(html.includes("Apple silicon · Source build"));
+  assert.ok(html.includes("ELASTOS_COLLABORATION_STARTUP_MODE=isolated"));
+  assert.ok(html.includes("git clone --branch upstream/0.7.1-dev"));
   assert.ok(html.includes("Development preview."));
   assert.ok(html.includes("Sign in with your passkey."));
   assert.ok(html.includes("guest access is open"));
