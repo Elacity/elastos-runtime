@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ElastOS | Your apps. Your Home.</title>
+  <meta name="description" content="Explore ElastOS Home, a desktop for your apps and data. See the preview status, try Home, and find the source setup guide for your computer.">
+  <meta name="theme-color" content="#050608">
+  <link rel="icon" href="./assets/elastos-mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./site.css">
+  <script type="module" src="./site.mjs"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="page">
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="ElastOS website"><img src="./assets/elastos-logo.svg" width="168" height="28" alt="ElastOS"></a>
+      <nav aria-label="Main navigation">
+        <a href="#explore">Explore</a>
+        <a href="#run-it">Run it yourself</a>
+        <a href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs">Docs</a>
+      </nav>
+      <a class="header-home" href="/home/">Open Home <span aria-hidden="true">↗</span></a>
+    </header>
+
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="eyebrow">ElastOS · In development</p>
+          <h1 id="hero-title">Your apps.<br>Your <span>Home.</span></h1>
+          <p class="hero-lead">A desktop for your files, ideas and everyday apps. Choose the services you use, and keep control of what they can access.</p>
+          <div class="hero-actions">
+            <a class="button primary" id="open-home" href="/home/">Open Home <span aria-hidden="true">↗</span></a>
+            <a class="text-link" href="#run-it">Run it on your computer</a>
+          </div>
+          <p class="action-note">Home opens on this server. Sign in with your passkey.</p>
+        </div>
+        <figure class="home-art">
+          <div class="home-art-surface">
+            <img class="wallpaper" src="./assets/home-wallpaper.webp" width="1920" height="1080" alt="" fetchpriority="high">
+            <div class="art-heading"><span class="art-label">ElastOS Home</span><span class="art-caption">A place for your things.</span></div>
+            <img class="home-mark" src="./assets/elastos-mark.svg" width="100" height="100" alt="">
+            <div class="app-art" aria-label="Apps in the source Home profile">
+              <div><img src="./assets/documents.png" width="56" height="56" alt=""><span>Documents</span></div>
+              <div><img src="./assets/library.png" width="56" height="56" alt=""><span>Library</span></div>
+              <div><img src="./assets/wallet.png" width="56" height="56" alt=""><span>Wallet</span></div>
+              <div><img src="./assets/browser.png" width="56" height="56" alt=""><span>Browser</span></div>
+            </div>
+          </div>
+          <figcaption>Home artwork and app icons from the source tree.</figcaption>
+        </figure>
+      </section>
+
+      <aside class="release-strip" aria-label="Preview and release status">
+        <div><span class="meta-label">Development</span><strong id="candidate-version">0.7.1 candidate</strong></div>
+        <div><span class="meta-label">Home on this server</span><strong id="hosted-version">Version awaiting verification</strong></div>
+        <div><span class="meta-label">Public installer</span><strong id="public-version">Last observed: 0.1.2 · Linux only</strong><span id="public-status">Checked 10 September 2026. Current Home uses source setup.</span></div>
+        <a href="#release-details">See the evidence <span aria-hidden="true">↓</span></a>
+      </aside>
+
+      <section class="explore-section section" id="explore" aria-labelledby="explore-title">
+        <div class="section-intro">
+          <p class="eyebrow">Start with something familiar</p>
+          <h2 id="explore-title">Make yourself<br>at Home.</h2>
+          <p>Home brings your apps together. System holds the controls for your Runtime. Start with a small task, then explore what comes next.</p>
+          <a class="text-link" href="/home/">Go to Home <span aria-hidden="true">↗</span></a>
+        </div>
+        <div class="journeys">
+          <details class="journey" data-journey="home" open>
+            <summary><span class="journey-number">01</span><span><strong>Sign in. Find your things.</strong><span class="journey-status">Source preview</span></span><span class="expand" aria-hidden="true">+</span></summary>
+            <div class="journey-body"><p>Use a passkey to enter Home. Open Documents to write, or Library to find a file. Home keeps each person's data with their account.</p><p class="next-step">On your own new installation, the first passkey sets up the Home owner. On this server, use an existing account or the guest option when available.</p><a data-evidence href="https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/state.md#installed-candidate-proof">Read the recorded Home test <span aria-hidden="true">↗</span></a></div>
+          </details>
+          <details class="journey" data-journey="update">
+            <summary><span class="journey-number">02</span><span><strong>Know what you are running.</strong><span class="journey-status">Release proof open</span></span><span class="expand" aria-hidden="true">+</span></summary>
+            <div class="journey-body"><p>Check the installed version before an update. Published installs use their saved trusted source. Source testing follows the reviewed checkout and its setup guide.</p><p class="next-step">Follow the source guide for the candidate. Each public release needs a separate install and update check.</p><a data-evidence href="https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/state.md#public-install-truth">Read the install status <span aria-hidden="true">↗</span></a></div>
+          </details>
+          <details class="journey" data-journey="ai">
+            <summary><span class="journey-number">03</span><span><strong>Give your ideas an assistant.</strong><span class="journey-status">Model setup required</span></span><span class="expand" aria-hidden="true">+</span></summary>
+            <div class="journey-body"><p>Home Agent is the place to work with an AI assistant. It needs a configured model service before it can answer.</p><p class="next-step">Local AI requires model files and a compatible model service. The recorded Home test covers the interface; a working local model remains a separate check.</p><a data-evidence href="https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/state.md#installed-candidate-proof">Read the Home Agent status <span aria-hidden="true">↗</span></a></div>
+          </details>
+          <details class="journey" data-journey="browser">
+            <summary><span class="journey-number">04</span><span><strong>Open a page in Browser.</strong><span class="journey-status">Device proof open</span></span><span class="expand" aria-hidden="true">+</span></summary>
+            <div class="journey-body"><p>Browser uses the engine and network service selected for your Runtime. Availability depends on the device and its service setup.</p><p class="next-step">Mac Browser testing needs a prepared virtual machine. Audio, reconnect and wallet flows still need full product proof. Start with the device runbook.</p><a href="https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/docs/MAC.md#browser-vm-artifacts">Mac Browser setup <span aria-hidden="true">↗</span></a><a data-evidence href="https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/state.md#browser-truth">Browser evidence <span aria-hidden="true">↗</span></a></div>
+          </details>
+          <details class="journey" data-journey="publish">
+            <summary><span class="journey-number">05</span><span><strong>Share something you made.</strong><span class="journey-status">Publishing preview</span></span><span class="expand" aria-hidden="true">+</span></summary>
+            <div class="journey-body"><p>Prepare a page locally, then publish it when you are ready. ElastOS gives the published content an identity that stays with its bytes.</p><p class="next-step">The Sites guide covers staging, publication and rollback. Paid and protected content has its own acceptance work.</p><a data-evidence href="https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/docs/SITES.md">Publish a page with Sites <span aria-hidden="true">↗</span></a></div>
+          </details>
+        </div>
+      </section>
+
+      <section class="section run-section" id="run-it" aria-labelledby="run-title">
+        <div class="section-heading"><div><p class="eyebrow">Your computer. Your Runtime.</p><h2 id="run-title">Choose a path to try it.</h2></div><p>Current Home testing uses a source setup. The public installer becomes the simple path when its release and device checks are complete.</p></div>
+        <div class="run-grid">
+          <article class="source-card">
+            <div class="card-heading"><span class="tag">Available for testing</span><span class="card-platform">Apple silicon · Linux</span></div>
+            <h3>Set up Home from source</h3>
+            <p>Build a reviewed checkout and install it into a separate test Home. This takes developer tools and time for the first build.</p>
+            <details class="source-guide" id="source-guide">
+              <summary>Mac setup guide <span aria-hidden="true">+</span></summary>
+              <div class="guide-content">
+                <p>This guide follows <a href="https://github.com/Elacity/elastos-runtime/tree/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac">upstream/0.7.1-dev at 6c61c990</a>. It prepares a local source build; its version is separate from the Home served by this website.</p>
+                <h4>1. Prepare the Mac</h4>
+                <p>Use Apple silicon with Xcode command-line tools, Homebrew, Git and Rust. Follow the <a href="https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/docs/MAC.md#from-fresh-mac-to-home">Mac runbook</a> for the prerequisite installs. Keep at least 10% of the disk free for builds.</p>
+                <h4>2. Get the source</h4>
+                <p>Create a local branch at the reviewed commit. The final command prints the source identity for your test record.</p>
+                <pre><code>git clone --branch upstream/0.7.1-dev --single-branch https://github.com/Elacity/elastos-runtime.git
+cd elastos-runtime
+git switch --create feat/local-home-preview 6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac
+git rev-parse HEAD</code></pre>
+                <h4>3. Build a separate test Home</h4>
+                <p>From the checkout, keep Rust on your normal toolchain and install the test Runtime into its own data home.</p>
+                <pre><code>export MAC_TEST_HOME="$HOME/elastos-mac-test-home"
+export ELASTOS_OPERATOR_HOME="$HOME"
+
+HOME="$MAC_TEST_HOME" \
+CARGO_HOME="$ELASTOS_OPERATOR_HOME/.cargo" \
+RUSTUP_HOME="$ELASTOS_OPERATOR_HOME/.rustup" \
+PATH="$ELASTOS_OPERATOR_HOME/.cargo/bin:/opt/homebrew/bin:$PATH" \
+scripts/setup-source-home.sh</code></pre>
+                <h4>4. Start and check Home</h4>
+                <p>The restart helper checks the installed files and prepares the data roots. Use the Home address it prints. Keep the same hostname for passkey sign-in.</p>
+                <pre><code>scripts/mac-source-home-restart.sh \
+  --init \
+  --test-home "$MAC_TEST_HOME" \
+  --addr localhost:61180
+
+curl -fsS http://localhost:61180/api/health</code></pre>
+                <p>Home and passkeys can be tested before the Browser VM is ready. The Mac runbook has the extra Browser steps, restart checks and shutdown guidance.</p>
+              </div>
+            </details>
+            <a class="text-link" href="https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/docs/GETTING_STARTED.md#build-from-source">Linux and developer guide <span aria-hidden="true">↗</span></a>
+          </article>
+
+          <article class="installer-card" aria-labelledby="installer-title">
+            <div class="card-heading"><span class="tag subtle">Public release channel</span></div>
+            <h3 id="installer-title">Install a published release</h3>
+            <p id="installer-intro">On 10 September 2026, the publisher served 0.1.2 for Linux. Live release facts appear here when available.</p>
+            <label for="platform">Your platform</label>
+            <select id="platform"><option value="aarch64-darwin">macOS · Apple silicon</option><option value="x86_64-linux">Linux · x86_64</option><option value="aarch64-linux">Linux · aarch64</option></select>
+            <p id="install-state" class="install-state" role="status">Installation is unavailable in this preview. Read the source guide for current Home testing.</p>
+            <button class="button secondary" id="copy-install" type="button" disabled>Installer unavailable</button>
+            <p class="small"><a href="/install.sh">Inspect the served installer</a> · <a href="#release-details">Release evidence</a></p>
+            <noscript><p class="small">Live release status needs JavaScript. The dated observation and source guide remain available.</p></noscript>
+          </article>
+        </div>
+      </section>
+
+      <section class="section evidence-section" id="release-details" aria-labelledby="evidence-title">
+        <div class="section-heading"><div><p class="eyebrow">Check the source</p><h2 id="evidence-title">A clear view of the preview.</h2></div><p>Source code, the Home running on this server and the public download can have different versions. Each needs its own evidence.</p></div>
+        <div class="evidence-grid">
+          <div class="evidence-copy"><h3>What supports these claims</h3><p>These journey notes were reviewed on <time id="claims-date" datetime="2026-09-10">10 September 2026</time>. The linked records describe the tested scope and the work that remains.</p><ul><li><a id="source-evidence" href="https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/state.md">Source status and recorded tests</a></li><li><a href="./claims.json">Website facts and publication observations</a></li><li id="hosted-evidence" hidden></li></ul></div>
+          <div class="trust-copy"><h3>How the installer checks a release</h3><p>The installer checks the release signatures and file hashes before installation. The facts below describe the files served here. A displayed checksum alone does not verify a publisher.</p><dl class="trust-facts"><div><dt>Metadata</dt><dd id="metadata-state">Live check pending</dd></div><div><dt>Installer SHA-256</dt><dd><code id="installer-sha">Checksum unavailable</code></dd></div><div><dt>Publisher DID</dt><dd><code id="publisher-did">Awaiting matching metadata</code></dd></div></dl><p class="small"><a href="/release-head.json">Release head</a> · <a href="/release.json">Release manifest</a> · <a href="https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/docs/INSTALL.md#trust-model">Trust model</a></p></div>
+        </div>
+      </section>
+    </main>
+    <footer><a class="brand" href="/" aria-label="ElastOS website"><img src="./assets/elastos-logo.svg" width="132" height="22" alt="ElastOS"></a><p>Home for people. Clear rules for apps.</p><div><a href="https://github.com/Elacity/elastos-runtime">GitHub</a><a href="https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/LICENSE">License</a><a href="https://github.com/Elacity/elastos-runtime/security/advisories/new">Security</a></div></footer>
+  </div>
+</body>
+</html>

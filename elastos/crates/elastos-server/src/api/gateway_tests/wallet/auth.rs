@@ -93,7 +93,7 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
     let challenge_json: serde_json::Value = serde_json::from_slice(&challenge_body).unwrap();
     let message = challenge_json["challenge"]["message"].as_str().unwrap();
     assert!(message.contains("https://elastos.elacitylabs.com wants you to sign in"));
-    assert!(message.contains("URI: https://elastos.elacitylabs.com/apps/home/"));
+    assert!(message.contains("URI: https://elastos.elacitylabs.com/home/"));
     assert!(message.contains("elastos://auth/challenge/"));
     assert!(message.contains("elastos://wallet/account/link"));
     assert!(message.contains(&format!("elastos://principal/{}", authority.principal_id)));
@@ -766,7 +766,7 @@ async fn test_evm_auth_challenge_uses_http_for_loopback_home() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let message = json["challenge"]["message"].as_str().unwrap();
     assert!(message.contains("http://127.0.0.1:8090 wants you to sign in"));
-    assert!(message.contains("URI: http://127.0.0.1:8090/apps/home/"));
+    assert!(message.contains("URI: http://127.0.0.1:8090/home/"));
 }
 
 #[tokio::test]
@@ -904,6 +904,7 @@ async fn test_unisat_token_can_link_bip322_account_without_minting_home_session(
         .unwrap();
     let challenge_json: serde_json::Value = serde_json::from_slice(&challenge_body).unwrap();
     let message = challenge_json["challenge"]["message"].as_str().unwrap();
+    assert!(message.contains("URI: https://elastos.elacitylabs.com/home/"));
 
     let verified = app
         .clone()

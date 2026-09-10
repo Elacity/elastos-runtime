@@ -983,7 +983,7 @@ def build_context(source_root, values, home, xdg, host, port):
         "gateway": gateway,
         "addr": values.addr,
         "port": port,
-        "home_url": f"http://{probe_host}:{port}/apps/home/",
+        "home_url": f"http://{probe_host}:{port}/home/",
         "services_url": f"http://{probe_host}:{port}/apps/services/",
         "gateway_log": data_dir / "logs" / f"gateway-{stamp}-{os.getpid()}.log",
         "upgrade_log": data_dir / "logs" / f"principal-root-upgrade-{stamp}-{os.getpid()}.json",

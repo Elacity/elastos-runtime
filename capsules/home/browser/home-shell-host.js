@@ -1108,7 +1108,7 @@ function reloadHomeShellHost() {
     window.location.reload();
     return;
   }
-  window.location.href = "/apps/home/";
+  window.location.href = "/home/";
 }
 
 async function recoverToHomeGui() {

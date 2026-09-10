@@ -36,7 +36,7 @@ use super::gateway::{
     consume_passkey_step_up_token, home_session_cookie_header_for_token,
     is_wallet_connector_capsule_id, issue_home_launch_token_for_auth_grant,
     require_home_launch_token_binding, require_runtime_wallet_authority, runtime_wallet_authority,
-    GatewayState, RuntimeWalletAdapter, RuntimeWalletAuthority, HOME_CAPSULE_ID,
+    GatewayState, RuntimeWalletAdapter, RuntimeWalletAuthority, HOME_CAPSULE_ID, HOME_ROUTE,
 };
 
 const AUTH_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
@@ -3086,7 +3086,7 @@ pub(in crate::api) async fn evm_challenge_for_wallet_link(
     let request_authority = request_domain(headers)?;
     let scheme = request_scheme(&request_authority);
     let origin = format!("{scheme}://{request_authority}");
-    let uri = format!("{origin}/apps/home/");
+    let uri = format!("{origin}{HOME_ROUTE}");
     let resources = vec![
         "elastos://wallet/account/link".to_string(),
         format!("elastos://principal/{}", context.principal_id),
@@ -3330,7 +3330,7 @@ pub(in crate::api) async fn btc_challenge_for_wallet_link(
     let now = crate::auth::now_ts();
     let domain = request_domain(headers)?;
     let scheme = request_scheme(&domain);
-    let uri = format!("{scheme}://{domain}/apps/home/");
+    let uri = format!("{scheme}://{domain}{HOME_ROUTE}");
     let resources = vec![
         "elastos://wallet/account/link".to_string(),
         format!("elastos://principal/{}", context.principal_id),

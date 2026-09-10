@@ -356,7 +356,7 @@ pub(super) fn write_home_principal_object_json_for_authority(
 }
 
 #[tokio::test]
-async fn test_home_static_route_serves_browser_surface() {
+async fn test_home_entry_serves_browser_surface() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
     std::fs::write(
@@ -373,7 +373,7 @@ async fn test_home_static_route_serves_browser_surface() {
         .clone()
         .oneshot(
             test_browser_request("localhost:61180", "http://localhost:61180")
-                .uri("/apps/home/")
+                .uri("/home/")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -423,7 +423,7 @@ async fn test_home_static_route_serves_browser_surface() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/apps/home/")
+                .uri("/home/")
                 .header(COOKIE, valid_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -445,7 +445,7 @@ async fn test_home_static_route_serves_browser_surface() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/apps/home/home-shell-host.js")
+                .uri("/home/home-shell-host.js")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -478,6 +478,154 @@ async fn test_home_static_route_serves_browser_surface() {
             .and_then(|value| value.to_str().ok()),
         Some("application/javascript")
     );
+}
+
+#[tokio::test]
+async fn test_home_entry_redirects_preserve_bookmarks_and_capsule_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    for (uri, location) in [
+        ("/home", "/home/"),
+        ("/apps/home", "/home/"),
+        ("/apps/home/", "/home/"),
+        ("/apps/home/?view=accounts", "/home/?view=accounts"),
+        ("/home?view=accounts", "/home/?view=accounts"),
+        ("/apps/system", "/apps/system/"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT, "{uri}");
+        assert_eq!(response.headers()["location"], location, "{uri}");
+        assert!(response.headers().get(SET_COOKIE).is_none(), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn test_home_entry_preserves_capsule_bytes_and_security_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    std::fs::write(
+        dir.path()
+            .join("capsules/home/browser/manifest.webmanifest"),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../capsules/home/browser/manifest.webmanifest"
+        )),
+    )
+    .unwrap();
+    for (host, origin) in [
+        ("localhost:8090", "http://localhost:8090"),
+        ("elastos.elacitylabs.com", "https://elastos.elacitylabs.com"),
+    ] {
+        for (home_path, capsule_path) in [
+            ("/home/", "/apps/home/index.html"),
+            ("/home/index.html", "/apps/home/index.html"),
+            ("/home/home-shell-host.js", "/apps/home/home-shell-host.js"),
+            (
+                "/home/manifest.webmanifest",
+                "/apps/home/manifest.webmanifest",
+            ),
+        ] {
+            let home = app
+                .clone()
+                .oneshot(
+                    test_browser_request(host, origin)
+                        .uri(home_path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let capsule = app
+                .clone()
+                .oneshot(
+                    test_browser_request(host, origin)
+                        .uri(capsule_path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(home.status(), StatusCode::OK, "{home_path}");
+            assert_eq!(capsule.status(), StatusCode::OK, "{capsule_path}");
+            assert_eq!(home.headers(), capsule.headers(), "{home_path}");
+            assert_eq!(home.headers()["cache-control"], "no-store");
+            assert_eq!(home.headers()["cross-origin-opener-policy"], "same-origin");
+            assert_eq!(
+                home.headers()["cross-origin-embedder-policy"],
+                "require-corp"
+            );
+            assert_eq!(home.headers()["x-content-type-options"], "nosniff");
+            if home_path.ends_with('/') || home_path.ends_with(".html") {
+                let csp = home.headers()["content-security-policy"].to_str().unwrap();
+                assert!(csp.contains("connect-src 'self'"));
+                assert!(csp.contains("frame-ancestors 'none'"));
+            }
+            let home_body = axum::body::to_bytes(home.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let capsule_body = axum::body::to_bytes(capsule.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(home_body, capsule_body, "{home_path}");
+            if home_path.ends_with(".webmanifest") {
+                let manifest: serde_json::Value = serde_json::from_slice(&home_body).unwrap();
+                for path in [home_path, capsule_path] {
+                    let manifest_url = url::Url::parse(&format!("{origin}{path}")).unwrap();
+                    let start = manifest_url
+                        .join(manifest["start_url"].as_str().unwrap())
+                        .unwrap();
+                    let scope = manifest_url
+                        .join(manifest["scope"].as_str().unwrap())
+                        .unwrap();
+                    let id = start.join(manifest["id"].as_str().unwrap()).unwrap();
+                    assert_eq!(start.as_str(), format!("{origin}/home/"));
+                    assert_eq!(scope, start);
+                    // Preserve the former implicit id while moving Home's navigation scope.
+                    assert_eq!(id.as_str(), format!("{origin}/apps/home/"));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_home_entry_rejects_path_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    for uri in [
+        "/home/%2e%2e/manifest.json",
+        "/home/browser/%2e%2e/index.html",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+    }
+    #[cfg(unix)]
+    {
+        std::fs::write(dir.path().join("outside.txt"), "outside Home").unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("outside.txt"),
+            dir.path().join("capsules/home/browser/escape.txt"),
+        )
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/home/escape.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[tokio::test]
@@ -1104,10 +1252,10 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     // browser surface, System (asserted below at /api/apps/system/summary).
     // The Home shell has no consumer for it, so the Home summary strips it.
     assert!(payload["identity"]["device_did"].is_null());
-    assert_eq!(payload["home"]["route"], "/apps/home/");
+    assert_eq!(payload["home"]["route"], "/home/");
     assert_eq!(payload["home"]["attach_kind"], "iframe");
     assert_eq!(payload["app"]["id"], "home");
-    assert_eq!(payload["app"]["route"], "/apps/home/");
+    assert_eq!(payload["app"]["route"], "/home/");
     assert!(payload["appearance"]["background_image_url"].is_null());
     assert_eq!(payload["runtime"]["running"], false);
     assert_eq!(payload["site"]["root_uri"], MY_WEBSITE_URI);
@@ -3437,7 +3585,7 @@ async fn test_system_summary_reports_identity_and_app_id() {
     assert_eq!(payload["identity"]["profile_setup_display_name"], "anders");
     assert!(payload["identity"]["device_did"].is_string());
     assert_eq!(payload["home"]["id"], "home");
-    assert_eq!(payload["home"]["route"], "/apps/home/");
+    assert_eq!(payload["home"]["route"], "/home/");
     assert_eq!(payload["app"]["id"], "system");
     assert_eq!(payload["app"]["route"], "/apps/system/");
     assert_eq!(payload["runtime"]["running"], false);

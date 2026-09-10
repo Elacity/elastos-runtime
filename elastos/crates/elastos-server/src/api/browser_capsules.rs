@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use elastos_common::{CapsuleManifest, CapsuleRole, CapsuleType};
@@ -12,7 +12,7 @@ use super::capsule_inventory::{
 };
 use super::gateway::{
     capsule_icon_variants, content_type, ensure_wallet_connector_configured, request_uses_tls,
-    validate_file_path, GatewayState,
+    validate_file_path, GatewayState, HOME_CAPSULE_ID, HOME_ROUTE,
 };
 
 const BROWSER_CAPSULE_CACHE_CONTROL: &str = "no-store";
@@ -63,6 +63,29 @@ pub(crate) struct ViewerBoundCapsule {
     pub storage: Vec<String>,
     /// Capsule-relative icon directory as declared in the manifest.
     pub icon: Option<String>,
+}
+
+pub async fn redirect_home_root(RawQuery(query): RawQuery) -> Response {
+    let route = match query {
+        Some(query) => format!("{HOME_ROUTE}?{query}"),
+        None => HOME_ROUTE.to_string(),
+    };
+    Redirect::permanent(&route).into_response()
+}
+
+pub async fn serve_home_index(
+    State(state): State<GatewayState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    serve_browser_capsule_path(&state.data_dir, &headers, HOME_CAPSULE_ID, None).await
+}
+
+pub async fn serve_home_asset(
+    State(state): State<GatewayState>,
+    headers: axum::http::HeaderMap,
+    AxumPath(path): AxumPath<String>,
+) -> Response {
+    serve_browser_capsule_path(&state.data_dir, &headers, HOME_CAPSULE_ID, Some(&path)).await
 }
 
 pub async fn serve_browser_app_root(AxumPath(app): AxumPath<String>) -> Response {
@@ -867,6 +890,7 @@ mod tests {
             "/apps/browser/settings/?view=privacy#home_token=secret"
         );
         assert!(canonical_browser_capsule_route("https://example.test/apps/browser/").is_err());
+        assert!(canonical_browser_capsule_route(HOME_ROUTE).is_err());
     }
 
     #[tokio::test]

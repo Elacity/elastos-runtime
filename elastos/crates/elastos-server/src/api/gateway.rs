@@ -399,7 +399,7 @@ const WALLET_CONNECTOR_CAPSULE_IDS: &[&str] = &[
 pub(crate) const HOME_CAPSULE_ID: &str = "home";
 pub(crate) const HOME_GUI_SHELL_ID: &str = "home-gui";
 pub(crate) const HOME_CLI_SHELL_ID: &str = "home-cli";
-const HOME_ROUTE: &str = "/apps/home/";
+pub(super) const HOME_ROUTE: &str = "/home/";
 pub(crate) const WALLETCONNECT_CONFIG_SCHEMA: &str = "elastos.walletconnect.connector/v1";
 pub(crate) const WALLETCONNECT_CONFIG_PATH: &str =
     "ElastOS/SystemServices/WalletConnect/config.json";
@@ -1110,6 +1110,20 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/viewers/:viewer/storage/:capsule/:scope/:name",
             get(super::viewer_gateway::viewer_storage_get)
                 .put(super::viewer_gateway::viewer_storage_put),
+        )
+        .route("/home", get(super::browser_capsules::redirect_home_root))
+        .route(HOME_ROUTE, get(super::browser_capsules::serve_home_index))
+        .route(
+            "/home/*path",
+            get(super::browser_capsules::serve_home_asset),
+        )
+        .route(
+            "/apps/home",
+            get(super::browser_capsules::redirect_home_root),
+        )
+        .route(
+            "/apps/home/",
+            get(super::browser_capsules::redirect_home_root),
         )
         .route(
             "/apps/:app",

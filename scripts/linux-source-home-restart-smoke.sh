@@ -255,12 +255,18 @@ data = pathlib.Path(os.environ["XDG_DATA_HOME"]) / "elastos"
 home = (data / "capsules/home/browser/index.html").read_bytes()
 services = (data / "capsules/services/browser/index.html").read_bytes()
 if os.environ.get("ELASTOS_SMOKE_BAD_HOME") == "1":
-    home = b"wrong Home\n"
+    home = b"wrong Home\\n"
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == "/apps/home/":
+            self.send_response(308)
+            self.send_header("Location", "/home/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         values = {
-            "/apps/home/": home,
+            "/home/": home,
             "/apps/services/": services,
         }
         body = values.get(self.path)
@@ -442,6 +448,8 @@ def dry_run_proof(base):
         raise AssertionError("dry-run receipt status mismatch")
     if value.get("gateway_bin") != str(fixture.runtime.resolve()):
         raise AssertionError("dry run did not select the stable Runtime")
+    if value.get("home_url") != f"http://{fixture.addr}/home/":
+        raise AssertionError("dry-run receipt did not name canonical Home")
     if value.get("installed_runtime_sha256") != sha256(fixture.runtime):
         raise AssertionError("dry run did not bind the installed Runtime hash")
     if any("rollback" in name for name in value):
@@ -489,6 +497,8 @@ def linux_active_proof(base):
     )
     dead_success = dead_stale.run()
     dead_receipt = json.loads(dead_success.stdout)
+    if dead_receipt.get("home_url") != f"http://{dead_stale.addr}/home/":
+        raise AssertionError("restart receipt did not name canonical Home")
     dead_pid = dead_receipt.get("gateway_pid")
     if not isinstance(dead_pid, int) or not process_alive(dead_pid):
         raise AssertionError("dead prior PID record did not admit one new gateway")
