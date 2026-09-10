@@ -24,6 +24,17 @@ const enrollmentChoice = document.querySelector("#home-enrollment-choice");
 const enrollmentCreate = document.querySelector("#home-enrollment-create");
 const enrollmentRecover = document.querySelector("#home-enrollment-recover");
 const enrollmentDismiss = document.querySelector("#home-enrollment-dismiss");
+const recoveryKitPanel = document.querySelector("#home-recovery-kit");
+const recoveryFile = document.querySelector("#home-recovery-file");
+const recoveryPassword = document.querySelector("#home-recovery-password");
+const recoveryPasswordLabel = document.querySelector("#home-recovery-password-label");
+const MAX_RECOVERY_KIT_BYTES = 1024 * 1024;
+const RECOVERY_SELECTION_MS = 10 * 60 * 1000;
+let recoveryKit = null;
+let recoverySelectionVersion = 0;
+let recoverySelectionTimer = 0;
+let recoverySession = null;
+let recoveryTerminalToken = "";
 const PENDING_REGISTRATION_KEY = "elastos.home.pending-registration/v1";
 const PENDING_REGISTRATION_MS = 12 * 60 * 60 * 1000;
 const MAX_PENDING_REGISTRATION_CHARS = 65536;
@@ -106,6 +117,9 @@ export function hideHomeUnlock() {
   if (!unlockPanel) {
     return;
   }
+  clearRecoverySelection();
+  recoverySession = null;
+  recoveryTerminalToken = "";
   const finish = () => {
     unlockPanel.hidden = true;
     unlockPanel.setAttribute("aria-hidden", "true");
@@ -131,11 +145,19 @@ export function hideHomeUnlock() {
 }
 
 export function bindHomeUnlock() {
+  recoveryFile?.addEventListener("change", selectRecoveryKit);
+  window.addEventListener("pagehide", () => {
+    clearRecoverySelection();
+    recoverySession = null;
+    recoveryTerminalToken = "";
+  });
   for (const [control, purpose] of [[enrollmentCreate, "create"], [enrollmentRecover, "recover"]]) {
     control?.addEventListener("change", () => {
-      if (busy || pendingRegistration || !control.checked) return;
+      if (busy || pendingRegistration || recoverySession || !control.checked) return;
       enrollmentPurpose = purpose;
+      clearRecoverySelection();
       renderEnrollmentChoice();
+      if (purpose === "recover") recoveryFile?.click();
     });
   }
   enrollmentDismiss?.addEventListener("click", () => {
@@ -159,6 +181,9 @@ export function bindHomeUnlock() {
   unlockPrimary?.addEventListener("click", startUnlock);
   unlockPerson?.addEventListener("click", startUnlock);
   unlockSecondary?.addEventListener("click", () => {
+    clearRecoverySelection();
+    recoverySession = null;
+    recoveryTerminalToken = "";
     if (unlockMode === "resume_registration") {
       unlockMode = guestRegistrationAvailable ? "signin_guest_enabled" : "signin";
       renderUnlockMode({ registered: true, guestRegistrationEnabled: guestRegistrationAvailable });
@@ -453,28 +478,156 @@ function savePendingRegistration(pending) {
 function renderEnrollmentChoice() {
   const enrolling = ["create", "create_guest", "resume_owner", "resume_registration"].includes(unlockMode);
   const purpose = pendingRegistration?.intent.purpose || enrollmentPurpose;
-  if (enrollmentCreate) { enrollmentCreate.checked = purpose === "create"; enrollmentCreate.disabled = busy || !!pendingRegistration; }
-  if (enrollmentRecover) { enrollmentRecover.checked = purpose === "recover"; enrollmentRecover.disabled = busy || !!pendingRegistration; }
+  if (enrollmentCreate) { enrollmentCreate.checked = purpose === "create"; enrollmentCreate.disabled = busy || !!pendingRegistration || !!recoverySession; }
+  if (enrollmentRecover) { enrollmentRecover.checked = purpose === "recover"; enrollmentRecover.disabled = busy || !!pendingRegistration || !!recoverySession; }
   if (enrollmentDismiss) enrollmentDismiss.hidden = !pendingRegistrationInvalid;
   setUnlockNameVisible(enrolling && purpose === "create");
   if (unlockName && pendingRegistration) unlockName.disabled = true;
   if (enrolling && unlockCopy) unlockCopy.textContent = purpose === "recover"
-    ? "Create a passkey, then choose your Recovery Kit in System. Your existing identity will be restored from the kit."
+    ? "Choose your Recovery Kit first. Home will then use a passkey to restore your signed Profile and its name."
     : "Create a passkey and Profile with the name people will see.";
-  if (enrolling && pendingRegistration && unlockPrimary) unlockPrimary.textContent = "Resume setup";
+  if (recoveryKitPanel) recoveryKitPanel.hidden = !(enrolling && purpose === "recover");
+  if (recoveryFile) recoveryFile.disabled = busy;
+  if (recoveryPassword) recoveryPassword.disabled = busy;
+  if (enrolling && purpose === "recover" && unlockPrimary) unlockPrimary.textContent = recoveryKit
+    ? (recoverySession ? "Recover account" : "Continue with passkey") : "Choose Recovery Kit";
+  if (enrolling && purpose === "create" && !pendingRegistration && unlockPrimary) unlockPrimary.textContent = unlockMode === "resume_owner"
+    ? "Resume Home setup" : unlockMode === "create_guest" ? "Create guest passkey" : "Create admin passkey";
+  if (enrolling && purpose === "create" && pendingRegistration && unlockPrimary) unlockPrimary.textContent = "Resume setup";
   if (enrolling && pendingRegistration && unlockCopy) unlockCopy.textContent = purpose === "recover"
-    ? "Resume your saved Recover setup, then choose your Recovery Kit in System."
+    ? "Choose your Recovery Kit again, then resume recovery with your passkey."
     : `Resume your saved Create setup for ${pendingRegistration.intent.public_name}.`;
+}
+
+function clearRecoverySelection() {
+  recoverySelectionVersion++;
+  recoveryKit = null;
+  window.clearTimeout(recoverySelectionTimer);
+  recoverySelectionTimer = 0;
+  if (recoveryFile) recoveryFile.value = "";
+  if (recoveryPassword) { recoveryPassword.value = ""; recoveryPassword.hidden = true; }
+  if (recoveryPasswordLabel) recoveryPasswordLabel.hidden = true;
+}
+
+async function selectRecoveryKit() {
+  const file = recoveryFile?.files?.[0];
+  clearRecoverySelection();
+  if (!file || busy) { renderEnrollmentChoice(); return; }
+  const version = recoverySelectionVersion;
+  try {
+    if (file.size > MAX_RECOVERY_KIT_BYTES) throw new Error("Recovery Kit exceeds the 1 MB limit.");
+    const imported = JSON.parse(await file.text());
+    if (version !== recoverySelectionVersion || enrollmentPurpose !== "recover" || busy) return;
+    const encrypted = imported?.schema === "elastos.full-recovery-bundle.package/v1";
+    if (!encrypted && imported?.schema !== "elastos.full-recovery-bundle/v1") {
+      throw new Error("Choose a full Recovery Kit JSON file.");
+    }
+    if (!encrypted && !imported.people_identity?.profile_authority_bundle) {
+      setUnlockStatus("This kit has no signed Profile or name. Choose a newer kit that includes your Profile.", "error");
+      renderEnrollmentChoice();
+      return;
+    }
+    recoveryKit = imported;
+    if (recoveryPassword) recoveryPassword.hidden = !encrypted;
+    if (recoveryPasswordLabel) recoveryPasswordLabel.hidden = !encrypted;
+    recoverySelectionTimer = window.setTimeout(() => {
+      clearRecoverySelection();
+      renderEnrollmentChoice();
+      setUnlockStatus("Recovery Kit selection expired. Choose the kit again.", "muted");
+    }, RECOVERY_SELECTION_MS);
+    setUnlockStatus(encrypted ? "Kit selected. Enter its password, then continue with your passkey."
+      : "Kit selected. Continue with your passkey to recover this account.", "muted");
+    if (encrypted) recoveryPassword?.focus();
+  } catch (_) {
+    if (version !== recoverySelectionVersion) return;
+    clearRecoverySelection();
+    setUnlockStatus("Choose a valid full Recovery Kit JSON file, up to 1 MB.", "error");
+  }
+  renderEnrollmentChoice();
+}
+
+async function completeEnrollmentRecovery() {
+  setUnlockStatus("Restoring your account and signed Profile.", "muted");
+  const headers = { "x-elastos-home-token": recoverySession.home_token };
+  const selectedKit = recoveryKit;
+  const password = recoveryPassword?.value || "";
+  const status = await fetchJson("/api/auth/recovery/status", { headers });
+  const request = {
+    schema: "elastos.full-recovery-bundle.import.request/v1",
+    principal_id: status.principal_id,
+    localhost_root: status.localhost_root,
+    reassign_to_current_principal: true,
+  };
+  if (selectedKit?.schema === "elastos.full-recovery-bundle.package/v1") {
+    request.package = selectedKit;
+    request.password = password;
+  } else {
+    request.bundle = selectedKit;
+  }
+  if (recoveryTerminalToken) headers["x-elastos-recovery-terminal"] = recoveryTerminalToken;
+  let response;
+  try {
+    response = await fetchJson("/api/auth/recovery/full-import", {
+      method: "POST", headers, body: JSON.stringify(request),
+    });
+  } catch (_) {
+    throw new Error("Recovery could not finish. Choose your kit again, check its password, and retry.");
+  } finally {
+    delete request.password;
+    clearRecoverySelection();
+  }
+  if (readText(response.home_token)) {
+    recoverySession = { ...recoverySession, home_token: response.home_token };
+    setHomeAuthorityToken(response.home_token);
+  }
+  recoveryTerminalToken = readText(response.runtime_audit?.retry_token);
+  if (response.schema !== "elastos.full-recovery-bundle.import.response/v2"
+    || response.wallet_restore?.status !== "complete"
+    || response.runtime_audit?.status !== "complete"
+    || response.people_identity_restore?.status !== "restored") {
+    throw new Error(response.people_identity_restore?.status === "absent"
+      ? "The root was recovered. This kit has no signed Profile or name. Choose a newer kit that includes your Profile."
+      : "The root was recovered. Profile, Wallet, or audit recovery still needs completion. Choose the same kit again to retry safely.");
+  }
+  const refreshed = await refreshHomeSession();
+  recoverySession = refreshed;
+  const summary = await fetchJson("/api/apps/home/summary", {
+    headers: { "x-elastos-home-token": refreshed.home_token },
+  });
+  const profile = summary?.identity?.profile;
+  if (summary?.authority?.signed_in !== true
+    || !readText(response.people_identity_restore?.profile_did)
+    || summary?.identity?.profile_readiness?.status !== "ready"
+    || !readText(profile?.display_name)) {
+    throw new Error("Recovery finished, but Home could not confirm your signed Profile and name. Choose the same kit again to retry.");
+  }
+  recoverySession = null;
+  recoveryTerminalToken = "";
+  await unlockComplete(refreshed, { enrollmentPurpose: "recover" });
 }
 
 async function runPasskeyCreate() {
   if (busy || !window.PublicKeyCredential) {
     return;
   }
+  if ((pendingRegistration?.intent.purpose || enrollmentPurpose) === "recover" && !recoveryKit) {
+    recoveryFile?.click();
+    return;
+  }
+  if (recoveryKit?.schema === "elastos.full-recovery-bundle.package/v1" && !recoveryPassword?.value) {
+    recoveryPassword?.focus();
+    setUnlockStatus("Enter the Recovery Kit password before continuing.", "error");
+    return;
+  }
   busy = true;
   setButtonsDisabled(true);
+  renderEnrollmentChoice();
   setUnlockStatus("Creating passkey", "muted");
   try {
+    if (recoverySession) {
+      await completeEnrollmentRecovery();
+      return;
+    }
     if (!pendingRegistration) pendingRegistration = readPendingRegistration();
     const displayName = readUnlockName();
     if (!pendingRegistration && enrollmentPurpose === "create" && !displayName) {
@@ -557,7 +710,15 @@ async function runPasskeyCreate() {
     catch (_) { throw new Error("Home cannot clear setup retry data. Check browser storage and retry."); }
     pendingRegistration = null;
     setHomeAuthorityToken(response?.home_token);
-    await unlockComplete(response, { enrollmentPurpose: pending.intent.purpose });
+    if (pending.intent.purpose === "recover") {
+      recoverySession = response;
+      await completeEnrollmentRecovery();
+    } else {
+      await unlockComplete(response, { enrollmentPurpose: pending.intent.purpose });
+    }
+  } catch (error) {
+    if (enrollmentPurpose === "recover") clearRecoverySelection();
+    throw error;
   } finally {
     busy = false;
     setButtonsDisabled(false);

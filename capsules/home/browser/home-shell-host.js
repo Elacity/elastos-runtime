@@ -393,11 +393,7 @@ async function showHostAuthGate(options = {}) {
   const personName = options?.preserveSignedProfileLabel ? currentSignedProfileDisplayName() : "";
   const unlockReady = showHomeUnlock(async (response, flow) => {
     await boot();
-    if (flow?.enrollmentPurpose === "recover") {
-      await activateDesktopShell();
-      await openTargetFromHomeGui("system", { query: { settings: "security", recovery: "import" } });
-      return;
-    }
+    if (flow?.enrollmentPurpose === "recover") return;
     const profileActionTarget = profileReadinessActionTarget(response);
     if (profileActionTarget) {
       await activateDesktopShell();

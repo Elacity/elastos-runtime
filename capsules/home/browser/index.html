@@ -94,6 +94,12 @@
             <label for="home-enrollment-create"><input id="home-enrollment-create" type="radio" name="home-enrollment-purpose" value="create" aria-label="Create account" checked /> Create account</label>
             <label for="home-enrollment-recover"><input id="home-enrollment-recover" type="radio" name="home-enrollment-purpose" value="recover" aria-label="Recover account" /> Recover account</label>
           </fieldset>
+          <div id="home-recovery-kit" hidden>
+            <label for="home-recovery-file">Recovery Kit</label>
+            <input id="home-recovery-file" aria-label="Recovery Kit" class="home-unlock-input" type="file" accept=".json,application/json" />
+            <label id="home-recovery-password-label" for="home-recovery-password" hidden>Recovery Kit password</label>
+            <input id="home-recovery-password" aria-label="Recovery Kit password" class="home-unlock-input" type="password" maxlength="1024" autocomplete="off" spellcheck="false" hidden />
+          </div>
           <label id="home-unlock-name-label" for="home-unlock-name" hidden>Your display name</label>
           <input
             id="home-unlock-name"

@@ -1381,6 +1381,34 @@ async fn assert_fresh_machine_full_recovery(real_enrollment: bool) {
         saved.document().revision + 1
     );
     assert_eq!(recovered_head.document().display_name, "Original Person");
+    let summary = fresh_app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .uri("/api/apps/home/summary")
+                .header(
+                    "x-elastos-home-token",
+                    import_json["home_token"].as_str().unwrap(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let summary_body = axum::body::to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let summary_json: serde_json::Value = serde_json::from_slice(&summary_body).unwrap();
+    assert_eq!(summary_json["authority"]["signed_in"], true);
+    assert_eq!(
+        summary_json["identity"]["profile_readiness"]["status"],
+        "ready"
+    );
+    assert_eq!(
+        summary_json["identity"]["profile"]["display_name"],
+        "Original Person"
+    );
     let (_, fresh_device_did) = elastos_identity::load_or_create_did(fresh_dir.path()).unwrap();
     assert!(recovered_head.authorizes_endpoint(&fresh_device_did));
     assert!(
