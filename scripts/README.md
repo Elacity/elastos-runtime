@@ -16,7 +16,11 @@ automatically a stable end-user command.
 - `setup-crosvm.sh` installs VM prerequisites.
 - `publish-release.sh` is the low-level release publisher.
 - `python3 scripts/publish-platform-artifacts-test.py` checks its local platform
-  manifest exports and native/guest target selection without signing or uploading.
+  manifest exports, native/guest target selection and the staged artifact gate
+  without signing or uploading. CI and `just verify` run these checks.
+- `components-release-integrity-check.py --artifact-root <directory> --platform
+  <platform> --manifest <manifest>` verifies hashes and sizes for locally
+  advertised release files before publication.
 - `vendor-walletconnect-adapter.sh` refreshes the pinned WalletConnect asset.
 
 Use the `justfile` for repository gates:

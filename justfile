@@ -146,6 +146,8 @@ verify:
     node scripts/check-capsule-templates.mjs
     ./scripts/vendor-ui-tokens.sh --check
     node scripts/home-entropy-check.mjs
+    python3 scripts/components-release-integrity-check.py --self-test
+    python3 scripts/publish-platform-artifacts-test.py
     node scripts/home-agent-shell-smoke.mjs
     node scripts/carrier-dependency-generation-check.mjs
     just product-ui-source

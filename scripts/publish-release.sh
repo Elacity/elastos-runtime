@@ -839,6 +839,52 @@ build_supported_direct_assets() {
     stamp_direct_assets "$setup_platform" "$updates_json"
 }
 
+stage_release_artifacts() {
+    local artifact_dir="$1"
+    local f base CROSS_SRC
+    mkdir -p "$artifact_dir"
+    # Save platform binaries for direct gateway serving
+    cp "${STAGED_ELASTOS}" "${artifact_dir}/elastos-${PLATFORM}"
+    if [[ -n "${CROSS_ELASTOS:-}" && -f "${CROSS_ELASTOS}" ]]; then
+        cp "${CROSS_ELASTOS}" "${artifact_dir}/elastos-${CROSS_PLATFORM}"
+    fi
+    cp "${TMPDIR}/components.json" "${artifact_dir}/components-${PLATFORM}.json"
+    if [[ -n "${CROSS_PLATFORM:-}" && -f "${TMPDIR}/components-${CROSS_PLATFORM}.json" ]]; then
+        cp "${TMPDIR}/components-${CROSS_PLATFORM}.json" "${artifact_dir}/components-${CROSS_PLATFORM}.json"
+    fi
+    # Copy first-party support assets for Carrier-served setup fetches.
+    for f in "${TMPDIR}/supported-assets-${PLATFORM}"/* \
+        "${TMPDIR}/supported-assets-universal"/*; do
+        [ -f "$f" ] || continue
+        cp -f "$f" "${artifact_dir}/$(basename "$f")"
+    done
+    for f in "${TMPDIR}/supported-provider-contracts-universal"/*; do
+        [ -f "$f" ] || continue
+        cp -f "$f" "${artifact_dir}/$(basename "$f")"
+    done
+    if [[ -n "${CROSS_PLATFORM:-}" ]]; then
+        for f in "${TMPDIR}/supported-assets-${CROSS_PLATFORM}"/*; do
+            [ -f "$f" ] || continue
+            cp -f "$f" "${artifact_dir}/$(basename "$f")"
+        done
+    fi
+    # Copy capsule artifacts for Carrier serving (platform-suffixed)
+    for f in "${ARTIFACTS_DIR}"/*.capsule.tar.gz; do
+        [ -f "$f" ] || continue
+        base=$(basename "$f" .capsule.tar.gz)
+        cp -f "$f" "${artifact_dir}/${base}-${PLATFORM}.capsule.tar.gz"
+    done
+    if [[ -n "${CROSS_PLATFORM:-}" ]]; then
+        CROSS_SRC="${TMPDIR}/artifacts-${CROSS_ARCH}"
+        [ -d "$CROSS_SRC" ] || CROSS_SRC="artifacts-${CROSS_ARCH}"
+        for f in "${CROSS_SRC}"/*.capsule.tar.gz; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f" .capsule.tar.gz)
+            cp -f "$f" "${artifact_dir}/${base}-${CROSS_PLATFORM}.capsule.tar.gz"
+        done
+    fi
+}
+
 build_platform_independent_direct_assets() {
     local platform="$1"
     local stage_dir updates_json release_path
@@ -1841,6 +1887,26 @@ if [[ -n "$CROSS_ARCH" ]]; then
     fi
 fi
 
+# Assemble the files advertised by this release before signing its metadata.
+PREPARED_ARTIFACTS_DIR="${TMPDIR}/publication-artifacts"
+stage_release_artifacts "$PREPARED_ARTIFACTS_DIR"
+[[ "$(sha256 "${PREPARED_ARTIFACTS_DIR}/elastos-${PLATFORM}")" == "$BINARY_SHA256" ]] \
+    || die "Staged runtime differs from the release descriptor (${PLATFORM})"
+[[ "$(sha256 "${PREPARED_ARTIFACTS_DIR}/components-${PLATFORM}.json")" == "$COMPONENTS_SHA256" ]] \
+    || die "Staged components differ from the release descriptor (${PLATFORM})"
+python3 scripts/components-release-integrity-check.py \
+    --manifest "${PREPARED_ARTIFACTS_DIR}/components-${PLATFORM}.json" \
+    --platform "$SETUP_PLATFORM" --artifact-root "$PREPARED_ARTIFACTS_DIR"
+if [[ -n "$CROSS_PLATFORM" ]]; then
+    [[ "$(sha256 "${PREPARED_ARTIFACTS_DIR}/elastos-${CROSS_PLATFORM}")" == "$CROSS_BINARY_SHA256" ]] \
+        || die "Staged runtime differs from the release descriptor (${CROSS_PLATFORM})"
+    [[ "$(sha256 "${PREPARED_ARTIFACTS_DIR}/components-${CROSS_PLATFORM}.json")" == "$CROSS_COMPONENTS_SHA256" ]] \
+        || die "Staged components differ from the release descriptor (${CROSS_PLATFORM})"
+    python3 scripts/components-release-integrity-check.py \
+        --manifest "${PREPARED_ARTIFACTS_DIR}/components-${CROSS_PLATFORM}.json" \
+        --platform "$CROSS_SETUP_PLATFORM" --artifact-root "$PREPARED_ARTIFACTS_DIR"
+fi
+
 # ── Step 7: Create + sign release.json ───────────────────────────────
 
 PREV_RELEASE_CID="null"
@@ -2162,45 +2228,7 @@ mkdir -p "${PUBLISHER_ARTIFACTS_DIR}"
 cp "${TMPDIR}/release-head.json" "${PUBLISHER_ROOT}/release-head.json"
 cp "${TMPDIR}/release.json" "${PUBLISHER_ROOT}/release.json"
 cp "$STAMPED_INSTALL" "${PUBLISHER_ROOT}/install.sh"
-# Save platform binaries for direct gateway serving
-cp "${STAGED_ELASTOS}" "${PUBLISHER_ARTIFACTS_DIR}/elastos-${PLATFORM}"
-if [[ -n "${CROSS_ELASTOS:-}" && -f "${CROSS_ELASTOS}" ]]; then
-    cp "${CROSS_ELASTOS}" "${PUBLISHER_ARTIFACTS_DIR}/elastos-${CROSS_PLATFORM}"
-fi
-cp "${TMPDIR}/components.json" "${PUBLISHER_ARTIFACTS_DIR}/components-${PLATFORM}.json"
-if [[ -n "${CROSS_PLATFORM:-}" && -f "${TMPDIR}/components-${CROSS_PLATFORM}.json" ]]; then
-    cp "${TMPDIR}/components-${CROSS_PLATFORM}.json" "${PUBLISHER_ARTIFACTS_DIR}/components-${CROSS_PLATFORM}.json"
-fi
-# Copy first-party support assets for Carrier-served setup fetches.
-for f in "${TMPDIR}/supported-assets-${PLATFORM}"/*; do
-    [ -f "$f" ] || continue
-    cp -f "$f" "${PUBLISHER_ARTIFACTS_DIR}/$(basename "$f")"
-done
-for f in "${TMPDIR}/supported-provider-contracts-universal"/*; do
-    [ -f "$f" ] || continue
-    cp -f "$f" "${PUBLISHER_ARTIFACTS_DIR}/$(basename "$f")"
-done
-if [[ -n "${CROSS_PLATFORM:-}" ]]; then
-    for f in "${TMPDIR}/supported-assets-${CROSS_PLATFORM}"/*; do
-        [ -f "$f" ] || continue
-        cp -f "$f" "${PUBLISHER_ARTIFACTS_DIR}/$(basename "$f")"
-    done
-fi
-# Copy capsule artifacts for Carrier serving (platform-suffixed)
-for f in "${ARTIFACTS_DIR}"/*.capsule.tar.gz; do
-    [ -f "$f" ] || continue
-    base=$(basename "$f" .capsule.tar.gz)
-    cp -f "$f" "${PUBLISHER_ARTIFACTS_DIR}/${base}-${PLATFORM}.capsule.tar.gz"
-done
-if [[ -n "${CROSS_PLATFORM:-}" ]]; then
-    CROSS_SRC="${TMPDIR}/artifacts-${CROSS_ARCH}"
-    [ -d "$CROSS_SRC" ] || CROSS_SRC="artifacts-${CROSS_ARCH}"
-    for f in "${CROSS_SRC}"/*.capsule.tar.gz; do
-        [ -f "$f" ] || continue
-        base=$(basename "$f" .capsule.tar.gz)
-        cp -f "$f" "${PUBLISHER_ARTIFACTS_DIR}/${base}-${CROSS_PLATFORM}.capsule.tar.gz"
-    done
-fi
+cp "${PREPARED_ARTIFACTS_DIR}"/* "${PUBLISHER_ARTIFACTS_DIR}/"
 info "Saved release artifacts to ${PUBLISHER_ROOT} for gateway serving"
 
 # ── Step 10: Start public gateway URL (best-effort) ──────────────────

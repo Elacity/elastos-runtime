@@ -136,6 +136,17 @@ approved plan retains full release acceptance.
   source review. Complete artifact assembly and fresh installation remain
   delivery work.
 
+- The publisher now assembles its served artifact directory before release
+  signing, including universal app archives previously omitted from that copy.
+  Staged Runtime and manifest hashes must match the release descriptors. The
+  component checker also verifies advertised local app, provider metadata and
+  capsule file sizes/hashes, and rejects unsafe paths and file types. Five
+  regression groups pass, including ten cases through the actual pre-signing
+  gate. Independent source review found no concrete issues. These checks are
+  wired into CI and `just verify`; remote CI has not run for this local work.
+  URL-only dependencies, complete platform-input admission, atomic promotion
+  and fresh installation remain separate open delivery checks.
+
 The source and installed sections below preserve the earlier evidence snapshot.
 Their original identities qualify those results. Current milestone receipts
 above take precedence where the work has moved; remaining sections are refreshed
