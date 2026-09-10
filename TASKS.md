@@ -12,111 +12,54 @@ Do not add new product surface area until the `Now` section is materially tighte
 
 ## Now
 
-Read this section as strict priority order for this branch. Do not start a lower
-section if a higher section is incoherent, unverified, or too large to review.
+Mission revision R2, 2026-09-10. The [approved five-journey plan](https://app.notion.com/p/wauio/ElastOS-0-7-1-release-plan-five-user-journeys-from-start-to-stop-3d6b682adcca81948f78d12abcd677b9)
+owns release acceptance and decisions D1-D6. The latest user clarification makes
+the first target the seed server running reviewed code from the active local
+work, rather than a link to a private local Runtime. [Execution](docs/EXECUTION.md)
+owns the verification recipes and monitoring decisions; [state.md](state.md)
+owns source, installed and public facts.
 
-Active priority index:
+This is the current execution queue. Older references below are retained
+follow-up obligations, not permission to bypass this order or the release gate.
+The C1-C7 sequence in the approved plan controls integration and publication.
 
-- current priority: publish the tested local candidate for team review after
-  explicit push authorization, then review the combined candidate on its exact
-  revision. The candidate is not ready to merge
-- released line: `origin/main@8ac18bec` is `v0.7.0`. Keep follow-up work on
-  `origin/upstream/0.7.1-dev` until the reviewed 0.7.1 line is ready. The
-  checked publish flow still owns release stamping
-- local candidate `900d7e5c` contains the reviewed PR52 source at
-  `origin/feat/protected-content-installed-provisioning@4d688cc5`, PR54 at
-  `origin/feat/home-first-run-seed-0.7.1@2a49ea57`, and the PR55 Home Agent
-  source from `origin/feat/home-shelf-assistant-face-0.7.1@923193bb`. PR54 and
-  PR55 remain the original feature review slices
-- integrated UIUX source evidence: published
-  `origin/feat/0.7-uiux-candidate` at `8b547590`; this ref is donor evidence,
-  not installed, live, or release truth
-- current protected-content source stack is already in `origin/main` and
-  `origin/upstream/0.7.1-dev`, including the exact PR43 mint-adoption commit
-  `58ebfb23`. The audit fixes retain mixed source and installed evidence.
-  Each remaining GUI gate needs its own verdict
-- separately authorized after localhost: install the same reviewed tree on the
-  seed and the third custody node with matching stable receipts
-- all other work remains queued below
+| ID | Outcome | Status / owner | Required input and next proof |
+| --- | --- | --- | --- |
+| C1-site | A useful, truthful public storefront | Source accepted / coordinator | Reviewed source and rendered checks are recorded in state.md; public delivery remains C1-seed. |
+| C1-home | Human Home entry at `/home/` | Source accepted / coordinator | Route, assets, auth, manifest and full Mac/Linux restart smokes pass. Installed sign-out and shortcut migration remain C1-seed. |
+| C1-proof | The execution loop handles a real reviewed slice | Verifying / coordinator and independent reviewer | Source and rendered review, nine process cases and a real monitor observation pass. Observe the recurring timer and preserve its source/target distinction. |
+| C1-seed | Seed serves the reviewed local candidate and storefront | Preparing / target owner | Build the selected dev base plus reviewed C1 source in an isolated seed installation. Bind source/artifact receipts, then request deployment approval for that candidate and verify public routes and ordinary Home use. Journey donors enter C2–C5. |
+| C1-delivery | Signed three-platform candidate installation | Active / installer owner | Embedded verifier, Bash 3.2 bootstrap and signed metadata identity checks pass source review. Next: canonical Mac data/process handling, complete artifacts and exact head/release content binding, isolated publisher, repaired smoke assertions and initial J1 reproduction. |
+| J1 / C2 | Install, passkey, Recovery Kit, Profile and usable Home | Planned / Home and installer owners | Eight setup commits from the integration donor; W2-W5; full Linux/Mac staging. Publish J1 for review first under D1. |
+| J2 | Ordinary update preserves user state | Planned / delivery owner and independent reviewer | Coherent update commits on J1; actual starting updater; candidate/interruption proof at C6. |
+| J3 / C3 | Obtain a model through Content/Carrier and use it locally | Planned / model and Content owners | J1 parent; acceptance steps 1, 2, 3 and 5 in section 6 of the approved plan. Hosted/Codex adapters are Optional before freeze; remote inference and Jetson are Later. |
+| J4 / C4 | Browser works in the two agreed placements | Planned / Browser owner | Retain canonical B01-B16 on the Browser branch; Mac A/A/A and Linux Home/Exit with Mac Engine A/B/A, including reload. Full claimed-role proof remains C6. |
+| J5 | Protect, list, buy, play and close controlled video | Planned / protected-content owner | Review PR60 then PR59 against final callers. PR62 required video repairs stay Required; extensions enter by readiness before freeze. |
+| C5 | Assemble and freeze the reviewed candidate | Planned / coordinator | Reviewed required source; exact optional task list. Optional work cannot delay freeze. |
+| C6 | Accept the combined signed candidate | Planned / independent reviewer and human testers | All required journeys, shared Home/app regression, Browser qualification and first-hop update proof on matching artifacts. |
+| C7 | Publish and verify the accepted release | Planned / release owner | C6 and explicit approvals, accepted main tree/artifact identity, then public delivery checks. |
 
-### Integrated UIUX and protected-content proof
+The required shared regression includes Desktop/Terminal and Inbox handoff,
+Create/Recover, Recovery Kit coverage, Profile and window placement, document
+save conflicts and picker acknowledgements, drafts, games, Archive/Library,
+Chat and repeated System Save. One combined record serves J1 and J3. The
+[journey register](docs/audits/ElastOS-Home-Journey-Audit.xlsx) retains the
+underlying findings and their proof requirements.
 
-Verified integrated source and installed localhost truth is in
-[state.md](state.md). Candidate assembly, source checks, isolated installation,
-and the broad manual Brave journey are complete on `900d7e5c`. The journey
-found open first-run, Browser startup, model, collaboration, and
-protected-content prerequisites. It did not change the pending Wallet approval.
+Existing two-Runtime, independent-operator, funded Base and wider Browser goals
+keep their Later gates as set by D2/D4 and the approved plan. Preserve the
+protected-content Runtime authority cutover, DocumentsSaveRequest/if_revision,
+bridge lifecycle, completed-mint adoption and cleanup obligations during
+integration. Required failures stay open until the relevant proof passes.
 
-Open gates, in order:
-
-1. [ ] After explicit authorization, publish the tested candidate for team
-   review. Review the combined candidate on its exact revision before any
-   merge decision.
-2. [ ] After PR54 and PR55 review results or merge commits reach upstream,
-   rebuild or rebase the candidate on that updated upstream. Drop
-   patch-equivalent duplicates and retain the unique integration fixes.
-3. [ ] Rerun the source gates and isolated installed acceptance on that exact
-   rebuilt candidate.
-4. [ ] After separate authorization, install the same reviewed tree on the
-   seed and the third custody node with matching stable Runtime, component,
-   capsule metadata, provider, static audit, installation, and platform
-   restart receipts.
-5. [ ] Provision one real signed owner-only 2-of-3 custody composition across
-   three distinct operators and failure domains.
-6. [ ] Install the private multi-RPC Chain configuration and verify the exact
-   deployed Base network, contract, token, emitter, and finality authority.
-7. [ ] Prove exactly three protected-content replicas and repair after one
-    replica is lost.
-8. [ ] Fund the creator and buyer Base accounts, then run the Brave
-    two-Runtime journey: mint, list, and share on localhost; import, deny,
-    buy, open, play, and close on the seed. Prove one bound KID with allowed,
-    denied, and unbound reads, the CentralStorage binding, the exact
-    `AuthorityGateway.buyAccess` receipt and event, restart, replay, tamper
-    rejection, settlement, cleanup, and zero unresolved state.
-9. [ ] Complete the remaining installed UIUX cases for first-run recovery and
-    Profile creation, configured model execution, collaboration, Browser
-    startup diagnostics, and protected-content prerequisites. Keep the broad
-    localhost journey as completed evidence rather than repeating it.
-10. [ ] Make one atomic cutover that selects the Runtime-owned
-    protected-content path and removes the provisional `drm`, `rights`, `key`,
-    and `decrypt` authority surfaces from startup, registration, resources,
-    packaging, tests, and docs.
-
-The operator-owned model-provider configuration remains a separate installed
-Assistant proof item. Missing configuration is an honest zero-offer state.
-
-### Home audit follow-up
-
-- [ ] Diagnose and prove direct Desktop/Terminal switching on the installed
-  Home. Host-authority and startup-replay repairs have source coverage, but
-  an installed transition can still leave a blank shell. Verify the exact
-  Inbox handoff through that transition and native Terminal Chat separately.
-- [ ] Prove recovery coverage when a Profile is created after the first
-  recovery-kit download, plus clean first-run Profile and window placement.
-- [ ] Complete Browser input ordering, lifecycle and accepted media proof on
-  the target installation. Source checks cover only their stated contracts.
-- [ ] Finish document-dialog keyboard focus and the remaining app-by-app
-  acceptance matrix. Preserve failed, partial and prerequisite-blocked results
-  as separate outcomes; a visible control alone is a partial observation.
-- [ ] Inventory and test the standalone Assistant's distinct Chat, Build, and
-  Studio behavior. Keep it as an explicitly scoped optional app, or migrate
-  its useful behavior and remove it. The default product should present one
-  clear Agent surface through Home Agent.
-- [ ] Define typed Runtime operations before adding Home Agent tools, Library
-  reads, web search, Studio, Usage, or sampling controls. Each surface stays
-  behind its owning operation and its authority checks.
-- [ ] Verify completed-mint adoption after a restart on the installed path.
-  Reconcile partial settled mint records and their custody cleanup obligations;
-  the source adoption repair only rolls forward fully completed records.
 - [ ] Turn the journey audit register into an automated pre-release gate:
-  extract Journey Matrix rows with complete verdicts into scripted checks that
-  run before every release, following the existing smoke-script pattern.
-  Journeys whose proof needs installed evidence stay manual and keep their
-  register verdicts authoritative.
-- [ ] Review Irzhy's PR15 follow-up on pinning the canonical
-  `has_access_by_content_id` selector (`0x54d42821`). Current configuration
-  validates its shape. Use a gated channel for deny proofs; a permissive
-  token-threshold configuration is a separate operator choice.
+  extract complete-verdict Journey Matrix rows into checks using the existing
+  smoke-script pattern. Installed and human journeys keep their own authoritative
+  register verdicts; source automation covers only the behavior it can observe.
+- [ ] Review the PR15 follow-up for the canonical `has_access_by_content_id`
+  selector (`0x54d42821`), whose configuration currently validates shape only.
+  Use a gated channel for deny proof; a permissive token threshold remains a
+  separate operator choice. Carry this review with J5/C6 acceptance.
 
 ## Later
 
@@ -665,8 +608,8 @@ installed behavior and public-live behavior require separate evidence.
 
 Current protected-content source status lives in [state.md](state.md).
 The contract is in [Protected content](docs/PROTECTED_CONTENT.md).
-The single acceptance sequence is
-[Integrated UIUX and protected-content proof](#integrated-uiux-and-protected-content-proof).
+The J5 and C6 rows in the [current execution queue](#now) own the acceptance
+sequence, with the detailed criteria in sections 8 and 9 of the approved plan.
 External cryptographic review remains open before public dKMS or production
 confidentiality claims.
 

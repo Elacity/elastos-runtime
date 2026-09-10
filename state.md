@@ -1,12 +1,67 @@
 # State
 
-Last updated: 2026-09-03 UTC
+Last updated: 2026-09-10 UTC
 
 This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
 volatile proof logs remain outside the repository.
 
-## Release Posture
+## Current execution snapshot — 2026-09-10
+
+The first execution pilot is the public storefront and `/home/` on the seed,
+using reviewed source from the active local work. Mission R2 corrects an initial
+private-Mac interpretation. [TASKS.md](TASKS.md) is the current queue; the linked
+approved plan retains full release acceptance.
+
+- Freshly fetched public main is `8ac18bec` (`v0.7.0`); development is
+  `6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac`, tree
+  `184b7a52f93403956817cdb1a8a15781b76bb4e2`. PR58, PR52 and PR54 are merged.
+- The user chose that development base for `feat/0.7.1-website-execution`.
+  The branch began at the same commit/tree, zero ahead and zero behind. The
+  website, route and restart-helper source is reviewed in `cdcb7902`, tree
+  `564c5dddeebbd4f963182c05a240a157f6d1a775`, one commit after that fetched
+  development ref. This is the scoped C1 source; journey donor intake follows
+  under C2–C5. Publication and seed deployment remain pending.
+- Local integration donor `6972e165` is clean, tree `8b32a72a`, 51 ahead and
+  zero behind dev. Browser donor `50196355`, tree `f650c4dd`, is 164 ahead
+  and two behind dev, with seven preserved dirty files at the review snapshot.
+  These local lines are absent from the fetched origin branches.
+- Recorded Home installation remains `94ed0dc6`; diagnostic source `05ee824d`
+  was built from `e9b9baf7` and is uninstalled. Browser recorded Mac Runtime
+  is `690170bc`, Linux consumer/Exit is `b8c78d79`, and `de0a299e` remains
+  a built candidate. This task has not yet repeated their installed proof.
+- Public reads show root 200, `/home/` 404 and `/apps/home/` 200. Published
+  installer metadata remains `0.1.2`, with Linux x86_64 and aarch64 entries.
+  Served website and Home source identities remain unproved. The site must
+  distinguish download, source and hosted Runtime facts.
+- PR60 `617796a9` and PR59 `25ab205e` remain open; draft PR62 `decab1f5`
+  contains planned follow-up work. PR63 `424acd3d` supplies verified framing
+  under D6; the J1 replacement owns closure once visible.
+- The source pilot passes 31 focused Rust cases, four manifest follow-up cases,
+  Home recovery/sign-out checks, 20 website tests, six website checks and the
+  required entropy/format gates. Four rendered desktop/mobile cases cover
+  metadata success, absence and disagreement, keyboard use and layout.
+  Independent review resolved moving-source instructions, stale installer proof
+  and installed-app identity. Full Mac and Linux restart smokes also pass;
+  committed objects match the corresponding source and workbook receipts.
+  The three new journey rows retain pending target acceptance.
+- The installer bootstrap passes 18 offline tests with stock Bash 3.2,
+  including signed publisher envelopes and RFC 8032 vectors. Independent
+  comparison with a second Ed25519 implementation accepted 128 valid signatures
+  and rejected 256 modified inputs. Canonical Mac data/process handling and
+  complete candidate installation remain open; this source proof does not
+  claim a published Mac installer.
+- The existing 30-minute monitor is active. Nine independent process cases
+  passed review. Its first real observation exposed task permission limits;
+  a writable shared state and coordinator reads resolved them in a second real
+  observation. Timer delivery remains to be observed. Old tasks retain their pause.
+
+The source and installed sections below preserve the earlier evidence snapshot.
+Their original identities qualify those results. Current milestone receipts
+above take precedence where the work has moved; remaining sections are refreshed
+as their journeys are accepted.
+
+## Prior release/source snapshot — 2026-09-03
 
 - A fresh fetch records `origin/main` at `8ac18bec` as the released `v0.7.0`
   source and `origin/upstream/0.7.1-dev` at `c511b133` as the active
