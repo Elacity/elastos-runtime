@@ -8,12 +8,14 @@
   <meta name="theme-color" content="#050608">
   <link rel="icon" href="./assets/elastos-mark.svg" type="image/svg+xml">
   <link rel="stylesheet" href="./site.css">
+  <script src="./site.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
   <div class="page">
     <header class="site-header">
       <a class="brand" href="/" aria-label="ElastOS website"><img src="./assets/elastos-logo.svg" width="168" height="28" alt="ElastOS"></a>
+      <span class="release-badge">0.7.1 <span>preview</span></span>
       <nav aria-label="Main navigation">
         <a href="#explore">Explore</a>
         <a href="#install">Install</a>
@@ -24,37 +26,50 @@
 
     <main id="main">
       <section class="hero" aria-labelledby="hero-title">
-        <div class="hero-copy">
-          <p class="eyebrow">ElastOS · Open source</p>
-          <h1 id="hero-title">Your apps.<br>Your <span>Home.</span></h1>
-          <p class="hero-lead">ElastOS is a local-first runtime for apps and services. Home gives you a desktop to use them. Each app works with the access you grant.</p>
-          <div class="hero-actions">
-            <a class="button primary" id="open-home" href="/home/">Open Home <span aria-hidden="true">↗</span></a>
-            <a class="text-link" href="#install">Install on your device</a>
-          </div>
-          <p class="action-note">Development preview. Sign in with your passkey.</p>
+        <img class="hero-mark" src="./assets/elastos-mark.svg" width="80" height="80" alt="">
+        <h1 id="hero-title">ElastOS</h1>
+        <p class="hero-tagline">Your apps, on your own machine.<br>You choose what they can access.</p>
+        <p class="hero-lead">ElastOS runs apps and services on your hardware. Open Home in your browser, sign in with a passkey, and manage your files, contacts and apps in one place.</p>
+        <div class="hero-actions">
+          <a class="button primary" href="#install">Install ElastOS <span aria-hidden="true">↓</span></a>
+          <a class="button secondary" id="open-home" href="/home/">Try Home <span aria-hidden="true">↗</span></a>
         </div>
-        <figure class="home-art" aria-label="ElastOS Home illustration with Documents, Library, People and System apps">
-          <div class="home-art-surface">
-            <img class="wallpaper" src="./assets/home-wallpaper.webp" width="1920" height="1080" alt="" fetchpriority="high">
-            <div class="art-heading"><span class="art-label">ElastOS Home</span></div>
-            <img class="home-mark" src="./assets/elastos-mark.svg" width="100" height="100" alt="">
-            <div class="app-art">
-              <div><img src="./assets/documents.png" width="56" height="56" alt=""><span>Documents</span></div>
-              <div><img src="./assets/library.png" width="56" height="56" alt=""><span>Library</span></div>
-              <div><img src="./assets/people.png" width="56" height="56" alt=""><span>People</span></div>
-              <div><img src="./assets/system.png" width="56" height="56" alt=""><span>System</span></div>
-            </div>
+        <p class="action-note">Development preview.</p>
+      </section>
+
+      <section class="install-section" id="install" aria-labelledby="install-title">
+        <div class="install-heading"><h2 id="install-title">Install on your hardware</h2><span class="install-version">0.7.1</span></div>
+        <div class="install-card">
+          <div class="platform-tabs" role="tablist" aria-label="Installation platform">
+            <button type="button" role="tab" id="linux-x86" aria-selected="true" aria-controls="install-panel" data-platform="Linux x86_64" tabindex="0">Linux x86_64</button>
+            <button type="button" role="tab" id="linux-arm" aria-selected="false" aria-controls="install-panel" data-platform="Linux ARM64" tabindex="-1">Linux ARM64</button>
+            <button type="button" role="tab" id="mac-arm" aria-selected="false" aria-controls="install-panel" data-platform="macOS · Apple silicon" tabindex="-1">macOS · Apple silicon</button>
           </div>
-        </figure>
+          <div class="install-body" id="install-panel" role="tabpanel" aria-labelledby="linux-x86" tabindex="0">
+            <p class="install-caption">One command. Setup included.</p>
+            <div class="command-box">
+              <pre tabindex="0" aria-label="Installation command" hidden><code id="install-command">curl -fsSL https://elastos.elacitylabs.com/install.sh | bash</code></pre>
+              <p class="install-status" id="install-status">0.7.1 installer coming soon.</p>
+              <button type="button" class="copy-button" id="copy-install" disabled aria-describedby="install-status">Copy</button>
+            </div>
+            <p class="sr-only" id="copy-status" role="status" aria-live="polite"></p>
+            <a class="text-link" id="install-guide" href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs/INSTALL.md">Installation guide <span aria-hidden="true">↗</span></a>
+          </div>
+        </div>
+        <p class="install-alternative">Want to try it first? <a href="/home/">Open Home in your browser <span aria-hidden="true">↗</span></a></p>
       </section>
 
       <section class="explore-section section" id="explore" aria-labelledby="explore-title">
         <div class="section-intro">
           <p class="eyebrow">Inside Home</p>
           <h2 id="explore-title">Files, contacts <br>and settings.</h2>
+          <div class="app-icons" aria-hidden="true">
+            <img src="./assets/documents.png" width="42" height="42" alt="">
+            <img src="./assets/library.png" width="42" height="42" alt="">
+            <img src="./assets/people.png" width="42" height="42" alt="">
+            <img src="./assets/system.png" width="42" height="42" alt="">
+          </div>
           <p>Home brings your apps together. Use Documents to write, Library to find your files, and People to manage your profile and contacts.</p>
-          <p>New here? The sign-in screen offers account creation when guest access is open.</p>
         </div>
         <div class="journeys">
           <details class="journey" open>
@@ -72,46 +87,10 @@
         </div>
       </section>
 
-      <section class="section install-section" id="install" aria-labelledby="install-title">
-        <div class="section-intro">
-          <p class="eyebrow">On your hardware</p>
-          <h2 id="install-title">Run your own Home.</h2>
-          <p>Run apps and keep your files on your own computer.</p>
-          <p>The 0.7.1 downloads are in preparation, with setup included in the installer.</p>
-        </div>
-        <div class="platforms">
-          <details class="platform" open>
-            <summary><strong>Linux</strong><span>x86_64 · ARM64</span></summary>
-            <div class="platform-body">
-              <h3>Install the published preview</h3>
-              <p>Open a terminal and run:</p>
-              <pre tabindex="0" aria-label="Linux installation command"><code>curl -fsSL https://elastos.elacitylabs.com/install.sh | bash</code></pre>
-              <p>This installs the older 0.1.2 Linux preview. Follow its printed setup steps.</p>
-              <a href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs/INSTALL.md">Linux installation guide <span aria-hidden="true">↗</span></a>
-            </div>
-          </details>
-          <details class="platform">
-            <summary><strong>macOS</strong><span>Apple silicon</span></summary>
-            <div class="platform-body">
-              <h3>Mac download in preparation</h3>
-              <p>The Apple silicon installer is being prepared for 0.7.1. Developers can build from source using the Mac guide.</p>
-              <a href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs/MAC.md">Mac build guide <span aria-hidden="true">↗</span></a>
-            </div>
-          </details>
-          <details class="platform">
-            <summary><strong>Windows</strong><span>Planned</span></summary>
-            <div class="platform-body">
-              <p>Windows installation is planned through WSL2, which runs a Linux environment on your PC.</p>
-              <a href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs/WINDOWS.md">Windows plan <span aria-hidden="true">↗</span></a>
-            </div>
-          </details>
-        </div>
-      </section>
-
       <section class="section developer-section" id="developers" aria-labelledby="developer-title">
         <div class="section-intro">
           <p class="eyebrow">For developers</p>
-          <h2 id="developer-title">Build your own Home.</h2>
+          <h2 id="developer-title">Build with ElastOS.</h2>
           <p>ElastOS is open source and in active development. Build the Runtime on your own computer, work on an app, or help improve the project.</p>
           <a class="text-link" href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev">Explore the source <span aria-hidden="true">↗</span></a>
         </div>

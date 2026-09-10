@@ -33,15 +33,15 @@ check("facts identify source and dated evidence", () => {
 });
 
 check("visitor content stays useful without release services", () => {
-  assert.ok(!/<script\b/i.test(html), "the visitor page should work without JavaScript");
-  assert.ok(!/<button\b[^>]*disabled/i.test(html), "avoid unavailable action controls");
   assert.ok(html.includes('href="#install"'), "visitors need a device installation path");
-  assert.ok(html.includes(`older ${facts.public_observation.version} Linux preview`), "identify the published installer version separately from development source");
-  assert.ok(html.includes("Mac download in preparation"));
+  assert.ok(html.includes('src="./site.js"'), "platform selection and copy use a local script");
+  assert.ok(html.includes('id="copy-install" disabled'), "keep copying unavailable until 0.7.1 installation is verified");
+  assert.ok(html.includes("0.7.1 installer coming soon."));
+  assert.ok(html.includes('aria-label="Installation command" hidden'), "reveal command only with the verified installer");
+  assert.ok(!/0\.1\.2|Mac download in preparation|guest access is open/.test(html));
   assert.ok(!/xcode-select|ELASTOS_SOURCE_HOME|git clone/.test(html), "source build steps belong in the developer guide");
   assert.ok(html.includes("Development preview."));
-  assert.ok(html.includes("Sign in with your passkey."));
-  assert.ok(html.includes("guest access is open"));
+  assert.ok(html.includes("sign in with a passkey"));
   assert.ok(html.includes("Recovery Kit"));
   assert.ok(html.includes("For developers"));
   assert.ok(!/Version awaiting verification|Release proof open|Device proof open|See the evidence|Publisher DID|Installer SHA-256/i.test(html));
@@ -102,7 +102,6 @@ check("assets have source parity", () => {
   const pairs = [
     ["elastos-logo.svg", "capsules/home/browser/elastos-logo.svg"],
     ["elastos-mark.svg", "capsules/home/browser/elastos-home-icon.svg"],
-    ["home-wallpaper.webp", "capsules/home-gui/browser/wallpaper.webp"],
     ["Inter-latin-var.woff2", "capsules/home/browser/assets/fonts/Inter-latin-var.woff2"],
     ...["documents", "library", "people", "system"].map((app) => [`${app}.png`, `capsules/${app}/browser/icons/icon-128.png`]),
   ];
