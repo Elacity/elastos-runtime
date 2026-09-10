@@ -671,11 +671,35 @@ async function homeState(page) {
     unlockNameVisible: !(document.querySelector("#home-unlock-name")?.hidden ?? true),
     unlockStatus: document.querySelector("#home-unlock-status")?.textContent?.trim() || "",
     activeShellRootHidden: document.querySelector("#active-shell-root")?.hidden !== false,
+    activeShellFrameHidden: document.querySelector("#active-shell-frame")?.hidden === true,
     activeShellFrameSrc: document.querySelector("#active-shell-frame")?.getAttribute("src") || "",
+    activeShellFrameHasSrcdoc: document.querySelector("#active-shell-frame")?.hasAttribute("srcdoc") !== false,
     hostGuiDomPresent: Boolean(document.querySelector(
       "#desktop, .desktop-backdrop, .toolbar, .desktop-workspace, .taskbar, #launcher, #window-template",
     )),
   }));
+}
+
+async function assertSignedOutShell(page, state) {
+  assert(
+    state.authority === "unsigned" && state.shell === "resolving" && state.gui === "dormant"
+      && state.activeShellRootHidden && state.activeShellFrameHidden
+      && state.activeShellFrameSrc === "about:blank" && !state.activeShellFrameHasSrcdoc
+      && !state.hostGuiDomPresent,
+    "A Home shell remained mounted behind the passkey prompt",
+    state,
+  );
+  // Inspect through Playwright because Home's opaque iframe sandbox owns a
+  // separate origin. A blank src attribute alone does not prove it unloaded.
+  const element = await page.locator("#active-shell-frame").elementHandle();
+  const frame = await element?.contentFrame();
+  assert(frame, "Home's cleared shell frame was missing", state);
+  await frame.waitForFunction(
+    () => document.URL === "about:blank" && document.head?.childNodes.length === 0
+      && document.body?.childNodes.length === 0,
+    null,
+    { timeout: 5_000 },
+  );
 }
 
 async function waitForSignedHome(page, timeoutMs = 30_000) {
@@ -2438,17 +2462,20 @@ async function statusFromServer(page) {
   });
 }
 
-async function createPasskeyFromCurrentUnlock(page, mode) {
+async function createPasskeyFromCurrentUnlock(page, mode, onCreated) {
   const name = page.locator("#home-unlock-name");
   await name.waitFor({ state: "visible", timeout: 10_000 });
   await name.fill(TEST_NAME);
   const tokenPromise = captureNextPasskeyToken(page);
   await page.locator("#home-unlock-primary").click();
+  const created = { created: true, mode, homeToken: await tokenPromise };
+  // Registration can succeed even when the next shell-readiness check fails.
+  await onCreated(created);
   await waitForSignedHome(page);
-  return { mode, homeToken: await tokenPromise };
+  return created;
 }
 
-async function ensureSignedWithVirtualPasskey(page) {
+async function ensureSignedWithVirtualPasskey(page, onCreated) {
   await waitForHomeReady(page);
   let state = await homeState(page);
   if (state.authority === "signed") {
@@ -2470,7 +2497,7 @@ async function ensureSignedWithVirtualPasskey(page) {
   const guestRegistrationEnabled = status.body.guest_registration_enabled === true;
 
   if (!registered) {
-    const created = await createPasskeyFromCurrentUnlock(page, "admin");
+    const created = await createPasskeyFromCurrentUnlock(page, "admin", onCreated);
     return { created: true, ...created };
   }
 
@@ -2500,7 +2527,7 @@ async function ensureSignedWithVirtualPasskey(page) {
     "Home did not enter guest passkey creation mode",
     state,
   );
-  const created = await createPasskeyFromCurrentUnlock(page, "guest");
+  const created = await createPasskeyFromCurrentUnlock(page, "guest", onCreated);
   return { created: true, ...created };
 }
 
@@ -2599,17 +2626,9 @@ async function signBackIn(page) {
 
   const state = await homeState(page);
   assert(state.unlockVisible, "Home did not show the unlock prompt after sign-out", state);
-  assert(
-    state.shell === "resolving" &&
-      state.gui === "dormant" &&
-      state.activeShellRootHidden &&
-      !state.activeShellFrameSrc &&
-      !state.hostGuiDomPresent,
-    "A Home shell remained mounted behind the passkey prompt",
-    state,
-  );
+  await assertSignedOutShell(page, state);
   const clickTokenPromise = captureNextPasskeyToken(page).catch(() => null);
-  await page.locator("#home-unlock-primary").click();
+  await page.locator("#home-unlock-person").click();
   await waitForSignedHome(page);
   const token = await settleTokenWithin(clickTokenPromise, 1_000)
     || await settleTokenWithin(tokenPromise, 1_000);
@@ -3596,27 +3615,45 @@ async function main() {
   let homeToken = "";
   let cleanupAttempted = false;
   let virtualAuthenticator = null;
+  let credentialStore = { skipped: true };
+  let failure = null;
   async function cleanupCreatedPasskey() {
     if (
       cleanupAttempted
       || !created?.created
       || !CLEANUP_PASSKEY
-      || !passkey?.proof_binding_id
-      || !homeToken
     ) {
       return cleanupResult || { skipped: !created?.created || !CLEANUP_PASSKEY };
     }
     cleanupAttempted = true;
-    cleanupResult = await revokeCurrentPasskey(page, passkey.proof_binding_id, homeToken);
+    assert(passkey?.proof_binding_id, "Test passkey cleanup needs its recorded proof binding");
+    // Sign-out invalidates the earlier Home token. Recover authority, then
+    // check ownership before revoking the one passkey created by this run.
+    const refreshed = await refreshCurrentHomeToken(page);
+    const cleanupToken = refreshed.ok && refreshed.homeToken
+      ? refreshed.homeToken : await signBackIn(page);
+    const authenticated = await currentPasskey(page, cleanupToken);
+    assert(
+      authenticated?.proof_binding_id === passkey.proof_binding_id,
+      "Cleanup authentication selected a different passkey; test credential retained",
+      { expected: passkey.proof_binding_id, current: authenticated?.proof_binding_id },
+    );
+    cleanupResult = await revokeCurrentPasskey(page, passkey.proof_binding_id, cleanupToken);
     return cleanupResult;
   }
   try {
     virtualAuthenticator = await setupVirtualAuthenticator(context, page);
     await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
-    created = await ensureSignedWithVirtualPasskey(page);
+    created = await ensureSignedWithVirtualPasskey(page, async (registered) => {
+      created = registered;
+      homeToken = registered.homeToken;
+      credentialStore = await persistVirtualAuthenticatorCredentials(virtualAuthenticator);
+      passkey = await currentPasskey(page, homeToken);
+    });
     homeToken = created.homeToken;
     passkey = await currentPasskey(page, homeToken);
     assert(passkey?.proof_binding_id, "signed virtual passkey was not visible through the passkey list", passkey);
+    credentialStore = await persistVirtualAuthenticatorCredentials(virtualAuthenticator);
 
     await signOut(page, homeToken);
     homeToken = await signBackIn(page);
@@ -3626,9 +3663,7 @@ async function main() {
       "virtual passkey sign-in did not restore the same proof binding",
       { before: passkey, after: afterSignIn },
     );
-    const credentialStore = (!created.created || !CLEANUP_PASSKEY)
-      ? await persistVirtualAuthenticatorCredentials(virtualAuthenticator)
-      : { skipped: true, reason: "created credential will be cleaned up" };
+    credentialStore = await persistVirtualAuthenticatorCredentials(virtualAuthenticator);
 
     const homePublicCopy = await checkHomePublicCopy(page);
     const system = await launchSystem(page, homeToken);
@@ -3669,6 +3704,7 @@ async function main() {
     };
     console.log(JSON.stringify(redactSensitive(report), null, 2));
   } catch (error) {
+    failure = { message: String(error.message || error), stage: smokeStage };
     if (error.skip) {
       console.log(error.message);
       if (error.details) {
@@ -3683,6 +3719,7 @@ async function main() {
         console.error(JSON.stringify(cleanup, null, 2));
       }
     } catch (cleanupError) {
+      cleanupResult = { ok: false, error: String(cleanupError.message || cleanupError) };
       console.error("virtual test passkey cleanup threw after smoke error");
       console.error(cleanupError.message || cleanupError);
     }
@@ -3697,13 +3734,51 @@ async function main() {
       const state = page ? await homeState(page).catch(() => null) : null;
       if (state) {
         state.stage = smokeStage;
-        console.error(JSON.stringify(state, null, 2));
+        console.error(JSON.stringify(redactSensitive(state), null, 2));
       }
     }
     process.exitCode = 1;
   } finally {
+    // A virtual authenticator's private key lives in CDP memory, not in the
+    // browser profile. Export it before closing, including failed registration.
+    let credentialSaveError = null;
+    try {
+      credentialStore = await persistVirtualAuthenticatorCredentials(virtualAuthenticator);
+    } catch (error) {
+      credentialSaveError = String(error.message || error);
+    }
+    const retainForRecovery = cleanupResult?.ok !== true && (
+      created?.created || (credentialStore.credential_count || 0) > 0 || credentialSaveError
+    );
+    if (retainForRecovery) {
+      const recovery = {
+        schema: "elastos.home.virtual-authenticator-recovery/v1",
+        recorded_at: new Date().toISOString(),
+        home_url: HOME_URL,
+        profile_dir: PROFILE_DIR,
+        credential_store: VIRTUAL_AUTH_CREDENTIAL_STORE,
+        virtual_authenticator_credentials: credentialStore,
+        credential_save_error: credentialSaveError,
+        created_mode: created?.mode || "registration outcome unknown",
+        proof_binding_id: passkey?.proof_binding_id || null,
+        cleanup: cleanupResult || { skipped: !CLEANUP_PASSKEY },
+        failure,
+        cleanup_condition: "Keep this profile until its test passkey is revoked in Home. Set HOME_VIRTUAL_AUTH_PROFILE to this profile_dir and use the same HOME_URL to restore its authenticator.",
+      };
+      const recoveryPath = join(PROFILE_DIR, "elastos-virtual-authenticator-recovery.json");
+      try {
+        mkdirSync(PROFILE_DIR, { recursive: true, mode: 0o700 });
+        writeFileSync(recoveryPath, `${JSON.stringify(recovery, null, 2)}\n`, { mode: 0o600 });
+        chmodSync(recoveryPath, 0o600);
+      } catch (error) {
+        console.error(`Could not save recovery receipt: ${error.message || error}`);
+        process.exitCode = 1;
+      }
+      console.error("Virtual passkey profile retained until credential cleanup completes");
+      console.error(JSON.stringify(redactSensitive({ recovery_path: recoveryPath, ...recovery }), null, 2));
+    }
     await context.close().catch(() => {});
-    if (!PRESERVE_PROFILE && !process.env.HOME_VIRTUAL_AUTH_PROFILE) {
+    if (!retainForRecovery && !PRESERVE_PROFILE && !process.env.HOME_VIRTUAL_AUTH_PROFILE) {
       rmSync(PROFILE_DIR, { recursive: true, force: true });
     }
   }
