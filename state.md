@@ -9,24 +9,27 @@ Last updated: 2026-09-10 UTC
   repository gates pass. Existing gateway behavior is preserved. This is source
   acceptance; installed J1 proof follows the remaining setup changes.
 
-- J1 account setup now binds Create/Recover intent to passkey enrollment and
-  resumes interrupted owner creation. Initial Profile data is included in the
-  Recovery Kit. Focused identity/auth/server tests, five UI fixtures, six
-  Create/Recover viewport checks and basic repository gates pass. Independent
-  source and mobile visual review pass. The fixed preview candidate proceeds
-  to native binary compilation and real Mac installation; installed acceptance
-  remains open.
+- J1 account setup binds Create/Recover intent to passkey enrollment and
+  resumes interrupted owner creation. Product candidate `d790a48e` passed real
+  signed Mac installation, default setup, account creation, sign-out/sign-in,
+  System entry and Profile-inclusive Recovery Kit export. The user also ran
+  the installer successfully. Full recovery and the app matrix remain open.
 
-- Latest private working-build proof: Runtime `b726db95` reports 0.7.1, with
-  built, installed and running SHA-256
-  `9a618d0566cb9fa3449e562a9ff813949a80a171356f93061e6265ce2b3f6759`.
-  The separately reviewed storefront is `3a1c5b0f`. Target artifact checks,
-  virtual passkey registration/sign-out/sign-in, nonempty rendered Home and
-  ordinary System Settings entry pass. Test credential revocation passes.
-  The smoke waits for the desktop projection before closing its setup reminder;
-  it explicitly leaves Recovery Kit/Profile completion and the full app matrix
-  to their journey acceptance. The zero-migration guard preserved protected
-  state. Public live is unchanged; final release assembly follows source freeze.
+- The private seed now serves `d790a48e`, with Runtime SHA-256
+  `6068849b898284465980b049f37488f2f7de95db15c981529eadb389d7c41a53`.
+  Source, installed and served artifact checks pass. Actual passkey step-up
+  and a 5,032-byte Recovery Kit export pass; the kit includes the Profile and
+  matching principal binding. Smoke repair `49a62db1` selects the foreground
+  System window after recovery controls load. A separate clean preview is
+  available. Public live remains unchanged.
+
+- Mac testing exposed unclosed download connections, slow gateway shutdown
+  and duplicate media-tool installation. Carrier repair `4e62b6db` passes six
+  focused lifecycle tests and basic repository gates. Gateway and media setup
+  repairs are in progress. These repairs await combined installed verification.
+  User-requested recovery now enters kit selection before passkey setup in
+  working source; exact Profile DID/name restoration and retry behavior are
+  under review. The installed preview retains its earlier recovery flow.
 
 This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
