@@ -24,6 +24,7 @@ const PRESERVE_PROFILE = process.env.HOME_VIRTUAL_AUTH_PRESERVE_PROFILE === "1";
 const CLEANUP_PASSKEY = process.env.HOME_VIRTUAL_AUTH_CLEANUP !== "0";
 const INCLUDE_BROWSER = process.env.HOME_VIRTUAL_AUTH_BROWSER === "1";
 const CHECK_APP_MATRIX = process.env.HOME_VIRTUAL_AUTH_APP_MATRIX === "1";
+const CHECK_RECOVERY_EXPORT = process.env.HOME_VIRTUAL_AUTH_RECOVERY_EXPORT === "1";
 const CHECK_SHELL_SWITCH = process.env.HOME_VIRTUAL_AUTH_SHELL_SWITCH !== "0";
 const CHECK_BROWSER_SUMMARY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_SUMMARY === "1" ||
@@ -2727,7 +2728,7 @@ async function openDesktopAppWindow(page, target) {
   return appFrame;
 }
 
-async function launchSystem(page, homeToken) {
+async function launchSystem(page, homeToken, passkey) {
   assert(homeToken, "launchSystem requires a passkey-issued Home token");
   const route = await page.evaluate(async (token) => {
     const response = await fetch("/api/apps/home/launch", {
@@ -2776,7 +2777,88 @@ async function launchSystem(page, homeToken) {
   assert(!system.fields.includes("Documents"), "System should not duplicate Documents controls", system);
   assert(system.walletControlsRemoved, "System should not include wallet account or approval controls", system);
   assert(!system.errorText, "System rendered an access error after signed launch", system);
-  return system;
+  const recoveryExport = CHECK_RECOVERY_EXPORT
+    ? await checkSystemRecoveryExport(page, systemFrame, passkey)
+    : null;
+  return { ...system, recoveryExport };
+}
+
+async function readRecoveryExportDownload(download, expected) {
+  // Read only in memory, bound the allocation, and give parse failures a fixed
+  // message: JSON syntax errors can otherwise quote recovery key material.
+  const stream = await download.createReadStream();
+  assert(stream, "Recovery Kit download did not provide a readable stream");
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of stream) {
+    bytes += chunk.length;
+    assert(bytes <= 8 * 1024 * 1024, "Recovery Kit download exceeds the smoke limit");
+    chunks.push(chunk);
+  }
+  let bundle;
+  try {
+    bundle = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw new Error("Recovery Kit download is not valid JSON");
+  }
+  assert(bundle?.schema === "elastos.full-recovery-bundle/v1", "Recovery Kit download has the wrong schema");
+  assert(typeof expected.principal_id === "string" && expected.principal_id.length > 0
+    && typeof expected.localhost_root === "string" && expected.localhost_root.startsWith("localhost://")
+    && bundle.principal_id === expected.principal_id && bundle.localhost_root === expected.localhost_root,
+  "Recovery Kit download has the wrong principal binding");
+  assert(bundle.included?.data_kit === true && bundle.data_kit?.schema === "elastos.recovery-kit/v1"
+    && bundle.data_kit.principal_id === expected.principal_id
+    && bundle.data_kit.localhost_root === expected.localhost_root,
+  "Recovery Kit download is missing its bound data kit");
+  const identity = bundle.people_identity;
+  const profile = identity?.profile_authority_bundle;
+  assert(bundle.included?.people_identity === true
+    && identity?.schema === "elastos.people.recovery-identity/v1"
+    && profile?.schema === "elastos.profile-authority-bundle/v1"
+    && /^[0-9a-f]{64}$/.test(profile.profile_signing_seed_hex || "")
+    && typeof profile.signed_profile?.payload?.profile_did === "string"
+    && profile.signed_profile.payload.profile_did.startsWith("did:key:z"),
+  "Recovery Kit download is missing its Profile authority");
+  // Keep the bundle, key material, and download path out of the report.
+  return { bytes, profile_included: true, principal_binding_checked: true };
+}
+
+async function checkSystemRecoveryExport(page, systemFrame, passkey) {
+  markStage("recovery-export:system-ui");
+  assert(passkey?.principal_id, "Recovery Kit export requires the recorded signed-in principal");
+  await systemFrame.locator('.settings-sidebar-item[data-settings="security"]').click();
+  await systemFrame.locator('#recovery-password').fill("");
+  const profileName = systemFrame.locator('#recovery-profile-name');
+  if (await profileName.isVisible()) {
+    await profileName.fill(TEST_NAME);
+  }
+  let download = null;
+  const responseAt = (path, method) => response => response.request().method() === method
+    && new URL(response.url()).origin === new URL(HOME_URL).origin
+    && new URL(response.url()).pathname === path;
+  try {
+    markStage("recovery-export:download-and-step-up");
+    const [status, stepUp] = await Promise.all([
+      page.waitForResponse(responseAt("/api/auth/recovery/status", "GET"), { timeout: 120_000 }),
+      page.waitForResponse(responseAt("/api/auth/passkey-step-up/complete", "POST"), { timeout: 120_000 }),
+      page.waitForEvent("download", { timeout: 120_000 }).then(value => { download = value; }),
+      systemFrame.locator('#recovery-download').click(),
+    ]);
+    assert(status.ok() && stepUp.ok(), "System Recovery export did not complete its status and passkey step-up");
+    let expected;
+    try {
+      expected = await status.json();
+    } catch {
+      throw new Error("System Recovery status is not valid JSON");
+    }
+    assert(expected?.principal_id === passkey.principal_id, "System Recovery status changed the signed-in principal");
+    const result = await readRecoveryExportDownload(download, expected);
+    return { ...result, virtual_step_up_checked: true, download_deleted: true };
+  } finally {
+    // Browser download storage has a separate lifecycle from a retained
+    // virtual-authenticator profile. Remove the exported secrets on failure too.
+    if (download) await download.delete();
+  }
 }
 
 async function checkShellSwitchJourney(page, homeToken) {
@@ -3688,7 +3770,7 @@ async function main() {
     credentialStore = await persistVirtualAuthenticatorCredentials(virtualAuthenticator);
 
     const homePublicCopy = await checkHomePublicCopy(page);
-    const system = await launchSystem(page, homeToken);
+    const system = await launchSystem(page, homeToken, passkey);
     const shellSwitch = CHECK_SHELL_SWITCH
       ? await checkShellSwitchJourney(page, homeToken)
       : null;
@@ -3711,6 +3793,8 @@ async function main() {
       role: passkey.role,
       virtual_authenticator_credentials: credentialStore,
       first_run_setup_checked: false,
+      recovery_export_checked: Boolean(system.recoveryExport),
+      recovery_export: system.recoveryExport,
       system_fields: system.fields,
       home_public_copy: homePublicCopy,
       shell_switch: shellSwitch,
