@@ -672,12 +672,36 @@ create_capsule_tar() {
     local archive="$1"
     local stage_root="$2"
     local capsule_name="$3"
-    tar --sort=name \
-        --mtime='UTC 1970-01-01' \
-        --owner=0 \
-        --group=0 \
-        --numeric-owner \
-        -czf "$archive" -C "$stage_root" "$capsule_name"
+    python3 - "$archive" "$stage_root" "$capsule_name" <<'PY'
+import gzip
+from pathlib import Path
+import sys
+import tarfile
+
+archive, stage_root, capsule_name = sys.argv[1:]
+
+def normalize(info):
+    # Equivalent checkouts can share inodes differently. Store regular files
+    # independently, while preserving explicit symbolic links.
+    if info.islnk():
+        info.type = tarfile.REGTYPE
+        info.linkname = ""
+        info.size = (Path(stage_root) / info.name).stat().st_size
+    info.uid = info.gid = info.mtime = 0
+    info.uname = info.gname = ""
+    info.pax_headers = {}
+    info.mode = 0o777 if info.issym() else (
+        0o755 if info.isdir() or info.mode & 0o111 else 0o644
+    )
+    return info
+
+# tarfile sorts recursive entries. The gzip header must also be independent
+# of the output filename and wall clock, on both macOS and Linux.
+with open(archive, "wb") as output:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as package:
+            package.add(Path(stage_root) / capsule_name, arcname=capsule_name, filter=normalize)
+PY
 }
 
 stage_wasm_capsule() {

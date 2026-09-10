@@ -155,6 +155,15 @@ approved plan retains full release acceptance.
   groups and independent source review pass. Normal publication keeps its
   existing behavior and approval gate.
 
+- App and provider-metadata archives now use Python's standard library, replacing
+  GNU-only tar options that failed on macOS. The archive writer preserves app
+  layout, executable files and symbolic links, with normalized file metadata.
+  Seven publisher regression groups pass. The same fixture on macOS ARM64
+  (Python 3.9) and Linux x86_64 (Python 3.12) produces identical compressed
+  bytes and extracts with each system's tar. Independent source review passes.
+  Archive hashes change from the previous writer; a new candidate must bind
+  the new bytes. Full candidate builds and device installation remain open.
+
 The source and installed sections below preserve the earlier evidence snapshot.
 Their original identities qualify those results. Current milestone receipts
 above take precedence where the work has moved; remaining sections are refreshed

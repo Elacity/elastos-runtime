@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import tarfile
+import unicodedata
 import unittest
 
 
@@ -19,6 +21,65 @@ spec.loader.exec_module(integrity)
 
 
 class PlatformArtifactExportTest(unittest.TestCase):
+    def test_capsule_archive_is_portable_and_reproducible(self):
+        source = PUBLISHER.read_text()
+        function = "create_capsule_tar() {" + source.split(
+            "create_capsule_tar() {", 1
+        )[1].split("\n}\n", 1)[0] + "\n}\n"
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            stage = root / "staged apps"
+            app = stage / "example"
+            app.mkdir(parents=True)
+            (app / "empty").mkdir()
+            (app / "café with spaces.txt").write_text("content\n")
+            (app / "launch").write_text("#!/bin/sh\nexit 0\n")
+            (app / "launch").chmod(0o700)
+            (app / "alias").symlink_to("café with spaces.txt")
+            os.link(app / "launch", app / "launch-copy")
+            archives = [root / "first.tar.gz", root / "different name.tar.gz"]
+            def pack(path):
+                result = subprocess.run(
+                    ["bash", "-euc", function + 'create_capsule_tar "$1" "$2" example',
+                     "archive-test", str(path), str(stage)],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+            pack(archives[0])
+            # An equivalent checkout can have different ownership, times, umask
+            # permissions and inode sharing; none should alter universal bytes.
+            (app / "launch-copy").unlink()
+            (app / "launch-copy").write_bytes((app / "launch").read_bytes())
+            for path in [app, *app.rglob("*")]:
+                if path.is_symlink():
+                    continue
+                os.utime(path, (1234567890, 1234567890))
+                path.chmod(0o755 if path.is_dir() or path.name.startswith("launch") else 0o600)
+            pack(archives[1])
+            self.assertEqual(archives[0].read_bytes(), archives[1].read_bytes())
+            with tarfile.open(archives[0]) as archive:
+                entries = archive.getmembers()
+                self.assertEqual([e.name for e in entries], sorted(e.name for e in entries))
+                self.assertEqual({e.name for e in entries}, {
+                    "example", "example/empty", "example/café with spaces.txt",
+                    "example/launch", "example/launch-copy", "example/alias",
+                })
+                for entry in entries:
+                    self.assertEqual((entry.uid, entry.gid, entry.mtime), (0, 0, 0))
+                    self.assertEqual((entry.uname, entry.gname), ("", ""))
+                self.assertEqual(archive.getmember("example/launch").mode, 0o755)
+                self.assertEqual(archive.getmember("example/café with spaces.txt").mode, 0o644)
+                self.assertTrue(archive.getmember("example/launch-copy").isfile())
+                self.assertTrue(archive.getmember("example/alias").issym())
+            extracted = root / "extracted"
+            extracted.mkdir()
+            subprocess.run(["tar", "-xzf", str(archives[0]), "-C", str(extracted)], check=True)
+            self.assertEqual((extracted / "example/café with spaces.txt").read_text(), "content\n")
+            self.assertEqual(unicodedata.normalize("NFC", os.readlink(extracted / "example/alias")),
+                             "café with spaces.txt")
+            self.assertEqual((extracted / "example/alias").read_text(), "content\n")
+            self.assertTrue(os.access(extracted / "example/launch", os.X_OK))
+
     def test_low_level_dry_run_rejects_before_side_effects(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
