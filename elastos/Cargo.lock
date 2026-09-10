@@ -1872,6 +1872,7 @@ dependencies = [
  "wasmparser 0.236.1",
  "x-wing",
  "zip",
+ "zeroize",
 ]
 
 [[package]]

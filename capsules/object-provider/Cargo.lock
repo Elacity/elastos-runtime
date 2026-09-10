@@ -1762,6 +1762,7 @@ dependencies = [
  "url",
  "wasmparser 0.236.1",
  "zip",
+ "zeroize",
 ]
 
 [[package]]

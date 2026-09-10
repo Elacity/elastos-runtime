@@ -3059,14 +3059,15 @@ assert(
 );
 assert(
   shellAuthJs.includes("profileReadinessActionTarget") &&
-    shellAuthJs.includes('return "people"') &&
+    !shellAuthJs.includes('return "people"') &&
     shellAuthJs.includes('return "system"') &&
-    shellJs.includes("openTargetFromHomeGui(profileActionTarget)") &&
+    shellJs.includes("openTargetFromHomeGui(profileActionTarget, { query })") &&
+    shellJs.includes('query.recovery = "import"') &&
     peopleScript.includes('readiness.schema === "elastos.profile.readiness/v1"') &&
     peopleScript.includes('profileForm?.dataset.profileState === "unavailable"') &&
     !peopleScript.includes("identity.profile ?") &&
     !peopleDiscoverySmoke.includes("identity.profile ?"),
-  "First-run Profile UX must consume typed Runtime readiness: only setup-required opens People, while unavailable, missing, or unknown authority fails closed through System without browser identity inference",
+  "First-run Profile UX must consume typed Runtime readiness: setup-required opens System import, while unavailable, missing, or unknown readiness checks System without browser identity inference",
 );
 const peopleProfileSave = sourceBlock(
   gatewayApi,
@@ -3075,19 +3076,16 @@ const peopleProfileSave = sourceBlock(
 );
 assert(
   peopleProfileSave.includes("validate_profile_authority_update") &&
-    peopleProfileSave.includes("principal_root_recovery_status_for_context") &&
-    peopleProfileSave.includes("PeopleProfileProtectionRequiredResponse") &&
-    gatewayApi.includes("elastos.people.profile-protection-required/v1") &&
+    peopleProfileSave.includes("require_profile_authority_passkey_binding") &&
+    peopleProfileSave.includes("initialize_local_profile") &&
     !peopleProfileSave.includes("ensure_principal_root_protection") &&
     !peopleProfileSave.includes("RecoveryKitDelivery") &&
-    peopleScript.includes("elastos.people.profile-protection-required/v1") &&
-    peopleScript.includes("Open System") &&
-    peopleScript.includes("choose Security") &&
+    !peopleScript.includes("elastos.people.profile-protection-required/v1") &&
     authGatewayApi.includes("mark_recovery_kit_handed_to_person") &&
     gatewayHomeSystemTests.includes(
-      "test_people_profile_creation_requires_completed_system_recovery_without_partial_state",
+      "existing_profile_setup_protects_root_without_claiming_recovery",
     ),
-  "People Profile creation must remain mutation-free until verified System Recovery protection exists; People never mints or retains unseen Recovery material",
+  "Runtime initializes local Profile protection under current passkey authority; exporting a Recovery Kit remains a separate action",
 );
 assert(
   profileUpdates.includes(
@@ -7687,12 +7685,18 @@ assert(
 );
 assert(
   shellIndex.includes('id="home-unlock-name"') &&
-    shellAuth.includes("display_name: displayName"),
-  "Home passkey creation must collect and persist a passkey/user display name",
+    shellAuth.includes('public_name: displayName') &&
+    shellAuth.includes('JSON.stringify({ intent: pending.intent })'),
+  "Home Create must bind its explicit public name to the registration intent",
 );
 assert(
-  shellAuth.includes("Enter a name for this passkey."),
-  "Home must not create anonymous Passkey/guest principals",
+  shellAuth.includes("Enter the display name people will see.") &&
+    shellAuth.includes('intent: pending.intent') &&
+    !shellAuth.includes("profile_display_name: displayName") &&
+    !shellAuth.includes("display_name: displayName") &&
+    shellIndex.includes('id="home-enrollment-recover"') &&
+    shellIndex.includes('id="home-unlock-name-label"'),
+  "Home guided enrollment must keep Create consent in one intent and offer Recover",
 );
 assert(
   shellAuth.includes("Create guest account") &&
@@ -7718,7 +7722,7 @@ assert(
 assert(
   !shellAuth.includes("status.accounts") &&
     !shellAuth.includes("profile_setup_display_name") &&
-    !shellAuth.includes("guestRegistrationAvailable"),
+    shellAuth.includes("guestRegistrationAvailable = guestRegistrationEnabled;"),
   "Home lock sign-in must not depend on unsigned account-directory or profile setup fields",
 );
 assert(
@@ -7727,7 +7731,7 @@ assert(
   "Home guest creation must be a distinct state, not blended into sign-in",
 );
 assert(
-  shellAuth.includes("setUnlockNameVisible(canCreate)") &&
+  shellAuth.includes('setUnlockNameVisible(enrolling && purpose === "create")') &&
     !shellAuth.includes(
       "const canCreate = !registered || guestRegistrationEnabled",
     ),
@@ -7796,9 +7800,9 @@ assert(
   "Protected-content contracts must reject hidden object, key-release, and decrypt-session authority fields at decode time",
 );
 assert(
-  shellStyle.includes(".visually-hidden") &&
-    shellIndex.includes('class="visually-hidden"'),
-  "Home unlock labels must use a real visually-hidden utility instead of leaking form labels into the UI",
+  shellIndex.includes('id="home-unlock-name-label" for="home-unlock-name"') &&
+    shellIndex.includes('aria-describedby="home-unlock-name-hint"'),
+  "Home enrollment keeps the public-name label and audience hint visible with the editable field",
 );
 assert(
   !shellStyle.includes("home-unlock-kicker"),
@@ -7861,7 +7865,9 @@ assert(
 assert(
   system.includes('id="recovery-password"') &&
     system.includes("Download Recovery Kit") &&
-    system.includes("Downloads everything recoverable for this account") &&
+    system.includes("Save your Profile, Home data recovery, and built-in Wallet recovery keys in one kit.") &&
+    system.includes('id="recovery-profile-name"') &&
+    systemJs.includes("intent.profile_display_name = name;") &&
     systemJs.includes("download_password") &&
     systemJs.includes("recoveryDownloadPassword") &&
     systemJs.includes("elastos.full-recovery-bundle.export.request/v1") &&

@@ -189,6 +189,7 @@ function assert(condition, message, details = null) {
 
 globalThis.HTMLElement = FakeElement;
 globalThis.document = {
+  getElementById: id => elementForSelector(`#${id}`),
   activeElement: null,
   body: elementForSelector("body"),
   documentElement: elementForSelector("html"),
@@ -209,6 +210,7 @@ Object.defineProperty(globalThis, "navigator", {
   },
 });
 globalThis.window = {
+  sessionStorage: { getItem: () => null },
   PublicKeyCredential: function PublicKeyCredential() {},
   atob: (value) => Buffer.from(String(value), "base64").toString("binary"),
   btoa: (value) => Buffer.from(String(value), "binary").toString("base64"),
@@ -538,7 +540,7 @@ assert(profileReadinessActionTarget({
     schema: "elastos.profile.readiness/v1",
     status: "setup_required",
   },
-}) === "people", "Home did not direct explicit Profile setup to People");
+}) === "system", "Home did not direct missing Profile recovery to System");
 assert(profileReadinessActionTarget({
   profile_readiness: {
     schema: "elastos.profile.readiness/v1",

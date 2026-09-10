@@ -391,12 +391,23 @@ function handleHomeUiPreferenceMessage(event, context, data) {
 async function showHostAuthGate(options = {}) {
   enterHostAuthGate();
   const personName = options?.preserveSignedProfileLabel ? currentSignedProfileDisplayName() : "";
-  const unlockReady = showHomeUnlock(async (response) => {
+  const unlockReady = showHomeUnlock(async (response, flow) => {
     await boot();
+    if (flow?.enrollmentPurpose === "recover") {
+      await activateDesktopShell();
+      await openTargetFromHomeGui("system", { query: { settings: "security", recovery: "import" } });
+      return;
+    }
     const profileActionTarget = profileReadinessActionTarget(response);
     if (profileActionTarget) {
       await activateDesktopShell();
-      await openTargetFromHomeGui(profileActionTarget);
+      const query = { settings: "security" };
+      if (flow?.enrollmentPurpose !== "create" &&
+          response?.profile_readiness?.schema === "elastos.profile.readiness/v1" &&
+          response.profile_readiness.status === "setup_required") {
+        query.recovery = "import";
+      }
+      await openTargetFromHomeGui(profileActionTarget, { query });
     }
   }, {
     ...options,

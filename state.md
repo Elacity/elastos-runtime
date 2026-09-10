@@ -9,6 +9,14 @@ Last updated: 2026-09-10 UTC
   repository gates pass. Existing gateway behavior is preserved. This is source
   acceptance; installed J1 proof follows the remaining setup changes.
 
+- J1 account setup now binds Create/Recover intent to passkey enrollment and
+  resumes interrupted owner creation. Initial Profile data is included in the
+  Recovery Kit. Focused identity/auth/server tests, five UI fixtures, six
+  Create/Recover viewport checks and basic repository gates pass. Independent
+  source and mobile visual review pass. The fixed preview candidate proceeds
+  to native binary compilation and real Mac installation; installed acceptance
+  remains open.
+
 - Latest private working-build proof: Runtime `b726db95` reports 0.7.1, with
   built, installed and running SHA-256
   `9a618d0566cb9fa3449e562a9ff813949a80a171356f93061e6265ce2b3f6759`.

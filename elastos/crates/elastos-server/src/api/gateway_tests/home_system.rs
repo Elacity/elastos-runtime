@@ -76,7 +76,7 @@ async fn home_test_get_json_without_origin(
     (status, payload)
 }
 
-async fn home_test_post_json(
+pub(super) async fn home_test_post_json(
     app: &axum::Router,
     uri: &str,
     token: &str,
@@ -2355,7 +2355,7 @@ async fn test_home_summary_does_not_turn_conversation_members_into_people_contac
 }
 
 #[tokio::test]
-async fn test_people_profile_creation_requires_completed_system_recovery_without_partial_state() {
+async fn test_root_only_recovery_export_preserves_later_profile_consent() {
     let dir = tempfile::tempdir().unwrap();
     let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
     let app = gateway_router(wallet_test_state(dir.path()).await);
@@ -2373,55 +2373,6 @@ async fn test_people_profile_creation_requires_completed_system_recovery_without
         .is_none(),
         "this journey starts with no protection"
     );
-    let before_profile_attempt = file_snapshot(dir.path());
-
-    for _ in 0..2 {
-        let response = app
-            .clone()
-            .oneshot(
-                test_browser_request("localhost:61180", "null")
-                    .method("POST")
-                    .uri("/api/apps/people/profile")
-                    .header("x-elastos-home-token", authority.people_token.as_str())
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"display_name":"Anders"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let payload: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            payload,
-            json!({
-                "schema": "elastos.people.profile-protection-required/v1",
-                "status": "recovery_required",
-                "action_target": "system",
-                "message": "Open System, choose Security, and download Recovery. Then retry creating your Profile."
-            })
-        );
-        assert_eq!(file_snapshot(dir.path()), before_profile_attempt);
-    }
-    assert!(
-        crate::collaboration_profile_authority::load_profile_authority(
-            dir.path(),
-            &principal.principal_id,
-            &principal.localhost_root,
-        )
-        .unwrap()
-        .is_none()
-    );
-    assert!(crate::auth::load_principal_root_protection(
-        dir.path(),
-        &principal.principal_id,
-        &principal.localhost_root,
-    )
-    .unwrap()
-    .is_none());
-
     let export_intent = json!({
         "principal_id": authority.principal_id,
         "localhost_root": principal.localhost_root,
@@ -2471,6 +2422,21 @@ async fn test_people_profile_creation_requires_completed_system_recovery_without
         .iter()
         .any(|protector| protector.verified_at.is_some()));
 
+    assert!(
+        crate::collaboration_profile_authority::load_profile_authority(
+            dir.path(),
+            &principal.principal_id,
+            &principal.localhost_root,
+        )
+        .unwrap()
+        .is_none(),
+        "export does not turn an account label into a Profile"
+    );
+    assert!(protection
+        .protectors
+        .iter()
+        .all(|p| p.profile_coverage.is_none()));
+
     let profile = app
         .clone()
         .oneshot(
@@ -2518,7 +2484,148 @@ fn assert_recovery_readiness_projection(payload: &Value, status: &str, path: &st
 }
 
 #[tokio::test]
-async fn test_recovery_readiness_and_first_profile_gate_share_one_recovery_rule() {
+async fn existing_profile_setup_protects_root_without_claiming_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("Private account label"));
+    let principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+    write_home_principal_object_json_for_authority(
+        dir.path(),
+        &authority,
+        "active-shell.json",
+        json!({
+            "schema": "elastos.home.active-shell/v1", "principal_id": principal.principal_id,
+            "localhost_root": principal.localhost_root, "active": "home-gui",
+        }),
+    );
+    let uri = format!(
+        "{}/.AppData/ElastOS/Home/active-shell.json",
+        principal.localhost_root
+    );
+    let path = elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &uri).unwrap();
+    let plaintext = std::fs::read(&path).unwrap();
+    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let before = file_snapshot(dir.path());
+    for invalid in ["", "   ", "bad/name"] {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/people/profile")
+                    .header("x-elastos-home-token", authority.people_token.as_str())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"display_name": invalid}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+        assert_eq!(file_snapshot(dir.path()), before);
+    }
+    let (status, _) = home_test_post_json(
+        &app,
+        "/api/apps/people/profile",
+        &authority.people_token,
+        "null",
+        json!({"display_name": "Confirmed public name"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let protection = crate::auth::load_principal_root_protection(
+        dir.path(),
+        &principal.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(protection
+        .protectors
+        .iter()
+        .all(|p| p.verified_at.is_none() && p.profile_coverage.is_none()));
+    let profile = crate::collaboration_profile_authority::load_profile_authority(
+        dir.path(),
+        &principal.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(profile.document().display_name, "Confirmed public name");
+    assert_ne!(std::fs::read(&path).unwrap(), plaintext);
+    assert_eq!(
+        crate::auth::read_principal_root_object(
+            dir.path(),
+            &principal.principal_id,
+            &principal.localhost_root,
+            &uri,
+            &path
+        )
+        .unwrap(),
+        plaintext
+    );
+    assert_eq!(
+        crate::auth::load_auth_state(dir.path())
+            .unwrap()
+            .audit
+            .iter()
+            .filter(|event| event.event_type == "auth.principal_root.plaintext_migrated")
+            .count(),
+        1
+    );
+    assert_eq!(
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap()
+            .display_name,
+        "Private account label"
+    );
+    let after_principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+    assert_eq!(
+        serde_json::to_value(&after_principal).unwrap(),
+        serde_json::to_value(&principal).unwrap()
+    );
+    let established = file_snapshot(dir.path());
+    let (status, _) = home_test_post_json(
+        &app,
+        "/api/apps/people/profile",
+        &authority.people_token,
+        "null",
+        json!({"display_name": "Confirmed public name"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        file_snapshot(dir.path()),
+        established,
+        "repeat confirmation is read-only"
+    );
+    let restarted = gateway_router(test_state(dir.path()));
+    let (status, payload) = home_test_get_json(
+        &restarted,
+        "/api/apps/people/summary",
+        &authority.people_token,
+        "null",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["identity"]["profile_readiness"]["status"], "ready");
+    assert_recovery_readiness_projection(&payload, "setup_required", "profile without backup");
+    assert_eq!(
+        payload["discovery"]["status"], "unconfigured",
+        "Profile creation does not opt into discovery"
+    );
+}
+
+#[tokio::test]
+async fn test_recovery_readiness_does_not_claim_profile_coverage() {
     let dir = tempfile::tempdir().unwrap();
     let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
     let app = gateway_router(wallet_test_state(dir.path()).await);
@@ -2542,25 +2649,6 @@ async fn test_recovery_readiness_and_first_profile_gate_share_one_recovery_rule(
         assert_recovery_readiness_projection(&payload, "setup_required", path);
     }
     assert_eq!(file_snapshot(dir.path()), before_summary);
-
-    let (status, payload) = home_test_post_json(
-        &app,
-        "/api/apps/people/profile",
-        authority.people_token.as_str(),
-        "null",
-        json!({ "display_name": "Anders" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(
-        payload,
-        json!({
-            "schema": "elastos.people.profile-protection-required/v1",
-            "status": "recovery_required",
-            "action_target": "system",
-            "message": "Open System, choose Security, and download Recovery. Then retry creating your Profile."
-        })
-    );
 
     crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
 

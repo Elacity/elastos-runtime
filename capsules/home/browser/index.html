@@ -85,23 +85,33 @@
             </div>
           </div>
         </div>
-        <div class="home-unlock-card" role="dialog" aria-modal="true">
+        <div class="home-unlock-card" role="dialog" aria-modal="true" aria-labelledby="home-unlock-title" aria-describedby="home-unlock-copy">
           <img class="home-unlock-logo" src="./elastos-logo.svg" alt="ElastOS" draggable="false" />
           <h1 id="home-unlock-title">Sign in</h1>
           <p id="home-unlock-copy">Use your passkey to unlock your data, apps and desktop.</p>
-          <label class="visually-hidden" for="home-unlock-name">Name this passkey</label>
+          <fieldset id="home-enrollment-choice" hidden>
+            <legend>Set up your identity</legend>
+            <label for="home-enrollment-create"><input id="home-enrollment-create" type="radio" name="home-enrollment-purpose" value="create" aria-label="Create account" checked /> Create account</label>
+            <label for="home-enrollment-recover"><input id="home-enrollment-recover" type="radio" name="home-enrollment-purpose" value="recover" aria-label="Recover account" /> Recover account</label>
+          </fieldset>
+          <label id="home-unlock-name-label" for="home-unlock-name" hidden>Your display name</label>
           <input
             id="home-unlock-name"
             class="home-unlock-input"
             type="text"
             maxlength="64"
             autocomplete="name"
+            aria-describedby="home-unlock-name-hint"
             placeholder="Your name"
             hidden
           />
+          <p id="home-unlock-name-hint" hidden>The name people will see. Discovery starts off.</p>
+          <label id="home-owner-token-label" for="home-owner-token" hidden>Operator enrollment token</label>
+          <input id="home-owner-token" class="home-unlock-input" type="password" maxlength="64" autocomplete="off" spellcheck="false" hidden />
           <div class="home-unlock-actions">
             <button id="home-unlock-primary" class="home-unlock-button" type="button">Use passkey</button>
             <button id="home-unlock-secondary" class="home-unlock-button home-unlock-button-secondary" type="button" hidden>Create guest account</button>
+            <button id="home-enrollment-dismiss" class="home-unlock-button home-unlock-button-secondary" type="button" hidden>Dismiss expired or invalid setup</button>
           </div>
           <p id="home-unlock-status" class="home-unlock-status" data-tone="muted" role="status">One moment.</p>
         </div>

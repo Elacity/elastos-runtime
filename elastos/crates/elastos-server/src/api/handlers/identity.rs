@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -12,18 +12,13 @@ use axum::{
 use serde::Serialize;
 
 use elastos_identity::{
-    AuthenticationOutcome, AuthenticationResponse, CreationOptions, IdentityManager,
-    RegistrationOutcome, RegistrationResponse, RequestOptions, StoredCredential,
+    AuthenticationOutcome, AuthenticationResponse, IdentityManager, RegistrationOutcome,
+    RegistrationResponse, RequestOptions, StoredCredential,
 };
-use elastos_runtime::auth::{
-    AuthSessionGrantV1, PasskeyWebAuthnBinding, ProofBinding, RuntimeAuditEventV1,
-};
+use elastos_runtime::auth::AuthSessionGrantV1;
 use elastos_runtime::primitives::audit::AuditLog;
 use elastos_runtime::primitives::time::SecureTimestamp;
 use elastos_runtime::session::{Session, SessionRegistry};
-use rand::RngCore;
-
-const PASSKEY_AUTH_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 
 /// Shared state for identity endpoints
 #[derive(Clone)]
@@ -200,16 +195,50 @@ pub async fn identity_status(
 /// POST /api/identity/register/begin
 pub async fn register_begin(
     State(state): State<IdentityState>,
-    headers: HeaderMap,
+    peer: Option<ConnectInfo<std::net::SocketAddr>>,
+    mut headers: HeaderMap,
     session: axum::Extension<Session>,
-) -> Result<Json<CreationOptions>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
     let rp =
         derive_rp(&headers).map_err(|e| error_response(StatusCode::FORBIDDEN, &e.to_string()))?;
+    let loopback =
+        crate::api::auth_gateway::local_first_owner_registration(&headers, peer.map(|peer| peer.0));
+    crate::api::auth_gateway::prepare_owner_claim(&mut headers, loopback).map_err(owner_error)?;
+    let claim = crate::api::auth_gateway::owner_claim(&headers)
+        .map_err(owner_error)?
+        .unwrap_or_default();
     let mut manager = state.manager.lock().await;
+    let owner_ceremony = format!("owner:{}", crate::auth::random_secret_hex());
+    if let Some((ceremony, options)) = crate::auth::begin_owner_enrollment(
+        &state.data_dir,
+        &mut manager,
+        &crate::auth::OwnerAdmission {
+            origin: &rp.origin,
+            rp_id: &rp.id,
+            claimant: &claim,
+            loopback,
+        },
+        &owner_ceremony,
+        crate::auth::now_ts(),
+    )
+    .map_err(owner_error)?
+    {
+        let mut response = crate::api::auth_gateway::with_owner_claim_cookie(
+            &headers,
+            Json(options).into_response(),
+        );
+        response.headers_mut().insert(
+            "x-elastos-owner-ceremony",
+            ceremony
+                .parse()
+                .map_err(|_| owner_error(crate::auth::OwnerEnrollmentDenied.into()))?,
+        );
+        return Ok(response);
+    }
     require_existing_registration_authority(&manager, &session)?;
-    require_guest_registration_policy(&state.data_dir, manager.status().registered)?;
+    require_guest_registration_policy(&state.data_dir)?;
     match manager.begin_registration(&session.token, &rp.id, &rp.origin) {
-        Ok(options) => Ok(Json(options)),
+        Ok(options) => Ok(Json(options).into_response()),
         Err(e) => Err(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
     }
 }
@@ -217,16 +246,58 @@ pub async fn register_begin(
 /// POST /api/identity/register/complete
 pub async fn register_complete(
     State(state): State<IdentityState>,
+    peer: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
     session: axum::Extension<Session>,
-    Json(response): Json<RegistrationResponse>,
+    Json(response): Json<Option<RegistrationResponse>>,
 ) -> Result<Json<UserIdResponse>, (StatusCode, Json<ErrorResponse>)> {
     let rp =
         derive_rp(&headers).map_err(|e| error_response(StatusCode::FORBIDDEN, &e.to_string()))?;
+    let loopback =
+        crate::api::auth_gateway::local_first_owner_registration(&headers, peer.map(|peer| peer.0));
+    let claim = crate::api::auth_gateway::owner_claim(&headers)
+        .map_err(owner_error)?
+        .unwrap_or_default();
+    let ceremony = match headers.get("x-elastos-owner-ceremony") {
+        Some(value) => value
+            .to_str()
+            .map_err(|_| owner_error(crate::auth::OwnerEnrollmentDenied.into()))?,
+        None => "",
+    };
     let mut manager = state.manager.lock().await;
+    if let Some(grant) = crate::auth::complete_owner_enrollment(
+        &state.data_dir,
+        &mut manager,
+        &crate::auth::OwnerAdmission {
+            origin: &rp.origin,
+            rp_id: &rp.id,
+            claimant: &claim,
+            loopback,
+        },
+        ceremony,
+        response.as_ref(),
+        None,
+        crate::auth::now_ts(),
+    )
+    .map_err(owner_error)?
+    {
+        let user_id = manager
+            .status()
+            .user_id
+            .ok_or_else(|| owner_error(crate::auth::OwnerEnrollmentDenied.into()))?;
+        drop(manager);
+        state
+            .session_registry
+            .get_session_mut(&session.token, |session| session.set_owner(user_id.clone()))
+            .await;
+        return Ok(Json(user_id_response(user_id, grant)));
+    }
     require_existing_registration_authority(&manager, &session)?;
-    require_guest_registration_policy(&state.data_dir, manager.status().registered)?;
-    match manager.complete_registration(&session.token, &response, &rp.id, &rp.origin) {
+    require_guest_registration_policy(&state.data_dir)?;
+    let response = response
+        .as_ref()
+        .ok_or_else(|| owner_error(crate::auth::OwnerEnrollmentDenied.into()))?;
+    match manager.complete_registration(&session.token, response, &rp.id, &rp.origin) {
         Ok(outcome) => {
             let user_id = outcome.user_id.clone();
             let grant = match issue_passkey_session_grant_for_registration(&state, &outcome) {
@@ -341,17 +412,12 @@ fn require_existing_registration_authority(
 
 fn require_guest_registration_policy(
     data_dir: &Path,
-    registered: bool,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    if !registered
-        && crate::auth::active_passkey_principal_count(data_dir)
-            .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()))?
-            == 0
-    {
-        return Ok(());
-    }
     if crate::auth::guest_registration_enabled(data_dir)
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()))?
+        && crate::auth::active_admin_passkey_principal_count(data_dir)
+            .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()))?
+            > 0
     {
         return Ok(());
     }
@@ -365,13 +431,17 @@ fn issue_passkey_session_grant_for_registration(
     state: &IdentityState,
     outcome: &RegistrationOutcome,
 ) -> anyhow::Result<AuthSessionGrantV1> {
-    issue_passkey_session_grant(
-        state,
-        &outcome.user_id,
-        &outcome.credential,
-        &outcome.origin,
-        outcome.user_verified,
-        "passkey registration verified and session granted",
+    crate::auth::grant_passkey_session(
+        &state.data_dir,
+        crate::auth::PasskeySessionRequest {
+            credential: &outcome.credential,
+            origin: &outcome.origin,
+            user_verified: outcome.user_verified,
+            display_name: None,
+            reason: "passkey registration verified and session granted",
+            profile_display_name: None,
+            purpose: crate::auth::PasskeySessionPurpose::GuestRegistration,
+        },
     )
 }
 
@@ -397,66 +467,27 @@ fn issue_passkey_session_grant(
     user_verified: bool,
     reason: &str,
 ) -> anyhow::Result<AuthSessionGrantV1> {
-    let now = crate::auth::now_ts();
-    let binding = ProofBinding::passkey_webauthn(PasskeyWebAuthnBinding {
-        credential_id: credential.credential_id.clone(),
-        public_key: credential.public_key.clone(),
-        sign_count: credential.sign_count,
-        user_verified,
-        origin: origin.to_string(),
-        rp_id: credential.rp_id.clone(),
-        created_at: now,
-        last_used_at: now,
-        revoked_at: None,
-    });
-    let role = if crate::auth::active_passkey_principal_count(&state.data_dir)? == 0 {
-        crate::auth::RuntimePrincipalRole::Admin
-    } else {
-        crate::auth::RuntimePrincipalRole::Guest
-    };
-    let principal_id =
-        crate::auth::passkey_credential_principal_id(&credential.rp_id, &credential.credential_id)?;
-    let principal = crate::auth::upsert_principal_for_binding_as_role(
+    crate::auth::grant_passkey_session(
         &state.data_dir,
-        binding,
-        principal_id,
-        role,
-        now,
-    )?;
-    crate::auth::ensure_proof_binding_not_revoked(&principal)?;
-    let grant = AuthSessionGrantV1 {
-        schema: AuthSessionGrantV1::SCHEMA.to_string(),
-        grant_id: format!("grant:{}", random_hex(16)),
-        session_id: format!("auth:{}", random_hex(16)),
-        principal_id: principal.principal_id.clone(),
-        proof_binding_id: principal.proof_binding_id.clone(),
-        issued_at: now,
-        expires_at: now.saturating_add(PASSKEY_AUTH_SESSION_TTL_SECS),
-        apps: vec![
-            crate::api::gateway::HOME_CAPSULE_ID.to_string(),
-            "system".to_string(),
-        ],
-    };
-    crate::auth::store_session_grant(&state.data_dir, grant.clone())?;
-    crate::auth::append_audit_event(
-        &state.data_dir,
-        RuntimeAuditEventV1 {
-            schema: RuntimeAuditEventV1::SCHEMA.to_string(),
-            event_id: format!("audit:{}", random_hex(16)),
-            event_type: "auth.session.granted".to_string(),
-            principal_id: Some(grant.principal_id.clone()),
-            proof_binding_id: Some(grant.proof_binding_id.clone()),
-            session_id: Some(grant.session_id.clone()),
-            challenge_id: None,
-            capsule_id: None,
-            result: "ok".to_string(),
-            reason: reason.to_string(),
-            occurred_at: now,
-            signer_did: None,
-            signature: None,
+        crate::auth::PasskeySessionRequest {
+            credential,
+            origin,
+            user_verified,
+            display_name: None,
+            reason,
+            profile_display_name: None,
+            purpose: crate::auth::PasskeySessionPurpose::SignIn,
         },
-    )?;
-    Ok(grant)
+    )
+}
+
+fn owner_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    let status = if error.is::<crate::auth::OwnerEnrollmentDenied>() {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    error_response(status, &error.to_string())
 }
 
 fn user_id_response(user_id: String, grant: AuthSessionGrantV1) -> UserIdResponse {
@@ -467,12 +498,6 @@ fn user_id_response(user_id: String, grant: AuthSessionGrantV1) -> UserIdRespons
         session_id: grant.session_id,
         expires_at: grant.expires_at,
     }
-}
-
-fn random_hex(len: usize) -> String {
-    let mut bytes = vec![0u8; len];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
 }
 
 #[cfg(test)]
@@ -597,14 +622,39 @@ mod tests {
     fn direct_identity_registration_respects_guest_gate() {
         let data_dir = tempfile::tempdir().unwrap();
 
-        assert!(require_guest_registration_policy(data_dir.path(), false).is_ok());
-
-        let (status, Json(body)) =
-            require_guest_registration_policy(data_dir.path(), true).unwrap_err();
+        let (status, Json(body)) = require_guest_registration_policy(data_dir.path()).unwrap_err();
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body.error, "guest passkey registration is disabled");
 
         crate::auth::set_guest_registration_enabled(data_dir.path(), true, 10).unwrap();
-        assert!(require_guest_registration_policy(data_dir.path(), true).is_ok());
+        assert_eq!(
+            require_guest_registration_policy(data_dir.path())
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let binding = elastos_runtime::auth::ProofBinding::passkey_webauthn(
+            elastos_runtime::auth::PasskeyWebAuthnBinding {
+                credential_id: "admin-credential".into(),
+                public_key: "admin-public-key".into(),
+                sign_count: 0,
+                user_verified: true,
+                origin: "https://home.example".into(),
+                rp_id: "home.example".into(),
+                created_at: 10,
+                last_used_at: 10,
+                revoked_at: None,
+            },
+        );
+        crate::auth::upsert_principal_for_binding_as_role(
+            data_dir.path(),
+            binding,
+            crate::auth::passkey_credential_principal_id("home.example", "admin-credential")
+                .unwrap(),
+            crate::auth::RuntimePrincipalRole::Admin,
+            10,
+        )
+        .unwrap();
+        assert!(require_guest_registration_policy(data_dir.path()).is_ok());
     }
 }

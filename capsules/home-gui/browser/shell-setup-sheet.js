@@ -9,7 +9,7 @@ import { openTarget } from "./shell-windows.js?v=home-20260813a";
 const PROFILE_READINESS_SCHEMA = "elastos.profile.readiness/v1";
 const RECOVERY_READINESS_SCHEMA = "elastos.recovery.readiness/v1";
 const SETUP_HOLD_TARGETS = new Set(["chat-room"]);
-const SETUP_REMINDER_ID = "home-setup:recovery-then-profile";
+const SETUP_REMINDER_ID = "home-setup:profile-and-recovery";
 
 let sheet = null;
 let card = null;
@@ -18,14 +18,10 @@ let leadNode = null;
 let recoveryButton = null;
 let recoveryBody = null;
 let recoveryStep = null;
-let profileButton = null;
-let profileBody = null;
-let profileStep = null;
 let closeButton = null;
 let bound = false;
 let dismissedThisSession = false;
 let drag = null;
-let lastRecoveryReady = false;
 let finishedHideTimer = null;
 
 export function bindSetupSheet() {
@@ -39,9 +35,6 @@ export function bindSetupSheet() {
   recoveryButton = document.querySelector("#setup-sheet-recovery");
   recoveryBody = document.querySelector("#setup-sheet-recovery-body");
   recoveryStep = document.querySelector("#setup-sheet-step-recovery");
-  profileButton = document.querySelector("#setup-sheet-profile");
-  profileBody = document.querySelector("#setup-sheet-profile-body");
-  profileStep = document.querySelector("#setup-sheet-step-profile");
   closeButton = document.querySelector("#setup-sheet-close");
   if (!sheet) {
     return;
@@ -49,7 +42,6 @@ export function bindSetupSheet() {
   bound = true;
   closeButton?.addEventListener("click", () => hideSetupSheet());
   recoveryButton?.addEventListener("click", () => openRecoveryAct());
-  profileButton?.addEventListener("click", () => openProfileAct());
   setHomeSetupNotificationHandler(() => {
     dismissedThisSession = false;
     showSetupSheet();
@@ -94,7 +86,7 @@ function typedReadinessStatus(readiness, schema) {
 
 export function homeSetupNeedsAct(summary) {
   const status = homeSetupStatus(summary);
-  return status !== "ready" && status !== "signed_out";
+  return status !== "signed_out" && !setupFinished(summary);
 }
 
 function setupFinished(summary) {
@@ -120,7 +112,8 @@ export function holdHomeSetupAct(targetId) {
   if (!SETUP_HOLD_TARGETS.has(targetId)) {
     return false;
   }
-  if (!homeSetupNeedsAct(shellState.currentSummary)) {
+  const profileStatus = homeSetupStatus(shellState.currentSummary);
+  if (profileStatus === "ready" || profileStatus === "signed_out") {
     return false;
   }
   showSetupSheet();
@@ -161,7 +154,7 @@ export function hideSetupSheet({ restoreFocus = true, rememberDismiss = true } =
         id: SETUP_REMINDER_ID,
         kind: "home_setup",
         title: "Finish Home setup",
-        body: "Save a Recovery Kit, then create your Profile.",
+        body: "Finish setup in System and save your Recovery Kit.",
       });
     }
   }
@@ -181,82 +174,38 @@ export function showSetupSheet() {
   }
   const alreadyOpen = !sheet.hidden;
   const yielded = sheet.classList.contains("is-yielded");
-  const unavailable = homeSetupStatus(shellState.currentSummary) === "unavailable" ||
-    homeRecoveryStatus(shellState.currentSummary) === "unavailable";
   renderSetupSheet(shellState.currentSummary);
   sheet.hidden = false;
   sheet.inert = false;
   sheet.setAttribute("aria-hidden", "false");
   if (!alreadyOpen && !yielded) {
-    const next = unavailable || homeRecoveryStatus(shellState.currentSummary) !== "ready"
-      ? recoveryButton
-      : profileButton;
-    (next && !next.disabled ? next : closeButton)?.focus();
+    (recoveryButton && !recoveryButton.disabled ? recoveryButton : closeButton)?.focus();
   }
   return true;
 }
 
 function renderSetupSheet(summary) {
-  const profileStatus = homeSetupStatus(summary);
-  const recoveryStatus = homeRecoveryStatus(summary);
-  const unavailable = profileStatus === "unavailable" || recoveryStatus === "unavailable";
-  const recoveryReady = recoveryStatus === "ready";
-  const profileReady = profileStatus === "ready";
-  const setupName = typeof summary?.identity?.profile_setup_display_name === "string"
-    ? summary.identity.profile_setup_display_name.trim()
-    : "";
-  if (titleNode) {
-    titleNode.textContent = "Welcome to Home";
-  }
-  if (leadNode) {
-    leadNode.textContent = unavailable
-      ? "Setup could not be verified. Open System to check Recovery Kit, then create your Profile."
-      : (profileReady && recoveryReady
-        ? "Home is set up."
-        : (recoveryReady
-          ? (setupName
-            ? `Recovery Kit is saved. Create your Profile as ${setupName}.`
-            : "Recovery Kit is saved. Create your Profile.")
-          : (setupName
-            ? `Save a Recovery Kit, then create your Profile as ${setupName}.`
-            : "Save a Recovery Kit, then create your Profile.")));
-  }
-  recoveryStep?.classList.toggle("is-complete", recoveryReady);
-  recoveryStep?.classList.toggle("is-current", !recoveryReady && !unavailable);
-  profileStep?.classList.toggle("is-complete", profileReady);
-  profileStep?.classList.toggle("is-current", recoveryReady && !profileReady && !unavailable);
-  if (recoveryBody) {
-    recoveryBody.textContent = unavailable
-      ? "Open System."
-      : recoveryReady
-        ? "Saved. This Home can now create your Profile."
-        : "Required first. Download a kit in System → Security so this Home can create your Profile.";
-  }
+  const unavailable = homeSetupStatus(summary) === "unavailable" || homeRecoveryStatus(summary) === "unavailable";
+  const complete = setupFinished(summary);
+  const profileReady = homeSetupStatus(summary) === "ready";
+  if (titleNode) titleNode.textContent = "Welcome to Home";
+  if (leadNode) leadNode.textContent = complete ? "Home is set up."
+    : unavailable ? "Open System to check setup."
+    : profileReady ? "Save an updated Recovery Kit that includes your Profile."
+    : "Create your Profile and save a complete Recovery Kit in System.";
+  recoveryStep?.classList.toggle("is-complete", complete);
+  recoveryStep?.classList.toggle("is-current", !complete && !unavailable);
+  if (recoveryBody) recoveryBody.textContent = unavailable
+    ? "Open System to check setup."
+    : complete ? "Profile and Recovery Kit are ready."
+    : profileReady ? "Your Profile stays unchanged. Save the updated kit offline."
+    : "Confirm your name and save the kit offline.";
   if (recoveryButton) {
-    recoveryButton.textContent = unavailable
-      ? "Open System"
-      : recoveryReady
-        ? "Saved"
-        : "Save kit";
-    recoveryButton.disabled = unavailable
-      ? !targetById(summary, "system")
-      : recoveryReady || !targetById(summary, "system");
-    recoveryButton.classList.toggle("el-button-primary", unavailable || !recoveryReady);
+    recoveryButton.textContent = complete ? "Ready" : unavailable ? "Open System"
+      : profileReady ? "Save Recovery Kit" : "Finish setup";
+    recoveryButton.disabled = complete || !targetById(summary, "system");
+    recoveryButton.classList.toggle("el-button-primary", !complete);
   }
-  if (profileBody) {
-    profileBody.textContent = profileReady
-      ? "Created. People and Chat can use this name."
-      : "The name people see. Chat stays closed until this exists.";
-  }
-  if (profileButton) {
-    profileButton.textContent = profileReady ? "Created" : "Create Profile";
-    profileButton.disabled = unavailable || profileReady || !recoveryReady || !targetById(summary, "people");
-    profileButton.classList.toggle("el-button-primary", !unavailable && recoveryReady && !profileReady);
-  }
-  if (recoveryReady && !lastRecoveryReady && profileButton && !profileButton.disabled) {
-    profileButton.focus();
-  }
-  lastRecoveryReady = recoveryReady;
 }
 
 function openRecoveryAct() {
@@ -265,14 +214,6 @@ function openRecoveryAct() {
   }
   yieldSetupSheet();
   openTarget("system", { query: { settings: "security" } });
-}
-
-function openProfileAct() {
-  if (!targetById(shellState.currentSummary, "people")) {
-    return;
-  }
-  yieldSetupSheet();
-  openTarget("people");
 }
 
 function yieldSetupSheet() {

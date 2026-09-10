@@ -30,7 +30,7 @@ The C1-C7 sequence in the approved plan controls integration and publication.
 | C1-proof | The execution loop handles a real reviewed slice | Accepted for source review and monitoring / coordinator | Independent source/rendered review, nine process cases and actual recurring monitor delivery pass. Continue through installed and public proof under C1-seed. |
 | C1-seed | Seed serves the reviewed local candidate and storefront | Private working build verified / coordinator | Runtime b726db95 and reviewed storefront pass artifact parity. Virtual passkey registration, sign-out/sign-in, rendered Home, ordinary System Settings entry and credential cleanup pass. Protected state is preserved. Public-stage refresh, user approval and full journey acceptance remain open. |
 | C1-delivery | Signed three-platform candidate installation | Functional preparation complete; final assembly after C5 freeze / delivery owner | Native inputs, bootstrap and publisher import have bounded source/artifact proof. Keep working builds for functional tests and rebuild only affected components. Complete atomic promotion, final installer stamping, platform regeneration and signed fresh installs at the final release boundary. |
-| J1 / C2 | Install, passkey, Recovery Kit, Profile and usable Home | Active / Home and installer owners | Registration binding and atomic/conflict-safe identity persistence are integrated with 66 focused tests passing. Next: durable owner intent and Profile-inclusive recovery, then concurrent-save and window/selection UI; W2-W5; rerun the smoke with System entry through the ElastOS menu, then complete the app matrix; full Linux/Mac staging. Publish J1 for review first under D1. |
+| J1 / C2 | Install, passkey, Recovery Kit, Profile and usable Home | Active / Home and installer owners | Registration binding and atomic/conflict-safe identity persistence are integrated with 66 focused tests passing. Durable owner intent and Profile-inclusive recovery now pass source and UI checks. Next: fixed Mac preview installation and seed proof, then concurrent-save and window/selection UI; W2-W5; rerun the smoke with System entry through the ElastOS menu, then complete the app matrix; full Linux/Mac staging. Publish J1 for review first under D1. |
 | J2 | Ordinary update preserves user state | Planned / delivery owner and independent reviewer | Coherent update commits on J1; Mac platform selection is repaired in 52fc231e with 11 updater tests; establish the actual stamped 0.7.0 starting updater. The published tag and local 0.7.0 tag differ; a source-home replacement cannot close first-hop proof. Candidate/interruption acceptance remains C6. |
 | J3 / C3 | Obtain a model through Content/Carrier and use it locally | Planned / model and Content owners | J1 parent; acceptance steps 1, 2, 3 and 5 in section 6 of the approved plan. Hosted/Codex adapters are Optional before freeze; remote inference and Jetson are Later. |
 | J4 / C4 | Browser works in the two agreed placements | Planned / Browser owner | Retain canonical B01-B16 on the Browser branch; Mac A/A/A and Linux Home/Exit with Mac Engine A/B/A, including reload. Full claimed-role proof remains C6. |
@@ -43,6 +43,14 @@ User sequencing clarification: finish functional journey work before final relea
 assembly. Preserve evidence for unchanged components across source updates. Build
 affected components for testing as needed; stamp the final installer and produce
 the final signed platform packages after the source freeze.
+
+Immediate preview delivery: finish the active account/setup slice, freeze that
+preview source, and prove the existing installer with a matching Mac candidate.
+Then refresh the seed candidate and prepare the public deployment for approval.
+Jetson is deferred at the user's request. The wider J2–J5 work and final
+three-platform release assembly remain required for release, but do not block
+this first website and Mac installation preview. Keep the preview candidate fixed
+while that proof runs; later source work does not reset it.
 
 The required shared regression includes Desktop/Terminal and Inbox handoff,
 Create/Recover, Recovery Kit coverage, Profile and window placement, document

@@ -30,6 +30,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const AUTH_STATE_SCHEMA: &str = "elastos.auth.state/v1";
+pub(crate) const AUTH_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 const AUTH_STATE_ROOT: &str = "ElastOS/System/Auth";
 const AUTH_STATE_FILE: &str = "auth-state.json";
 const AUDIT_CHAIN_REQUIRED_FILE: &str = "audit-chain-required.json";
@@ -672,6 +673,8 @@ pub struct PrincipalRecord {
     pub proof_binding: ProofBinding,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_profile_display_name: Option<String>,
     #[serde(default)]
     pub role: RuntimePrincipalRole,
     #[serde(default)]
@@ -751,6 +754,10 @@ struct AuditChainActivationV2 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthState {
     pub schema: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_enrollment: Option<OwnerEnrollment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    guest_registrations: Vec<GuestRegistration>,
     #[serde(default)]
     pub challenges: Vec<StoredAuthChallenge>,
     #[serde(default)]
@@ -775,6 +782,8 @@ impl Default for AuthState {
     fn default() -> Self {
         Self {
             schema: AUTH_STATE_SCHEMA.to_string(),
+            owner_enrollment: None,
+            guest_registrations: Vec::new(),
             challenges: Vec::new(),
             principals: Vec::new(),
             sessions: Vec::new(),
@@ -788,10 +797,2267 @@ impl Default for AuthState {
     }
 }
 
+// Enrollment phases and candidate facts are private to this Runtime owner.
+// The auth file lock precedes identity file locks; callers may hold the in-memory
+// IdentityManager mutex, but no identity file lock may be held on entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerEnrollment {
+    runtime_id: String,
+    purpose: String,
+    origin: String,
+    rp_id: String,
+    secret_digest: [u8; 32],
+    expires_at: u64,
+    public: bool,
+    phase: OwnerEnrollmentPhase,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "phase", deny_unknown_fields)]
+enum OwnerEnrollmentPhase {
+    Issued,
+    Claimed {
+        ceremony_id: String,
+        challenge: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intent: Option<PasskeyEnrollmentIntent>,
+    },
+    Verified {
+        verification: OwnerVerification,
+    },
+    Consumed {
+        verification: OwnerVerification,
+        session_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerVerification {
+    ceremony_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intent: Option<PasskeyEnrollmentIntent>,
+    response_digest: [u8; 32],
+    candidate: elastos_identity::webauthn::RegistrationCandidate,
+    display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile_display_name: Option<String>,
+}
+
+pub(crate) struct OwnerEnrollmentNames<'a> {
+    pub display_name: Option<&'a str>,
+    pub profile_display_name: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "purpose", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum PasskeyEnrollmentIntent {
+    Create { public_name: String },
+    Recover {},
+}
+
+const MAX_GUEST_REGISTRATIONS: usize = 16;
+const MAX_GUEST_REGISTRATION_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestRegistration {
+    ceremony_id: String,
+    intent: PasskeyEnrollmentIntent,
+    claimant_digest: [u8; 32],
+    binding_digest: [u8; 32],
+    response_digest: [u8; 32],
+    candidate: elastos_identity::webauthn::RegistrationCandidate,
+    previous_history: elastos_identity::store::GuestCredentialHistory,
+    terminal: Option<GuestRegistrationTerminal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestRegistrationTerminal {
+    session_id: String,
+    expires_at: u64,
+}
+
+pub(crate) struct GuestRegistrationClient<'a> {
+    pub origin: &'a str,
+    pub rp_id: &'a str,
+    pub client_claim: &'a str,
+}
+
+fn require_guest_registration_policy(state: &AuthState) -> anyhow::Result<()> {
+    if !state.guest_registration_enabled
+        || !state.principals.iter().any(|principal| {
+            principal.role == RuntimePrincipalRole::Admin
+                && principal
+                    .proof_binding
+                    .passkey
+                    .as_ref()
+                    .is_some_and(|passkey| passkey.revoked_at.is_none())
+        })
+    {
+        return enrollment_denied();
+    }
+    Ok(())
+}
+
+fn guest_registration_binding(
+    request: &GuestRegistrationClient<'_>,
+    intent: &PasskeyEnrollmentIntent,
+) -> anyhow::Result<[u8; 32]> {
+    validate_owner_enrollment_intent(Some(intent))?;
+    if request.origin.len() > 512 || request.rp_id.len() > 253 {
+        return enrollment_denied();
+    }
+    let claimant = claimant_digest(request.client_claim)?;
+    Ok(Sha256::digest(serde_json::to_vec(&(
+        request.origin,
+        request.rp_id,
+        claimant,
+        intent,
+    ))?)
+    .into())
+}
+
+pub(crate) fn begin_guest_registration(
+    data_dir: &Path,
+    identity: &mut elastos_identity::IdentityManager,
+    request: &GuestRegistrationClient<'_>,
+    ceremony_id: &str,
+    intent: &PasskeyEnrollmentIntent,
+) -> anyhow::Result<elastos_identity::CreationOptions> {
+    let binding = guest_registration_binding(request, intent)?;
+    if let PasskeyEnrollmentIntent::Create { public_name } = intent {
+        crate::collaboration_profile_authority::validate_profile_authority_update(
+            data_dir,
+            public_name,
+            None,
+        )?;
+    }
+    mutate_auth_state(data_dir, |state| {
+        require_guest_registration_policy(state)?;
+        state.guest_registrations.retain(|record| {
+            record
+                .terminal
+                .as_ref()
+                .is_none_or(|terminal| terminal.expires_at > now_ts())
+        });
+        if state.guest_registrations.len() >= MAX_GUEST_REGISTRATIONS {
+            return enrollment_denied();
+        }
+        identity.begin_bound_principal_registration(
+            ceremony_id,
+            request.rp_id,
+            request.origin,
+            binding,
+        )
+    })
+}
+
+pub(crate) fn complete_guest_registration(
+    data_dir: &Path,
+    identity: &mut elastos_identity::IdentityManager,
+    request: &GuestRegistrationClient<'_>,
+    ceremony_id: &str,
+    response: &elastos_identity::RegistrationResponse,
+    intent: &PasskeyEnrollmentIntent,
+) -> anyhow::Result<AuthSessionGrantV1> {
+    // Bound attacker-controlled strings before hashing/decoding the response.
+    if ceremony_id.len() > 128
+        || response._id.len() > 8192
+        || response._raw_id.len() > 8192
+        || response._type != "public-key"
+        || response.response.client_data_json.len() > 4096
+        || response.response.attestation_object.len() > 32768
+    {
+        return enrollment_denied();
+    }
+    let binding = guest_registration_binding(request, intent)?;
+    let claimant = claimant_digest(request.client_claim)?;
+    let response_digest: [u8; 32] = Sha256::digest(serde_json::to_vec(response)?).into();
+    let result = mutate_auth_state(data_dir, |state| {
+        let now = now_ts();
+        require_guest_registration_policy(state)?;
+        identity.reload_credentials()?;
+        let index = if let Some(index) = state
+            .guest_registrations
+            .iter()
+            .position(|record| record.ceremony_id == ceremony_id)
+        {
+            index
+        } else {
+            state.guest_registrations.retain(|record| {
+                record
+                    .terminal
+                    .as_ref()
+                    .is_none_or(|terminal| terminal.expires_at > now)
+            });
+            if state.guest_registrations.len() >= MAX_GUEST_REGISTRATIONS {
+                return enrollment_denied();
+            }
+            let candidate = identity.verify_bound_registration(
+                ceremony_id,
+                response,
+                request.rp_id,
+                request.origin,
+                binding,
+            )?;
+            if !candidate.user_verified
+                || identity
+                    .credentials()
+                    .iter()
+                    .any(|item| item.credential_id == candidate.credential.credential_id)
+                || state.guest_registrations.iter().any(|record| {
+                    record.candidate.credential.credential_id == candidate.credential.credential_id
+                })
+                || state.principals.iter().any(|principal| {
+                    principal
+                        .proof_binding
+                        .passkey
+                        .as_ref()
+                        .is_some_and(|key| key.credential_id == candidate.credential.credential_id)
+                })
+            {
+                return enrollment_denied();
+            }
+            let record = GuestRegistration {
+                ceremony_id: ceremony_id.into(),
+                intent: intent.clone(),
+                claimant_digest: claimant,
+                binding_digest: binding,
+                response_digest,
+                candidate,
+                previous_history: identity.guest_credential_history()?,
+                terminal: None,
+            };
+            if serde_json::to_vec(&record)?.len() > MAX_GUEST_REGISTRATION_BYTES {
+                return enrollment_denied();
+            }
+            state.guest_registrations.push(record);
+            // This same auth record is the pre-effect recovery owner.
+            save_auth_state(data_dir, state)?;
+            identity.cancel_challenge(ceremony_id);
+            state.guest_registrations.len() - 1
+        };
+        let record = state.guest_registrations[index].clone();
+        if record.intent != *intent
+            || record.claimant_digest != claimant
+            || record.binding_digest != binding
+            || record.response_digest != response_digest
+        {
+            return enrollment_denied();
+        }
+        if let Some(terminal) = &record.terminal {
+            let stored = state
+                .sessions
+                .iter()
+                .find(|stored| stored.grant.session_id == terminal.session_id)
+                .ok_or(OwnerEnrollmentDenied)?;
+            let principal = state
+                .principals
+                .iter()
+                .find(|principal| {
+                    principal.proof_binding_id == stored.grant.proof_binding_id
+                        && principal.principal_id == stored.grant.principal_id
+                })
+                .ok_or(OwnerEnrollmentDenied)?;
+            ensure_proof_binding_not_revoked(principal)?;
+            if terminal.expires_at <= now
+                || stored.revoked_at.is_some()
+                || stored.grant.expires_at <= now
+                || principal.role != RuntimePrincipalRole::Guest
+                || !identity.credentials().iter().any(|key| {
+                    key.credential_id == record.candidate.credential.credential_id
+                        && key.public_key == record.candidate.credential.public_key
+                        && key.rp_id == record.candidate.credential.rp_id
+                        && key.sign_count >= record.candidate.credential.sign_count
+                })
+            {
+                return enrollment_denied();
+            }
+            let mut grant = stored.grant.clone();
+            grant.expires_at = grant.expires_at.min(terminal.expires_at);
+            return Ok(grant);
+        }
+        #[cfg(test)]
+        owner_enrollment_test_fault(data_dir, OwnerEnrollmentTestFault::BeforeCredential)?;
+        let credential =
+            identity.persist_guest_candidate(&record.candidate, &record.previous_history)?;
+        #[cfg(test)]
+        owner_enrollment_test_fault(data_dir, OwnerEnrollmentTestFault::AfterCredential)?;
+        let name = match intent {
+            PasskeyEnrollmentIntent::Create { public_name } => Some(public_name.as_str()),
+            PasskeyEnrollmentIntent::Recover {} => None,
+        };
+        let grant = grant_passkey_session_in_state(
+            data_dir,
+            state,
+            PasskeySessionRequest {
+                credential: &credential,
+                origin: &record.candidate.origin,
+                user_verified: true,
+                display_name: name,
+                profile_display_name: name,
+                reason: "guided guest passkey verified and session granted",
+                purpose: PasskeySessionPurpose::GuestRegistration,
+            },
+            now,
+        )?;
+        state.guest_registrations[index].terminal = Some(GuestRegistrationTerminal {
+            session_id: grant.session_id.clone(),
+            expires_at: grant.expires_at,
+        });
+        #[cfg(test)]
+        owner_enrollment_test_fault(data_dir, OwnerEnrollmentTestFault::BeforeTerminal)?;
+        Ok(grant)
+    });
+    #[cfg(test)]
+    if result.is_ok() {
+        owner_enrollment_test_fault(data_dir, OwnerEnrollmentTestFault::AfterTerminal)?;
+    }
+    result
+}
+
+pub(crate) struct OwnerEnrollmentCompletion<'a> {
+    pub intent: Option<&'a PasskeyEnrollmentIntent>,
+    pub names: OwnerEnrollmentNames<'a>,
+}
+
+pub(crate) fn validate_owner_enrollment_intent(
+    intent: Option<&PasskeyEnrollmentIntent>,
+) -> anyhow::Result<()> {
+    if let Some(PasskeyEnrollmentIntent::Create { public_name }) = intent {
+        if public_name.len() > 64
+            || public_name.chars().any(char::is_control)
+            || clean_principal_display_name(Some(public_name))?.as_deref()
+                != Some(public_name.as_str())
+        {
+            return enrollment_denied();
+        }
+    }
+    Ok(())
+}
+
+/// Constructed by the HTTP route from verified transport provenance, never JSON.
+pub(crate) struct OwnerAdmission<'a> {
+    pub origin: &'a str,
+    pub rp_id: &'a str,
+    pub claimant: &'a str,
+    pub loopback: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct OwnerEnrollmentDenied;
+impl std::fmt::Display for OwnerEnrollmentDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("owner enrollment unavailable")
+    }
+}
+impl std::error::Error for OwnerEnrollmentDenied {}
+
+fn enrollment_denied<T>() -> anyhow::Result<T> {
+    Err(OwnerEnrollmentDenied.into())
+}
+
+fn claimant_digest(secret: &str) -> anyhow::Result<[u8; 32]> {
+    if secret.len() != 64
+        || !secret
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return enrollment_denied();
+    }
+    Ok(Sha256::digest(secret.as_bytes()).into())
+}
+
+fn same_claimant(expected: &[u8; 32], actual: &[u8; 32]) -> bool {
+    expected
+        .iter()
+        .zip(actual)
+        .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
+}
+
+fn require_unowned(
+    data_dir: &Path,
+    state: &AuthState,
+    identity: &elastos_identity::IdentityManager,
+    recovering: bool,
+) -> anyhow::Result<()> {
+    // Retained raw sessions count even when the normal read projection prunes them.
+    let raw = load_auth_state_unverified(data_dir)?.unwrap_or_default();
+    let users = rooted_localhost_fs_path(data_dir, "Users").ok_or(OwnerEnrollmentDenied)?;
+    let roots_present = match std::fs::read_dir(users) {
+        Ok(mut entries) => entries.next().transpose()?.is_some(),
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if !state.principals.is_empty()
+        || !raw.sessions.is_empty()
+        || !state.principal_root_protections.is_empty()
+        || state.audit.iter().any(|event| {
+            event.principal_id.is_some()
+                || event.proof_binding_id.is_some()
+                || event.session_id.is_some()
+        })
+        || roots_present
+        || (!recovering && identity.has_credential_history())
+    {
+        return enrollment_denied();
+    }
+    Ok(())
+}
+
+fn require_secure_owner_persistence(data_dir: &Path) -> anyhow::Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = data_dir;
+        enrollment_denied()
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let auth = auth_state_path(data_dir)?;
+        ensure_regular_auth_parent(data_dir, auth.parent().ok_or(OwnerEnrollmentDenied)?)?;
+        let mut path = data_dir.to_path_buf();
+        let validate = |path: &Path| -> anyhow::Result<()> {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o022 != 0
+            {
+                return enrollment_denied();
+            }
+            Ok(())
+        };
+        validate(&path)?;
+        for component in auth.strip_prefix(data_dir)?.components() {
+            path.push(component);
+            if path.exists() {
+                validate(&path)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Local operator command. The returned secret is shown once on the operator's
+/// terminal; only its digest is stored. This never changes an owned Runtime.
+pub fn arm_owner_enrollment(
+    data_dir: &Path,
+    origin: &str,
+    rp_id: &str,
+    ttl_secs: u64,
+) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    let origin_url = url::Url::parse(origin).map_err(|_| OwnerEnrollmentDenied)?;
+    if origin.len() > 512
+        || rp_id.len() > 253
+        || origin_url.scheme() != "https"
+        || origin_url.origin().ascii_serialization() != origin
+        || origin_url.host_str() != Some(rp_id)
+        || ttl_secs == 0
+        || ttl_secs > 900
+    {
+        return enrollment_denied();
+    }
+    require_secure_owner_persistence(data_dir)?;
+    let secret = zeroize::Zeroizing::new(random_secret_hex());
+    let digest = claimant_digest(&secret)?;
+    let (_, runtime_id) = elastos_identity::load_or_create_did(data_dir)?;
+    let now = now_ts();
+    mutate_auth_state(data_dir, |state| {
+        let identity = elastos_identity::IdentityManager::new(data_dir.to_path_buf())?;
+        require_unowned(data_dir, state, &identity, false)?;
+        if let Some(previous) = &state.owner_enrollment {
+            if previous.expires_at > now
+                || matches!(
+                    previous.phase,
+                    OwnerEnrollmentPhase::Verified { .. } | OwnerEnrollmentPhase::Consumed { .. }
+                )
+            {
+                return enrollment_denied();
+            }
+        }
+        state.owner_enrollment = Some(OwnerEnrollment {
+            runtime_id,
+            purpose: "first-owner".into(),
+            origin: origin.into(),
+            rp_id: rp_id.into(),
+            secret_digest: digest,
+            expires_at: now + ttl_secs,
+            public: true,
+            phase: OwnerEnrollmentPhase::Issued,
+        });
+        Ok(())
+    })?;
+    Ok(secret)
+}
+
+pub(crate) fn random_secret_hex() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn check_owner_claim(
+    data_dir: &Path,
+    record: &OwnerEnrollment,
+    request: &OwnerAdmission<'_>,
+) -> anyhow::Result<()> {
+    if record.origin.len() > 512 || record.rp_id.len() > 253 {
+        return enrollment_denied();
+    }
+    if record.public {
+        require_secure_owner_persistence(data_dir)?;
+    }
+    let (_, runtime_id) = elastos_identity::load_or_create_did(data_dir)?;
+    if record.runtime_id != runtime_id
+        || record.purpose != "first-owner"
+        || record.origin != request.origin
+        || record.rp_id != request.rp_id
+        || (!record.public && !request.loopback)
+        || !same_claimant(&record.secret_digest, &claimant_digest(request.claimant)?)
+    {
+        return enrollment_denied();
+    }
+    Ok(())
+}
+
+pub(crate) fn begin_owner_enrollment(
+    data_dir: &Path,
+    identity: &mut elastos_identity::IdentityManager,
+    request: &OwnerAdmission<'_>,
+    ceremony_id: &str,
+    now: u64,
+) -> anyhow::Result<Option<(String, Option<elastos_identity::CreationOptions>)>> {
+    // Existing callers select credential enrollment, not public Profile consent.
+    begin_owner_enrollment_with_intent(data_dir, identity, request, ceremony_id, None, now)
+}
+
+pub(crate) fn begin_owner_enrollment_with_intent(
+    data_dir: &Path,
+    identity: &mut elastos_identity::IdentityManager,
+    request: &OwnerAdmission<'_>,
+    ceremony_id: &str,
+    intent: Option<&PasskeyEnrollmentIntent>,
+    now: u64,
+) -> anyhow::Result<Option<(String, Option<elastos_identity::CreationOptions>)>> {
+    validate_owner_enrollment_intent(intent)?;
+    mutate_auth_state(data_dir, |state| {
+        identity.reload_credentials()?;
+        if let Some(record) = &state.owner_enrollment {
+            if let OwnerEnrollmentPhase::Verified { verification } = &record.phase {
+                check_owner_claim(data_dir, record, request)?;
+                if verification.intent.as_ref() != intent {
+                    return enrollment_denied();
+                }
+                require_unowned(data_dir, state, identity, true)?;
+                return Ok(Some((verification.ceremony_id.clone(), None)));
+            }
+        }
+        if !state.principals.is_empty() {
+            return Ok(None);
+        }
+        require_unowned(data_dir, state, identity, false)?;
+        let expired_local = request.loopback
+            && state.owner_enrollment.as_ref().is_some_and(|record| {
+                !record.public
+                    && record.expires_at <= now
+                    && matches!(
+                        record.phase,
+                        OwnerEnrollmentPhase::Issued | OwnerEnrollmentPhase::Claimed { .. }
+                    )
+            });
+        if state.owner_enrollment.is_none() || expired_local {
+            if !request.loopback {
+                return enrollment_denied();
+            }
+            if request.origin.len() > 512 || request.rp_id.len() > 253 {
+                return enrollment_denied();
+            }
+            let (_, runtime_id) = elastos_identity::load_or_create_did(data_dir)?;
+            state.owner_enrollment = Some(OwnerEnrollment {
+                runtime_id,
+                purpose: "first-owner".into(),
+                origin: request.origin.into(),
+                rp_id: request.rp_id.into(),
+                secret_digest: claimant_digest(request.claimant)?,
+                expires_at: now + 300,
+                public: false,
+                phase: OwnerEnrollmentPhase::Issued,
+            });
+        }
+        let record = state
+            .owner_enrollment
+            .as_mut()
+            .ok_or(OwnerEnrollmentDenied)?;
+        check_owner_claim(data_dir, record, request)?;
+        if record.expires_at <= now {
+            return enrollment_denied();
+        }
+        if let Some(PasskeyEnrollmentIntent::Create { public_name }) = intent {
+            crate::collaboration_profile_authority::validate_profile_authority_update(
+                data_dir,
+                public_name,
+                None,
+            )?;
+        }
+        if let OwnerEnrollmentPhase::Claimed { intent: saved, .. } = &record.phase {
+            if saved.as_ref() != intent {
+                return enrollment_denied();
+            }
+        }
+        let mut options =
+            identity.begin_principal_registration(ceremony_id, request.rp_id, request.origin)?;
+        // The durable record owns this challenge; remove the redundant RAM ceremony.
+        identity.cancel_challenge(ceremony_id);
+        match &record.phase {
+            OwnerEnrollmentPhase::Issued => {
+                record.phase = OwnerEnrollmentPhase::Claimed {
+                    ceremony_id: ceremony_id.into(),
+                    challenge: options.public_key.challenge.clone(),
+                    intent: intent.cloned(),
+                };
+                Ok(Some((ceremony_id.into(), Some(options))))
+            }
+            OwnerEnrollmentPhase::Claimed {
+                ceremony_id,
+                challenge,
+                ..
+            } => {
+                options.public_key.challenge.clone_from(challenge);
+                Ok(Some((ceremony_id.clone(), Some(options))))
+            }
+            _ => enrollment_denied(),
+        }
+    })
+}
+
+pub(crate) fn complete_owner_enrollment(
+    data_dir: &Path,
+    identity: &mut elastos_identity::IdentityManager,
+    request: &OwnerAdmission<'_>,
+    ceremony_id: &str,
+    response: Option<&elastos_identity::RegistrationResponse>,
+    display_name: Option<&str>,
+    now: u64,
+) -> anyhow::Result<Option<AuthSessionGrantV1>> {
+    complete_owner_enrollment_with_names(
+        data_dir,
+        identity,
+        request,
+        ceremony_id,
+        response,
+        OwnerEnrollmentNames {
+            display_name,
+            profile_display_name: None,
+        },
+        now,
+    )
+}
+
+pub(crate) fn complete_owner_enrollment_with_names(
+    data_dir: &Path,
+    identity: &mut elastos_identity::IdentityManager,
+    request: &OwnerAdmission<'_>,
+    ceremony_id: &str,
+    response: Option<&elastos_identity::RegistrationResponse>,
+    names: OwnerEnrollmentNames<'_>,
+    now: u64,
+) -> anyhow::Result<Option<AuthSessionGrantV1>> {
+    complete_owner_enrollment_with_intent(
+        data_dir,
+        identity,
+        request,
+        ceremony_id,
+        response,
+        OwnerEnrollmentCompletion {
+            intent: None,
+            names,
+        },
+        now,
+    )
+}
+
+pub(crate) fn complete_owner_enrollment_with_intent(
+    data_dir: &Path,
+    identity: &mut elastos_identity::IdentityManager,
+    request: &OwnerAdmission<'_>,
+    ceremony_id: &str,
+    response: Option<&elastos_identity::RegistrationResponse>,
+    completion: OwnerEnrollmentCompletion<'_>,
+    now: u64,
+) -> anyhow::Result<Option<AuthSessionGrantV1>> {
+    let intent = completion.intent;
+    validate_owner_enrollment_intent(intent)?;
+    let names = match intent {
+        Some(intent) => {
+            if completion.names.display_name.is_some()
+                || completion.names.profile_display_name.is_some()
+            {
+                return enrollment_denied();
+            }
+            let name = match intent {
+                PasskeyEnrollmentIntent::Create { public_name } => Some(public_name.as_str()),
+                PasskeyEnrollmentIntent::Recover {} => None,
+            };
+            OwnerEnrollmentNames {
+                display_name: name,
+                profile_display_name: name,
+            }
+        }
+        None => completion.names,
+    };
+    let display_name = names.display_name;
+    let profile_display_name = names.profile_display_name;
+    let response_digest = response
+        .map(|response| {
+            serde_json::to_vec(response).map(|bytes| <[u8; 32]>::from(Sha256::digest(bytes)))
+        })
+        .transpose()?;
+    let result = mutate_auth_state(data_dir, |state| {
+        identity.reload_credentials()?;
+        let Some(mut record) = state.owner_enrollment.clone() else {
+            if !state.principals.is_empty() {
+                return Ok(None);
+            }
+            return enrollment_denied();
+        };
+        let owns_ceremony = match &record.phase {
+            OwnerEnrollmentPhase::Claimed {
+                ceremony_id: saved, ..
+            } => saved == ceremony_id,
+            OwnerEnrollmentPhase::Verified { verification }
+            | OwnerEnrollmentPhase::Consumed { verification, .. } => {
+                verification.ceremony_id == ceremony_id
+            }
+            OwnerEnrollmentPhase::Issued => false,
+        };
+        if !owns_ceremony {
+            if !state.principals.is_empty() {
+                return Ok(None);
+            }
+            return enrollment_denied();
+        }
+        check_owner_claim(data_dir, &record, request)?;
+        if let OwnerEnrollmentPhase::Claimed {
+            challenge,
+            intent: saved,
+            ..
+        } = &record.phase
+        {
+            if saved.as_ref() != intent {
+                return enrollment_denied();
+            }
+            if record.expires_at <= now {
+                return enrollment_denied();
+            }
+            require_unowned(data_dir, state, identity, false)?;
+            let candidate = elastos_identity::IdentityManager::verify_registration_candidate(
+                response.ok_or(OwnerEnrollmentDenied)?,
+                request.rp_id,
+                request.origin,
+                challenge,
+            )?;
+            record.phase = OwnerEnrollmentPhase::Verified {
+                verification: OwnerVerification {
+                    ceremony_id: ceremony_id.into(),
+                    intent: intent.cloned(),
+                    response_digest: response_digest.ok_or(OwnerEnrollmentDenied)?,
+                    candidate,
+                    display_name: clean_principal_display_name(display_name)?,
+                    profile_display_name: clean_principal_display_name(profile_display_name)?,
+                },
+            };
+            state.owner_enrollment = Some(record.clone());
+            // The admission and exact candidate reach disk BEFORE credential effects.
+            save_auth_state(data_dir, state)?;
+        }
+        let verification = match &record.phase {
+            OwnerEnrollmentPhase::Verified { verification }
+            | OwnerEnrollmentPhase::Consumed { verification, .. } => verification.clone(),
+            _ => return enrollment_denied(),
+        };
+        if verification.intent.as_ref() != intent {
+            return enrollment_denied();
+        }
+        if response_digest.is_some_and(|digest| digest != verification.response_digest)
+            || (response.is_some() || display_name.is_some())
+                && verification.display_name != clean_principal_display_name(display_name)?
+        {
+            return enrollment_denied();
+        }
+        if (response.is_some() || profile_display_name.is_some())
+            && verification.profile_display_name
+                != clean_principal_display_name(profile_display_name)?
+        {
+            return enrollment_denied();
+        }
+        if let OwnerEnrollmentPhase::Consumed { session_id, .. } = &record.phase {
+            let stored = state
+                .sessions
+                .iter()
+                .find(|session| &session.grant.session_id == session_id)
+                .ok_or(OwnerEnrollmentDenied)?;
+            let principal = state
+                .principals
+                .iter()
+                .find(|principal| principal.proof_binding_id == stored.grant.proof_binding_id)
+                .ok_or(OwnerEnrollmentDenied)?;
+            ensure_proof_binding_not_revoked(principal)?;
+            if stored.revoked_at.is_some()
+                || stored.grant.expires_at <= now
+                || !identity.credentials().iter().any(|credential| {
+                    credential.credential_id == verification.candidate.credential.credential_id
+                        && credential.public_key == verification.candidate.credential.public_key
+                        && credential.rp_id == verification.candidate.credential.rp_id
+                        && credential.sign_count >= verification.candidate.credential.sign_count
+                })
+            {
+                return enrollment_denied();
+            }
+            return Ok(Some(stored.grant.clone()));
+        }
+        require_unowned(data_dir, state, identity, true)?;
+        #[cfg(test)]
+        owner_enrollment_test_fault(data_dir, OwnerEnrollmentTestFault::BeforeCredential)?;
+        identity.persist_enrollment_candidate(&verification.candidate)?;
+        #[cfg(test)]
+        owner_enrollment_test_fault(data_dir, OwnerEnrollmentTestFault::AfterCredential)?;
+        let candidate = verification.candidate;
+        let binding =
+            ProofBinding::passkey_webauthn(elastos_runtime::auth::PasskeyWebAuthnBinding {
+                credential_id: candidate.credential.credential_id.clone(),
+                public_key: candidate.credential.public_key,
+                sign_count: identity.credentials()[0].sign_count,
+                user_verified: candidate.user_verified,
+                origin: candidate.origin,
+                rp_id: candidate.credential.rp_id.clone(),
+                created_at: now,
+                last_used_at: now,
+                revoked_at: None,
+            });
+        let principal_id = passkey_credential_principal_id(
+            &candidate.credential.rp_id,
+            &candidate.credential.credential_id,
+        )?;
+        let grant = AuthSessionGrantV1 {
+            schema: AuthSessionGrantV1::SCHEMA.into(),
+            grant_id: format!("grant:{}", random_secret_hex()),
+            session_id: format!("auth:{}", random_secret_hex()),
+            principal_id: principal_id.clone(),
+            proof_binding_id: binding.id(),
+            issued_at: now,
+            expires_at: now.saturating_add(AUTH_SESSION_TTL_SECS),
+            apps: vec!["home".into(), "system".into()],
+        };
+        let event = sign_audit_event(
+            data_dir,
+            RuntimeAuditEventV1 {
+                schema: RuntimeAuditEventV1::SCHEMA.into(),
+                event_id: format!("audit:{}", random_secret_hex()),
+                event_type: "auth.owner.enrolled".into(),
+                principal_id: Some(principal_id.clone()),
+                proof_binding_id: Some(binding.id()),
+                session_id: Some(grant.session_id.clone()),
+                challenge_id: None,
+                capsule_id: None,
+                result: "ok".into(),
+                reason: "first owner passkey verified".into(),
+                occurred_at: now,
+                signer_did: None,
+                signature: None,
+            },
+        )?;
+        state.principals.push(PrincipalRecord {
+            localhost_root: principal_localhost_root(&principal_id),
+            principal_id,
+            proof_binding_id: binding.id(),
+            proof_binding: binding,
+            display_name: verification.display_name.unwrap_or_default(),
+            initial_profile_display_name: verification.profile_display_name.clone(),
+            role: RuntimePrincipalRole::Admin,
+            created_at: now,
+            updated_at: now,
+        });
+        state.sessions.push(StoredAuthSession {
+            grant: grant.clone(),
+            revoked_at: None,
+        });
+        push_audit_event(data_dir, state, event)?;
+        let OwnerEnrollmentPhase::Verified { verification } = record.phase else {
+            return enrollment_denied();
+        };
+        record.phase = OwnerEnrollmentPhase::Consumed {
+            verification,
+            session_id: grant.session_id.clone(),
+        };
+        state.owner_enrollment = Some(record);
+        // Principal, grant, audit and consumption use this ONE terminal auth write.
+        #[cfg(test)]
+        owner_enrollment_test_fault(data_dir, OwnerEnrollmentTestFault::BeforeTerminal)?;
+        Ok(Some(grant))
+    });
+    #[cfg(test)]
+    if matches!(&result, Ok(Some(_))) {
+        owner_enrollment_test_fault(data_dir, OwnerEnrollmentTestFault::AfterTerminal)?;
+    }
+    result
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerEnrollmentTestFault {
+    BeforeCredential,
+    AfterCredential,
+    BeforeTerminal,
+    AfterTerminal,
+}
+
+#[cfg(test)]
+thread_local! {
+    static OWNER_ENROLLMENT_TEST_FAULT: std::cell::RefCell<Option<(PathBuf, OwnerEnrollmentTestFault)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_owner_enrollment_once_for_test(
+    data_dir: &Path,
+    fault: OwnerEnrollmentTestFault,
+) {
+    OWNER_ENROLLMENT_TEST_FAULT.with(|slot| *slot.borrow_mut() = Some((data_dir.into(), fault)));
+}
+
+#[cfg(test)]
+fn owner_enrollment_test_fault(
+    data_dir: &Path,
+    point: OwnerEnrollmentTestFault,
+) -> anyhow::Result<()> {
+    OWNER_ENROLLMENT_TEST_FAULT.with(|slot| {
+        let mut fault = slot.borrow_mut();
+        if fault
+            .as_ref()
+            .is_some_and(|(path, selected)| path == data_dir && *selected == point)
+        {
+            *fault = None;
+            anyhow::bail!("injected owner persistence failure");
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn owner_attestation_for_test(
+    challenge: &str,
+    rp: &str,
+    origin: &str,
+) -> elastos_identity::RegistrationResponse {
+    passkey_attestation_with_id_for_test(challenge, rp, origin, b"synthetic-owner")
+}
+
+#[cfg(test)]
+pub(crate) fn passkey_attestation_with_id_for_test(
+    challenge: &str,
+    rp: &str,
+    origin: &str,
+    id: &[u8],
+) -> elastos_identity::RegistrationResponse {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut auth_data = Sha256::digest(rp.as_bytes()).to_vec();
+    auth_data.push(0x45);
+    auth_data.extend_from_slice(&[0; 20]);
+    auth_data.extend_from_slice(&(id.len() as u16).to_be_bytes());
+    auth_data.extend_from_slice(id);
+    auth_data.extend_from_slice(
+        &hex::decode(concat!(
+            "a5010203262001215820",
+            "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
+            "225820",
+            "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+        ))
+        .unwrap(),
+    );
+    // Fixed fmt:none CBOR fixture, as in the HTTPS guest registration test.
+    let mut attestation =
+        hex::decode("a363666d74646e6f6e656761747453746d74a0686175746844617461").unwrap();
+    attestation.extend_from_slice(&[0x58, u8::try_from(auth_data.len()).unwrap()]);
+    attestation.extend_from_slice(&auth_data);
+    serde_json::from_value(serde_json::json!({"id": URL_SAFE_NO_PAD.encode(id), "rawId": URL_SAFE_NO_PAD.encode(id), "type": "public-key", "response": {"clientDataJson": URL_SAFE_NO_PAD.encode(serde_json::json!({"type": "webauthn.create", "challenge": challenge, "origin": origin, "crossOrigin": false}).to_string()), "attestationObject": URL_SAFE_NO_PAD.encode(attestation)}})).unwrap()
+}
+
+#[cfg(test)]
+mod guest_registration_tests {
+    use super::*;
+
+    fn client(claim: &str) -> GuestRegistrationClient<'_> {
+        GuestRegistrationClient {
+            origin: "http://localhost:61180",
+            rp_id: "localhost",
+            client_claim: claim,
+        }
+    }
+
+    fn fixture() -> (tempfile::TempDir, elastos_identity::IdentityManager) {
+        let root = tempfile::tempdir().unwrap();
+        let mut identity = elastos_identity::IdentityManager::new(root.path().into()).unwrap();
+        let secret = random_secret_hex();
+        let owner = OwnerAdmission {
+            origin: client(&secret).origin,
+            rp_id: "localhost",
+            claimant: &secret,
+            loopback: true,
+        };
+        let (_, options) =
+            begin_owner_enrollment(root.path(), &mut identity, &owner, "owner", now_ts())
+                .unwrap()
+                .unwrap();
+        let response = owner_attestation_for_test(
+            &options.unwrap().public_key.challenge,
+            "localhost",
+            owner.origin,
+        );
+        complete_owner_enrollment(
+            root.path(),
+            &mut identity,
+            &owner,
+            "owner",
+            Some(&response),
+            None,
+            now_ts(),
+        )
+        .unwrap()
+        .unwrap();
+        set_guest_registration_enabled(root.path(), true, now_ts()).unwrap();
+        (root, identity)
+    }
+
+    fn begin(
+        root: &Path,
+        identity: &mut elastos_identity::IdentityManager,
+        claim: &str,
+        id: &str,
+    ) -> elastos_identity::RegistrationResponse {
+        let options = begin_guest_registration(
+            root,
+            identity,
+            &client(claim),
+            id,
+            &PasskeyEnrollmentIntent::Recover {},
+        )
+        .unwrap();
+        passkey_attestation_with_id_for_test(
+            &options.public_key.challenge,
+            "localhost",
+            client(claim).origin,
+            id.as_bytes(),
+        )
+    }
+
+    #[test]
+    fn guest_registration_restart_reconciles_each_effect_boundary_once() {
+        for fault in [
+            OwnerEnrollmentTestFault::BeforeCredential,
+            OwnerEnrollmentTestFault::AfterCredential,
+            OwnerEnrollmentTestFault::BeforeTerminal,
+            OwnerEnrollmentTestFault::AfterTerminal,
+        ] {
+            let (root, mut identity) = fixture();
+            let claim = random_secret_hex();
+            let response = begin(root.path(), &mut identity, &claim, "guest");
+            let intent = PasskeyEnrollmentIntent::Recover {};
+            fail_owner_enrollment_once_for_test(root.path(), fault);
+            assert!(complete_guest_registration(
+                root.path(),
+                &mut identity,
+                &client(&claim),
+                "guest",
+                &response,
+                &intent
+            )
+            .is_err());
+            drop(identity);
+            let mut identity = elastos_identity::IdentityManager::new(root.path().into()).unwrap();
+            let auth_before = std::fs::read(auth_state_path(root.path()).unwrap()).unwrap();
+            assert!(complete_guest_registration(
+                root.path(),
+                &mut identity,
+                &client(&random_secret_hex()),
+                "guest",
+                &response,
+                &intent
+            )
+            .is_err());
+            assert_eq!(
+                std::fs::read(auth_state_path(root.path()).unwrap()).unwrap(),
+                auth_before
+            );
+            let grant = complete_guest_registration(
+                root.path(),
+                &mut identity,
+                &client(&claim),
+                "guest",
+                &response,
+                &intent,
+            )
+            .unwrap();
+            let replay = complete_guest_registration(
+                root.path(),
+                &mut identity,
+                &client(&claim),
+                "guest",
+                &response,
+                &intent,
+            )
+            .unwrap();
+            assert_eq!(grant.session_id, replay.session_id);
+            let state = load_auth_state(root.path()).unwrap();
+            assert_eq!(state.principals.len(), 2);
+            assert_eq!(state.sessions.len(), 2);
+            assert_eq!(identity.credentials().len(), 2);
+            assert_eq!(
+                state
+                    .principals
+                    .iter()
+                    .filter(|p| p.role == RuntimePrincipalRole::Guest)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn guest_registration_concurrent_ceremonies_and_retries_preserve_grants() {
+        for same_ceremony in [false, true] {
+            let (root, mut identity) = fixture();
+            let claim = random_secret_hex();
+            let first = begin(root.path(), &mut identity, &claim, "first");
+            let second = if same_ceremony {
+                None
+            } else {
+                Some(begin(root.path(), &mut identity, &claim, "second"))
+            };
+            // Persist both verified candidates, then restart each independent caller.
+            for (id, response) in [("first", Some(&first)), ("second", second.as_ref())] {
+                if let Some(response) = response {
+                    fail_owner_enrollment_once_for_test(
+                        root.path(),
+                        OwnerEnrollmentTestFault::BeforeCredential,
+                    );
+                    assert!(complete_guest_registration(
+                        root.path(),
+                        &mut identity,
+                        &client(&claim),
+                        id,
+                        response,
+                        &PasskeyEnrollmentIntent::Recover {}
+                    )
+                    .is_err());
+                }
+            }
+            let barrier = std::sync::Barrier::new(2);
+            let grants = std::thread::scope(|scope| {
+                let launch = |id, response| {
+                    let barrier = &barrier;
+                    let claim = &claim;
+                    let root = root.path();
+                    scope.spawn(move || {
+                        let mut identity =
+                            elastos_identity::IdentityManager::new(root.into()).unwrap();
+                        barrier.wait();
+                        complete_guest_registration(
+                            root,
+                            &mut identity,
+                            &client(claim),
+                            id,
+                            response,
+                            &PasskeyEnrollmentIntent::Recover {},
+                        )
+                        .unwrap()
+                    })
+                };
+                let a = launch("first", &first);
+                let b = launch(
+                    if same_ceremony { "first" } else { "second" },
+                    second.as_ref().unwrap_or(&first),
+                );
+                (a.join().unwrap(), b.join().unwrap())
+            });
+            assert_eq!(grants.0.session_id == grants.1.session_id, same_ceremony);
+            let state = load_auth_state(root.path()).unwrap();
+            assert_eq!(state.principals.len(), if same_ceremony { 2 } else { 3 });
+            assert_eq!(state.sessions.len(), state.principals.len());
+        }
+    }
+
+    #[test]
+    fn guest_registration_terminal_replay_requires_original_expiry_and_current_policy() {
+        for denial in ["expiry", "session", "guest", "admin", "policy"] {
+            let (root, mut identity) = fixture();
+            let claim = random_secret_hex();
+            let response = begin(root.path(), &mut identity, &claim, "guest");
+            let intent = PasskeyEnrollmentIntent::Recover {};
+            let grant = complete_guest_registration(
+                root.path(),
+                &mut identity,
+                &client(&claim),
+                "guest",
+                &response,
+                &intent,
+            )
+            .unwrap();
+            mutate_auth_state(root.path(), |state| {
+                match denial {
+                    "expiry" => {
+                        state.guest_registrations[0]
+                            .terminal
+                            .as_mut()
+                            .unwrap()
+                            .expires_at = now_ts() - 1;
+                        state
+                            .sessions
+                            .iter_mut()
+                            .find(|s| s.grant.session_id == grant.session_id)
+                            .unwrap()
+                            .grant
+                            .expires_at = now_ts() + 3600;
+                    }
+                    "session" => {
+                        state
+                            .sessions
+                            .iter_mut()
+                            .find(|s| s.grant.session_id == grant.session_id)
+                            .unwrap()
+                            .revoked_at = Some(now_ts())
+                    }
+                    "guest" | "admin" => {
+                        state
+                            .principals
+                            .iter_mut()
+                            .find(|p| {
+                                (p.role == RuntimePrincipalRole::Guest) == (denial == "guest")
+                            })
+                            .unwrap()
+                            .proof_binding
+                            .passkey
+                            .as_mut()
+                            .unwrap()
+                            .revoked_at = Some(now_ts())
+                    }
+                    "policy" => state.guest_registration_enabled = false,
+                    _ => unreachable!(),
+                }
+                Ok(())
+            })
+            .unwrap();
+            let before = std::fs::read(auth_state_path(root.path()).unwrap()).unwrap();
+            assert!(
+                complete_guest_registration(
+                    root.path(),
+                    &mut identity,
+                    &client(&claim),
+                    "guest",
+                    &response,
+                    &intent
+                )
+                .is_err(),
+                "{denial}"
+            );
+            assert_eq!(
+                std::fs::read(auth_state_path(root.path()).unwrap()).unwrap(),
+                before
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod owner_enrollment_tests {
+    use super::*;
+
+    fn local(claimant: &str) -> OwnerAdmission<'_> {
+        OwnerAdmission {
+            origin: "http://localhost:61180",
+            rp_id: "localhost",
+            claimant,
+            loopback: true,
+        }
+    }
+
+    fn complete_intent(
+        root: &Path,
+        identity: &mut elastos_identity::IdentityManager,
+        secret: &str,
+        response: Option<&elastos_identity::RegistrationResponse>,
+        intent: Option<&PasskeyEnrollmentIntent>,
+    ) -> anyhow::Result<Option<AuthSessionGrantV1>> {
+        complete_owner_enrollment_with_intent(
+            root,
+            identity,
+            &local(secret),
+            "intent",
+            response,
+            OwnerEnrollmentCompletion {
+                intent,
+                names: OwnerEnrollmentNames {
+                    display_name: None,
+                    profile_display_name: None,
+                },
+            },
+            now_ts(),
+        )
+    }
+
+    #[test]
+    fn owner_enrollment_intent_validates_name_and_strict_shape() {
+        assert!(
+            validate_owner_enrollment_intent(Some(&PasskeyEnrollmentIntent::Create {
+                public_name: "Person".into(),
+            }))
+            .is_ok()
+        );
+        for value in [
+            serde_json::json!({"purpose": "recover", "public_name": "Alice"}),
+            serde_json::json!({"purpose": "create"}),
+            serde_json::json!({"purpose": "other"}),
+        ] {
+            assert!(
+                serde_json::from_value::<PasskeyEnrollmentIntent>(value.clone()).is_err(),
+                "accepted invalid owner enrollment intent: {value}"
+            );
+        }
+        for name in [
+            "".into(),
+            " ".into(),
+            "Alice\nSmith".into(),
+            "a/b".into(),
+            "x".repeat(65),
+            " Alice ".into(),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let secret = random_secret_hex();
+            let mut identity = elastos_identity::IdentityManager::new(root.path().into()).unwrap();
+            assert!(begin_owner_enrollment_with_intent(
+                root.path(),
+                &mut identity,
+                &local(&secret),
+                "intent",
+                Some(&PasskeyEnrollmentIntent::Create { public_name: name }),
+                now_ts(),
+            )
+            .is_err());
+            assert!(identity.credentials().is_empty());
+            assert!(load_auth_state(root.path())
+                .unwrap()
+                .owner_enrollment
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn owner_enrollment_intent_is_bound_before_attestation() {
+        for intent in [
+            PasskeyEnrollmentIntent::Create {
+                public_name: "Alice".into(),
+            },
+            PasskeyEnrollmentIntent::Recover {},
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let secret = random_secret_hex();
+            let mut identity = elastos_identity::IdentityManager::new(root.path().into()).unwrap();
+            let (_, options) = begin_owner_enrollment_with_intent(
+                root.path(),
+                &mut identity,
+                &local(&secret),
+                "intent",
+                Some(&intent),
+                now_ts(),
+            )
+            .unwrap()
+            .unwrap();
+            let challenge = options.unwrap().public_key.challenge;
+            let response =
+                owner_attestation_for_test(&challenge, "localhost", local(&secret).origin);
+            drop(identity);
+            let mut identity = elastos_identity::IdentityManager::new(root.path().into()).unwrap();
+            let auth_before = std::fs::read(auth_state_path(root.path()).unwrap()).unwrap();
+            for replacement in [
+                None,
+                Some(PasskeyEnrollmentIntent::Create {
+                    public_name: "Other".into(),
+                }),
+                Some(match intent {
+                    PasskeyEnrollmentIntent::Create { .. } => PasskeyEnrollmentIntent::Recover {},
+                    PasskeyEnrollmentIntent::Recover {} => PasskeyEnrollmentIntent::Create {
+                        public_name: "Alice".into(),
+                    },
+                }),
+            ] {
+                assert!(begin_owner_enrollment_with_intent(
+                    root.path(),
+                    &mut identity,
+                    &local(&secret),
+                    "new-page",
+                    replacement.as_ref(),
+                    now_ts(),
+                )
+                .is_err());
+                assert!(complete_intent(
+                    root.path(),
+                    &mut identity,
+                    &secret,
+                    Some(&response),
+                    replacement.as_ref()
+                )
+                .is_err());
+                assert_eq!(
+                    std::fs::read(auth_state_path(root.path()).unwrap()).unwrap(),
+                    auth_before
+                );
+                assert!(identity.credentials().is_empty());
+            }
+            let (ceremony, options) = begin_owner_enrollment_with_intent(
+                root.path(),
+                &mut identity,
+                &local(&secret),
+                "new-page",
+                Some(&intent),
+                now_ts(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(ceremony, "intent");
+            assert_eq!(options.unwrap().public_key.challenge, challenge);
+            assert_eq!(
+                load_auth_state(root.path())
+                    .unwrap()
+                    .owner_enrollment
+                    .unwrap()
+                    .purpose,
+                "first-owner"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_enrollment_intent_survives_verified_and_consumed_retries() {
+        for intent in [
+            PasskeyEnrollmentIntent::Create {
+                public_name: "Alice".into(),
+            },
+            PasskeyEnrollmentIntent::Recover {},
+        ] {
+            for fault in [
+                OwnerEnrollmentTestFault::BeforeCredential,
+                OwnerEnrollmentTestFault::AfterCredential,
+                OwnerEnrollmentTestFault::BeforeTerminal,
+                OwnerEnrollmentTestFault::AfterTerminal,
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let secret = random_secret_hex();
+                let mut identity =
+                    elastos_identity::IdentityManager::new(root.path().into()).unwrap();
+                let (_, options) = begin_owner_enrollment_with_intent(
+                    root.path(),
+                    &mut identity,
+                    &local(&secret),
+                    "intent",
+                    Some(&intent),
+                    now_ts(),
+                )
+                .unwrap()
+                .unwrap();
+                let response = owner_attestation_for_test(
+                    &options.unwrap().public_key.challenge,
+                    "localhost",
+                    local(&secret).origin,
+                );
+                fail_owner_enrollment_once_for_test(root.path(), fault);
+                assert!(complete_intent(
+                    root.path(),
+                    &mut identity,
+                    &secret,
+                    Some(&response),
+                    Some(&intent)
+                )
+                .is_err());
+                drop(identity);
+                let mut identity =
+                    elastos_identity::IdentityManager::new(root.path().into()).unwrap();
+                let auth_before = std::fs::read(auth_state_path(root.path()).unwrap()).unwrap();
+                let credentials_before = identity.credentials();
+                for replacement in [
+                    None,
+                    Some(PasskeyEnrollmentIntent::Create {
+                        public_name: "Other".into(),
+                    }),
+                    Some(match intent {
+                        PasskeyEnrollmentIntent::Create { .. } => {
+                            PasskeyEnrollmentIntent::Recover {}
+                        }
+                        PasskeyEnrollmentIntent::Recover {} => PasskeyEnrollmentIntent::Create {
+                            public_name: "Alice".into(),
+                        },
+                    }),
+                ] {
+                    assert!(complete_intent(
+                        root.path(),
+                        &mut identity,
+                        &secret,
+                        None,
+                        replacement.as_ref()
+                    )
+                    .is_err());
+                }
+                assert!(complete_intent(
+                    root.path(),
+                    &mut identity,
+                    &random_secret_hex(),
+                    None,
+                    Some(&intent)
+                )
+                .is_err());
+                assert!(complete_owner_enrollment_with_intent(
+                    root.path(),
+                    &mut identity,
+                    &local(&secret),
+                    "intent",
+                    None,
+                    OwnerEnrollmentCompletion {
+                        intent: Some(&intent),
+                        names: OwnerEnrollmentNames {
+                            display_name: None,
+                            profile_display_name: Some("Injected"),
+                        }
+                    },
+                    now_ts(),
+                )
+                .is_err());
+                assert_eq!(
+                    std::fs::read(auth_state_path(root.path()).unwrap()).unwrap(),
+                    auth_before
+                );
+                assert_eq!(
+                    serde_json::to_value(identity.credentials()).unwrap(),
+                    serde_json::to_value(credentials_before).unwrap()
+                );
+                let grant =
+                    complete_intent(root.path(), &mut identity, &secret, None, Some(&intent))
+                        .unwrap()
+                        .unwrap();
+                let replay = complete_intent(
+                    root.path(),
+                    &mut identity,
+                    &secret,
+                    Some(&response),
+                    Some(&intent),
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(grant.session_id, replay.session_id);
+                let auth = load_auth_state(root.path()).unwrap();
+                assert_eq!(
+                    (
+                        auth.principals.len(),
+                        auth.sessions.len(),
+                        identity.credentials().len()
+                    ),
+                    (1, 1, 1)
+                );
+                let expected_name = match &intent {
+                    PasskeyEnrollmentIntent::Create { public_name } => Some(public_name.clone()),
+                    PasskeyEnrollmentIntent::Recover {} => None,
+                };
+                assert_eq!(
+                    auth.principals[0].initial_profile_display_name,
+                    expected_name
+                );
+                assert_eq!(auth.principals[0].role, RuntimePrincipalRole::Admin);
+                let OwnerEnrollmentPhase::Consumed { verification, .. } =
+                    auth.owner_enrollment.unwrap().phase
+                else {
+                    panic!("enrollment did not settle");
+                };
+                assert_eq!(verification.intent, Some(intent.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn owner_enrollment_native_label_is_not_public_profile_consent() {
+        let root = tempfile::tempdir().unwrap();
+        let secret = random_secret_hex();
+        let mut identity = elastos_identity::IdentityManager::new(root.path().into()).unwrap();
+        let (_, options) = begin_owner_enrollment(
+            root.path(),
+            &mut identity,
+            &local(&secret),
+            "native",
+            now_ts(),
+        )
+        .unwrap()
+        .unwrap();
+        let response = owner_attestation_for_test(
+            &options.unwrap().public_key.challenge,
+            "localhost",
+            local(&secret).origin,
+        );
+        complete_owner_enrollment(
+            root.path(),
+            &mut identity,
+            &local(&secret),
+            "native",
+            Some(&response),
+            Some("Private label"),
+            now_ts(),
+        )
+        .unwrap()
+        .unwrap();
+        let auth = load_auth_state(root.path()).unwrap();
+        assert_eq!(auth.principals[0].display_name, "Private label");
+        assert!(auth.principals[0].initial_profile_display_name.is_none());
+        let OwnerEnrollmentPhase::Consumed { verification, .. } =
+            auth.owner_enrollment.unwrap().phase
+        else {
+            panic!("enrollment did not settle");
+        };
+        assert!(verification.intent.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_enrollment_public_admission_is_exact_expiring_and_digest_only() {
+        let root = tempfile::tempdir().unwrap();
+        let secret =
+            arm_owner_enrollment(root.path(), "https://home.example", "home.example", 300).unwrap();
+        let auth_path = auth_state_path(root.path()).unwrap();
+        let before = std::fs::read(&auth_path).unwrap();
+        assert!(!String::from_utf8_lossy(&before).contains(secret.as_str()));
+        let mut identity = elastos_identity::IdentityManager::new(root.path().into()).unwrap();
+        let exact = OwnerAdmission {
+            origin: "https://home.example",
+            rp_id: "home.example",
+            claimant: &secret,
+            loopback: false,
+        };
+        for request in [
+            OwnerAdmission {
+                origin: "https://other.example",
+                ..exact
+            },
+            OwnerAdmission {
+                rp_id: "other.example",
+                ..exact
+            },
+            OwnerAdmission {
+                claimant: "",
+                ..exact
+            },
+            OwnerAdmission {
+                claimant: "malformed",
+                ..exact
+            },
+        ] {
+            assert!(begin_owner_enrollment(
+                root.path(),
+                &mut identity,
+                &request,
+                "denied",
+                now_ts()
+            )
+            .is_err());
+            assert_eq!(std::fs::read(&auth_path).unwrap(), before);
+        }
+        let (_, options) =
+            begin_owner_enrollment(root.path(), &mut identity, &exact, "public", now_ts())
+                .unwrap()
+                .unwrap();
+        let response = owner_attestation_for_test(
+            &options.unwrap().public_key.challenge,
+            exact.rp_id,
+            exact.origin,
+        );
+        mutate_auth_state(root.path(), |state| {
+            state.owner_enrollment.as_mut().unwrap().expires_at = now_ts() - 1;
+            Ok(())
+        })
+        .unwrap();
+        let expired = std::fs::read(&auth_path).unwrap();
+        assert!(complete_owner_enrollment(
+            root.path(),
+            &mut identity,
+            &exact,
+            "public",
+            Some(&response),
+            None,
+            now_ts()
+        )
+        .is_err());
+        assert!(
+            begin_owner_enrollment(root.path(), &mut identity, &exact, "new", now_ts()).is_err()
+        );
+        assert_eq!(std::fs::read(&auth_path).unwrap(), expired);
+        assert!(!identity.has_credential_history());
+        assert!(load_auth_state(root.path()).unwrap().sessions.is_empty());
+    }
+
+    #[test]
+    fn owner_enrollment_concurrent_claims_and_completions_have_one_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let attempts = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..2)
+                .map(|index| {
+                    let root = root.path();
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let secret = random_secret_hex();
+                        let ceremony = format!("claim-{index}");
+                        let mut identity =
+                            elastos_identity::IdentityManager::new(root.into()).unwrap();
+                        barrier.wait();
+                        let result = begin_owner_enrollment(
+                            root,
+                            &mut identity,
+                            &local(&secret),
+                            &ceremony,
+                            now_ts(),
+                        );
+                        (secret, result)
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            attempts.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        let (secret, result) = attempts
+            .into_iter()
+            .find(|(_, result)| result.is_ok())
+            .unwrap();
+        let (ceremony, options) = result.unwrap().unwrap();
+        let response = serde_json::to_vec(&owner_attestation_for_test(
+            &options.unwrap().public_key.challenge,
+            "localhost",
+            local(&secret).origin,
+        ))
+        .unwrap();
+        let grants = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (root, barrier, secret, ceremony, response) =
+                        (root.path(), &barrier, &secret, &ceremony, &response);
+                    scope.spawn(move || {
+                        let mut identity =
+                            elastos_identity::IdentityManager::new(root.into()).unwrap();
+                        let response = serde_json::from_slice(response).unwrap();
+                        barrier.wait();
+                        complete_owner_enrollment(
+                            root,
+                            &mut identity,
+                            &local(secret),
+                            ceremony,
+                            Some(&response),
+                            None,
+                            now_ts(),
+                        )
+                        .unwrap()
+                        .unwrap()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(grants[0].grant_id, grants[1].grant_id);
+        let auth = load_auth_state(root.path()).unwrap();
+        assert_eq!(
+            (auth.principals.len(), auth.sessions.len(), auth.audit.len()),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            elastos_identity::IdentityManager::new(root.path().into())
+                .unwrap()
+                .credentials()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn owner_enrollment_recovery_preserves_counter_and_rejects_revoked_credential() {
+        for revoke in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let secret = random_secret_hex();
+            let mut identity = elastos_identity::IdentityManager::new(root.path().into()).unwrap();
+            let (_, options) = begin_owner_enrollment(
+                root.path(),
+                &mut identity,
+                &local(&secret),
+                "counter",
+                now_ts(),
+            )
+            .unwrap()
+            .unwrap();
+            let response = owner_attestation_for_test(
+                &options.unwrap().public_key.challenge,
+                "localhost",
+                local(&secret).origin,
+            );
+            fail_owner_enrollment_once_for_test(
+                root.path(),
+                OwnerEnrollmentTestFault::AfterCredential,
+            );
+            assert!(complete_owner_enrollment(
+                root.path(),
+                &mut identity,
+                &local(&secret),
+                "counter",
+                Some(&response),
+                None,
+                now_ts()
+            )
+            .is_err());
+            let mut store = elastos_identity::IdentityStore::new(root.path()).unwrap();
+            store.load().unwrap();
+            let id = store.get_credentials()[0].credential_id.clone();
+            if revoke {
+                assert!(store.remove_credential(&id));
+            } else {
+                store.update_sign_count(&id, 9);
+            }
+            store.save().unwrap();
+            let credential_bytes =
+                std::fs::read(root.path().join("identity/credentials.json")).unwrap();
+            let auth_bytes = std::fs::read(auth_state_path(root.path()).unwrap()).unwrap();
+            let result = complete_owner_enrollment(
+                root.path(),
+                &mut identity,
+                &local(&secret),
+                "counter",
+                None,
+                None,
+                now_ts(),
+            );
+            if revoke {
+                assert!(result.is_err());
+                assert_eq!(
+                    std::fs::read(auth_state_path(root.path()).unwrap()).unwrap(),
+                    auth_bytes
+                );
+                assert!(load_auth_state(root.path()).unwrap().principals.is_empty());
+            } else {
+                assert!(result.unwrap().is_some());
+                assert_eq!(identity.credentials()[0].sign_count, 9);
+                assert_eq!(
+                    load_auth_state(root.path()).unwrap().principals[0]
+                        .proof_binding
+                        .passkey
+                        .as_ref()
+                        .unwrap()
+                        .sign_count,
+                    9
+                );
+            }
+            assert_eq!(
+                std::fs::read(root.path().join("identity/credentials.json")).unwrap(),
+                credential_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn owner_enrollment_expired_local_attempt_can_restart_but_history_cannot() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(rooted_localhost_fs_path(root.path(), "Users").unwrap()).unwrap();
+        let mut identity = elastos_identity::IdentityManager::new(root.path().into()).unwrap();
+        let secret = random_secret_hex();
+        let first = begin_owner_enrollment(
+            root.path(),
+            &mut identity,
+            &local(&secret),
+            "first",
+            now_ts(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(first.1.is_some());
+        mutate_auth_state(root.path(), |state| {
+            state.owner_enrollment.as_mut().unwrap().expires_at = now_ts() - 1;
+            Ok(())
+        })
+        .unwrap();
+        let next_secret = random_secret_hex();
+        let next = begin_owner_enrollment(
+            root.path(),
+            &mut identity,
+            &local(&next_secret),
+            "next",
+            now_ts(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(next.0, "next");
+        assert!(begin_owner_enrollment(
+            root.path(),
+            &mut identity,
+            &local(&secret),
+            "old",
+            now_ts()
+        )
+        .is_err());
+        let response = owner_attestation_for_test(
+            &next.1.unwrap().public_key.challenge,
+            "localhost",
+            local(&next_secret).origin,
+        );
+        complete_owner_enrollment(
+            root.path(),
+            &mut identity,
+            &local(&next_secret),
+            "next",
+            Some(&response),
+            None,
+            now_ts(),
+        )
+        .unwrap();
+        // Revoking/count changes never make an owned Runtime fresh again.
+        mutate_auth_state(root.path(), |state| {
+            for principal in &mut state.principals {
+                principal.proof_binding.passkey.as_mut().unwrap().revoked_at = Some(now_ts());
+            }
+            Ok(())
+        })
+        .unwrap();
+        let bytes = std::fs::read(auth_state_path(root.path()).unwrap()).unwrap();
+        assert!(
+            arm_owner_enrollment(root.path(), "https://home.example", "home.example", 300).is_err()
+        );
+        assert_eq!(
+            std::fs::read(auth_state_path(root.path()).unwrap()).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn owner_enrollment_restart_recovers_exact_candidate_and_one_terminal_grant() {
+        for fault in [
+            OwnerEnrollmentTestFault::BeforeCredential,
+            OwnerEnrollmentTestFault::AfterCredential,
+            OwnerEnrollmentTestFault::BeforeTerminal,
+            OwnerEnrollmentTestFault::AfterTerminal,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let secret = random_secret_hex();
+            let mut identity = elastos_identity::IdentityManager::new(root.path().into()).unwrap();
+            let (_, options) = begin_owner_enrollment(
+                root.path(),
+                &mut identity,
+                &local(&secret),
+                "one-operation",
+                now_ts(),
+            )
+            .unwrap()
+            .unwrap();
+            let response = owner_attestation_for_test(
+                &options.unwrap().public_key.challenge,
+                "localhost",
+                local(&secret).origin,
+            );
+            fail_owner_enrollment_once_for_test(root.path(), fault);
+            assert!(complete_owner_enrollment(
+                root.path(),
+                &mut identity,
+                &local(&secret),
+                "one-operation",
+                Some(&response),
+                Some("Owner"),
+                now_ts()
+            )
+            .is_err());
+            drop(identity);
+            let mut identity = elastos_identity::IdentityManager::new(root.path().into()).unwrap();
+            let wrong = random_secret_hex();
+            assert!(complete_owner_enrollment(
+                root.path(),
+                &mut identity,
+                &local(&wrong),
+                "one-operation",
+                None,
+                None,
+                now_ts()
+            )
+            .is_err());
+            if fault != OwnerEnrollmentTestFault::AfterTerminal {
+                mutate_auth_state(root.path(), |state| {
+                    state.owner_enrollment.as_mut().unwrap().expires_at = now_ts() - 1;
+                    Ok(())
+                })
+                .unwrap();
+                let resume = begin_owner_enrollment(
+                    root.path(),
+                    &mut identity,
+                    &local(&secret),
+                    "new-page",
+                    now_ts(),
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(resume.0, "one-operation");
+                assert!(resume.1.is_none());
+            }
+            let grant = complete_owner_enrollment(
+                root.path(),
+                &mut identity,
+                &local(&secret),
+                "one-operation",
+                None,
+                None,
+                now_ts(),
+            )
+            .unwrap()
+            .unwrap();
+            let replay = complete_owner_enrollment(
+                root.path(),
+                &mut identity,
+                &local(&secret),
+                "one-operation",
+                None,
+                None,
+                now_ts(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(&grant).unwrap(),
+                serde_json::to_value(replay).unwrap()
+            );
+            let auth = load_auth_state(root.path()).unwrap();
+            assert_eq!(
+                (
+                    identity.credentials().len(),
+                    auth.principals.len(),
+                    auth.sessions.len(),
+                    auth.audit.len()
+                ),
+                (1, 1, 1, 1)
+            );
+            assert_eq!(auth.principals[0].role, RuntimePrincipalRole::Admin);
+            assert_eq!(auth.principals[0].display_name, "Owner");
+            assert!(matches!(
+                auth.owner_enrollment.unwrap().phase,
+                OwnerEnrollmentPhase::Consumed { .. }
+            ));
+            mutate_auth_state(root.path(), |state| {
+                state.sessions[0].grant.expires_at = now_ts() - 1;
+                Ok(())
+            })
+            .unwrap();
+            assert!(complete_owner_enrollment(
+                root.path(),
+                &mut identity,
+                &local(&secret),
+                "one-operation",
+                None,
+                None,
+                now_ts()
+            )
+            .is_err());
+            assert_eq!(load_auth_state(root.path()).unwrap().sessions.len(), 1);
+        }
+    }
+}
+
+pub(crate) fn owner_setup_pending(data_dir: &Path) -> anyhow::Result<bool> {
+    Ok(load_auth_state(data_dir)?
+        .owner_enrollment
+        .is_some_and(|record| matches!(record.phase, OwnerEnrollmentPhase::Verified { .. })))
+}
+
+pub(crate) fn confirmed_initial_profile_name(
+    data_dir: &Path,
+    grant: &AuthSessionGrantV1,
+) -> anyhow::Result<Option<String>> {
+    let state = load_auth_state(data_dir)?;
+    if !state.sessions.iter().any(|s| {
+        s.grant.grant_id == grant.grant_id
+            && s.grant.session_id == grant.session_id
+            && s.grant.principal_id == grant.principal_id
+            && s.grant.proof_binding_id == grant.proof_binding_id
+            && s.revoked_at.is_none()
+            && s.grant.expires_at > now_ts()
+    }) {
+        return enrollment_denied();
+    }
+    let principal = state
+        .principals
+        .iter()
+        .find(|p| {
+            p.principal_id == grant.principal_id && p.proof_binding_id == grant.proof_binding_id
+        })
+        .ok_or(OwnerEnrollmentDenied)?;
+    ensure_proof_binding_not_revoked(principal)?;
+    Ok(principal.initial_profile_display_name.clone())
+}
+
 pub fn auth_state_path(data_dir: &Path) -> anyhow::Result<PathBuf> {
     rooted_localhost_fs_path(data_dir, AUTH_STATE_ROOT)
         .ok_or_else(|| anyhow!("invalid auth state root"))
         .map(|root| root.join(AUTH_STATE_FILE))
+}
+
+pub(crate) enum PasskeySessionPurpose {
+    SignIn,
+    GuestRegistration,
+}
+
+pub(crate) struct PasskeySessionRequest<'a> {
+    pub credential: &'a elastos_identity::StoredCredential,
+    pub origin: &'a str,
+    pub user_verified: bool,
+    pub display_name: Option<&'a str>,
+    pub profile_display_name: Option<&'a str>,
+    pub reason: &'a str,
+    pub purpose: PasskeySessionPurpose,
+}
+
+/// Enrollment alone creates Admin. Guest registration and sign-in use their
+/// existing policies under the same auth mutation lock as enrollment.
+pub(crate) fn grant_passkey_session(
+    data_dir: &Path,
+    request: PasskeySessionRequest<'_>,
+) -> anyhow::Result<AuthSessionGrantV1> {
+    mutate_auth_state(data_dir, |state| {
+        grant_passkey_session_in_state(data_dir, state, request, now_ts())
+    })
+}
+
+fn grant_passkey_session_in_state(
+    data_dir: &Path,
+    state: &mut AuthState,
+    request: PasskeySessionRequest<'_>,
+    now: u64,
+) -> anyhow::Result<AuthSessionGrantV1> {
+    let credential = request.credential;
+    let mut binding =
+        ProofBinding::passkey_webauthn(elastos_runtime::auth::PasskeyWebAuthnBinding {
+            credential_id: credential.credential_id.clone(),
+            public_key: credential.public_key.clone(),
+            sign_count: credential.sign_count,
+            user_verified: request.user_verified,
+            origin: request.origin.into(),
+            rp_id: credential.rp_id.clone(),
+            created_at: now,
+            last_used_at: now,
+            revoked_at: None,
+        });
+    if !request.user_verified {
+        return enrollment_denied();
+    }
+    let display_name = clean_principal_display_name(request.display_name)?;
+    let profile_display_name = clean_principal_display_name(request.profile_display_name)?;
+    {
+        let existing = state
+            .principals
+            .iter_mut()
+            .find(|principal| principal.proof_binding_id == binding.id());
+        let principal = match request.purpose {
+            PasskeySessionPurpose::SignIn => {
+                let principal = existing.ok_or(OwnerEnrollmentDenied)?;
+                ensure_proof_binding_not_revoked(principal)?;
+                if profile_display_name.is_some()
+                    && profile_display_name != principal.initial_profile_display_name
+                {
+                    return enrollment_denied();
+                }
+                let passkey = principal
+                    .proof_binding
+                    .passkey
+                    .as_ref()
+                    .ok_or(OwnerEnrollmentDenied)?;
+                if passkey.public_key != credential.public_key
+                    || passkey.rp_id != credential.rp_id
+                    || credential.sign_count < passkey.sign_count
+                {
+                    return enrollment_denied();
+                }
+                preserve_passkey_binding_metadata(&mut binding, &principal.proof_binding);
+                principal.proof_binding = binding;
+                principal.updated_at = now;
+                principal.clone()
+            }
+            PasskeySessionPurpose::GuestRegistration => {
+                if existing.is_some()
+                    || !state.guest_registration_enabled
+                    || !state.principals.iter().any(|principal| {
+                        principal.role == RuntimePrincipalRole::Admin
+                            && principal
+                                .proof_binding
+                                .passkey
+                                .as_ref()
+                                .is_some_and(|passkey| passkey.revoked_at.is_none())
+                    })
+                {
+                    return enrollment_denied();
+                }
+                let principal_id =
+                    passkey_credential_principal_id(&credential.rp_id, &credential.credential_id)?;
+                let principal = PrincipalRecord {
+                    localhost_root: principal_localhost_root(&principal_id),
+                    principal_id,
+                    proof_binding_id: binding.id(),
+                    proof_binding: binding,
+                    display_name: display_name.unwrap_or_default(),
+                    initial_profile_display_name: profile_display_name,
+                    role: RuntimePrincipalRole::Guest,
+                    created_at: now,
+                    updated_at: now,
+                };
+                state.principals.push(principal.clone());
+                principal
+            }
+        };
+        let grant = AuthSessionGrantV1 {
+            schema: AuthSessionGrantV1::SCHEMA.into(),
+            grant_id: format!("grant:{}", random_secret_hex()),
+            session_id: format!("auth:{}", random_secret_hex()),
+            principal_id: principal.principal_id,
+            proof_binding_id: principal.proof_binding_id,
+            issued_at: now,
+            expires_at: now.saturating_add(AUTH_SESSION_TTL_SECS),
+            apps: vec!["home".into(), "system".into()],
+        };
+        let event = sign_audit_event(
+            data_dir,
+            RuntimeAuditEventV1 {
+                schema: RuntimeAuditEventV1::SCHEMA.into(),
+                event_id: format!("audit:{}", random_secret_hex()),
+                event_type: "auth.session.granted".into(),
+                principal_id: Some(grant.principal_id.clone()),
+                proof_binding_id: Some(grant.proof_binding_id.clone()),
+                session_id: Some(grant.session_id.clone()),
+                challenge_id: None,
+                capsule_id: None,
+                result: "ok".into(),
+                reason: request.reason.into(),
+                occurred_at: now,
+                signer_did: None,
+                signature: None,
+            },
+        )?;
+        state.sessions.push(StoredAuthSession {
+            grant: grant.clone(),
+            revoked_at: None,
+        });
+        push_audit_event(data_dir, state, event)?;
+        Ok(grant)
+    }
 }
 
 fn audit_chain_activation_path(data_dir: &Path) -> anyhow::Result<PathBuf> {
@@ -1458,6 +3724,7 @@ pub fn upsert_principal_for_binding_as_role_named(
             proof_binding_id,
             proof_binding: binding,
             display_name: display_name.unwrap_or_default(),
+            initial_profile_display_name: None,
             role,
             localhost_root,
             created_at: now,
@@ -1653,6 +3920,54 @@ pub fn load_principal_root_protection(
     };
     validate_principal_root_protection(&protection).map_err(anyhow::Error::msg)?;
     Ok(Some(protection))
+}
+
+pub(crate) fn mark_recovery_kit_handed_to_person(
+    data_dir: &Path,
+    kit: &RecoveryKitV1,
+    coverage: Option<elastos_runtime::auth::RecoveryProfileCoverageV1>,
+    now: u64,
+) -> anyhow::Result<()> {
+    verify_recovery_kit_material(kit)?;
+    mutate_auth_state(data_dir, |state| {
+        let protection = state
+            .principal_root_protections
+            .iter_mut()
+            .find(|stored| {
+                stored.principal_id == kit.principal_id
+                    && stored.localhost_root == kit.localhost_root
+            })
+            .ok_or_else(|| anyhow!("principal root protection is missing"))?;
+        validate_principal_root_protection(protection).map_err(anyhow::Error::msg)?;
+        if protection.data_key_id != kit.data_key_id || protection.crypto != kit.crypto {
+            anyhow::bail!("recovery kit protection binding mismatch");
+        }
+        let protector = protection
+            .protectors
+            .iter_mut()
+            .find(|protector| protector.protector_id == kit.protector_id)
+            .ok_or_else(|| anyhow!("recovery kit protector is missing"))?;
+        if protector.kind != PrincipalRootProtectorKind::RecoveryKit {
+            anyhow::bail!("recovery kit protector kind mismatch");
+        }
+        let archived = recovery_kit_from_archive(
+            data_dir,
+            protector
+                .archive
+                .as_ref()
+                .ok_or_else(|| anyhow!("recovery kit archive is missing"))?,
+        )?;
+        verify_recovery_kit_material(&archived)?;
+        if archived != *kit {
+            anyhow::bail!("recovery kit archive binding mismatch");
+        }
+        protector.verified_at.get_or_insert(now);
+        if let Some(coverage) = coverage {
+            protector.profile_coverage = Some(coverage);
+        }
+        protection.updated_at = now.max(protection.updated_at);
+        validate_principal_root_protection(protection).map_err(anyhow::Error::msg)
+    })
 }
 
 #[derive(Debug)]
@@ -2469,6 +4784,7 @@ pub fn commit_recovered_root_reassignment(
             .ok_or_else(|| anyhow!("passkey proof binding not found after reassignment cleanup"))?;
         principal.principal_id = recovered_principal_id;
         principal.localhost_root = recovered_localhost_root;
+        principal.initial_profile_display_name = None;
         principal.updated_at = updated_at;
         let record = principal.clone();
         for stored in &mut state.sessions {
@@ -4738,6 +7054,7 @@ pub(crate) fn store_test_principal_root_protection(
         data_key_id,
         crypto,
         protectors: vec![elastos_runtime::auth::PrincipalRootProtectorV1 {
+            profile_coverage: None,
             protector_id: kit.protector_id,
             kind: PrincipalRootProtectorKind::RecoveryKit,
             label: "Test Recovery Kit".to_string(),
@@ -5318,11 +7635,92 @@ mod tests {
     }
 
     #[test]
+    fn recovered_root_reassignment_retires_initial_profile_consent() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (reassignment, current, current_grant) =
+            recovered_root_reassignment_fixture(data_dir.path());
+        mutate_auth_state(data_dir.path(), |state| {
+            let principal = state
+                .principals
+                .iter_mut()
+                .find(|principal| principal.proof_binding_id == current.proof_binding_id)
+                .unwrap();
+            principal.initial_profile_display_name = Some("Original Create name".into());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            confirmed_initial_profile_name(data_dir.path(), &current_grant).unwrap(),
+            Some("Original Create name".into())
+        );
+        let replacement_grant = reassignment.replacement_grant.clone();
+        let recovered_root = reassignment.recovered_localhost_root.clone();
+        let protection = serde_json::to_value(&reassignment.protection).unwrap();
+        let audit = serde_json::to_value(&reassignment.signed_audit_event).unwrap();
+        let before = load_auth_state(data_dir.path()).unwrap();
+        let device_key_path = elastos_identity::device_key_path(data_dir.path());
+        let device_key = std::fs::read(&device_key_path).unwrap();
+
+        let recovered = commit_recovered_root_reassignment(data_dir.path(), reassignment).unwrap();
+        assert_eq!(recovered.principal_id, replacement_grant.principal_id);
+        assert_eq!(recovered.localhost_root, recovered_root);
+        assert_eq!(recovered.role, current.role);
+        assert_eq!(
+            serde_json::to_value(&recovered.proof_binding).unwrap(),
+            serde_json::to_value(&current.proof_binding).unwrap()
+        );
+        assert_eq!(std::fs::read(&device_key_path).unwrap(), device_key);
+        assert_eq!(
+            serde_json::to_value(
+                load_principal_root_protection(
+                    data_dir.path(),
+                    &recovered.principal_id,
+                    &recovered.localhost_root
+                )
+                .unwrap()
+                .unwrap()
+            )
+            .unwrap(),
+            protection
+        );
+        let after = load_auth_state(data_dir.path()).unwrap();
+        assert_eq!(after.principals.len(), before.principals.len());
+        assert_eq!(after.audit.len(), before.audit.len() + 1);
+        assert_eq!(
+            serde_json::to_value(after.audit.last().unwrap()).unwrap(),
+            audit
+        );
+        assert!(
+            !is_auth_session_active(data_dir.path(), &current_grant.session_id, now_ts()).unwrap()
+        );
+        assert!(
+            is_auth_session_active(data_dir.path(), &replacement_grant.session_id, now_ts())
+                .unwrap()
+        );
+        // Create consent belongs to the original identity, not a recovered root
+        // whose Profile restoration may still be incomplete.
+        assert_eq!(
+            confirmed_initial_profile_name(data_dir.path(), &replacement_grant).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn recovered_root_reassignment_rejects_invalid_audit_signatures_before_mutation() {
         for case in ["malformed", "substituted", "wrong-runtime-signer"] {
             let data_dir = tempfile::tempdir().unwrap();
             let (mut reassignment, current, current_grant) =
                 recovered_root_reassignment_fixture(data_dir.path());
+            mutate_auth_state(data_dir.path(), |state| {
+                state
+                    .principals
+                    .iter_mut()
+                    .find(|principal| principal.proof_binding_id == current.proof_binding_id)
+                    .unwrap()
+                    .initial_profile_display_name = Some("Original Create name".into());
+                Ok(())
+            })
+            .unwrap();
             match case {
                 "malformed" => {
                     reassignment.signed_audit_event.signature =
@@ -5357,6 +7755,10 @@ mod tests {
                 load_principal_for_proof_binding(data_dir.path(), &current.proof_binding_id)
                     .unwrap();
             assert_eq!(retained.principal_id, current.principal_id);
+            assert_eq!(
+                confirmed_initial_profile_name(data_dir.path(), &current_grant).unwrap(),
+                Some("Original Create name".into())
+            );
             assert!(
                 is_auth_session_active(data_dir.path(), &current_grant.session_id, now_ts())
                     .unwrap()
