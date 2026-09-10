@@ -33,6 +33,12 @@ const RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE: &str = "Runtime custody pub
 const RUNTIME_CUSTODY_SHARE_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody sharing is not available yet";
 const RUNTIME_CUSTODY_PUBLISHED_PAYLOAD: &str = "runtime_custody_encrypted";
+pub(crate) const RUNTIME_CUSTODY_PUBLISH_UNSUPPORTED_TYPE_MESSAGE: &str =
+    "Runtime custody publish does not support this file type";
+/// Refusal for the three protected viewer operations on any route that does
+/// not verify `executable_actor`. See [`LibraryRequestRoute`].
+pub(crate) const RUNTIME_CUSTODY_VIEWER_ROUTE_DENIED_MESSAGE: &str =
+    "Runtime custody viewer operations require the verified viewer gateway route";
 
 static LIBRARY_EVENT_NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
 
@@ -144,6 +150,30 @@ struct LibraryEvent {
     at: u64,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     details: Value,
+}
+
+/// Which route one Library request arrived on.
+///
+/// Only [`LibraryRequestRoute::VerifiedGatewayLaunchToken`] —
+/// `api::gateway_provider_proxy::gateway_provider_proxy` — cryptographically
+/// verifies the home launch token and then strips any client-supplied
+/// `executable_actor` before inserting the verified
+/// `required.launch_context.executable_actor`. Every other entry point
+/// (`ObjectProvider::send_raw`, the capsule resource-bridge route, and
+/// `handle_object_provider_runtime_request`) leaves that field exactly as the
+/// caller wrote it, so the three protected viewer operations — whose session
+/// binding is keyed on it — are refused there instead of trusting it.
+///
+/// This is deliberately NOT the same signal as the gateway Wallet authority:
+/// the proxy passes `gateway_authority: None` for `open_viewer`/`read_viewer`/
+/// `close_viewer` (it only builds a Wallet authority for protected `publish`
+/// and `buy`), so keying off that would reject the verified route itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LibraryRequestRoute {
+    /// The gateway provider proxy, after home-launch-token verification.
+    VerifiedGatewayLaunchToken,
+    /// Any route whose request fields are entirely caller-supplied.
+    UnverifiedCaller,
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,6 +364,16 @@ enum ObjectProviderRequest {
     OpenViewer {
         principal_id: String,
         mint_id: String,
+        /// The verified viewer capsule (`elacity-player` or
+        /// `elacity-reader`). Never trusted from the client: the gateway
+        /// proxy overwrites this with `required.launch_context.executable_actor`
+        /// before this request reaches here, exactly as it already does for
+        /// `launch_id`/`session_id`/`grant_id`, and
+        /// `handle_runtime_custody_library_request` refuses the viewer
+        /// operations outright on every route that does not do that overwrite
+        /// (see [`LibraryRequestRoute`]).
+        #[serde(default)]
+        executable_actor: Option<String>,
         #[serde(default)]
         launch_id: Option<String>,
         #[serde(default)]
@@ -348,6 +388,8 @@ enum ObjectProviderRequest {
         mint_id: String,
         viewer_session_handle: String,
         #[serde(default)]
+        executable_actor: Option<String>,
+        #[serde(default)]
         launch_id: Option<String>,
         #[serde(default)]
         proof_binding_id: Option<String>,
@@ -355,6 +397,11 @@ enum ObjectProviderRequest {
         session_id: Option<String>,
         #[serde(default)]
         grant_id: Option<String>,
+        // No `chunk_index` yet: the object read path is deferred, and a
+        // declared-but-ignored selector would silently serve a media part
+        // driven by `segment_index` instead. `deny_unknown_fields` on this
+        // enum turns a caller that sends one into an explicit request error
+        // until the object read path lands and can honour it.
         #[serde(default)]
         segment_index: Option<u32>,
     },
@@ -362,6 +409,8 @@ enum ObjectProviderRequest {
         principal_id: String,
         mint_id: String,
         viewer_session_handle: String,
+        #[serde(default)]
+        executable_actor: Option<String>,
         #[serde(default)]
         launch_id: Option<String>,
         #[serde(default)]
@@ -483,7 +532,14 @@ impl Provider for ObjectProvider {
                         "object provider registry unavailable",
                     ));
                 };
-                handle_runtime_custody_library_request(data_dir, registry, request, None).await
+                handle_runtime_custody_library_request(
+                    data_dir,
+                    registry,
+                    request,
+                    None,
+                    LibraryRequestRoute::UnverifiedCaller,
+                )
+                .await
             }
             request => {
                 tokio::task::spawn_blocking(move || handle_library_request(&data_dir, request))
@@ -682,7 +738,14 @@ pub async fn handle_object_provider_runtime_request(
     registry: Arc<ProviderRegistry>,
     request: &Value,
 ) -> Value {
-    handle_object_provider_runtime_request_with_gateway(data_dir, registry, request, None).await
+    handle_object_provider_runtime_request_with_gateway(
+        data_dir,
+        registry,
+        request,
+        None,
+        LibraryRequestRoute::UnverifiedCaller,
+    )
+    .await
 }
 
 pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
@@ -693,6 +756,7 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
         &crate::api::gateway::GatewayState,
         &crate::api::gateway::RuntimeWalletAuthority,
     )>,
+    route: LibraryRequestRoute,
 ) -> Value {
     let request = match serde_json::from_value::<ObjectProviderRequest>(request.clone()) {
         Ok(request) => request,
@@ -749,8 +813,14 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
         | ObjectProviderRequest::CloseViewer { .. }) => {
-            handle_runtime_custody_library_request(data_dir, registry, request, gateway_authority)
-                .await
+            handle_runtime_custody_library_request(
+                data_dir,
+                registry,
+                request,
+                gateway_authority,
+                route,
+            )
+            .await
         }
         request => tokio::task::spawn_blocking(move || handle_library_request(&data_dir, request))
             .await
@@ -1580,7 +1650,24 @@ async fn handle_runtime_custody_library_request(
         &crate::api::gateway::GatewayState,
         &crate::api::gateway::RuntimeWalletAuthority,
     )>,
+    route: LibraryRequestRoute,
 ) -> anyhow::Result<Value> {
+    // Session binding v3 is keyed on `executable_actor`, and only the gateway
+    // proxy verifies that field (it discards whatever the client sent and
+    // re-inserts the value from the verified home launch token). Refuse the
+    // three viewer operations on every other route rather than bind a session
+    // to a caller-chosen actor. Note this cannot key off `gateway_authority`:
+    // the proxy passes `None` there for viewer ops, since it only builds a
+    // Wallet authority for protected `publish` and `buy`.
+    if matches!(
+        request,
+        ObjectProviderRequest::OpenViewer { .. }
+            | ObjectProviderRequest::ReadViewer { .. }
+            | ObjectProviderRequest::CloseViewer { .. }
+    ) && route != LibraryRequestRoute::VerifiedGatewayLaunchToken
+    {
+        anyhow::bail!(RUNTIME_CUSTODY_VIEWER_ROUTE_DENIED_MESSAGE);
+    }
     match request {
         ObjectProviderRequest::ListRuntimeCustody { principal_id } => {
             crate::protected_content_runtime::list_runtime_custody_listings(
@@ -1623,6 +1710,7 @@ async fn handle_runtime_custody_library_request(
         ObjectProviderRequest::OpenViewer {
             principal_id,
             mint_id,
+            executable_actor,
             launch_id,
             proof_binding_id,
             session_id,
@@ -1634,6 +1722,7 @@ async fn handle_runtime_custody_library_request(
                 crate::protected_content_runtime::RuntimeCustodyViewerOpenInput {
                     principal_id,
                     mint_id,
+                    executable_actor: executable_actor.unwrap_or_default(),
                     launch_id,
                     proof_binding_id,
                     session_id,
@@ -1646,6 +1735,7 @@ async fn handle_runtime_custody_library_request(
             principal_id,
             mint_id,
             viewer_session_handle,
+            executable_actor,
             launch_id,
             proof_binding_id,
             session_id,
@@ -1658,6 +1748,7 @@ async fn handle_runtime_custody_library_request(
                 &principal_id,
                 &mint_id,
                 &viewer_session_handle,
+                executable_actor.as_deref().unwrap_or_default(),
                 launch_id.as_deref(),
                 proof_binding_id.as_deref(),
                 session_id.as_deref(),
@@ -1670,6 +1761,7 @@ async fn handle_runtime_custody_library_request(
             principal_id,
             mint_id,
             viewer_session_handle,
+            executable_actor,
             launch_id,
             proof_binding_id,
             session_id,
@@ -1681,6 +1773,7 @@ async fn handle_runtime_custody_library_request(
                 &principal_id,
                 &mint_id,
                 &viewer_session_handle,
+                executable_actor.as_deref().unwrap_or_default(),
                 launch_id.as_deref(),
                 proof_binding_id.as_deref(),
                 session_id.as_deref(),
@@ -1709,6 +1802,24 @@ async fn library_publish(
     if let Some(protection) = protection {
         let loaded =
             validate_runtime_custody_publish_input(data_dir, principal_id, &target, protection)?;
+        let filename = target
+            .uri
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("object.bin");
+        let content_type = mime_for_name(filename);
+        // Fail closed on an unrecognised type, before any Wallet or custody
+        // work. `mime_for_name` returns `application/octet-stream` for
+        // everything its table does not know, and minting that as an EPC1
+        // object would produce content nothing can open (the object open/read
+        // path is deferred) while also burning the source's `same_authority_as`
+        // shape, so a later retry as media would be refused as "conflicts with
+        // existing authority". A clear refusal before any mint is the only safe
+        // answer until object open lands.
+        if content_type == "application/octet-stream" {
+            anyhow::bail!(RUNTIME_CUSTODY_PUBLISH_UNSUPPORTED_TYPE_MESSAGE);
+        }
         let source_storage = published_source_storage(data_dir, principal_id, &target)?.to_string();
         let Some((state, authority)) = gateway_authority else {
             anyhow::bail!(
@@ -1723,24 +1834,59 @@ async fn library_publish(
             &source_storage,
         )
         .await?;
-        let runtime_input = crate::protected_content_runtime::RuntimeCustodyLibrarySourceInput {
-            object_uri: target.uri.clone(),
-            principal_id: principal_id.to_string(),
-            source_file_path: target.path.clone(),
-            wallet_account_id: creator_binding.account_id,
-            wallet_account_address: creator_binding.address,
-            creator_mint_source_digest: creator_binding.source_digest,
-            copies: loaded.copies,
-            price: loaded.price,
-            source_storage,
+        // Video/audio keep the existing media-provider transcode path
+        // unchanged (D5: audio also transcodes to fMP4). Every other type
+        // takes the new EPC1 object path, which mints/provisions/verifies
+        // availability but — unlike the media path — stops short of the
+        // creator chain-mint + listing tail (see
+        // `publish_runtime_custody_library_object_content`'s doc comment).
+        let facts = if content_type.starts_with("video/") || content_type.starts_with("audio/") {
+            let runtime_input =
+                crate::protected_content_runtime::RuntimeCustodyLibrarySourceInput {
+                    object_uri: target.uri.clone(),
+                    principal_id: principal_id.to_string(),
+                    source_file_path: target.path.clone(),
+                    wallet_account_id: creator_binding.account_id,
+                    wallet_account_address: creator_binding.address,
+                    creator_mint_source_digest: creator_binding.source_digest,
+                    copies: loaded.copies,
+                    price: loaded.price,
+                    source_storage,
+                };
+            crate::api::gateway::runtime_custody_publish_via_gateway(
+                state,
+                authority,
+                registry,
+                runtime_input,
+            )
+            .await?
+        } else {
+            let clear_plaintext = crate::protected_content_runtime::read_runtime_object_source(
+                data_dir,
+                principal_id,
+                &target.uri,
+                &target.path,
+            )?;
+            let runtime_input =
+                crate::protected_content_runtime::RuntimeCustodyLibraryPublishObjectInput {
+                    object_uri: target.uri.clone(),
+                    principal_id: principal_id.to_string(),
+                    content_type: content_type.to_string(),
+                    wallet_account_id: creator_binding.account_id,
+                    wallet_account_address: creator_binding.address,
+                    creator_mint_source_digest: creator_binding.source_digest,
+                    copies: loaded.copies,
+                    price: loaded.price,
+                    clear_plaintext,
+                    source_storage,
+                };
+            crate::protected_content_runtime::publish_runtime_custody_library_object_content(
+                &state.data_dir,
+                registry,
+                runtime_input,
+            )
+            .await?
         };
-        let facts = crate::api::gateway::runtime_custody_publish_via_gateway(
-            state,
-            authority,
-            registry,
-            runtime_input,
-        )
-        .await?;
         let record = LibraryPublishRecord {
             schema: "elastos.library.publish-record/v1".to_string(),
             object_uri: target.uri.clone(),
@@ -6445,34 +6591,66 @@ fn now_nanos() -> u128 {
         .as_nanos()
 }
 
+/// Content type for one Library object name.
+///
+/// The `video/*` and `audio/*` arms are load-bearing beyond metadata: they are
+/// the dispatch gate `library_publish` uses to route protected publishing to
+/// the ffmpeg-backed media provider instead of the EPC1 object path, so a
+/// media container missing here would be sealed as an object rather than
+/// transcoded (and, until the object open/read path lands, could not be opened
+/// at all). The media extensions are therefore taken from the provider's own
+/// accepted input rather than guessed: `capsules/media-provider/src/lib.rs`
+/// imposes no container restriction of its own (it runs `ffprobe`/`ffmpeg`
+/// over a generic `-i input.bin` and only requires a video stream), so the set
+/// below is ffmpeg's own container registry — the "Common extensions" line of
+/// `ffmpeg -h demuxer=<name>` / `ffmpeg -h muxer=<name>` (ffmpeg 7.1.1) for the
+/// A/V container formats. Image-only extensions that ffmpeg's `mov` demuxer
+/// also claims (`avif`, `heic`, `heif`) are deliberately NOT treated as media.
 fn mime_for_name(name: &str) -> &'static str {
     let lower = name.to_lowercase();
-    if lower.ends_with(".md") || lower.ends_with(".txt") {
-        "text/plain"
-    } else if lower.ends_with(".html") {
-        "text/html"
-    } else if lower.ends_with(".json") {
-        "application/json"
-    } else if lower.ends_with(".png") {
-        "image/png"
-    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        "image/jpeg"
-    } else if lower.ends_with(".gif") {
-        "image/gif"
-    } else if lower.ends_with(".pdf") {
-        "application/pdf"
-    } else if lower.ends_with(".tar") {
-        "application/x-tar"
-    } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
-        "application/gzip"
-    } else if lower.ends_with(".zip") {
-        "application/zip"
-    } else if lower.ends_with(".mp4") {
-        "video/mp4"
-    } else if lower.ends_with(".mp3") {
-        "audio/mpeg"
-    } else {
-        "application/octet-stream"
+    // Two-part suffix: checked before the single-extension table below.
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        return "application/gzip";
+    }
+    let Some((_, extension)) = lower.rsplit_once('.') else {
+        return "application/octet-stream";
+    };
+    match extension {
+        "md" | "txt" => "text/plain",
+        "html" => "text/html",
+        "json" => "application/json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "pdf" => "application/pdf",
+        "tar" => "application/x-tar",
+        "zip" => "application/zip",
+        // Video containers (ffmpeg demuxers: mov, m4v, matroska, avi, flv,
+        // mpeg, mpegts, asf, vob).
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "3gp" | "3g2" => "video/3gpp",
+        "mkv" | "mk3d" => "video/x-matroska",
+        "webm" => "video/webm",
+        "avi" => "video/x-msvideo",
+        "flv" | "f4v" => "video/x-flv",
+        "mpg" | "mpeg" | "vob" => "video/mpeg",
+        "ts" | "m2t" | "m2ts" | "mts" => "video/mp2t",
+        "wmv" => "video/x-ms-wmv",
+        // Audio containers (ffmpeg demuxers: mp3, mov, aac, wav, flac, ogg,
+        // opus, oga, matroska, asf). Audio follows the media path too: it is
+        // transcoded to an fMP4 audio rendition rather than sealed as an
+        // object.
+        "mp3" | "mp2" | "m2a" | "mpa" => "audio/mpeg",
+        "m4a" | "m4b" => "audio/mp4",
+        "aac" => "audio/aac",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "ogg" | "oga" => "audio/ogg",
+        "opus" => "audio/opus",
+        "mka" => "audio/x-matroska",
+        "wma" => "audio/x-ms-wma",
+        _ => "application/octet-stream",
     }
 }
 
@@ -6595,6 +6773,158 @@ mod tests {
     }
 
     use super::*;
+
+    /// The media families the ffmpeg-backed media provider accepts must be
+    /// recognised as `video/*`/`audio/*`, because `library_publish` uses that
+    /// prefix to keep protected publishing on the media transcode path. Before
+    /// this table was widened only `.mp4`/`.mp3` were, so every other
+    /// container silently fell through to the EPC1 object path — a real
+    /// regression that no test caught, since every protected-content test uses
+    /// `.mp4` or `.mp3` filenames.
+    #[test]
+    fn mime_for_name_routes_every_media_family_to_the_media_path() {
+        for name in [
+            "clip.mov",
+            "CLIP.MOV",
+            "clip.mkv",
+            "clip.webm",
+            "clip.m4v",
+            "clip.mp4",
+            "clip.avi",
+            "clip.3gp",
+            "clip.flv",
+            "clip.mpg",
+            "clip.mpeg",
+            "clip.ts",
+            "clip.m2ts",
+            "clip.wmv",
+            "clip.vob",
+        ] {
+            let mime = mime_for_name(name);
+            assert!(
+                mime.starts_with("video/"),
+                "{name} must stay on the media path, got {mime}"
+            );
+        }
+        for name in [
+            "song.mp3",
+            "song.m4a",
+            "song.aac",
+            "song.wav",
+            "song.flac",
+            "song.ogg",
+            "song.oga",
+            "song.opus",
+            "song.mka",
+            "song.wma",
+        ] {
+            let mime = mime_for_name(name);
+            assert!(
+                mime.starts_with("audio/"),
+                "{name} must stay on the media path, got {mime}"
+            );
+        }
+    }
+
+    /// Non-media names must NOT leak onto the media path, and anything the
+    /// table does not know must stay `application/octet-stream` so
+    /// `library_publish` refuses it instead of minting an un-openable object.
+    /// `avif`/`heic`/`heif` matter specifically: ffmpeg's `mov` demuxer claims
+    /// them, so a naive "whatever ffmpeg reads is media" list would capture
+    /// still images.
+    #[test]
+    fn mime_for_name_keeps_non_media_off_the_media_path() {
+        for (name, expected) in [
+            ("notes.md", "text/plain"),
+            ("notes.txt", "text/plain"),
+            ("page.html", "text/html"),
+            ("data.json", "application/json"),
+            ("shot.png", "image/png"),
+            ("shot.jpg", "image/jpeg"),
+            ("shot.jpeg", "image/jpeg"),
+            ("shot.gif", "image/gif"),
+            ("book.pdf", "application/pdf"),
+            ("bundle.tar", "application/x-tar"),
+            ("bundle.tar.gz", "application/gzip"),
+            ("bundle.tgz", "application/gzip"),
+            ("bundle.zip", "application/zip"),
+            ("shot.avif", "application/octet-stream"),
+            ("shot.heic", "application/octet-stream"),
+            ("shot.heif", "application/octet-stream"),
+            ("model.glb", "application/octet-stream"),
+            ("noextension", "application/octet-stream"),
+        ] {
+            assert_eq!(mime_for_name(name), expected, "{name}");
+        }
+    }
+
+    /// The three protected viewer operations bind a session to
+    /// `executable_actor`, which only the gateway proxy verifies. On the raw
+    /// provider route every request field is caller-supplied, so they must be
+    /// refused there rather than trust it.
+    #[tokio::test]
+    async fn raw_object_provider_route_refuses_protected_viewer_operations() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let temp = tempfile::tempdir().unwrap();
+        let provider = ObjectProvider::new(temp.path().to_path_buf(), Arc::downgrade(&registry));
+        for request in [
+            json!({
+                "op": "open_viewer",
+                "principal_id": "person:local:raw-viewer",
+                "mint_id": "00".repeat(32),
+                "executable_actor": "elacity-player",
+            }),
+            json!({
+                "op": "read_viewer",
+                "principal_id": "person:local:raw-viewer",
+                "mint_id": "00".repeat(32),
+                "viewer_session_handle": "00".repeat(32),
+                "executable_actor": "elacity-player",
+            }),
+            json!({
+                "op": "close_viewer",
+                "principal_id": "person:local:raw-viewer",
+                "mint_id": "00".repeat(32),
+                "viewer_session_handle": "00".repeat(32),
+                "executable_actor": "elacity-player",
+            }),
+        ] {
+            let response = provider.send_raw(&request).await.unwrap();
+            assert_eq!(response["status"], "error", "{request}");
+            assert_eq!(
+                response["message"], RUNTIME_CUSTODY_VIEWER_ROUTE_DENIED_MESSAGE,
+                "{request}"
+            );
+        }
+    }
+
+    /// A caller that sends a `chunk_index` selector must be told it is not
+    /// supported, never silently served a `segment_index`-driven media part.
+    #[tokio::test]
+    async fn raw_object_provider_route_rejects_a_chunk_index_selector() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let temp = tempfile::tempdir().unwrap();
+        let provider = ObjectProvider::new(temp.path().to_path_buf(), Arc::downgrade(&registry));
+        let response = provider
+            .send_raw(&json!({
+                "op": "read_viewer",
+                "principal_id": "person:local:raw-viewer",
+                "mint_id": "00".repeat(32),
+                "viewer_session_handle": "00".repeat(32),
+                "chunk_index": 0,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["code"], "invalid_request");
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("chunk_index"),
+            "{response}"
+        );
+    }
 
     #[test]
     fn object_provider_exposes_object_scheme_only() {

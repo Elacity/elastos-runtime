@@ -207,6 +207,7 @@ test("player opens, reads ordered media parts, and closes once on ended", async 
     expires_at: 123,
     mime_type: "video/mp4",
     codecs: "avc1.640028",
+    content_kind: "media",
     has_init_segment: true,
     segment_count: 2,
   };
@@ -310,6 +311,7 @@ test("player sends one keepalive close on pagehide", async () => {
         expires_at: 123,
         mime_type: "video/mp4",
         codecs: "avc1.640028",
+        content_kind: "media",
         has_init_segment: true,
         segment_count: 1,
       },
@@ -388,6 +390,7 @@ test("player keeps the first visible state when quiet close fails", async () => 
         expires_at: 123,
         mime_type: "video/mp4",
         codecs: "avc1.640028",
+        content_kind: "media",
         has_init_segment: true,
         segment_count: 1,
       },
@@ -463,6 +466,7 @@ test("player fails closed on malformed part data and closes once", async () => {
         expires_at: 123,
         mime_type: "video/mp4",
         codecs: "avc1.640028",
+        content_kind: "media",
         has_init_segment: true,
         segment_count: 1,
       },
@@ -554,6 +558,7 @@ test("player parser rejects malformed viewer data", async () => {
           expires_at: 1,
           mime_type: "video/mp4",
           codecs: "avc1.640028",
+          content_kind: "media",
           has_init_segment: true,
         },
         "ab".repeat(32),
@@ -570,8 +575,29 @@ test("player parser rejects malformed viewer data", async () => {
           expires_at: 1,
           mime_type: "video/mp4",
           codecs: "avc1.640028",
+          content_kind: "media",
           has_init_segment: true,
           segment_count: MAX_VIEWER_SEGMENT_COUNT + 1,
+        },
+        "ab".repeat(32),
+      ),
+    /Viewer response is unavailable/,
+  );
+  // A non-media session must be refused outright: the player has no renderer
+  // for object chunk geometry, and its segment ladder would misread it.
+  assert.throws(
+    () =>
+      parseViewerOpenData(
+        {
+          schema: "elastos.library.runtime-custody-viewer/v1",
+          mint_id: "ab".repeat(32),
+          viewer_session_handle: "cd".repeat(32),
+          expires_at: 1,
+          mime_type: "video/mp4",
+          codecs: "avc1.640028",
+          content_kind: "object",
+          has_init_segment: true,
+          segment_count: 1,
         },
         "ab".repeat(32),
       ),
@@ -664,6 +690,7 @@ test("player preserves the first failure and closes once under repeated media er
         expires_at: 123,
         mime_type: "video/mp4",
         codecs: "avc1.640028",
+        content_kind: "media",
         has_init_segment: true,
         segment_count: 1,
       },

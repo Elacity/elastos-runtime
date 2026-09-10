@@ -7,17 +7,20 @@ use elastos_protected_content_contracts::{
 use elastos_protected_content_custody::{
     protect_validated_clear_fmp4_init_to_cenc_v1, protect_validated_clear_fmp4_segment_to_cenc_v1,
     provision_custody_envelope_for_exact_nodes, ContentEncryptionKeyV1, ExactCustodyEnvelopeNodeV1,
+    PayloadSealerV1,
 };
 use elastos_protected_content_provider_contracts::{
-    CencFmp4MediaIdentityV1, ProtectProviderRequestOpV1, ProtectProviderRequestV1,
-    ProtectProviderResponseV1, ProtectionSessionNodeV1, ProviderFailureCodeV1,
-    ValidatedClearFmp4MediaSessionLayoutV1, MAX_PROVIDER_FRAME_BYTES_V1,
-    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1, PROTECT_PROVIDER_REQUEST_SCHEMA_V1,
-    PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
+    CencFmp4MediaIdentityV1, ChunkedPayloadObjectIdentityV1, ProtectProviderRequestOpV1,
+    ProtectProviderRequestV1, ProtectProviderResponseV1, ProtectionSessionNodeV1,
+    ProviderFailureCodeV1, ValidatedClearFmp4MediaSessionLayoutV1, MAX_OBJECT_CHUNKS_V1,
+    MAX_OBJECT_PLAINTEXT_BYTES_V1, MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1,
+    MAX_PROVIDER_FRAME_BYTES_V1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
+    PROTECT_PROVIDER_REQUEST_SCHEMA_V1, PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
+use tracing::info;
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
@@ -91,16 +94,28 @@ struct OpenReplayEntry {
     response: ProtectProviderResponseV1,
 }
 
+/// Media's `protection_session_request_id` and an object session's
+/// `session_id` are both caller-supplied 32-byte digests and share the
+/// `open_replays` map's key space; without a domain tag, a media request id
+/// and an object session id that happen to collide would spuriously read
+/// each other's cached open response (or a digest mismatch between them
+/// would surface as `BindingMismatch`), and `trim_btree_map`'s eviction
+/// would evict across both namespaces instead of each one aging out on its
+/// own terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OpenReplayDomain {
+    Media,
+    Object,
+}
+
+type OpenReplayKey = (OpenReplayDomain, HandleBytes);
+
 #[derive(Clone)]
 struct SegmentReplayEntry {
     request_digest: RequestDigest,
 }
 
-struct ProtectionSessionEntry {
-    custody_pool: CustodyPoolIdentityV1,
-    custody_epoch: CustodyEpochIdentityV1,
-    custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
-    nodes: Vec<ExactCustodyEnvelopeNodeV1>,
+struct MediaSessionState {
     mime_type: String,
     codecs: String,
     clear_session_layout: ValidatedClearFmp4MediaSessionLayoutV1,
@@ -113,11 +128,41 @@ struct ProtectionSessionEntry {
     segment_count: u32,
     next_segment_index: u32,
     aggregate_protected_bytes: usize,
+}
+
+/// `sealer` is `None` once the object session has been finalized: the sealer
+/// is consumed by value (`PayloadSealerV1::finish_unprovisioned`), so there
+/// is nothing to keep after a successful finalize, and `ProtectionSessionEntry::finalized`
+/// (set at the same time) is what a finalize replay reads instead. Mirrors
+/// `MediaSessionState::content_key`, which is set to `None` for the same
+/// reason once the media session has been finalized.
+struct ObjectSessionState {
+    sealer: Option<PayloadSealerV1>,
+    /// Byte length of the framed header prefix `PayloadSealerV1::open`
+    /// returned when this session was opened. `AuthenticatedChunkPayloadHeaderV1`
+    /// (reachable from the sealer only via a consuming `finish`/`finish_unprovisioned`
+    /// call) exposes no public accessor for this length, so it is captured
+    /// once, up front, from the prefix bytes this provider already emits in
+    /// the open response.
+    framed_header_bytes: u32,
+}
+
+enum ProtectionSessionKind {
+    Media(MediaSessionState),
+    Object(ObjectSessionState),
+}
+
+struct ProtectionSessionEntry {
+    custody_pool: CustodyPoolIdentityV1,
+    custody_epoch: CustodyEpochIdentityV1,
+    custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
+    nodes: Vec<ExactCustodyEnvelopeNodeV1>,
+    kind: ProtectionSessionKind,
     finalized: Option<ProtectProviderResponseV1>,
 }
 
 struct ConfiguredProtectProvider {
-    open_replays: BTreeMap<[u8; 32], OpenReplayEntry>,
+    open_replays: BTreeMap<OpenReplayKey, OpenReplayEntry>,
     sessions: BTreeMap<HandleBytes, ProtectionSessionEntry>,
     closed_handles: BTreeSet<HandleBytes>,
 }
@@ -182,7 +227,10 @@ impl ProtectProvider {
                 | "protect_media_segment"
                 | "finalize_protection_session"
                 | "cancel_protection_session"
-                | "close_protection_session",
+                | "close_protection_session"
+                | "open_object_protection_session"
+                | "protect_object_chunk"
+                | "finalize_object_protection_session",
             ) => {
                 if !matches!(envelope, EnvelopeState::Present) {
                     return (invalid_request(), false);
@@ -224,6 +272,9 @@ impl ProtectProvider {
                 "finalize_protection_session",
                 "cancel_protection_session",
                 "close_protection_session",
+                "open_object_protection_session",
+                "protect_object_chunk",
+                "finalize_object_protection_session",
                 "shutdown"
             ],
         }))
@@ -271,7 +322,8 @@ impl ProtectProvider {
                 let mime_type = mime_type.to_string();
                 let codecs = codecs.to_string();
                 let request_id = *session_request_id.as_bytes();
-                if let Some(replay) = state.open_replays.get(&request_id) {
+                let open_replay_key: OpenReplayKey = (OpenReplayDomain::Media, request_id);
+                if let Some(replay) = state.open_replays.get(&open_replay_key) {
                     return if replay.request_digest == request_digest {
                         typed_ok(replay.response.clone())
                     } else {
@@ -385,7 +437,7 @@ impl ProtectProvider {
                 };
                 trim_btree_map(&mut state.open_replays, MAX_TERMINAL_REPLAYS_V1);
                 state.open_replays.insert(
-                    request_id,
+                    open_replay_key,
                     OpenReplayEntry {
                         request_digest,
                         response: response.clone(),
@@ -398,18 +450,20 @@ impl ProtectProvider {
                         custody_epoch,
                         custody_committee_authorization,
                         nodes,
-                        mime_type,
-                        codecs,
-                        clear_session_layout,
-                        protected_init_segment,
-                        protected_segments: Vec::with_capacity(segment_count as usize),
-                        segment_replays: BTreeMap::new(),
-                        content_key: Some(content_key),
-                        iv_prefix,
-                        next_iv_counter: 0,
-                        segment_count,
-                        next_segment_index: 0,
-                        aggregate_protected_bytes,
+                        kind: ProtectionSessionKind::Media(MediaSessionState {
+                            mime_type,
+                            codecs,
+                            clear_session_layout,
+                            protected_init_segment,
+                            protected_segments: Vec::with_capacity(segment_count as usize),
+                            segment_replays: BTreeMap::new(),
+                            content_key: Some(content_key),
+                            iv_prefix,
+                            next_iv_counter: 0,
+                            segment_count,
+                            next_segment_index: 0,
+                            aggregate_protected_bytes,
+                        }),
                         finalized: None,
                     },
                 );
@@ -426,14 +480,19 @@ impl ProtectProvider {
                         ProviderFailureCodeV1::HandleAbsent,
                     ));
                 };
+                let ProtectionSessionKind::Media(media) = &mut session.kind else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
                 let Some(segment_index) = request.segment_index() else {
                     return typed_response(ProtectProviderResponseV1::new_failure(
                         ProviderFailureCodeV1::InvalidRequest,
                     ));
                 };
-                if let Some(replay) = session.segment_replays.get(&segment_index) {
+                if let Some(replay) = media.segment_replays.get(&segment_index) {
                     return if replay.request_digest == request_digest {
-                        match session.protected_segments.get(segment_index as usize) {
+                        match media.protected_segments.get(segment_index as usize) {
                             Some(protected_segment) => {
                                 match ProtectProviderResponseV1::new_segment_protected(
                                     handle,
@@ -459,14 +518,14 @@ impl ProtectProvider {
                     };
                 }
                 if session.finalized.is_some()
-                    || segment_index != session.next_segment_index
-                    || segment_index >= session.segment_count
+                    || segment_index != media.next_segment_index
+                    || segment_index >= media.segment_count
                 {
                     return typed_response(ProtectProviderResponseV1::new_failure(
                         ProviderFailureCodeV1::InvalidRequest,
                     ));
                 }
-                let Some(content_key) = session.content_key.as_ref() else {
+                let Some(content_key) = media.content_key.as_ref() else {
                     return typed_response(ProtectProviderResponseV1::new_failure(
                         ProviderFailureCodeV1::BindingMismatch,
                     ));
@@ -477,7 +536,7 @@ impl ProtectProvider {
                     ));
                 };
                 let clear_segment_layout =
-                    match session.clear_session_layout.validate_segment(clear_segment) {
+                    match media.clear_session_layout.validate_segment(clear_segment) {
                         Ok(value) => value,
                         Err(_) => {
                             return typed_response(ProtectProviderResponseV1::new_failure(
@@ -487,8 +546,8 @@ impl ProtectProvider {
                     };
                 let sample_count = clear_segment_layout.samples().len();
                 let sample_ivs = match allocate_sample_ivs(
-                    session.iv_prefix,
-                    &mut session.next_iv_counter,
+                    media.iv_prefix,
+                    &mut media.next_iv_counter,
                     sample_count,
                 ) {
                     Ok(value) => value,
@@ -511,7 +570,7 @@ impl ProtectProvider {
                         ));
                     }
                 };
-                let new_aggregate = match session
+                let new_aggregate = match media
                     .aggregate_protected_bytes
                     .checked_add(protected_segment.len())
                 {
@@ -534,10 +593,10 @@ impl ProtectProvider {
                         ));
                     }
                 };
-                session.aggregate_protected_bytes = new_aggregate;
-                session.next_segment_index = session.next_segment_index.saturating_add(1);
-                session.protected_segments.push(protected_segment);
-                session
+                media.aggregate_protected_bytes = new_aggregate;
+                media.next_segment_index = media.next_segment_index.saturating_add(1);
+                media.protected_segments.push(protected_segment);
+                media
                     .segment_replays
                     .insert(segment_index, SegmentReplayEntry { request_digest });
                 typed_ok(response)
@@ -555,24 +614,29 @@ impl ProtectProvider {
                         ProtectProviderResponseV1::new_failure(ProviderFailureCodeV1::HandleAbsent)
                     });
                 };
+                let ProtectionSessionKind::Media(media) = &mut session.kind else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
                 if let Some(response) = &session.finalized {
                     return typed_ok(response.clone());
                 }
-                if session.next_segment_index != session.segment_count {
+                if media.next_segment_index != media.segment_count {
                     return typed_response(ProtectProviderResponseV1::new_failure(
                         ProviderFailureCodeV1::InvalidRequest,
                     ));
                 }
-                let Some(content_key) = session.content_key.as_ref() else {
+                let Some(content_key) = media.content_key.as_ref() else {
                     return typed_response(ProtectProviderResponseV1::new_failure(
                         ProviderFailureCodeV1::BindingMismatch,
                     ));
                 };
                 let media_identity = match CencFmp4MediaIdentityV1::new_from_bytes(
-                    &session.protected_init_segment,
-                    &session.protected_segments,
-                    &session.mime_type,
-                    &session.codecs,
+                    &media.protected_init_segment,
+                    &media.protected_segments,
+                    &media.mime_type,
+                    &media.codecs,
                 ) {
                     Ok(value) => value,
                     Err(_) => {
@@ -608,8 +672,8 @@ impl ProtectProvider {
                         ));
                     }
                 };
+                media.content_key = None;
                 session.finalized = Some(response.clone());
-                session.content_key = None;
                 typed_ok(response)
             }
             ProtectProviderRequestOpV1::CancelProtectionSession => {
@@ -639,6 +703,329 @@ impl ProtectProvider {
                 } else {
                     typed_response(ProtectProviderResponseV1::new_already_absent(handle))
                 }
+            }
+            ProtectProviderRequestOpV1::OpenObjectProtectionSession => {
+                let (
+                    Some(session_id),
+                    Ok(Some(custody_pool)),
+                    Ok(Some(custody_epoch)),
+                    Ok(Some(custody_committee_authorization)),
+                    Some(content_type),
+                    Some(plaintext_bytes),
+                    Some(threshold_required),
+                    Some(threshold_total),
+                ) = (
+                    request.session_id(),
+                    request.custody_pool(),
+                    request.custody_epoch(),
+                    request.custody_committee_authorization(),
+                    request.content_type(),
+                    request.plaintext_bytes(),
+                    request.threshold_required(),
+                    request.threshold_total(),
+                )
+                else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
+                // The object contract accepts any valid (threshold_required,
+                // threshold_total) with nodes.len() == threshold_total, but
+                // provision_custody_envelope_for_exact_nodes (below) hard-
+                // requires exactly 3 nodes and hard-codes a 2-of-3 threshold
+                // internally regardless of what was asked for. Without this
+                // check, a (3, 3) request with 3 nodes would provision
+                // successfully and silently return a lower-than-requested
+                // 2-of-3 envelope, and a (3, 5) request would burn a session
+                // slot and up to 64 MiB of streamed chunks before failing at
+                // finalize with a provider-fault code that misattributes a
+                // caller error. Reject both up front instead.
+                if (threshold_required, threshold_total) != (2, 3) {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                }
+                let content_type = content_type.to_string();
+                let session_key: HandleBytes = *session_id.as_bytes();
+                let open_replay_key: OpenReplayKey = (OpenReplayDomain::Object, session_key);
+
+                if let Some(replay) = state.open_replays.get(&open_replay_key) {
+                    return if replay.request_digest == request_digest {
+                        typed_ok(replay.response.clone())
+                    } else {
+                        typed_response(ProtectProviderResponseV1::new_failure(
+                            ProviderFailureCodeV1::BindingMismatch,
+                        ))
+                    };
+                }
+                if state.sessions.contains_key(&session_key) {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::BindingMismatch,
+                    ));
+                }
+                if state.sessions.len() >= MAX_ACTIVE_SESSIONS_V1 {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::BackendUnavailable,
+                    ));
+                }
+                if plaintext_bytes == 0 || plaintext_bytes > MAX_OBJECT_PLAINTEXT_BYTES_V1 {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                }
+                // Enforced independently of the plaintext_bytes bound above
+                // (rather than relying on the two constants happening to
+                // divide evenly) so a future drift between them fails closed
+                // here instead of silently opening an over-large session.
+                let chunk_count =
+                    plaintext_bytes.div_ceil(MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1 as u64);
+                if chunk_count > u64::from(MAX_OBJECT_CHUNKS_V1) {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                }
+                let Some(request_nodes) = request.nodes() else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
+                let nodes = match request_nodes
+                    .iter()
+                    .map(exact_custody_node)
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return typed_response(ProtectProviderResponseV1::new_failure(
+                            ProviderFailureCodeV1::InvalidRequest,
+                        ));
+                    }
+                };
+                // Belt-and-suspenders alongside the threshold check above:
+                // provision_custody_envelope_for_exact_nodes requires exactly
+                // 3 nodes regardless of what the contract-level threshold
+                // validation independently enforces.
+                if nodes.len() != 3 {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                }
+                let (sealer, framed_header) =
+                    match PayloadSealerV1::open(&content_type, plaintext_bytes) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return typed_response(ProtectProviderResponseV1::new_failure(
+                                ProviderFailureCodeV1::InvalidRequest,
+                            ));
+                        }
+                    };
+                let framed_header_bytes = match u32::try_from(framed_header.len()) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return typed_response(ProtectProviderResponseV1::new_failure(
+                            ProviderFailureCodeV1::InternalFailure,
+                        ));
+                    }
+                };
+                let response = match ProtectProviderResponseV1::new_object_opened(&framed_header) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return typed_response(ProtectProviderResponseV1::new_failure(
+                            ProviderFailureCodeV1::InternalFailure,
+                        ));
+                    }
+                };
+
+                trim_btree_map(&mut state.open_replays, MAX_TERMINAL_REPLAYS_V1);
+                state.open_replays.insert(
+                    open_replay_key,
+                    OpenReplayEntry {
+                        request_digest,
+                        response: response.clone(),
+                    },
+                );
+                state.sessions.insert(
+                    session_key,
+                    ProtectionSessionEntry {
+                        custody_pool,
+                        custody_epoch,
+                        custody_committee_authorization,
+                        nodes,
+                        kind: ProtectionSessionKind::Object(ObjectSessionState {
+                            sealer: Some(sealer),
+                            framed_header_bytes,
+                        }),
+                        finalized: None,
+                    },
+                );
+                typed_ok(response)
+            }
+            ProtectProviderRequestOpV1::ProtectObjectChunk => {
+                let Some(session_id) = request.session_id() else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
+                let session_key: HandleBytes = *session_id.as_bytes();
+                let Some(session) = state.sessions.get_mut(&session_key) else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::HandleAbsent,
+                    ));
+                };
+                let ProtectionSessionKind::Object(object) = &mut session.kind else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
+                let (Some(chunk_index), Some(plaintext), Some(sealer)) = (
+                    request.chunk_index(),
+                    request.plaintext(),
+                    object.sealer.as_mut(),
+                ) else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
+                let framed_chunk = match sealer.seal_chunk(chunk_index, plaintext) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        // The sealer enforces strict, gap-free, non-replayable
+                        // chunk ordering; any rejection here (wrong index,
+                        // wrong length) means the caller's stream is
+                        // desynchronized from what has already been sealed
+                        // and folded into the running hash. There is no safe
+                        // partial-retry: cancel the whole session rather than
+                        // leave a half-sealed object reachable.
+                        cancel_session(state, session_key);
+                        return typed_response(ProtectProviderResponseV1::new_failure(
+                            ProviderFailureCodeV1::InvalidRequest,
+                        ));
+                    }
+                };
+                match ProtectProviderResponseV1::new_object_chunk_protected(&framed_chunk) {
+                    Ok(response) => typed_ok(response),
+                    Err(_) => typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InternalFailure,
+                    )),
+                }
+            }
+            ProtectProviderRequestOpV1::FinalizeObjectProtectionSession => {
+                let Some(session_id) = request.session_id() else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
+                let Ok(Some(declared_encrypted_content)) = request.encrypted_content() else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
+                let session_key: HandleBytes = *session_id.as_bytes();
+                let Some(session) = state.sessions.get_mut(&session_key) else {
+                    return typed_response(if state.closed_handles.contains(&session_key) {
+                        ProtectProviderResponseV1::new_already_absent(session_key)
+                    } else {
+                        ProtectProviderResponseV1::new_failure(ProviderFailureCodeV1::HandleAbsent)
+                    });
+                };
+                let ProtectionSessionKind::Object(object) = &mut session.kind else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
+                if let Some(response) = &session.finalized {
+                    return typed_ok(response.clone());
+                }
+                // Copied out now, before `sealer.take()`, so provisioning
+                // below never needs to re-borrow `session` mutably (which
+                // would otherwise require an infallible-but-panicking
+                // re-lookup purely to satisfy the borrow checker, in a
+                // sandboxed provider where a panic kills the process).
+                let custody_pool = session.custody_pool;
+                let custody_epoch = session.custody_epoch;
+                let custody_committee_authorization = session.custody_committee_authorization;
+                let nodes = session.nodes.clone();
+                let framed_header_bytes = object.framed_header_bytes;
+                let Some(sealer) = object.sealer.take() else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
+
+                let unprovisioned = match sealer.finish_unprovisioned() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        cancel_session(state, session_key);
+                        return typed_response(ProtectProviderResponseV1::new_failure(
+                            ProviderFailureCodeV1::InvalidRequest,
+                        ));
+                    }
+                };
+                // Compare the caller's declared identity against the
+                // identity actually sealed *before* provisioning anything:
+                // a mismatch must not release any share of the content key.
+                if unprovisioned.encrypted_content_identity() != &declared_encrypted_content {
+                    cancel_session(state, session_key);
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::BindingMismatch,
+                    ));
+                }
+                let custody_envelope = match provision_custody_envelope_for_exact_nodes(
+                    unprovisioned.encrypted_content_identity().clone(),
+                    unprovisioned.content_key(),
+                    custody_pool,
+                    custody_epoch,
+                    custody_committee_authorization,
+                    &nodes,
+                ) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        cancel_session(state, session_key);
+                        return typed_response(ProtectProviderResponseV1::new_failure(
+                            ProviderFailureCodeV1::InternalFailure,
+                        ));
+                    }
+                };
+                let object_identity = match ChunkedPayloadObjectIdentityV1::new(
+                    unprovisioned.encrypted_content_identity().clone(),
+                    unprovisioned.header().content_type(),
+                    unprovisioned.header().plaintext_bytes(),
+                    framed_header_bytes,
+                ) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        cancel_session(state, session_key);
+                        return typed_response(ProtectProviderResponseV1::new_failure(
+                            ProviderFailureCodeV1::InternalFailure,
+                        ));
+                    }
+                };
+                let response = match ProtectProviderResponseV1::new_object_finalized(
+                    &object_identity,
+                    custody_envelope.manifest().content_key_commitment(),
+                    &custody_envelope,
+                ) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        cancel_session(state, session_key);
+                        return typed_response(ProtectProviderResponseV1::new_failure(
+                            ProviderFailureCodeV1::InternalFailure,
+                        ));
+                    }
+                };
+
+                let plaintext_bytes = unprovisioned.header().plaintext_bytes();
+                let chunks = plaintext_bytes.div_ceil(MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1 as u64);
+                let session_id_hex = hex_encode(&session_key);
+                info!(
+                    session_id = %session_id_hex,
+                    chunks,
+                    plaintext_bytes,
+                    "object protection session finalized"
+                );
+
+                session.finalized = Some(response.clone());
+                typed_ok(response)
             }
         }
     }
@@ -847,6 +1234,38 @@ fn trim_btree_set<T: Ord + Clone>(set: &mut BTreeSet<T>, max: usize) {
         };
         set.remove(&first);
     }
+}
+
+/// Tear down a session that an error has invalidated: remove it from the
+/// active map, drop its now-stale open-replay cache entry, and record the
+/// handle as closed. Object protection sessions have no dedicated
+/// cancel/close wire op (the existing media-shaped ones already work for
+/// them, since both kinds share one handle/session-id keyspace and one
+/// session map), so this helper is what an object-session error path uses
+/// to reach the equivalent end state — this is currently only ever called
+/// for object sessions (`ObjectProtectionSession`), so it clears the
+/// `Object`-domain open-replay entry specifically. Without this, a
+/// byte-identical re-open after an auto-cancelled session would hit the
+/// stale replay cache and return a success response (`ObjectProtectionSessionOpened`)
+/// for a session that no longer exists, permanently dead-ending that
+/// session_id (every subsequent chunk would see `HandleAbsent`, and a
+/// differing digest would see `BindingMismatch` instead of a fresh open).
+fn cancel_session(state: &mut ConfiguredProtectProvider, handle: HandleBytes) {
+    state.sessions.remove(&handle);
+    state
+        .open_replays
+        .remove(&(OpenReplayDomain::Object, handle));
+    trim_btree_set(&mut state.closed_handles, MAX_TERMINAL_REPLAYS_V1);
+    state.closed_handles.insert(handle);
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 pub fn read_provider_frame<R: BufRead>(reader: &mut R) -> io::Result<Option<Result<Vec<u8>, ()>>> {
@@ -1165,6 +1584,9 @@ mod tests {
                     "finalize_protection_session",
                     "cancel_protection_session",
                     "close_protection_session",
+                    "open_object_protection_session",
+                    "protect_object_chunk",
+                    "finalize_object_protection_session",
                     "shutdown"
                 ],
             })

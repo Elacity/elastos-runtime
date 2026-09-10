@@ -28,6 +28,7 @@ const MODEL_OBJECT_OUTPUT_SCHEMA: &str = "elastos.model.output.object/v1";
 const MODEL_CONTENT_OUTPUT_SCHEMA: &str = "elastos.model.output.content/v1";
 const MODEL_OUTPUT_URI_MAX_BYTES: usize = 4 * 1024;
 const ELACITY_PLAYER_CAPSULE_ID: &str = "elacity-player";
+const ELACITY_READER_CAPSULE_ID: &str = "elacity-reader";
 static LIBRARY_UPLOAD_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Deserialize)]
@@ -291,6 +292,10 @@ struct ResolvedProtectedContentPurchaseStep {
 type ResolvedProtectedContentPurchaseAccess =
     crate::protected_content_runtime::RuntimeCustodyPurchaseAccessEvidenceRecord;
 
+/// Writer twin of `protected_content_runtime`'s `RuntimePortableMetadata`
+/// reader: same field order, same "exactly one identity field, absent one
+/// skipped" rule, so a media metadata document keeps its exact pre-object
+/// bytes and an object one carries `content_identity_base64` instead.
 #[derive(Serialize)]
 struct RuntimeCustodyCreatorMetadata<'a> {
     schema: &'static str,
@@ -302,7 +307,10 @@ struct RuntimeCustodyCreatorMetadata<'a> {
     protected_content_identity: &'a str,
     mint_id: String,
     publisher_profile_did: &'a str,
-    media_identity_base64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media_identity_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_identity_base64: Option<String>,
     key_envelope_identity_base64: String,
     rights_policy_identity_base64: String,
     content_key_commitment_base64: String,
@@ -1639,7 +1647,9 @@ pub(super) async fn gateway_provider_proxy(
             | "shared_access"
             | "events" => &[LIBRARY_CAPSULE_ID],
             "roots" | "stat" | "publish" => &[LIBRARY_CAPSULE_ID, CREATOR_CAPSULE_ID],
-            "open_viewer" | "read_viewer" | "close_viewer" => &[ELACITY_PLAYER_CAPSULE_ID],
+            "open_viewer" | "read_viewer" | "close_viewer" => {
+                &[ELACITY_PLAYER_CAPSULE_ID, ELACITY_READER_CAPSULE_ID]
+            }
             "import_runtime_custody" => &[LIBRARY_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
             "list_runtime_custody" | "buy" => &[LIBRARY_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
             _ => {
@@ -1704,15 +1714,18 @@ pub(super) async fn gateway_provider_proxy(
     };
     let is_protected_viewer_op =
         scheme == "object" && matches!(op.as_str(), "open_viewer" | "read_viewer" | "close_viewer");
+    const NOT_AUTHORIZED_FOR_VIEWER: (StatusCode, &str) = (
+        StatusCode::FORBIDDEN,
+        "home launch token is not authorized for this viewer",
+    );
     if is_protected_viewer_op
-        && (required.launch_context.selected_resource != ELACITY_PLAYER_CAPSULE_ID
-            || required.launch_context.executable_actor != ELACITY_PLAYER_CAPSULE_ID)
+        && (required.launch_context.selected_resource != required.launch_context.executable_actor
+            || !matches!(
+                required.launch_context.executable_actor.as_str(),
+                ELACITY_PLAYER_CAPSULE_ID | ELACITY_READER_CAPSULE_ID
+            ))
     {
-        return (
-            StatusCode::FORBIDDEN,
-            "home launch token is not authorized for this viewer",
-        )
-            .into_response();
+        return NOT_AUTHORIZED_FOR_VIEWER.into_response();
     }
     let context = required.context.clone();
     let principal_id = context.principal_id.clone();
@@ -1771,6 +1784,11 @@ pub(super) async fn gateway_provider_proxy(
             object.remove("grant_id");
             object.remove("wallet_request_hex");
             object.remove("wallet_response_hex");
+            object.remove("executable_actor");
+            object.insert(
+                "executable_actor".to_string(),
+                serde_json::Value::String(required.launch_context.executable_actor.clone()),
+            );
             if let Some(proof) = context
                 .proof_binding_id
                 .as_deref()
@@ -1800,6 +1818,22 @@ pub(super) async fn gateway_provider_proxy(
             );
         }
     }
+    // Session binding v3, kind <-> viewer: `open_viewer` additionally
+    // requires the admitted viewer to be the ONE that matches this mint's
+    // own content kind (media -> player, object -> reader). This is NOT
+    // decided here: `RuntimeMintJournal::load` unconditionally calls
+    // `ensure_root_dir`, so a speculative pre-dispatch load (keyed off the
+    // client-supplied, not-yet-authorized `mint_id`) would create this
+    // Runtime's mint-journal directory as a side effect of every
+    // `open_viewer` call — including ones from a principal who has never
+    // minted anything (confirmed: it broke a gateway test's cross-runtime
+    // isolation assertion). The check instead runs inside
+    // `open_runtime_custody_viewer`, after the normal purchase/listing/draft
+    // load that a legitimate open already performs, so it adds no new
+    // filesystem footprint. Its rejection surfaces as
+    // `RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE` there rather than the literal
+    // "not authorized for this viewer" 403 this comment's neighbour uses —
+    // see the Task 13 report for why that tradeoff was made deliberately.
     if scheme == "object" && op == "shared_access" {
         if let Some(object) = request.as_object_mut() {
             object.remove("recipient_proof");
@@ -1923,6 +1957,10 @@ pub(super) async fn gateway_provider_proxy(
             wallet_authority
                 .as_ref()
                 .map(|authority| (&state, authority)),
+            // This function verified the home launch token above and
+            // overwrote `executable_actor` with the verified value, which is
+            // what makes the protected viewer operations admissible at all.
+            crate::library::LibraryRequestRoute::VerifiedGatewayLaunchToken,
         )
         .await
     } else {
@@ -2695,30 +2733,39 @@ fn confirmed_stage(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// `mime_type`/`codecs` are derived from the mint draft's own content
+/// identity rather than taken as caller parameters. For media that is the
+/// identical value the caller used to pass (`RuntimeMintDraft::new` is built
+/// from the same two strings, and `verify_runtime_portable_metadata` already
+/// asserts the published document matches the identity), so the emitted bytes
+/// do not move; for an object there is no caller-side codecs string at all.
 async fn publish_runtime_custody_creator_metadata(
     registry: &ProviderRegistry,
     data_dir: &std::path::Path,
     object_uri: &str,
-    mime_type: &str,
-    codecs: &str,
     facts: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
     mint: &elastos_protected_content_runtime::PersistedRuntimeMint,
     publisher_profile_did: &str,
 ) -> anyhow::Result<(String, String)> {
     let draft = mint.draft();
+    let (media_identity_base64, content_identity_base64) =
+        crate::protected_content_runtime::runtime_portable_identity_fields(
+            draft.content_identity(),
+        )?;
     let metadata = RuntimeCustodyCreatorMetadata {
         schema: "elastos.protected-content.metadata/v1",
         name: runtime_custody_metadata_name(object_uri),
-        mime_type,
-        codecs,
+        mime_type: draft.content_identity().content_type(),
+        codecs: crate::protected_content_runtime::runtime_portable_content_codecs(
+            draft.content_identity(),
+        ),
         encrypted_content_cid: &facts.content_cid,
         content_access_id: format!("0x{}", hex::encode(draft.content_access_id().as_bytes())),
         protected_content_identity: &facts.content_id,
         mint_id: hex::encode(draft.mint_id().as_bytes()),
         publisher_profile_did,
-        media_identity_base64: base64::engine::general_purpose::STANDARD
-            .encode(draft.media_identity().canonical_bytes()?),
+        media_identity_base64,
+        content_identity_base64,
         key_envelope_identity_base64: base64::engine::general_purpose::STANDARD
             .encode(draft.key_envelope().canonical_bytes()?),
         rights_policy_identity_base64: base64::engine::general_purpose::STANDARD
@@ -3732,8 +3779,6 @@ async fn runtime_custody_publish_creator_tail_from_facts(
                 registry.as_ref(),
                 &state.data_dir,
                 &input.object_uri,
-                &input.mime_type,
-                &input.codecs,
                 &facts,
                 &mint,
                 &publisher_profile_did,

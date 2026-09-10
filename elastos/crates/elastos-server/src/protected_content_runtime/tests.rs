@@ -24,15 +24,15 @@ use elastos_protected_content_rights::{
 use elastos_protected_content_runtime::{
     bind_buy, cancel_prepared_recipient, close_viewer_session, open_viewer_session,
     prepare_recipient, read_viewer_media_part, resolve_runtime_mint_selected_nodes,
-    PersistedRuntimeMint, RuntimeContentAvailabilityRequirement, RuntimeCustodyProvider,
-    RuntimeDecryptProvider, RuntimeMediaPreparationRecord, RuntimeMediaPreparationState,
-    RuntimeMintCoordinator, RuntimeMintCoordinatorOutcome, RuntimeMintDraft, RuntimeMintIntent,
-    RuntimeMintJournal, RuntimeMintNodeBinding, RuntimeMintNodeReceipt, RuntimeMintSelectedNode,
-    RuntimeOpenError, RuntimeOpenViewerSessionInput, RuntimeProtectedContentPurchaseIntent,
-    RuntimeProviderCallError, RuntimePurchaseEffectAuthority, RuntimeReleaseCoordinator,
-    RuntimeReleaseCoordinatorOutcome, RuntimeReleaseJournal, RuntimeReleaseTerminalResult,
-    RuntimeRightsProvider, RuntimeSelectedProvider, RuntimeVerifiedPurchaseEffect,
-    RuntimeViewerSession,
+    PersistedRuntimeMint, RuntimeContentAvailabilityRequirement, RuntimeContentIdentityV1,
+    RuntimeCustodyProvider, RuntimeDecryptProvider, RuntimeMediaPreparationRecord,
+    RuntimeMediaPreparationState, RuntimeMintCoordinator, RuntimeMintCoordinatorOutcome,
+    RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal, RuntimeMintNodeBinding,
+    RuntimeMintNodeReceipt, RuntimeMintSelectedNode, RuntimeOpenError, RuntimeOpenViewerContentV1,
+    RuntimeOpenViewerSessionInput, RuntimeProtectedContentPurchaseIntent, RuntimeProviderCallError,
+    RuntimePurchaseEffectAuthority, RuntimeReleaseCoordinator, RuntimeReleaseCoordinatorOutcome,
+    RuntimeReleaseJournal, RuntimeReleaseTerminalResult, RuntimeRightsProvider,
+    RuntimeSelectedProvider, RuntimeVerifiedPurchaseEffect, RuntimeViewerSession,
 };
 use elastos_runtime::provider::{
     bridge::ProviderConfig, CapsuleProvider, Provider, ProviderBridge, ProviderCarrierInvoker,
@@ -58,19 +58,20 @@ use super::{
     invoke_json_provider, list_unresolved_runtime_releases, load_or_persist_runtime_mint_intent,
     load_runtime_custody_composition, load_runtime_custody_composition_config,
     load_runtime_custody_purchase, load_runtime_media_provider_bridge_config,
-    load_runtime_protected_content_chain_provider_config, persist_runtime_custody_purchase,
-    prepare_runtime_custody_library_source, prepare_runtime_media_provider_prerequisite_with_path,
+    load_runtime_protected_content_chain_provider_config, object_protected_content_files,
+    persist_runtime_custody_purchase, prepare_runtime_custody_library_source,
+    prepare_runtime_media_provider_prerequisite_with_path, protected_content_object_manifest_bytes,
     publish_runtime_custody_library_object, publish_runtime_custody_library_source,
     register_custody_provider, register_custody_runtime_provider_target, register_protect_provider,
     register_protected_content_decrypt_provider, resolve_runtime_rights_policy,
     runtime_media_source_digest, runtime_mint_journal, runtime_protected_content_id,
     runtime_purchase_lock_path, runtime_purchase_lock_test_overlap_detected, runtime_purchase_path,
-    unresolved_release_audit_records, write_owner_only_bytes, InactiveCustodyProvider,
-    RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile,
-    RuntimeCustodyConfirmedPurchaseStage, RuntimeCustodyLibraryPublishInput,
-    RuntimeCustodyLibrarySourceInput, RuntimeCustodyPurchaseAccessEvidenceRecord,
-    RuntimeCustodyPurchaseProgress, RuntimeCustodyPurchaseRecord,
-    RuntimeCustodyPurchaseStageRecord, RuntimeCustodyRegistryAdapter,
+    unresolved_release_audit_records, verify_protected_content_object_directory,
+    write_owner_only_bytes, InactiveCustodyProvider, RuntimeCustodyComposition,
+    RuntimeCustodyCompositionConfigFile, RuntimeCustodyConfirmedPurchaseStage,
+    RuntimeCustodyLibraryPublishInput, RuntimeCustodyLibrarySourceInput,
+    RuntimeCustodyPurchaseAccessEvidenceRecord, RuntimeCustodyPurchaseProgress,
+    RuntimeCustodyPurchaseRecord, RuntimeCustodyPurchaseStageRecord, RuntimeCustodyRegistryAdapter,
     RuntimeCustodyRouteBindingConfig, RuntimeCustodyRouteTransportConfig,
     RuntimeCustodyTerminalPurchaseRecord, RuntimeDecryptRegistryAdapter,
     RuntimeLibraryMediaPreparation, CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1,
@@ -79,6 +80,7 @@ use super::{
     MEDIA_PROVIDER_ID, MEDIA_PROVIDER_MAX_INPUT_BYTES_V1, MEDIA_PROVIDER_TIMEOUT_MS_V1,
     PROTECTED_CONTENT_CHAIN_PROVIDER_CONFIG_SCHEMA_V1, PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
     PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS, PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION,
+    PROTECTED_CONTENT_OBJECT_EPC1_PATH, PROTECTED_CONTENT_OBJECT_MANIFEST_PATH,
     PROTECTED_CONTENT_PROVIDER_STATUS_TIMEOUT, PROTECT_PROVIDER_ID, PROTECT_PROVIDER_OPERATIONS,
     PROTECT_PROVIDER_PROCESS_ID, PROTECT_PROVIDER_VERSION,
     RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE, RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE,
@@ -114,11 +116,11 @@ use elastos_protected_content_contracts::{
     X_WING_DRAFT06_CIPHERTEXT_BYTES,
 };
 use elastos_protected_content_provider_contracts::{
-    CencFmp4MediaIdentityV1, CustodyProviderRequestV1, CustodyProviderResponseV1,
-    DecryptProviderRequestV1, DecryptProviderResponseStatusV1, DecryptProviderResponseV1,
-    ProtectProviderRequestV1, ProtectProviderResponseStatusV1, ProtectProviderResponseV1,
-    ProtectionSessionNodeV1, ProviderFailureCodeV1, RightsProviderRequestV1,
-    RightsProviderResponseV1, ValidatedClearFmp4MediaSessionLayoutV1,
+    CencFmp4MediaIdentityV1, ChunkedPayloadObjectIdentityV1, CustodyProviderRequestV1,
+    CustodyProviderResponseV1, DecryptProviderRequestV1, DecryptProviderResponseStatusV1,
+    DecryptProviderResponseV1, ProtectProviderRequestV1, ProtectProviderResponseStatusV1,
+    ProtectProviderResponseV1, ProtectionSessionNodeV1, ProviderFailureCodeV1,
+    RightsProviderRequestV1, RightsProviderResponseV1, ValidatedClearFmp4MediaSessionLayoutV1,
     ValidatedCustodyProviderRequestV1, ValidatedDecryptProviderRequestV1,
     ValidatedRightsProviderRequestV1, ViewerMediaPartSelectorV1,
     CUSTODY_PROVIDER_REQUEST_SCHEMA_V1, CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1,
@@ -129,6 +131,14 @@ use elastos_protected_content_provider_contracts::{
 
 const TEST_VIEWER_LAUNCH_ID: &str = "launch:11111111111111111111111111111111";
 const TEST_VIEWER_LAUNCH_ID_B: &str = "launch:22222222222222222222222222222222";
+/// Every existing test in this file exercises the media/player viewer path;
+/// session binding v3 takes the verified executable actor as an explicit
+/// parameter instead of a hard-coded constant, so these tests supply the same
+/// value the real player launch context would carry.
+const TEST_VIEWER_EXECUTABLE_ACTOR: &str = "elacity-player";
+/// The second viewer capsule session binding v3 admits. Used to prove the
+/// kind <-> viewer check denies it on a media mint.
+const TEST_VIEWER_READER_EXECUTABLE_ACTOR: &str = "elacity-reader";
 
 struct RecordingProvider {
     name: &'static str,
@@ -1180,8 +1190,11 @@ fn runtime_custody_listing_record_for_test(
         ),
         publisher_profile_did,
         display_name: display_name.to_string(),
-        media_identity_base64: base64::engine::general_purpose::STANDARD
-            .encode(draft.media_identity().canonical_bytes().unwrap()),
+        media_identity_base64: Some(
+            base64::engine::general_purpose::STANDARD
+                .encode(draft.media_identity().unwrap().canonical_bytes().unwrap()),
+        ),
+        content_identity_base64: None,
         key_envelope_identity_base64: base64::engine::general_purpose::STANDARD
             .encode(draft.key_envelope().canonical_bytes().unwrap()),
         rights_policy_identity_base64: base64::engine::general_purpose::STANDARD
@@ -1310,7 +1323,9 @@ async fn runtime_custody_prebuy_availability_harness(
         fixture_now.saturating_sub(1),
         digest(0x71),
         mint_draft.encrypted_content().clone(),
-        mint_draft.media_identity().media_manifest_root(),
+        elastos_protected_content_runtime::RuntimeVerifiedContentIdentityRootV1::for_media(
+            mint_draft.media_identity().unwrap(),
+        ),
     )
     .unwrap();
     let available = mint_journal
@@ -2474,6 +2489,7 @@ fn persist_runtime_custody_active_viewer_for_purchase(
     let binding = super::derive_runtime_custody_session_binding(
         &purchase.principal_id,
         &purchase.profile_did,
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         TEST_VIEWER_LAUNCH_ID,
         proof_binding_id,
         session_id,
@@ -2527,6 +2543,7 @@ fn persist_runtime_custody_open_pending_viewer_for_purchase(
     let binding = super::derive_runtime_custody_session_binding(
         &purchase.principal_id,
         &purchase.profile_did,
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         TEST_VIEWER_LAUNCH_ID,
         proof_binding_id,
         session_id,
@@ -7308,7 +7325,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     let availability_evidence = super::publish_and_verify_protected_content_availability(
         content_registry.as_ref(),
         content_directory.path(),
-        mint_draft.media_identity(),
+        mint_draft.media_identity().unwrap(),
         &requirement,
         crate::auth::now_ts,
     )
@@ -7554,8 +7571,10 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
             signed_runtime_release_operation: &operation,
             expected_terminal_issuer: terminal_receipt.statement().issuer(),
             content_key_commitment: envelope.manifest().content_key_commitment(),
-            media_identity: &protected_media_identity,
-            protected_init_segment: &protected_init_segment,
+            content: RuntimeOpenViewerContentV1::Media {
+                media_identity: &protected_media_identity,
+                protected_init_segment: &protected_init_segment,
+            },
             signed_node_contributions: &signed_node_contributions,
             signed_terminal_receipt: &terminal_receipt,
             now_unix_seconds: crate::auth::now_ts(),
@@ -7578,8 +7597,10 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
             signed_runtime_release_operation: &operation,
             expected_terminal_issuer: terminal_receipt.statement().issuer(),
             content_key_commitment: envelope.manifest().content_key_commitment(),
-            media_identity: &wrong_media_identity,
-            protected_init_segment: &protected_init_segment,
+            content: RuntimeOpenViewerContentV1::Media {
+                media_identity: &wrong_media_identity,
+                protected_init_segment: &protected_init_segment,
+            },
             signed_node_contributions: &signed_node_contributions,
             signed_terminal_receipt: &terminal_receipt,
             now_unix_seconds: crate::auth::now_ts(),
@@ -7596,8 +7617,10 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
             signed_runtime_release_operation: &operation,
             expected_terminal_issuer: terminal_receipt.statement().issuer(),
             content_key_commitment: envelope.manifest().content_key_commitment(),
-            media_identity: &protected_media_identity,
-            protected_init_segment: &protected_init_segment,
+            content: RuntimeOpenViewerContentV1::Media {
+                media_identity: &protected_media_identity,
+                protected_init_segment: &protected_init_segment,
+            },
             signed_node_contributions: &signed_node_contributions,
             signed_terminal_receipt: &terminal_receipt,
             now_unix_seconds: crate::auth::now_ts(),
@@ -8927,7 +8950,9 @@ fn seed_settled_runtime_custody_mint_record(
         crate::auth::now_ts(),
         digest(0xa1),
         draft.encrypted_content().clone(),
-        draft.media_identity().media_manifest_root(),
+        elastos_protected_content_runtime::RuntimeVerifiedContentIdentityRootV1::for_media(
+            draft.media_identity().unwrap(),
+        ),
     )
     .unwrap();
     journal
@@ -10244,6 +10269,7 @@ async fn runtime_custody_release_wallet_pends_on_managed_approval_and_resumes_ex
     let session = super::derive_runtime_custody_session_binding(
         principal_id,
         &current_profile_did,
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         TEST_VIEWER_LAUNCH_ID,
         "proof:alpha",
         "runtime-session:alpha",
@@ -10491,6 +10517,7 @@ async fn runtime_custody_release_wallet_uses_fresh_binding_per_session() {
     let session_a = super::derive_runtime_custody_session_binding(
         principal_id,
         &current_profile_did,
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         TEST_VIEWER_LAUNCH_ID,
         "proof:alpha",
         "runtime-session:alpha",
@@ -10501,6 +10528,7 @@ async fn runtime_custody_release_wallet_uses_fresh_binding_per_session() {
     let session_b = super::derive_runtime_custody_session_binding(
         principal_id,
         &current_profile_did,
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         TEST_VIEWER_LAUNCH_ID,
         "proof:alpha",
         "runtime-session:beta",
@@ -10511,6 +10539,7 @@ async fn runtime_custody_release_wallet_uses_fresh_binding_per_session() {
     let launch_b = super::derive_runtime_custody_session_binding(
         principal_id,
         &current_profile_did,
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         TEST_VIEWER_LAUNCH_ID_B,
         "proof:alpha",
         "runtime-session:alpha",
@@ -10632,6 +10661,7 @@ async fn runtime_custody_viewer_open_replays_exact_active_session_without_provid
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            executable_actor: TEST_VIEWER_EXECUTABLE_ACTOR.to_string(),
             launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some(proof_binding_id),
             session_id: Some("runtime-session:alpha".to_string()),
@@ -10645,12 +10675,25 @@ async fn runtime_custody_viewer_open_replays_exact_active_session_without_provid
         hex::encode(session.viewer_session_handle())
     );
     assert_eq!(open["expires_at"].as_u64(), Some(session.expires_at()));
+    assert_eq!(
+        open["content_kind"],
+        super::RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_MEDIA
+    );
     assert_eq!(open["mime_type"], MEDIA_MIME_TYPE_V1);
     assert_eq!(open["codecs"], MEDIA_CODECS_V1);
     assert_eq!(open["has_init_segment"], true);
     assert_eq!(
         open["segment_count"].as_u64(),
-        Some(u64::try_from(mint.draft().media_identity().encrypted_segments().len()).unwrap())
+        Some(
+            u64::try_from(
+                mint.draft()
+                    .media_identity()
+                    .unwrap()
+                    .encrypted_segments()
+                    .len()
+            )
+            .unwrap()
+        )
     );
     let open_keys = open
         .as_object()
@@ -10662,6 +10705,7 @@ async fn runtime_custody_viewer_open_replays_exact_active_session_without_provid
         open_keys,
         std::collections::BTreeSet::from([
             "codecs",
+            "content_kind",
             "expires_at",
             "has_init_segment",
             "mime_type",
@@ -10712,6 +10756,7 @@ async fn runtime_custody_viewer_open_rejects_substituted_session_without_provide
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            executable_actor: TEST_VIEWER_EXECUTABLE_ACTOR.to_string(),
             launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some(proof_binding_id),
             session_id: Some("runtime-session:beta".to_string()),
@@ -10772,6 +10817,7 @@ async fn runtime_custody_viewer_open_rejects_missing_live_availability_before_ne
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            executable_actor: TEST_VIEWER_EXECUTABLE_ACTOR.to_string(),
             launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some(proof_binding_id),
             session_id: Some("runtime-session:alpha".to_string()),
@@ -10861,6 +10907,7 @@ async fn runtime_custody_viewer_open_rejects_missing_or_tampered_listing_before_
             super::RuntimeCustodyViewerOpenInput {
                 principal_id: principal_id.to_string(),
                 mint_id: hex::encode(harness.mint_id.as_bytes()),
+                executable_actor: TEST_VIEWER_EXECUTABLE_ACTOR.to_string(),
                 launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
                 proof_binding_id: Some(proof_binding_id),
                 session_id: Some("runtime-session:alpha".to_string()),
@@ -10946,6 +10993,7 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         Some(TEST_VIEWER_LAUNCH_ID),
         Some(&proof_binding_id),
         Some("runtime-session:alpha"),
@@ -10965,6 +11013,7 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         Some(TEST_VIEWER_LAUNCH_ID),
         Some(&proof_binding_id),
         Some("runtime-session:alpha"),
@@ -10991,6 +11040,7 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         Some(TEST_VIEWER_LAUNCH_ID),
         Some(&proof_binding_id),
         Some("runtime-session:alpha"),
@@ -11035,6 +11085,7 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         Some(TEST_VIEWER_LAUNCH_ID),
         Some(&proof_binding_id),
         Some("runtime-session:alpha"),
@@ -11071,6 +11122,7 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         Some(TEST_VIEWER_LAUNCH_ID),
         Some(&proof_binding_id),
         Some("runtime-session:alpha"),
@@ -11162,6 +11214,7 @@ async fn runtime_custody_viewer_open_read_and_close_reject_wrong_principal_witho
         super::RuntimeCustodyViewerOpenInput {
             principal_id: wrong_principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            executable_actor: TEST_VIEWER_EXECUTABLE_ACTOR.to_string(),
             launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some(proof_binding_id.clone()),
             session_id: Some("runtime-session:alpha".to_string()),
@@ -11180,6 +11233,7 @@ async fn runtime_custody_viewer_open_read_and_close_reject_wrong_principal_witho
         wrong_principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         Some(TEST_VIEWER_LAUNCH_ID),
         Some(&proof_binding_id),
         Some("runtime-session:alpha"),
@@ -11198,6 +11252,7 @@ async fn runtime_custody_viewer_open_read_and_close_reject_wrong_principal_witho
         wrong_principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         Some(TEST_VIEWER_LAUNCH_ID),
         Some(&proof_binding_id),
         Some("runtime-session:alpha"),
@@ -11271,6 +11326,7 @@ async fn runtime_custody_viewer_close_retains_cleanup_pending_until_exact_settle
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         Some(TEST_VIEWER_LAUNCH_ID),
         Some(&proof_binding_id),
         Some("runtime-session:alpha"),
@@ -11632,6 +11688,7 @@ async fn runtime_custody_open_pending_survives_active_write_failure_and_failed_c
         super::derive_runtime_custody_session_binding(
             principal_id,
             &current_profile_did,
+            TEST_VIEWER_EXECUTABLE_ACTOR,
             TEST_VIEWER_LAUNCH_ID,
             &proof_binding_id,
             "runtime-session:alpha",
@@ -11766,6 +11823,7 @@ async fn runtime_custody_viewer_expiry_reconciles_exact_cleanup_before_read() {
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         Some(TEST_VIEWER_LAUNCH_ID),
         Some(&proof_binding_id),
         Some("runtime-session:alpha"),
@@ -11941,6 +11999,7 @@ async fn runtime_custody_viewer_read_and_close_reject_substituted_session_withou
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         Some(TEST_VIEWER_LAUNCH_ID),
         Some(&proof_binding_id),
         Some("runtime-session:beta"),
@@ -11959,6 +12018,7 @@ async fn runtime_custody_viewer_read_and_close_reject_substituted_session_withou
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         Some(TEST_VIEWER_LAUNCH_ID),
         Some(&proof_binding_id),
         Some("runtime-session:beta"),
@@ -12027,6 +12087,7 @@ async fn runtime_custody_viewer_read_and_close_reject_malformed_binding_without_
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         Some(TEST_VIEWER_LAUNCH_ID),
         Some(&proof_binding_id),
         Some(""),
@@ -12046,6 +12107,7 @@ async fn runtime_custody_viewer_read_and_close_reject_malformed_binding_without_
         principal_id,
         &hex::encode(harness.mint_id.as_bytes()),
         &hex::encode(session.viewer_session_handle()),
+        TEST_VIEWER_EXECUTABLE_ACTOR,
         Some(TEST_VIEWER_LAUNCH_ID),
         Some(&proof_binding_id),
         Some("runtime-session:alpha"),
@@ -12341,6 +12403,7 @@ async fn runtime_custody_viewer_expired_old_binding_allows_cleanup_before_fresh_
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            executable_actor: TEST_VIEWER_EXECUTABLE_ACTOR.to_string(),
             launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some(proof_binding_id),
             session_id: Some("runtime-session:beta".to_string()),
@@ -12803,6 +12866,7 @@ async fn runtime_custody_library_open_after_purchase_fails_closed_without_profil
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            executable_actor: TEST_VIEWER_EXECUTABLE_ACTOR.to_string(),
             launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some("proof:alpha".to_string()),
             session_id: Some("runtime-session:alpha".to_string()),
@@ -12857,6 +12921,7 @@ async fn runtime_custody_library_open_after_purchase_rejects_mismatched_purchase
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            executable_actor: TEST_VIEWER_EXECUTABLE_ACTOR.to_string(),
             launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some(proof_binding_id),
             session_id: Some("runtime-session:alpha".to_string()),
@@ -12910,6 +12975,7 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_decrypt() {
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            executable_actor: TEST_VIEWER_EXECUTABLE_ACTOR.to_string(),
             launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some(proof_binding_id),
             session_id: Some("runtime-session:alpha".to_string()),
@@ -13226,6 +13292,7 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_launch_toke
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            executable_actor: TEST_VIEWER_EXECUTABLE_ACTOR.to_string(),
             launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: None,
             session_id: None,
@@ -13285,6 +13352,7 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wal
         super::RuntimeCustodyViewerOpenInput {
             principal_id: principal_id.to_string(),
             mint_id: hex::encode(harness.mint_id.as_bytes()),
+            executable_actor: TEST_VIEWER_EXECUTABLE_ACTOR.to_string(),
             launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
             proof_binding_id: Some(proof_binding_id),
             session_id: Some("runtime-session:alpha".to_string()),
@@ -13318,6 +13386,79 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wal
         record.lifecycle_status,
         super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
     );
+}
+
+/// Session binding v3 admits two viewer capsules, so admission alone no longer
+/// says which one may open a given mint. `open_runtime_custody_viewer` is the
+/// SOLE place kind <-> viewer is enforced (the gateway proxy deliberately does
+/// not, to avoid creating a mint-journal directory per `open_viewer` call), so
+/// a reader launch opening a media mint must be denied here — before any
+/// decrypt-provider effect.
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_open_denies_a_reader_actor_on_a_media_mint() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted_now(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-open-cross-kind-viewer";
+    write_device_key(&harness.data_dir, 0x61);
+    let (_epoch, _composition_now) = write_library_publish_test_composition(&harness.data_dir);
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    assert!(
+        mint.draft().media_identity().is_some(),
+        "this fixture must be a media mint for the cross-kind case to mean anything"
+    );
+    let decrypt = PrepareOnlyCleanupDecryptProvider::with_expected_issuer_seed(0x61);
+    harness
+        .registry
+        .register_runtime_provider_target(PROTECTED_CONTENT_DECRYPT_PROVIDER_ID, decrypt.clone())
+        .await
+        .unwrap();
+    let profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &profile_did,
+        crate::auth::now_ts(),
+    );
+    let open = super::open_runtime_custody_viewer(
+        &harness.data_dir,
+        harness.registry.clone(),
+        super::RuntimeCustodyViewerOpenInput {
+            principal_id: principal_id.to_string(),
+            mint_id: hex::encode(harness.mint_id.as_bytes()),
+            executable_actor: TEST_VIEWER_READER_EXECUTABLE_ACTOR.to_string(),
+            launch_id: Some(TEST_VIEWER_LAUNCH_ID.to_string()),
+            proof_binding_id: Some(proof_binding_id),
+            session_id: Some("runtime-session:alpha".to_string()),
+            grant_id: Some("grant:alpha".to_string()),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        open.to_string()
+            .contains(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE),
+        "{open}"
+    );
+    assert!(
+        decrypt.requests().await.is_empty(),
+        "a cross-kind open must be denied before any decrypt-provider effect"
+    );
+    assert!(super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id()
+    )
+    .unwrap()
+    .is_none());
 }
 
 #[cfg(unix)]
@@ -13382,5 +13523,366 @@ async fn runtime_media_preparation_stages_plaintext_from_a_protected_principal_r
     assert_eq!(
         fs::read(staging_root.join(operation_id).join("input.bin")).unwrap(),
         plaintext
+    );
+}
+
+fn test_object_identity(framed_bytes: &[u8]) -> ChunkedPayloadObjectIdentityV1 {
+    let ciphertext_sha256 = Digest32::new(sha2::Sha256::digest(framed_bytes).into());
+    let encrypted_content =
+        EncryptedContentIdentityV1::new(ciphertext_sha256, framed_bytes.len() as u64).unwrap();
+    ChunkedPayloadObjectIdentityV1::new(encrypted_content, "application/pdf", 4096, 64).unwrap()
+}
+
+fn write_object_protected_content_directory(
+    directory: &Path,
+    object_identity: &ChunkedPayloadObjectIdentityV1,
+    framed_bytes: &[u8],
+) {
+    let tree = directory.join("protected-content/v1");
+    fs::create_dir_all(&tree).unwrap();
+    fs::write(
+        directory.join(PROTECTED_CONTENT_OBJECT_MANIFEST_PATH),
+        protected_content_object_manifest_bytes(object_identity).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        directory.join(PROTECTED_CONTENT_OBJECT_EPC1_PATH),
+        framed_bytes,
+    )
+    .unwrap();
+}
+
+#[test]
+fn publish_object_seals_with_epc1_and_writes_object_manifest() {
+    let framed_bytes = vec![0x5au8; 4160];
+    let object_identity = test_object_identity(&framed_bytes);
+    let directory = tempfile::tempdir().unwrap();
+    write_object_protected_content_directory(directory.path(), &object_identity, &framed_bytes);
+
+    verify_protected_content_object_directory(directory.path(), &object_identity)
+        .expect("a freshly written object directory must verify");
+
+    let files = object_protected_content_files(&object_identity).unwrap();
+    assert_eq!(files.len(), 2);
+    assert!(files
+        .iter()
+        .any(|file| file.path == PROTECTED_CONTENT_OBJECT_EPC1_PATH
+            && file.size == framed_bytes.len() as u64
+            && file.sha256
+                == hex::encode(
+                    object_identity
+                        .encrypted_content()
+                        .ciphertext_sha256()
+                        .as_bytes()
+                )));
+    assert!(files
+        .iter()
+        .any(|file| file.path == PROTECTED_CONTENT_OBJECT_MANIFEST_PATH));
+
+    let manifest_bytes = fs::read(
+        directory
+            .path()
+            .join(PROTECTED_CONTENT_OBJECT_MANIFEST_PATH),
+    )
+    .unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    assert_eq!(
+        manifest["schema"],
+        "elastos.protected-content.object-manifest/v1"
+    );
+    assert_eq!(manifest["content_type"], "application/pdf");
+    assert_eq!(manifest["plaintext_bytes"], 4096);
+    assert_eq!(manifest["framed_header_bytes"], 64);
+    assert_eq!(
+        manifest["encrypted_content"]["sha256"],
+        hex::encode(
+            object_identity
+                .encrypted_content()
+                .ciphertext_sha256()
+                .as_bytes()
+        )
+    );
+    assert_eq!(manifest["encrypted_content"]["bytes"], 4160);
+}
+
+#[test]
+fn verify_protected_content_directory_rejects_tampered_object_file() {
+    let framed_bytes = vec![0x5au8; 4160];
+    let object_identity = test_object_identity(&framed_bytes);
+    let directory = tempfile::tempdir().unwrap();
+    write_object_protected_content_directory(directory.path(), &object_identity, &framed_bytes);
+    verify_protected_content_object_directory(directory.path(), &object_identity).unwrap();
+
+    // Tamper with the framed ciphertext after the fact: the sha256 no longer
+    // matches what the object identity commits to.
+    let mut tampered = framed_bytes.clone();
+    tampered[0] ^= 0xff;
+    fs::write(
+        directory.path().join(PROTECTED_CONTENT_OBJECT_EPC1_PATH),
+        &tampered,
+    )
+    .unwrap();
+    assert!(verify_protected_content_object_directory(directory.path(), &object_identity).is_err());
+
+    // Restore, then tamper with the manifest instead.
+    fs::write(
+        directory.path().join(PROTECTED_CONTENT_OBJECT_EPC1_PATH),
+        &framed_bytes,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join(PROTECTED_CONTENT_OBJECT_MANIFEST_PATH),
+        br#"{"schema":"elastos.protected-content.object-manifest/v1","content_type":"text/plain","plaintext_bytes":4096,"framed_header_bytes":64,"encrypted_content":{"sha256":"00","bytes":4160}}"#,
+    )
+    .unwrap();
+    assert!(verify_protected_content_object_directory(directory.path(), &object_identity).is_err());
+
+    // A directory missing the object entirely must also fail closed.
+    let empty = tempfile::tempdir().unwrap();
+    assert!(verify_protected_content_object_directory(empty.path(), &object_identity).is_err());
+}
+
+/// A byte-for-byte copy of a real listing file written by the installed
+/// Runtime *before* the object widening landed, taken from this machine's
+/// installed data directory
+/// (`~/Library/Application Support/elastos/protected-content/runtime-listings/
+/// 58a70fb16023b740402f180b162fa6683fd9b2d21d9a6c8955e801c0be0e7b3d.json`,
+/// stamped 2026-09-06 by the installed end-to-end proof run; one of the 14
+/// listings that corpus holds, every one of them carrying
+/// `media_identity_base64`).
+///
+/// It was deliberately NOT regenerated by the current encoder: a fixture the
+/// new code can produce proves nothing about the listings already on disk.
+const REAL_PRE_OBJECT_WIDENING_LISTING_JSON: &[u8] = br#"{"schema":"elastos.library.runtime-custody-listing/v1","origin":{"kind":"local_creator","principal_id":"person:local:b62d976e8b765ee6819e585a6fc69486","listing_uri":"elastos://Qmf4jPsuwJtF4YBBX3LUFpp8Kxqc2LyrFoGtLqes4q7xuf","package_sha256":"81a3de84abe41219508112d5def9a6d82869df653b2be1a7231af65538626716"},"package":{"schema":"elastos.protected-content.portable-listing/v1","mint_id":"58a70fb16023b740402f180b162fa6683fd9b2d21d9a6c8955e801c0be0e7b3d","content_id":"content:5adec06aa185a801d88e440e0054503d2a7c9ff59ad3f999e2b36c5253c99f56","content_cid":"QmUgzoEcj1MtBzCJ4tQxMYJVpMKkjro1pn8Eom43ZSJNtX","metadata_cid":"QmX1bpSqJeXdSQ3gj1yYbazp9zD3EXR3tEtAkCVAgCXunr","token_uri":"ipfs://QmX1bpSqJeXdSQ3gj1yYbazp9zD3EXR3tEtAkCVAgCXunr/metadata.json","publisher_profile_did":"did:key:z6MkgowPpYJhdHT4E6xQcs1PBxvF2YYFuJLdcgcDaWMHoR9Q","display_name":"protected-content-installed-e2e-proof-20260906T071856Z-7576","media_identity_base64":"ZWxhc3Rvcy5wcm90ZWN0ZWQtY29udGVudC5jZW5jLWZtcDQtbWVkaWEtaWRlbnRpdHkvdjEAABZjZW5jLWZtcDQtYWVzMTI4Y3RyL3YxAFdlbGFzdG9zLnByb3RlY3RlZC1jb250ZW50LmVuY3J5cHRlZC1jb250ZW50L3YxACqs+NINPwTniTCHRJp8YEROnvoMMv7cerqTaXxc+EwSAAAAAAABn0vu0fVUIOwTa7f1hALcHFc+gwPUhxdKL+Eld7jnWLGOU8MP6bfu3Mgl5C+MJS0cNdXlouB4LkteryHNEfX6rtm0AAAAAAAAA4MACXZpZGVvL21wNAALYXZjMS42NDAwMjgAAwBXZWxhc3Rvcy5wcm90ZWN0ZWQtY29udGVudC5jZW5jLWZtcDQtc2VnbWVudC92MQCmaDmlEUShdbHpbVD037JOdUoqKQjwh3L3VupHy9r2yQAAAAAAAJBdAFdlbGFzdG9zLnByb3RlY3RlZC1jb250ZW50LmNlbmMtZm1wNC1zZWdtZW50L3YxAEGyspD4GIRJ/oRHjxW1IewpWpy6woVnkFr0G7C+/M9mAAAAAAAAljoAV2VsYXN0b3MucHJvdGVjdGVkLWNvbnRlbnQuY2VuYy1mbXA0LXNlZ21lbnQvdjEAphAM2eZLmC4ciOkcomIjkHCYFen6NE7mhx1ra4A3IrsAAAAAAAB4tA==","content_access_id":"0xd3b75643e2d735d466ba1ceb9aa76e44","key_envelope_identity_base64":"ZWxhc3Rvcy5wcm90ZWN0ZWQtY29udGVudC5rZXktZW52ZWxvcGUvdjEAAFdlbGFzdG9zLnByb3RlY3RlZC1jb250ZW50LmVuY3J5cHRlZC1jb250ZW50L3YxACqs+NINPwTniTCHRJp8YEROnvoMMv7cerqTaXxc+EwSAAAAAAABn0vNRf5pRtXoOz7TAPK1u4TyTdsCC9XxAEEGNC8YI76HHQAAH8EBwgwcBjXemQvazqEIu6nuwvChPMLXqatgtjYJWW3XmgIDAFdlbGFzdG9zLnByb3RlY3RlZC1jb250ZW50LmN1c3RvZHktcG9vbC5pZGVudGl0eS92MQCEOT8R2alUlpWVxgx3n9AS2pd6Ok8Xppb5AWQ+TAKDwgAAFK0AWGVsYXN0b3MucHJvdGVjdGVkLWNvbnRlbnQuY3VzdG9keS1lcG9jaC1pZGVudGl0eS92MQDn9SGB0cbTUlbSJwL9jB1X9Ge3vt5uCZBvY4bfFosrLwAAENcAamVsYXN0b3MucHJvdGVjdGVkLWNvbnRlbnQuY3VzdG9keS1jb21taXR0ZWUtYXV0aG9yaXphdGlvbi5pZGVudGl0eS92MQCCGGc5r/gwRtJY1Co5gfdxiXLXPMEVH3Gbp4JIKRy6/AAAAaI=","rights_policy_identity_base64":"ZWxhc3Rvcy5wcm90ZWN0ZWQtY29udGVudC5yaWdodHMtcG9saWN5LWlkZW50aXR5L3YxABFFBT9Njh7IiiewWpDprkfdHefJL9J/JB/86JXUFDjjAAAA+A==","content_key_commitment_base64":"kSNx+7wd8YimGT4pxpELj2cjeCYachPFmv4uCClpiV4=","seller_address":"0xf36c114c19f96b4174b6d71e392c00db95093a1e","chain_namespace":"eip155:8453","network":"base-mainnet","ledger":"0x0ebac909d31ef0074495e752c0cf4ea49ba13c41","token_id":"0xeaa1578cfda2c9885e4f626cf014c2d42c6be5c71ce64ebc9bda704072b32556","operative":"0xbaec8aa7dbbe6ef205feb93cb83a2bf91d650098","quantity":"0x3","price":"0x38d7ea4c68000","pay_token":"0x0000000000000000000000000000000000000000","mint_transaction_hash":"0xb8f5b500e32c54470ba5b674108da44ec74b3a4c4612b5bbc61cf3b2a85c89d9","published_at":1788679217},"availability":{"checked_at":1788679139,"observed_replicas":3,"receipt_digest":"85811f14bde02cac0498daff517c46f5ddaeb7a539bbe5756d5c6c948eb6aedc"}}"#;
+
+/// The `package_sha256` the real file above already carries, pinned as a
+/// literal. `RuntimeCustodyListingRecord::validate` recomputes
+/// `sha256(serde_json::to_vec(package))` and compares it to the value stored
+/// in the record's own `origin`, so a single changed byte in a media
+/// package's re-serialization fails the whole record — this literal makes
+/// that pin visible rather than implicit.
+const REAL_PRE_OBJECT_WIDENING_PACKAGE_SHA256: &str =
+    "81a3de84abe41219508112d5def9a6d82869df653b2be1a7231af65538626716";
+
+#[test]
+fn real_pre_object_widening_listing_still_decodes_and_reserializes_byte_identically() {
+    let record: super::RuntimeCustodyListingRecord =
+        serde_json::from_slice(REAL_PRE_OBJECT_WIDENING_LISTING_JSON)
+            .expect("a real pre-widening listing file must still deserialize");
+    record
+        .validate()
+        .expect("a real pre-widening listing file must still validate");
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(
+            serde_json::to_vec(&record.package).unwrap()
+        )),
+        REAL_PRE_OBJECT_WIDENING_PACKAGE_SHA256,
+        "a media listing package must re-serialize to the exact bytes its stored digest commits to"
+    );
+    assert_eq!(
+        serde_json::to_vec(&record).unwrap(),
+        REAL_PRE_OBJECT_WIDENING_LISTING_JSON,
+        "the whole record must round-trip to the exact on-disk bytes"
+    );
+    let decoded = record.package.decode_and_validate().unwrap();
+    let media = match &decoded.content_identity {
+        RuntimeContentIdentityV1::Media(media) => media,
+        RuntimeContentIdentityV1::Object(_) => {
+            panic!("the real corpus listing is a media listing")
+        }
+    };
+    assert_eq!(media.mime_type(), "video/mp4");
+    assert_eq!(media.codecs(), "avc1.640028");
+    assert_eq!(media.encrypted_segments().len(), 3);
+}
+
+/// A deterministic object mint draft plus the portable listing package a
+/// creator would publish for it: the object twin of
+/// `runtime_custody_listing_record_for_test`'s media package, reusing every
+/// non-identity field verbatim so the only difference under test is which
+/// identity field the package carries.
+fn object_listing_package_for_test(
+    seed: u8,
+) -> (
+    ChunkedPayloadObjectIdentityV1,
+    super::RuntimePortableListingPackage,
+) {
+    let epoch = signed_custody_epoch();
+    let framed = vec![seed; 4160];
+    let object_identity = ChunkedPayloadObjectIdentityV1::new(
+        EncryptedContentIdentityV1::new(
+            Digest32::new(sha2::Sha256::digest(&framed).into()),
+            framed.len() as u64,
+        )
+        .unwrap(),
+        "application/pdf",
+        4096,
+        64,
+    )
+    .unwrap();
+    let manifest = CustodyEnvelopeManifestV1::new(
+        object_identity.encrypted_content().clone(),
+        CustodyPoolIdentityV1::new(digest(seed ^ 0x34), 512).unwrap(),
+        epoch.epoch_identity().unwrap(),
+        CustodyCommitteeAuthorizationIdentityV1::new(digest(seed ^ 0x35), 512).unwrap(),
+        ThresholdV1::new(2, 3).unwrap(),
+        digest(seed ^ 0x33),
+        epoch.statement().nodes().to_vec(),
+    )
+    .unwrap();
+    let envelope = CustodyEnvelopeV1::new(
+        manifest,
+        [seed ^ 0x50, seed ^ 0x51, seed ^ 0x52]
+            .into_iter()
+            .map(sealed_share)
+            .collect(),
+    )
+    .unwrap();
+    let mint_nodes = epoch
+        .statement()
+        .nodes()
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            let node_seed = u8::try_from(index + 1).unwrap();
+            RuntimeMintNodeBinding::new(
+                node.node_public_key(),
+                CustodyPoolOperatorIdV1::new([0x80 + node_seed; 32]),
+                CustodyPoolFailureDomainIdV1::new([0x90 + node_seed; 32]),
+                Digest32::new([0x3f + node_seed; 32]),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let draft = RuntimeMintDraft::new_from_identity(
+        RuntimeContentIdentityV1::Object(object_identity.clone()),
+        content_access_id(seed),
+        envelope.key_envelope_identity().unwrap(),
+        policy_body().policy_identity().unwrap(),
+        envelope.manifest().content_key_commitment(),
+        envelope.manifest().threshold(),
+        mint_nodes,
+    )
+    .unwrap();
+    let media_package = runtime_custody_listing_record_for_test(
+        draft.mint_id(),
+        "person:local:object-listing",
+        "object-listing",
+        NOW,
+    )
+    .package;
+    let (media_identity_base64, content_identity_base64) =
+        super::runtime_portable_identity_fields(draft.content_identity()).unwrap();
+    let package = super::RuntimePortableListingPackage {
+        mint_id: hex::encode(draft.mint_id().as_bytes()),
+        content_id: super::runtime_protected_content_id(draft.encrypted_content()).unwrap(),
+        content_access_id: format!("0x{}", hex::encode(draft.content_access_id().as_bytes())),
+        media_identity_base64,
+        content_identity_base64,
+        key_envelope_identity_base64: base64::engine::general_purpose::STANDARD
+            .encode(draft.key_envelope().canonical_bytes().unwrap()),
+        rights_policy_identity_base64: base64::engine::general_purpose::STANDARD
+            .encode(draft.policy().canonical_bytes().unwrap()),
+        content_key_commitment_base64: base64::engine::general_purpose::STANDARD
+            .encode(draft.content_key_commitment().as_bytes()),
+        ..media_package
+    };
+    (object_identity, package)
+}
+
+#[test]
+fn object_listing_package_decodes_as_an_object_and_omits_the_media_identity_field() {
+    let (object_identity, package) = object_listing_package_for_test(0x71);
+    let bytes = serde_json::to_vec(&package).unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(
+        !text.contains("media_identity_base64"),
+        "an object package must not carry a media identity field at all"
+    );
+    assert!(text.contains("\"content_identity_base64\":"));
+    assert_eq!(
+        serde_json::from_slice::<super::RuntimePortableListingPackage>(&bytes).unwrap(),
+        package,
+        "an object package must round-trip through the durable JSON form"
+    );
+    let decoded = package.decode_and_validate().unwrap();
+    match &decoded.content_identity {
+        RuntimeContentIdentityV1::Object(object) => assert_eq!(object, &object_identity),
+        RuntimeContentIdentityV1::Media(_) => panic!("an object package must decode as an object"),
+    }
+    assert_eq!(decoded.content_identity.content_type(), "application/pdf");
+    assert_eq!(
+        super::runtime_portable_content_codecs(&decoded.content_identity),
+        "",
+        "an object declares no codecs"
+    );
+}
+
+#[test]
+fn listing_package_requires_exactly_one_identity_field_of_the_matching_kind() {
+    let (_, object_package) = object_listing_package_for_test(0x72);
+    let media_package = runtime_custody_listing_record_for_test(
+        Digest32::new([0x73; 32]),
+        "person:local:media-listing",
+        "media-listing",
+        NOW,
+    )
+    .package;
+    media_package
+        .decode_and_validate()
+        .expect("the media control package must still decode");
+    object_package
+        .decode_and_validate()
+        .expect("the object control package must still decode");
+
+    let mut both = object_package.clone();
+    both.media_identity_base64 = media_package.media_identity_base64.clone();
+    assert!(
+        both.decode_and_validate().is_err(),
+        "a package carrying both identity fields must fail closed"
+    );
+
+    let mut neither = object_package.clone();
+    neither.content_identity_base64 = None;
+    assert!(
+        neither.decode_and_validate().is_err(),
+        "a package carrying no identity field must fail closed"
+    );
+
+    // A media identity smuggled into the object field is a cross-kind
+    // encoding: media has exactly one canonical home, `media_identity_base64`.
+    let media_identity = match media_package
+        .decode_and_validate()
+        .unwrap()
+        .content_identity
+    {
+        RuntimeContentIdentityV1::Media(media) => media,
+        RuntimeContentIdentityV1::Object(_) => panic!("the control package is media"),
+    };
+    let mut smuggled = media_package.clone();
+    smuggled.media_identity_base64 = None;
+    smuggled.content_identity_base64 = Some(
+        base64::engine::general_purpose::STANDARD.encode(
+            RuntimeContentIdentityV1::Media(media_identity)
+                .canonical_bytes()
+                .unwrap(),
+        ),
+    );
+    assert!(
+        smuggled.decode_and_validate().is_err(),
+        "a media identity carried under content_identity_base64 must fail closed"
+    );
+
+    // An unknown kind discriminant is corrupt, never a default.
+    let mut unknown_kind = object_package.clone();
+    let mut raw = base64::engine::general_purpose::STANDARD
+        .decode(object_package.content_identity_base64.as_deref().unwrap())
+        .unwrap();
+    raw[0] = 0x03;
+    unknown_kind.content_identity_base64 =
+        Some(base64::engine::general_purpose::STANDARD.encode(raw));
+    assert!(
+        unknown_kind.decode_and_validate().is_err(),
+        "an unknown content-identity kind byte must fail closed"
     );
 }

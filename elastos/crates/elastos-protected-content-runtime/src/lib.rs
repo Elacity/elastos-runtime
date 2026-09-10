@@ -12,6 +12,8 @@ mod mint_journal;
 mod open;
 #[cfg(test)]
 mod test_media;
+#[cfg(test)]
+mod test_object;
 
 pub use coordinator::{
     wallet_rights_signature_result, RuntimeCustodyProvider, RuntimeProviderCallError,
@@ -31,18 +33,20 @@ pub use mint::{
 };
 pub use mint_journal::{
     ExclusiveFileLock, PersistedRuntimeMint, RuntimeContentAvailabilityRequirement,
-    RuntimeCustodyTerminalKind, RuntimeMediaPreparationRecord, RuntimeMediaPreparationState,
-    RuntimeMintCreatorDesiredTerms, RuntimeMintCreatorEffectBinding, RuntimeMintCreatorState,
-    RuntimeMintCreatorTerminalEvidence, RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal,
-    RuntimeMintJournalError, RuntimeMintNodeBinding, RuntimeMintNodeReceipt,
-    RuntimeVerifiedContentAvailability,
+    RuntimeContentIdentityV1, RuntimeCustodyTerminalKind, RuntimeMediaPreparationRecord,
+    RuntimeMediaPreparationState, RuntimeMintCreatorDesiredTerms, RuntimeMintCreatorEffectBinding,
+    RuntimeMintCreatorState, RuntimeMintCreatorTerminalEvidence, RuntimeMintDraft,
+    RuntimeMintIntent, RuntimeMintIntentContentV1, RuntimeMintJournal, RuntimeMintJournalError,
+    RuntimeMintNodeBinding, RuntimeMintNodeReceipt, RuntimeVerifiedContentAvailability,
+    RuntimeVerifiedContentIdentityRootV1,
 };
 pub use open::{
     bind_buy, cancel_prepared_recipient, cancel_prepared_recipient_with_result_by_handle,
     close_viewer_session, close_viewer_session_with_result, open_viewer_session, prepare_recipient,
-    read_viewer_media_part, reject_bearer_playback, RuntimeBuyReceipt, RuntimeDecryptProvider,
-    RuntimeOpenError, RuntimeOpenViewerSessionInput, RuntimePreparedRecipient,
-    RuntimePreparedRecipientCancelResult, RuntimeProtectedContentPurchaseIntent,
-    RuntimePurchaseEffectAuthority, RuntimeVerifiedPurchaseEffect, RuntimeViewerMediaPart,
+    read_viewer_media_part, read_viewer_object_chunk, reject_bearer_playback, RuntimeBuyReceipt,
+    RuntimeDecryptProvider, RuntimeOpenError, RuntimeOpenViewerContentV1,
+    RuntimeOpenViewerSessionInput, RuntimePreparedRecipient, RuntimePreparedRecipientCancelResult,
+    RuntimeProtectedContentPurchaseIntent, RuntimePurchaseEffectAuthority,
+    RuntimeVerifiedPurchaseEffect, RuntimeViewerMediaPart, RuntimeViewerObjectChunk,
     RuntimeViewerSession, RuntimeViewerSessionCloseResult,
 };

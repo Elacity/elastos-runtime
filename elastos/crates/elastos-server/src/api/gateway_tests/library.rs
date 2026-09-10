@@ -28,6 +28,7 @@ fn protected_content_gateway_mock_test_guard() -> &'static tokio::sync::Mutex<()
 }
 
 const ELACITY_PLAYER_CAPSULE_ID_FOR_TEST: &str = "elacity-player";
+const ELACITY_READER_CAPSULE_ID_FOR_TEST: &str = "elacity-reader";
 const RUNTIME_PORTABLE_LISTING_TEST_CID: &str =
     "bafybeibwzif2r5tn7z7cq4f5a2mmepmab4s4m5a2hqu5v4f4uzkd3t2u7m";
 
@@ -419,7 +420,9 @@ fn seed_completed_runtime_custody_mint(
         crate::auth::now_ts(),
         elastos_protected_content_contracts::Digest32::new([0xa1; 32]),
         draft.encrypted_content().clone(),
-        draft.media_identity().media_manifest_root(),
+        elastos_protected_content_runtime::RuntimeVerifiedContentIdentityRootV1::for_media(
+            draft.media_identity().unwrap(),
+        ),
     )
     .unwrap();
     journal
@@ -428,7 +431,7 @@ fn seed_completed_runtime_custody_mint(
     seed_mock_published_protected_content(
         &content_id,
         &publisher_profile_did,
-        draft.media_identity(),
+        draft.media_identity().unwrap(),
         &protected_init_segment,
         &protected_segments,
         evidence.checked_at(),
@@ -6885,6 +6888,7 @@ async fn test_runtime_custody_buy_raw_provider_call_requires_gateway_wallet_auth
             "mint_id": "00".repeat(32),
         }),
         None,
+        crate::library::LibraryRequestRoute::UnverifiedCaller,
     )
     .await;
     assert_eq!(response["status"], "error");
@@ -8401,7 +8405,10 @@ async fn run_runtime_custody_portable_listing_import(
         protected_content_identity: &'a str,
         mint_id: &'a str,
         publisher_profile_did: &'a str,
-        media_identity_base64: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        media_identity_base64: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content_identity_base64: Option<&'a str>,
         key_envelope_identity_base64: &'a str,
         rights_policy_identity_base64: &'a str,
         content_key_commitment_base64: &'a str,
@@ -8449,7 +8456,8 @@ async fn run_runtime_custody_portable_listing_import(
             protected_content_identity: &listing.package.content_id,
             mint_id: &listing.package.mint_id,
             publisher_profile_did: &listing.package.publisher_profile_did,
-            media_identity_base64: &listing.package.media_identity_base64,
+            media_identity_base64: listing.package.media_identity_base64.as_deref(),
+            content_identity_base64: listing.package.content_identity_base64.as_deref(),
             key_envelope_identity_base64: &listing.package.key_envelope_identity_base64,
             rights_policy_identity_base64: &listing.package.rights_policy_identity_base64,
             content_key_commitment_base64: &listing.package.content_key_commitment_base64,
@@ -9036,6 +9044,7 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
         open_keys,
         std::collections::BTreeSet::from([
             "codecs",
+            "content_kind",
             "expires_at",
             "has_init_segment",
             "mime_type",
@@ -9044,6 +9053,10 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
             "segment_count",
             "viewer_session_handle",
         ])
+    );
+    assert_eq!(
+        open_payload["data"]["content_kind"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_MEDIA
     );
     assert_eq!(
         open_payload["data"]["segment_count"].as_u64(),
@@ -9882,6 +9895,30 @@ async fn test_library_provider_runtime_custody_viewer_ops_require_player_launch_
         "home launch token is not authorized for this viewer"
     );
 
+    // Session binding v3 admits a second viewer capsule. A reader launch token
+    // whose `selected_resource` matches its `executable_actor` must clear the
+    // proxy's viewer admission — it is then denied by the Runtime for the
+    // ordinary reason (no purchase), not by the proxy's 403.
+    let reader_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        ELACITY_READER_CAPSULE_ID_FOR_TEST,
+        &authority,
+    );
+    let (reader_status, reader_payload) = post_library(
+        app.clone(),
+        &reader_token,
+        "open_viewer",
+        json!({ "mint_id": "00".repeat(32) }),
+    )
+    .await;
+    assert_eq!(reader_status, StatusCode::OK, "{reader_payload}");
+    assert_eq!(reader_payload["status"], "error", "{reader_payload}");
+    assert_eq!(
+        reader_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE,
+        "{reader_payload}"
+    );
+
     let player_token = projection_launch_token_for_authority_context(
         dir.path(),
         ELACITY_PLAYER_CAPSULE_ID_FOR_TEST,
@@ -9915,6 +9952,67 @@ async fn test_library_provider_runtime_custody_viewer_ops_require_player_launch_
         .await
         .unwrap();
     assert_eq!(wrong_origin.status(), StatusCode::FORBIDDEN);
+}
+
+/// The protected-publish content-type gate.
+///
+/// `library_publish` routes `video/*`/`audio/*` to the unchanged media
+/// transcode path and everything else to the EPC1 object path. Before
+/// `mime_for_name` was widened, every media container but `.mp4`/`.mp3`
+/// resolved to `application/octet-stream` and was sealed as an object instead
+/// — un-openable, and poisoning the source's authority shape for any later
+/// retry. Media families must now pass the gate, and a type the table does not
+/// know must be refused outright rather than minted.
+#[tokio::test]
+async fn test_library_provider_runtime_custody_publish_gates_on_content_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let unsupported = crate::library::RUNTIME_CUSTODY_PUBLISH_UNSUPPORTED_TYPE_MESSAGE;
+
+    for name in [
+        "clip.mkv",
+        "clip.mov",
+        "clip.webm",
+        "clip.m4v",
+        "clip.avi",
+        "clip.ts",
+        "song.m4a",
+        "song.wav",
+        "song.flac",
+        "song.ogg",
+        "song.opus",
+        "notes.md",
+        "shot.png",
+        "book.pdf",
+    ] {
+        let uri = format!("{root}/Documents/gate-{name}");
+        write_library_bytes(&app, &token, &uri, b"source-bytes").await;
+        let (status, payload) = publish_runtime_custody(&app, &token, &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(
+            payload["message"].as_str().unwrap_or_default(),
+            unsupported,
+            "{name} must pass the protected-publish content-type gate: {payload}"
+        );
+    }
+
+    for name in ["archive.xyz", "blob.bin", "noextension", "shot.heic"] {
+        let uri = format!("{root}/Documents/gate-{name}");
+        write_library_bytes(&app, &token, &uri, b"source-bytes").await;
+        assert_runtime_custody_publish_error(
+            dir.path(),
+            &app,
+            &token,
+            &authority.principal_id,
+            &uri,
+            unsupported,
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
