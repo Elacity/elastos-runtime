@@ -188,6 +188,11 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         capsules: Vec<String>,
 
+        /// Prepared native input for each release platform (repeat PLATFORM=DIR three times)
+        #[arg(long = "platform-input", value_name = "PLATFORM=DIR",
+              conflicts_with_all = &["skip_build", "skip_rootfs", "cross", "capsules"])]
+        platform_inputs: Vec<String>,
+
         /// Override release signing key path
         #[arg(long)]
         key: Option<PathBuf>,
@@ -1383,6 +1388,7 @@ async fn main() -> anyhow::Result<()> {
             skip_rootfs,
             cross,
             capsules,
+            platform_inputs,
             key,
             dry_run,
             preflight_only,
@@ -1401,6 +1407,7 @@ async fn main() -> anyhow::Result<()> {
                 skip_rootfs,
                 cross,
                 capsules,
+                platform_inputs,
                 key,
                 dry_run,
                 preflight_only,
@@ -2171,6 +2178,50 @@ mod tests {
     use clap::Parser;
     use sha2::Digest;
     use std::fs;
+
+    #[test]
+    fn publish_release_cli_accepts_repeated_platform_inputs() {
+        let args = [
+            "elastos",
+            "publish-release",
+            "--version",
+            "0.7.1",
+            "--platform-input",
+            "x86_64-linux=/prepared/amd64",
+            "--platform-input",
+            "aarch64-linux=/prepared/arm64",
+            "--platform-input",
+            "aarch64-darwin=/prepared/mac",
+        ];
+        let cli = super::Cli::try_parse_from(args).unwrap();
+        let Some(super::Commands::PublishRelease {
+            platform_inputs,
+            profile,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected publish-release command");
+        };
+        assert_eq!(profile, "home");
+        assert_eq!(
+            platform_inputs,
+            [
+                "x86_64-linux=/prepared/amd64",
+                "aarch64-linux=/prepared/arm64",
+                "aarch64-darwin=/prepared/mac",
+            ]
+        );
+        for conflict in [
+            vec!["--skip-build"],
+            vec!["--skip-rootfs"],
+            vec!["--cross", "aarch64"],
+            vec!["--capsules", "home"],
+        ] {
+            let mut invalid = args.to_vec();
+            invalid.extend(conflict);
+            assert!(super::Cli::try_parse_from(invalid).is_err());
+        }
+    }
 
     #[test]
     fn home_browser_cli_preserves_terminal_default_and_probe_options() {

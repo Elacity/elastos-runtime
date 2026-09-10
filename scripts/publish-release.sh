@@ -151,7 +151,8 @@ ALLOWED_CHANNELS=(
     jetson-test
 )
 
-# Navigate to project root
+# Navigate to project root; relative CLI paths belong to the original caller.
+PUBLISH_CALLER_DIR="$PWD"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 # ── Help ──────────────────────────────────────────────────────────────
@@ -177,6 +178,7 @@ show_help() {
     echo "  --public-with-sudo Start auto-public gateway+tunnel via sudo"
     echo "  --allow-signer-rotation  Allow signer DID to differ from the current canonical publisher signer"
     echo "  --gateway-addr     Gateway listen addr for auto-public URL (default: 127.0.0.1:8090)"
+    echo "  --platform-input PLATFORM=DIR  Import each of the three reviewed native inputs (repeat three times)"
     echo "  --cross ARCH       Also cross-compile for ARCH (e.g., aarch64). Creates multi-platform release."
     echo "  --public-timeout   Seconds to wait for trycloudflare URL (default: 60)"
     echo "  --help             Show this help"
@@ -281,6 +283,14 @@ canonical_publisher_gateway() {
 }
 
 inspect_signer_did() {
+    if [[ -n "${PREPARED_INPUT_ROOT:-}" ]]; then
+        local value args=()
+        for value in "${PLATFORM_INPUTS[@]}"; do args+=(--platform-input "$value"); done
+        "$ELASTOS" publish-release --version "$VERSION" --channel "$CHANNEL" \
+            --key "$KEY_PATH" --dry-run "${args[@]}" \
+            | sed -n 's/^  Signer:[[:space:]]*//p' | head -n1
+        return
+    fi
     cargo run -q -p elastos-server --manifest-path "elastos/Cargo.toml" -- publish-release \
         --version "$VERSION" \
         --channel "$CHANNEL" \
@@ -1128,6 +1138,54 @@ runtime_tunnel_url() {
     return 0
 }
 
+# Input admission and byte staging happen before signing, uploads or state writes.
+stage_platform_inputs() {
+    local output="$1"
+    shift
+    local value args=()
+    for value in "$@"; do args+=(--input "$value"); done
+    python3 scripts/release-platform-input.py stage-inputs \
+        --version "$VERSION" --output "$output" "${args[@]}"
+}
+
+publish_prepared_platform_inputs() {
+    local root="$1"
+    local path cid components_cid components_sha components_size
+    python3 scripts/release-platform-input.py verify-staged "$root" || return
+    : > "${TMPDIR}/input-cids.jsonl"
+    while IFS= read -r path; do
+        cid=$(ipfs_add "$root/artifacts/$path") || return
+        jq -nc --arg path "$path" --arg cid "$cid" '{($path): $cid}' >> "${TMPDIR}/input-cids.jsonl" || return
+    done < <(jq -r '.files | keys[]' "$root/assembly.json")
+    jq -s 'add' "${TMPDIR}/input-cids.jsonl" > "${TMPDIR}/input-cids.json" || return
+    python3 scripts/release-platform-input.py attach-cids "$root" \
+        --cids "${TMPDIR}/input-cids.json" || return
+    PREPARED_ARTIFACTS_DIR="$root/artifacts"
+    components_cid=$(ipfs_add "$PREPARED_ARTIFACTS_DIR/components-${PLATFORM}.json") || return
+    components_sha=$(sha256 "$PREPARED_ARTIFACTS_DIR/components-${PLATFORM}.json") || return
+    components_size=$(file_size "$PREPARED_ARTIFACTS_DIR/components-${PLATFORM}.json") || return
+    PLATFORMS_JSON=$(jq -n --slurpfile assembly "$root/assembly.json" \
+        --slurpfile cids "${TMPDIR}/input-cids.json" \
+        --arg cid "$components_cid" --arg sha "$components_sha" --argjson size "$components_size" '
+        $assembly[0] as $a | $cids[0] as $c | reduce $a.platforms[] as $p ({};
+        .[$p] = {binary: {cid: $c["elastos-"+$p], sha256: $a.files["elastos-"+$p].sha256,
+                         size: $a.files["elastos-"+$p].size},
+                 components: {cid: $cid, sha256: $sha, size: $size}})') || return
+    RELEASE_SOURCE_JSON=$(jq -c '.source | {commit,tree}' "$root/assembly.json") || return
+    STAGED_ELASTOS="$PREPARED_ARTIFACTS_DIR/elastos-${PLATFORM}"
+    cp "$PREPARED_ARTIFACTS_DIR/components-${PLATFORM}.json" "${TMPDIR}/components.json" || return
+    BINARY_CID=$(printf '%s' "$PLATFORMS_JSON" | jq -r --arg p "$PLATFORM" '.[$p].binary.cid')
+    BINARY_SHA256=$(sha256 "$STAGED_ELASTOS")
+    BINARY_SIZE=$(file_size "$STAGED_ELASTOS")
+    COMPONENTS_CID="$components_cid"
+    COMPONENTS_SHA256="$components_sha"
+    COMPONENTS_SIZE="$components_size"
+    CAPSULE_ENTRIES='{}'
+    CROSS_CAPSULE_ENTRIES='{}'
+    CROSS_PLATFORM='' CROSS_BINARY_CID='' CROSS_COMPONENTS_CID=''
+    SHELL_CID='' SHELL_SHA256=''
+}
+
 # Sourcing exposes local builders without invoking the publisher.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     return 0
@@ -1147,6 +1205,8 @@ ALLOW_SIGNER_ROTATION=false
 GATEWAY_ADDR="127.0.0.1:8090"
 PUBLIC_URL_TIMEOUT=60
 CROSS_ARCH=""
+PLATFORM_INPUTS=()
+CAPSULES_EXPLICIT=false
 STATE_DIR="${ELASTOS_PUBLISH_STATE_DIR:-.}"
 
 while [[ $# -gt 0 ]]; do
@@ -1179,7 +1239,15 @@ while [[ $# -gt 0 ]]; do
         --cross)
             [[ -z "${2:-}" ]] && die "Usage: --cross ARCH (e.g., aarch64)"
             CROSS_ARCH="$2"; shift 2 ;;
+        --platform-input)
+            [[ -z "${2:-}" ]] && die "Usage: --platform-input PLATFORM=DIR"
+            input_name="${2%%=*}"
+            input_path="${2#*=}"
+            [[ "$2" == *=* && -n "$input_path" ]] || die "Usage: --platform-input PLATFORM=DIR"
+            [[ "$input_path" == /* ]] || input_path="$PUBLISH_CALLER_DIR/$input_path"
+            PLATFORM_INPUTS+=("${input_name}=${input_path}"); shift 2 ;;
         --capsules)
+            CAPSULES_EXPLICIT=true
             [[ -z "${2:-}" ]] && die "Usage: --capsules name1,name2,..."
             IFS=',' read -r -a CAPSULES <<< "$2"
             shift 2 ;;
@@ -1190,13 +1258,10 @@ done
 # ── Preflight ─────────────────────────────────────────────────────────
 
 [[ -z "$VERSION" ]] && die "--version is required"
-[[ -z "$KEY_PATH" ]] && die "--key is required (release signing must use an explicit key)"
-[[ ! -f "$KEY_PATH" ]] && die "Key file not found: $KEY_PATH"
 bash "./scripts/check-versioning.sh" "$VERSION"
 if ! is_allowed_channel "$CHANNEL"; then
     die "Unsupported release channel '${CHANNEL}'. Allowed channels: ${ALLOWED_CHANNELS[*]}"
 fi
-mkdir -p "$STATE_DIR"
 export ELASTOS_RELEASE_VERSION="$VERSION"
 
 for cmd in jq python3 curl; do
@@ -1205,6 +1270,32 @@ done
 
 sha256 /dev/null &>/dev/null || die "No SHA-256 tool available"
 
+if [[ ${#PLATFORM_INPUTS[@]} -gt 0 ]]; then
+    [[ "$SKIP_BUILD" == false && "$SKIP_ROOTFS" == false && -z "$CROSS_ARCH" && "$CAPSULES_EXPLICIT" == false ]] \
+        || die "--platform-input conflicts with --skip-build, --skip-rootfs, --cross and --capsules"
+fi
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+PREPARED_INPUT_ROOT=""
+if [[ ${#PLATFORM_INPUTS[@]} -gt 0 ]]; then
+    PREPARED_INPUT_ROOT="${TMPDIR}/native-inputs"
+    stage_platform_inputs "$PREPARED_INPUT_ROOT" "${PLATFORM_INPUTS[@]}"
+    case "$(uname -s):$(uname -m)" in
+        Linux:x86_64) PLATFORM=x86_64-linux; SETUP_PLATFORM=linux-amd64 ;;
+        Linux:aarch64|Linux:arm64) PLATFORM=aarch64-linux; SETUP_PLATFORM=linux-arm64 ;;
+        Darwin:arm64|Darwin:aarch64) PLATFORM=aarch64-darwin; SETUP_PLATFORM=darwin-arm64 ;;
+        *) die "Prepared input publication requires a supported native coordinator" ;;
+    esac
+    ELASTOS="$PREPARED_INPUT_ROOT/artifacts/elastos-${PLATFORM}"
+    HOST_DATA_DIR="$(default_elastos_data_dir)"
+    if [[ -z "$IPFS_PROVIDER_BIN" ]]; then
+        IPFS_PROVIDER_BIN="$PREPARED_INPUT_ROOT/artifacts/ipfs-provider-${SETUP_PLATFORM}"
+    fi
+fi
+[[ -z "$KEY_PATH" ]] && die "--key is required (release signing must use an explicit key)"
+[[ ! -f "$KEY_PATH" ]] && die "Key file not found: $KEY_PATH"
+mkdir -p "$STATE_DIR"
+
 if [[ -z "$IPFS_PROVIDER_BIN" ]]; then
     IPFS_PROVIDER_BIN=$(find_ipfs_provider_binary || true)
 fi
@@ -1212,6 +1303,7 @@ fi
 [[ ! -x "$IPFS_PROVIDER_BIN" ]] && die "ipfs-provider binary is not executable: $IPFS_PROVIDER_BIN"
 export ELASTOS_IPFS_PROVIDER_BIN="$IPFS_PROVIDER_BIN"
 
+if [[ -z "$PREPARED_INPUT_ROOT" ]]; then
 # Resolve target dir from .cargo/config.toml (supports custom target-dir for WSL2 ext4 perf)
 CARGO_TARGET_DIR=""
 if [[ -f "elastos/.cargo/config.toml" ]]; then
@@ -1222,6 +1314,8 @@ if [[ -n "$CARGO_TARGET_DIR" ]]; then
     ELASTOS="${CARGO_TARGET_DIR}/release/elastos"
 else
     ELASTOS="elastos/target/release/elastos"
+fi
+
 fi
 
 CANDIDATE_SIGNER_DID="$(inspect_signer_did)"
@@ -1240,6 +1334,10 @@ echo -e "${DIM}  IPFS provider: ${IPFS_PROVIDER_BIN}${NC}"
 echo -e "${DIM}  Capsules: ${CAPSULES[*]}${NC}"
 echo ""
 
+if [[ -n "$PREPARED_INPUT_ROOT" ]]; then
+    info "Publishing the admitted three-platform native inputs..."
+    publish_prepared_platform_inputs "$PREPARED_INPUT_ROOT"
+else
 # ── Step 1: Build runtime (and capsules only when needed) ────────────
 
 if [ "$SKIP_BUILD" = true ]; then
@@ -1604,9 +1702,6 @@ if [[ ${#missing_external[@]} -gt 0 && "$SKIP_ROOTFS" != true ]]; then
     unique_external=$(printf '%s\n' "${missing_external[@]}" | sort -u | tr '\n' ',' | sed 's/,$//')
     die "Missing external components required for publish rootfs build (${SETUP_PLATFORM}): ${unique_external}\n  Run: elastos setup --with ${unique_external}"
 fi
-
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
 
 ARTIFACTS_DIR="${TMPDIR}/artifacts"
 mkdir -p "$ARTIFACTS_DIR"
@@ -2028,6 +2123,9 @@ if [[ -n "$CROSS_PLATFORM" ]]; then
         --platform "$CROSS_SETUP_PLATFORM" --artifact-root "$PREPARED_ARTIFACTS_DIR"
 fi
 
+# End build-mode preparation.
+fi
+
 # ── Step 7: Create + sign release.json ───────────────────────────────
 
 PREV_RELEASE_CID="null"
@@ -2035,6 +2133,7 @@ if [[ -f "${STATE_DIR}/last-release-cid" ]]; then
     PREV_RELEASE_CID="\"$(cat "${STATE_DIR}/last-release-cid")\""
 fi
 
+if [[ -z "$PREPARED_INPUT_ROOT" ]]; then
 # Build the platforms object. Start with the host platform.
 PLATFORMS_JSON=$(jq -n \
     --arg platform "$PLATFORM" \
@@ -2070,6 +2169,8 @@ if [[ -n "$CROSS_BINARY_CID" && -n "$CROSS_COMPONENTS_CID" ]]; then
     info "Release includes: ${PLATFORM}, ${CROSS_PLATFORM}"
 fi
 
+fi
+
 RELEASE_PAYLOAD=$(jq -ncS \
     --arg schema "elastos.release/v1" \
     --arg channel "$CHANNEL" \
@@ -2079,6 +2180,7 @@ RELEASE_PAYLOAD=$(jq -ncS \
     --arg shell_cid "${SHELL_CID}" \
     --arg shell_sha256 "${SHELL_SHA256}" \
     --argjson platforms "$PLATFORMS_JSON" \
+    --argjson source "${RELEASE_SOURCE_JSON:-null}" \
     '{
         schema: $schema,
         channel: $channel,
@@ -2088,7 +2190,8 @@ RELEASE_PAYLOAD=$(jq -ncS \
         shell_cid: $shell_cid,
         shell_sha256: $shell_sha256,
         platforms: $platforms
-    }')
+    } + (if $source == null then {} else {source: $source} end)
+      | if $source == null then . else del(.shell_cid,.shell_sha256) end')
 
 info "Signing release payload..."
 SIGN_OUTPUT=$(echo -n "$RELEASE_PAYLOAD" | "$ELASTOS" sign-payload --domain elastos.release.v1 --key "$KEY_PATH")
@@ -2333,10 +2436,9 @@ mkdir -p artifacts
 cp "$STAMPED_INSTALL" artifacts/install.sh
 cp "${TMPDIR}/release.json" artifacts/release.json
 cp "${TMPDIR}/release-head.json" artifacts/release-head.json
-cp "${TMPDIR}/components.json" "artifacts/components-${PLATFORM}.json"
-if [[ -n "$CROSS_PLATFORM" && -f "${TMPDIR}/components-${CROSS_PLATFORM}.json" ]]; then
-    cp "${TMPDIR}/components-${CROSS_PLATFORM}.json" "artifacts/components-${CROSS_PLATFORM}.json"
-fi
+for components_file in "${PREPARED_ARTIFACTS_DIR}"/components-*.json; do
+    cp "$components_file" "artifacts/$(basename "$components_file")"
+done
 info "Installer CID: ${INSTALL_SCRIPT_CID}"
 
 # Save release metadata to runtime-owned publisher state for gateway serving.
@@ -2515,7 +2617,9 @@ echo -e "${GREEN}${BOLD}Release published!${NC}"
 echo ""
 echo -e "  Version:      ${BOLD}${VERSION}${NC}"
 echo -e "  Channel:      ${CHANNEL}"
-if [[ -n "$CROSS_BINARY_CID" ]]; then
+if [[ -n "$PREPARED_INPUT_ROOT" ]]; then
+    echo -e "  Platforms:    $(printf '%s' "$PLATFORMS_JSON" | jq -r 'keys | join(", ")')"
+elif [[ -n "$CROSS_BINARY_CID" ]]; then
     echo -e "  Platforms:    ${PLATFORM}, ${CROSS_PLATFORM}"
 else
     echo -e "  Platform:     ${PLATFORM}"
@@ -2602,7 +2706,11 @@ TOTAL_ARTIFACTS=${#CAPSULES[@]}
 if [[ -n "$CROSS_BINARY_CID" ]]; then
     TOTAL_ARTIFACTS=$(( ${#CAPSULES[@]} * 2 ))
 fi
+if [[ -n "$PREPARED_INPUT_ROOT" ]]; then
+    echo -e "${DIM}  Native release inputs published for all three platforms; generic microVM rootfs acceptance is separate.${NC}"
+else
 echo -e "${DIM}  Capsule artifacts published: ${TOTAL_ARTIFACTS} (${#CAPSULES[@]} capsules × $([ -n "$CROSS_BINARY_CID" ] && echo "2 platforms" || echo "1 platform"))${NC}"
+fi
 echo -e "${DIM}  Installer downloads: binary + components.json (2 files, platform-specific)${NC}"
 echo -e "${DIM}  Native setup assets are stamped per platform in components.json${NC}"
 echo -e "${DIM}  Browser/static/WASM capsule assets are stamped once under '*' in components.json${NC}"
@@ -2622,6 +2730,11 @@ if command -v ipfs &>/dev/null && ipfs swarm peers &>/dev/null 2>&1; then
         if [[ -d "artifacts-${CROSS_ARCH:-}" ]]; then
             for f in "artifacts-${CROSS_ARCH}"/*.capsule.tar.gz; do
                 [[ -f "$f" ]] && ipfs add -q "$f" >/dev/null 2>&1 || true
+            done
+        fi
+        if [[ -n "$PREPARED_INPUT_ROOT" ]]; then
+            for f in "$PREPARED_ARTIFACTS_DIR"/*; do
+                ipfs add -q "$f" >/dev/null 2>&1 || true
             done
         fi
         # Add binaries

@@ -2,6 +2,7 @@
 """Record and verify unsigned native build inputs. This tool never publishes."""
 
 import argparse
+import copy
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -10,11 +11,13 @@ from pathlib import Path, PurePosixPath
 import platform as host_platform
 import posixpath
 import re
+import shutil
 import stat
 import struct
 import subprocess
 import sys
 import tarfile
+import tempfile
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -394,7 +397,7 @@ def verify(root):
     return receipt
 
 
-def validate_inputs(values):
+def validate_inputs(values, version=None):
     inputs = {}
     for value in values:
         name, sep, path = value.partition("=")
@@ -420,6 +423,8 @@ def validate_inputs(values):
     if set(inputs) != set(PLATFORMS):
         raise ValueError("candidate input requires all three platforms")
     first = next(iter(inputs.values()))
+    if version is not None and first["version"] != version:
+        raise ValueError("platform input version differs from requested release")
     # Admission runs from the reviewed candidate checkout. Agreement between
     # unsigned workers is insufficient to establish the selected source tree.
     expected_source = source_identity(first["source"]["commit"], first["source"]["tree"])
@@ -444,6 +449,140 @@ def validate_inputs(values):
     return inputs
 
 
+def merged_input_components(values, receipts):
+    merged = json.loads((SOURCE_ROOT / "components.json").read_text())
+    merged["schema"], merged["capsules"] = "elastos.components/v1", {}
+    selected = {}
+    for value in values:
+        platform, _, path = value.partition("=")
+        manifest_path = regular_file(Path(path), "components.json")
+        manifest_bytes = manifest_path.read_bytes()
+        expected = receipts[platform]["files"]["components.json"]
+        actual = {"sha256": hashlib.sha256(manifest_bytes).hexdigest(), "size": len(manifest_bytes),
+                  "executable": bool(manifest_path.stat().st_mode & 0o111)}
+        if actual != expected:
+            raise ValueError(f"input manifest changed after admission: {platform}")
+        manifest = json.loads(manifest_bytes)
+        for name, component in manifest["external"].items():
+            for metadata in (False, True):
+                entry = component.get("capsule_metadata") if metadata else component
+                if entry is None:
+                    continue
+                key, info = integrity.resolve_platform_info(entry, PLATFORMS[platform][0])
+                if info is None:
+                    continue
+                identity = (name, metadata, key)
+                if identity in selected and selected[identity] != info:
+                    raise ValueError(f"conflicting universal descriptor: {name} ({key})")
+                selected[identity] = info
+                target = merged["external"][name]
+                if metadata:
+                    contract = {k: v for k, v in entry.items() if k != "platforms"}
+                    target = target.setdefault("capsule_metadata", {**contract, "platforms": {}})
+                    if {k: v for k, v in target.items() if k != "platforms"} != contract:
+                        raise ValueError(f"conflicting provider metadata contract: {name}")
+                target.setdefault("platforms", {})[key] = copy.deepcopy(info)
+    return merged
+
+
+def stage_inputs(values, version, output):
+    receipts = validate_inputs(values, version)
+    if output.exists() or output.is_symlink():
+        raise ValueError("publication input staging output already exists")
+    merged = merged_input_components(values, receipts)
+    files = {}
+    origins = {}
+    for value in values:
+        platform, _, path = value.partition("=")
+        for relative, record in receipts[platform]["files"].items():
+            if relative.startswith("artifacts/"):
+                name = relative.removeprefix("artifacts/")
+                files[name], origins[name] = record, (Path(path), relative)
+    parent = output.parent.resolve()
+    parent.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(parent)
+    if usage.free - sum(record["size"] for record in files.values()) < usage.total / 10:
+        raise ValueError("publication staging requires at least 10% free after its copy")
+    with tempfile.TemporaryDirectory(prefix=".platform-import-", dir=parent) as temporary:
+        stage = Path(temporary) / "input"
+        artifacts = stage / "artifacts"
+        artifacts.mkdir(parents=True)
+        for name, (root, relative) in origins.items():
+            destination = artifacts / name
+            shutil.copyfile(regular_file(root, relative), destination)
+            destination.chmod(0o700 if files[name]["executable"] else 0o600)
+            if file_record(destination) != files[name]:
+                raise ValueError(f"input changed while staging: {name}")
+        (stage / "components.json").write_text(json.dumps(merged, indent=2) + "\n")
+        first = next(iter(receipts.values()))
+        record = {"version": version, "source": first["source"],
+                  "platforms": list(PLATFORMS), "files": files,
+                  "components": file_record(stage / "components.json")}
+        (stage / "assembly.json").write_text(json.dumps(record, indent=2) + "\n")
+        verify_staged_inputs(stage)
+        stage.rename(output)
+    return record
+
+
+def verify_staged_inputs(stage, allow_generated=False):
+    record = json.loads(regular_file(stage, "assembly.json").read_text())
+    source = record["source"]
+    if source_identity(source["commit"], source["tree"]) != source:
+        raise ValueError("publication staging source differs from candidate checkout")
+    if set(record["platforms"]) != set(PLATFORMS):
+        raise ValueError("publication staging requires all three platforms")
+    actual = {str(path.relative_to(stage / "artifacts"))
+              for path in (stage / "artifacts").rglob("*") if not path.is_dir() or path.is_symlink()}
+    generated = {f"components-{platform}.json" for platform in PLATFORMS} if allow_generated else set()
+    if not set(record["files"]) <= actual or actual - set(record["files"]) - generated:
+        raise ValueError("staged artifact inventory differs from admitted inputs")
+    for name, expected in record["files"].items():
+        if file_record(regular_file(stage / "artifacts", name)) != expected:
+            raise ValueError(f"staged input differs from admitted bytes: {name}")
+    components = regular_file(stage, "components.json")
+    if file_record(components) != record["components"]:
+        raise ValueError("staged components changed after admission")
+    manifest = json.loads(components.read_text())
+    for platform, (setup, _, _) in PLATFORMS.items():
+        check_binary(regular_file(stage / "artifacts", f"elastos-{platform}"), platform)
+        errors = integrity.audit_manifest(manifest, [setup])
+        errors += integrity.audit_release_artifacts(manifest, [setup], stage / "artifacts")
+        if errors:
+            raise ValueError("; ".join(errors))
+    return record
+
+
+def attach_input_cids(stage, cids_path):
+    record = verify_staged_inputs(stage, allow_generated=True)
+    cids = json.loads(cids_path.read_text())
+    if set(cids) != set(record["files"]) or any(
+            not isinstance(cid, str) or not re.fullmatch(r"[A-Za-z0-9]+", cid) for cid in cids.values()):
+        raise ValueError("upload results must bind every admitted artifact to a nonempty CID")
+    manifest = json.loads((stage / "components.json").read_text())
+    for component in manifest["external"].values():
+        for entry in (component, component.get("capsule_metadata", {})):
+            for info in entry.get("platforms", {}).values():
+                if info.get("release_path"):
+                    info["cid"] = cids[info["release_path"]]
+    # Each platform gets the same complete manifest. Descriptors were replaced
+    # as units during staging; pinned external URL records remain unchanged.
+    output_bytes = (json.dumps(manifest, indent=2) + "\n").encode()
+    for platform, (setup, _, _) in PLATFORMS.items():
+        existing = stage / "artifacts" / f"components-{platform}.json"
+        if existing.exists() or existing.is_symlink():
+            if regular_file(stage / "artifacts", existing.name).read_bytes() != output_bytes:
+                raise ValueError(f"existing generated components differ: {platform}")
+        errors = integrity.audit_manifest(manifest, [setup])
+        errors += integrity.audit_release_artifacts(manifest, [setup], stage / "artifacts")
+        if errors:
+            raise ValueError("; ".join(errors))
+    for platform in PLATFORMS:
+        output = stage / "artifacts" / f"components-{platform}.json"
+        if not output.exists():
+            output.write_bytes(output_bytes)
+    return record
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -457,14 +596,30 @@ def main():
     check.add_argument("root", type=Path)
     combined = commands.add_parser("validate-inputs")
     combined.add_argument("--input", action="append", required=True)
+    combined.add_argument("--version")
+    stage = commands.add_parser("stage-inputs")
+    stage.add_argument("--input", action="append", required=True)
+    stage.add_argument("--version", required=True)
+    stage.add_argument("--output", required=True, type=Path)
+    staged = commands.add_parser("verify-staged")
+    staged.add_argument("root", type=Path)
+    attach = commands.add_parser("attach-cids")
+    attach.add_argument("root", type=Path)
+    attach.add_argument("--cids", required=True, type=Path)
     args = parser.parse_args()
     try:
         if args.command == "record":
             record(args)
         elif args.command == "verify":
             print(json.dumps(verify(args.root), sort_keys=True))
+        elif args.command == "stage-inputs":
+            stage_inputs(args.input, args.version, args.output)
+        elif args.command == "verify-staged":
+            verify_staged_inputs(args.root)
+        elif args.command == "attach-cids":
+            attach_input_cids(args.root, args.cids)
         else:
-            receipts = validate_inputs(args.input)
+            receipts = validate_inputs(args.input, args.version)
             print(f"Verified source and local bytes for {len(receipts)} platform inputs; publication and installed acceptance remain separate.")
     except (ValueError, OSError, KeyError, TypeError, tarfile.TarError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"Error: {exc}\n")

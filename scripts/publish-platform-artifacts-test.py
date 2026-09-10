@@ -277,8 +277,8 @@ touch "$TEST_FALSE_SUCCESS"
         function = "stage_release_artifacts() {" + source.split(
             "stage_release_artifacts() {", 1
         )[1].split("\n}\n", 1)[0] + "\n}\n"
-        start = source.index('PREPARED_ARTIFACTS_DIR="')
-        gate = source[start:source.index("# ── Step 7:", start)]
+        start = source.index("# Assemble the files advertised by this release")
+        gate = source[start:source.index("# End build-mode preparation.", start)]
         for failure in (None, "missing", "stale", "runtime", "manifest",
                         "cross-valid", "cross-missing", "cross-runtime", "cross-manifest", "cross-app"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
@@ -498,8 +498,11 @@ printf '%s\\n' "$HOST_PLATFORM_DIRECT_ASSETS" "${GUEST_RUST_TARGET:-${HOST_RUST_
                 inputs.mkdir()
                 for name in ("install.sh", "release.json", "release-head.json"):
                     (inputs / name).write_text(name)
-                (inputs / "components.json").write_text(f"host:{host}")
+                prepared = inputs / "publication-artifacts"
+                prepared.mkdir()
+                (prepared / f"components-{host}.json").write_text(f"host:{host}")
                 if cross:
+                    (prepared / f"components-{cross}.json").write_text(f"cross:{cross}")
                     # Prepare both names so this test detects the output naming
                     # defect independently of the temporary input naming change.
                     for name in (cross, cross.split("-")[0]):
@@ -510,6 +513,7 @@ printf '%s\\n' "$HOST_PLATFORM_DIRECT_ASSETS" "${GUEST_RUST_TARGET:-${HOST_RUST_
                     env={
                         **os.environ,
                         "TMPDIR": str(inputs),
+                        "PREPARED_ARTIFACTS_DIR": str(prepared),
                         "STAMPED_INSTALL": str(inputs / "install.sh"),
                         "PLATFORM": host,
                         "CROSS_PLATFORM": cross,

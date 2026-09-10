@@ -181,10 +181,13 @@ approved plan retains full release acceptance.
   receipt. Admission checks all three platform inputs against the candidate
   source, component template, native OS/CPU, provider contracts and exact file
   inventory. Preparation and admission fixtures pass for all three platforms.
-  Actual Mac preparation passed from the source before managed media delivery;
-  Linux preparation exposed native ioctl and custody-link portability gaps.
-  Final source-bound inputs, publisher import, external dependencies and signed
-  fresh installs remain open.
+  Actual Mac, Linux x86 and Linux ARM preparation pass from 8587dff6, including managed
+  media delivery. All three inputs pass full file verification; shared app and
+  provider-metadata archives match across platforms. Linux ioctl and custody
+  syscall repairs pass native compilation and focused tests. Publisher input
+  staging and its CLI pass offline checks and Linux musl tests. Complete
+  publication promotion, final input regeneration and signed fresh installs
+  remain open.
 
 - Three standalone Linux Browser helpers now have tracked Cargo lockfiles.
   Their registry versions and checksums match the existing Runtime workspace

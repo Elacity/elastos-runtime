@@ -6,6 +6,8 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import shutil
 from pathlib import Path
 import struct
 import subprocess
@@ -129,6 +131,216 @@ class PlatformInputTest(unittest.TestCase):
 
     def test_three_matching_platform_inputs_pass(self):
         self.assertEqual(set(inputs.validate_inputs(self.values())), set(inputs.PLATFORMS))
+
+    def test_input_staging_and_cid_attachment_preserve_three_platforms(self):
+        pinned = {"platforms": {"*": {"url": "https://example.invalid/kubo-v1.tar.gz",
+                   "checksum": "sha256:" + "d" * 64, "size": 100, "install_path": "bin/ipfs"}}}
+        self.template["external"]["kubo"] = pinned
+        self.template["profiles"]["home"]["components"].append("kubo")
+        self.write_json(inputs.SOURCE_ROOT / "components.json", self.template)
+        for root in self.bundles.values():
+            manifest = json.loads((root / "components.json").read_text())
+            manifest["external"]["kubo"] = copy.deepcopy(pinned)
+            manifest["profiles"] = copy.deepcopy(self.template["profiles"])
+            self.write_json(root / "components.json", manifest)
+            self.write_json(root / "components-template.json", self.template)
+            self.refresh(root)
+        stage = self.root / "publication"
+        record = inputs.stage_inputs(self.values(), "0.7.1", stage)
+        self.assertEqual(len(record["files"]), 8)
+        inputs.verify_staged_inputs(stage)
+        merged = json.loads((stage / "components.json").read_text())
+        self.assertEqual(set(merged["external"]["shell"]["platforms"]),
+                         {value[0] for value in inputs.PLATFORMS.values()})
+        self.assertEqual(merged["capsules"], {})
+        self.assertEqual(merged["profiles"], self.template["profiles"])
+        cids = self.root / "cids.json"
+        self.write_json(cids, {name: "bafy" + entry["sha256"] for name, entry in record["files"].items()})
+        inputs.attach_input_cids(stage, cids)
+        outputs = [(stage / "artifacts" / f"components-{platform}.json").read_bytes()
+                   for platform in inputs.PLATFORMS]
+        self.assertEqual(len(set(outputs)), 1)
+        final = json.loads(outputs[0])
+        self.assertEqual(final["external"]["kubo"], pinned)
+        for setup, _, _ in inputs.PLATFORMS.values():
+            descriptor = final["external"]["shell"]["platforms"][setup]
+            self.assertTrue(descriptor["cid"].startswith("bafy"))
+            self.assertEqual(descriptor["size"], 64)
+        self.assertNotIn("cid", merged["external"]["home"]["platforms"]["*"])
+
+    def test_input_staging_rejects_version_existing_output_and_changed_bytes(self):
+        stage = self.root / "publication"
+        with self.assertRaisesRegex(ValueError, "requested release"):
+            inputs.stage_inputs(self.values(), "0.7.2", stage)
+        self.assertFalse(stage.exists())
+        stage.symlink_to(self.root / "absent")
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            inputs.stage_inputs(self.values(), "0.7.1", stage)
+        self.assertTrue(stage.is_symlink())
+        stage.unlink()
+        inputs.stage_inputs(self.values(), "0.7.1", stage)
+        (stage / "artifacts/home.tar.gz").write_bytes(b"changed after admission")
+        cids = self.root / "cids.json"
+        self.write_json(cids, {})
+        with self.assertRaisesRegex(ValueError, "staged input differs"):
+            inputs.attach_input_cids(stage, cids)
+        self.assertFalse(list((stage / "artifacts").glob("components-*.json")))
+
+    def actual_source_fixture(self):
+        source = self.root / "actual-source"
+        (source / "scripts").mkdir(parents=True)
+        (source / "elastos").mkdir()
+        (source / "elastos/Cargo.lock").write_text("version = 4\n")
+        self.write_json(source / "components.json", self.template)
+        for name in ("release-platform-input.py", "components-release-integrity-check.py",
+                     "publish-release.sh", "check-versioning.sh", "install.sh"):
+            shutil.copyfile(Path(__file__).with_name(name), source / "scripts" / name)
+        for args in (("init", "-q"), ("add", "."),
+                     ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                      "commit", "-qm", "controlled publisher fixture")):
+            subprocess.run(["git", *args], cwd=source, check=True, capture_output=True)
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
+        tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=source, text=True).strip()
+        for root in self.bundles.values():
+            receipt = json.loads((root / "platform-input.json").read_text())
+            receipt["source"] = {"clean": True, "commit": commit, "tree": tree,
+                                  "lockfiles": {"elastos/Cargo.lock": inputs.digest(source / "elastos/Cargo.lock")}}
+            self.write_json(root / "platform-input.json", receipt)
+        return source
+
+    def test_actual_publisher_import_success_and_effect_boundaries(self):
+        source = self.actual_source_fixture()
+        publisher = (source / "scripts/publish-release.sh").read_text()
+        payload = "RELEASE_PAYLOAD=" + publisher.split("\nRELEASE_PAYLOAD=", 1)[1].split(
+            '\ninfo "Signing release payload', 1)[0]
+        for failure in ("", "tamper", "upload"):
+            with self.subTest(failure=failure):
+                work = self.root / ("publisher-" + (failure or "success"))
+                work.mkdir()
+                body = r'''source "$1"
+VERSION=0.7.1
+TMPDIR="$2/work"
+mkdir "$TMPDIR"
+PLATFORM=aarch64-darwin
+failure="$3"
+shift 3
+stage_platform_inputs "$TMPDIR/staged" "$@"
+if [[ "$failure" == tamper ]]; then printf bad > "$TMPDIR/staged/artifacts/home.tar.gz"; fi
+ipfs_add() {
+    printf '%s\n' "$(basename "$1")" >> "$TMPDIR/uploads"
+    [[ "$failure" != upload ]] || return 93
+    printf 'bafy%s\n' "$(sha256 "$1")"
+}
+publish_prepared_platform_inputs "$TMPDIR/staged"
+printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
+printf '%s\n' "$RELEASE_SOURCE_JSON" > "$TMPDIR/source.json"
+printf 'later signing boundary reached\n' > "$TMPDIR/later-effect"
+'''
+                body = body.replace("printf 'later signing boundary reached",
+                    'CHANNEL=stable\nPREV_RELEASE_CID=null\n' + payload +
+                    "\nprintf '%s\\n' \"$RELEASE_PAYLOAD\" > \"$TMPDIR/release-payload.json\"\n" +
+                    "printf 'later signing boundary reached")
+                result = subprocess.run(["/bin/bash", "-euc", body, "publisher-fixture",
+                                         str(source / "scripts/publish-release.sh"), str(work), failure,
+                                         *self.values()], capture_output=True, text=True)
+                prepared = work / "work"
+                if failure:
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertFalse((prepared / "later-effect").exists())
+                    if failure == "tamper":
+                        self.assertFalse((prepared / "uploads").exists())
+                    else:
+                        self.assertEqual(len((prepared / "uploads").read_text().splitlines()), 1)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    platforms = json.loads((prepared / "platforms.json").read_text())
+                    self.assertEqual(set(platforms), set(inputs.PLATFORMS))
+                    self.assertEqual(len((prepared / "uploads").read_text().splitlines()), 9)
+                    self.assertEqual(len({json.dumps(p["components"], sort_keys=True) for p in platforms.values()}), 1)
+                    for platform, descriptor in platforms.items():
+                        self.assertEqual(descriptor["binary"]["sha256"], inputs.digest(
+                            self.bundles[platform] / "artifacts" / f"elastos-{platform}"))
+                    public_source = json.loads((prepared / "source.json").read_text())
+                    self.assertEqual(set(public_source), {"commit", "tree"})
+                    release = json.loads((prepared / "release-payload.json").read_text())
+                    self.assertEqual(release["source"], public_source)
+                    self.assertEqual(set(release["platforms"]), set(inputs.PLATFORMS))
+                    self.assertNotIn("shell_cid", release)
+                    self.assertNotIn("shell_sha256", release)
+                    self.assertTrue((prepared / "later-effect").exists())
+
+    def test_actual_publisher_rejects_input_before_state_or_key_inspection(self):
+        source = self.actual_source_fixture()
+        state = self.root / "publisher-state"
+        command = ["/bin/bash", str(source / "scripts/publish-release.sh"),
+                   "--version", "0.7.1", "--key", str(self.root / "missing-key")]
+        for platform, root in self.bundles.items():
+            command.extend(["--platform-input", f"{platform}={os.path.relpath(root, self.root)}"])
+        for failure in ("key", "conflict", "corrupt"):
+            with self.subTest(failure=failure):
+                if failure == "corrupt":
+                    (self.bundles["aarch64-darwin"] / "artifacts/home.tar.gz").write_bytes(b"stale")
+                result = subprocess.run(command + (["--skip-build"] if failure == "conflict" else []),
+                                        cwd=self.root, env={**os.environ, "ELASTOS_PUBLISH_STATE_DIR": str(state)},
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                expected = {"key": "Key file not found", "conflict": "conflicts with", "corrupt": "differs from receipt"}[failure]
+                self.assertIn(expected, result.stderr)
+                self.assertFalse(state.exists())
+
+    def test_input_snapshot_and_copy_races_preserve_absent_output(self):
+        stage = self.root / "publication"
+        original_merge = inputs.merged_input_components
+        changed = self.bundles["aarch64-darwin"] / "components.json"
+        original_bytes = changed.read_bytes()
+        def mutate_manifest(*args):
+            data = json.loads(original_bytes)
+            data["external"]["home"]["platforms"]["*"]["url"] = "https://changed.invalid/archive"
+            self.write_json(changed, data)
+            return original_merge(*args)
+        with patch.object(inputs, "merged_input_components", side_effect=mutate_manifest):
+            with self.assertRaisesRegex(ValueError, "manifest changed after admission"):
+                inputs.stage_inputs(self.values(), "0.7.1", stage)
+        self.assertFalse(stage.exists())
+        changed.write_bytes(original_bytes)
+        original_copy = inputs.shutil.copyfile
+        def corrupt_copy(source, destination):
+            original_copy(source, destination)
+            destination.write_bytes(b"changed during copy")
+        with patch.object(inputs.shutil, "copyfile", side_effect=corrupt_copy):
+            with self.assertRaisesRegex(ValueError, "changed while staging"):
+                inputs.stage_inputs(self.values(), "0.7.1", stage)
+        self.assertFalse(stage.exists())
+        self.assertFalse(list(self.root.glob(".platform-import-*")))
+
+    def test_staged_inventory_and_generated_retry_are_exact(self):
+        stage = self.root / "publication"
+        record = inputs.stage_inputs(self.values(), "0.7.1", stage)
+        extra = stage / "artifacts/unexpected"
+        extra.write_text("unrelated bytes")
+        with self.assertRaisesRegex(ValueError, "inventory differs"):
+            inputs.verify_staged_inputs(stage)
+        extra.unlink()
+        cids = self.root / "cids.json"
+        self.write_json(cids, {name: "bafy" + entry["sha256"] for name, entry in record["files"].items()})
+        inputs.attach_input_cids(stage, cids)
+        inputs.attach_input_cids(stage, cids)
+        generated = stage / "artifacts/components-aarch64-darwin.json"
+        generated.write_text("conflicting prior output")
+        with self.assertRaisesRegex(ValueError, "existing generated components differ"):
+            inputs.attach_input_cids(stage, cids)
+        self.assertEqual(generated.read_text(), "conflicting prior output")
+
+    def test_input_cid_attachment_requires_complete_upload_results(self):
+        stage = self.root / "publication"
+        record = inputs.stage_inputs(self.values(), "0.7.1", stage)
+        cids = self.root / "cids.json"
+        for values in ({}, {name: "" for name in record["files"]},
+                       {name: "CID with space" for name in record["files"]}):
+            self.write_json(cids, values)
+            with self.assertRaisesRegex(ValueError, "every admitted artifact"):
+                inputs.attach_input_cids(stage, cids)
+            self.assertFalse(list((stage / "artifacts").glob("components-*.json")))
 
     def test_runtime_only_provider_metadata_follows_source_contract(self):
         root = self.bundles["aarch64-darwin"]
