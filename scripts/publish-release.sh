@@ -172,8 +172,6 @@ show_help() {
     echo "  --channel NAME     Release channel (stable | canary | jetson-test; default: stable)"
     echo "  --skip-build       Skip building binaries (use existing artifacts)"
     echo "  --skip-rootfs      Skip rootfs building (reuse existing .capsule.tar.gz and skip capsule rebuilds)"
-    echo "  --dry-run          Local rehearsal: no network reads/writes, no IPNS publish, no public URL,"
-    echo "                     publish state (last-release-*) untouched; --key optional (ephemeral key)"
     echo "  --capsules CSV     Override publish capsule list (default: Home capsule set)"
     echo "  --no-public-url    Skip auto-starting gateway+tunnel and URL emission"
     echo "  --public-with-sudo Start auto-public gateway+tunnel via sudo"
@@ -182,6 +180,8 @@ show_help() {
     echo "  --cross ARCH       Also cross-compile for ARCH (e.g., aarch64). Creates multi-platform release."
     echo "  --public-timeout   Seconds to wait for trycloudflare URL (default: 60)"
     echo "  --help             Show this help"
+    echo ""
+    echo "  Read-only planning: elastos publish-release --version X.Y.Z --dry-run"
     echo ""
     echo -e "${BOLD}Output:${NC}"
     echo "  Publishes per-capsule artifacts + runtime binary as raw CIDs."
@@ -995,7 +995,6 @@ IPFS_PROVIDER_BIN=""
 CHANNEL="stable"
 SKIP_BUILD=false
 SKIP_ROOTFS=false
-DRY_RUN=false
 PUBLISH_PUBLIC_URL=true
 PUBLIC_WITH_SUDO=false
 ALLOW_SIGNER_ROTATION=false
@@ -1021,7 +1020,7 @@ while [[ $# -gt 0 ]]; do
             CHANNEL="$2"; shift 2 ;;
         --skip-build) SKIP_BUILD=true; shift ;;
         --skip-rootfs) SKIP_ROOTFS=true; shift ;;
-        --dry-run) DRY_RUN=true; shift ;;
+        --dry-run) die "Use elastos publish-release --dry-run for a read-only plan. This low-level script builds and publishes releases." ;;
         --no-public-url) PUBLISH_PUBLIC_URL=false; shift ;;
         --public-with-sudo) PUBLIC_WITH_SUDO=true; shift ;;
         --allow-signer-rotation) ALLOW_SIGNER_ROTATION=true; shift ;;
@@ -1045,15 +1044,6 @@ done
 # ── Preflight ─────────────────────────────────────────────────────────
 
 [[ -z "$VERSION" ]] && die "--version is required"
-if [[ "$DRY_RUN" == true ]]; then
-    # Local-only rehearsal: never start the public gateway/tunnel path.
-    PUBLISH_PUBLIC_URL=false
-    if [[ -z "$KEY_PATH" ]]; then
-        KEY_PATH=$(mktemp -t elastos-dryrun-key.XXXXXX)
-        python3 -c 'import secrets; print(secrets.token_hex(32))' > "$KEY_PATH"
-        warn "Dry run without --key: signing with ephemeral throwaway key ${KEY_PATH}"
-    fi
-fi
 [[ -z "$KEY_PATH" ]] && die "--key is required (release signing must use an explicit key)"
 [[ ! -f "$KEY_PATH" ]] && die "Key file not found: $KEY_PATH"
 bash "./scripts/check-versioning.sh" "$VERSION"
@@ -1091,12 +1081,7 @@ fi
 CANDIDATE_SIGNER_DID="$(inspect_signer_did)"
 [[ -n "$CANDIDATE_SIGNER_DID" ]] || die "Failed to determine signer DID from ${KEY_PATH}"
 CANONICAL_GATEWAY="$(canonical_publisher_gateway)"
-CURRENT_CANONICAL_SIGNER_DID=""
-if [[ "$DRY_RUN" == true ]]; then
-    warn "Dry run: skipping canonical signer check against ${CANONICAL_GATEWAY}"
-else
-    CURRENT_CANONICAL_SIGNER_DID="$(fetch_canonical_signer_did "$CANONICAL_GATEWAY" || true)"
-fi
+CURRENT_CANONICAL_SIGNER_DID="$(fetch_canonical_signer_did "$CANONICAL_GATEWAY" || true)"
 if [[ -n "$CURRENT_CANONICAL_SIGNER_DID" && "$ALLOW_SIGNER_ROTATION" != true && "$CANDIDATE_SIGNER_DID" != "$CURRENT_CANONICAL_SIGNER_DID" ]]; then
     die "Signer DID mismatch for canonical publisher.\n  Candidate: ${CANDIDATE_SIGNER_DID}\n  Canonical: ${CURRENT_CANONICAL_SIGNER_DID}\n  Gateway:   ${CANONICAL_GATEWAY}\nRe-run with --allow-signer-rotation only for an intentional trust-anchor rotation."
 fi
@@ -1107,9 +1092,6 @@ echo -e "${DIM}  Version:  ${VERSION}${NC}"
 echo -e "${DIM}  Channel:  ${CHANNEL}${NC}"
 echo -e "${DIM}  IPFS provider: ${IPFS_PROVIDER_BIN}${NC}"
 echo -e "${DIM}  Capsules: ${CAPSULES[*]}${NC}"
-if [[ "$DRY_RUN" == true ]]; then
-    echo -e "${YELLOW}  Mode:     DRY RUN (local only — no network, no publish-state writes)${NC}"
-fi
 echo ""
 
 # ── Step 1: Build runtime (and capsules only when needed) ────────────
@@ -1320,10 +1302,6 @@ PY
             [[ "$strategy" == "source-build" || "$strategy" == "local-copy" ]] && continue  # Can't auto-download
 
             if [[ -n "$dep_url" ]]; then
-                if [[ "$DRY_RUN" == true ]]; then
-                    warn "  Dry run: skipping download of ${dep} for ${CROSS_ARCH}"
-                    continue
-                fi
                 info "  Downloading ${dep} for ${CROSS_ARCH}..."
                 local dl_tmp
                 dl_tmp="$(mktemp -d)"
@@ -2096,9 +2074,7 @@ if [[ -f "$KUBO_COORD_FILE" ]]; then
     KUBO_PORT=$(jq -r '.api_port // empty' "$KUBO_COORD_FILE" 2>/dev/null || true)
 fi
 
-if [[ "$DRY_RUN" == true ]]; then
-    info "Dry run: skipping IPNS publish (would announce /ipfs/${HEAD_CID})."
-elif [[ -n "$KUBO_PORT" ]]; then
+if [[ -n "$KUBO_PORT" ]]; then
     info "Publishing HEAD to IPNS (lifetime=8760h)..."
     IPNS_RESPONSE=$(curl -s -X POST "http://127.0.0.1:${KUBO_PORT}/api/v0/name/publish?arg=/ipfs/${HEAD_CID}&key=self&lifetime=8760h" 2>/dev/null || true)
     IPNS_NAME=$(echo "$IPNS_RESPONSE" | jq -r '.Name // empty' 2>/dev/null || true)
@@ -2380,29 +2356,19 @@ fi
 
 # ── Step 11: Save state ───────────────────────────────────────────────
 
-if [[ "$DRY_RUN" == true ]]; then
-    info "Dry run: publish state untouched (last-release-* files not written)."
-else
-    echo -n "$RELEASE_CID" > "${STATE_DIR}/last-release-cid"
-    echo -n "$HEAD_CID" > "${STATE_DIR}/last-release-head-cid"
-    echo -n "$INSTALL_SCRIPT_CID" > "${STATE_DIR}/last-install-script-cid"
-    echo -n "$RELEASE_OBJECT_CID" > "${STATE_DIR}/last-release-object-cid"
-    echo -n "$HEAD_OBJECT_CID" > "${STATE_DIR}/last-release-head-object-cid"
-    if [[ -n "$PUBLIC_INSTALL_URL" ]]; then
-        echo -n "$PUBLIC_INSTALL_URL" > "${STATE_DIR}/last-public-install-url"
-    fi
+echo -n "$RELEASE_CID" > "${STATE_DIR}/last-release-cid"
+echo -n "$HEAD_CID" > "${STATE_DIR}/last-release-head-cid"
+echo -n "$INSTALL_SCRIPT_CID" > "${STATE_DIR}/last-install-script-cid"
+echo -n "$RELEASE_OBJECT_CID" > "${STATE_DIR}/last-release-object-cid"
+echo -n "$HEAD_OBJECT_CID" > "${STATE_DIR}/last-release-head-object-cid"
+if [[ -n "$PUBLIC_INSTALL_URL" ]]; then
+    echo -n "$PUBLIC_INSTALL_URL" > "${STATE_DIR}/last-public-install-url"
 fi
 
 # ── Step 12: Print results ────────────────────────────────────────────
 
 echo ""
-if [[ "$DRY_RUN" == true ]]; then
-    echo -e "${YELLOW}${BOLD}Dry run complete — nothing published.${NC}"
-    echo -e "${DIM}  Local only: artifacts built, signed and pinned to the local IPFS repo.${NC}"
-    echo -e "${DIM}  Skipped: canonical signer check, IPNS publish, public URL, publish-state writes.${NC}"
-else
-    echo -e "${GREEN}${BOLD}Release published!${NC}"
-fi
+echo -e "${GREEN}${BOLD}Release published!${NC}"
 echo ""
 echo -e "  Version:      ${BOLD}${VERSION}${NC}"
 echo -e "  Channel:      ${CHANNEL}"
@@ -2434,7 +2400,7 @@ fi
 echo ""
 CANONICAL_PUBLIC_GATEWAY_URL=""
 CANONICAL_PUBLIC_INSTALL_URL=""
-if [[ "$DRY_RUN" != true && -z "$PUBLIC_GATEWAY_URL" && -n "${STAMPED_PUBLISHER_GATEWAY:-}" && "${STAMPED_PUBLISHER_GATEWAY}" != "__PUBLISHER_GATEWAY__" ]]; then
+if [[ -z "$PUBLIC_GATEWAY_URL" && -n "${STAMPED_PUBLISHER_GATEWAY:-}" && "${STAMPED_PUBLISHER_GATEWAY}" != "__PUBLISHER_GATEWAY__" ]]; then
     if curl -fsSI --max-time 10 "${STAMPED_PUBLISHER_GATEWAY}/install.sh" >/dev/null 2>&1 && \
        curl -fsSI --max-time 10 "${STAMPED_PUBLISHER_GATEWAY}/release-head.json" >/dev/null 2>&1; then
         CANONICAL_PUBLIC_GATEWAY_URL="${STAMPED_PUBLISHER_GATEWAY}"

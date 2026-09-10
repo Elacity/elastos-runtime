@@ -147,6 +147,14 @@ approved plan retains full release acceptance.
   URL-only dependencies, complete platform-input admission, atomic promotion
   and fresh installation remain separate open delivery checks.
 
+- The low-level publisher now rejects `--dry-run` before side effects and
+  directs operators to the existing read-only `elastos publish-release` planner.
+  The former shell mode still reached upload/Publisher-write code despite its
+  no-write description. The full-script tripwire test reproduced an attempted
+  temporary-key allocation, then passed after repair. Six publisher regression
+  groups and independent source review pass. Normal publication keeps its
+  existing behavior and approval gate.
+
 The source and installed sections below preserve the earlier evidence snapshot.
 Their original identities qualify those results. Current milestone receipts
 above take precedence where the work has moved; remaining sections are refreshed

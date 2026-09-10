@@ -19,6 +19,27 @@ spec.loader.exec_module(integrity)
 
 
 class PlatformArtifactExportTest(unittest.TestCase):
+    def test_low_level_dry_run_rejects_before_side_effects(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            commands = root / "commands"
+            commands.mkdir()
+            effects = root / "effects"
+            for command in ("mktemp", "mkdir", "curl", "cargo", "ipfs-provider", "git"):
+                stub = commands / command
+                stub.write_text('#!/bin/sh\nprintf "%s\\n" "$0" >> "$TEST_EFFECT_LOG"\nexit 93\n')
+                stub.chmod(0o755)
+            result = subprocess.run(
+                ["bash", str(PUBLISHER), "--version", "0.7.1", "--dry-run"],
+                env={**os.environ, "PATH": str(commands) + os.pathsep + os.environ["PATH"],
+                     "TEST_EFFECT_LOG": str(effects), "ELASTOS_PUBLISH_STATE_DIR": str(root / "state")},
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(effects.exists(), result.stderr)
+            self.assertFalse((root / "state").exists())
+            self.assertIn("elastos publish-release --dry-run", result.stderr)
+
     def test_artifact_gate_stops_before_release_signing(self):
         source = PUBLISHER.read_text()
         function = "stage_release_artifacts() {" + source.split(

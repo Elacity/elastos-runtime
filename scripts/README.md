@@ -14,7 +14,9 @@ automatically a stable end-user command.
 - `home-demo-local.sh` and `chat-demo-local.sh` start disposable local demos.
 - `share-demo.sh` runs the focused sharing demo.
 - `setup-crosvm.sh` installs VM prerequisites.
-- `publish-release.sh` is the low-level release publisher.
+- `publish-release.sh` is the low-level release publisher. Use
+  `elastos publish-release --version <version> --dry-run` for read-only planning;
+  the low-level script rejects that flag before side effects.
 - `python3 scripts/publish-platform-artifacts-test.py` checks its local platform
   manifest exports, native/guest target selection and the staged artifact gate
   without signing or uploading. CI and `just verify` run these checks.
