@@ -82,7 +82,7 @@ figcaption { margin-top: 9px; font-size: 12px; color: var(--soft); text-align: c
 .release-strip > div { display: grid; gap: 3px; }
 .meta-label { color: var(--soft); font-size: 12px; }
 .release-strip strong { font-size: 14px; font-weight: 550; line-height: 1.5; }
-#public-status { color: var(--muted); font-size: 12px; }
+#public-status, #hosted-checked { color: var(--muted); font-size: 12px; }
 .release-strip > a { font-size: 13px; text-decoration-color: #676b73; white-space: nowrap; }
 .release-strip > a span { padding-left: 4px; }
 

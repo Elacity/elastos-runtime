@@ -28,7 +28,7 @@ check("facts identify source and dated evidence", () => {
   assert.match(facts.public_observation.observed_at, /^\d{4}-\d{2}-\d{2}$/);
   for (const key of ["release_head_sha256", "release_sha256", "installer_sha256"]) assert.match(facts.public_observation[key], /^[a-f0-9]{64}$/);
   assert.deepEqual(facts.public_observation.evidence, ["/release-head.json", "/release.json", "/install.sh"]);
-  if (facts.hosted.status === "verified") assert.ok(hostedStatus(facts.hosted).evidence, "hosted version needs commit and deployment evidence");
+  if (facts.hosted.status === "verified") assert.ok(hostedStatus(facts.hosted, new URL(facts.hosted.target).origin).evidence, "hosted version needs a dated deployment receipt");
   else assert.equal(facts.hosted.status, "unverified");
 });
 
@@ -50,7 +50,7 @@ check("static fallback agrees with facts", () => {
   assert.equal(facts.journeys.length, 5);
 });
 
-const endpoints = new Set(["/", HOME_PATH, "/install.sh", "/release-head.json", "/release.json"]);
+const endpoints = new Set(["/", HOME_PATH, "/install.sh", "/release-head.json", "/release.json", "/claims.json"]);
 const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]);
 const slug = (text) => text.toLowerCase().replace(/[^\p{L}\p{N}\s-]/gu, "").replace(/\s/g, "-");
 const pinnedFiles = new Map();
