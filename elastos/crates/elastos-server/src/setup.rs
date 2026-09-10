@@ -1080,6 +1080,10 @@ fn component_install_state_for_name(
     if !install_root.is_dir() {
         return base;
     }
+    // Ordinary tool bundles retain archive identity without capsule metadata.
+    if !manifest.capsules.contains_key(name) && !Path::new(path).starts_with("capsules") {
+        return base;
+    }
     if !install_root.join("capsule.json").is_file() {
         return InstallState::Stale("capsule metadata missing from installed bundle".to_string());
     }
@@ -2898,7 +2902,7 @@ mod tests {
                     "release_path": format!("media-tools-{platform}.tar.gz"), "extract_path": "media-tools", "checksum": checksum}}},
                 "media-provider": {"platforms": {}},
                 "effect": {"install_path": "bin/effect", "platforms": {platform.clone(): {"strategy": "local-copy", "source": effect}}}
-            }, "profiles": {"home": {"components": ["effect", "media-provider"]}}
+            }, "profiles": {"home": {"components": ["effect", "media-provider", "media-tools"]}}
         })).unwrap()).unwrap();
         let manifest = load_manifest_from_path(&manifest_path).unwrap();
         let selected = vec!["media-provider".to_owned()];
@@ -2941,6 +2945,37 @@ mod tests {
             None => std::env::remove_var(COMPONENTS_MANIFEST_ENV),
         }
         result.unwrap();
+        let installed = load_manifest_from_path(&data.join("components.json")).unwrap();
+        assert_eq!(
+            serde_json::to_value(&installed.external["media-tools"]).unwrap(),
+            serde_json::to_value(&manifest.external["media-tools"]).unwrap()
+        );
+        let state = |manifest: &ComponentsManifest| {
+            component_install_state_for_name(
+                manifest,
+                &data,
+                "media-tools",
+                &manifest.external["media-tools"],
+                Some(info),
+            )
+        };
+        assert_eq!(state(&manifest), InstallState::Installed);
+        fs::write(dest.join(CACHED_ARTIFACT_SHA_FILE), "sha256:stale").unwrap();
+        assert_eq!(
+            state(&manifest),
+            InstallState::Stale("extracted bundle checksum metadata missing or stale".into())
+        );
+        maybe_write_component_cache_metadata(&manifest, Some(info), "media-tools", &dest).unwrap();
+        assert_eq!(state(&manifest), InstallState::Installed);
+        let mut registered_capsule = manifest.clone();
+        registered_capsule.capsules.insert(
+            "media-tools".into(),
+            serde_json::from_value(serde_json::json!({"cid": "test", "sha256": "test"})).unwrap(),
+        );
+        assert_eq!(
+            state(&registered_capsule),
+            InstallState::Stale("capsule metadata missing from installed bundle".into())
+        );
         assert!(data
             .join("protected-content/media-provider/config.json")
             .is_file());
