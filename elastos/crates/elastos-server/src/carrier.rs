@@ -6514,6 +6514,7 @@ fn carrier_endpoint_matches_peer(endpoint: &iroh::EndpointAddr, peer_did: &str) 
 pub struct CarrierClient {
     conn: iroh::endpoint::Connection,
     _endpoint: Endpoint,
+    owns_endpoint: bool,
 }
 
 fn carrier_provider_invoke_message(
@@ -6587,6 +6588,7 @@ impl CarrierClient {
         Ok(Self {
             conn,
             _endpoint: endpoint.clone(),
+            owns_endpoint: false,
         })
     }
 
@@ -6603,18 +6605,31 @@ impl CarrierClient {
             .await
             .context("Failed to bind")?;
 
-        let conn = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            endpoint.connect(addr, CARRIER_ALPN),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("connect timed out"))?
-        .context("connect failed")?;
+        Self::connect_owned_endpoint(endpoint, addr, timeout_secs).await
+    }
 
-        Ok(Self {
-            conn,
-            _endpoint: endpoint,
-        })
+    async fn connect_owned_endpoint(
+        endpoint: Endpoint,
+        addr: iroh::EndpointAddr,
+        timeout_secs: u64,
+    ) -> Result<Self> {
+        match Self::connect_known_endpoint(&endpoint, addr, timeout_secs).await {
+            Ok(mut client) => {
+                client.owns_endpoint = true;
+                Ok(client)
+            }
+            Err(err) => {
+                endpoint.close().await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Finish a short-lived client without closing a Runtime-owned endpoint.
+    async fn close(self) {
+        if self.owns_endpoint {
+            self._endpoint.close().await;
+        }
     }
 
     pub async fn connect(
@@ -6856,13 +6871,16 @@ async fn read_carrier_len_prefixed_bytes(
 }
 
 async fn fetch_file_with_timeout(
-    client: &CarrierClient,
+    client: CarrierClient,
     path: &str,
     timeout_secs: u64,
 ) -> Result<Vec<u8>> {
-    tokio::time::timeout(Duration::from_secs(timeout_secs), client.fetch_file(path))
+    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), client.fetch_file(path))
         .await
-        .map_err(|_| anyhow::anyhow!("file fetch timed out after {}s", timeout_secs))?
+        .map_err(|_| anyhow::anyhow!("file fetch timed out after {}s", timeout_secs))
+        .and_then(|result| result);
+    client.close().await;
+    result
 }
 
 pub async fn fetch_file_from_trusted_source(
@@ -6876,7 +6894,7 @@ pub async fn fetch_file_from_trusted_source(
     let ticket_endpoints = decode_ticket_endpoints(&source.connect_ticket);
     for (index, endpoint) in ticket_endpoints.into_iter().enumerate() {
         match CarrierClient::connect_endpoint_addr(endpoint, connect_timeout_secs).await {
-            Ok(client) => match fetch_file_with_timeout(&client, path, fetch_timeout_secs).await {
+            Ok(client) => match fetch_file_with_timeout(client, path, fetch_timeout_secs).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => errors.push(format!("ticket[{index}] fetch failed: {err}")),
             },
@@ -6887,7 +6905,7 @@ pub async fn fetch_file_from_trusted_source(
     let relay_endpoints = relay_only_ticket_endpoints(source);
     for (index, endpoint) in relay_endpoints.into_iter().enumerate() {
         match CarrierClient::connect_endpoint_addr(endpoint, connect_timeout_secs).await {
-            Ok(client) => match fetch_file_with_timeout(&client, path, fetch_timeout_secs).await {
+            Ok(client) => match fetch_file_with_timeout(client, path, fetch_timeout_secs).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => errors.push(format!("relay[{index}] fetch failed: {err}")),
             },
@@ -6899,7 +6917,7 @@ pub async fn fetch_file_from_trusted_source(
         node_id.ok_or_else(|| anyhow::anyhow!("trusted source has no usable Carrier node id"))?;
     let addrs = source_carrier_addrs(source);
     match CarrierClient::connect(&node_id, &addrs, connect_timeout_secs).await {
-        Ok(client) => match fetch_file_with_timeout(&client, path, fetch_timeout_secs).await {
+        Ok(client) => match fetch_file_with_timeout(client, path, fetch_timeout_secs).await {
             Ok(bytes) => Ok(bytes),
             Err(err) => {
                 errors.push(format!("direct fetch failed: {err}"));
@@ -6927,7 +6945,9 @@ pub async fn try_p2p_discovery(
     let client = CarrierClient::connect(publisher_node_id, publisher_addrs, timeout_secs)
         .await
         .ok()?;
-    let release = client.release_head().await.ok()??;
+    let release = client.release_head().await;
+    client.close().await;
+    let release = release.ok()??;
     release["head_cid"].as_str().map(|s| s.to_string())
 }
 
@@ -8510,6 +8530,162 @@ mod tests {
         assert!(!carrier_provider_target_allowed(
             "protected-content-decrypt"
         ));
+    }
+
+    async fn carrier_client_fetch_cleanup_case(reply: &str) {
+        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![CARRIER_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let observer = endpoint.clone();
+        let address = wait_for_direct_endpoint_addr(&server).await;
+        let server_endpoint = server.clone();
+        let reply = reply.to_string();
+        let server_reply = reply.clone();
+        let serving = tokio::spawn(async move {
+            let conn = server_endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, recv) = conn.accept_bi().await.unwrap();
+            let mut reader = BufReader::new(recv);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap()["path"],
+                "artifact"
+            );
+            match server_reply.as_str() {
+                "success" => {
+                    send.write_all(&7u64.to_be_bytes()).await.unwrap();
+                    send.write_all(b"fixture").await.unwrap();
+                    send.finish().unwrap();
+                }
+                "error" => {
+                    send.write_all(b"{\"ok\":false,\"error\":\"fixture missing\"}\n")
+                        .await
+                        .unwrap();
+                    send.finish().unwrap();
+                }
+                "timeout" => {}
+                _ => unreachable!(),
+            }
+            conn.closed().await
+        });
+        let client = CarrierClient::connect_owned_endpoint(endpoint, address, 5)
+            .await
+            .unwrap();
+        let result = fetch_file_with_timeout(client, "artifact", 1).await;
+        let closed_before_return = observer.is_closed();
+        observer.close().await;
+        let remote_close = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .unwrap()
+            .unwrap();
+        server.close().await;
+        assert!(
+            closed_before_return,
+            "owned fetch endpoint remained open after {reply}"
+        );
+        assert!(matches!(
+            remote_close,
+            iroh::endpoint::ConnectionError::ApplicationClosed(_)
+        ));
+        match reply.as_str() {
+            "success" => assert_eq!(result.unwrap(), b"fixture"),
+            "error" => assert_eq!(
+                result.unwrap_err().to_string(),
+                "trusted source file fetch for artifact failed: fixture missing"
+            ),
+            "timeout" => assert_eq!(
+                result.unwrap_err().to_string(),
+                "file fetch timed out after 1s"
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_client_owned_fetch_success_closes_endpoint() {
+        carrier_client_fetch_cleanup_case("success").await;
+    }
+
+    #[tokio::test]
+    async fn carrier_client_owned_fetch_error_closes_endpoint() {
+        carrier_client_fetch_cleanup_case("error").await;
+    }
+
+    #[tokio::test]
+    async fn carrier_client_owned_fetch_timeout_closes_endpoint() {
+        carrier_client_fetch_cleanup_case("timeout").await;
+    }
+
+    #[tokio::test]
+    async fn carrier_client_failed_connect_closes_only_owned_endpoint() {
+        for owned in [true, false] {
+            let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap();
+            let observer = endpoint.clone();
+            let unavailable = iroh::EndpointAddr::from(SecretKey::from_bytes(&[137; 32]).public());
+            let result = if owned {
+                CarrierClient::connect_owned_endpoint(endpoint, unavailable, 1).await
+            } else {
+                CarrierClient::connect_known_endpoint(&endpoint, unavailable, 1).await
+            };
+            let closed_before_return = observer.is_closed();
+            observer.close().await;
+            assert!(result.is_err());
+            assert_eq!(result.err().unwrap().to_string(), "connect failed");
+            assert_eq!(closed_before_return, owned);
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_client_connect_timeout_closes_owned_endpoint() {
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let observer = endpoint.clone();
+        let address = iroh::EndpointAddr::from(SecretKey::from_bytes(&[138; 32]).public())
+            .with_addrs([iroh::TransportAddr::Ip(blackhole.local_addr().unwrap())]);
+        let result = CarrierClient::connect_owned_endpoint(endpoint, address, 1).await;
+        let closed_before_return = observer.is_closed();
+        observer.close().await;
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap().to_string(), "connect timed out");
+        assert!(closed_before_return);
+    }
+
+    #[tokio::test]
+    async fn carrier_client_borrowed_close_keeps_endpoint_usable() {
+        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![CARRIER_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let address = wait_for_direct_endpoint_addr(&server).await;
+        for _ in 0..2 {
+            let accept = async { server.accept().await.unwrap().await.unwrap() };
+            let connect = CarrierClient::connect_known_endpoint(&endpoint, address.clone(), 5);
+            let (connection, client) = tokio::join!(accept, connect);
+            client.unwrap().close().await;
+            assert!(!endpoint.is_closed());
+            // The peer closes this completed connection; the next iteration
+            // proves the caller's endpoint can still open another one.
+            connection.close(0u32.into(), b"fixture complete");
+        }
+        endpoint.close().await;
+        server.close().await;
     }
 
     struct PeerDidRouteFixture {
