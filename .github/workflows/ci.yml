@@ -54,6 +54,8 @@ jobs:
         run: |
           python3 scripts/components-release-integrity-check.py --self-test
           python3 scripts/publish-platform-artifacts-test.py
+          python3 scripts/release-platform-input-test.py
+          python3 scripts/prepare-release-platform-test.py
       - name: Browser close handshake
         run: node --test scripts/browser-window-close-handshake.test.mjs
 

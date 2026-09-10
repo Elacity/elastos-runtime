@@ -493,6 +493,11 @@ support_binary_build_path() {
     capsule_dir=$(resolve_capsule_dir "$name" || true)
     [[ -n "$capsule_dir" ]] || return 1
 
+    if [[ "${RELEASE_PREPARE_LOCKED:-false}" == true && -n "${CARGO_TARGET_DIR:-}" ]]; then
+        printf '%s/%srelease/%s\n' "$CARGO_TARGET_DIR" "${target:+${target}/}" "$name"
+        return 0
+    fi
+
     # Workspace members (under elastos/capsules/) compile to the workspace
     # root target dir, not the capsule's own target dir.
     local paths=()
@@ -521,6 +526,10 @@ build_support_binary() {
     local target="${3:-}"
     local use_cross="${4:-false}"
     local capsule_dir binary
+    local build_args=(build --release)
+    if [[ "${RELEASE_PREPARE_LOCKED:-false}" == true ]]; then
+        build_args+=(--locked)
+    fi
     capsule_dir=$(resolve_capsule_dir "$name" || true)
     [[ -n "$capsule_dir" ]] || die "Source directory not found for support asset '${name}'"
     binary=$(support_binary_build_path "$name" "$target")
@@ -534,12 +543,12 @@ build_support_binary() {
     info "  Building ${name} (${platform})..." >&2
     if [[ -n "$target" ]]; then
         if [[ "$use_cross" == true ]] && command -v cross >/dev/null 2>&1; then
-            (cd "$capsule_dir" && "${CROSS_ENV[@]}" cross build --release --target "$target") >&2 || return
+            (cd "$capsule_dir" && "${CROSS_ENV[@]}" cross "${build_args[@]}" --target "$target") >&2 || return
         else
-            (cd "$capsule_dir" && cargo build --release --target "$target") >&2 || return
+            (cd "$capsule_dir" && cargo "${build_args[@]}" --target "$target") >&2 || return
         fi
     else
-        (cd "$capsule_dir" && cargo build --release) >&2 || return
+        (cd "$capsule_dir" && cargo "${build_args[@]}") >&2 || return
     fi
 
     binary=$(support_binary_build_path "$name" "$target")
@@ -628,12 +637,12 @@ build_packaged_provider_capsule_metadata_archive() {
     rm -rf "$stage_root" || return
     mkdir -p "${stage_root}/${capsule_name}" "$archive_dir" || return
 
-    cp "${capsule_dir}/capsule.json" "${stage_root}/${capsule_name}/capsule.json" || return
+    copy_release_source_file "${capsule_dir}/capsule.json" "${stage_root}/${capsule_name}/capsule.json" || return
     for size in 32 64 128 256; do
         source="${capsule_dir}/${icon_dir}/icon-${size}.png"
         [[ -f "$source" ]] || die "${capsule_name} provider capsule icon missing: ${icon_dir}/icon-${size}.png"
         mkdir -p "${stage_root}/${capsule_name}/${icon_dir}" || return
-        cp "$source" "${stage_root}/${capsule_name}/${icon_dir}/icon-${size}.png" || return
+        copy_release_source_file "$source" "${stage_root}/${capsule_name}/${icon_dir}/icon-${size}.png" || return
     done
 
     create_capsule_tar "$archive" "$stage_root" "$capsule_name" || return
@@ -660,12 +669,28 @@ copy_clean_capsule_tree() {
     local src="$1"
     local dest="$2"
     mkdir -p "$dest"
+    if [[ -n "${RELEASE_PREPARE_SOURCE_COMMIT:-}" ]]; then
+        local prefix
+        prefix=$(git -C "$src" rev-parse --show-prefix) || return
+        git archive "${RELEASE_PREPARE_SOURCE_COMMIT}:${prefix%/}" | tar -xf - -C "$dest"
+        return
+    fi
     tar \
         --exclude='./target' \
         --exclude='./node_modules' \
         --exclude='./.git' \
         --exclude='./.DS_Store' \
         -cf - -C "$src" . | tar -xf - -C "$dest"
+}
+
+copy_release_source_file() {
+    local src="$1"
+    local dest="$2"
+    if [[ -n "${RELEASE_PREPARE_SOURCE_COMMIT:-}" ]]; then
+        git show "${RELEASE_PREPARE_SOURCE_COMMIT}:${src}" > "$dest"
+    else
+        cp "$src" "$dest"
+    fi
 }
 
 create_capsule_tar() {
@@ -735,11 +760,15 @@ stage_wasm_capsule() {
     [[ -n "$built_wasm" ]] || die "${capsule_name} entrypoint missing after build: ${entrypoint}"
 
     mkdir -p "$(dirname "${dest}/${entrypoint}")" || return
-    cp "${capsule_dir}/capsule.json" "$dest/" || return
-    cp "$built_wasm" "${dest}/${entrypoint}" || return
+    copy_release_source_file "${capsule_dir}/capsule.json" "$dest/capsule.json" || return
     if [[ -d "${capsule_dir}/browser" ]]; then
         mkdir -p "${dest}/browser" || return
         copy_clean_capsule_tree "${capsule_dir}/browser" "${dest}/browser" || return
+    fi
+    if [[ "$runtime_abi" == "elastos.runtime-projection/v1" ]]; then
+        copy_release_source_file "$built_wasm" "${dest}/${entrypoint}" || return
+    else
+        cp "$built_wasm" "${dest}/${entrypoint}" || return
     fi
 }
 
@@ -1014,6 +1043,22 @@ merge_direct_assets() {
     jq -s '.[0] * .[1]' <(printf '%s\n' "$1") <(printf '%s\n' "$2")
 }
 
+# The native preparation worker uses the same template and profile merge.
+generate_components_json() {
+    local capsule_entries="$1"
+    local direct_assets="$2"
+    local external profiles
+    external=$(jq '.external' components.json)
+    profiles=$(jq '.profiles' components.json)
+    jq -n \
+        --arg schema "elastos.components/v1" \
+        --argjson capsules "$capsule_entries" \
+        --argjson external "$external" \
+        --argjson profiles "$profiles" \
+        --argjson direct "$direct_assets" \
+        '{schema: $schema, capsules: $capsules, external: ($external * $direct.external), profiles: $profiles}'
+}
+
 runtime_tunnel_url() {
     local coords_file
     coords_file="$(default_elastos_data_dir)/runtime-coords.json"
@@ -1037,6 +1082,11 @@ runtime_tunnel_url() {
     echo "$url"
     return 0
 }
+
+# Sourcing exposes local builders without invoking the publisher.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
 
 # ── Parse args ────────────────────────────────────────────────────────
 
@@ -1778,22 +1828,6 @@ if [[ -n "$CROSS_ARCH" ]]; then
 fi
 
 # ── Step 5: Generate components.json with real CIDs ──────────────────
-
-# Generate per-platform components.json (each platform has its own capsule CIDs).
-generate_components_json() {
-    local capsule_entries="$1"
-    local direct_assets="$2"
-    local external profiles
-    external=$(jq '.external' components.json)
-    profiles=$(jq '.profiles' components.json)
-    jq -n \
-        --arg schema "elastos.components/v1" \
-        --argjson capsules "$capsule_entries" \
-        --argjson external "$external" \
-        --argjson profiles "$profiles" \
-        --argjson direct "$direct_assets" \
-        '{schema: $schema, capsules: $capsules, external: ($external * $direct.external), profiles: $profiles}'
-}
 
 validate_generated_components_json() {
     local manifest="$1"

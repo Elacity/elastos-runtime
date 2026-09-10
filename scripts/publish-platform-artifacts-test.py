@@ -104,7 +104,7 @@ publish_direct_assets() { touch "$TEST_UPLOAD"; echo '{}'; }
 
     def test_fresh_projection_packaging_and_asset_records_do_not_publish(self):
         source = PUBLISHER.read_text()
-        names = ("capsule_manifest_field", "copy_clean_capsule_tree", "create_capsule_tar",
+        names = ("capsule_manifest_field", "copy_clean_capsule_tree", "copy_release_source_file", "create_capsule_tar",
                  "stage_wasm_capsule", "build_packaged_capsule_archive",
                  "record_direct_asset", "record_provider_capsule_metadata_asset",
                  "sha256", "file_size")

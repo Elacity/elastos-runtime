@@ -39,6 +39,43 @@ tests, and the separate Browser local-exit checks. `just verify-release` adds
 browser-based UI source checks, local Carrier setup and Home front-door proofs.
 Publishing trust and signer verification are separate release gates.
 
+## Native platform inputs
+
+Run the preparation worker from one reviewed, clean checkout on each native
+builder. It supports Linux x86_64, Linux ARM64 and macOS Apple silicon. Choose
+an absent output directory outside the checkout:
+
+```sh
+scripts/prepare-release-platform.sh --version 0.7.1 --output /path/to/new-platform-input
+python3 scripts/release-platform-input.py verify /path/to/new-platform-input
+```
+
+The worker builds native Runtime/provider files with locked dependencies, copies
+tracked app sources and rebuilt entrypoints, and writes unsigned local inputs.
+The receipt binds the source commit/tree, lockfiles, tool versions, component
+template and each output's size/hash. It records helpers absent from the source
+platform matrix. Generic provider VM archives remain a separate build path.
+Linux preparation needs tracked lockfiles for the standalone Browser helper
+projects; a missing lockfile stops preparation before a native build.
+
+From that same clean candidate checkout, check all three transferred inputs:
+
+```sh
+python3 scripts/release-platform-input.py validate-inputs \
+  --input x86_64-linux=/path/to/linux-x86_64-input \
+  --input aarch64-linux=/path/to/linux-arm64-input \
+  --input aarch64-darwin=/path/to/mac-arm64-input
+```
+
+This checks source and local file agreement, native OS/CPU headers, archive
+contracts and required Home delivery metadata. Source-template external downloads
+retain their pinned URLs and checksums. Media prerequisites, Browser substrate
+provisioning and actual fresh-device installation keep their target acceptance.
+Publisher import, signing and promotion follow this preparation boundary and
+remain separate release work. These commands perform local file operations;
+the builds can fetch Cargo dependencies. Keep their output through candidate
+review, then remove it after adoption or abandonment.
+
 ## Public-install proof
 
 The three public-install wrappers cover separate installed paths:

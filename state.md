@@ -108,16 +108,18 @@ approved plan retains full release acceptance.
   Current tag assets and source-home receipts alone do not establish the
   required ordinary update path.
 
-- The visitor page now offers both Open Home and installation on the user's
-  hardware. It identifies the published Linux download as the older 0.1.2
-  preview, gives Apple silicon source-build steps and labels Windows as planned.
-  The public installer and release manifest were read again and match the
-  recorded hashes. Three viewport/keyboard checks pass with the install panels
-  expanded and JavaScript disabled; all three displayed command blocks pass
-  shell syntax checks. Fresh-device installation remains J1 acceptance.
-  The earlier content revision at `cd7376ec` passed private seed file parity;
-  these newer install instructions need that stage refreshed after copy review.
-  Public live remains unchanged. Version/proof widgets stay in operator tooling.
+- The visitor page offers Open Home and installation on the user's hardware.
+  One command installs the older public 0.1.2 Linux preview; Apple silicon
+  developers have a source-guide link, and 0.7.1 downloads remain in preparation.
+  Current content and local source/served parity checks pass. The private seed
+  website package still needs this copy revision before deployment review.
+- The candidate installer now runs Home setup and opens terminal Home after
+  verified bootstrap. It uses the installed binary's absolute path and reads
+  interactive input from the terminal. Headless setup prints the launch path;
+  install-only mode lets automation own setup and process cleanup. Forty-three
+  offline installer checks pass; four optional captured-public-fixture checks
+  were skipped. This is source/fixture proof. Actual fresh-device installation
+  and browser Home launch remain open.
 - The installation guides now explain that the source Home profile already
   includes Documents, Library and the CLI's IPFS backend. Getting started omits
   redundant component setup. The Mac guide selects an explicit development ref,
@@ -170,8 +172,16 @@ approved plan retains full release acceptance.
   substitutions, and nested app entrypoints get their parent directory before
   copying. Ten regression groups pass on macOS and Linux, including four
   preparation failures that stop before upload. Independent source review and
-  required source checks pass. Transferable platform receipts, full preparation
-  commands and candidate installation remain open.
+  required source checks pass. Actual candidate installation remains open.
+
+- The native preparation worker builds from a clean Git revision and tracked
+  Cargo lockfiles, then exports local artifacts with an unsigned source/file
+  receipt. Admission checks all three platform inputs against the candidate
+  source, component template, native OS/CPU, provider contracts and exact file
+  inventory. Sixteen admission test groups and five preparation fixture tests
+  pass, including synthetic builds for all three platforms. Independent source
+  review found no remaining issues. Linux helper lockfiles, actual native builds,
+  publisher import, external dependencies and fresh installs remain open.
 
 The source and installed sections below preserve the earlier evidence snapshot.
 Their original identities qualify those results. Current milestone receipts
