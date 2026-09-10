@@ -137,15 +137,26 @@ async fn start_gateway_server_with_shutdown(
     if let Some(on_ready) = on_ready {
         on_ready(&home_url);
     }
-    let serve_result = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        shutdown.await;
-        println!("\nShutting down gateway...");
-    })
-    .await;
+    let connections = axum_server::Handle::new();
+    let server = axum_server::Server::<SocketAddr>::from_listener(listener)
+        .handle(connections.clone())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>());
+    tokio::pin!(server);
+    let serve_result = tokio::select! {
+        result = &mut server => result,
+        _ = shutdown => {
+            println!("\nShutting down gateway...");
+            // Bound stream draining, then cancel the owned HTTP connections.
+            connections.graceful_shutdown(Some(std::time::Duration::from_secs(2)));
+            (&mut server).await
+        }
+    };
+    connections.shutdown();
+    // The server's deadline signals connection tasks. Wait for their request
+    // futures to drop before cleanup can release this data root to a new host.
+    while connections.connection_count() != 0 {
+        tokio::task::yield_now().await;
+    }
     browser_lifecycle_reconciler.cancel();
     let reconciliation_result = browser_lifecycle_reconciler.join().await;
     let local_control_result = async {
@@ -280,6 +291,7 @@ mod trusted_gateway_tests {
     use super::*;
     use std::sync::Mutex;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
 
     static READY_URL: Mutex<Option<oneshot::Sender<String>>> = Mutex::new(None);
@@ -316,10 +328,21 @@ mod trusted_gateway_tests {
         let task_addr = addr.clone();
         let data = temp.path().to_path_buf();
         let task_data = data.clone();
+        // Match the real gateway caller's owned child guard. Even an open HTTP
+        // body must let gateway shutdown return so this guard can reap its child.
+        let helper = crate::api::server::HostHelperProcess {
+            name: "gateway shutdown test",
+            child: std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        };
+        let helper_pid = helper.child.id();
         let server = tokio::spawn(async move {
+            let _helper = helper;
             start_gateway_server_with_shutdown(
                 &task_addr,
-                None,
+                Some(Arc::new(ProviderRegistry::new())),
                 GatewayCollaborationContext::default(),
                 task_data.join("cache"),
                 task_data,
@@ -360,12 +383,59 @@ mod trusted_gateway_tests {
             .to_string()
             .contains("already running for this data root"));
 
-        stop_tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), server)
+        // Expect:100 proves Axum started reading this streaming request body.
+        // Keep it incomplete while shutdown begins, as an SSE/WebSocket client
+        // likewise keeps an in-flight connection alive after the listener closes.
+        let mut streaming = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        streaming
+            .write_all(format!(
+                "POST /api/auth/passkey/register/begin HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nExpect: 100-continue\r\n\r\n"
+            ).as_bytes())
+            .await
+            .unwrap();
+        let mut interim = [0; 128];
+        let length = tokio::time::timeout(Duration::from_secs(2), streaming.read(&mut interim))
             .await
             .unwrap()
-            .unwrap()
             .unwrap();
+        assert!(String::from_utf8_lossy(&interim[..length]).starts_with("HTTP/1.1 100 Continue"));
+        streaming.write_all(b"{").await.unwrap();
+        let coords_path = data.join("gateway-runtime-coords.json");
+        assert!(coords_path.is_file());
+
+        stop_tx.send(()).unwrap();
+        let mut server = server;
+        let stopped = tokio::time::timeout(Duration::from_secs(5), &mut server).await;
+        if stopped.is_err() {
+            server.abort();
+            let _ = server.await;
+            panic!("gateway shutdown waited for a client stream to close");
+        }
+        stopped.unwrap().unwrap().unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(1), streaming.read(&mut interim))
+            .await
+            .expect("shutdown must close the held client connection");
+        assert!(matches!(closed, Ok(0)) || closed.is_err());
+        // Completing the body after shutdown cannot resume its request handler.
+        let remainder = format!("}}{}", " ".repeat(998));
+        let _ = streaming.write_all(remainder.as_bytes()).await;
+        let after_write =
+            tokio::time::timeout(Duration::from_secs(1), streaming.read(&mut interim))
+                .await
+                .expect("the closed connection must remain closed");
+        assert!(matches!(after_write, Ok(0)) || after_write.is_err());
+        assert!(
+            !coords_path.exists(),
+            "local control ownership must be released"
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(unsafe { libc::kill(helper_pid as i32, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
         // Reusing both the address and data root proves listener/reconciler cleanup.
         start_gateway_server_with_shutdown(
             &addr,
