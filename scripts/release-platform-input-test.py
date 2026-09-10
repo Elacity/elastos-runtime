@@ -130,6 +130,32 @@ class PlatformInputTest(unittest.TestCase):
     def test_three_matching_platform_inputs_pass(self):
         self.assertEqual(set(inputs.validate_inputs(self.values())), set(inputs.PLATFORMS))
 
+    def test_runtime_only_provider_metadata_follows_source_contract(self):
+        root = self.bundles["aarch64-darwin"]
+        template = json.loads((root / "components-template.json").read_text())
+        manifest = json.loads((root / "components.json").read_text())
+        del manifest["external"]["shell"]["capsule_metadata"]
+        (root / "artifacts/shell-metadata.tar.gz").unlink()
+        for value in (False, True, 1, "true"):
+            template["external"]["shell"]["provider_runtime"]["runtime_only"] = value
+            manifest["external"]["shell"]["provider_runtime"]["runtime_only"] = value
+            self.write_json(root / "components-template.json", template)
+            self.write_json(root / "components.json", manifest)
+            self.refresh(root)
+            with self.subTest(runtime_only=value):
+                if value is True:
+                    inputs.verify(root)
+                else:
+                    with self.assertRaisesRegex(ValueError, "provider capsule metadata is missing"):
+                        inputs.verify(root)
+        template["external"]["shell"]["provider_runtime"]["runtime_only"] = False
+        manifest["external"]["shell"]["provider_runtime"]["runtime_only"] = True
+        self.write_json(root / "components-template.json", template)
+        self.write_json(root / "components.json", manifest)
+        self.refresh(root)
+        with self.assertRaisesRegex(ValueError, "component contract differs from source template"):
+            inputs.verify(root)
+
     def test_missing_duplicate_or_wrong_platform_labels_reject(self):
         values = self.values()
         for case in (values[:2], values + values[:1], [values[0].replace("x86_64-linux=", "aarch64-linux="), *values[1:]]):

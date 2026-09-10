@@ -21,6 +21,44 @@ spec.loader.exec_module(integrity)
 
 
 class PlatformArtifactExportTest(unittest.TestCase):
+    def test_source_provider_metadata_archives_pass_admission(self):
+        repo = PUBLISHER.parent.parent
+        external = json.loads((repo / "components.json").read_text())["external"]
+        sources = {}
+        for name, component in external.items():
+            if not isinstance(component.get("provider_runtime"), dict):
+                continue
+            for parent in (repo / "capsules", repo / "elastos/capsules"):
+                if (parent / name / "capsule.json").is_file():
+                    sources[name] = parent / name
+                    break
+        spec = importlib.util.spec_from_file_location(
+            "platform_input", PUBLISHER.with_name("release-platform-input.py"))
+        admission = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(admission)
+        with tempfile.TemporaryDirectory() as root:
+            result = subprocess.run(
+                ["bash", "-euc", 'source "$1"; build_platform_independent_provider_capsule_metadata_assets',
+                 "provider-metadata-test", str(PUBLISHER)], cwd=repo,
+                env={**os.environ, "TMPDIR": root, "RELEASE_PREPARE_SOURCE_COMMIT": ""},
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            records = json.loads(result.stdout)["external"]
+            self.assertEqual(set(records), set(sources))
+            for name, source in sources.items():
+                with self.subTest(provider=name):
+                    descriptor = records[name]["capsule_metadata"]["platforms"]["*"]
+                    archive_path = Path(root) / "supported-provider-contracts-universal" / descriptor["release_path"]
+                    admission.check_archive(archive_path, name, provider=True)
+                    self.assertEqual(descriptor["checksum"], "sha256:" + hashlib.sha256(archive_path.read_bytes()).hexdigest())
+                    self.assertEqual(descriptor["size"], archive_path.stat().st_size)
+                    manifest = json.loads((source / "capsule.json").read_text())
+                    members = ["capsule.json"] + [f'{manifest["icon"]}/icon-{size}.png' for size in (32, 64, 128, 256)]
+                    with tarfile.open(archive_path) as archive:
+                        for member in members:
+                            self.assertEqual(archive.extractfile(f"{name}/{member}").read(), (source / member).read_bytes())
+
     def test_direct_asset_publication_attaches_cids_after_preparation(self):
         source = PUBLISHER.read_text()
         function = "publish_direct_assets() {" + source.split(

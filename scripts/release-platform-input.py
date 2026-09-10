@@ -197,7 +197,9 @@ def check_contents(root, platform, omissions):
                 raise ValueError(f"{name}: source-local component needs a local artifact")
             if not original_info.get("release_path") and original_info.get("url") and prepared_info != original_info:
                 raise ValueError(f"{name}: external dependency differs from pinned source template")
-        if original_info is not None and isinstance(component.get("provider_runtime"), dict):
+        provider_runtime = component.get("provider_runtime")
+        if (original_info is not None and isinstance(provider_runtime, dict)
+                and provider_runtime.get("runtime_only") is not True):
             metadata = component.get("capsule_metadata")
             if not isinstance(metadata, dict) or integrity.resolve_platform_info(metadata, setup_platform)[1] is None:
                 raise ValueError(f"{name}: provider capsule metadata is missing")
