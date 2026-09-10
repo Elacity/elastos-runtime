@@ -220,12 +220,16 @@ pub fn format_bytes(bytes: usize) -> String {
 
 /// Detect the current platform for release binary selection.
 pub fn detect_release_platform() -> &'static str {
-    if cfg!(target_arch = "x86_64") {
-        "x86_64-linux"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64-linux"
-    } else {
-        "unknown"
+    release_platform_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn release_platform_for(os: &str, arch: &str) -> &'static str {
+    match (os, arch) {
+        ("linux", "x86_64") => "x86_64-linux",
+        ("linux", "aarch64") => "aarch64-linux",
+        ("macos", "x86_64") => "x86_64-darwin",
+        ("macos", "aarch64") => "aarch64-darwin",
+        _ => "unknown",
     }
 }
 
@@ -939,6 +943,24 @@ mod tests {
     use axum::http::StatusCode;
     use axum::routing::get;
     use axum::Router;
+
+    #[test]
+    fn release_platform_matches_publisher_keys_for_each_host() {
+        // CPU architecture alone must not select a Linux executable on macOS.
+        // These are release keys; components use setup's separate platform names.
+        for (os, arch, expected) in [
+            ("linux", "x86_64", "x86_64-linux"),
+            ("linux", "aarch64", "aarch64-linux"),
+            ("macos", "x86_64", "x86_64-darwin"),
+            ("macos", "aarch64", "aarch64-darwin"),
+            ("windows", "aarch64", "unknown"),
+            ("linux", "riscv64", "unknown"),
+        ] {
+            assert_eq!(release_platform_for(os, arch), expected);
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(detect_release_platform(), "aarch64-darwin");
+    }
 
     fn binding_envelope(payload: serde_json::Value, domain: &str) -> Vec<u8> {
         // Disposable deterministic identity; never a live publisher key.
