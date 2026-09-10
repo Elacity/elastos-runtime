@@ -18,6 +18,7 @@
       <span class="release-badge">0.7.1 <span>preview</span></span>
       <nav aria-label="Main navigation">
         <a href="#explore">Explore</a>
+        <a href="#status">Status</a>
         <a href="#install">Install</a>
         <a href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs">Docs</a>
       </nav>
@@ -29,7 +30,7 @@
         <img class="hero-mark" src="./assets/elastos-mark.svg" width="80" height="80" alt="">
         <h1 id="hero-title">ElastOS</h1>
         <p class="hero-tagline">Your apps, on your own machine.<br>You choose what they can access.</p>
-        <p class="hero-lead">ElastOS runs apps and services on your hardware. Open Home in your browser, sign in with a passkey, and manage your files, contacts and apps in one place.</p>
+        <p class="hero-lead">ElastOS is a local-first runtime for apps and services. Home is your desktop in the browser. Runtime manages identity and permissions across the apps you use.</p>
         <div class="hero-actions">
           <a class="button primary" href="#install">Install ElastOS <span aria-hidden="true">↓</span></a>
           <a class="button secondary" id="open-home" href="/home/">Try Home <span aria-hidden="true">↗</span></a>
@@ -59,31 +60,56 @@
         <p class="install-alternative">Want to try it first? <a href="/home/">Open Home in your browser <span aria-hidden="true">↗</span></a></p>
       </section>
 
-      <section class="explore-section section" id="explore" aria-labelledby="explore-title">
-        <div class="section-intro">
-          <p class="eyebrow">Inside Home</p>
-          <h2 id="explore-title">Files, contacts <br>and settings.</h2>
-          <div class="app-icons" aria-hidden="true">
-            <img src="./assets/documents.png" width="42" height="42" alt="">
-            <img src="./assets/library.png" width="42" height="42" alt="">
-            <img src="./assets/people.png" width="42" height="42" alt="">
-            <img src="./assets/system.png" width="42" height="42" alt="">
-          </div>
-          <p>Home brings your apps together. Use Documents to write, Library to find your files, and People to manage your profile and contacts.</p>
+      <section class="section" id="explore" aria-labelledby="explore-title">
+        <div class="section-heading"><p class="eyebrow">Inside Home</p><h2 id="explore-title">Apps that work on your terms.</h2><p>Use your hardware for more than storage. ElastOS brings AI, browsing and content publishing into a shared system for identity and access.</p></div>
+        <div class="features-grid">
+          <article class="feature-card"><div class="feature-heading"><span class="feature-kind">AI</span><span class="status-label">Preview</span></div><h3>Run models on your hardware</h3><p>Use local compute for AI alongside your apps and files. Runtime controls the access granted to agents, just as it does for other apps.</p><a href="#status">Local AI status <span aria-hidden="true">↓</span></a></article>
+          <article class="feature-card"><div class="feature-heading"><span class="feature-kind">Browser</span><span class="status-label">Preview</span></div><h3>Bring the web into Home</h3><p>Open websites in Browser with Wallet available for dapps. Runtime manages the Browser service and its network access.</p><a href="#status">Browser status <span aria-hidden="true">↓</span></a></article>
+          <article class="feature-card"><div class="feature-heading"><span class="feature-kind">Publishing</span><span class="status-label">In testing</span></div><h3>Set access rules for your content</h3><p>Publish protected video, list it for purchase and let buyers play it through their granted access. Publishing and playback use the same identity and permissions system.</p><a href="#status">Protected video status <span aria-hidden="true">↓</span></a></article>
         </div>
-        <div class="journeys">
-          <details class="journey" open>
-            <summary><span class="journey-number">01</span><strong>Write and organise</strong><span class="expand" aria-hidden="true">+</span></summary>
-            <div class="journey-body"><p>Start a document, return to a draft, or find something you saved. Documents and Library work with the files in your Home.</p></div>
-          </details>
-          <details class="journey">
-            <summary><span class="journey-number">02</span><strong>Create your profile</strong><span class="expand" aria-hidden="true">+</span></summary>
-            <div class="journey-body"><p>Choose the name people see when they connect with you. People keeps your profile and contacts together.</p></div>
-          </details>
-          <details class="journey">
-            <summary><span class="journey-number">03</span><strong>Look after your account</strong><span class="expand" aria-hidden="true">+</span></summary>
-            <div class="journey-body"><p>Save a Recovery Kit during setup and keep it somewhere safe. Open System Settings from the ElastOS menu to manage your account, appearance and services.</p></div>
-          </details>
+      </section>
+
+      <section class="section first-steps" id="first-steps" aria-labelledby="first-steps-title">
+        <div class="section-heading">
+          <p class="eyebrow">Start with Home</p>
+          <h2 id="first-steps-title">Your first 10 minutes</h2>
+          <p>Open Home and follow the setup guide, then try your first app.</p>
+        </div>
+        <div class="steps-grid">
+          <article class="step-card"><span class="step-number">01</span><h3>Sign in with a passkey</h3><p>Use your device to sign in. If you are setting up a new Home, create its first passkey.</p><a href="/home/">Open Home <span aria-hidden="true">↗</span></a></article>
+          <article class="step-card"><span class="step-number">02</span><h3>Save your Recovery Kit</h3><p>Download your Recovery Kit during setup and keep it somewhere safe. You will need it if you lose access.</p><span class="step-location">System Settings → Security</span></article>
+          <article class="step-card"><span class="step-number">03</span><h3>Create your profile</h3><p>Choose the name people see when they connect with you. Add your profile in People.</p><span class="step-location">Home → People</span></article>
+          <article class="step-card"><img src="./assets/documents.png" width="36" height="36" alt=""><h3>Write something</h3><p>Open Documents, start a document and save it. Return to your draft from Home.</p><span class="step-location">Home → Documents</span></article>
+          <article class="step-card"><img src="./assets/library.png" width="36" height="36" alt=""><h3>Explore your files</h3><p>Open Library to browse the files in your Home and find what you have saved.</p><span class="step-location">Home → Library</span></article>
+          <article class="step-card"><img src="./assets/system.png" width="36" height="36" alt=""><h3>Make Home yours</h3><p>Use the ElastOS menu to open System Settings. Manage your account, appearance and services.</p><span class="step-location">ElastOS menu → System Settings</span></article>
+        </div>
+      </section>
+
+      <section class="section" id="about" aria-labelledby="about-title">
+        <div class="section-heading"><p class="eyebrow">How it fits together</p><h2 id="about-title">What ElastOS is</h2></div>
+        <div class="concept-grid">
+          <article><span class="concept-number">01 /</span><h3>Runtime</h3><p>The software that runs on your machine. It manages apps, services and access to your data.</p></article>
+          <article><span class="concept-number">02 /</span><h3>Home</h3><p>Your desktop in the browser. Sign in with a passkey to open apps and manage your account.</p></article>
+          <article><span class="concept-number">03 /</span><h3>Apps</h3><p>Signed packages for tasks such as writing, managing files and connecting with people. Apps request access through Runtime.</p></article>
+          <article><span class="concept-number">04 /</span><h3>Permissions</h3><p>Grants define what an app or agent can do. Runtime checks that access when it handles a request.</p></article>
+        </div>
+      </section>
+
+      <section class="section" id="status" aria-labelledby="status-title">
+        <div class="section-heading"><p class="eyebrow">0.7.1 preview</p><h2 id="status-title">What works today</h2><p>Start with Home. The wider app and device experience is still in testing.</p></div>
+        <div class="status-table-wrap">
+          <table class="status-table">
+            <thead><tr><th scope="col">Feature</th><th scope="col">Status</th><th scope="col">What to expect</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Passkeys, Recovery Kit and Profile</th><td><span class="status-label available">Available in Home</span></td><td>Sign in, save your Recovery Kit and create your profile.</td></tr>
+              <tr><th scope="row">Documents and Library</th><td><span class="status-label">Preview</span></td><td>Write documents and browse files. The full save and sharing experience is still being tested.</td></tr>
+              <tr><th scope="row">Install on your device</th><td><span class="status-label">Coming soon</span></td><td>The 0.7.1 installer will support Linux and Apple silicon Macs.</td></tr>
+              <tr><th scope="row">Update an existing installation</th><td><span class="status-label">In testing</span></td><td>The 0.7.1 upgrade path is being checked for preservation of accounts, settings and files.</td></tr>
+              <tr><th scope="row">Local AI</th><td><span class="status-label">Preview</span></td><td>Requires a configured model service. Getting and using models directly from Home is in development.</td></tr>
+              <tr><th scope="row">Browser</th><td><span class="status-label">Preview</span></td><td>Requires a configured Browser service. Media playback and reconnect behavior are still in testing.</td></tr>
+              <tr><th scope="row">Protected video</th><td><span class="status-label">In testing</span></td><td>Publishing, purchases and playback are being tested together.</td></tr>
+            </tbody>
+          </table>
         </div>
       </section>
 

@@ -108,13 +108,13 @@ approved plan retains full release acceptance.
   Current tag assets and source-home receipts alone do not establish the
   required ordinary update path.
 
-- The visitor page offers Open Home and installation on the user's hardware.
-  One command installs the older public 0.1.2 Linux preview; Apple silicon
-  developers have a source-guide link, and 0.7.1 downloads remain in preparation.
-  Current content and local source/served parity checks pass. The private seed
-  website package now serves this copy revision: all eleven website files and
-  the complete staged artifact set pass source/hash checks. Public copy review
-  and deployment approval remain open.
+- The storefront follows the reviewed design reference with platform tabs and
+  a centered introduction. It explains local AI, Browser and protected publishing,
+  provides a first-use guide, describes Runtime/Home/Apps/permissions, and shows
+  feature availability. The 0.7.1 command remains hidden with Copy disabled until
+  its installer is served and verified; old public-version copy is omitted.
+  Desktop/mobile, keyboard and clipboard/fallback checks pass. User review and
+  public deployment approval remain open.
 - The candidate installer now runs Home setup and opens terminal Home after
   verified bootstrap. It uses the installed binary's absolute path and reads
   interactive input from the terminal. Headless setup prints the launch path;
