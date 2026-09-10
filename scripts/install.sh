@@ -25,9 +25,8 @@
 #   1. elastos binary → ~/.local/bin/elastos
 #   2. components.json → the platform's ElastOS application-data directory
 #
-# Capsules are NOT pre-installed. They are downloaded on-demand by the
-# supervisor when a command needs them (e.g., `elastos chat` downloads
-# chat + its provider dependencies automatically).
+# After bootstrap, setup installs the Home profile and opens Home in the
+# terminal. Use --install-only for automated provisioning or other profiles.
 #
 # Trust model:
 #   1. Bootstrap over the stamped publisher URL (or explicit operator/debug CID gateway)
@@ -135,6 +134,7 @@ show_help() {
     echo "  --publisher-node-id ID   Publisher P2P node ID (for durable Carrier link)"
     echo "  --allow-unsigned      Skip signature verification (NOT recommended)"
     echo "  --install-dir PATH    Binary install directory (default: ~/.local/bin)"
+    echo "  --install-only        Install Runtime without setup or opening Home"
     echo "  --help                Show this help"
     echo ""
     echo -e "${BOLD}What gets installed:${NC}"
@@ -142,9 +142,9 @@ show_help() {
     echo "  \${XDG_DATA_HOME:-~/.local/share}/elastos/components.json   Capsule registry"
     echo "  macOS registry: ~/Library/Application Support/elastos/components.json"
     echo ""
-    echo -e "${BOLD}What does NOT get installed:${NC}"
-    echo "  Capsules are downloaded on-demand when you run commands."
-    echo "  Example: 'elastos chat' auto-downloads chat + providers."
+    echo -e "${BOLD}After installation:${NC}"
+    echo "  Setup installs the Home profile, then opens Home in your terminal."
+    echo "  On a headless connection, the installer prints the command to open Home."
     echo ""
     echo -e "${BOLD}Trust model:${NC}"
     echo "  All artifacts signed with Ed25519. install.sh is the explicit"
@@ -746,6 +746,25 @@ PY_RELEASE_IDENTITY
     fi
 }
 
+# Complete setup without reading the curl pipe as input. Interactive Home owns
+# the controlling terminal; headless provisioning finishes without a renderer.
+finish_install() {
+    local runtime_bin="${INSTALL_DIR}/elastos"
+    if [[ "$INSTALL_ONLY" == true || "$INSTALL_ONLY" == 1 ]]; then
+        info "Runtime installed: ${runtime_bin}"
+        return 0
+    fi
+    info "Setting up Home..."
+    "$runtime_bin" setup </dev/null || return $?
+    if ( : </dev/tty ) 2>/dev/null && [[ -t 1 ]]; then
+        info "Opening Home..."
+        "$runtime_bin" </dev/tty || return $?
+    else
+        info "Home is ready. Open it from a terminal:"
+        printf '  %q\n' "$runtime_bin"
+    fi
+}
+
 # ── Parse args ────────────────────────────────────────────────────────
 
 # Repo smoke/publisher helpers source these definitions inside a subshell.
@@ -756,6 +775,7 @@ fi
 
 ALLOW_UNSIGNED=false
 INSTALL_DIR="${HOME}/.local/bin"
+INSTALL_ONLY="${ELASTOS_INSTALL_ONLY:-false}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -777,6 +797,7 @@ while [[ $# -gt 0 ]]; do
         --publisher-node-id)
             [[ -z "${2:-}" ]] && die "Usage: --publisher-node-id <node-id>"
             PUBLISHER_NODE_ID="$2"; PUBLISHER_NODE_ID_EXPLICIT=true; shift 2 ;;
+        --install-only) INSTALL_ONLY=true; shift ;;
         --allow-unsigned) ALLOW_UNSIGNED=true; shift ;;
         --install-dir)
             [[ -z "${2:-}" ]] && die "Usage: --install-dir PATH"
@@ -1080,30 +1101,6 @@ cp "${TMPDIR}/release-head.json" "${PUBLISHER_ROOT}/release-head.json"
 cp "${TMPDIR}/release.json" "${PUBLISHER_ROOT}/release.json"
 info "Saved publisher metadata for future upgrades"
 
-# ── Guest-network compatibility mode (optional) ─────────────────────
-# Normal app capsules (chat, Documents, etc.) are Carrier-only and rootless.
-# CAP_NET_ADMIN belongs only to explicit guest-network capsules, mediated by
-# the runtime. Do NOT print sudo suggestions for normal installs.
+# ── Complete installation ─────────────────────────────────────────────
 
-# ── Done ──────────────────────────────────────────────────────────────
-
-echo ""
-echo -e "${GREEN}${BOLD}ElastOS ${RELEASE_VERSION} installed!${NC}"
-echo ""
-echo -e "  ${INSTALL_DIR}/elastos"
-echo ""
-
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
-    echo -e "  Add to your PATH:"
-    echo ""
-    echo "    export PATH=\"${INSTALL_DIR}:\$PATH\""
-    echo ""
-fi
-
-echo -e "  Setup home:     elastos setup"
-echo -e "  Open Home:      elastos"
-echo -e "  Check source:   elastos source show"
-echo -e "  Check updates:  elastos update --check"
-echo -e "  Optional chat:  elastos chat --nick $(whoami)"
-echo -e "  Full help:      elastos --help"
-echo ""
+finish_install

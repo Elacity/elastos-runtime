@@ -2,20 +2,33 @@
 
 ## Install from the publisher
 
-The public installer is the current Linux `x86_64`/`aarch64` preview.
-For macOS, use the [source-home staging runbook](MAC.md).
+The public endpoint currently serves the older 0.1.2 Linux preview. Its
+installer prints separate setup commands. The 0.7.1 installer in this checkout
+combines installation, Home setup, and launch into one command:
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-export PATH="$HOME/.local/bin:$PATH"
-elastos setup
-elastos
 ```
 
-The installer verifies the signed release, then installs the `elastos` binary.
-`elastos setup` fetches the core Home profile from the trusted publisher.
-Running `elastos` opens Home. This path does not need a separate
-`elastos serve` process.
+That complete flow becomes available at this URL when the candidate installer
+and signed release are published. macOS Apple silicon downloads are still in
+preparation; developers can use the [Mac source guide](MAC.md).
+
+The candidate installer detects the platform, verifies the signed release,
+installs Runtime, and fetches the Home profile from the trusted publisher. It
+opens Home in the terminal. On a headless connection, setup completes and prints
+the installed binary's full path for opening Home later. The installer uses that
+path directly, so editing PATH is optional.
+
+For automated provisioning or a different setup profile, use `--install-only`:
+
+```bash
+curl -fsSL https://elastos.elacitylabs.com/install.sh | bash -s -- --install-only
+```
+
+`ELASTOS_INSTALL_ONLY=1` also selects bootstrap only. Test scripts use this
+setting to own setup, launch, and cleanup; older installers ignore it and already
+stop after bootstrap.
 
 The current default Home exposes System, People, Services, Browser, Wallet,
 Documents, Library, Marketplace, Archive, and Inbox. People is installed as a
@@ -116,8 +129,6 @@ curl -fsSL "${EXPLICIT_GATEWAY}/ipfs/INSTALLER_CID/install.sh" | bash
 curl -fsSL "${EXPLICIT_GATEWAY}/ipfs/INSTALLER_CID/install.sh" | bash \
   -s -- --head-cid HEAD_CID --maintainer-did MAINTAINER_DID
 
-~/.local/bin/elastos setup
-~/.local/bin/elastos
 ```
 
 Replace the uppercase placeholders with the publisher's values. Use one gateway
@@ -130,9 +141,6 @@ The installer detects Linux `aarch64`:
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-~/.local/bin/elastos setup
-~/.local/bin/elastos
-~/.local/bin/elastos update --check
 ```
 
 Native Home and chat run without KVM, crosvm, a guest kernel, Kubo, or `sudo`.

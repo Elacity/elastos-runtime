@@ -76,47 +76,25 @@
         <div class="section-intro">
           <p class="eyebrow">On your hardware</p>
           <h2 id="install-title">Run your own Home.</h2>
-          <p>Install the Runtime on your computer, then use Home in your browser. Your computer runs the apps and stores your files.</p>
-          <p>The published download is the older 0.1.2 Linux preview. The 0.7.1 development version is available as source code.</p>
+          <p>Run apps and keep your files on your own computer.</p>
+          <p>The 0.7.1 downloads are in preparation, with setup included in the installer.</p>
         </div>
         <div class="platforms">
           <details class="platform" open>
             <summary><strong>Linux</strong><span>x86_64 · ARM64</span></summary>
             <div class="platform-body">
               <h3>Install the published preview</h3>
-              <p>For version 0.1.2, open a terminal and run:</p>
-              <pre tabindex="0" aria-label="Linux installation commands"><code>curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-export PATH="$HOME/.local/bin:$PATH"
-elastos setup
-elastos</code></pre>
-              <p>Requires curl, Python 3 and OpenSSL with Ed25519 support. Home opens after setup; follow its account setup steps.</p>
+              <p>Open a terminal and run:</p>
+              <pre tabindex="0" aria-label="Linux installation command"><code>curl -fsSL https://elastos.elacitylabs.com/install.sh | bash</code></pre>
+              <p>This installs the older 0.1.2 Linux preview. Follow its printed setup steps.</p>
               <a href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs/INSTALL.md">Linux installation guide <span aria-hidden="true">↗</span></a>
             </div>
           </details>
           <details class="platform">
-            <summary><strong>macOS</strong><span>Apple silicon · Source build</span></summary>
+            <summary><strong>macOS</strong><span>Apple silicon</span></summary>
             <div class="platform-body">
-              <h3>Build the development version</h3>
-              <p>Use an Apple silicon Mac with Xcode command-line tools, Homebrew, Rust and Node.js. This installs a separate development Home.</p>
-              <p>Install the build tools:</p>
-              <pre tabindex="0" aria-label="Mac build prerequisites"><code>xcode-select --install
-brew install node e2fsprogs coturn ffmpeg
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-rustup target add wasm32-unknown-unknown</code></pre>
-              <p>When the tools are ready, get the development branch and build:</p>
-              <pre tabindex="0" aria-label="Mac source installation commands"><code>git clone --branch upstream/0.7.1-dev https://github.com/Elacity/elastos-runtime.git
-cd elastos-runtime
-export ELASTOS_SOURCE_HOME="$HOME/elastos-source-home"
-env HOME="$ELASTOS_SOURCE_HOME" \
-  CARGO_HOME="$HOME/.cargo" \
-  RUSTUP_HOME="$HOME/.rustup" \
-  ELASTOS_COLLABORATION_STARTUP_MODE=isolated \
-  scripts/setup-source-home.sh
-scripts/mac-source-home-restart.sh \
-  --test-home "$ELASTOS_SOURCE_HOME" \
-  --addr localhost:61180</code></pre>
-              <p>Open the Home address printed by the restart command. The Mac guide covers build troubleshooting and the extra artifacts required for the Browser app.</p>
+              <h3>Mac download in preparation</h3>
+              <p>The Apple silicon installer is being prepared for 0.7.1. Developers can build from source using the Mac guide.</p>
               <a href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs/MAC.md">Mac build guide <span aria-hidden="true">↗</span></a>
             </div>
           </details>

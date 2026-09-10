@@ -311,6 +311,89 @@ exec "$2" --noprofile --norc "$3" "${@:7}"
         return result, (root / "requests").read_text().splitlines()
 
 
+class CompletionTests(unittest.TestCase):
+    def run_completion(self, setup_exit=0, home_exit=0, install_only="false", terminal=False):
+        with tempfile.TemporaryDirectory(prefix="installer-completion-") as directory:
+            root = Path(directory)
+            # Spaces catch accidental reliance on PATH or unquoted install paths.
+            install_dir = root / "installed runtime"
+            install_dir.mkdir()
+            runtime = install_dir / "elastos"
+            runtime.write_text("#!/bin/bash\n"
+                               'printf "%s\\n" "${1:-home}" >> "$CALLS"\n'
+                               'if [[ "${1:-}" == setup ]]; then\n'
+                               '  if read -r unexpected; then exit 98; fi\n'
+                               '  exit "$SETUP_EXIT"\n'
+                               'fi\n'
+                               '[[ -t 0 ]] || exit 99\n'
+                               'exit "$HOME_EXIT"\n')
+            runtime.chmod(0o755)
+            command = HELPERS + "\nfinish_install\n"
+            script = root / "completion.sh"
+            script.write_text(command)
+            calls = root / "calls"
+            env = dict(os.environ, INSTALL_DIR=str(install_dir), INSTALL_ONLY=install_only,
+                       CALLS=str(calls), SETUP_EXIT=str(setup_exit), HOME_EXIT=str(home_exit))
+            argv = [OPTIONS.bash, "--noprofile", "--norc", str(script)]
+            if terminal:
+                import fcntl
+                import termios
+                master, slave = os.openpty()
+                def controlling_terminal():
+                    os.setsid()
+                    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+                try:
+                    proc = subprocess.Popen([OPTIONS.bash, "--noprofile", "--norc", "-s"],
+                                            stdin=subprocess.PIPE, stdout=slave, stderr=slave,
+                                            env=env, pass_fds=(slave,), preexec_fn=controlling_terminal)
+                    proc.stdin.write(command.encode())
+                    proc.stdin.close()
+                    import select
+                    chunks = []
+                    deadline = time.monotonic() + 10
+                    while proc.poll() is None and time.monotonic() < deadline:
+                        if select.select([master], [], [], 0.1)[0]:
+                            chunks.append(os.read(master, 65536))
+                    output = b"".join(chunks).decode(errors="replace")
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+                        raise AssertionError("Terminal completion timed out: " + output)
+                    status = proc.returncode
+                finally:
+                    os.close(master)
+                    os.close(slave)
+            else:
+                result = subprocess.run(argv, input="remaining curl input\n", text=True,
+                                        capture_output=True, env=env, timeout=10)
+                status, output = result.returncode, result.stdout
+            return status, calls.read_text().splitlines() if calls.exists() else [], output
+
+    def test_headless_setup_does_not_consume_script_pipe_or_open_renderer(self):
+        status, calls, output = self.run_completion()
+        self.assertEqual((status, calls), (0, ["setup"]))
+        self.assertIn("Home is ready", output)
+        self.assertIn("installed\\ runtime/elastos", output)
+
+    def test_setup_failure_stops_before_home_and_success_message(self):
+        status, calls, output = self.run_completion(setup_exit=23)
+        self.assertEqual((status, calls), (23, ["setup"]))
+        self.assertNotIn("Home is ready", output)
+
+    def test_install_only_skips_both_setup_and_home(self):
+        for value in ["true", "1"]:
+            status, calls, _ = self.run_completion(install_only=value)
+            self.assertEqual((status, calls), (0, []))
+
+    def test_terminal_install_sets_up_then_opens_home_with_tty(self):
+        status, calls, _ = self.run_completion(terminal=True)
+        self.assertEqual((status, calls), (0, ["setup", "home"]))
+
+    def test_home_failure_is_reported(self):
+        status, calls, _ = self.run_completion(terminal=True, home_exit=24)
+        self.assertEqual((status, calls), (24, ["setup", "home"]))
+
+
 class BindingTests(unittest.TestCase):
     def test_exact_signed_release_required_even_at_same_version(self):
         did, head, first, second = binding_fixture()

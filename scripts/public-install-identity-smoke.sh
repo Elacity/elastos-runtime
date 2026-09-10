@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This fixture owns setup, launch, and cleanup after bootstrap.
+export ELASTOS_INSTALL_ONLY=1
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/scripts/lib/public-install-guards.sh"
 source "${REPO_ROOT}/scripts/lib/runtime-cleanup.sh"
