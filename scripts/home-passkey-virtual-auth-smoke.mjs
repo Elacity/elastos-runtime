@@ -2826,7 +2826,26 @@ async function readRecoveryExportDownload(download, expected) {
 async function checkSystemRecoveryExport(page, systemFrame, passkey) {
   markStage("recovery-export:system-ui");
   assert(passkey?.principal_id, "Recovery Kit export requires the recorded signed-in principal");
+  // Static HTML is visible before System binds navigation and loads state.
+  // Wait for the recovery note to be populated even while its tab is hidden.
+  await systemFrame.waitForFunction(() => {
+    const note = document.querySelector('[data-field="recovery-note"]');
+    return note && !note.hidden && note.textContent.trim().length > 0;
+  }, null, { timeout: 30_000 });
+  // Restored windows can finish opening after the menu launch. Interact with
+  // the foreground System window, rather than a covered earlier instance.
+  const desktop = await homeGuiFrameForPage(page);
+  const activeSystem = desktop.locator('section.window.window-active[data-target="system"] iframe.window-frame');
+  await activeSystem.waitFor({ state: "visible", timeout: 10_000 });
+  const activeHandle = await activeSystem.elementHandle();
+  systemFrame = await activeHandle.contentFrame();
+  assert(systemFrame, "Foreground System window has no frame");
+  await systemFrame.waitForFunction(() => {
+    const note = document.querySelector('[data-field="recovery-note"]');
+    return note && !note.hidden && note.textContent.trim().length > 0;
+  }, null, { timeout: 30_000 });
   await systemFrame.locator('.settings-sidebar-item[data-settings="security"]').click();
+  await systemFrame.locator('[data-field="recovery-note"]').waitFor({ state: "visible", timeout: 10_000 });
   await systemFrame.locator('#recovery-password').fill("");
   const profileName = systemFrame.locator('#recovery-profile-name');
   if (await profileName.isVisible()) {
@@ -2836,6 +2855,23 @@ async function checkSystemRecoveryExport(page, systemFrame, passkey) {
   const responseAt = (path, method) => response => response.request().method() === method
     && new URL(response.url()).origin === new URL(HOME_URL).origin
     && new URL(response.url()).pathname === path;
+  const responses = [];
+  const messages = [];
+  const captureResponse = response => {
+    const url = new URL(response.url());
+    if (url.origin === new URL(HOME_URL).origin
+      && /^\/api\/auth\/(recovery|passkey-step-up)\//.test(url.pathname)) {
+      responses.push({ path: url.pathname, status: response.status() });
+    }
+  };
+  const captureConsole = message => {
+    if (["warning", "error"].includes(message.type())) {
+      messages.push(redactSensitiveString(message.text()).slice(0, 1000));
+      if (messages.length > 20) messages.shift();
+    }
+  };
+  page.on("response", captureResponse);
+  page.on("console", captureConsole);
   try {
     markStage("recovery-export:download-and-step-up");
     const [status, stepUp] = await Promise.all([
@@ -2854,7 +2890,17 @@ async function checkSystemRecoveryExport(page, systemFrame, passkey) {
     assert(expected?.principal_id === passkey.principal_id, "System Recovery status changed the signed-in principal");
     const result = await readRecoveryExportDownload(download, expected);
     return { ...result, virtual_step_up_checked: true, download_deleted: true };
+  } catch (error) {
+    const ui = await systemFrame.evaluate(() => ({
+      status: document.querySelector('[data-field="recovery-status"]')?.textContent,
+      note: document.querySelector('[data-field="recovery-note"]')?.textContent,
+      downloadDisabled: document.querySelector('#recovery-download')?.disabled,
+    })).catch(() => ({ unavailable: true }));
+    error.details = redactSensitive({ stage: smokeStage, responses, messages, ui });
+    throw error;
   } finally {
+    page.off("response", captureResponse);
+    page.off("console", captureConsole);
     // Browser download storage has a separate lifecycle from a retained
     // virtual-authenticator profile. Remove the exported secrets on failure too.
     if (download) await download.delete();
@@ -3831,9 +3877,9 @@ async function main() {
       console.error(cleanupError.message || cleanupError);
     }
     console.error("FAIL home-passkey-virtual-auth-smoke");
-    console.error(error.message || error);
+    console.error(redactSensitiveString(error.message || error));
     if (error.stack) {
-      console.error(error.stack);
+      console.error(redactSensitiveString(error.stack));
     }
     if (error.details) {
       console.error(JSON.stringify(redactSensitive(error.details), null, 2));
