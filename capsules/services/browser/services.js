@@ -11,8 +11,45 @@ const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).ge
 const homeOrigin = launchParams.get("home_origin") || "";
 const EXIT_SERVICE_KIND = "remote_exit";
 const BROWSER_ENGINE_SERVICE_KIND = "browser_engine";
+const MODEL_SERVICE_KIND = "remote_model";
 const CONFIGURED_REMOTE_EXIT_SOURCE = "configured_remote_exit";
-const VISIBLE_SERVICE_KINDS = new Set([BROWSER_ENGINE_SERVICE_KIND, EXIT_SERVICE_KIND]);
+const VISIBLE_SERVICE_KINDS = new Set([BROWSER_ENGINE_SERVICE_KIND, MODEL_SERVICE_KIND, EXIT_SERVICE_KIND]);
+const SERVICE_KIND_COPY = {
+  [BROWSER_ENGINE_SERVICE_KIND]: {
+    rank: 0,
+    noun: "Browser Engine",
+    mineTitle: { shared: "My Browser Engine is shared", private: "Share my Browser Engine" },
+    mineCopy: {
+      shared: "People you trust can use this Browser Engine after you approve access. Low-level connection details stay hidden.",
+      private: "Make this Browser Engine available to People you trust. Access stays under your approval.",
+    },
+    consumer: "Browser",
+    otherFallback: "this person's Browser Engine",
+  },
+  [MODEL_SERVICE_KIND]: {
+    rank: 1,
+    noun: "AI model",
+    mineTitle: { shared: "My AI model is shared", private: "Share my AI model" },
+    mineCopy: {
+      shared: "People you trust can run your local AI model after you approve each request. The model and every run stay on this device; hosted models stay private.",
+      private: "Let People you trust run your local AI model. Access stays under your approval and you can revoke it.",
+    },
+    consumer: "Assistant",
+    otherFallback: "this person's AI model",
+  },
+  [EXIT_SERVICE_KIND]: {
+    rank: 2,
+    noun: "Browser Exit service",
+    mineTitle: { shared: "My Browser Exit service is shared", private: "Share my Browser Exit service" },
+    mineCopy: {
+      shared: "People you trust can use this device's Browser Exit service after approval. Low-level network details stay hidden.",
+      private: "Let People you trust use this device's Browser Exit service. Access stays under your approval.",
+    },
+    consumer: "Browser",
+    otherFallback: "this person's Browser Exit service",
+  },
+};
+const SERVICE_KIND_LIST_COPY = "Browser Engine, AI model or Browser Exit";
 
 let currentServices = null;
 let pendingServiceAction = null;
@@ -119,7 +156,7 @@ function renderServices(services) {
     selectedTitle: "Shared",
     availableTitle: "Available on this device",
     emptySelected: "No Services are shared.",
-    emptyAvailable: "No Browser Engine or Browser Exit service is installed on this device.",
+    emptyAvailable: `No ${SERVICE_KIND_LIST_COPY} service is installed on this device.`,
   });
   otherServicesList.innerHTML = renderServiceSection({
     selected: remoteOffers,
@@ -128,7 +165,7 @@ function renderServices(services) {
     selectedTitle: "Subscribed",
     availableTitle: "Available from People",
     emptySelected: "No Services from others are subscribed.",
-    emptyAvailable: "No Browser Engine or Browser Exit services are available from People you are connected with.",
+    emptyAvailable: `No ${SERVICE_KIND_LIST_COPY} services are available from People you are connected with.`,
   });
 }
 
@@ -290,61 +327,34 @@ function visibleServiceOffers(offers) {
     : [];
 }
 
+function serviceKindCopy(offer) {
+  return SERVICE_KIND_COPY[readText(offer?.service_kind)] || SERVICE_KIND_COPY[EXIT_SERVICE_KIND];
+}
+
 function serviceTitle(offer, source, selected) {
-  const kind = readText(offer?.service_kind);
-  if (kind === BROWSER_ENGINE_SERVICE_KIND) {
-    if (source === "mine") {
-      return selected ? "My Browser Engine is shared" : "Share my Browser Engine";
-    }
-    return readText(offer?.display_name) || "Browser Engine";
-  }
+  const copy = serviceKindCopy(offer);
   if (source === "mine") {
-    return selected ? "My Browser Exit service is shared" : "Share my Browser Exit service";
+    return selected ? copy.mineTitle.shared : copy.mineTitle.private;
   }
-  return readText(offer?.display_name) || "External Browser Exit service";
+  return readText(offer?.display_name) || (copy === SERVICE_KIND_COPY[EXIT_SERVICE_KIND] ? "External Browser Exit service" : copy.noun);
 }
 
 function serviceCopy(offer, source, selected) {
-  const kind = readText(offer?.service_kind);
-  if (kind === BROWSER_ENGINE_SERVICE_KIND) {
-    if (source === "mine") {
-      return selected
-        ? "People you trust can use this Browser Engine after you approve access. Low-level connection details stay hidden."
-        : "Make this Browser Engine available to People you trust. Access stays under your approval.";
-    }
-    const name = readText(offer?.display_name) || "this person's Browser Engine";
-    if (offer?.grant_required === true) {
-      const requestStatus = serviceRequestStatus(offer);
-      if (selected && requestStatus === "approved") {
-        return `${name} was approved. Browser can use it when access becomes active.`;
-      }
-      if (selected && requestStatus === "denied") {
-        return `${name} denied the request. Remove it and ask again if needed.`;
-      }
-      return selected
-        ? `${name} is waiting for approval.`
-        : `Ask to use ${name}. You need to be connected in People first.`;
-    }
-    return selected
-      ? `${name} is saved as a Browser Engine option. Browser can use it when the service connection is active.`
-      : `Subscribe to ${name}. You need to be connected in People first.`;
-  }
-  const name = readText(offer?.display_name) || "this person's Browser Exit service";
+  const copy = serviceKindCopy(offer);
   if (source === "mine") {
-    return selected
-      ? "People you trust can use this device's Browser Exit service after approval. Low-level network details stay hidden."
-      : "Let People you trust use this device's Browser Exit service. Access stays under your approval.";
+    return selected ? copy.mineCopy.shared : copy.mineCopy.private;
   }
+  const name = readText(offer?.display_name) || copy.otherFallback;
   if (readText(offer?.source) === CONFIGURED_REMOTE_EXIT_SOURCE) {
     return `${name} is available as a Browser Exit option on this device.`;
   }
   if (readText(offer?.status) === "active" && offer?.enabled === true) {
-    return `${name} is active and ready for Browser.`;
+    return `${name} is active and ready for ${copy.consumer}.`;
   }
   if (offer?.grant_required === true) {
     const requestStatus = serviceRequestStatus(offer);
     if (selected && requestStatus === "approved") {
-      return `${name} was approved. Browser can use it when access becomes active.`;
+      return `${name} was approved. ${copy.consumer} can use it when access becomes active.`;
     }
     if (selected && requestStatus === "denied") {
       return `${name} denied the request. Remove it and ask again if needed.`;
@@ -354,7 +364,7 @@ function serviceCopy(offer, source, selected) {
       : `Ask to use ${name}. You need to be connected in People first.`;
   }
   return selected
-    ? `${name} is saved as a Browser Exit option. Browser can use it when the service connection is active.`
+    ? `${name} is saved as a ${copy.noun} option. ${copy.consumer} can use it when the service connection is active.`
     : `Subscribe to ${name}. You need to be connected in People first.`;
 }
 
@@ -409,14 +419,7 @@ function orderedServiceOffers(offers) {
 }
 
 function serviceKindRank(kind) {
-  switch (kind) {
-    case BROWSER_ENGINE_SERVICE_KIND:
-      return 0;
-    case EXIT_SERVICE_KIND:
-      return 1;
-    default:
-      return 10;
-  }
+  return SERVICE_KIND_COPY[kind]?.rank ?? 10;
 }
 
 function serviceStatusTone(offer, source) {
