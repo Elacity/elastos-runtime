@@ -3,7 +3,7 @@
 The September 11 integration now uses the full donor history. The combined source
 preserves current recovery, cookie and shutdown code while adding model admission,
 provider lifecycle, storage and window behavior. Focused source and rendered
-fixtures pass; installed human Homes remain `1e320578`. Full model history is
+fixtures pass; the earlier recovery human Homes remain `1e320578`. Full model history is
 merged by `b318bfda`, and Sash shelf ancestry is reconciled by `37c82d4f`. Irzhy
 foundation `617796a9` retains current lifecycle fixes after a reproduced explicit
 Carrier bind defect was repaired. Its focused source checks pass; dedicated
@@ -13,10 +13,10 @@ changes. The proposed full old-URUX-tip merge is superseded by review of concret
 remaining behavior differences. The remaining protected-content stack retains
 its source order and feature-preservation gates
 in [the integration check](docs/audits/2026-09-11-integration-preservation.md).
-The approved Assistant consolidation now passes source and rendered preservation checks; its installed proof is next. Original UI parity beyond this slice and full cross-platform J3 acceptance remain open. See [the convergence check](docs/audits/2026-09-11-assistant-convergence.md).
+The approved Assistant consolidation `fa297cb5` now passes source, rendered and installed Mac checks: one identity, real Qwen reply/save/reload, original draft/model preservation and full Runtime restart. A separate fresh human Home serves the same candidate for passkey setup. Original UI parity beyond this slice and full cross-platform J3 acceptance remain open. See [the convergence check](docs/audits/2026-09-11-assistant-convergence.md).
 
 
-The isolated Mac J3 installation runs Runtime `fbf1a4b0` with matching build,
+The earlier isolated Mac J3 receipt records Runtime `fbf1a4b0` with matching build,
 installed and served hashes and current manifests. Signed catalog visibility,
 Use/cancel/retry, exact local package admission, cold startup, exact model
 selection, an actual Qwen reply and its saved conversation pass. Reply and unsent
@@ -884,9 +884,12 @@ complete. Installed proof and the atomic authority cutover remain open.
   history. Historical foreign runs and copied sessions retain their original
   identities without acquiring authority. Copy uses trusted Home Clipboard.
 - The source and rendered preservation gates pass. Installed canonical Assistant
-  and actual Qwen proof are pending on the frozen Mac candidate. Earlier installed
-  Home Agent and standalone Assistant observations above remain historical target
-  receipts. Advanced tools, Library reads, search and broader Studio capabilities
+  `fa297cb5` passes one catalog identity, legacy launch, a real Qwen reply, exact
+  saved/reloaded text and model selection, and owned shutdown/restart. Current
+  build/installed/served receipts match. The new human Home has fresh passkey
+  setup and a locally cached Qwen package; human enrollment/admission remains
+  pending. Earlier Home Agent and standalone Assistant observations above are
+  historical target receipts. Advanced tools, Library reads, search and broader Studio capabilities
   retain their typed-contract gates.
 
 

@@ -23,66 +23,53 @@ local operator ledger and current checkpoint. Resolve their directory with
 `git rev-parse --path-format=absolute --git-common-dir`; read
 `development-loop-current.md` there. A linked worktree's `.git` is a file.
 
-Use `feat/0.7.1-website-execution`, based on the user-selected
-`origin/upstream/0.7.1-dev` at `6c61c990`. Preserve the integration and Browser
-donors. Before edits, recheck HEAD/tree, dirt, fetched divergence and target
-receipts. Human preview Homes remain `1e320578`; the separate Mac J3 Home has
-accepted Runtime `fbf1a4b0` Qwen proof. The approved one-Assistant source now passes
-preservation and rendered checks. Install its frozen candidate next, as recorded
-in [the convergence check](2026-09-11-assistant-convergence.md). The affected
-Runtime build has passed; reuse providers, engine and model data.
+Use the explicit website checkout on `feat/0.7.1-website-execution`, based on
+the user-selected `origin/upstream/0.7.1-dev` at `6c61c990`. The default checkout
+contains unrelated dirty donor work. Preserve all 70 branches and 12 worktrees.
+Before edits, recheck HEAD/tree, dirt, fetched divergence and process ownership.
+Published review remains `00003b6f`; subsequent integration and Assistant work is
+local. Closeout documentation follows the code candidate.
 
-The installed checkpoint code is `1e320578b6b8a77753c4b5ef8fab51c12ea3d9e2`, tree
-`44b08f00907c02dd3fe3bb2d3ed8e79e1bb76788`, 54 ahead / zero behind dev `6c61c990`.
-Closeout documentation follows that candidate. The default checkout contains
-unrelated dirty donor work; use the website checkout explicitly.
+The current installed Assistant candidate is
+`fa297cb59a07971a472c6020586ea876fdc9a220`, tree
+`4c1eaa05448ab2de64c685df4872f7a7d23b245d`. It contains Sash's UI in the canonical
+Assistant capsule and protected v2 workspace adoption. The bounded Mac checkpoint
+passes one identity, canonical and legacy launch, real Qwen reply/save/reload,
+original draft/exact model preservation and full Runtime restart. Shutdown closed
+29 owned processes and the held HTTP connection. Runtime, capsule and served
+hashes match their current installation receipts. Providers, engine and the six
+admitted package files are reused. See
+[the convergence check](2026-09-11-assistant-convergence.md) for the acceptance
+mapping and the distinction between installed data and three-store fixture proof.
 
-One owner built the Runtime once per platform for the revised candidate and
-reused unchanged verified artifacts. The old pinned assembly helper was reviewed
-and left unused. Official installation receipts were refreshed after manifest
-changes. Automated test gateways are stopped; only isolated human-test Homes
-remain for AUTH-01. Existing user previews and public stage retain `d790a48e`.
+A separate fresh Mac human Home serves the same candidate and has a verified
+locally cached Qwen package. Its normal passkey setup is ready. The private
+checkpoint records its URL and receipt. Human enrollment and normal model
+admission there require the user's presence. The earlier recovery human Homes
+remain `1e320578`; existing user previews and public stage remain `d790a48e`.
+The original recovery, retry, reload, media reuse and Carrier cleanup receipts
+remain accepted. Full AUTH-01 human acceptance is still pending.
 
-The full model donor `6972e165` is merged by `b318bfda`. Sash's shelf history
-is reconciled by `37c82d4f` after full behavior comparison. Irzhy
-foundation `617796a9` (PR60, which replaced PR57) is merged by `dd21d8bd`. Further
-intake is frozen for one installed Qwen journey in a fresh test-owned Mac Home. Reuse the existing signed model package and engine. Prove
-catalog visibility and normal cancel before a large transfer, then preparation,
-selection, reply, stop and restart/reuse. Carrier cold delivery retains its
-separate Required gate. Existing user Homes stay preserved.
+The full model donor `6972e165` is merged by `b318bfda`. Sash shelf history is
+reconciled by `37c82d4f`; Irzhy foundation `617796a9` (PR60 replacing PR57) is
+merged by `dd21d8bd`. Adapted URUX/UIUX `8b547590` already entered through
+reconstruction `7dd1780b` and merge `985fdffc`, followed by newer Sash dock/lock
+work. The full old-tip merge proposal remains superseded. The
+[preservation check](2026-09-11-integration-preservation.md) accounts for all
+13 September contributor PRs and retains each remaining feature gate.
 
-The [preservation check](2026-09-11-integration-preservation.md) accounts for all
-13 Irzhy and Sash PRs created or updated in September. It records original
-history, adopted behavior, explicit differences and remaining proof. Adapted
-URUX/UIUX already entered through Irzhy reconstruction; compare remaining UI
-differences against that baseline. Irzhy authority cutover and Required follow-up
-work retain their dependency order. Keep both Assistant workspace stores intact;
-one visible Assistant requires full history and draft preservation. Integrated
-UI and full model acceptance remain pending. Installed Mac Runtime `fbf1a4b0`
-now passes exact Qwen admission, cold startup, selection, an actual typed reply
-and saved conversation. Reply, draft and exact CID/offer survive reload with zero
-implicit dispatches. Stop returns an honest unknown outcome, as permitted by J3
-Step 5; confirmed backend cancellation remains separate. The native adapter
-intentionally records unknown when stream closure cannot prove backend stop.
-Owned shutdown closes all 29 processes including the engine, a held HTTP connection
-and the listener. The same installed Home restarts, produces a second real reply
-and restores the original draft. All six package files, protected files and prior
-message hashes match; measured reuse receives zero Bitswap payload and makes zero
-Content mutations. Independent review accepts this bounded Mac milestone. Current manifests and receipts bind all changed artifacts;
-providers, engine and the admitted package are reused. The model menu repair `8f28b6e3` passes installed refresh, placement, normal close
-and workspace-preservation checks. A stale copied archive identity was corrected
-in source-install metadata; the bounded stamper repair prevents recurrence.
-The original URUX full-merge proposal is superseded: the UIUX candidate
-`8b547590` entered through reconstruction `7dd1780b` and Irzhy merge `985fdffc`,
-followed by newer Sash dock/lock changes. Next, verify concrete remaining UI
-differences and preserve all Assistant workspaces before consolidation. Preserve the
-legacy `homeBrowserState.session.agent` object as well as both current workspace
-stores. Repair concurrent saves and durable history limits on the combined clients.
-The 79-conflict preview remains historical; no actual URUX merge was started.
-Linux needs additional disk headroom and a reviewed startup profile. The private
-checkpoint owns current processes and receipts; user Homes remain preserved.
-Public staging needs exact-candidate review and approval. Final installer stamping
-and signing follow C5 source freeze.
+This implementation checkpoint is closed at its bounded Mac result and waits
+for human acceptance. Linux needs the recorded additional disk headroom and a
+reviewed startup profile. Cold Carrier delivery, Marketplace handoff,
+retention/removal, remaining UI differences, Irzhy authority cutover and follow-up,
+dedicated provider-host/J5 proof and full J1–J5 retain their dependency order and
+Required gates. Confirmed backend cancellation remains distinct from the accepted
+honest unknown result. Recurring monitoring remains paused; Jetson is deferred.
+
+Further public deployment requires review and approval of the exact candidate.
+The seed's existing GitHub credentials remain available for a future authorized
+push. Required installation manifests and receipts are current; final installer
+stamping, packaging and signing follow C5 source freeze and the release gate.
 
 ## Earlier preview evidence
 

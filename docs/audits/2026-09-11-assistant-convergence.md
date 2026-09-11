@@ -10,13 +10,13 @@ change J1–J5 or D1–D6, publish another branch, or deploy the public Home.
 
 | Behavior | Source repair | Target and check | Current result |
 | --- | --- | --- | --- |
-| One Assistant from Apps, shelf and legacy launch | Canonical manifest, launch normalization, catalog and installer retirement | Mac source/shell regression; installed Home | Source passes; installed pending |
-| Complete old work and editable drafts | Protected workspace v2, three-store adoption, full records and source-scoped IDs | Seven Runtime tests, ten migration tests, rendered Mac fixture | Pass; installed pending |
+| One Assistant from Apps, shelf and legacy launch | Canonical manifest, launch normalization, catalog and installer retirement | Mac source/shell regression; installed Home | Pass on Mac source and installed canonical/legacy launches |
+| Complete old work and editable drafts | Protected workspace v2, three-store adoption, full records and source-scoped IDs | Seven Runtime tests, ten migration tests, rendered Mac fixture | All three stores pass Runtime/rendered tests; installed Home Agent adoption and preservation pass |
 | Preserve concurrent edits and failed saves | Revision checks, visible conflict copies, deferred merge during active runs | Rendered two-page conflict and Runtime race/failure tests | Pass |
-| Exact model choice and reload | Existing CID/offer contract and per-session selection | Rendered Qwen choice and draft/reply restoration | Fixture passes; actual installed Qwen pending |
+| Exact model choice and reload | Existing CID/offer contract and per-session selection | Rendered Qwen choice and draft/reply restoration | Pass: real Qwen reply, visible/saved text, reload and Runtime restart |
 | Real Chat, Build and Studio controls | Sash UI plus existing typed Studio controller; per-session state | Rendered modes and eight Studio preservation tests | Pass within offered capabilities |
 | Preserve run authority and unknown outcomes | Original actor/run/request identity, detached history copies, save before create | 26 cancellation/recovery tests; eight Studio tests | Pass |
-| Safe installation and restart | Owned shutdown, current receipts and affected artifact parity | Test-owned Mac Home only | Pending |
+| Safe installation and restart | Owned shutdown, current receipts and affected artifact parity | Test-owned Mac Home only | Pass: owned shutdown/restart and matching installed/served hashes |
 
 Migration retains immutable raw copies of the three original stores and leaves
 their protected objects in place. Unknown fields, complete text, roles, projects,
@@ -29,6 +29,44 @@ retains an unknown result when a create response is lost. Each session owns its
 run cursor and complete output history. Reload reads the same run; opening or
 switching modes creates no run. Chat and Studio keep separate drafts. An absent
 image/video offer produces the existing unavailable state.
+
+## Installed Mac result
+
+Candidate `fa297cb59a07971a472c6020586ea876fdc9a220`, tree
+`4c1eaa05448ab2de64c685df4872f7a7d23b245d`, passes the bounded installed
+Assistant checkpoint. Runtime built and installed SHA-256 is
+`fcc0b7d91667f2f291ac06728f9bb8936954775c8bcad1dcad16b2bf89ebc0fa`.
+The receipt binds source, components, capsule files and current process identity.
+All 118 affected artifact records match; browser files also match served bytes.
+
+Home summary and catalog show one Assistant. The old launch target resolves to
+Assistant with the exact model query. Old bookmarks return to Home with their
+launch fragment cleared. One explicit Qwen request produced `4`; provider output,
+visible text and acknowledged saved text agree. The reply, original draft and
+exact CID/offer survive browser reload and a full Runtime restart with zero
+implicit creates. The native provider, engine and six admitted package files are
+reused; package hashes, sizes, inodes and modification times remain unchanged.
+
+The first installed adoption captured the existing Home Agent workspace. The
+final reply proof resumed canonical revision 6. All-three-store adoption and long
+Unicode history are established by Runtime and rendered tests; they are separate
+from that installed data set. Installed Studio proves mode selection and honest
+unavailability of image/video offers. Its generation and foreign-run protections
+retain source/test evidence.
+
+Shutdown closed 29 owned processes, the held HTTP connection and the listener.
+Restart succeeded, proving release of the data-root lock. Identity, Profile and
+old protected workspace bytes remain exact. The test intentionally saved new
+canonical messages and Home window state; readback proves their contents.
+A separate fresh Mac Home serves the same candidate for human passkey setup. Its
+Qwen package was imported from the verified local closure with zero network
+download; normal user enrollment and model admission remain to be exercised there.
+Existing human previews remain unchanged.
+
+Independent review accepts this bounded Mac result. Linux convergence remains
+pending on the recorded disk headroom and startup-profile requirements. Human
+acceptance, cold Carrier delivery, Marketplace handoff, retention/removal and
+full cross-platform J3 retain their Required gates.
 
 ## Review and failure disposition
 
@@ -44,6 +82,13 @@ rendered Unicode failure came from the fixture decoding each HTTP chunk
 separately; whole-body UTF-8 decoding preserves exact text. A product sidebar
 path bypassed draft restoration and was routed through the shared selector.
 Explicit New Chat after an unknown run retains the unsent draft in both histories.
+The first installed phrase test completed with a model refusal. Its prompt hash
+and provider journal match the unchanged contract. A neutral arithmetic request
+then passed the provider-to-UI-to-storage check. Early readiness and selector
+failures, plus historical-run and ciphertext assertions in reused proof helpers,
+were diagnosed before their corrected checks. These failures remain in private
+receipts; they are not hidden by the passing final run.
+
 Diagnostics and exact source/build/process receipts stay in the private operator
 checkpoint. The Mac Runtime build passes; providers, engine and model data are
 reused. Linux remains pending on its recorded capacity and startup-profile gates.

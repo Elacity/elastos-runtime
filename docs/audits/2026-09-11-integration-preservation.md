@@ -389,5 +389,6 @@ and carries the existing typed Studio controller with it. The old Home Agent
 source remains in Git history. Protected legacy stores remain intact, and v2
 adoption preserves all three stores before the installed app retires.
 [The convergence check](2026-09-11-assistant-convergence.md) records behavior,
-review findings and the remaining installed gate. This is a named preservation
+review findings and the passing bounded installed Mac gate. Human acceptance and
+the remaining full J3 target gates stay pending. This is a named preservation
 repair on the integrated source, not another extraction of URUX history.
